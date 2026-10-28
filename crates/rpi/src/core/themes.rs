@@ -285,7 +285,7 @@ fn is_function_color(value: &str) -> bool {
 /// Embedded `dark.json` (values ported verbatim from
 /// `packages/coding-agent/src/modes/interactive/theme/dark.json`).
 const DARK_THEME_JSON: &str = r##"{
-	"$schema": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+	"$schema": "https://revpi.dev/schemas/theme.schema.json",
 	"name": "dark",
 	"appearance": "dark",
 	"vars": {
@@ -366,7 +366,7 @@ const DARK_THEME_JSON: &str = r##"{
 /// Embedded `light.json` (values ported verbatim from
 /// `packages/coding-agent/src/modes/interactive/theme/light.json`).
 const LIGHT_THEME_JSON: &str = r##"{
-	"$schema": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+	"$schema": "https://revpi.dev/schemas/theme.schema.json",
 	"name": "light",
 	"appearance": "light",
 	"vars": {

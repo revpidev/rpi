@@ -35,6 +35,7 @@ pub mod self_update;
 pub mod session_cwd;
 pub mod session_manager;
 pub mod settings_manager;
+pub mod settings_write;
 pub mod share;
 pub mod skills;
 pub mod slash_commands;

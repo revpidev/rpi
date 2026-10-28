@@ -42,7 +42,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use rpi_agent::types::{QueueMode, ThinkingLevel};
 use rpi_ai::types::Transport;
 use serde::{Deserialize, Serialize};
@@ -361,6 +360,20 @@ pub enum FullscreenExitOutput {
     Transcript,
     #[serde(rename = "resume-hint")]
     ResumeHint,
+}
+
+/// `SessionShareDestination = "auto" | "gist" | "radius"`
+/// (settings-manager.ts:804-817 @ cea257439). rpi supports the gist backend;
+/// `radius` is recognized but explicitly unsupported at the command entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SessionShareDestination {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "gist")]
+    Gist,
+    #[serde(rename = "radius")]
+    Radius,
 }
 
 /// `settings.treeFilterMode`: `"default" | "no-tools" | "user-only" |
@@ -751,11 +764,6 @@ pub trait SettingsStorage: Send + Sync {
     ) -> Result<(), RpiError>;
 }
 
-/// proper-lockfile acquisition shape (settings-manager.ts:199-224): 10
-/// attempts, 20ms delay, contention-only retry.
-const LOCK_MAX_ATTEMPTS: u32 = 10;
-const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
-
 /// `FileSettingsStorage` (settings-manager.ts:188-255).
 pub struct FileSettingsStorage {
     global_settings_path: PathBuf,
@@ -785,47 +793,14 @@ impl FileSettingsStorage {
     pub fn project_settings_path(&self) -> &Path {
         &self.project_settings_path
     }
-
-    /// `acquireLockSyncWithRetry` (settings-manager.ts:199-224), with fs2
-    /// flock in place of proper-lockfile (see module header). Returns the
-    /// locked file handle; the flock releases on drop.
-    ///
-    /// `create` opens with `O_CREAT` for the write path, where upstream
-    /// locks before the file exists (proper-lockfile needs no target file).
-    fn acquire_lock_with_retry(path: &Path, create: bool) -> Result<std::fs::File, RpiError> {
-        for attempt in 1..=LOCK_MAX_ATTEMPTS {
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true).write(true);
-            if create {
-                options.create(true);
-            }
-            let file = options.open(path).map_err(RpiError::Io)?;
-            match file.try_lock_exclusive() {
-                Ok(()) => return Ok(file),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if attempt == LOCK_MAX_ATTEMPTS {
-                        return Err(RpiError::Settings(format!(
-                            "Failed to acquire settings lock for {}: {error}",
-                            path.display()
-                        )));
-                    }
-                    std::thread::sleep(LOCK_RETRY_DELAY);
-                }
-                Err(error) => return Err(RpiError::Io(error)),
-            }
-        }
-        Err(RpiError::Settings(format!(
-            "Failed to acquire settings lock for {}",
-            path.display()
-        )))
-    }
 }
 
 impl SettingsStorage for FileSettingsStorage {
-    /// `withLock` (settings-manager.ts:226-254): the lock is only acquired
-    /// when the file exists or a write is about to happen; the directory is
-    /// only created when a write actually happens; the write is atomic
-    /// (temp file + rename — upstream `writeFileSync` is not; T14 review).
+    /// `withLock` (settings-manager.ts:226-254) over the shared A(host fs2) →
+    /// B(`<target>.write-lock`) coordinator (ADR-0040 / V18-02): the whole
+    /// read-modify-write re-reads under both locks, preserves every
+    /// top-level key the caller does not touch, and replaces the file
+    /// atomically while keeping the trailing-newline state and Unix mode.
     fn with_lock(
         &mut self,
         scope: SettingsScope,
@@ -835,42 +810,10 @@ impl SettingsStorage for FileSettingsStorage {
             SettingsScope::Global => &self.global_settings_path,
             SettingsScope::Project => &self.project_settings_path,
         };
-        let dir = path.parent().map(Path::to_path_buf);
-
-        let file_exists = path.exists();
-        let mut guard: Option<std::fs::File> = None;
-        let current = if file_exists {
-            guard = Some(Self::acquire_lock_with_retry(path, false)?);
-            let raw = std::fs::read_to_string(path)?;
-            // #8337 (`1355cd36e`): strip a leading UTF-8 BOM before parsing —
-            // editors on Windows write settings.json with a BOM.
-            Some(crate::tools::edit_diff::strip_bom(&raw).1)
-        } else {
-            None
-        };
-
-        let next = f(current.as_deref())?;
-        if let Some(next) = next {
-            if let Some(dir) = &dir
-                && !dir.exists()
-            {
-                std::fs::create_dir_all(dir)?;
-            }
-            if guard.is_none() {
-                guard = Some(Self::acquire_lock_with_retry(path, true)?);
-            }
-            // Atomic write (temp + rename in the same directory; T14
-            // review — upstream's `writeFileSync` can truncate the store
-            // on crash mid-write, hard-failing the next read).
-            crate::config::atomic_write(path, &next)?;
-        }
-
-        // Explicit release mirroring upstream's `finally { release() }`; the
-        // flock would also release when the handle drops.
-        if let Some(file) = guard {
-            let _ = file.unlock();
-        }
-        Ok(())
+        crate::core::settings_write::with_settings_write_lock(path, |current| {
+            let next = f(current)?;
+            Ok((next, ()))
+        })
     }
 }
 
@@ -1649,6 +1592,25 @@ impl SettingsManager {
     /// including slash-separated auto themes.
     pub fn get_theme_setting(&self) -> Option<String> {
         self.settings.get_str("theme").map(str::to_string)
+    }
+
+    /// `getSessionShareDestination` (settings-manager.ts:804-812 @
+    /// cea257439): only `gist`/`radius` are recognized; anything else
+    /// (including absent/invalid values) falls back to `auto`.
+    pub fn get_session_share_destination(&self) -> SessionShareDestination {
+        match self.settings.get_str("sessionShareDestination") {
+            Some("gist") => SessionShareDestination::Gist,
+            Some("radius") => SessionShareDestination::Radius,
+            _ => SessionShareDestination::Auto,
+        }
+    }
+
+    /// `setSessionShareDestination` (settings-manager.ts:814-817).
+    pub fn set_session_share_destination(&mut self, destination: SessionShareDestination) {
+        self.global_settings
+            .set("sessionShareDestination", json_value(&destination));
+        self.mark_modified("sessionShareDestination", None);
+        self.save();
     }
 
     /// `getTheme` (settings-manager.ts:729-732): slash-separated automatic
@@ -3809,6 +3771,8 @@ mod tests {
             })])
             .unwrap();
 
+        let errors = manager.drain_errors();
+        assert!(errors.is_empty(), "settings errors: {errors:?}");
         assert!(dirs.project_dir.join(".rpi").exists());
         assert!(project_path(&dirs).exists());
     }
@@ -5305,6 +5269,34 @@ mod tests {
         assert_eq!(
             errors[0].path.as_deref(),
             Some(global_path(&dirs).to_str().expect("utf8 path"))
+        );
+    }
+    #[test]
+    fn session_share_destination_defaults_and_round_trips() {
+        let dirs = test_dirs();
+        let mut manager = create(&dirs);
+        assert_eq!(
+            manager.get_session_share_destination(),
+            SessionShareDestination::Auto
+        );
+        manager.set_session_share_destination(SessionShareDestination::Gist);
+        assert_eq!(
+            manager.get_session_share_destination(),
+            SessionShareDestination::Gist
+        );
+        manager.set_session_share_destination(SessionShareDestination::Radius);
+        assert_eq!(
+            manager.get_session_share_destination(),
+            SessionShareDestination::Radius
+        );
+        // Invalid values fall back to auto (settings are not schema-validated
+        // at runtime, like upstream).
+        manager
+            .settings
+            .set("sessionShareDestination", json!("gist-invalid"));
+        assert_eq!(
+            manager.get_session_share_destination(),
+            SessionShareDestination::Auto
         );
     }
 }

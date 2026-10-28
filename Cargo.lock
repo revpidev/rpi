@@ -3107,6 +3107,7 @@ dependencies = [
  "httpdate",
  "ignore",
  "image",
+ "jsonschema",
  "kamadak-exif",
  "libc",
  "regex",
@@ -3334,6 +3335,7 @@ name = "rpi-ext-subagents"
 version = "0.1.7"
 dependencies = [
  "abi_stable",
+ "fs2",
  "futures",
  "libc",
  "regex",

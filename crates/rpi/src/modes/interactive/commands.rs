@@ -454,6 +454,20 @@ impl InteractiveUi {
     pub(crate) fn handle_share_command(self: &Arc<Self>) {
         use crate::core::share::GhAuthStatus;
 
+        // `sessionShareDestination` (settings-manager.ts:804-817 @
+        // cea257439): rpi has the gist backend only. `radius` must fail
+        // explicitly instead of silently uploading to a different service.
+        if self
+            .session()
+            .settings_manager(|settings| settings.get_session_share_destination())
+            == crate::core::settings_manager::SessionShareDestination::Radius
+        {
+            self.show_error(
+                "The \"radius\" share destination is not supported by rpi. Set \"sessionShareDestination\" to \"auto\" or \"gist\" in settings.json.",
+            );
+            return;
+        }
+
         let runner = lock(&self.share_runner).clone();
         match runner.auth_status() {
             GhAuthStatus::NotInstalled => {
@@ -1284,6 +1298,29 @@ mod tests {
         );
         assert!(
             rendered.contains("https://cli.github.com/"),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn share_command_radius_destination_fails_explicitly() {
+        use crate::core::settings_manager::SessionShareDestination;
+
+        let (mode, _terminal) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.session().settings_manager(|settings| {
+            settings.set_session_share_destination(SessionShareDestination::Radius)
+        });
+        let runner = Arc::new(MockShareRunner::ok());
+        ui.set_share_runner(runner);
+        ui.handle_share_command();
+        let rendered = chat_render(ui);
+        assert!(
+            rendered.contains("\"radius\" share destination is not supported"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("sessionShareDestination"),
             "rendered: {rendered}"
         );
     }

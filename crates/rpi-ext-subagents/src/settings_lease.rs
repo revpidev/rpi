@@ -125,7 +125,38 @@ pub(crate) fn with_settings_file_lease<T>(
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let target = resolve_settings_write_target(file_path).map_err(|error| error.to_string())?;
-    with_file_lease(&target, action).map_err(|error| error.to_string())?
+    // V18-02 R3.1.3: fixed A(host fs2) → B(`.write-lock`) order. Old host
+    // writers hold only A; old subagents hold only B. Holding both in the
+    // fixed order is what lets all three generations interleave safely.
+    let host_lock = acquire_host_lock(&target).map_err(|error| error.to_string())?;
+    let result = with_file_lease(&target, action).map_err(|error| error.to_string())?;
+    let _ = fs2::FileExt::unlock(&host_lock);
+    result
+}
+
+fn acquire_host_lock(path: &Path) -> io::Result<std::fs::File> {
+    const ATTEMPTS: u32 = 10;
+    const DELAY: Duration = Duration::from_millis(20);
+    let mut last = None;
+    for attempt in 1..=ATTEMPTS {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(file),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                last = Some(error);
+                if attempt < ATTEMPTS {
+                    std::thread::sleep(DELAY);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "settings lock is held")))
 }
 
 /// Hold a lease beside `file_path` for a short synchronous update, waiting at
@@ -342,10 +373,17 @@ pub(crate) fn write_settings_json(file_path: &Path, root: &serde_json::Value) ->
         // Write-access validation only; the handle is dropped immediately.
         std::fs::OpenOptions::new().write(true).open(&target)?;
     }
-    let body = format!(
-        "{}\n",
-        serde_json::to_string_pretty(root).unwrap_or_default()
-    );
+    // Preserve the original trailing-newline state (V18-02 R3.1.4); a new
+    // file keeps the historical trailing newline.
+    let had_newline = std::fs::read_to_string(&target)
+        .map(|raw| raw.ends_with('\n'))
+        .unwrap_or(true);
+    let serialized = serde_json::to_string_pretty(root).unwrap_or_default();
+    let body = if had_newline {
+        format!("{serialized}\n")
+    } else {
+        serialized
+    };
     let temp = temp_path_for(&target);
     let result = write_temp_then_rename(&temp, &target, &body, existing_mode);
     if result.is_err() {
@@ -452,6 +490,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn write_settings_json_preserves_the_absence_of_a_trailing_newline() {
+        let dir = temp_dir("no-newline");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{\"old\": true}").unwrap();
+        write_settings_json(
+            &path,
+            &serde_json::json!({"subagents": {"agentOverrides": {}}}),
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.ends_with('\n'), "{raw:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_settings_json_preserves_the_existing_mode() {
@@ -495,12 +548,10 @@ mod tests {
         let held = with_settings_file_lease(&path, || {
             // A nested acquisition (simulating another session) must time out.
             let nested = with_settings_file_lease(&path, || Ok(()));
-            assert!(
-                nested
-                    .err()
-                    .is_some_and(|error| error.contains("Timed out waiting for another process")),
-                "nested lease must time out"
-            );
+            // The outer writer holds A; the nested attempt stops at A
+            // (or at B when another generation only holds B). Either way the
+            // nested writer must not enter the critical section.
+            assert!(nested.is_err(), "nested lease must be rejected");
             Ok(())
         });
         held.unwrap();
