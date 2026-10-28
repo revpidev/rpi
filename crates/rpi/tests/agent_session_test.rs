@@ -631,11 +631,11 @@ async fn old_session_without_system_entries_backfills_on_first_request() {
     );
 }
 
-/// #9548 (agent-session.ts:421-424): constructed without an explicit initial
-/// loadout, the session restores the transcript-declared tool set — a resumed
-/// session keeps the tools a previous run activated (e.g. `setActiveTools`).
+/// 6f2f164ab (agent-session.ts:1817-1848): a resumed session using the
+/// default tool selection restores the transcript-declared loadout — a
+/// previous run's `setActiveTools` state survives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn constructor_restores_transcript_declared_tools_without_initial_set() {
+async fn constructor_restores_transcript_declared_tools_for_default_selection() {
     let tmp = TempDir::new();
     let cwd = tmp.path().join("cwd");
     let agent_dir = tmp.path().join("agent");
@@ -707,7 +707,7 @@ async fn constructor_restores_transcript_declared_tools_without_initial_set() {
         custom_tools: Vec::new(),
         model_runtime,
         initial_active_tool_names: None,
-        uses_default_tools: false,
+        uses_default_tools: true,
         default_tool_modifiers: Vec::new(),
         allowed_tool_names: None,
         excluded_tool_names: None,
@@ -2863,4 +2863,181 @@ async fn tools_cli_modifiers_adjust_default_tools_selection() {
     )
     .await;
     assert!(sorted_active(&fixture.session).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 6f2f164ab / bd3c9b823: resume loadout restore
+// ---------------------------------------------------------------------------
+
+/// A custom SDK tool with `name` (active by default).
+struct NamedTool(&'static str);
+
+#[async_trait::async_trait]
+impl rpi_agent::types::AgentTool for NamedTool {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn label(&self) -> &str {
+        self.0
+    }
+    fn description(&self) -> &str {
+        "named test tool"
+    }
+    fn parameters(&self) -> &Value {
+        static PARAMETERS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        PARAMETERS.get_or_init(|| serde_json::json!({ "type": "object", "properties": {} }))
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        _params: Value,
+        _signal: tokio_util::sync::CancellationToken,
+        _on_update: Option<rpi_agent::types::AgentToolUpdateCallback>,
+    ) -> Result<rpi_agent::types::AgentToolResult, rpi_agent::AgentError> {
+        Ok(rpi_agent::types::AgentToolResult::default())
+    }
+}
+
+async fn resume_session_with_loadout(
+    declarations: &[(Vec<&str>, Vec<&str>)],
+    initial_active: Option<Vec<String>>,
+    uses_default_tools: bool,
+    modifiers: Vec<String>,
+    custom_tools: Vec<Arc<dyn rpi_agent::types::AgentTool>>,
+) -> AgentSession {
+    let tmp = TempDir::new();
+    let cwd = tmp.path().join("cwd");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+    let provider = FauxProvider::new(FauxProviderOptions::default());
+    let model = provider.get_model(None).expect("faux model");
+    let model_runtime = rpi::core::model_runtime::ModelRuntime::create(CreateModelRuntimeOptions {
+        credentials: None,
+        auth_path: Some(agent_dir.join("auth.json")),
+        models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+        ..Default::default()
+    })
+    .await;
+    model_runtime
+        .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
+        .await
+        .expect("register faux provider");
+    let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+        cwd: cwd.clone(),
+        agent_dir: Some(agent_dir.clone()),
+        settings_manager: None,
+        model_runtime: Some(model_runtime.clone()),
+        extension_flag_values: Vec::new(),
+        resource_loader_options: None,
+    })
+    .await
+    .expect("services");
+
+    let tool = |name: &str| -> rpi_ai::types::Tool {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "description": format!("{name} tool"),
+            "parameters": {"type": "object", "properties": {}}
+        }))
+        .expect("tool")
+    };
+    let mut session_manager = SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
+        .expect("in-memory session");
+    for (added, removed) in declarations {
+        session_manager
+            .append_message(AgentMessage::System(rpi_ai::types::SystemMessage {
+                role: Default::default(),
+                content: rpi_ai::types::SystemContent::Text("prompt".to_owned()),
+                sections: None,
+                tools_added: Some(added.iter().map(|name| tool(*name)).collect()),
+                tools_removed: if removed.is_empty() {
+                    None
+                } else {
+                    Some(
+                        removed
+                            .iter()
+                            .map(|name| rpi_ai::types::ToolReference {
+                                name: (*name).to_owned(),
+                            })
+                            .collect(),
+                    )
+                },
+                timestamp: 1,
+            }))
+            .expect("append declaration");
+    }
+
+    let mut agent_options = rpi_agent::AgentOptions::new(provider.stream_fn());
+    agent_options.initial_state.model = Some(model);
+    AgentSession::new(rpi::core::agent_session::AgentSessionConfig {
+        agent: Arc::new(rpi_agent::agent::Agent::new(agent_options)),
+        session_manager: Arc::new(Mutex::new(session_manager)),
+        cwd: cwd.to_string_lossy().into_owned(),
+        scoped_models: Vec::new(),
+        resource_loader: services.resource_loader.clone(),
+        custom_tools,
+        model_runtime,
+        initial_active_tool_names: initial_active,
+        uses_default_tools,
+        default_tool_modifiers: modifiers,
+        allowed_tool_names: None,
+        excluded_tool_names: None,
+        extension_runner_ref: rpi::core::extensions::new_extension_runner_ref(Arc::new(
+            rpi::core::extensions::NoopExtensionRunner::default(),
+        )),
+        session_start_event: rpi::core::extensions::SessionStartEvent {
+            reason: rpi::core::extensions::SessionStartReason::Resume,
+            previous_session_file: None,
+        },
+        cache_warmer: None,
+        http_dispatcher: None,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_tool_selection_wins_over_the_recorded_loadout() {
+    let session = resume_session_with_loadout(
+        &[(vec!["read", "grep"], vec![])],
+        Some(vec!["read".to_owned(), "write".to_owned()]),
+        false,
+        Vec::new(),
+        Vec::new(),
+    )
+    .await;
+    let mut active = session.get_active_tool_names();
+    active.sort();
+    assert_eq!(active, vec!["read", "write"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_applies_tool_modifiers_to_the_recorded_loadout() {
+    let session = resume_session_with_loadout(
+        &[(vec!["read", "bash"], vec![])],
+        None,
+        true,
+        vec!["+grep".to_owned(), "-bash".to_owned()],
+        Vec::new(),
+    )
+    .await;
+    let mut active = session.get_active_tool_names();
+    active.sort();
+    assert_eq!(active, vec!["grep", "read"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_activates_unmentioned_tools_but_keeps_removed_ones_inactive() {
+    let custom: Vec<Arc<dyn rpi_agent::types::AgentTool>> = vec![Arc::new(NamedTool("late-tool"))];
+    let session = resume_session_with_loadout(
+        &[(vec!["read", "grep"], vec![]), (vec![], vec!["grep"])],
+        None,
+        true,
+        Vec::new(),
+        custom,
+    )
+    .await;
+    let mut active = session.get_active_tool_names();
+    active.sort();
+    assert_eq!(active, vec!["late-tool", "read"], "grep stays removed");
 }

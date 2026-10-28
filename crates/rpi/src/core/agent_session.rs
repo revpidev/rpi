@@ -552,6 +552,13 @@ struct AgentSessionInner {
     run_system_prompt_options: Mutex<Option<BuildSystemPromptOptions>>,
     base_system_prompt_options: Mutex<BuildSystemPromptOptions>,
     tool_registry: Mutex<OrderedMap<Arc<dyn AgentTool>>>,
+    /// Active names recorded by the transcript but not registered yet
+    /// (for example MCP tools of servers still connecting). Activated when
+    /// they register (agent-session.ts `_pendingToolNames`).
+    pending_tool_names: Mutex<HashSet<String>>,
+    /// Names the branch explicitly removed: a late registration must not
+    /// re-activate them on `defaultActive` (bd3c9b823).
+    suppressed_tool_names: Mutex<HashSet<String>>,
     /// `ToolDefinitionEntry` registry (agent-session.ts:2460 `_toolDefinitions`).
     tool_definitions: Mutex<OrderedMap<ToolDefinitionEntry>>,
     /// `_hiddenDeclarations` (agent-session.ts:452-453 @ 4a080252f): declared
@@ -1006,6 +1013,8 @@ impl AgentSession {
                 doc_paths: None,
             }),
             tool_registry: Mutex::new(OrderedMap::default()),
+            pending_tool_names: Mutex::new(HashSet::new()),
+            suppressed_tool_names: Mutex::new(HashSet::new()),
             tool_definitions: Mutex::new(OrderedMap::default()),
             hidden_declarations: Mutex::new(HashSet::new()),
             tool_exposure_overrides: Mutex::new(HashMap::new()),
@@ -1157,16 +1166,13 @@ impl AgentSession {
         // #9548).
         session.install_agent_forced_prompt_projection();
         // Upstream constructor order (agent-session.ts:415-423): installs →
-        // `_buildRuntime` → restore. `config.initialActiveToolNames ===
-        // undefined` decides the restore — capture before the move.
-        let restore_from_transcript = config.initial_active_tool_names.is_none();
+        // `_buildRuntime` → restore. `usesDefaultTools` decides the restore
+        // (6f2f164ab): a resumed session replaces the setting-derived set
+        // with the loadout its transcript records, with `--tools +name`/
+        // `-name` modifiers applied.
         session.build_tool_runtime(config.initial_active_tool_names);
-        // `_restoreToolsFromTranscript` (agent-session.ts:421-424 @ #9548):
-        // with no explicit initial loadout, the transcript-declared tool set
-        // is authoritative (resume restores `setActiveTools` state); a fresh
-        // transcript declares nothing and this is a no-op.
-        if restore_from_transcript {
-            session.restore_tools_from_transcript();
+        if config.uses_default_tools {
+            session.restore_tools_from_transcript(&config.default_tool_modifiers);
         }
         session
     }
@@ -3035,20 +3041,30 @@ impl AgentSession {
             }
         } else if options.active_tool_names.is_none() {
             // Pending tools that are registered now become active
-            // (agent-session.ts:3534-3539).
+            // (agent-session.ts:3534-3539), except names the branch
+            // explicitly removed (bd3c9b823).
+            let pending = lock(&self.inner.pending_tool_names).clone();
+            let suppressed = lock(&self.inner.suppressed_tool_names).clone();
             for name in &registry_names {
-                if !previous_activated_on_registration.contains(name)
-                    && Self::is_activated_on_registration(&definitions_snapshot, name)
+                if suppressed.contains(name) {
+                    continue;
+                }
+                if pending.contains(name)
+                    || (!previous_activated_on_registration.contains(name)
+                        && Self::is_activated_on_registration(&definitions_snapshot, name))
                 {
                     next_active.push(name.clone());
                 }
             }
+            // A pending name that finally registered no longer needs the
+            // pending slot.
+            lock(&self.inner.pending_tool_names).retain(|name| !registry_names.contains(name));
         }
         // Upstream `[...new Set(names)]`: dedup keeping first-occurrence
         // order (agent-session.ts:2544) — no sorting.
         let mut seen: HashSet<String> = HashSet::new();
         next_active.retain(|name| seen.insert(name.clone()));
-        self.set_active_tools_by_name(next_active);
+        self.apply_active_tool_names(next_active);
     }
 
     /// `_isDeclarable` (agent-session.ts:3548-3551): whether activating the
@@ -3316,7 +3332,16 @@ impl AgentSession {
     }
 
     /// `setActiveToolsByName` (agent-session.ts:1488-1496 @ 4a080252f).
+    /// A user/API call replaces the restored loadout, so any pending/suppressed
+    /// state from the transcript restore no longer applies.
     pub fn set_active_tools_by_name(&self, tool_names: Vec<String>) {
+        self.clear_tool_restore_state();
+        self.apply_active_tool_names(tool_names);
+    }
+
+    /// Apply one active set without touching the restore bookkeeping (the
+    /// internal refresh path and the restore itself use this).
+    fn apply_active_tool_names(&self, tool_names: Vec<String>) {
         let tools = self.apply_tool_loadout(tool_names);
         let valid_names: Vec<String> = tools.iter().map(|tool| tool.name().to_owned()).collect();
         self.inner.agent.set_tools(tools);
@@ -3324,6 +3349,11 @@ impl AgentSession {
         // #9548: rebuilding only refreshes the base options — the live
         // prompt rides the transcript's system messages.
         self.rebuild_system_prompt(&valid_names);
+    }
+
+    fn clear_tool_restore_state(&self) {
+        lock(&self.inner.pending_tool_names).clear();
+        lock(&self.inner.suppressed_tool_names).clear();
     }
 
     /// `_applyToolLoadout` (agent-session.ts:1528-1569 @ 4a080252f): the
@@ -3768,39 +3798,97 @@ impl AgentSession {
         )));
     }
 
-    /// `_restoreToolsFromTranscript` (agent-session.ts:1194-1204 @ #9548):
-    /// restore the active tool loadout declared by the session transcript,
-    /// if it declares one.
-    fn restore_tools_from_transcript(&self) {
-        let context = lock(&self.inner.session_manager).build_session_context();
-        let llm_messages: Vec<rpi_ai::types::Message> = context
-            .messages
+    /// `_restoreToolsFromTranscript` (agent-session.ts:1817-1848 @
+    /// 4a080252f + bd3c9b823): restore the loadout the branch records, add
+    /// extension tools registered after it recorded (unless
+    /// `defaultActive:false`), apply `+name`/`-name` modifiers, and keep
+    /// recorded tools that have not registered yet pending. Tools the branch
+    /// ever removed stay suppressed across later refreshes.
+    fn restore_tools_from_transcript(&self, modifiers: &[String]) {
+        let manager = self.inner.session_manager.clone();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        let branch = manager.get_branch(None);
+        drop(manager);
+        // All system messages on the branch, including those before a
+        // compaction: compaction snapshots are derived from them.
+        let system_messages: Vec<rpi_ai::types::Message> = branch
             .iter()
-            .filter_map(|message| match message {
-                AgentMessage::System(system) => {
-                    Some(rpi_ai::types::Message::System(system.clone()))
-                }
+            .filter_map(|entry| match entry.known() {
+                Some(SessionEntry::Message(message_entry)) => match &message_entry.message {
+                    AgentMessage::System(system) => {
+                        Some(rpi_ai::types::Message::System(system.clone()))
+                    }
+                    _ => None,
+                },
                 _ => None,
             })
             .collect();
-        let Some(current) = rpi_ai::utils::transcript::get_current_system_message(&llm_messages)
-        else {
+        if system_messages.is_empty() {
             return;
-        };
-        let registry = lock(&self.inner.tool_registry);
-        let mut tool_names: Vec<String> = Vec::new();
-        let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
-        if let Some(added) = &current.tools_added {
-            for tool in added {
-                if let Some(registered) = registry.get(&tool.name) {
-                    tool_names.push(tool.name.clone());
-                    tools.push(registered.clone());
-                }
+        }
+        let mut mentioned: HashSet<String> = HashSet::new();
+        for message in &system_messages {
+            let rpi_ai::types::Message::System(system) = message else {
+                continue;
+            };
+            for tool in system.tools_added.iter().flatten() {
+                mentioned.insert(tool.name.clone());
+            }
+            for tool in system.tools_removed.iter().flatten() {
+                mentioned.insert(tool.name.clone());
             }
         }
-        drop(registry);
-        self.inner.agent.set_tools(tools);
-        self.rebuild_system_prompt(&tool_names);
+        let recorded: Vec<String> = rpi_ai::utils::transcript::get_current_tools(&system_messages)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        // Extension tools the branch never mentioned were registered after
+        // it recorded its loadout: activate them like new registrations.
+        // Built-ins follow `defaultTools` instead.
+        let new_tools: Vec<String> = {
+            let definitions = lock(&self.inner.tool_definitions);
+            let registry = lock(&self.inner.tool_registry);
+            registry
+                .keys()
+                .filter(|name| {
+                    !mentioned.contains(*name)
+                        && !recorded.contains(*name)
+                        && definitions.get(name).is_some_and(|entry| {
+                            entry.source_info.source != "builtin"
+                                && Self::is_activated_on_registration(&definitions, name)
+                        })
+                })
+                .cloned()
+                .collect()
+        };
+        let mut base = recorded.clone();
+        base.extend(new_tools);
+        let names = crate::core::tool_names::apply_tool_modifiers(&base, modifiers);
+        let allowed: Vec<String> = names
+            .iter()
+            .filter(|name| self.is_allowed_tool(name))
+            .cloned()
+            .collect();
+        // Explicitly removed names (mentioned but absent from the final
+        // loadout) must not be re-activated by a late registration.
+        let suppressed: HashSet<String> = mentioned
+            .iter()
+            .filter(|name| !allowed.contains(*name))
+            .cloned()
+            .collect();
+        *lock(&self.inner.suppressed_tool_names) = suppressed;
+        // Recorded names that are not registered yet (e.g. MCP servers still
+        // connecting) become active when they register.
+        let pending: HashSet<String> = {
+            let registry = lock(&self.inner.tool_registry);
+            allowed
+                .iter()
+                .filter(|name| !registry.contains_key(name))
+                .cloned()
+                .collect()
+        };
+        *lock(&self.inner.pending_tool_names) = pending;
+        self.apply_active_tool_names(allowed);
     }
 
     // ==================================================================
@@ -5947,7 +6035,7 @@ impl AgentSession {
         // declares (agent-session.ts:3431-3434 @ #9548).
         let session_context = lock(&self.inner.session_manager).build_session_context();
         self.inner.agent.set_messages(session_context.messages);
-        self.restore_tools_from_transcript();
+        self.restore_tools_from_transcript(&[]);
 
         // `session_tree` payload (agent-session.ts:3288-3295 @ 9841914): the
         // post-navigation leaf, the pre-navigation leaf, and — only when a
@@ -6629,4 +6717,119 @@ fn agent_error_to_rpi(error: AgentError) -> RpiError {
 
 fn now_iso8601_compact() -> String {
     crate::core::session_manager::now_iso8601().replace([':', '.'], "-")
+}
+
+#[cfg(test)]
+mod recovery_omission_tests {
+    use super::*;
+    use rpi_ai::types::{
+        AssistantContent, AssistantMessage, AssistantRole, StopReason, TextContent, ToolCall,
+        ToolResultContent, ToolResultMessage, ToolResultRole,
+    };
+
+    fn tool_call_assistant() -> AssistantMessage {
+        AssistantMessage {
+            role: AssistantRole::Assistant,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: "call-truncated".to_owned(),
+                name: "read".to_owned(),
+                arguments: serde_json::Map::from_iter([(
+                    "path".to_owned(),
+                    Value::String("a.ts".to_owned()),
+                )]),
+                thought_signature: None,
+                namespace: None,
+                arguments_error: None,
+            })],
+            api: rpi_ai::types::ApiKind("openai-completions".into()),
+            provider: "custom".to_owned(),
+            model: "m1".to_owned(),
+            response_model: None,
+            response_id: None,
+            provider_thinking_level: None,
+            thinking_level: None,
+            diagnostics: None,
+            usage: rpi_ai::types::Usage::default(),
+            stop_reason: StopReason::Length,
+            error_message: None,
+            timestamp: 2,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
+            duration_ms: None,
+        }
+    }
+
+    fn tool_result() -> ToolResultMessage {
+        ToolResultMessage {
+            role: ToolResultRole::ToolResult,
+            tool_call_id: "call-truncated".to_owned(),
+            tool_name: "read".to_owned(),
+            content: vec![ToolResultContent::Text(TextContent {
+                text: "ok".to_owned(),
+                text_signature: None,
+            })],
+            details: None,
+            usage: None,
+            nested_calls: None,
+            is_error: false,
+            timestamp: 3,
+            duration_ms: None,
+        }
+    }
+
+    /// 02726086d (#11227): a recovery omission removes the assistant attempt
+    /// AND the immediate tool results of its turn from model context, so the
+    /// provider never sees an orphaned result on the next request.
+    #[tokio::test]
+    async fn omission_pairs_the_truncated_call_with_its_tool_results() {
+        let fixture = crate::modes::interactive::test_support::build_test_session().await;
+        let assistant = tool_call_assistant();
+        let (assistant_id, result_id) = {
+            let manager = fixture.session.session_manager();
+            let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            let assistant_id = manager
+                .append_message(AgentMessage::Assistant(assistant.clone()))
+                .expect("assistant");
+            let result_id = manager
+                .append_message(AgentMessage::ToolResult(tool_result()))
+                .expect("result");
+            let context = manager.build_session_context();
+            fixture.session.agent().set_messages(context.messages);
+            (assistant_id, result_id)
+        };
+
+        fixture.session.omit_recovery_attempt(&assistant);
+
+        let manager = fixture.session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        let edits: Vec<Value> = manager
+            .get_entries()
+            .iter()
+            .filter(|entry| entry.type_tag() == "context_edit")
+            .map(|entry| entry.raw_value().clone())
+            .collect();
+        assert_eq!(edits.len(), 2, "assistant + its result: {edits:?}");
+        let targets: Vec<&str> = edits
+            .iter()
+            .filter_map(|edit| edit.get("targetId").and_then(Value::as_str))
+            .collect();
+        assert!(targets.contains(&assistant_id.as_str()), "{targets:?}");
+        assert!(targets.contains(&result_id.as_str()), "{targets:?}");
+
+        let projected = manager.build_session_context().messages;
+        assert!(
+            !projected.iter().any(|message| matches!(
+                message,
+                AgentMessage::Assistant(assistant) if assistant.content.iter().any(|block| matches!(block, AssistantContent::ToolCall(call) if call.id == "call-truncated"))
+            )),
+            "truncated call omitted"
+        );
+        assert!(
+            !projected
+                .iter()
+                .any(|message| matches!(message, AgentMessage::ToolResult(result) if result.tool_call_id == "call-truncated")),
+            "orphaned result omitted"
+        );
+    }
 }
