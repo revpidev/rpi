@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::HostState;
-use super::host_call::{block_on, str_arg};
+use super::host_call::{block_on, bool_arg, str_arg};
 use crate::api::{
     ExtensionWidgetOptions, NotifyType, UiDialogOptions, WidgetContent, WidgetPlacement,
     WorkingIndicatorOptions,
@@ -263,6 +263,18 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     _ => NotifyType::Info,
                 },
             );
+            Ok(Value::Null)
+        }
+        "ui.emitText" => {
+            // rpi additive (ADR-0040 / V18-02): `{text, validateOnly?}`.
+            // The bridge decides whether this mode has an output channel;
+            // NullUi answers `unsupported-output` before any fetch/write.
+            let Some(text) = str_arg(&args, "text") else {
+                return err("invalidRequest", "ui.emitText: required string arg `text`");
+            };
+            let validate_only = bool_arg(&args, "validateOnly").unwrap_or(false);
+            ui.emit_text(text, validate_only)
+                .map_err(|error| ("call", error.to_string()))?;
             Ok(Value::Null)
         }
         "ui.setStatus" => {
@@ -873,5 +885,88 @@ mod tests {
             Ok(value) => assert_eq!(value, Value::Null),
             Err((kind, message)) => panic!("ui.custom must keep its own arm: {kind}: {message}"),
         }
+    }
+
+    // -- ADR-0040 / V18-02: additive `ui.emitText` -------------------------
+
+    #[test]
+    fn ui_emit_text_on_null_bridge_is_unsupported_output() {
+        let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
+        let (kind, message) = dispatch(
+            &mut state,
+            "ui.emitText",
+            serde_json::json!({"text": "statusline: help"}),
+        )
+        .expect_err("NullUi has no output channel");
+        assert_eq!(kind, "call");
+        assert_eq!(message, "unsupported-output");
+    }
+
+    #[test]
+    fn ui_emit_text_requires_a_string_text() {
+        let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
+        let (kind, _) =
+            dispatch(&mut state, "ui.emitText", serde_json::json!({})).expect_err("missing text");
+        assert_eq!(kind, "invalidRequest");
+    }
+
+    #[test]
+    fn ui_emit_text_writes_text_and_validate_only_produces_nothing() {
+        let chunks = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink_chunks = Arc::clone(&chunks);
+        let sink: crate::bridges::UiOutputSink =
+            Arc::new(move |chunk: &str| sink_chunks.lock().unwrap().push(chunk.to_owned()));
+        let bridge = crate::bridges::OutputUiBridge::text(Value::Null, sink);
+        let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
+        state
+            .api
+            .runtime()
+            .set_ui_bridge(Some(Arc::new(bridge)), ExtensionMode::Print);
+
+        dispatch(
+            &mut state,
+            "ui.emitText",
+            serde_json::json!({"text": "ignored", "validateOnly": true}),
+        )
+        .expect("validate");
+        assert!(
+            chunks.lock().unwrap().is_empty(),
+            "validateOnly writes nothing"
+        );
+
+        dispatch(
+            &mut state,
+            "ui.emitText",
+            serde_json::json!({"text": "statusline: help"}),
+        )
+        .expect("emit");
+        assert_eq!(chunks.lock().unwrap().as_slice(), ["statusline: help\n"]);
+    }
+
+    #[test]
+    fn ui_emit_text_json_bridge_emits_a_notify_frame() {
+        let chunks = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink_chunks = Arc::clone(&chunks);
+        let sink: crate::bridges::UiOutputSink =
+            Arc::new(move |chunk: &str| sink_chunks.lock().unwrap().push(chunk.to_owned()));
+        let bridge = crate::bridges::OutputUiBridge::json_notify(Value::Null, sink);
+        let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
+        state
+            .api
+            .runtime()
+            .set_ui_bridge(Some(Arc::new(bridge)), ExtensionMode::Json);
+        dispatch(
+            &mut state,
+            "ui.emitText",
+            serde_json::json!({"text": "statusline: help"}),
+        )
+        .expect("emit");
+        let chunks = chunks.lock().unwrap();
+        let frame: Value = serde_json::from_str(chunks[0].trim()).expect("frame json");
+        assert_eq!(frame["type"], "extension_ui_request");
+        assert_eq!(frame["method"], "notify");
+        assert_eq!(frame["message"], "statusline: help");
+        assert_eq!(frame["notifyType"], "info");
+        assert!(frame["id"].as_str().is_some_and(|id| !id.is_empty()));
     }
 }

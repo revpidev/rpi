@@ -826,6 +826,28 @@ pub enum NotifyType {
     Error,
 }
 
+/// Failure reason of the additive `ui.emitText` output channel
+/// (ADR-0040 / V18-02). `UnsupportedOutput` is answered by
+/// [`crate::bridges::NullUiBridge`] and any other bridge that has no
+/// machine-readable output path (NullUi / subagent). Its wire string is
+/// exactly `unsupported-output`, so command handlers can check the channel
+/// before fetching or scripting anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiOutputError {
+    /// This bridge/mode has no output channel for command text.
+    UnsupportedOutput,
+}
+
+impl std::fmt::Display for UiOutputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedOutput => f.write_str("unsupported-output"),
+        }
+    }
+}
+
+impl std::error::Error for UiOutputError {}
+
 /// `WorkingIndicatorOptions` (types.ts:115-120).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -925,6 +947,18 @@ pub trait UiBridge: Send + Sync {
 
     /// `notify` (types.ts:141).
     fn notify(&self, message: &str, kind: NotifyType);
+
+    /// `ui.emitText {text, validateOnly?}` (rpi additive, ADR-0040 /
+    /// V18-02): command text output for statusline configuration/help.
+    /// TUI routes to `notify`; RPC and `--mode json` emit an
+    /// `extension_ui_request{method:"notify"}` frame; text print writes to
+    /// controlled RawStdout; NullUi/subagents answer
+    /// [`UiOutputError::UnsupportedOutput`]. `validate_only` only checks the
+    /// channel and produces no output. The default stays unsupported so a
+    /// bridge must opt in explicitly.
+    fn emit_text(&self, _text: &str, _validate_only: bool) -> Result<(), UiOutputError> {
+        Err(UiOutputError::UnsupportedOutput)
+    }
 
     /// `onTerminalInput` (types.ts:144) — interactive mode only.
     fn on_terminal_input(&self, handler: TerminalInputHandler) -> Unsubscribe;
@@ -1260,6 +1294,14 @@ pub trait ContextActions: Send + Sync {
         _limit: Option<u64>,
     ) -> Vec<crate::types::SessionToolResultInfo> {
         Vec::new()
+    }
+
+    /// `ctx.sessionStats()` (rpi additive, ADR-0040 / V18-02): one absolute
+    /// snapshot from a single `SessionManager` lock. `None` when no session
+    /// is bound (the dispatch layer answers `null` so guests can
+    /// feature-detect).
+    fn session_stats(&self) -> Option<crate::types::SessionStatsSnapshot> {
+        None
     }
 }
 
@@ -2049,6 +2091,15 @@ impl ExtensionContext {
             .context_actions()?
             .map(|actions| actions.get_session_tool_results(tool_name, limit))
             .unwrap_or_default())
+    }
+
+    /// `ctx.sessionStats()` (rpi additive, ADR-0040 / V18-02) — the host's
+    /// absolute session snapshot. `None` when unbound (wire `null`, so
+    /// guests can feature-detect like `ctx.sessionFile`).
+    pub fn session_stats(&self) -> Result<Option<crate::types::SessionStatsSnapshot>, ExtError> {
+        Ok(self
+            .context_actions()?
+            .and_then(|actions| actions.session_stats()))
     }
 }
 

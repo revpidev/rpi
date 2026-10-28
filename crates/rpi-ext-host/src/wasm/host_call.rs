@@ -134,7 +134,8 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         | "ctx.removeRuntimeApiKey"
         | "ctx.sessionFile"
         | "ctx.sessionEntries"
-        | "ctx.sessionToolResults" => Requires(Capability::Session),
+        | "ctx.sessionToolResults"
+        | "ctx.sessionStats" => Requires(Capability::Session),
         _ => UnknownMethod,
     }
 }
@@ -149,7 +150,7 @@ pub(super) fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
-fn bool_arg(args: &Value, key: &str) -> Option<bool> {
+pub(super) fn bool_arg(args: &Value, key: &str) -> Option<bool> {
     args.get(key).and_then(Value::as_bool)
 }
 
@@ -1284,6 +1285,17 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(serde_json::to_value(results).unwrap_or(Value::Array(Vec::new())))
         }
+        "ctx.sessionStats" => {
+            // rpi additive (ADR-0040 / V18-02): the host's absolute session
+            // snapshot. Empty args; unbound hosts answer `null` (feature
+            // probe), live hosts answer one consistent object.
+            let stats = state
+                .api
+                .context()
+                .session_stats()
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(serde_json::to_value(stats).unwrap_or(Value::Null))
+        }
         "ctx.getSystemPrompt" => Ok(json!(
             state
                 .api
@@ -2039,6 +2051,164 @@ mod session_entries_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+}
+
+/// V18-02 (ADR-0040): `ctx.sessionStats` dispatch-level behavior — empty
+/// args, unbound `null`, camelCase snapshot shape and the capability gate.
+/// The absolute aggregation against a real session lives in
+/// `rpi/src/core/extension_context.rs` tests.
+#[cfg(test)]
+mod session_stats_tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+
+    use super::dispatch;
+    use crate::api::{
+        CompactOptions, ContextActions, ContextUsage, ExtensionApi, ExtensionRuntime,
+        LoadedExtension,
+    };
+    use crate::types::{SessionStatsSnapshot, SessionTokenStats};
+    use crate::wasm::{Capability, DispatchTarget, HostState, WasmForward};
+
+    struct StatsActions {
+        stats: Option<SessionStatsSnapshot>,
+    }
+
+    #[async_trait]
+    impl ContextActions for StatsActions {
+        fn get_model(&self) -> Option<Value> {
+            None
+        }
+        fn is_idle(&self) -> bool {
+            true
+        }
+        fn is_project_trusted(&self) -> bool {
+            true
+        }
+        fn get_signal(&self) -> Option<tokio_util::sync::CancellationToken> {
+            None
+        }
+        fn abort(&self) {}
+        fn has_pending_messages(&self) -> bool {
+            false
+        }
+        fn shutdown(&self) {}
+        fn get_context_usage(&self) -> Option<ContextUsage> {
+            None
+        }
+        fn compact(&self, _options: CompactOptions) {}
+        fn get_system_prompt(&self) -> String {
+            String::new()
+        }
+        fn get_system_prompt_options(&self) -> Value {
+            Value::Null
+        }
+        fn session_stats(&self) -> Option<SessionStatsSnapshot> {
+            self.stats.clone()
+        }
+    }
+
+    fn host_state(capabilities: HashSet<Capability>) -> HostState {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new("<inline:v18-02>", "<inline:v18-02>")),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        HostState {
+            api,
+            capabilities,
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+            subscriptions: Default::default(),
+            memory_limiter: crate::wasm::MemoryLimiter,
+        }
+    }
+
+    #[test]
+    fn ctx_session_stats_is_session_capability() {
+        assert!(matches!(
+            super::required_capability("ctx.sessionStats"),
+            super::CapabilityRequirement::Requires(Capability::Session)
+        ));
+    }
+
+    #[test]
+    fn unbound_host_answers_null() {
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        let value = dispatch(&mut state, "ctx.sessionStats", json!({})).expect("unbound");
+        assert_eq!(value, Value::Null);
+    }
+
+    #[test]
+    fn snapshot_serializes_camel_case_and_omits_memory_session_file() {
+        let actions = Arc::new(StatsActions {
+            stats: Some(SessionStatsSnapshot {
+                session_id: "s1".to_owned(),
+                session_file: None,
+                started_at: "2026-10-27T10:00:00Z".to_owned(),
+                entry_count: 9,
+                tokens: SessionTokenStats {
+                    input: 10,
+                    output: 20,
+                    cache_read: 30,
+                    cache_write: 40,
+                },
+                cost: 1.5,
+            }),
+        });
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        state
+            .api
+            .runtime()
+            .set_context_actions(Some(actions as Arc<dyn ContextActions>));
+        let value = dispatch(&mut state, "ctx.sessionStats", json!({})).expect("call");
+        assert_eq!(
+            value,
+            json!({
+                "sessionId": "s1",
+                "startedAt": "2026-10-27T10:00:00Z",
+                "entryCount": 9,
+                "tokens": {
+                    "input": 10,
+                    "output": 20,
+                    "cacheRead": 30,
+                    "cacheWrite": 40
+                },
+                "cost": 1.5
+            })
+        );
+        assert!(value.get("sessionFile").is_none());
+        assert!(value.get("tokens").and_then(|t| t.get("total")).is_none());
+    }
+
+    #[test]
+    fn file_backed_session_keeps_the_path() {
+        let actions = Arc::new(StatsActions {
+            stats: Some(SessionStatsSnapshot {
+                session_id: "s2".to_owned(),
+                session_file: Some("/tmp/s2.jsonl".to_owned()),
+                started_at: "2026-10-27T10:00:00Z".to_owned(),
+                entry_count: 0,
+                tokens: SessionTokenStats::default(),
+                cost: 0.0,
+            }),
+        });
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        state
+            .api
+            .runtime()
+            .set_context_actions(Some(actions as Arc<dyn ContextActions>));
+        let value = dispatch(&mut state, "ctx.sessionStats", json!({})).expect("call");
+        assert_eq!(value["sessionFile"], "/tmp/s2.jsonl");
     }
 }
 

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::Value;
 
-use crate::api::{ExtensionWidgetOptions, NotifyType};
+use crate::api::{ExtensionWidgetOptions, NotifyType, UiOutputError};
 use crate::api::{
     SetThemeResult, TerminalInputHandler, ThemeInfo, UiBridge, UiDialogOptions, Unsubscribe,
     WidgetContent, WorkingIndicatorOptions,
@@ -145,6 +145,213 @@ impl UiBridge for NullUiBridge {
     }
 }
 
+/// Output flavor of [`OutputUiBridge`] (ADR-0040 / 04 §7.4 matrix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiOutputFlavor {
+    /// Plain print output: the text plus one trailing newline.
+    Text,
+    /// `--mode json`: an `extension_ui_request{method:"notify"}` frame.
+    JsonNotify,
+}
+
+/// Sink for command text. The mode supplies its controlled RawStdout path;
+/// the bridge only formats the chunk.
+pub type UiOutputSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Output-capable, non-interactive bridge for plain print and `--mode json`
+/// (ADR-0040 / 04 §7.4). `hasUI` stays false (`is_noop = true`) so an
+/// extension cannot mistake it for an interactive TUI, but `ui.emitText`
+/// succeeds through the mode's controlled stdout sink. Dialogs and UI state
+/// changes stay no-ops like [`NullUiBridge`].
+pub struct OutputUiBridge {
+    inner: NullUiBridge,
+    sink: UiOutputSink,
+    flavor: UiOutputFlavor,
+}
+
+impl OutputUiBridge {
+    /// Plain-print flavor: `ui.emitText` writes the text to the sink.
+    pub fn text(default_theme: Value, sink: UiOutputSink) -> Self {
+        Self {
+            inner: NullUiBridge::new(default_theme),
+            sink,
+            flavor: UiOutputFlavor::Text,
+        }
+    }
+
+    /// `--mode json` flavor: `ui.emitText` emits a notify frame.
+    pub fn json_notify(default_theme: Value, sink: UiOutputSink) -> Self {
+        Self {
+            inner: NullUiBridge::new(default_theme),
+            sink,
+            flavor: UiOutputFlavor::JsonNotify,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl UiBridge for OutputUiBridge {
+    async fn select(
+        &self,
+        title: &str,
+        options: &[String],
+        opts: Option<UiDialogOptions>,
+    ) -> Option<String> {
+        self.inner.select(title, options, opts).await
+    }
+
+    async fn confirm(&self, title: &str, message: &str, opts: Option<UiDialogOptions>) -> bool {
+        self.inner.confirm(title, message, opts).await
+    }
+
+    async fn input(
+        &self,
+        title: &str,
+        placeholder: Option<&str>,
+        opts: Option<UiDialogOptions>,
+    ) -> Option<String> {
+        self.inner.input(title, placeholder, opts).await
+    }
+
+    fn notify(&self, message: &str, kind: NotifyType) {
+        self.inner.notify(message, kind);
+    }
+
+    fn emit_text(&self, text: &str, validate_only: bool) -> Result<(), UiOutputError> {
+        if validate_only {
+            return Ok(());
+        }
+        match self.flavor {
+            UiOutputFlavor::Text => {
+                let mut out = String::from(text);
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                (self.sink)(&out);
+            }
+            UiOutputFlavor::JsonNotify => {
+                let frame = serde_json::json!({
+                    "type": "extension_ui_request",
+                    "id": rpi_ai::utils::uuid::random_uuid(),
+                    "method": "notify",
+                    "message": text,
+                    "notifyType": "info",
+                });
+                if let Ok(mut line) = serde_json::to_string(&frame) {
+                    line.push('\n');
+                    (self.sink)(&line);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn on_terminal_input(&self, handler: TerminalInputHandler) -> Unsubscribe {
+        self.inner.on_terminal_input(handler)
+    }
+
+    fn set_status(&self, key: &str, text: Option<&str>) {
+        self.inner.set_status(key, text);
+    }
+
+    fn set_working_message(&self, message: Option<&str>) {
+        self.inner.set_working_message(message);
+    }
+
+    fn set_working_visible(&self, visible: bool) {
+        self.inner.set_working_visible(visible);
+    }
+
+    fn set_working_indicator(&self, options: Option<WorkingIndicatorOptions>) {
+        self.inner.set_working_indicator(options);
+    }
+
+    fn set_hidden_thinking_label(&self, label: Option<&str>) {
+        self.inner.set_hidden_thinking_label(label);
+    }
+
+    fn set_widget(
+        &self,
+        key: &str,
+        content: Option<WidgetContent>,
+        options: Option<ExtensionWidgetOptions>,
+    ) {
+        self.inner.set_widget(key, content, options);
+    }
+
+    fn set_footer(&self, component: Option<ComponentTree>) {
+        self.inner.set_footer(component);
+    }
+
+    fn set_header(&self, component: Option<ComponentTree>) {
+        self.inner.set_header(component);
+    }
+
+    fn set_title(&self, title: &str) {
+        self.inner.set_title(title);
+    }
+
+    async fn custom(&self, component: ComponentTree, options: Option<Value>) -> Option<Value> {
+        self.inner.custom(component, options).await
+    }
+
+    fn paste_to_editor(&self, text: &str) {
+        self.inner.paste_to_editor(text);
+    }
+
+    fn set_editor_text(&self, text: &str) {
+        self.inner.set_editor_text(text);
+    }
+
+    fn get_editor_text(&self) -> String {
+        self.inner.get_editor_text()
+    }
+
+    async fn editor(&self, title: &str, prefill: Option<&str>) -> Option<String> {
+        self.inner.editor(title, prefill).await
+    }
+
+    fn add_autocomplete_provider(&self, provider: Value) {
+        self.inner.add_autocomplete_provider(provider);
+    }
+
+    fn set_editor_component(&self, component: Option<ComponentTree>) {
+        self.inner.set_editor_component(component);
+    }
+
+    fn get_editor_component(&self) -> Option<ComponentTree> {
+        self.inner.get_editor_component()
+    }
+
+    fn theme(&self) -> Value {
+        self.inner.theme()
+    }
+
+    fn get_all_themes(&self) -> Vec<ThemeInfo> {
+        self.inner.get_all_themes()
+    }
+
+    fn get_theme(&self, name: &str) -> Option<Value> {
+        self.inner.get_theme(name)
+    }
+
+    fn set_theme(&self, theme: Value) -> SetThemeResult {
+        self.inner.set_theme(theme)
+    }
+
+    fn get_tools_expanded(&self) -> bool {
+        self.inner.get_tools_expanded()
+    }
+
+    fn set_tools_expanded(&self, expanded: bool) {
+        self.inner.set_tools_expanded(expanded);
+    }
+
+    fn is_noop(&self) -> bool {
+        true
+    }
+}
+
 /// Extension-scoped widget-key decorator (TE11 FR-E.1). The shared UI
 /// bridge keys widgets globally (one `HashMap<key, …>` for all extensions),
 /// so two extensions using the same `setWidget` key would remove each
@@ -197,6 +404,10 @@ impl UiBridge for NamespacedUiBridge {
 
     fn notify(&self, message: &str, kind: NotifyType) {
         self.inner.notify(message, kind);
+    }
+
+    fn emit_text(&self, text: &str, validate_only: bool) -> Result<(), UiOutputError> {
+        self.inner.emit_text(text, validate_only)
     }
 
     fn on_terminal_input(&self, handler: TerminalInputHandler) -> Unsubscribe {
@@ -610,6 +821,10 @@ impl UiBridge for UiPromptBridge {
 
     fn notify(&self, message: &str, kind: NotifyType) {
         self.inner.notify(message, kind);
+    }
+
+    fn emit_text(&self, text: &str, validate_only: bool) -> Result<(), UiOutputError> {
+        self.inner.emit_text(text, validate_only)
     }
 
     fn on_terminal_input(&self, handler: TerminalInputHandler) -> Unsubscribe {
@@ -1298,5 +1513,19 @@ mod tests {
             .iter()
             .filter(|(name, _)| name == "dialog")
             .count()
+    }
+
+    #[test]
+    fn namespaced_bridge_forwards_emit_text() {
+        let chunks = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink_chunks = Arc::clone(&chunks);
+        let sink: UiOutputSink =
+            Arc::new(move |chunk: &str| sink_chunks.lock().unwrap().push(chunk.to_owned()));
+        let inner: Arc<dyn UiBridge> = Arc::new(OutputUiBridge::text(Value::Null, sink));
+        let bridge = NamespacedUiBridge::new(inner, "ext-a".to_owned());
+        bridge.emit_text("statusline: help", false).expect("emit");
+        assert_eq!(chunks.lock().unwrap().as_slice(), ["statusline: help\n"]);
+        // The wrapper does not turn the output bridge into an interactive one.
+        assert!(bridge.is_noop());
     }
 }

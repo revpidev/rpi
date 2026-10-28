@@ -977,6 +977,37 @@ pub struct SessionFileInfo {
     pub id: String,
 }
 
+/// `ctx.sessionStats()` result (rpi additive host-call, ADR-0040 / V18-02):
+/// the host's absolute, consistent snapshot of the current session. All
+/// fields come from one `SessionManager` lock; `sessionFile` is omitted for
+/// in-memory sessions, `startedAt` is the session header timestamp
+/// (RFC3339), and `entryCount` excludes the header without branch
+/// filtering. The four token components are accumulated directly from the
+/// five usage-bearing entry kinds; the raw provider `totalTokens` is never
+/// read or returned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatsSnapshot {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<String>,
+    pub started_at: String,
+    pub entry_count: u64,
+    pub tokens: SessionTokenStats,
+    pub cost: f64,
+}
+
+/// Four token components of [`SessionStatsSnapshot`] (camelCase on the
+/// wire: `cacheRead` / `cacheWrite`). `total` is deliberately absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTokenStats {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
 /// `ctx.sessionEntries` item (rpi additive host-call, ADR-0027): one
 /// `type:"custom"` entry of the active branch, projected read-only from
 /// the stored entry — `{id, parentId, timestamp, customType, data}`.

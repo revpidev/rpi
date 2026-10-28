@@ -17,7 +17,9 @@ use serde_json::{Value, json};
 pub mod events;
 pub mod interactive_ui;
 pub mod model_registry;
+pub mod output;
 pub mod session_entries;
+pub mod session_stats;
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "rpi")]
