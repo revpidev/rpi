@@ -839,6 +839,37 @@ fn rewrite_setext_lone_operators(source: &str) -> String {
             })
         };
 
+        // A list marker inside a display block (`+ b`, `- b`, `* b`,
+        // `1. b`) is a math line to upstream's block extension but a list
+        // item to CommonMark, which splits the paragraph and drops the whole
+        // math block. Rewrite the marker bytes to `.` (same length).
+        let list_marker_rewrite = |body: &str| {
+            let content = body.trim_start_matches([' ', '\t']);
+            let indent_len = body.len() - content.len();
+            let marker_len = if content.starts_with("+ ")
+                || content.starts_with("- ")
+                || content.starts_with("* ")
+            {
+                1
+            } else {
+                let digits = content.bytes().take_while(u8::is_ascii_digit).count();
+                if digits > 0
+                    && matches!(content.as_bytes().get(digits), Some(b'.') | Some(b')'))
+                    && content.as_bytes().get(digits + 1) == Some(&b' ')
+                {
+                    digits + 1
+                } else {
+                    0
+                }
+            };
+            (marker_len > 0).then(|| {
+                let mut rewritten = body.to_string();
+                rewritten
+                    .replace_range(indent_len..indent_len + marker_len, &".".repeat(marker_len));
+                rewritten
+            })
+        };
+
         let rewritten: Option<String>;
         if let Some((marker, open_len)) = fence {
             // Closing fence: same marker char, at least the opening run
@@ -881,14 +912,14 @@ fn rewrite_setext_lone_operators(source: &str) -> String {
                         in_dollar_block = false;
                         rewritten = None;
                     } else {
-                        rewritten = lone_rewrite(body);
+                        rewritten = lone_rewrite(body).or_else(|| list_marker_rewrite(body));
                     }
                 } else if in_bracket_block {
                     if ends.ends_with("\\]") {
                         in_bracket_block = false;
                         rewritten = None;
                     } else {
-                        rewritten = lone_rewrite(body);
+                        rewritten = lone_rewrite(body).or_else(|| list_marker_rewrite(body));
                     }
                 } else if starts_dollar && !dollar_self_contained {
                     in_dollar_block = true;
@@ -1232,6 +1263,55 @@ fn strike_units_parse(units: &[char]) -> bool {
     true
 }
 
+/// CJK character class of upstream's CJK-friendly emphasis tokenizer
+/// (marked-cjk-friendly v0.1.2): Han/Kana/Hangul, CJK punctuation and
+/// fullwidth forms. Delimiters adjacent to these characters use CJK-aware
+/// flanking instead of CommonMark's punctuation rule (#10730).
+fn is_cjk_character(c: char) -> bool {
+    let code = c as u32;
+    matches!(
+        code,
+        0x1100..=0x11ff
+            | 0x20a9
+            | 0x2329..=0x232a
+            | 0x2630..=0x2637
+            | 0x268a..=0x268f
+            | 0x2e80..=0x2e99
+            | 0x2e9b..=0x2ef3
+            | 0x2f00..=0x2fd5
+            | 0x2ff0..=0x303e
+            | 0x3041..=0x3096
+            | 0x3099..=0x30ff
+            | 0x3105..=0x312f
+            | 0x3131..=0x318e
+            | 0x3190..=0x31e5
+            | 0x31ef..=0x321e
+            | 0x3220..=0x3247
+            | 0x3250..=0xa48c
+            | 0xa490..=0xa4c6
+            | 0xa960..=0xa97c
+            | 0xac00..=0xd7a3
+            | 0xd7b0..=0xd7c6
+            | 0xd7cb..=0xd7fb
+            | 0xf900..=0xfaff
+            | 0xfe10..=0xfe19
+            | 0xfe30..=0xfe52
+            | 0xfe54..=0xfe66
+            | 0xfe68..=0xfe6b
+            | 0xff01..=0xffbe
+            | 0xffc2..=0xffc7
+            | 0xffca..=0xffcf
+            | 0xffd2..=0xffd7
+            | 0xffda..=0xffdc
+            | 0xffe0..=0xffe6
+            | 0xffe8..=0xffee
+            | 0x17000..=0x18cd5
+            | 0x18cff..=0x18d1e
+            | 0x1b000..=0x1b2fb
+            | 0x20000..=0x3fffd
+    )
+}
+
 impl Markdown {
     pub fn new(
         text: impl Into<String>,
@@ -1362,7 +1442,7 @@ impl Markdown {
             let segments: Vec<&str> = text.split('\n').collect();
             segments
                 .iter()
-                .map(|segment| (style_context.apply_text)(segment))
+                .map(|segment| (style_context.apply_text)(&self.render_cjk_emphasis_text(segment)))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -1535,6 +1615,90 @@ impl Markdown {
     /// and rendered math (`renderLatex(text) ?? raw`). Returns the pending
     /// tail when the node ends with an unclosed math opening (upstream
     /// pending token raw, markdown.ts:84-89).
+    /// Fallback emphasis for delimiters adjacent to CJK punctuation
+    /// (#10730/#10154). CommonMark's flanking rules classify `。`, `：`, `」`
+    /// as punctuation, so `**这。**后面` stays literal; upstream's
+    /// CJK-friendly tokenizer treats the CJK side as ordinary text. comrak
+    /// has no tokenizer extension, so unmatched delimiter pairs left in text
+    /// nodes are styled here. Non-CJK punctuation keeps CommonMark rules
+    /// (`**end.**Then` stays literal).
+    fn render_cjk_emphasis_text(&self, text: &str) -> String {
+        if !text.contains('*') && !text.contains('_') {
+            return text.to_string();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut copied = 0usize;
+        let mut index = 0usize;
+        while index < chars.len() {
+            let delimiter = chars[index];
+            if delimiter != '*' && delimiter != '_' {
+                index += 1;
+                continue;
+            }
+            let mut opener_end = index;
+            while opener_end < chars.len() && chars[opener_end] == delimiter {
+                opener_end += 1;
+            }
+            let run_len = opener_end - index;
+            if run_len > 2 {
+                index = opener_end;
+                continue;
+            }
+            let opener_cjk = index
+                .checked_sub(1)
+                .and_then(|i| chars.get(i))
+                .is_some_and(|c| is_cjk_character(*c))
+                || chars
+                    .get(opener_end)
+                    .is_some_and(|c| is_cjk_character(*c));
+            let mut search = opener_end;
+            let mut closer = None;
+            while search < chars.len() {
+                if chars[search] != delimiter {
+                    search += 1;
+                    continue;
+                }
+                let mut closer_end = search;
+                while closer_end < chars.len() && chars[closer_end] == delimiter {
+                    closer_end += 1;
+                }
+                let closer_len = closer_end - search;
+                let content = &chars[opener_end..search];
+                let content_ok = !content.is_empty()
+                    && !content[0].is_whitespace()
+                    && !content[content.len() - 1].is_whitespace();
+                let closer_cjk = search
+                    .checked_sub(1)
+                    .and_then(|i| chars.get(i))
+                    .is_some_and(|c| is_cjk_character(*c))
+                    || chars
+                        .get(closer_end)
+                        .is_some_and(|c| is_cjk_character(*c));
+                if closer_len == run_len && content_ok && (opener_cjk || closer_cjk) {
+                    closer = Some((search, closer_end));
+                    break;
+                }
+                search = closer_end;
+            }
+            let Some((closer_start, closer_end)) = closer else {
+                index = opener_end;
+                continue;
+            };
+            out.extend(chars[copied..index].iter());
+            let content: String = chars[opener_end..closer_start].iter().collect();
+            out.push_str(&if run_len == 2 {
+                (self.theme.bold)(&content)
+            } else {
+                (self.theme.italic)(&content)
+            });
+            copied = closer_end;
+            index = closer_end;
+        }
+        out.extend(chars[copied..].iter());
+        out
+    }
+
     fn render_inline_text_with_latex<'r>(
         &self,
         raw: &'r str,
@@ -2703,6 +2867,102 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #11159: an unclosed `$$` must not swallow the table that follows it.
+    #[test]
+    fn unclosed_display_math_does_not_swallow_tables() {
+        let table = ["| A | B |", "|---|---|", "| 1 | 2 |"];
+        let rendered = [
+            "┌───┬───┐",
+            "│ A │ B │",
+            "├───┼───┤",
+            "│ 1 │ 2 │",
+            "└───┴───┘",
+        ];
+        let render = |lines: &[&str]| -> Vec<String> {
+            md(&lines.join("\n"))
+                .render(80)
+                .into_iter()
+                .map(|line| strip_ansi(&line).trim_end().to_string())
+                .collect()
+        };
+
+        let mut source = vec!["Intro", "", "$$", ""];
+        source.extend(table);
+        source.extend(["", "After"]);
+        let mut expected = vec!["Intro", "", "$$", ""];
+        expected.extend(rendered);
+        expected.extend(["", "After"]);
+        assert_eq!(render(&source), expected);
+
+        let mut source = vec!["$$", "x = 1", ""];
+        source.extend(table);
+        let mut expected = vec!["$$", "x = 1", ""];
+        expected.extend(rendered);
+        assert_eq!(render(&source), expected);
+
+        let source = vec!["$$", "", "| A |", ":---:", "| 1 |"];
+        assert_eq!(
+            render(&source),
+            ["$$", "", "┌───┐", "│ A │", "├───┤", "│ 1 │", "└───┘"]
+        );
+
+        let source = vec!["$$", "x^2", "", "Value", "| --- |", "1"];
+        assert_eq!(
+            render(&source),
+            [
+                "$$",
+                "x^2",
+                "",
+                "┌───────┐",
+                "│ Value │",
+                "├───────┤",
+                "│ 1     │",
+                "└───────┘"
+            ]
+        );
+
+        // A later `$$` pair still closes on its own.
+        let mut source = vec!["Intro", "", "$$", "x = 1", ""];
+        source.extend(table);
+        source.extend(["", "$$", "y^2", "$$"]);
+        let mut expected = vec!["Intro", "", "$$", "x = 1", ""];
+        expected.extend(rendered);
+        expected.extend(["", "y²"]);
+        assert_eq!(render(&source), expected);
+    }
+
+    /// A closed multi-line display block whose line starts with a list
+    /// marker is math, not a list (`a + b`, upstream marked).
+    #[test]
+    fn display_math_keeps_list_marker_lines() {
+        let source = [
+            "$$",
+            "a",
+            "+ b",
+            "$$",
+            "",
+            "| A | B |",
+            "|---|---|",
+            "| 1 | 2 |",
+        ];
+        assert_eq!(
+            md(&source.join("\n"))
+                .render(80)
+                .into_iter()
+                .map(|line| strip_ansi(&line).trim_end().to_string())
+                .collect::<Vec<_>>(),
+            [
+                "a + b",
+                "",
+                "┌───┬───┐",
+                "│ A │ B │",
+                "├───┼───┤",
+                "│ 1 │ 2 │",
+                "└───┴───┘"
+            ]
+        );
     }
 
     fn theme() -> Arc<MarkdownTheme> {
@@ -4430,5 +4690,47 @@ $$");
         // No invalidate(): the cache key must include the render_latex flag.
         markdown.options.render_latex = false;
         assert_eq!(plain(&markdown, 80), [r"Map $\mathbb{C}^3$"]);
+    }
+
+    fn render(text: &str) -> Vec<String> {
+        Markdown::new(text, 0, 0, theme(), None, None)
+            .render(80)
+            .into_iter()
+            .map(|line| line.trim_end().to_string())
+            .collect()
+    }
+
+    /// #10730/#10154: emphasis delimited next to CJK punctuation.
+    #[test]
+    fn renders_emphasis_delimited_next_to_cjk_punctuation() {
+        assert_eq!(
+            render("**这是测试。**后面"),
+            ["\x1b[1m这是测试。\x1b[22m后面"]
+        );
+        assert_eq!(
+            render("**一句话说清：**一台机器"),
+            ["\x1b[1m一句话说清：\x1b[22m一台机器"]
+        );
+        assert_eq!(
+            render("**要点到此为止。**20 小时"),
+            ["\x1b[1m要点到此为止。\x1b[22m20 小时"]
+        );
+        assert_eq!(render("字**「引用」**字"), ["字\x1b[1m「引用」\x1b[22m字"]);
+        assert_eq!(render("*斜体。*后面"), ["\x1b[3m斜体。\x1b[23m后面"]);
+    }
+
+    /// CommonMark flanking rules still apply to non-CJK punctuation.
+    #[test]
+    fn keeps_commonmark_flanking_rules_for_non_cjk_text() {
+        assert_eq!(render("**end.**Then next"), ["**end.**Then next"]);
+    }
+
+    /// Code spans keep literal delimiters (the fallback only styles text).
+    #[test]
+    fn code_spans_keep_literal_delimiters() {
+        assert_eq!(
+            render("`**这是测试。**`"),
+            ["\x1b[33m**这是测试。**\x1b[0m"]
+        );
     }
 }
