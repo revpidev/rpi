@@ -51,6 +51,11 @@ pub enum WatchEnd {
     Cancelled,
     /// The session closed.
     SessionClosed,
+    /// The session failed after a storage error.
+    SessionFailed {
+        /// The first error's message.
+        error: String,
+    },
     /// The observed incarnation retired.
     Retired,
     /// The listener threw; the affected watch settles with this message.
@@ -170,9 +175,12 @@ impl CommittedWatch {
         self.terminate(WatchEnd::Cancelled);
     }
 
-    /// Terminate because the session closed.
-    pub fn close_session(&self) {
-        self.terminate(WatchEnd::SessionClosed);
+    /// Terminate because the session closed, or failed with `failure`.
+    pub fn close_session(&self, failure: Option<String>) {
+        match failure {
+            Some(error) => self.terminate(WatchEnd::SessionFailed { error }),
+            None => self.terminate(WatchEnd::SessionClosed),
+        }
     }
 
     /// Await the terminal reason.
@@ -422,7 +430,7 @@ impl CommittedStateSource {
 
     /// Release every attachment because the session closed (upstream
     /// `closeSession`).
-    pub(crate) fn close_session(&self) {
+    pub(crate) fn close_session(&self, _failure: Option<String>) {
         if self.inner.closed.load(Ordering::SeqCst) {
             return;
         }

@@ -18,15 +18,15 @@ use crate::documents::{
     DocScope, DocTarget, DocToken, check_record_scope_record, check_record_version_record,
     materialize_document, resolve_address,
 };
-use crate::errors::StorageError;
 use crate::ids::{ConversationId, DocumentId, EntryId, Seq};
+use crate::session::guarded::GuardedStorage;
 use crate::session::observation::{
     CommittedStateSource, CommittedWatch, WatchListener, attach_state,
 };
 use crate::session::transaction::{LoadedDocument, Transaction, TransactionScope};
 use crate::session::{
-    CommitChange, CommitPublication, DocOwner, SessionError, SessionFuture, SessionResult,
-    Subscription, doc_target, observed_operations,
+    CommitChange, CommitPublication, DocOwner, SessionEnd, SessionError, SessionFuture,
+    SessionResult, Subscription, doc_target, observed_operations,
 };
 use crate::types::{ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, Storage};
 
@@ -105,17 +105,33 @@ pub struct ConversationDocumentView {
 
 /// Session kernel (upstream `SessionImpl`). Always shared as `Arc<SessionImpl>`.
 pub struct SessionImpl {
-    storage: Arc<dyn Storage>,
+    raw: Arc<dyn Storage>,
+    guarded: Arc<dyn Storage>,
+    guarded_typed: Arc<GuardedStorage>,
     now: NowFn,
     documents: Mutex<HashMap<String, Arc<LoadedDocument>>>,
-    commit_listeners: Arc<Mutex<Vec<(u64, CommitListener)>>>,
+    /// Commit listeners: `true` marks the Session's own component listener,
+    /// whose throw fails the Session; host listeners report only.
+    commit_listeners: Arc<Mutex<Vec<(u64, CommitListener, bool)>>>,
     close_listeners: Arc<Mutex<Vec<(u64, CloseListener)>>>,
     conversation_created_hook: Mutex<Option<ConversationCreatedHook>>,
     line: tokio::sync::Mutex<()>,
     closing: AtomicBool,
-    poisoned: AtomicBool,
     cleanup_done: AtomicBool,
+    /// The first error that failed the Session.
+    failure: Mutex<Option<String>>,
+    /// The terminal session state, once close or failure set it.
+    end: Mutex<Option<SessionEnd>>,
+    end_notify: tokio::sync::Notify,
+    failure_reporter: Mutex<Option<FailureReporter>>,
+    /// Callbacks run when the Session fails, before close listeners.
+    failure_hooks: Mutex<Vec<FailureHook>>,
 }
+
+/// Host reporter for the error that failed the Session.
+pub type FailureReporter = Arc<dyn Fn(String) + Send + Sync>;
+/// Callback run when the Session fails.
+pub type FailureHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Open a session kernel over one storage backend (upstream `createSession`).
 pub fn create_session(storage: Arc<dyn Storage>, now: Option<NowFn>) -> Arc<SessionImpl> {
@@ -125,8 +141,12 @@ pub fn create_session(storage: Arc<dyn Storage>, now: Option<NowFn>) -> Arc<Sess
 impl SessionImpl {
     /// Build a session over `storage` with the given clock (default [`crate::session::default_now`]).
     pub fn new(storage: Arc<dyn Storage>, now: Option<NowFn>) -> Arc<Self> {
-        Arc::new(Self {
-            storage,
+        let guarded_typed = GuardedStorage::new(Arc::clone(&storage));
+        let guarded: Arc<dyn Storage> = guarded_typed.clone();
+        let session = Arc::new(Self {
+            raw: Arc::clone(&storage),
+            guarded,
+            guarded_typed,
             now: now.unwrap_or_else(|| Arc::new(crate::session::default_now)),
             documents: Mutex::new(HashMap::new()),
             commit_listeners: Arc::new(Mutex::new(Vec::new())),
@@ -134,14 +154,119 @@ impl SessionImpl {
             conversation_created_hook: Mutex::new(None),
             line: tokio::sync::Mutex::new(()),
             closing: AtomicBool::new(false),
-            poisoned: AtomicBool::new(false),
             cleanup_done: AtomicBool::new(false),
-        })
+            failure: Mutex::new(None),
+            end: Mutex::new(None),
+            end_notify: tokio::sync::Notify::new(),
+            failure_reporter: Mutex::new(None),
+            failure_hooks: Mutex::new(Vec::new()),
+        });
+        session.guarded_typed.attach(&session);
+        session
     }
 
-    /// The storage backend.
+    /// The storage backend, guarded so a failure fails this Session.
     pub fn storage(&self) -> &Arc<dyn Storage> {
-        &self.storage
+        &self.guarded
+    }
+
+    /// The raw storage backend, for closing and tests.
+    pub fn raw_storage(&self) -> &Arc<dyn Storage> {
+        &self.raw
+    }
+
+    /// The first error that failed the Session, if one did.
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|failure| failure.clone())
+    }
+
+    /// Register a callback run when the Session fails; it rejects the
+    /// caller's pending waits.
+    pub fn on_failure(&self, hook: FailureHook) {
+        if let Ok(mut hooks) = self.failure_hooks.lock() {
+            hooks.push(hook);
+        }
+    }
+
+    /// Install the host reporter for the error that failed the Session.
+    pub fn set_failure_reporter(&self, reporter: FailureReporter) {
+        if let Ok(mut slot) = self.failure_reporter.lock() {
+            *slot = Some(reporter);
+        }
+    }
+
+    /// Fail the Session: the first failure wins. Admission ends, the close
+    /// listeners run at once, and Storage closes in the background. Later
+    /// calls and waits reject with `SessionFailed`.
+    pub fn fail(self: &Arc<Self>, cause: impl Into<String>) {
+        let cause = cause.into();
+        {
+            let Ok(mut failure) = self.failure.lock() else {
+                return;
+            };
+            if failure.is_some() {
+                return;
+            }
+            *failure = Some(cause.clone());
+        }
+        self.closing.store(true, Ordering::SeqCst);
+        self.set_end(SessionEnd::Failed {
+            error: cause.clone(),
+        });
+        let hooks: Vec<FailureHook> = match self.failure_hooks.lock() {
+            Ok(hooks) => hooks.clone(),
+            Err(_) => Vec::new(),
+        };
+        for hook in hooks {
+            hook(cause.as_str());
+        }
+        self.notify_close();
+        if let Ok(reporter) = self.failure_reporter.lock()
+            && let Some(reporter) = reporter.as_ref()
+        {
+            reporter(cause.clone());
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let this = Arc::clone(self);
+            handle.spawn(async move {
+                let _ = this.close(&crate::chord::context::BACKGROUND_CONTEXT).await;
+            });
+        }
+    }
+
+    /// Resolve with the terminal session state once close or failure reaches it.
+    pub async fn closed(&self) -> SessionEnd {
+        loop {
+            let notified = self.end_notify.notified();
+            if let Some(end) = self.end.lock().ok().and_then(|end| end.clone()) {
+                return end;
+            }
+            notified.await;
+        }
+    }
+
+    fn set_end(&self, end: SessionEnd) {
+        if let Ok(mut slot) = self.end.lock()
+            && slot.is_none()
+        {
+            *slot = Some(end);
+        }
+        self.end_notify.notify_waiters();
+    }
+
+    fn notify_close(&self) {
+        let listeners: Vec<CloseListener> = match self.close_listeners.lock() {
+            Ok(mut listeners) => listeners.drain(..).map(|(_, listener)| listener).collect(),
+            Err(_) => Vec::new(),
+        };
+        for listener in listeners {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener())).is_err()
+                && let Ok(reporter) = self.failure_reporter.lock()
+                && let Some(reporter) = reporter.as_ref()
+            {
+                reporter("A close listener panicked".to_string());
+            }
+        }
     }
 
     /// Current wall clock in milliseconds.
@@ -199,7 +324,7 @@ impl SessionImpl {
             documents.remove(address_id);
         }
         let record = self
-            .storage
+            .guarded
             .find_document(
                 address.clone(),
                 crate::types::DocumentPoint::CURRENT,
@@ -210,7 +335,7 @@ impl SessionImpl {
             return Ok(None);
         };
         let stored = self
-            .storage
+            .guarded
             .document(record.id, crate::types::DocumentPoint::CURRENT, context)
             .await?
             .ok_or_else(|| {
@@ -306,23 +431,21 @@ impl SessionImpl {
             return Ok(result);
         }
         let seq = match self
-            .storage
+            .storage()
             .commit(&writes, &without_abort_signal(&context))
             .await
         {
             Ok(seq) => seq,
             Err(error) => {
                 tx.discard();
-                if !matches!(error, StorageError::Rejected(_)) {
-                    self.poisoned.store(true, Ordering::SeqCst);
-                }
+                self.fail(error.to_string());
                 return Err(SessionError::Storage(error));
             }
         };
         let documents = match tx.adopt(seq) {
             Ok(documents) => documents,
             Err(error) => {
-                self.poisoned.store(true, Ordering::SeqCst);
+                self.fail(error.to_string());
                 return Err(error);
             }
         };
@@ -331,16 +454,16 @@ impl SessionImpl {
     }
 
     fn publish(
-        &self,
+        self: &Arc<Self>,
         seq: Seq,
         writes: &[crate::types::StorageWrite],
         documents: &[CommitChange],
         context: &Context,
     ) {
-        let listeners: Vec<CommitListener> = match self.commit_listeners.lock() {
+        let listeners: Vec<(CommitListener, bool)> = match self.commit_listeners.lock() {
             Ok(listeners) => listeners
                 .iter()
-                .map(|(_, listener)| Arc::clone(listener))
+                .map(|(_, listener, internal)| (Arc::clone(listener), *internal))
                 .collect(),
             Err(_) => return,
         };
@@ -361,8 +484,20 @@ impl SessionImpl {
         }
         changes.extend(documents.iter().cloned());
         let publication = CommitPublication { seq, changes };
-        for listener in listeners {
-            listener(&publication, context);
+        for (listener, internal) in listeners {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                listener(&publication, context);
+            }));
+            if let Err(payload) = outcome {
+                let message = panic_message(payload);
+                if internal {
+                    self.fail(format!("A component commit listener failed: {message}"));
+                } else if let Ok(reporter) = self.failure_reporter.lock()
+                    && let Some(reporter) = reporter.as_ref()
+                {
+                    reporter(format!("A commit listener failed: {message}"));
+                }
+            }
         }
     }
 
@@ -459,7 +594,7 @@ impl SessionImpl {
     }
 
     async fn document_state_resolved(
-        &self,
+        self: &Arc<Self>,
         definition: &Arc<crate::documents::DocDefinition>,
         address_id: String,
         address: DocumentAddress,
@@ -498,8 +633,11 @@ impl SessionImpl {
             }
         }));
         let source_close = Arc::clone(&source);
-        let subscription_close =
-            self.subscribe_close(Arc::new(move || source_close.close_session()));
+        let weak = Arc::downgrade(self);
+        let subscription_close = self.subscribe_close(Arc::new(move || {
+            let failure = weak.upgrade().and_then(|session| session.failure());
+            source_close.close_session(failure);
+        }));
         source.set_release(Box::new(move || {
             subscription_commit.unsubscribe();
             subscription_close.unsubscribe();
@@ -532,7 +670,7 @@ impl SessionImpl {
     }
 
     async fn watch_doc_resolved(
-        &self,
+        self: &Arc<Self>,
         definition: &Arc<crate::documents::DocDefinition>,
         address_id: String,
         address: DocumentAddress,
@@ -577,8 +715,11 @@ impl SessionImpl {
             }
         }));
         let watch_close = watch.clone();
-        let subscription_close =
-            self.subscribe_close(Arc::new(move || watch_close.close_session()));
+        let weak = Arc::downgrade(self);
+        let subscription_close = self.subscribe_close(Arc::new(move || {
+            let failure = weak.upgrade().and_then(|session| session.failure());
+            watch_close.close_session(failure);
+        }));
         watch.set_detach(Box::new(move || {
             subscription_commit.unsubscribe();
             subscription_close.unsubscribe();
@@ -632,7 +773,7 @@ impl SessionImpl {
         let _guard = self.line.lock().await;
         self.assert_healthy()?;
         let stored_entry = self
-            .storage
+            .storage()
             .entry_in_conversation(conversation, at, context)
             .await?
             .ok_or_else(|| {
@@ -648,12 +789,12 @@ impl SessionImpl {
             key: None,
         };
         let point = crate::types::DocumentPoint::At(stored_entry.commit_seq);
-        let record = self.storage.find_document(address, point, context).await?;
+        let record = self.guarded.find_document(address, point, context).await?;
         let Some(record) = record else {
             return Ok(None);
         };
         let stored = self
-            .storage
+            .storage()
             .document(record.id, point, context)
             .await?
             .ok_or_else(|| {
@@ -718,19 +859,16 @@ impl SessionImpl {
     /// Seal admission and close storage (upstream `close`).
     pub fn close(self: &Arc<Self>, context: &Context) -> SessionFuture<'_, ()> {
         if !self.closing.swap(true, Ordering::SeqCst) {
-            let listeners: Vec<CloseListener> = match self.close_listeners.lock() {
-                Ok(mut listeners) => listeners.drain(..).map(|(_, listener)| listener).collect(),
-                Err(_) => Vec::new(),
-            };
-            for listener in listeners {
-                listener();
-            }
+            self.notify_close();
         }
         let this = Arc::clone(self);
         let context = without_abort_signal(context);
         Box::pin(async move {
             let _guard = this.line.lock().await;
             if this.cleanup_done.swap(true, Ordering::SeqCst) {
+                if this.failure().is_none() {
+                    this.set_end(SessionEnd::Closed);
+                }
                 return Ok(());
             }
             // If closing is cancelled or fails, the flag must go back to
@@ -743,8 +881,15 @@ impl SessionImpl {
             if let Ok(mut listeners) = this.commit_listeners.lock() {
                 listeners.clear();
             }
-            this.storage.close(&context).await?;
+            let result = this.raw.close(&context).await;
+            if let Err(error) = &result {
+                this.fail(error.to_string());
+            }
+            if this.failure().is_none() {
+                this.set_end(SessionEnd::Closed);
+            }
             reset.disarm();
+            result?;
             Ok(())
         })
     }
@@ -756,11 +901,26 @@ impl SessionImpl {
         let store = Arc::clone(&self.commit_listeners);
         let id = NEXT_LISTENER_ID.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut listeners) = store.lock() {
-            listeners.push((id, listener));
+            listeners.push((id, listener, false));
         }
         Subscription::new(move || {
             if let Ok(mut listeners) = store.lock() {
-                listeners.retain(|(existing, _)| *existing != id);
+                listeners.retain(|(existing, _, _)| *existing != id);
+            }
+        })
+    }
+
+    /// Register the Session's own component commit listener: its throw fails
+    /// the Session (upstream `subscribeInternalCommits`).
+    pub fn subscribe_internal_commits(&self, listener: CommitListener) -> Subscription {
+        let store = Arc::clone(&self.commit_listeners);
+        let id = NEXT_LISTENER_ID.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut listeners) = store.lock() {
+            listeners.push((id, listener, true));
+        }
+        Subscription::new(move || {
+            if let Ok(mut listeners) = store.lock() {
+                listeners.retain(|(existing, _, _)| *existing != id);
             }
         })
     }
@@ -780,17 +940,29 @@ impl SessionImpl {
     }
 
     fn assert_usable(&self) -> SessionResult<()> {
+        self.assert_healthy()?;
         if self.closing.load(Ordering::SeqCst) {
             return Err(SessionError::Closed);
         }
-        self.assert_healthy()
+        Ok(())
     }
 
     fn assert_healthy(&self) -> SessionResult<()> {
-        if self.poisoned.load(Ordering::SeqCst) {
-            return Err(SessionError::Poisoned);
+        if let Some(cause) = self.failure() {
+            return Err(SessionError::Failed { cause });
         }
         Ok(())
+    }
+}
+
+/// The message of a caught panic payload.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 

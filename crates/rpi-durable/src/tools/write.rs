@@ -50,7 +50,7 @@ impl ToolExecute for WriteTool {
                 return Err(tool_error("Operation aborted"));
             }
             Ok(ToolExecutionResult {
-                content: Some(vec![ToolResultContent::Text(TextContent {
+                output: Some(vec![ToolResultContent::Text(TextContent {
                     text: format!("Successfully wrote to {path}"),
                     text_signature: None,
                 })]),
@@ -98,6 +98,9 @@ pub fn create_write_tool() -> ToolRegistration {
         execution_mode: None,
         prepare_arguments: None,
         output_limits: None,
+        structured_output_schema: None,
+        callers: None,
+        deferred: false,
         execute: Arc::new(WriteTool),
     }
 }

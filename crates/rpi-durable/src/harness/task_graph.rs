@@ -161,10 +161,11 @@ impl TaskGraphView {
             Ok(mut guard) => guard.take().map(|mount| mount.observers),
             Err(_) => None,
         };
+        let failure = self.session.failure();
         for observer in observers.into_iter().flatten() {
             match observer {
-                Observer::State(source) => source.close_session(),
-                Observer::Watch(_, watch) => watch.close_session(),
+                Observer::State(source) => source.close_session(failure.clone()),
+                Observer::Watch(_, watch) => watch.close_session(failure.clone()),
             }
         }
     }

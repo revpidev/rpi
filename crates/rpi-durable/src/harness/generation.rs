@@ -42,7 +42,7 @@ use crate::harness::compaction::{
 use crate::harness::inbox::{BoundaryAt, QueueModes, apply_boundary, prepare_boundary};
 use crate::harness::json::assign_json;
 use crate::harness::live::{
-    LIVE_DOC, LiveState, ToolSlot, ToolSlotStatus, convert_partial, end_run,
+    LIVE_DOC, LiveState, SlotProgress, ToolSlot, ToolSlotStatus, convert_partial, end_run,
 };
 use crate::harness::prompt::{plan_system_entries, render_sections, replay_sections};
 use crate::harness::registry::{GENERATION_TASK_NAME, TOOL_TASK_NAME};
@@ -1016,9 +1016,12 @@ async fn start_tool_round(
                         append_tool_result(tx, conversation_id, call, &unavailable, now, None)
                             .await?;
                     slots.push(ToolSlot {
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        status: ToolSlotStatus::Done,
+                        progress: SlotProgress {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            status: ToolSlotStatus::Done,
+                            ..Default::default()
+                        },
                         entry: Some(result.id),
                         ..Default::default()
                     });
@@ -1027,9 +1030,12 @@ async fn start_tool_round(
                 if sequential && !tool_tasks.is_empty() {
                     pending.push(call.id.clone());
                     slots.push(ToolSlot {
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        status: ToolSlotStatus::Pending,
+                        progress: SlotProgress {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            status: ToolSlotStatus::Pending,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     });
                     continue;
@@ -1038,10 +1044,13 @@ async fn start_tool_round(
                     create_tool_task(tx, conversation_id, task_id, entry.id, &call.id).await?;
                 tool_tasks.push(tool_task);
                 slots.push(ToolSlot {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
+                    progress: SlotProgress {
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        status: ToolSlotStatus::Pending,
+                        ..Default::default()
+                    },
                     task_id: Some(tool_task),
-                    status: ToolSlotStatus::Pending,
                     ..Default::default()
                 });
             }
@@ -1096,7 +1105,7 @@ async fn tools(
             if let Some(slots) = state.tools.as_mut()
                 && let Some(slot) = slots
                     .iter_mut()
-                    .find(|slot| slot.call_id == next && slot.task_id.is_none())
+                    .find(|slot| slot.progress.call_id == next && slot.task_id.is_none())
             {
                 slot.task_id = Some(tool_task);
             }
@@ -1364,8 +1373,8 @@ async fn create_tool_task(
 ) -> SessionResult<TaskId> {
     tx.create_task(TaskCreate {
         kind: TOOL_TASK_NAME.to_string(),
-        version: 1,
-        input: serde_json::json!({ "assistant": assistant, "callId": call_id }),
+        version: 2,
+        input: serde_json::json!({ "kind": "model", "assistant": assistant, "callId": call_id }),
         checkpoint: serde_json::json!({ "phase": "call" }),
         ownership: TaskOwnership::Task(owner),
         conversation_id: Some(conversation_id),

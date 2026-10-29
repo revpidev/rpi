@@ -29,17 +29,14 @@ pub const TOOL_TASK_KIND: &str = "pi.tool";
 /// Built-in compaction task kind.
 pub const COMPACTION_TASK_KIND: &str = "pi.compaction";
 
-/// Presentation of one tool call of the current round.
+/// What a running tool call publishes, shared by model-issued and nested calls.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ToolSlot {
+pub struct SlotProgress {
     /// Provider call ID.
     pub call_id: String,
     /// Tool name.
     pub name: String,
-    /// Owning tool task; absent for a call not started yet and for an unoffered call.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<TaskId>,
     /// Presentation status.
     pub status: ToolSlotStatus,
     /// Retained running output.
@@ -57,9 +54,61 @@ pub struct ToolSlot {
     /// Diagnostics recorded through `api.diagnostic()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<Vec<ToolDiagnostic>>,
+}
+
+/// Presentation of one tool call of the current round.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolSlot {
+    /// Shared running presentation.
+    #[serde(flatten)]
+    pub progress: SlotProgress,
+    /// Owning tool task; absent for a call not started yet and for an unoffered call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
     /// Result entry once done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<EntryId>,
+}
+
+/// How a nested call ended: an error flag, its execution time, its spend, and up
+/// to 500 characters of error text.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedToolSummary {
+    /// Whether the call ended as an error.
+    pub is_error: bool,
+    /// Execution time of the attempt that produced the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Spend of the execution itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<rpi_ai::types::Usage>,
+    /// Error text, bounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Presentation of one nested call: a call a running tool made through
+/// `executeTool()`. `call_id` is `<parentCallId>/<key>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedToolSlot {
+    /// Shared running presentation.
+    #[serde(flatten)]
+    pub progress: SlotProgress,
+    /// Call ID of the calling tool.
+    pub parent_call_id: String,
+    /// Calling tool task.
+    pub parent_task_id: TaskId,
+    /// The nested call's tool task.
+    pub task_id: TaskId,
+    /// What the call was made with; replaced by the arguments it runs with once
+    /// it starts executing.
+    pub arguments: JsonObject,
+    /// Once done: how the call ended, for a status line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<NestedToolSummary>,
 }
 
 /// Status of one [`ToolSlot`].
@@ -115,6 +164,11 @@ pub struct LiveState {
     /// The current tool round in call order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolSlot>>,
+    /// Nested calls of running tool calls, in creation order, so a parent
+    /// precedes its children and task IDs ascend. A call's nested slots are
+    /// removed when the call settles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_tools: Option<Vec<NestedToolSlot>>,
     /// Live compaction tasks in task ID order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compactions: Option<Vec<CompactionStatus>>,
@@ -178,15 +232,17 @@ pub static LIVE_DOC: LazyLock<DocToken> = LazyLock::new(|| {
         // running tool slot.
         checkpoint_when: Some(Arc::new(|value, _ops, _revision| {
             let no_generation = value.get("generation").is_none();
-            let no_running = value
-                .get("tools")
-                .and_then(JsonValue::as_array)
-                .map(|tools| {
-                    tools.iter().all(|slot| {
-                        slot.get("status").and_then(JsonValue::as_str) != Some("running")
+            let no_running = ["tools", "nestedTools"].iter().all(|field| {
+                value
+                    .get(*field)
+                    .and_then(JsonValue::as_array)
+                    .map(|slots| {
+                        slots.iter().all(|slot| {
+                            slot.get("status").and_then(JsonValue::as_str) != Some("running")
+                        })
                     })
-                })
-                .unwrap_or(true);
+                    .unwrap_or(true)
+            });
             no_generation && no_running
         })),
     })
@@ -214,6 +270,7 @@ pub async fn end_run(
     }
     state.generation = None;
     state.tools = None;
+    state.nested_tools = None;
     write_state(live, &state)
 }
 
@@ -263,23 +320,149 @@ pub fn tool_slot(live: &DocDraft, task_id: TaskId) -> SessionResult<Option<ToolS
         .find(|slot| slot.task_id == Some(task_id)))
 }
 
+/// One live slot of either kind.
+#[derive(Debug)]
+pub enum LiveSlot<'a> {
+    /// A model-issued call of the current round.
+    Model(&'a mut ToolSlot),
+    /// A nested call of a running tool.
+    Nested(&'a mut NestedToolSlot),
+}
+
+impl<'a> LiveSlot<'a> {
+    /// Shared running presentation.
+    pub fn progress(&mut self) -> &mut SlotProgress {
+        match self {
+            LiveSlot::Model(slot) => &mut slot.progress,
+            LiveSlot::Nested(slot) => &mut slot.progress,
+        }
+    }
+
+    /// Whether this is a nested call's slot.
+    pub fn is_nested(&self) -> bool {
+        matches!(self, LiveSlot::Nested(_))
+    }
+
+    /// The slot's task ID.
+    pub fn task_id(&self) -> TaskId {
+        match self {
+            LiveSlot::Model(slot) => slot.task_id.unwrap_or(TaskId::from_number(0)),
+            LiveSlot::Nested(slot) => slot.task_id,
+        }
+    }
+
+    /// Mark the slot done and clear its running output; the caller sets a
+    /// model-issued call's result `entry` or a nested call's `summary`.
+    pub fn finish(&mut self) {
+        self.progress().status = ToolSlotStatus::Done;
+        clear_progress(self.progress());
+    }
+}
+
+/// The slot of tool task `task_id`, model-issued or nested, mutably.
+pub fn tool_slot_mut<'a>(state: &'a mut LiveState, task_id: TaskId) -> Option<LiveSlot<'a>> {
+    let in_tools = state
+        .tools
+        .as_ref()
+        .map(|tools| tools.iter().any(|slot| slot.task_id == Some(task_id)))
+        .unwrap_or(false);
+    if in_tools {
+        let tools = state.tools.as_mut()?;
+        let slot = tools
+            .iter_mut()
+            .find(|slot| slot.task_id == Some(task_id))?;
+        return Some(LiveSlot::Model(slot));
+    }
+    let nested = state.nested_tools.as_mut()?;
+    // Task IDs ascend: each slot is appended in the commit that creates its
+    // task, task IDs ascend in commit order, and removal keeps the order.
+    let index = nested.partition_point(|slot| slot.task_id < task_id);
+    match nested.get_mut(index) {
+        Some(slot) if slot.task_id == task_id => Some(LiveSlot::Nested(slot)),
+        _ => None,
+    }
+}
+
+/// A read-only snapshot of a slot's running presentation.
+#[derive(Debug, Clone, Default)]
+pub struct SlotSnapshot {
+    /// Retained output.
+    pub output: Option<String>,
+    /// Dropped bytes.
+    pub dropped_bytes: Option<u64>,
+    /// Dropped lines.
+    pub dropped_lines: Option<u64>,
+    /// Last details.
+    pub details: Option<JsonValue>,
+    /// Diagnostics.
+    pub diagnostics: Option<Vec<ToolDiagnostic>>,
+}
+
+impl From<&SlotProgress> for SlotSnapshot {
+    fn from(progress: &SlotProgress) -> Self {
+        Self {
+            output: progress.output.clone(),
+            dropped_bytes: progress.dropped_bytes,
+            dropped_lines: progress.dropped_lines,
+            details: progress.details.clone(),
+            diagnostics: progress.diagnostics.clone(),
+        }
+    }
+}
+
+/// The read-only snapshot of tool task `task_id`'s slot, model-issued or nested.
+pub fn tool_slot_snapshot(live: &DocDraft, task_id: TaskId) -> SessionResult<Option<SlotSnapshot>> {
+    let state: LiveState = read_state(live)?;
+    if let Some(slot) = state
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.iter().find(|slot| slot.task_id == Some(task_id)))
+    {
+        return Ok(Some((&slot.progress).into()));
+    }
+    Ok(state
+        .nested_tools
+        .as_ref()
+        .and_then(|nested| nested.iter().find(|slot| slot.task_id == task_id))
+        .map(|slot| (&slot.progress).into()))
+}
+
+/// Remove the nested slots below tool task `task_id`, transitively; the list
+/// holds parents before their children.
+pub fn remove_nested_slots(state: &mut LiveState, task_id: TaskId) {
+    let Some(nested) = state.nested_tools.as_mut() else {
+        return;
+    };
+    let mut removed: std::collections::BTreeSet<TaskId> = std::collections::BTreeSet::new();
+    removed.insert(task_id);
+    for slot in nested.iter() {
+        if removed.contains(&slot.parent_task_id) {
+            removed.insert(slot.task_id);
+        }
+    }
+    nested.retain(|slot| !removed.contains(&slot.parent_task_id));
+    if nested.is_empty() {
+        state.nested_tools = None;
+    }
+}
+
 /// Mark a slot done: the result entry, if any, now carries its running output.
 pub fn finish_slot(slot: &mut ToolSlot, entry: Option<EntryId>) {
-    slot.status = ToolSlotStatus::Done;
+    slot.progress.status = ToolSlotStatus::Done;
     if entry.is_some() {
         slot.entry = entry;
     }
-    clear_progress(slot);
+    clear_progress(&mut slot.progress);
 }
 
 /// Remove what a tool published while running; its result entry or a rerun
 /// replaces it.
-pub fn clear_progress(slot: &mut ToolSlot) {
-    slot.output = None;
-    slot.dropped_bytes = None;
-    slot.dropped_lines = None;
-    slot.details = None;
-    slot.diagnostics = None;
+pub fn clear_progress(progress: &mut SlotProgress) {
+    progress.output = None;
+    progress.dropped_bytes = None;
+    progress.dropped_lines = None;
+    progress.details = None;
+    progress.diagnostics = None;
 }
 
 /// Terminal outcome the scheduler writes itself.
@@ -312,14 +495,11 @@ pub async fn settle_scheduler_outcome(
     if record.kind == TOOL_TASK_KIND {
         let live = tx.doc(&LIVE_DOC, conversation_owner(record), None).await?;
         let mut state: LiveState = read_state(&live)?;
-        if let Some(tools) = state.tools.as_mut()
-            && let Some(slot) = tools
-                .iter_mut()
-                .find(|slot| slot.task_id == Some(record.id))
-        {
-            finish_slot(slot, None);
-            write_state(&live, &state)?;
+        if let Some(mut slot) = tool_slot_mut(&mut state, record.id) {
+            slot.finish();
         }
+        remove_nested_slots(&mut state, record.id);
+        write_state(&live, &state)?;
         return Ok(());
     }
     if record.kind == COMPACTION_TASK_KIND {
@@ -403,16 +583,19 @@ mod tests {
     #[test]
     fn finish_slot_clears_progress_and_keeps_entry_when_absent() {
         let mut slot = ToolSlot {
-            call_id: "c".to_string(),
-            name: "read".to_string(),
-            status: ToolSlotStatus::Running,
-            output: Some("out".to_string()),
+            progress: SlotProgress {
+                call_id: "c".to_string(),
+                name: "read".to_string(),
+                status: ToolSlotStatus::Running,
+                output: Some("out".to_string()),
+                ..SlotProgress::default()
+            },
             entry: Some(crate::ids::id_from_number::<crate::ids::Entry>(9)),
             ..ToolSlot::default()
         };
         finish_slot(&mut slot, None);
-        assert_eq!(slot.status, ToolSlotStatus::Done);
-        assert_eq!(slot.output, None);
+        assert_eq!(slot.progress.status, ToolSlotStatus::Done);
+        assert_eq!(slot.progress.output, None);
         assert!(slot.entry.is_some());
     }
 

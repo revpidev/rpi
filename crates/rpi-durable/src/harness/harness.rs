@@ -1037,9 +1037,13 @@ pub async fn open_harness_with_scheduler(
     )
     .unwrap_or_else(crate::harness::types::default_harness_identity);
     let models = rpi_ai::utils::identity::with_client_identity(&options.models, identity);
+    session.set_failure_reporter(Arc::new({
+        let report = Arc::clone(&report);
+        move |message| report(message)
+    }));
     let scheduler = scheduler_factory(SchedulerDeps {
         session: Arc::clone(&session),
-        storage: Arc::clone(&storage),
+        storage: Arc::clone(session.storage()),
         models,
         registry: Arc::clone(&options.registry),
         settings: settings.clone(),

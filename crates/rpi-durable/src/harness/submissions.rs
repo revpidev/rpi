@@ -73,7 +73,11 @@ impl Submissions {
         let closing = Arc::clone(&submissions);
         submissions.session.subscribe_close(Arc::new(move || {
             closing.closed.store(true, Ordering::SeqCst);
-            closing.waiters.reject_all(closed_error());
+            let error = match closing.session.failure() {
+                Some(cause) => WaitError::Failed(cause),
+                None => closed_error(),
+            };
+            closing.waiters.reject_all(error);
         }));
         submissions
     }
@@ -257,6 +261,7 @@ impl From<WaitError> for SessionError {
         match error {
             WaitError::Aborted => SessionError::Aborted,
             WaitError::Closed => SessionError::Closed,
+            WaitError::Failed(cause) => SessionError::Failed { cause },
         }
     }
 }

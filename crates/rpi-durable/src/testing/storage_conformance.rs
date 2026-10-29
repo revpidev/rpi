@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::chord::context::BACKGROUND_CONTEXT;
 use crate::chord::delta::Op;
 use crate::chord::json::{JsonObject, JsonValue};
-use crate::errors::{StorageError, StorageResult};
+use crate::errors::StorageResult;
 use crate::ids::{ConversationId, DocumentId, EntryId, SubmissionId, TaskId, id_from_number};
 use crate::types::{
     ConversationQuery, ConversationRecord, Cursor, DocumentAddress, DocumentContent,
@@ -65,9 +65,9 @@ fn check_err<T>(result: StorageResult<T>, contains: &str) -> Result<(), String> 
 
 fn check_rejected<T>(result: StorageResult<T>) -> Result<(), String> {
     match result {
-        Err(StorageError::Rejected(_)) => Ok(()),
-        Err(error) => Err(format!("expected StorageRejected, got {error}")),
-        Ok(_) => Err("expected StorageRejected, got success".to_string()),
+        Err(error) if error.is_request() => Ok(()),
+        Err(error) => Err(format!("expected StorageRequestError, got {error}")),
+        Ok(_) => Err("expected StorageRequestError, got success".to_string()),
     }
 }
 

@@ -76,6 +76,7 @@ pub struct ControlledStorage {
     commit_gate: Mutex<Option<Arc<Held>>>,
     find_gate: Mutex<Option<Arc<Held>>>,
     commit_failure: Mutex<Option<StorageError>>,
+    read_failure: Mutex<Option<StorageError>>,
     close_failure: Mutex<Option<StorageError>>,
 }
 
@@ -96,6 +97,7 @@ impl ControlledStorage {
             commit_gate: Mutex::new(None),
             find_gate: Mutex::new(None),
             commit_failure: Mutex::new(None),
+            read_failure: Mutex::new(None),
             close_failure: Mutex::new(None),
         }
     }
@@ -117,6 +119,11 @@ impl ControlledStorage {
     /// Inject one commit failure.
     pub fn fail_next_commit(&self, error: StorageError) {
         *self.commit_failure.lock().expect("failure") = Some(error);
+    }
+
+    /// Inject one document-read failure.
+    pub fn fail_next_read(&self, error: StorageError) {
+        *self.read_failure.lock().expect("read failure") = Some(error);
     }
 
     /// Inject one close failure.
@@ -268,6 +275,9 @@ impl Storage for ControlledStorage {
         let held = self.find_gate.lock().expect("gate").take();
         if let Some(held) = held {
             held.wait().await;
+        }
+        if let Some(error) = self.read_failure.lock().expect("read failure").take() {
+            return Err(error);
         }
         self.inner.find_document(address, at, context).await
     }

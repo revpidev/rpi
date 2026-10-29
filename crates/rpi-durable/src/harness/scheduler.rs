@@ -486,7 +486,7 @@ impl SchedulerInner {
     async fn open(self: &Arc<Self>, context: &Context) -> SessionResult<()> {
         let observer = Arc::clone(self);
         self.session
-            .subscribe_commits(Arc::new(move |publication, _| {
+            .subscribe_internal_commits(Arc::new(move |publication, _| {
                 observer.observe(publication);
             }));
         let sealer = Arc::clone(self);
@@ -2568,6 +2568,35 @@ impl TaskRuntime for InvocationRuntime {
         self.inner.wait_for_task(id, &bound).await
     }
 
+    async fn owned_tasks(&self, _context: &Context) -> SessionResult<Vec<TaskRecord>> {
+        self.ensure_open()?;
+        let task_id = self.invocation.task_id;
+        let mut owned: Vec<TaskRecord> = self
+            .inner
+            .live
+            .lock()
+            .map(|live| {
+                live.values()
+                    .filter(|record| {
+                        record.owner == Some(task_id)
+                            && !matches!(record.state, TaskState::Terminal { .. })
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        owned.sort_by_key(|record| record.id);
+        Ok(owned)
+    }
+
+    async fn abort_owned(&self, id: TaskId, context: &Context) -> SessionResult<()> {
+        self.ensure_open()?;
+        let _ = self.inner.abort(id, context).await?;
+        let bound = with_abort_signal(self.invocation.controller.clone(), context);
+        let _ = self.inner.wait_for_task(id, &bound).await?;
+        Ok(())
+    }
+
     async fn outcomes(
         &self,
         ids: Vec<TaskId>,
@@ -2827,9 +2856,21 @@ pub struct TaskScheduler {
 impl TaskScheduler {
     /// Build a scheduler from its Harness internals.
     pub fn new(deps: SchedulerDeps) -> Arc<Self> {
-        Arc::new(Self {
+        let scheduler = Arc::new(Self {
             inner: Arc::new(SchedulerInner::new(deps)),
-        })
+        });
+        let inner = Arc::clone(&scheduler.inner);
+        let session = Arc::clone(&inner.session);
+        session.on_failure(Arc::new(move |cause| {
+            let cause = cause.to_string();
+            inner
+                .task_waiters
+                .reject_all(crate::harness::util::WaitError::Failed(cause.clone()));
+            inner
+                .idle_waiters
+                .reject_all(crate::harness::util::WaitError::Failed(cause));
+        }));
+        scheduler
     }
 }
 

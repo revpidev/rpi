@@ -224,16 +224,28 @@ fn experimental_disclaimer_is_present() {
     );
 }
 
-/// FR-E R2/R3: the durable tool execution model has no `executeTool`/
-/// `structuredOutput`/`callers` surface (the post-v1.1.0 overflow), and the
-/// V16-06 nestedCalls foundation is not referenced from the durable crate.
+/// V18-06 FR-A: the durable tool execution model carries the upstream
+/// `executeTool`/`structuredOutput`/`callers` surface, while the V16-06
+/// nestedCalls foundation stays unreferenced (the two are never merged).
 #[test]
-fn nested_calls_surface_is_absent_and_uncoupled() {
+fn nested_calls_surface_is_present_and_uncoupled() {
     let tool_task = read_repo_file("crates/rpi-durable/src/harness/tool.rs");
-    for absent in ["executeTool", "structuredOutput", "callers"] {
+    for present in ["execute_tool", "structured_output"] {
         assert!(
-            !tool_task.contains(absent),
-            "durable v1.1.0 has no {absent} surface; it belongs to the v0.1.8 overflow"
+            tool_task.contains(present),
+            "V18-06 ports the durable {present} surface"
+        );
+    }
+    let tool_types = read_repo_file("crates/rpi-durable/src/harness/types.rs");
+    for present in [
+        "callers",
+        "deferred",
+        "model_tools",
+        "structured_output_schema",
+    ] {
+        assert!(
+            tool_types.contains(present),
+            "V18-06 ports the durable {present} surface"
         );
     }
     for path in [

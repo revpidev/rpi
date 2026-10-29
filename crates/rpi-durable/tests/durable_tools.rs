@@ -223,7 +223,7 @@ async fn read_reports_images_by_content_as_unsupported() {
     )
     .await;
     let result = result.expect("read");
-    assert_eq!(result.content, Some(Vec::new()));
+    assert_eq!(result.output, Some(Vec::new()));
     assert_eq!(result.is_error, Some(true));
     assert_eq!(
         diagnostic_text(&result),
@@ -430,17 +430,30 @@ async fn bash_reports_a_nonzero_exit_as_an_error_and_keeps_the_output() {
     }
     let dir = TempDir::new("durable-bash-exit");
     let env = create_env(&dir);
-    let (result, output, diagnostics) = run_tool(
+    let (result, output, _diagnostics) = run_tool(
         &create_bash_tool(None),
         json!({ "command": "printf 'out'; printf 'err' >&2; exit 3" }),
         Some(Arc::clone(&env)),
     )
     .await;
-    let error = result.expect_err("must fail");
-    assert_eq!(error.to_string(), "Command exited with code 3");
-    assert!(output.contains("out"), "got {output}");
-    assert!(output.contains("err"), "got {output}");
-    assert!(diagnostics.is_empty());
+    let result = result.expect("nonzero exit is an error result, not a throw");
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .flatten()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some("exit_code")
+                && diagnostic.message == "Command exited with code 3"),
+        "got {:?}",
+        result.diagnostics
+    );
+    let structured = result.structured_output.expect("structured output");
+    assert_eq!(structured["exitCode"], 3);
+    assert!(
+        structured["output"].as_str().unwrap_or_default() == output,
+        "structured output repeats the retained output"
+    );
 }
 
 #[cfg(unix)]

@@ -219,7 +219,7 @@ impl ToolExecute for EditTool {
                 first_changed_line: diff_result.first_changed_line,
             };
             Ok(ToolExecutionResult {
-                content: Some(vec![ToolResultContent::Text(TextContent {
+                output: Some(vec![ToolResultContent::Text(TextContent {
                     text: format!("Successfully replaced {block_count} block(s) in {path}."),
                     text_signature: None,
                 })]),
@@ -277,6 +277,9 @@ pub fn create_edit_tool() -> ToolRegistration {
         execution_mode: None,
         prepare_arguments: Some(Arc::new(|input: &Value| prepare_edit_arguments(input))),
         output_limits: None,
+        structured_output_schema: None,
+        callers: None,
+        deferred: false,
         execute: Arc::new(EditTool),
     }
 }

@@ -3216,6 +3216,7 @@ version = "0.1.7"
 dependencies = [
  "async-trait",
  "futures",
+ "jsonschema",
  "libc",
  "notify",
  "rpi-ai",

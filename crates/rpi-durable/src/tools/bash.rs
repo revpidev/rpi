@@ -124,16 +124,32 @@ fn timeout_text(timeout: f64) -> String {
     }
 }
 
+/// What a program that calls `bash` or `powershell` receives.
+fn shell_structured_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "output": { "type": "string", "description": "Combined stdout and stderr: the retained tail, as the model sees it" },
+            "truncated": { "type": "boolean", "description": "Whether earlier output was dropped" },
+            "fullOutputPath": { "type": "string", "description": "File with the complete output, when it was spilled" },
+            "exitCode": { "type": "number" }
+        },
+        "required": ["output", "truncated", "exitCode"]
+    })
+}
+
 /// Run each command form in turn until one starts, streaming output to
 /// `api.output()` within the retained window, and turn the result into the
-/// tool's outcome.
+/// tool's result: a spill diagnostic, an error result for a nonzero exit, and a
+/// thrown error for a failure such as a timeout. The structured output repeats
+/// the retained output with the exit code.
 async fn run_command(
     commands: Vec<ShellCommand>,
     execution: &BashExecution,
     timeout: Option<f64>,
     api: &dyn ToolExecutionApi,
     context: &Context,
-) -> Result<(), ToolExecuteError> {
+) -> Result<ToolExecutionResult, ToolExecuteError> {
     let env = require_env(api)?;
     let mut result: Option<Result<ShellExecResult, crate::env::types::ExecutionError>> = None;
     for command in commands {
@@ -190,13 +206,32 @@ async fn run_command(
     }
     match result {
         Ok(value) => {
-            if value.exit_code != 0 {
-                Err(tool_error(format!(
-                    "Command exited with code {}",
-                    value.exit_code
-                )))
+            let exit_code = value.exit_code;
+            let retained = api.retained_output().map_err(|error| tool_error(error))?;
+            let mut structured = serde_json::Map::new();
+            structured.insert("output".to_string(), Value::String(retained.text));
+            structured.insert("truncated".to_string(), Value::Bool(retained.truncated));
+            structured.insert("exitCode".to_string(), json!(exit_code));
+            if let Some(path) = &value.spill_path {
+                structured.insert("fullOutputPath".to_string(), Value::String(path.clone()));
+            }
+            let structured_output = Value::Object(structured);
+            if exit_code == 0 {
+                Ok(ToolExecutionResult {
+                    structured_output: Some(structured_output),
+                    ..Default::default()
+                })
             } else {
-                Ok(())
+                Ok(ToolExecutionResult {
+                    structured_output: Some(structured_output),
+                    is_error: Some(true),
+                    diagnostics: Some(vec![ToolDiagnostic {
+                        severity: DiagnosticSeverity::Error,
+                        code: Some("exit_code".to_string()),
+                        message: format!("Command exited with code {exit_code}"),
+                    }]),
+                    ..Default::default()
+                })
             }
         }
         Err(error) => {
@@ -289,8 +324,7 @@ impl ToolExecute for BashTool {
             api,
             context,
         )
-        .await?;
-        Ok(ToolExecutionResult::default())
+        .await
     }
 }
 
@@ -339,8 +373,7 @@ impl ToolExecute for PowerShellTool {
                 ShellCommand::Argv(argv)
             })
             .collect();
-        run_command(commands, &execution, timeout, api, context).await?;
-        Ok(ToolExecutionResult::default())
+        run_command(commands, &execution, timeout, api, context).await
     }
 }
 
@@ -358,6 +391,9 @@ pub fn create_bash_tool(options: Option<BashToolOptions>) -> ToolRegistration {
         execution_mode: None,
         prepare_arguments: None,
         output_limits: tail_limits(),
+        structured_output_schema: Some(shell_structured_output_schema()),
+        callers: None,
+        deferred: false,
         execute: Arc::new(BashTool {
             options: Options {
                 command_prefix: options.command_prefix,
@@ -381,6 +417,9 @@ pub fn create_power_shell_tool(options: Option<PowerShellToolOptions>) -> ToolRe
         execution_mode: None,
         prepare_arguments: None,
         output_limits: tail_limits(),
+        structured_output_schema: Some(shell_structured_output_schema()),
+        callers: None,
+        deferred: false,
         execute: Arc::new(PowerShellTool {
             options: Options {
                 command_prefix: options.command_prefix,

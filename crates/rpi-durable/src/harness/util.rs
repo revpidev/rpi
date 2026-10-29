@@ -29,6 +29,9 @@ pub enum WaitError {
     /// The harness closed while the wait was pending.
     #[error("Harness is closed")]
     Closed,
+    /// The session failed after a storage error while the wait was pending.
+    #[error("Session failed after a storage error; close and reopen it")]
+    Failed(String),
 }
 
 /// The error every pending wait rejects with when the harness closes.

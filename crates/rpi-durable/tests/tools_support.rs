@@ -121,6 +121,17 @@ impl ToolExecutionApi for FakeApi {
         self.env.clone()
     }
 
+    fn now(&self) -> Result<f64, SessionError> {
+        Ok(0.0)
+    }
+
+    fn retained_output(&self) -> Result<rpi_durable::harness::RetainedOutput, String> {
+        Ok(rpi_durable::harness::RetainedOutput {
+            text: self.output.lock().expect("output").clone(),
+            truncated: false,
+        })
+    }
+
     fn output(
         &self,
         chunk: &[u8],
@@ -197,6 +208,16 @@ impl ToolExecutionApi for FakeApi {
     ) -> Result<Option<Arc<dyn ConversationHandle>>, SessionError> {
         unimplemented!("conversation is not used by the tool tests")
     }
+
+    async fn execute_tool(
+        &self,
+        _name: &str,
+        _args: JsonObject,
+        _context: &Context,
+        _options: rpi_durable::harness::NestedCallOptions,
+    ) -> Result<rpi_durable::harness::NestedToolExecutionResult, SessionError> {
+        unimplemented!("execute_tool is not used by the tool tests")
+    }
 }
 
 /// Run `tool` against `env`, returning the result, streamed output and
@@ -222,7 +243,7 @@ pub async fn run_tool(
 /// Text of a tool result's content.
 pub fn text_output(result: &ToolExecutionResult) -> String {
     result
-        .content
+        .output
         .as_ref()
         .map(|content| {
             content

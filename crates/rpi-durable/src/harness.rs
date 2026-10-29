@@ -59,12 +59,13 @@ pub use inbox::{
     apply_boundary, entry_from_json, entry_to_json, is_stale, prepare_boundary, remove_inbox_item,
     withdraw_queued_inputs,
 };
-pub use json::{assign_json, assign_json_index};
+pub use json::{assign_json, assign_json_index, json_equal};
 pub use live::{
-    COMPACTION_TASK_KIND, LIVE_DOC, LiveGeneration, LiveRun, LiveState, RUN_TASK_KINDS,
-    SchedulerOutcome, TOOL_TASK_KIND, ToolSlot, ToolSlotStatus, add_compaction_status,
-    clear_progress, compaction_status, end_run, finish_slot, remove_compaction_status,
-    settle_scheduler_outcome, tool_slot,
+    COMPACTION_TASK_KIND, LIVE_DOC, LiveGeneration, LiveRun, LiveSlot, LiveState, NestedToolSlot,
+    NestedToolSummary, RUN_TASK_KINDS, SchedulerOutcome, SlotProgress, SlotSnapshot,
+    TOOL_TASK_KIND, ToolSlot, ToolSlotStatus, add_compaction_status, clear_progress,
+    compaction_status, end_run, finish_slot, remove_compaction_status, remove_nested_slots,
+    settle_scheduler_outcome, tool_slot, tool_slot_mut, tool_slot_snapshot,
 };
 pub use output::{OutputBuffer, Progress, bound_output, sanitize_output};
 pub use prompt::{plan_system_entries, render_sections, replay_sections};
@@ -79,7 +80,10 @@ pub use scheduler::{
 };
 pub use submissions::{SubmissionHandle, Submissions, admit_submission, is_settled};
 pub use task_graph::{TaskGraph, TaskGraphNode, TaskGraphState, TaskGraphView, TaskGraphWatch};
-pub use tool::{ToolTask, append_tool_result, harness_error};
+pub use tool::{
+    NESTED_CALL_DOC, NestedCallState, ToolCheckpoint, ToolTask, ToolTaskInput, ToolTaskResult,
+    append_tool_result, harness_error,
+};
 pub use types::{
     Agent, AgentChange, AgentState, AnyTask, AnyTaskDef, BlockedReason, CompactionPolicy,
     CompactionReason, CompactionResult, ContinueInput, Conversation, ConversationAbortOptions,
@@ -87,14 +91,16 @@ pub use types::{
     DeferredWindow, EnvFactory, EnvTarget, ExecutionEnv, Extension, ExtensionsChange,
     ExtensionsEdit, ExtensionsSelection, GenerationHooks, Harness, HarnessInspection,
     HarnessOptions, HarnessSettings, HookApi, HookHandlers, HookRegistration, InputSubmissionDraft,
-    Migration, ModelRef, NextTaskState, PromptInput, PromptRender, PromptSection, QueueMode,
-    Registry, RegistryError, RegistryListener, RegistryReader, RegistrySnapshot, ReportFn,
-    RequestMessages, RootOptions, RunningTask, Scheduling, Settings, SettledSubmissionRecord,
-    SettledTask, Submission, SubmissionAbort, SubmissionAbortResult, SubmissionDraft, TaskAbort,
-    TaskCommitFn, TaskDefinition, TaskInspection, TaskInspectionState, TaskRuntime, ToolCommitFn,
-    ToolControl, ToolDiagnostic, ToolExecute, ToolExecuteError, ToolExecutionApi,
-    ToolExecutionMode, ToolExecutionResult, ToolRegistration, ToolReplay, ToolsChange,
-    ToolsSelection, UserInput, WhenBusy, Wrap, WriteSubmissionDraft,
+    Migration, ModelRef, ModelToolsChange, ModelToolsSelection, NestedCallOptions,
+    NestedCallParent, NestedToolExecutionResult, NextTaskState, PromptInput, PromptRender,
+    PromptSection, QueueMode, Registry, RegistryError, RegistryListener, RegistryReader,
+    RegistrySnapshot, ReportFn, RequestMessages, RetainedOutput, RootOptions, RunningTask,
+    Scheduling, Settings, SettledSubmissionRecord, SettledTask, Submission, SubmissionAbort,
+    SubmissionAbortResult, SubmissionDraft, TaskAbort, TaskCommitFn, TaskDefinition,
+    TaskInspection, TaskInspectionState, TaskRuntime, ToolCaller, ToolCommitFn, ToolControl,
+    ToolDiagnostic, ToolExecute, ToolExecuteError, ToolExecutionApi, ToolExecutionMode,
+    ToolExecutionResult, ToolHookCall, ToolRegistration, ToolReplay, ToolsChange, ToolsSelection,
+    UserInput, WhenBusy, Wrap, WriteSubmissionDraft,
 };
 pub use usage::{USAGE_DOC, UsageBucket, UsageState, add_usage, add_usage_state, record_usage};
 pub use util::{WaitError, WaitFuture, Waiters, closed_error, scan_all};

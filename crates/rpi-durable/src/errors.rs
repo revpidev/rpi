@@ -9,9 +9,10 @@ use crate::ids::{ConversationId, Id};
 /// Failure modes raised by [`crate::storage::Storage`] implementations.
 #[derive(Debug, Error)]
 pub enum StorageError {
-    /// Storage rejected a batch before any durable effect (upstream `StorageRejected`).
+    /// Invalid request, such as an unknown conversation or a cursor from
+    /// another scan (upstream `StorageRequestError`).
     #[error("{0}")]
-    Rejected(String),
+    Request(StorageRequestError),
 
     /// Generic validation failure; the message mirrors the upstream `Error`.
     #[error("{0}")]
@@ -187,7 +188,37 @@ pub enum FileErrorCode {
     Unknown,
 }
 
-/// Upstream `StorageRejected` marker used by error-matching tests.
-pub type StorageRejected = StorageError;
+/// A Storage read rejected an invalid request with no durable effect. Unlike
+/// any other error a Storage throws, it fails only that read, not the Session;
+/// from `commit()` it is fatal like any other.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message}")]
+pub struct StorageRequestError {
+    /// Human-readable message.
+    pub message: String,
+}
+
+impl StorageRequestError {
+    /// Build a request error with the upstream message text.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl StorageError {
+    /// Whether this error marks an invalid read that fails only its call.
+    pub fn is_request(&self) -> bool {
+        matches!(
+            self,
+            StorageError::Request(_)
+                | StorageError::UnknownConversation(_)
+                | StorageError::InvalidCursor
+                | StorageError::CursorOrder { .. }
+        )
+    }
+}
+
 /// Convenience result alias.
 pub type StorageResult<T> = Result<T, StorageError>;

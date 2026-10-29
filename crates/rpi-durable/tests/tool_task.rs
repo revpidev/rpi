@@ -57,6 +57,9 @@ fn tool_extension(name: &str, parameters: serde_json::Value) -> Extension {
             execution_mode: None,
             prepare_arguments: None,
             output_limits: None,
+            structured_output_schema: None,
+            callers: None,
+            deferred: false,
             execute: Arc::new(ReportingTool),
         }],
         ..Extension::default()

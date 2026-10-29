@@ -28,6 +28,7 @@ use crate::ids::{ConversationId, Seq, TaskId};
 use crate::types::{DocumentCopySource, DocumentRecord, StorageWrite};
 
 pub mod forks;
+pub mod guarded;
 pub mod observation;
 // The design keeps the kernel in `session/session.rs` (frozen layout); Clippy's
 // `module_inception` is a style lint for the resulting `session::session` path.
@@ -89,10 +90,13 @@ pub enum SessionError {
     /// `"Session is closed"`).
     #[error("Session is closed")]
     Closed,
-    /// A commit failed after storage admitted it (or adoption failed); the
-    /// in-memory cache may lag durable state, so the session must be reopened.
-    #[error("Session is poisoned by a failed commit after storage admission; reopen it")]
-    Poisoned,
+    /// The Session failed after a storage error; nothing runs or commits any
+    /// more. Reopen the Session to recover from what was committed.
+    #[error("Session failed after a storage error; close and reopen it")]
+    Failed {
+        /// The first error's message.
+        cause: String,
+    },
     /// Storage failure surfaced unchanged (including `Rejected` and
     /// `ReadAfterWrite`).
     #[error(transparent)]
@@ -125,6 +129,18 @@ impl SessionError {
 
 /// Result alias for session operations.
 pub type SessionResult<T> = Result<T, SessionError>;
+
+/// How a Session ended (upstream `SessionEnd`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// Closed by its host.
+    Closed,
+    /// Failed after a storage error; carries the first error's message.
+    Failed {
+        /// First error's message.
+        error: String,
+    },
+}
 
 /// Owner argument of a typed document access (upstream `doc`/`snapshot` overload
 /// arguments).

@@ -163,7 +163,7 @@ async fn read_text(
     if let Some(mime_type) = mime_type {
         // Image content is not supported yet.
         return Ok(ToolExecutionResult {
-            content: Some(Vec::new()),
+            output: Some(Vec::new()),
             is_error: Some(true),
             diagnostics: Some(vec![ToolDiagnostic {
                 severity: DiagnosticSeverity::Error,
@@ -342,7 +342,7 @@ async fn read_text(
     }
 
     Ok(ToolExecutionResult {
-        content: Some(if output_text.is_empty() {
+        output: Some(if output_text.is_empty() {
             Vec::new()
         } else {
             vec![ToolResultContent::Text(TextContent {
@@ -451,6 +451,9 @@ pub fn create_read_tool() -> ToolRegistration {
         execution_mode: None,
         prepare_arguments: None,
         output_limits: None,
+        structured_output_schema: None,
+        callers: None,
+        deferred: false,
         execute: Arc::new(ReadTool),
     }
 }
@@ -547,7 +550,7 @@ mod tests {
             .expect("read");
         assert_eq!(
             result
-                .content
+                .output
                 .as_ref()
                 .and_then(|content| content.first())
                 .map(|part| match part {

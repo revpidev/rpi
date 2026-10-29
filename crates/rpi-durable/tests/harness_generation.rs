@@ -349,6 +349,9 @@ fn echo_extension() -> Extension {
             execution_mode: None,
             prepare_arguments: None,
             output_limits: None,
+            structured_output_schema: None,
+            callers: None,
+            deferred: false,
             execute: Arc::new(EchoTool),
         }],
         ..Extension::default()

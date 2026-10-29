@@ -649,9 +649,11 @@ impl SqliteStorage {
             if let Some(copy) = &action.copy
                 && actions.iter().any(|(other, _)| other == &copy.id)
             {
-                return Err(StorageError::Rejected(format!(
-                    "Document copy {id} source is changed in the copy batch"
-                )));
+                return Err(StorageError::Request(
+                    crate::errors::StorageRequestError::new(format!(
+                        "Document copy {id} source is changed in the copy batch"
+                    )),
+                ));
             }
             let existing: Option<DocumentRecord> = tx
                 .get(
@@ -984,10 +986,10 @@ impl SqliteStorage {
                 }
                 .await;
                 content = Some(resolved.map_err(|error| match error {
-                    StorageError::Rejected(_) => error,
-                    other => {
-                        StorageError::Rejected(format!("Document copy {id} was rejected: {other}"))
-                    }
+                    StorageError::Request(_) => error,
+                    other => StorageError::Request(crate::errors::StorageRequestError::new(
+                        format!("Document copy {id} was rejected: {other}"),
+                    )),
                 })?);
             }
 

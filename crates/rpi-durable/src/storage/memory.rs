@@ -438,11 +438,11 @@ fn resolve_document_copies(
                 })
             };
             resolve().map_err(|error| match error {
-                StorageError::Rejected(_) => error,
-                other => StorageError::Rejected(format!(
+                StorageError::Request(_) => error,
+                other => StorageError::Request(crate::errors::StorageRequestError::new(format!(
                     "Document copy {} was rejected: {other}",
                     source.id
-                )),
+                ))),
             })
         })
         .collect()

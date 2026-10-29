@@ -9,6 +9,11 @@
 
 use crate::chord::json::JsonValue;
 
+/// Structural JSON equality; object key order does not matter.
+pub fn json_equal(a: &JsonValue, b: &JsonValue) -> bool {
+    a == b
+}
+
 /// Assign `value` at `target[key]` leaf by leaf.
 ///
 /// `target` must be a JSON object; a non-object target is left unchanged.
@@ -123,5 +128,14 @@ mod tests {
         let mut target = json!([1, 2]);
         assign_json_index(&mut target, 3, json!(4));
         assert_eq!(target, json!([1, 2, null, 4]));
+    }
+
+    #[test]
+    fn json_equality_ignores_object_key_order() {
+        assert!(json_equal(
+            &json!({"a": 1, "b": [2]}),
+            &json!({"b": [2], "a": 1})
+        ));
+        assert!(!json_equal(&json!({"a": 1}), &json!({"a": 2})));
     }
 }

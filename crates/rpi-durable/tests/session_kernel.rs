@@ -13,9 +13,11 @@ use rpi_durable::chord::context::BACKGROUND_CONTEXT;
 use rpi_durable::chord::delta::Op;
 use rpi_durable::chord::json::{JsonObject, JsonValue};
 use rpi_durable::documents::{DocDefinition, DocScope, DocToken, define_doc, define_doc_family};
-use rpi_durable::errors::StorageError;
+use rpi_durable::errors::{StorageError, StorageRequestError};
 use rpi_durable::ids::EntryId;
-use rpi_durable::session::{DocOwner, SessionError, WatchEnd, commit_fn, watch_listener};
+use rpi_durable::session::{
+    DocOwner, SessionEnd, SessionError, WatchEnd, commit_fn, watch_listener,
+};
 use rpi_durable::types::{DocumentFork, DocumentHistory};
 
 use session_support::{
@@ -196,14 +198,16 @@ async fn callback_failure_leaves_nothing() {
     assert!(snapshot.is_none());
 }
 
-/// session-forks.test.ts:553 rolls back a guaranteed Storage rejection without poisoning.
+/// V18-06 R-D11: a StorageRequestError from `commit()` is fatal like any other
+/// storage error; the calling commit gets the backend's error, later calls get
+/// SessionFailed.
 #[tokio::test]
-async fn storage_rejection_leaves_session_usable() {
+async fn storage_request_error_from_commit_fails_the_session() {
     let harness = open_test_session();
     let conversation = create_conversation(&harness.session).await;
-    harness
-        .storage
-        .fail_next_commit(StorageError::Rejected("copy rejected".to_string()));
+    harness.storage.fail_next_commit(StorageError::Request(
+        rpi_durable::errors::StorageRequestError::new("copy rejected"),
+    ));
     let result = try_commit(&harness.session, move |tx| {
         Box::pin(async move {
             let draft = tx
@@ -220,39 +224,29 @@ async fn storage_rejection_leaves_session_usable() {
     .await;
     assert!(matches!(
         result,
-        Err(SessionError::Storage(StorageError::Rejected(_)))
+        Err(SessionError::Storage(StorageError::Request(_)))
     ));
-    // The session stays usable.
-    commit(&harness.session, move |tx| {
-        Box::pin(async move {
-            let draft = tx
-                .doc(live(), DocOwner::Conversation(conversation), None)
-                .await?;
-            draft
-                .write()?
-                .as_object_mut()
-                .unwrap()
-                .insert("message".into(), serde_json::json!("kept"));
-            Ok(())
-        })
-    })
-    .await;
-    let snapshot = harness
-        .session
-        .snapshot(
-            live(),
-            DocOwner::Conversation(conversation),
-            &BACKGROUND_CONTEXT,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(snapshot["message"], serde_json::json!("kept"));
+    // Nothing retries; the Session failed.
+    assert!(matches!(
+        harness
+            .session
+            .snapshot(
+                live(),
+                DocOwner::Conversation(conversation),
+                &BACKGROUND_CONTEXT
+            )
+            .await,
+        Err(SessionError::Failed { .. })
+    ));
+    assert!(matches!(
+        try_commit(&harness.session, |_tx| Box::pin(async { Ok(()) })).await,
+        Err(SessionError::Failed { .. })
+    ));
 }
 
-/// session-documents.test.ts:440 poisons the Session after an uncertain Storage failure.
+/// session-documents.test.ts:440 fails the Session after an uncertain Storage failure.
 #[tokio::test]
-async fn non_rejected_storage_error_poisons() {
+async fn storage_error_fails_the_session() {
     let harness = open_test_session();
     let conversation = create_conversation(&harness.session).await;
     harness
@@ -282,11 +276,11 @@ async fn non_rejected_storage_error_poisons() {
                 &BACKGROUND_CONTEXT
             )
             .await,
-        Err(SessionError::Poisoned)
+        Err(SessionError::Failed { .. })
     ));
     assert!(matches!(
         try_commit(&harness.session, |_tx| Box::pin(async { Ok(()) })).await,
-        Err(SessionError::Poisoned)
+        Err(SessionError::Failed { .. })
     ));
 }
 
@@ -1539,4 +1533,209 @@ async fn snapshot_as_of_reads_history() {
             .unwrap()["value"],
         serde_json::json!("old")
     );
+}
+
+// ─── Group 12: storage failures end the Session (V18-06 R-D11) ────────────
+
+/// R-D11: a `StorageRequestError` from a read fails only that call; the Session
+/// stays usable.
+#[tokio::test]
+async fn read_request_error_fails_only_its_call() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    harness
+        .storage
+        .fail_next_read(StorageError::Request(StorageRequestError::new(
+            "invalid cursor",
+        )));
+    let result = harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(SessionError::Storage(StorageError::Request(_)))
+    ));
+    // The Session is still healthy: a commit and a later read succeed.
+    commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft
+                .write()?
+                .as_object_mut()
+                .unwrap()
+                .insert("message".into(), serde_json::json!("kept"));
+            Ok(())
+        })
+    })
+    .await;
+    assert!(harness.session.failure().is_none());
+}
+
+/// R-D11: any other read error fails the Session; later calls and `closed`
+/// report `SessionFailed`.
+#[tokio::test]
+async fn other_read_error_fails_the_session() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    harness
+        .storage
+        .fail_next_read(StorageError::message("disk vanished"));
+    let result = harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(SessionError::Storage(StorageError::Message(_)))
+    ));
+    assert!(matches!(
+        harness
+            .session
+            .snapshot(
+                live(),
+                DocOwner::Conversation(conversation),
+                &BACKGROUND_CONTEXT
+            )
+            .await,
+        Err(SessionError::Failed { .. })
+    ));
+    assert_eq!(
+        harness.session.closed().await,
+        SessionEnd::Failed {
+            error: "disk vanished".to_string()
+        }
+    );
+}
+
+/// R-D11: a normal close ends `Session.closed` with `closed`.
+#[tokio::test]
+async fn normal_close_reports_closed() {
+    let harness = open_test_session();
+    harness
+        .session
+        .close(&BACKGROUND_CONTEXT)
+        .await
+        .expect("close");
+    assert_eq!(harness.session.closed().await, SessionEnd::Closed);
+}
+
+/// R-D11: a failed Session ends its watch with `session_failed`, not
+/// `session_closed`.
+#[tokio::test]
+async fn failed_session_ends_watch_with_session_failed() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    commit(&harness.session, {
+        move |tx| {
+            Box::pin(async move {
+                let draft = tx
+                    .doc(live(), DocOwner::Conversation(conversation), None)
+                    .await?;
+                draft
+                    .write()?
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("message".into(), serde_json::json!("watched"));
+                Ok(())
+            })
+        }
+    })
+    .await;
+    let watch = harness
+        .session
+        .watch_doc(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("watch")
+        .expect("document");
+    harness.session.fail("platform reset");
+    assert_eq!(
+        watch.closed().await,
+        WatchEnd::SessionFailed {
+            error: "platform reset".to_string()
+        }
+    );
+}
+
+/// R-D11: a host `subscribeCommits` listener's panic is contained and reported,
+/// and does not fail the Session.
+#[tokio::test]
+async fn host_commit_listener_panic_is_contained() {
+    let harness = open_test_session();
+    let reported = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&reported);
+    harness
+        .session
+        .set_failure_reporter(Arc::new(move |message| {
+            sink.lock().expect("reported").push(message);
+        }));
+    let _subscription = harness.session.subscribe_commits(Arc::new(|_, _| {
+        panic!("listener exploded");
+    }));
+    let conversation = create_conversation(&harness.session).await;
+    commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft
+                .write()?
+                .as_object_mut()
+                .unwrap()
+                .insert("message".into(), serde_json::json!("ok"));
+            Ok(())
+        })
+    })
+    .await;
+    assert!(harness.session.failure().is_none());
+    assert!(
+        reported
+            .lock()
+            .expect("reported")
+            .iter()
+            .any(|message| message.contains("commit listener failed")),
+        "got {reported:?}"
+    );
+}
+
+/// R-D11: a component commit listener's panic fails the Session.
+#[tokio::test]
+async fn internal_commit_listener_panic_fails_the_session() {
+    let harness = open_test_session();
+    let _subscription = harness.session.subscribe_internal_commits(Arc::new(|_, _| {
+        panic!("component exploded");
+    }));
+    let conversation = create_conversation(&harness.session).await;
+    let _ = try_commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft
+                .write()?
+                .as_object_mut()
+                .unwrap()
+                .insert("message".into(), serde_json::json!("ok"));
+            Ok(())
+        })
+    })
+    .await;
+    assert!(matches!(
+        try_commit(&harness.session, |_tx| Box::pin(async { Ok(()) })).await,
+        Err(SessionError::Failed { .. })
+    ));
 }

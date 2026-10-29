@@ -16,8 +16,8 @@ use crate::chord::json::JsonObject;
 use crate::documents::{DocDefinition, DocScope, DocToken, define_doc};
 use crate::harness::types::{
     Agent, AgentChange, AgentState, ExtensionsChange, ExtensionsSelection, HookHandlers,
-    PromptSection, ReportFn, Settings, ToolRegistration, ToolsChange, ToolsSelection, Wrap,
-    read_state, write_state,
+    ModelToolsChange, ModelToolsSelection, PromptSection, ReportFn, Settings, ToolCaller,
+    ToolRegistration, ToolsChange, ToolsSelection, Wrap, read_state, write_state,
 };
 use crate::ids::ConversationId;
 use crate::session::{DocOwner, SessionResult, Transaction};
@@ -192,6 +192,22 @@ pub fn apply_change(state: &mut AgentState, change: &AgentChange) {
             }),
         };
     }
+    if let Some(model_tools) = &change.model_tools {
+        state.model_tools = match model_tools {
+            None => None,
+            Some(ModelToolsChange::List(list)) => Some(ModelToolsSelection::List(
+                list.iter().map(|tool| tool.name().to_string()).collect(),
+            )),
+            Some(ModelToolsChange::Edit { remove, add }) => Some(ModelToolsSelection::Edit {
+                remove: remove
+                    .as_ref()
+                    .map(|list| list.iter().map(|tool| tool.name().to_string()).collect()),
+                add: add
+                    .as_ref()
+                    .map(|list| list.iter().map(|tool| tool.name().to_string()).collect()),
+            }),
+        };
+    }
     if let Some(instructions) = &change.instructions {
         state.instructions = instructions.clone();
     }
@@ -200,9 +216,12 @@ pub fn apply_change(state: &mut AgentState, change: &AgentChange) {
     }
 }
 
-/// `addTools` of a tool round: an array gets each name it lacks appended,
-/// `{ remove }` loses the names, and unset tools already offer every tool, so
-/// nothing is written.
+/// `addTools` of a tool round, applied to `tools` and `modelTools`, so the next
+/// request offers the tools: an array gets each name it lacks appended, and
+/// `{ remove }` loses the names. An unset `tools` already enables every tool, so
+/// nothing is written for it. An unset or object `modelTools` also gets each name
+/// appended to its `add`, which loads deferred tools and has no effect for
+/// others.
 pub async fn add_tools(
     tx: &mut Transaction,
     conversation_id: ConversationId,
@@ -214,7 +233,7 @@ pub async fn add_tools(
     let mut state: AgentState = read_state(&draft)?;
     let mut changed = false;
     match &mut state.tools {
-        None => return Ok(()),
+        None => {}
         Some(ToolsSelection::List(list)) => {
             for name in added {
                 if !list.contains(name) {
@@ -223,9 +242,51 @@ pub async fn add_tools(
                 }
             }
         }
-        Some(ToolsSelection::Remove { remove }) => {
-            if added.iter().any(|name| remove.contains(name)) {
-                remove.retain(|name| !added.contains(name));
+        Some(ToolsSelection::Remove { remove })
+            if added.iter().any(|name| remove.contains(name)) =>
+        {
+            remove.retain(|name| !added.contains(name));
+            changed = true;
+        }
+        Some(ToolsSelection::Remove { .. }) => {}
+    }
+    match &mut state.model_tools {
+        Some(ModelToolsSelection::List(list)) => {
+            for name in added {
+                if !list.contains(name) {
+                    list.push(name.clone());
+                    changed = true;
+                }
+            }
+        }
+        filter => {
+            let (remove, add) = match filter {
+                Some(ModelToolsSelection::Edit { remove, add }) => (
+                    remove.clone().unwrap_or_default(),
+                    add.clone().unwrap_or_default(),
+                ),
+                _ => (Vec::new(), Vec::new()),
+            };
+            let remove: Vec<String> = remove
+                .into_iter()
+                .filter(|name| !added.contains(name))
+                .collect();
+            let mut add = add;
+            for name in added {
+                if !add.contains(name) {
+                    add.push(name.clone());
+                }
+            }
+            let next = ModelToolsSelection::Edit {
+                remove: if remove.is_empty() {
+                    None
+                } else {
+                    Some(remove)
+                },
+                add: Some(add),
+            };
+            if state.model_tools.as_ref() != Some(&next) {
+                state.model_tools = Some(next);
                 changed = true;
             }
         }
@@ -314,29 +375,29 @@ pub fn resolve_agent(
         }
     }
 
-    let tools = match state.and_then(|state| state.tools.as_ref()) {
-        None => composed.into_iter().map(|(_, tool)| tool).collect(),
-        Some(ToolsSelection::List(list)) => {
-            let mut selected = Vec::new();
-            let mut seen: HashSet<&String> = HashSet::new();
-            for name in list {
-                if seen.insert(name)
-                    && let Some((_, tool)) = composed.iter().find(|(key, _)| key == name)
-                {
-                    selected.push(tool.clone());
-                }
-            }
-            selected
-        }
-        Some(ToolsSelection::Remove { remove }) => {
-            let removed: HashSet<&String> = remove.iter().collect();
-            composed
-                .into_iter()
-                .filter(|(name, _)| !removed.contains(name))
-                .map(|(_, tool)| tool)
-                .collect()
-        }
-    };
+    let enabled = filter_tools(
+        composed.into_iter().map(|(_, tool)| tool).collect(),
+        state.and_then(|state| state.tools.as_ref()),
+    );
+    let model_callable: Vec<ToolRegistration> = enabled
+        .iter()
+        .filter(|tool| tool.callable_by(ToolCaller::Model))
+        .cloned()
+        .collect();
+    let tools = offered_tools(
+        model_callable.clone(),
+        state.and_then(|state| state.model_tools.as_ref()),
+    );
+    let offered: HashSet<String> = tools.iter().map(|tool| tool.name().to_string()).collect();
+    let deferred: Vec<ToolRegistration> = model_callable
+        .iter()
+        .filter(|tool| tool.deferred && !offered.contains(tool.name()))
+        .cloned()
+        .collect();
+    let callable: Vec<ToolRegistration> = enabled
+        .into_iter()
+        .filter(|tool| tool.callable_by(ToolCaller::Tools))
+        .collect();
 
     let instructions = state.and_then(|state| state.instructions.clone());
     let mut agent_sections: Vec<PromptSection> =
@@ -360,9 +421,76 @@ pub fn resolve_agent(
             .unwrap_or(ModelThinkingLevel::Off),
         extensions,
         tools,
+        callable,
+        deferred,
         sections: agent_sections,
         instructions,
         cwd: state.and_then(|state| state.cwd.clone()),
+    }
+}
+
+/// `tools` through a stored filter: an array selects exactly its names, in its
+/// order; `{ remove }` drops names.
+fn filter_tools(
+    tools: Vec<ToolRegistration>,
+    filter: Option<&ToolsSelection>,
+) -> Vec<ToolRegistration> {
+    match filter {
+        None => tools,
+        Some(ToolsSelection::List(list)) => {
+            let mut seen: HashSet<&String> = HashSet::new();
+            list.iter()
+                .filter(|name| seen.insert(name))
+                .filter_map(|name| tools.iter().find(|tool| tool.name() == name).cloned())
+                .collect()
+        }
+        Some(ToolsSelection::Remove { remove }) => {
+            let removed: HashSet<&String> = remove.iter().collect();
+            tools
+                .into_iter()
+                .filter(|tool| !removed.contains(&tool.name().to_string()))
+                .collect()
+        }
+    }
+}
+
+/// The tools offered to the model, as `AgentState.modelTools` describes.
+fn offered_tools(
+    tools: Vec<ToolRegistration>,
+    filter: Option<&ModelToolsSelection>,
+) -> Vec<ToolRegistration> {
+    match filter {
+        Some(ModelToolsSelection::List(list)) => {
+            let mut seen: HashSet<&String> = HashSet::new();
+            list.iter()
+                .filter(|name| seen.insert(name))
+                .filter_map(|name| tools.iter().find(|tool| tool.name() == name).cloned())
+                .collect()
+        }
+        Some(ModelToolsSelection::Edit { remove, add }) => {
+            let removed: HashSet<&String> = remove.iter().flatten().collect();
+            let mut kept: Vec<ToolRegistration> = tools
+                .iter()
+                .filter(|tool| !tool.deferred && !removed.contains(&tool.name().to_string()))
+                .cloned()
+                .collect();
+            // Loaded deferred tools follow in load order, so loading one appends
+            // to the declared tools.
+            let mut seen: HashSet<&String> = HashSet::new();
+            for name in add.iter().flatten() {
+                if !seen.insert(name) || removed.contains(name) {
+                    continue;
+                }
+                if let Some(tool) = tools
+                    .iter()
+                    .find(|tool| tool.name() == name && tool.deferred)
+                {
+                    kept.push(tool.clone());
+                }
+            }
+            kept
+        }
+        None => tools.into_iter().filter(|tool| !tool.deferred).collect(),
     }
 }
 
@@ -498,6 +626,9 @@ mod tests {
             execution_mode: None,
             prepare_arguments: None,
             output_limits: None,
+            structured_output_schema: None,
+            callers: None,
+            deferred: false,
             execute: Arc::new(NoopTool),
         }
     }
@@ -784,6 +915,109 @@ mod tests {
         assert_eq!(
             state.tools,
             Some(ToolsSelection::List(vec!["x".to_string(), "y".to_string()]))
+        );
+    }
+
+    fn tool_with(name: &str, callers: Option<Vec<ToolCaller>>, deferred: bool) -> ToolRegistration {
+        let mut registration = tool(name, "");
+        registration.callers = callers;
+        registration.deferred = deferred;
+        registration
+    }
+
+    #[test]
+    fn deferred_tools_are_hidden_until_model_tools_loads_them() {
+        let extension = crate::harness::types::Extension {
+            name: "ext".to_string(),
+            tools: vec![
+                tool_with("plain", None, false),
+                tool_with("hidden", None, true),
+                tool_with("script_only", Some(vec![ToolCaller::Tools]), false),
+                tool_with("model_only", Some(vec![ToolCaller::Model]), false),
+            ],
+            ..Default::default()
+        };
+        let report: ReportFn = Arc::new(|_| {});
+        let registry = snapshot(vec![extension.clone()]);
+        let settings = resolve_settings(None);
+
+        let agent = resolve_agent(None, registry.as_ref(), &settings, &report);
+        assert_eq!(
+            agent
+                .tools
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>(),
+            vec!["plain", "model_only"]
+        );
+        assert_eq!(
+            agent
+                .deferred
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>(),
+            vec!["hidden"]
+        );
+        assert_eq!(
+            agent
+                .callable
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>(),
+            vec!["plain", "hidden", "script_only"]
+        );
+
+        // An object filter loads the deferred tool after the declared ones.
+        let state = AgentState {
+            model_tools: Some(ModelToolsSelection::Edit {
+                remove: None,
+                add: Some(vec!["hidden".to_string(), "script_only".to_string()]),
+            }),
+            ..AgentState::default()
+        };
+        let agent = resolve_agent(Some(&state), registry.as_ref(), &settings, &report);
+        assert_eq!(
+            agent
+                .tools
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>(),
+            vec!["plain", "model_only", "hidden"]
+        );
+        assert!(agent.deferred.is_empty());
+
+        // An array filter offers exactly those tools, deferred ones too.
+        let state = AgentState {
+            model_tools: Some(ModelToolsSelection::List(vec![
+                "hidden".to_string(),
+                "plain".to_string(),
+            ])),
+            ..AgentState::default()
+        };
+        let agent = resolve_agent(Some(&state), registry.as_ref(), &settings, &report);
+        assert_eq!(
+            agent
+                .tools
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>(),
+            vec!["hidden", "plain"]
+        );
+    }
+
+    #[test]
+    fn add_tools_also_loads_deferred_tools_into_model_tools() {
+        let mut state = AgentState::default();
+        apply_change(
+            &mut state,
+            &AgentChange {
+                model_tools: Some(Some(ModelToolsChange::List(vec![tool("a", "")]))),
+                ..AgentChange::default()
+            },
+        );
+        assert_eq!(
+            state.model_tools,
+            Some(ModelToolsSelection::List(vec!["a".to_string()]))
         );
     }
 }

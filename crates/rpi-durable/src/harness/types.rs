@@ -345,6 +345,10 @@ pub trait TaskRuntime: Send + Sync {
     async fn provider_session_id(&self, context: &Context) -> SessionResult<String>;
     /// Committed task record.
     async fn get_task(&self, id: TaskId, context: &Context) -> SessionResult<Option<TaskRecord>>;
+    /// Live tasks this task directly owns, as a copy.
+    async fn owned_tasks(&self, context: &Context) -> SessionResult<Vec<TaskRecord>>;
+    /// Abort `id` and wait until it is terminal.
+    async fn abort_owned(&self, id: TaskId, context: &Context) -> SessionResult<()>;
     /// Resolve with a task's terminal receipt; rejects when the invocation ends.
     async fn wait_for_task(
         &self,
@@ -521,15 +525,21 @@ pub struct ToolDiagnostic {
     pub code: Option<String>,
 }
 
-/// Result of one tool execution.
+/// Result of one tool execution, on three channels: `output` for the model,
+/// `structured_output` for programs that call the tool, and `details` for UIs.
 // FORM: upstream is generic over `TDetails` and omits absent fields; Rust fixes
 // details to `JsonValue` and represents absent fields as `None`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionResult {
-    /// Omitted: the retained `output()` text becomes the content.
+    /// Omitted: the retained `output()` text becomes the output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<Vec<ToolResultContent>>,
+    pub output: Option<Vec<ToolResultContent>>,
+    /// For programs: required unless `is_error` when the tool declares a
+    /// `structuredOutputSchema`, and validated against it; not allowed without
+    /// one, where programs receive the output itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<JsonValue>,
     /// Whether the result is an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
@@ -545,6 +555,35 @@ pub struct ToolExecutionResult {
     /// Post-tools controls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<ToolControl>,
+}
+
+/// Result of a nested call, as `executeTool()` returns it. Programs read
+/// `structured_output`; the output for the model is not kept, and `control`
+/// does not apply.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedToolExecutionResult {
+    /// The nested call's tool task.
+    pub task_id: TaskId,
+    /// The tool's value for programs; absent on an error result the Harness
+    /// wrote itself (unavailable, invalid, blocked, interrupted, aborted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<JsonValue>,
+    /// Whether the result is an error.
+    pub is_error: bool,
+    /// UI details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<JsonValue>,
+    /// Diagnostics, including what went wrong for a Harness error.
+    #[serde(default)]
+    pub diagnostics: Vec<ToolDiagnostic>,
+    /// Spend of the execution itself; already counted under the nested tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    /// Execution time of the attempt that produced the result; absent when it
+    /// never executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// What an environment dropped before one output chunk; the V17-15 env
@@ -625,6 +664,17 @@ pub enum ToolReplay {
     Unsafe,
 }
 
+/// Who may call a tool: the model, other tools through `executeTool()`, or
+/// both (default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolCaller {
+    /// The model may call the tool.
+    Model,
+    /// Other tools (nested calls, code mode) may call the tool.
+    Tools,
+}
+
 /// Executable tool registered in a registry.
 ///
 /// Only the pi-ai [`Tool`] fields enter the transcript; the extra fields drive
@@ -644,6 +694,14 @@ pub struct ToolRegistration {
         Option<Arc<dyn Fn(&JsonValue) -> Result<JsonValue, String> + Send + Sync>>,
     /// Bounds retained for this tool's running output.
     pub output_limits: Option<OutputLimits>,
+    /// Schema of `structuredOutput`, which programs that call the tool receive.
+    /// Omitted: they receive the result's bounded output.
+    pub structured_output_schema: Option<JsonValue>,
+    /// Who may call the tool; absent: the model and other tools.
+    pub callers: Option<Vec<ToolCaller>>,
+    /// Not offered to the model until loaded through `modelTools`; other tools
+    /// can call it any time.
+    pub deferred: bool,
     /// Executable body.
     pub execute: Arc<dyn ToolExecute>,
 }
@@ -662,6 +720,14 @@ impl ToolRegistration {
     /// Tool name.
     pub fn name(&self) -> &str {
         &self.tool.name
+    }
+
+    /// Whether `caller` may call this tool (upstream `callers` default both).
+    pub fn callable_by(&self, caller: ToolCaller) -> bool {
+        match &self.callers {
+            None => true,
+            Some(callers) => callers.contains(&caller),
+        }
     }
 }
 
@@ -924,6 +990,25 @@ pub enum ToolsSelection {
     },
 }
 
+/// Stored filter of the enabled model-callable tools one conversation offers.
+/// Never widens: other tools can still call the ones it leaves out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ModelToolsSelection {
+    /// Offer exactly these tools, in order, deferred ones too.
+    List(Vec<String>),
+    /// Every non-deferred tool except `remove`, then the deferred tools in
+    /// `add`, in add order.
+    Edit {
+        /// Names removed from the offered set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remove: Option<Vec<String>>,
+        /// Deferred tool names loaded into the offered set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        add: Option<Vec<String>>,
+    },
+}
+
 /// Stored choices of one conversation; names, not objects.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -940,6 +1025,9 @@ pub struct AgentState {
     /// Tool filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsSelection>,
+    /// Filter of the enabled model-callable tools the model is offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_tools: Option<ModelToolsSelection>,
     /// Free-form instructions rendered as the section `instructions`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
@@ -975,6 +1063,20 @@ pub enum ToolsChange {
     Remove(Vec<ToolRegistration>),
 }
 
+/// Model-tools change carried by [`AgentChange`].
+#[derive(Clone)]
+pub enum ModelToolsChange {
+    /// Replace the stored filter with exactly these tools, in order.
+    List(Vec<ToolRegistration>),
+    /// Edit the stored filter: remove and/or add deferred tools.
+    Edit {
+        /// Removed tools.
+        remove: Option<Vec<ToolRegistration>>,
+        /// Added (deferred) tools.
+        add: Option<Vec<ToolRegistration>>,
+    },
+}
+
 /// A change to `pi.agent`: a given field replaces the stored one, `null` clears
 /// it, `undefined` changes nothing.
 // FORM: Rust models upstream `field?: T | null` as `Option<Option<T>>`
@@ -989,6 +1091,8 @@ pub struct AgentChange {
     pub extensions: Option<Option<ExtensionsChange>>,
     /// Tool-filter change.
     pub tools: Option<Option<ToolsChange>>,
+    /// Model-tools filter change.
+    pub model_tools: Option<Option<ModelToolsChange>>,
     /// Instructions change.
     pub instructions: Option<Option<String>>,
     /// Working-directory change.
@@ -1006,6 +1110,12 @@ pub struct Agent {
     pub extensions: Vec<Arc<Extension>>,
     /// Tools a request offers, in order.
     pub tools: Vec<ToolRegistration>,
+    /// Tools nested calls (`executeTool()`) resolve among, in order: enabled
+    /// and callable by tools.
+    pub callable: Vec<ToolRegistration>,
+    /// Enabled deferred tools the model may call and is not offered yet, in
+    /// registry order: what `tool_search` loads.
+    pub deferred: Vec<ToolRegistration>,
     /// Extension sections, then `instructions` when set.
     pub sections: Vec<PromptSection>,
     /// Free-form instructions.
@@ -1651,18 +1761,69 @@ pub trait ToolHooks: Send + Sync {
     /// Before intent; the first block wins, otherwise `arguments` replace the call's.
     async fn before_tool(
         &self,
-        call: &ToolCall,
+        call: &ToolHookCall,
         api: &dyn HookApi,
         context: &Context,
     ) -> Option<BeforeToolResult>;
     /// After execution, before the result entry; replaces the result.
     async fn after_tool(
         &self,
-        call: &ToolCall,
+        call: &ToolHookCall,
         result: ToolExecutionResult,
         api: &dyn HookApi,
         context: &Context,
     ) -> Option<ToolExecutionResult>;
+}
+
+/// `beforeTool`/`afterTool` call: the call, and for a nested call its parent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolHookCall {
+    /// The tool call as the model issued it, or as `executeTool()` made it.
+    pub call: ToolCall,
+    /// Parent of a nested call: the calling tool task and its call ID.
+    pub parent: Option<NestedCallParent>,
+}
+
+impl ToolHookCall {
+    /// A model-issued call without a parent.
+    pub fn model(call: ToolCall) -> Self {
+        Self { call, parent: None }
+    }
+
+    /// The call as hooks see it (upstream `{...call, parent}`).
+    pub fn as_call(&self) -> ToolCall {
+        self.call.clone()
+    }
+}
+
+/// Parent edge of a nested call: the calling tool task and its call ID.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedCallParent {
+    /// Calling tool task.
+    pub task_id: TaskId,
+    /// Call ID of the calling tool.
+    pub call_id: String,
+}
+
+/// Options of one `executeTool()` nested call.
+#[derive(Debug, Clone, Default)]
+pub struct NestedCallOptions {
+    /// Explicit key; by default the call's position among this invocation's
+    /// nested calls (`1`, `2`, ...).
+    pub key: Option<String>,
+    /// `false`: commit no running output, details, or diagnostics to the
+    /// nested call's slot, only its status.
+    pub progress: Option<bool>,
+}
+
+/// Output retained so far by a running tool, as the model will see it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetainedOutput {
+    /// Retained text.
+    pub text: String,
+    /// Whether earlier output was dropped.
+    pub truncated: bool,
 }
 
 /// `beforeCompact` input.
@@ -1748,10 +1909,16 @@ pub trait ToolExecutionApi: Send + Sync {
     fn models(&self) -> &Models;
     /// Environment built for this call, if any.
     fn env(&self) -> Option<Arc<dyn ExecutionEnv>>;
+    /// The Harness clock (`HarnessOptions.now`), for times a rerun after a
+    /// restart compares against; rejects once the invocation ended.
+    fn now(&self) -> Result<f64, SessionError>;
     /// Append running output; fails when the retained window cannot accept it.
     fn output(&self, chunk: &[u8], skipped: Option<OutputSkip>) -> Result<(), String>;
     /// Retained output window, if any.
     fn output_window(&self) -> Option<OutputWindow>;
+    /// The output retained so far, as the model will see it when the result
+    /// omits `output`, and whether earlier output was dropped.
+    fn retained_output(&self) -> Result<RetainedOutput, String>;
     /// Record a model-visible remark.
     fn diagnostic(&self, diagnostic: ToolDiagnostic);
     /// Replace running details.
@@ -1789,4 +1956,12 @@ pub trait ToolExecutionApi: Send + Sync {
         id: ConversationId,
         context: &Context,
     ) -> Result<Option<Arc<dyn ConversationHandle>>, SessionError>;
+    /// Run tool `name` as a nested call of this one and wait for its result.
+    async fn execute_tool(
+        &self,
+        name: &str,
+        args: JsonObject,
+        context: &Context,
+        options: NestedCallOptions,
+    ) -> Result<NestedToolExecutionResult, SessionError>;
 }
