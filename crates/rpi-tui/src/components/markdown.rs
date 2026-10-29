@@ -1263,6 +1263,19 @@ fn strike_units_parse(units: &[char]) -> bool {
     true
 }
 
+/// CommonMark backslash escape: an odd number of `\` before a delimiter
+/// keeps it literal. The fallback runs on raw source slices in the LaTeX
+/// path, so escaped delimiters must not pair.
+fn is_escaped_delimiter(chars: &[char], index: usize) -> bool {
+    let mut backslashes = 0;
+    let mut cursor = index;
+    while cursor > 0 && chars[cursor - 1] == '\\' {
+        backslashes += 1;
+        cursor -= 1;
+    }
+    backslashes % 2 == 1
+}
+
 /// CJK character class of upstream's CJK-friendly emphasis tokenizer
 /// (marked-cjk-friendly v0.1.2): Han/Kana/Hangul, CJK punctuation and
 /// fullwidth forms. Delimiters adjacent to these characters use CJK-aware
@@ -1442,7 +1455,7 @@ impl Markdown {
             let segments: Vec<&str> = text.split('\n').collect();
             segments
                 .iter()
-                .map(|segment| (style_context.apply_text)(&self.render_cjk_emphasis_text(segment)))
+                .map(|segment| (style_context.apply_text)(segment))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -1471,7 +1484,7 @@ impl Markdown {
             let token = children[position];
             let value = &token.data.borrow().value;
             match value {
-                NodeValue::Text(text) => {
+                NodeValue::Text(_) => {
                     // Escape tokens (upstream `escape`) are resolved into
                     // text nodes; re-emit the backslash when preserving.
                     let raw = node_slice(source, index, token.data.borrow().sourcepos);
@@ -1497,10 +1510,13 @@ impl Markdown {
                             break;
                         }
                     } else {
+                        // Transformed on the raw slice (escape guard), then
+                        // normalized like the old `text` path.
+                        let emphasized = self.render_cjk_emphasis_text(raw);
                         let rendered = if self.options.preserve_backslash_escapes {
-                            re_escape_backslashes(raw)
+                            re_escape_backslashes(&emphasized)
                         } else {
-                            text.to_string()
+                            resolve_backslash_escapes(&emphasized)
                         };
                         result.push_str(&apply_text_with_newlines(&rendered));
                     }
@@ -1641,7 +1657,7 @@ impl Markdown {
                 opener_end += 1;
             }
             let run_len = opener_end - index;
-            if run_len > 2 {
+            if run_len > 2 || is_escaped_delimiter(&chars, index) {
                 index = opener_end;
                 continue;
             }
@@ -1649,9 +1665,7 @@ impl Markdown {
                 .checked_sub(1)
                 .and_then(|i| chars.get(i))
                 .is_some_and(|c| is_cjk_character(*c))
-                || chars
-                    .get(opener_end)
-                    .is_some_and(|c| is_cjk_character(*c));
+                || chars.get(opener_end).is_some_and(|c| is_cjk_character(*c));
             let mut search = opener_end;
             let mut closer = None;
             while search < chars.len() {
@@ -1664,6 +1678,10 @@ impl Markdown {
                     closer_end += 1;
                 }
                 let closer_len = closer_end - search;
+                if is_escaped_delimiter(&chars, search) {
+                    search = closer_end;
+                    continue;
+                }
                 let content = &chars[opener_end..search];
                 let content_ok = !content.is_empty()
                     && !content[0].is_whitespace()
@@ -1672,9 +1690,7 @@ impl Markdown {
                     .checked_sub(1)
                     .and_then(|i| chars.get(i))
                     .is_some_and(|c| is_cjk_character(*c))
-                    || chars
-                        .get(closer_end)
-                        .is_some_and(|c| is_cjk_character(*c));
+                    || chars.get(closer_end).is_some_and(|c| is_cjk_character(*c));
                 if closer_len == run_len && content_ok && (opener_cjk || closer_cjk) {
                     closer = Some((search, closer_end));
                     break;
@@ -1709,10 +1725,14 @@ impl Markdown {
             if segment.is_empty() {
                 return;
             }
+            // Emphasis is detected on the raw source so backslash-escaped
+            // delimiters stay literal; escape resolution then runs on the
+            // styled text (the theme output contains no backslashes).
+            let emphasized = self.render_cjk_emphasis_text(segment);
             let text = if self.options.preserve_backslash_escapes {
-                re_escape_backslashes(segment)
+                re_escape_backslashes(&emphasized)
             } else {
-                resolve_backslash_escapes(segment)
+                resolve_backslash_escapes(&emphasized)
             };
             result.push_str(&apply(&text));
         };
@@ -2962,6 +2982,17 @@ mod tests {
                 "│ 1 │ 2 │",
                 "└───┴───┘"
             ]
+        );
+    }
+
+    /// Escaped delimiters stay literal even next to CJK punctuation.
+    #[test]
+    fn escaped_delimiters_next_to_cjk_stay_literal() {
+        let rendered = md("。\\*x\\*").render(80).join("\n");
+        assert_eq!(
+            rendered.trim_end(),
+            "。*x*",
+            "escaped asterisks must not become emphasis"
         );
     }
 

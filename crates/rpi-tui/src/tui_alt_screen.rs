@@ -4509,7 +4509,10 @@ mod tests {
         EnvGuard, RecordingTerminal, TestTui, VirtualTerminal, VtEvent, osc52_sequence, send_input,
         settle, state_lock,
     };
-    use crate::tui::{Focusable, SizeValue, TuiMouseEventResult, shared_component};
+    use crate::tui::{
+        CURSOR_MARKER, FAKE_CURSOR_START, Focusable, SizeValue, TuiMouseEventResult,
+        render_fake_cursor, shared_component,
+    };
     use std::sync::MutexGuard;
     use std::sync::atomic::AtomicBool;
 
@@ -7489,6 +7492,39 @@ mod tests {
             "overlay hit blocks layout dispatch: {events:?}"
         );
 
+        stop(&tui);
+    }
+
+    /// v1.2.0: in fullscreen mode the hardware cursor replaces the focused
+    /// fake cursor (the unfocused reverse-video path is covered by the main
+    /// screen test).
+    #[test]
+    fn hardware_cursor_suppresses_the_focused_fake_cursor_in_fullscreen() {
+        let terminal = RecordingTerminal::new(40, 10);
+        let tui = TuiAltScreen::with_options(
+            Box::new(terminal.clone()),
+            Some(true),
+            None,
+            TuiAltScreenOptions::default(),
+        );
+        let (component, handle) = test_text(&[format!(
+            "left{}{}right",
+            CURSOR_MARKER,
+            render_fake_cursor("Z")
+        )]);
+        tui.add_child(component.clone());
+        tui.set_focus(Some(component));
+        tui.start();
+        settle(&tui);
+        let writes = terminal.get_writes();
+        assert!(
+            !writes.contains(FAKE_CURSOR_START),
+            "markers resolved: {writes:?}"
+        );
+        assert!(!writes.contains("\x1b[7mZ"), "no double cursor: {writes:?}");
+        assert!(writes.contains("leftZright"), "text stays: {writes:?}");
+
+        let _ = handle;
         stop(&tui);
     }
 
