@@ -197,6 +197,8 @@ pub struct SchedulerDeps {
     pub set_timer: Option<crate::harness::types::SetTimer>,
     /// Host wake callback, replacing the timer for sleeping tasks.
     pub on_wake: Option<WakeFn>,
+    /// Host-owned content-free telemetry.
+    pub telemetry: Option<crate::chord::telemetry::TelemetryContext>,
     /// Context of scheduler commits and invocations, without caller cancellation.
     pub context: Context,
 }
@@ -376,6 +378,7 @@ struct SchedulerInner {
     now: NowFn,
     timers: Arc<Timers>,
     on_wake: Option<WakeFn>,
+    telemetry: crate::chord::telemetry::TelemetryContext,
     context: Context,
     /// Earliest sleep timer, without `onWake` while scheduling runs.
     wake_timer: Mutex<Option<(f64, TimerDisarm)>>,
@@ -419,6 +422,9 @@ impl SchedulerInner {
             now: deps.now,
             timers: Timers::new(deps.set_timer, Arc::clone(&deps.report)),
             on_wake: deps.on_wake,
+            telemetry: deps
+                .telemetry
+                .unwrap_or_else(crate::chord::telemetry::TelemetryContext::none),
             context: deps.context,
             wake_timer: Mutex::new(None),
             last_wake: Mutex::new(None),
@@ -1852,6 +1858,14 @@ impl SchedulerInner {
             if self.parked(&record) {
                 continue;
             }
+            if !record.abort_requested
+                && !record.background
+                && self.below_cancelled(parent_of(&record))
+            {
+                self.cascade_pending.store(true, Ordering::SeqCst);
+                self.schedule_reconcile();
+                continue;
+            }
             let mode = if record.abort_requested {
                 InvocationMode::Abort
             } else {
@@ -2040,7 +2054,11 @@ impl SchedulerInner {
         mode: InvocationMode,
     ) -> Arc<Invocation> {
         let controller = CancellationToken::new();
-        let context = with_abort_signal(controller.clone(), &self.context);
+        let context = crate::chord::context::with_context_value(
+            &crate::chord::context::TELEMETRY_CONTEXT_KEY,
+            self.telemetry.clone(),
+            &with_abort_signal(controller.clone(), &self.context),
+        );
         let (done_tx, _done_rx) = tokio::sync::watch::channel(false);
         let invocation = Arc::new(Invocation {
             task_id: record.id,
@@ -2108,6 +2126,19 @@ impl SchedulerInner {
                 snapshot: Arc::clone(&snapshot_cell),
                 agent: Arc::new(tokio::sync::OnceCell::new()),
             };
+            if runtime.inner.telemetry.enabled() {
+                runtime.inner.telemetry.set_attributes(
+                    serde_json::json!({
+                        "task.id": invocation.task_id.get(),
+                        "task.name": task.name(),
+                        "phase": phase,
+                        "kind": if invocation.mode == InvocationMode::Abort { "abort" } else { "run" },
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+                );
+            }
             let outcome = task
                 .run_phase(&phase, current, &runtime, &invocation.context)
                 .await;

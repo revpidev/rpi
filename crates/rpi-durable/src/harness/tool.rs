@@ -1693,13 +1693,13 @@ async fn read_call(
     input: &ToolTaskInput,
     context: &Context,
 ) -> SessionResult<ToolHookCall> {
-    match input {
+    let call: ToolHookCall = match input {
         ToolTaskInput::Nested {
             parent,
             parent_call_id,
             call,
             ..
-        } => Ok(ToolHookCall {
+        } => Ok::<ToolHookCall, SessionError>(ToolHookCall {
             call: call.clone(),
             parent: Some(crate::harness::types::NestedCallParent {
                 task_id: *parent,
@@ -1730,9 +1730,19 @@ async fn read_call(
             let call = call.ok_or_else(|| {
                 SessionError::message(format!("Entry {assistant} has no tool call {call_id}"))
             })?;
-            Ok(ToolHookCall::model(call))
+            Ok::<ToolHookCall, SessionError>(ToolHookCall::model(call))
         }
-    }
+    }?;
+    context.telemetry().set_attributes(
+        serde_json::json!({
+            "tool.name": call.call.name,
+            "tool.call_id": call.call.id,
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default(),
+    );
+    Ok(call)
 }
 
 async fn read_slot(

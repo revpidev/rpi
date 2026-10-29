@@ -670,6 +670,7 @@ pub async fn open_with_storage_and_settings(
         registry.install(extension).expect("install test extension");
     }
     let options = HarnessOptions {
+        telemetry: None,
         models: Models::new(None).into(),
         identity: None,
         registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,

@@ -38,6 +38,7 @@ pub mod types;
 pub mod usage;
 pub mod util;
 
+pub use crate::chord::telemetry::{TelemetryContext, TelemetrySink, durable_telemetry_schema};
 pub use agent::{
     AGENT_DOC, DEFAULT_COMPACTION_POLICY, DEFAULT_CONTEXT_RETENTION_MS, DEFAULT_PROGRESS_POLICY,
     DEFAULT_RETRY_POLICY, INSTRUCTIONS_KEY, add_tools, agent_hooks, apply_change, configure,

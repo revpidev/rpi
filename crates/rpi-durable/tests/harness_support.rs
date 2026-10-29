@@ -215,6 +215,7 @@ pub fn options() -> HarnessOptions {
         .map(|name| Arc::new(FakeTask(name)) as AnyTask)
         .collect();
     HarnessOptions {
+        telemetry: None,
         models: Models::new(None).into(),
         identity: None,
         registry: Arc::new(RegistryImpl::with_builtins(builtins)),

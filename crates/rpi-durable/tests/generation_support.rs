@@ -325,6 +325,7 @@ pub async fn open_with_sources(
     let reports = Reports::default();
     let captured = reports.clone();
     let options = HarnessOptions {
+        telemetry: None,
         models,
         identity,
         registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,

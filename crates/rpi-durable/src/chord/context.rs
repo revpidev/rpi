@@ -73,6 +73,11 @@ pub struct Context {
     inner: Arc<ContextInner>,
 }
 
+/// Telemetry installed in a context tree.
+pub static TELEMETRY_CONTEXT_KEY: LazyLock<
+    crate::chord::context::ContextKey<crate::chord::telemetry::TelemetryContext>,
+> = LazyLock::new(|| crate::chord::context::create_context_key("telemetry"));
+
 impl Context {
     fn empty(name: &'static str) -> Self {
         Self {
@@ -123,6 +128,12 @@ impl Context {
                 }
             }
         }
+    }
+
+    /// The telemetry context installed in this tree, or a no-op one.
+    pub fn telemetry(&self) -> crate::chord::telemetry::TelemetryContext {
+        self.value(&TELEMETRY_CONTEXT_KEY)
+            .unwrap_or_else(crate::chord::telemetry::TelemetryContext::none)
     }
 
     /// Human-readable chain description (upstream `toString`).

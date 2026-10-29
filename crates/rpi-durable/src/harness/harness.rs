@@ -1075,6 +1075,7 @@ pub async fn open_harness_with_scheduler(
         storage: Arc::clone(session.storage()),
         set_timer: options.set_timer.clone(),
         on_wake: options.on_wake.clone(),
+        telemetry: options.telemetry.clone(),
         models,
         registry: Arc::clone(&options.registry),
         settings: settings_source.clone(),

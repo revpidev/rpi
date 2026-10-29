@@ -318,3 +318,110 @@ fn a_terminal_nested_task_state_is_readable() {
     assert!(matches!(state, TaskState::Terminal { .. }));
     let _ = TaskId::from_number(1);
 }
+
+/// V18-06 FR-F: telemetry carries durable record IDs, never content.
+#[tokio::test]
+async fn telemetry_records_ids_and_replay_events_without_content() {
+    use rpi_durable::harness::{TelemetryContext, TelemetrySink};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Sink {
+        attributes: Mutex<Vec<JsonObject>>,
+        events: Mutex<Vec<String>>,
+    }
+
+    impl TelemetrySink for Sink {
+        fn set_attributes(&self, attributes: JsonObject) {
+            self.attributes.lock().expect("attributes").push(attributes);
+        }
+        fn add_event(&self, name: &str, _attributes: JsonObject) {
+            self.events.lock().expect("events").push(name.to_string());
+        }
+        fn add_link(&self, _carrier: JsonValue) {}
+        fn record_metric(&self, _name: &str, _value: f64) {}
+    }
+
+    let sink = Arc::new(Sink::default());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let harness = open_with_telemetry(
+        vec![extension(vec![
+            tool("outer", None, None, Arc::new(OuterTool)),
+            tool(
+                "inner",
+                Some(vec![ToolCaller::Tools]),
+                None,
+                Arc::new(TextTool),
+            ),
+        ])],
+        TelemetryContext::new(sink.clone()),
+        runs,
+    )
+    .await;
+    let conversation = root_ready(&harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    submission.wait(&context()).await.expect("wait");
+
+    let attributes = sink.attributes.lock().expect("attributes").clone();
+    assert!(attributes.iter().any(|attributes| {
+        attributes.get("tool.name").and_then(JsonValue::as_str) == Some("outer")
+            && attributes
+                .get("task.name")
+                .and_then(JsonValue::as_str)
+                .is_none()
+    }));
+    assert!(attributes.iter().any(|attributes| {
+        attributes.get("task.name").and_then(JsonValue::as_str) == Some("pi.tool")
+    }));
+    let rendered = serde_json::to_string(&attributes).expect("render");
+    assert!(
+        !rendered.contains("text output"),
+        "no tool output in telemetry"
+    );
+}
+
+async fn open_with_telemetry(
+    tools: Vec<Extension>,
+    telemetry: rpi_durable::harness::TelemetryContext,
+    runs: Arc<AtomicUsize>,
+) -> Arc<rpi_durable::harness::HarnessImpl> {
+    use rpi_ai::models::Models;
+    use rpi_durable::harness::{
+        HarnessOptions, Registry, RegistryImpl, SchedulerDeps, SchedulerFactory, SchedulerService,
+        open_harness_with_scheduler,
+    };
+    let _ = runs;
+    let registry = Arc::new(RegistryImpl::with_builtins(
+        rpi_durable::harness::builtin_tasks(),
+    ));
+    for extension in tools {
+        registry.install(extension).expect("install");
+    }
+    let models = test_models(vec![
+        Script::Message(tool_use_message("outer", "c1", serde_json::json!({}))),
+        Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
+    ]);
+    let options = HarnessOptions {
+        telemetry: Some(telemetry),
+        models: models.into(),
+        identity: None,
+        registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,
+        settings: None,
+        env: None,
+        conversation_created: None,
+        now: None,
+        set_timer: None,
+        on_wake: None,
+        on_report: None,
+    };
+    let storage: Arc<dyn rpi_durable::types::Storage> =
+        Arc::new(rpi_durable::storage::MemoryStorage::new());
+    let factory: SchedulerFactory = Arc::new(|deps: SchedulerDeps| {
+        rpi_durable::harness::TaskScheduler::new(deps) as Arc<dyn SchedulerService>
+    });
+    let harness = open_harness_with_scheduler(storage, options, factory, &context())
+        .await
+        .expect("open");
+    let _ = (Models::new(None), runs);
+    harness
+}

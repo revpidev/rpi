@@ -1523,6 +1523,9 @@ pub fn default_harness_identity() -> rpi_ai::utils::identity::ClientIdentity {
 
 /// Harness construction options (`HarnessOptions`).
 pub struct HarnessOptions {
+    /// Host-owned content-free telemetry; phases and tools set attributes and
+    /// events carrying durable record IDs, never content.
+    pub telemetry: Option<crate::chord::telemetry::TelemetryContext>,
     /// pi-ai model access used by generation.
     pub models: ModelsSource,
     /// Request identity merged over [`default_harness_identity`]. An explicit

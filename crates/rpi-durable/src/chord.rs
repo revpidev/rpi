@@ -12,4 +12,5 @@ pub mod delta;
 pub mod json;
 pub mod sqlite;
 pub mod state;
+pub mod telemetry;
 pub mod tracker;
