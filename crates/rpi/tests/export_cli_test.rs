@@ -127,22 +127,30 @@ fn exported_viewer_read_line_range_and_cjk_wiring() {
         return;
     }
 
-    let cases = r#"
-const cases = [
-  [undefined, undefined],
-  [25, 13],
-  ["25", "13"],
-  [null, "13"],
-  ["25", null],
-  [undefined, undefined],
-  ["abc", 13],
-  [25, "abc"],
-  [25, 0],
-  [0, 10],
-];
-"#;
+    let fixture: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(format!(
+            "{}/../../fixtures/read-line-range.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("shared read line-range fixture"),
+    )
+    .expect("fixture json");
+    let cases: Vec<serde_json::Value> = fixture["cases"]
+        .as_array()
+        .expect("cases")
+        .iter()
+        .map(|case| serde_json::json!([case["offset"], case["limit"]]))
+        .collect();
+    let expected: Vec<String> = fixture["cases"]
+        .as_array()
+        .expect("cases")
+        .iter()
+        .map(|case| case["expected"].as_str().expect("expected").to_string())
+        .collect();
+
     let script = format!(
-        "{functions}\n{cases}\nconsole.log(JSON.stringify(cases.map(([o, l]) => formatReadLineRange(o, l))));"
+        "{functions}\nconst cases = {};\nconsole.log(JSON.stringify(cases.map(([o, l]) => formatReadLineRange(o, l))));",
+        serde_json::to_string(&cases).expect("cases json")
     );
     let tmp = TempDir::new();
     let script_path = tmp.path().join("read-range.js");
@@ -156,11 +164,7 @@ const cases = [
         "node failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let ranges: Vec<String> = serde_json::from_slice(&output.stdout).expect("range matrix JSON");
-    assert_eq!(
-        ranges,
-        [
-            "", ":25-37", ":25-37", ":1-13", ":25", "", "", "", ":25-24", ":0-9"
-        ]
-    );
+    let ranges: Vec<String> =
+        serde_json::from_slice(&output.stdout).expect("range matrix JSON");
+    assert_eq!(ranges, expected);
 }

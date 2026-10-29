@@ -51,6 +51,8 @@ fixtures/
 > and the v0.1.5 re-record @ `97435aab` with TE40) was retired with the adapter; the live runbook
 > is `scripts/mcp-parity/README.md` (builtin-only).
 
+`fixtures/read-line-range.json` is a handwritten cross-surface contract fixture (not generated): the TUI read row, session tree and the exported viewer's Node test all assert the same offset/limit matrix (#9887).
+
 ## 2. Runbook (repeatable generation)
 
 Prerequisites (one-time; `node_modules/` and `dist/` are both in `.gitignore`, so red-line G4 is not touched):

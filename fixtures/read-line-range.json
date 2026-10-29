@@ -1,0 +1,16 @@
+{
+  "comment": "Shared read line-range contract for the expanded TUI row, the session tree and the exported HTML viewer (#9887). Values are the raw tool arguments; expected is the suffix appended to the path.",
+  "cases": [
+    { "offset": null, "limit": null, "expected": "" },
+    { "offset": 25, "limit": 13, "expected": ":25-37" },
+    { "offset": "25", "limit": "13", "expected": ":25-37" },
+    { "offset": null, "limit": "13", "expected": ":1-13" },
+    { "offset": "25", "limit": null, "expected": ":25" },
+    { "offset": "abc", "limit": 13, "expected": "" },
+    { "offset": 25, "limit": "abc", "expected": "" },
+    { "offset": "Infinity", "limit": 13, "expected": "" },
+    { "offset": 25, "limit": 0, "expected": ":25-24" },
+    { "offset": 0, "limit": 10, "expected": ":0-9" },
+    { "offset": 1, "limit": 0, "expected": ":1" }
+  ]
+}

@@ -522,6 +522,30 @@ mod tests {
 
     // --- formatReadLineRange ------------------------------------------------
 
+    /// Shared contract fixture (also executed against the exported viewer in
+    /// `tests/export_cli_test.rs`).
+    #[test]
+    fn read_line_range_matches_the_shared_fixture() {
+        let fixture: Value = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/../../fixtures/read-line-range.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect("shared fixture"),
+        )
+        .expect("fixture json");
+        for case in fixture["cases"].as_array().expect("cases") {
+            let actual = shared_read_line_range(case.get("offset"), case.get("limit"));
+            assert_eq!(
+                actual,
+                case["expected"].as_str().expect("expected"),
+                "offset={:?} limit={:?}",
+                case.get("offset"),
+                case.get("limit")
+            );
+        }
+    }
+
     #[test]
     fn line_range_renders_offset_and_limit_variants() {
         let theme = theme();
