@@ -218,7 +218,7 @@ async fn fail_no_model(
             let live = tx
                 .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
                 .await?;
-            remove_compaction_status(&live, task_id)?;
+            crate::harness::live::fail_compaction_status(&live, task_id, message.clone())?;
             Ok(Some(NextTaskState::Terminal {
                 outcome: TaskOutcome::Failed {
                     error: TaskOutcomeError {
@@ -470,8 +470,8 @@ async fn summarize_phase(
                         .unwrap_or(JsonValue::Null);
                 return Ok(Some(NextTaskState::Running { checkpoint }));
             }
-            remove_compaction_status(&live, task_id)?;
             let text = summary_failure(&message);
+            crate::harness::live::fail_compaction_status(&live, task_id, text.clone())?;
             Ok(Some(NextTaskState::Terminal {
                 outcome: TaskOutcome::Failed {
                     error: TaskOutcomeError {
@@ -887,14 +887,6 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                 }
             }
             Message::Assistant(assistant) => {
-                let thinking: Vec<String> = assistant
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        AssistantContent::Thinking(thinking) => Some(thinking.thinking.clone()),
-                        _ => None,
-                    })
-                    .collect();
                 let text: Vec<String> = assistant
                     .content
                     .iter()
@@ -919,9 +911,6 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                         _ => None,
                     })
                     .collect();
-                if !thinking.is_empty() {
-                    parts.push(format!("[Assistant thinking]: {}", thinking.join("\n")));
-                }
                 if !text.is_empty() {
                     parts.push(format!("[Assistant]: {}", text.join("\n")));
                 }

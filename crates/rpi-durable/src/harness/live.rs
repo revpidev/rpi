@@ -662,6 +662,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_compaction_is_kept_until_a_summary() {
+        use crate::session::{ConversationOwnership, commit_fn, create_session};
+        use crate::storage::MemoryStorage;
+
+        let session = create_session(Arc::new(MemoryStorage::new()), None);
+        let context = crate::chord::context::BACKGROUND_CONTEXT.clone();
+        let conversation = session
+            .commit(
+                commit_fn(|tx| {
+                    Box::pin(async move {
+                        Ok(tx
+                            .create_conversation(ConversationOwnership::Ownerless)
+                            .await?
+                            .id)
+                    })
+                }),
+                &context,
+            )
+            .await
+            .expect("conversation");
+        let task_id = crate::ids::id_from_number::<crate::ids::Task>(3);
+        session
+            .commit(
+                commit_fn(move |tx| {
+                    Box::pin(async move {
+                        let live = tx
+                            .doc(&LIVE_DOC, DocOwner::Conversation(conversation), None)
+                            .await?;
+                        add_compaction_status(
+                            &live,
+                            CompactionStatus {
+                                task_id,
+                                reason: CompactionReason::Threshold,
+                                blocking: true,
+                                attempt: 1,
+                                retry: None,
+                            },
+                        )?;
+                        fail_compaction_status(&live, task_id, "model failed".to_string())
+                    })
+                }),
+                &context,
+            )
+            .await
+            .expect("fail status");
+        let value = session
+            .snapshot(&LIVE_DOC, DocOwner::Conversation(conversation), &context)
+            .await
+            .expect("snapshot")
+            .expect("present");
+        let state: LiveState = serde_json::from_value(JsonValue::Object(value)).expect("live");
+        assert_eq!(
+            state
+                .compaction_failure
+                .as_ref()
+                .map(|failure| failure.error.as_str()),
+            Some("model failed")
+        );
+        assert!(state.compactions.is_none());
+    }
+
+    #[tokio::test]
     async fn end_run_settles_inputs_and_clears_presentation() {
         use crate::ids::{Task, id_from_number};
         use crate::session::{ConversationOwnership, SubmissionCreate, commit_fn, create_session};

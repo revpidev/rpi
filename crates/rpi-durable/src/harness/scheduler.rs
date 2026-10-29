@@ -1312,8 +1312,32 @@ impl SchedulerInner {
         if !changed {
             return;
         }
+        self.prune_ownership_indexes();
         self.settle_idle();
         self.kick();
+    }
+
+    /// Keep only the terminal ownership nodes a live task's walk still reaches.
+    fn prune_ownership_indexes(self: &Arc<Self>) {
+        let records: Vec<TaskRecord> = self
+            .live
+            .lock()
+            .map(|live| live.values().cloned().collect())
+            .unwrap_or_default();
+        let mut needed: BTreeSet<TaskId> = BTreeSet::new();
+        for record in &records {
+            for step in self.above(parent_of(record), None) {
+                if let Step::Task(id, _) = step {
+                    needed.insert(id);
+                }
+            }
+        }
+        if let Ok(mut settled) = self.settled.lock() {
+            settled.retain(|id, _| needed.contains(id));
+        }
+        if let Ok(mut owners) = self.conversation_owners.lock() {
+            owners.retain(|id| needed.contains(id));
+        }
     }
 
     fn settle_idle(self: &Arc<Self>) {
