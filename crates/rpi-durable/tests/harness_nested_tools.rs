@@ -469,6 +469,7 @@ async fn codemode_journal_replays_a_delivered_nested_result() {
     let runs = Arc::new(AtomicUsize::new(0));
     let code = create_codemode_tool(CodemodeToolOptions {
         sandbox: Arc::new(TwiceSandbox),
+        ..Default::default()
     });
     let opened = open(
         vec![extension(vec![
@@ -526,8 +527,13 @@ fn codemode_journal_keeps_the_first_result_per_key() {
         duration_ms: None,
     };
     let mut journal = CodemodeJournal::default();
-    journal.record("1".to_string(), "inner".to_string(), result(1));
-    journal.record("1".to_string(), "inner".to_string(), result(2));
+    let args = rpi_durable::chord::json::JsonObject::new();
+    journal
+        .record("1", "inner", &args, 0.0, result(1))
+        .expect("record");
+    journal
+        .record("1", "inner", &args, 0.0, result(2))
+        .expect("same call");
     assert_eq!(
         journal
             .get("1")
@@ -537,7 +543,8 @@ fn codemode_journal_keeps_the_first_result_per_key() {
     let encoded = serde_json::to_value(CodemodeJournalEntry {
         key: "1".to_string(),
         name: "inner".to_string(),
-        result: result(1),
+        result: Some(result(1)),
+        ..Default::default()
     })
     .expect("encode");
     assert_eq!(encoded["key"], serde_json::json!("1"));
@@ -582,12 +589,13 @@ async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
                 self.hold.notified().await;
             }
             Ok(CodemodeOutcome::output(format!(
-                "value={}",
+                "value={} reply={}",
                 result
                     .structured_output
                     .as_ref()
                     .map(|value| value.to_string())
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                host.start_reply()
             )))
         }
     }
@@ -606,6 +614,7 @@ async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
                     hold: Arc::clone(&hold),
                     attempts: AtomicUsize::new(0),
                 }),
+                ..Default::default()
             }),
             tool(
                 "inner",
@@ -704,14 +713,22 @@ async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
     let journal: CodemodeJournal =
         serde_json::from_value(JsonValue::Object(journal)).expect("journal json");
     assert!(journal.get("c1").is_some());
-    assert!(
-        harness
-            .session()
-            .snapshot(&CODEMODE_RUN_DOC, DocOwner::Task(task_id), &context())
-            .await
-            .expect("run")
-            .is_some()
+    let run = harness
+        .session()
+        .snapshot(&CODEMODE_RUN_DOC, DocOwner::Task(task_id), &context())
+        .await
+        .expect("run")
+        .expect("run document");
+    let run: rpi_durable::codemode::CodemodeRunState =
+        serde_json::from_value(JsonValue::Object(run)).expect("run state");
+    let start = run.start.expect("start data");
+    assert_eq!(
+        start.version,
+        rpi_durable::codemode::CODEMODE_MODULE_VERSION
     );
+    assert!(!start.tools.is_empty());
+    assert!(start.max_output_tokens > 0);
+    assert_eq!(run.start_reply, Some(JsonValue::Null));
 
     let reopened = open_harness_with_scheduler(
         Arc::clone(&storage),
@@ -732,6 +749,11 @@ async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
         "the journal answered the nested call"
     );
     assert!(matches!(settled.record.state, TaskState::Terminal { .. }));
+    let texts = tool_result_texts(&entries(&root_ready(&reopened).await).await);
+    assert!(
+        texts.iter().any(|text| text.contains("reply=null")),
+        "the replay reused the stored start reply: {texts:?}"
+    );
     drop(hold);
 }
 

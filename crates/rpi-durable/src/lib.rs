@@ -76,3 +76,21 @@ pub use session::{
     TransactionScope, WatchEnd, WatchListener, commit_fn, create_session,
     prepare_fork_document_copies, watch_listener,
 };
+
+// Code mode (port of `packages/durable/src/codemode` @ `4a080252f`).
+pub use codemode::{
+    CATALOG_GLOBALS, CLASSIFY_TOOL, CODEMODE_INTERNAL_PREFIX, CODEMODE_JOURNAL_DOC,
+    CODEMODE_MODULE_VERSION, CODEMODE_RUN_DOC, CODEMODE_STORE_DOC, CODEMODE_TOOL_NAME,
+    CodemodeCallStatus, CodemodeCatalog, CodemodeDeclaration, CodemodeGlobalInfo,
+    CodemodeGlobalOutcome, CodemodeGlobalSpec, CodemodeHost, CodemodeImage, CodemodeJournal,
+    CodemodeJournalEntry, CodemodeJournalError, CodemodeNamespace, CodemodeNamespaceInfo,
+    CodemodeNestedCall, CodemodeOutcome, CodemodeRunState, CodemodeSandbox, CodemodeStart,
+    CodemodeStoreState, CodemodeTextItem, CodemodeToolDetails, CodemodeToolInfo,
+    CodemodeToolOptions, DEFAULT_CODEMODE_INLINE_BUDGET, DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_SEARCH_LIMIT, DISCOVERY_GLOBALS, EnvOutputFile, FormattedOutput, GENERATE_IMAGES_TOOL,
+    MAX_CONCURRENT_MODEL_CALLS, MODEL_CALLS, MODELS_DESCRIPTION, OutputFileWriter, OutputLimits,
+    args_fingerprint, catalog_call, codemode_description, codemode_section,
+    create_codemode_extension, create_codemode_tool, create_model_tools, declaration_of,
+    format_outcome, format_with_limits, model_call_arguments, model_tool_for, namespace_of,
+    sample_of, schema_to_type, to_codemode_identifier,
+};
