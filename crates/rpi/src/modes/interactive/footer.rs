@@ -954,7 +954,8 @@ mod tests {
         let footer_data = Arc::new(FooterDataProvider::new(&harness.cwd));
         footer_data.set_git_branch(Some("main".to_string()));
         let footer = FooterComponent::new(harness.session.clone(), footer_data, theme());
-        let pwd_line = strip_ansi(&footer.render(80)[0]);
+        // Wide enough for the temporary cwd and the session name.
+        let pwd_line = strip_ansi(&footer.render(200)[0]);
         assert!(pwd_line.contains("cwd"), "pwd: {pwd_line}");
         assert!(pwd_line.contains("(main)"), "pwd: {pwd_line}");
         assert!(pwd_line.contains("• my session"), "pwd: {pwd_line}");
