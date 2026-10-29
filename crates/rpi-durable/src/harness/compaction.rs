@@ -571,6 +571,7 @@ async fn place_summary(
     timestamp: i64,
 ) -> SessionResult<Option<NextTaskState>> {
     remove_compaction_status(live, task_id)?;
+    crate::harness::live::clear_compaction_failure(live)?;
     let text = format!("{SUMMARY_PREFIX}{summary}{SUMMARY_SUFFIX}");
     let mut draft = EntryDraft::new(COMPACTION_ENTRY);
     draft.head = Some(EntryHead::At(first_kept));

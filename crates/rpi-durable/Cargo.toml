@@ -40,6 +40,8 @@ notify = "8.2"
 sha2.workspace = true
 # Image attachments in the durable read tool.
 base64.workspace = true
+# Optional read-tool image processing (BMP conversion, EXIF orientation, resize).
+image.workspace = true
 uuid.workspace = true
 
 [target.'cfg(unix)'.dependencies]

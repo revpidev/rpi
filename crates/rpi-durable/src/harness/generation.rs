@@ -82,6 +82,9 @@ enum GenerationCheckpoint {
         /// Overflow text checked once when `prepare` resumes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         overflow: Option<String>,
+        /// Set when the blocking threshold started the compaction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        threshold: Option<bool>,
     },
     /// The pinned request.
     #[serde(rename = "request")]
@@ -231,12 +234,14 @@ fn parse_checkpoint(checkpoint: Option<&JsonValue>) -> GenerationCheckpoint {
                 attempt: 1,
                 compacted: None,
                 overflow: None,
+                threshold: None,
             })
         }
         None => GenerationCheckpoint::Prepare {
             attempt: 1,
             compacted: None,
             overflow: None,
+            threshold: None,
         },
     }
 }
@@ -284,13 +289,14 @@ async fn prepare(
     context: &Context,
     checkpoint: GenerationCheckpoint,
 ) -> SessionResult<()> {
-    let (attempt, compacted, overflow) = match checkpoint {
+    let (attempt, compacted, overflow, threshold) = match checkpoint {
         GenerationCheckpoint::Prepare {
             attempt,
             compacted,
             overflow,
-        } => (attempt, compacted, overflow),
-        _ => (1, None, None),
+            threshold,
+        } => (attempt, compacted, overflow, threshold),
+        _ => (1, None, None, None),
     };
     let agent = runtime.agent(context).await?;
     let settings = runtime.settings();
@@ -311,6 +317,17 @@ async fn prepare(
         );
         if !completed {
             return fail_model_error(runtime, overflow, context).await;
+        }
+    }
+    // A threshold compaction that found nothing to compact or was declined
+    // leaves a request that may still fit. One that failed leaves a context it
+    // judged too large, so the run fails and keeps the failure visible.
+    if let (Some(compacted), Some(true)) = (compacted, threshold) {
+        let outcomes = runtime.outcomes(vec![compacted], context).await?;
+        if let Some(outcome) = outcomes.first()
+            && !matches!(outcome, TaskOutcome::Completed { .. })
+        {
+            return fail_model_error(runtime, compaction_failure(outcome), context).await;
         }
     }
     let conversation_id = runtime.conversation_id();
@@ -375,6 +392,7 @@ async fn prepare(
                         attempt,
                         compacted: Some(child),
                         overflow: None,
+                        threshold: Some(true),
                     }),
                     on: vec![child],
                     policy: JoinPolicy::AllSettled,
@@ -711,6 +729,7 @@ async fn retry(
                     attempt: next,
                     compacted,
                     overflow: None,
+                    threshold: None,
                 }),
             }))
         })
@@ -813,6 +832,7 @@ async fn classify(
                             attempt,
                             compacted: Some(child),
                             overflow: Some(text),
+                            threshold: None,
                         }),
                         on: vec![child],
                         policy: JoinPolicy::AllSettled,
@@ -1470,6 +1490,18 @@ async fn apply_after_failed_run(
             }
             Ok(())
         }
+    }
+}
+
+/// Error text for a generation whose blocking compaction ended without completing.
+fn compaction_failure(outcome: &TaskOutcome) -> String {
+    match outcome {
+        TaskOutcome::Failed { error, .. } | TaskOutcome::Faulted { error } => {
+            format!("Compaction failed: {}", error.message)
+        }
+        TaskOutcome::Orphaned { reason } => format!("Compaction failed: {reason}"),
+        TaskOutcome::Aborted { .. } => "Compaction was aborted".to_string(),
+        TaskOutcome::Completed { .. } => "Compaction failed".to_string(),
     }
 }
 

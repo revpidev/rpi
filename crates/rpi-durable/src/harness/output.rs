@@ -473,6 +473,7 @@ struct ProgressInner {
     min_interval: Duration,
     state: std::sync::Mutex<ProgressState>,
     idle: Notify,
+    timing: ProgressTiming,
 }
 
 struct ProgressState {
@@ -480,6 +481,7 @@ struct ProgressState {
     timer_scheduled: bool,
     in_flight: bool,
     next_at: Instant,
+    next_at_host: f64,
     dirty: bool,
     stopped: bool,
 }
@@ -500,6 +502,24 @@ impl ProgressWaiter {
     pub fn reject(self, error: String) {
         let _ = self.sender.send(Err(error));
     }
+}
+
+/// Callback armed by a [`ProgressClock`].
+pub type ProgressArm = Arc<dyn Fn(Arc<dyn Fn() + Send + Sync>, f64) + Send + Sync>;
+
+/// The Harness clock and timer used by [`Progress`].
+#[derive(Clone)]
+pub struct ProgressClock {
+    /// Epoch milliseconds; the same clock as `HarnessOptions.now`.
+    pub now: Arc<dyn Fn() -> f64 + Send + Sync>,
+    /// Arm one callback after `delay_ms`.
+    pub arm: ProgressArm,
+}
+
+#[derive(Clone)]
+enum ProgressTiming {
+    Tokio,
+    Host(ProgressClock),
 }
 
 /// Adaptive progress commits: the first change after an idle period commits at
@@ -531,10 +551,45 @@ impl Progress {
                     timer_scheduled: false,
                     in_flight: false,
                     next_at: Instant::now(),
+                    next_at_host: 0.0,
                     dirty: false,
                     stopped: false,
                 }),
                 idle: Notify::new(),
+                timing: ProgressTiming::Tokio,
+            }),
+        }
+    }
+
+    /// Create a progress pump paced by a host clock and timer.
+    pub fn with_clock(
+        write: impl Fn() -> futures::future::BoxFuture<'static, Result<u64, String>>
+        + Send
+        + Sync
+        + 'static,
+        on_error: impl Fn(String) + Send + Sync + 'static,
+        min_interval_ms: u64,
+        clock: ProgressClock,
+    ) -> Self {
+        let progress = Self::new(write, on_error, min_interval_ms);
+        // Replace the timing before the first mark.
+        let inner = progress.inner;
+        Self {
+            inner: Arc::new(ProgressInner {
+                write: Arc::clone(&inner.write),
+                on_error: Arc::clone(&inner.on_error),
+                min_interval: inner.min_interval,
+                state: std::sync::Mutex::new(ProgressState {
+                    waiters: Vec::new(),
+                    timer_scheduled: false,
+                    in_flight: false,
+                    next_at: Instant::now(),
+                    next_at_host: (clock.now)(),
+                    dirty: false,
+                    stopped: false,
+                }),
+                idle: Notify::new(),
+                timing: ProgressTiming::Host(clock),
             }),
         }
     }
@@ -621,8 +676,13 @@ impl Progress {
         if state.stopped || state.timer_scheduled || state.in_flight || !state.dirty {
             return;
         }
+        let host_wait = match &inner.timing {
+            ProgressTiming::Host(clock) => Some(state.next_at_host - (clock.now)()),
+            ProgressTiming::Tokio => None,
+        };
         let wait = state.next_at.saturating_duration_since(Instant::now());
-        if wait.is_zero() {
+        let due = host_wait.map(|wait| wait <= 0.0).unwrap_or(wait.is_zero());
+        if due {
             let waiters = std::mem::take(&mut state.waiters);
             state.dirty = false;
             state.in_flight = true;
@@ -631,19 +691,42 @@ impl Progress {
             tokio::spawn(async move { run_write(inner, waiters, started).await });
         } else {
             state.timer_scheduled = true;
-            let deadline = Instant::now() + wait;
-            drop(state);
-            tokio::spawn(async move {
-                tokio::time::sleep_until(deadline).await;
-                let inner = Arc::clone(&inner);
-                let mut state = inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.timer_scheduled = false;
-                drop(state);
-                Progress { inner }.schedule();
-            });
+            match &inner.timing {
+                ProgressTiming::Tokio => {
+                    let deadline = Instant::now() + wait;
+                    drop(state);
+                    tokio::spawn(async move {
+                        tokio::time::sleep_until(deadline).await;
+                        let inner = Arc::clone(&inner);
+                        let mut state = inner
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.timer_scheduled = false;
+                        drop(state);
+                        Progress { inner }.schedule();
+                    });
+                }
+                ProgressTiming::Host(clock) => {
+                    let arm = Arc::clone(&clock.arm);
+                    let delay = host_wait.unwrap_or(0.0).max(0.0);
+                    drop(state);
+                    let callback_inner = Arc::clone(&inner);
+                    let callback: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                        let mut state = callback_inner
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.timer_scheduled = false;
+                        drop(state);
+                        Progress {
+                            inner: Arc::clone(&callback_inner),
+                        }
+                        .schedule();
+                    });
+                    arm(callback, delay);
+                }
+            }
         }
     }
 }
@@ -666,7 +749,15 @@ async fn run_write(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.in_flight = false;
         let paced = Duration::from_millis(bytes.saturating_mul(1000) / PROGRESS_BYTES_PER_SECOND);
-        state.next_at = started + inner.min_interval.max(paced);
+        match &inner.timing {
+            ProgressTiming::Tokio => {
+                state.next_at = started + inner.min_interval.max(paced);
+            }
+            ProgressTiming::Host(clock) => {
+                state.next_at_host =
+                    (clock.now)() + inner.min_interval.max(paced).as_millis() as f64;
+            }
+        }
         dirty = state.dirty && !state.stopped;
     }
     match result {
@@ -1017,6 +1108,48 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         settle().await;
         assert_eq!(*commits.lock().expect("commits"), vec![0, 500, 600]);
+    }
+
+    #[tokio::test]
+    async fn progress_can_be_paced_by_a_host_clock_and_timer() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let now = Arc::new(AtomicU64::new(0));
+        let commits = Arc::new(StdMutex::new(Vec::new()));
+        let clock_now = Arc::clone(&now);
+        let write_now = Arc::clone(&now);
+        let written = Arc::clone(&commits);
+        type Armed = (f64, Arc<dyn Fn() + Send + Sync>);
+        let timers: Arc<StdMutex<Vec<Armed>>> = Arc::new(StdMutex::new(Vec::new()));
+        let armed = Arc::clone(&timers);
+        let clock = ProgressClock {
+            now: Arc::new(move || clock_now.load(Ordering::SeqCst) as f64),
+            arm: Arc::new(move |callback, delay_ms| {
+                armed.lock().expect("timers").push((delay_ms, callback));
+            }),
+        };
+        let progress = Progress::with_clock(
+            move || {
+                written
+                    .lock()
+                    .expect("commits")
+                    .push(write_now.load(Ordering::SeqCst));
+                Box::pin(async { Ok(10) })
+            },
+            |_| {},
+            100,
+            clock,
+        );
+        progress.mark();
+        settle().await;
+        assert_eq!(*commits.lock().expect("commits"), vec![0]);
+        now.store(50, Ordering::SeqCst);
+        progress.mark();
+        let timer = timers.lock().expect("timers").pop().expect("timer");
+        assert_eq!(timer.0, 50.0);
+        now.store(100, Ordering::SeqCst);
+        (timer.1)();
+        settle().await;
+        assert_eq!(*commits.lock().expect("commits"), vec![0, 100]);
     }
 
     #[tokio::test(start_paused = true)]

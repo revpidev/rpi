@@ -110,7 +110,17 @@ impl ToolExecutionApi for FakeApi {
     }
 
     async fn agent(&self, _context: &Context) -> Result<Agent, SessionError> {
-        unimplemented!("agent is not used by the tool tests")
+        Ok(Agent {
+            model: None,
+            thinking_level: rpi_ai::types::ModelThinkingLevel::Off,
+            extensions: Vec::new(),
+            tools: Vec::new(),
+            callable: Vec::new(),
+            deferred: Vec::new(),
+            sections: Vec::new(),
+            instructions: None,
+            cwd: None,
+        })
     }
 
     fn models(&self) -> rpi_ai::models::Models {

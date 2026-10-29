@@ -151,6 +151,18 @@ pub struct CompactionStatus {
     pub retry: Option<RetryStatus>,
 }
 
+/// The newest compaction that failed since a compaction last produced a summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionFailure {
+    /// Compaction task.
+    pub task_id: TaskId,
+    /// Why it ran.
+    pub reason: CompactionReason,
+    /// The failed or faulted outcome's error, or why the scheduler orphaned it.
+    pub error: String,
+}
+
 /// Run control and presentation of the current generation and tool round.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -172,6 +184,9 @@ pub struct LiveState {
     /// Live compaction tasks in task ID order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compactions: Option<Vec<CompactionStatus>>,
+    /// The newest compaction failure, kept until a summary is produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_failure: Option<CompactionFailure>,
 }
 
 /// Run control of one busy conversation.
@@ -295,6 +310,43 @@ pub fn compaction_status(
         .unwrap_or_default()
         .into_iter()
         .find(|status| status.task_id == task_id))
+}
+
+/// Remove the status of compaction task `task_id` and record that it failed.
+pub fn fail_compaction_status(
+    live: &DocDraft,
+    task_id: TaskId,
+    error: String,
+) -> SessionResult<()> {
+    let mut state: LiveState = read_state(live)?;
+    if let Some(status) = state
+        .compactions
+        .as_ref()
+        .and_then(|statuses| statuses.iter().find(|status| status.task_id == task_id))
+    {
+        state.compaction_failure = Some(CompactionFailure {
+            task_id: status.task_id,
+            reason: status.reason,
+            error,
+        });
+    }
+    if let Some(list) = state.compactions.as_mut() {
+        list.retain(|status| status.task_id != task_id);
+        if list.is_empty() {
+            state.compactions = None;
+        }
+    }
+    write_state(live, &state)
+}
+
+/// Clear the recorded compaction failure once a summary is produced.
+pub fn clear_compaction_failure(live: &DocDraft) -> SessionResult<()> {
+    let mut state: LiveState = read_state(live)?;
+    if state.compaction_failure.is_some() {
+        state.compaction_failure = None;
+        write_state(live, &state)?;
+    }
+    Ok(())
 }
 
 /// Remove the status of compaction task `task_id`, and the list once empty.
@@ -504,7 +556,11 @@ pub async fn settle_scheduler_outcome(
     }
     if record.kind == COMPACTION_TASK_KIND {
         let live = tx.doc(&LIVE_DOC, conversation_owner(record), None).await?;
-        return remove_compaction_status(&live, record.id);
+        let error = match outcome {
+            SchedulerOutcome::Faulted { error } => error.message.clone(),
+            SchedulerOutcome::Orphaned { reason } => reason.clone(),
+        };
+        return fail_compaction_status(&live, record.id, error);
     }
     if !RUN_TASK_KINDS.contains(&record.kind.as_str()) {
         return Ok(());

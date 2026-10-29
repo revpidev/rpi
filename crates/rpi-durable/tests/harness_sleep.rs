@@ -36,12 +36,14 @@ impl TaskDefinition for FakeTask {
 /// Sleeps once, then completes, counting its phases.
 struct SleepTask {
     invocations: Arc<AtomicU64>,
+    delay: f64,
+    name: &'static str,
 }
 
 #[async_trait]
 impl TaskDefinition for SleepTask {
     fn name(&self) -> &str {
-        "test.sleep"
+        self.name
     }
     fn version(&self) -> u64 {
         1
@@ -59,7 +61,7 @@ impl TaskDefinition for SleepTask {
         self.invocations.fetch_add(1, Ordering::SeqCst);
         match phase {
             "sleep" => {
-                let until = runtime.now()? + 1_000.0;
+                let until = runtime.now()? + self.delay;
                 runtime
                     .sleep_until(until, serde_json::json!({ "phase": "done" }), context)
                     .await
@@ -225,6 +227,8 @@ async fn sleeping_task_holds_no_invocation_and_resumes_at_its_checkpoint() {
     let opened = open(
         Arc::new(SleepTask {
             invocations: Arc::clone(&invocations),
+            delay: 1_000.0,
+            name: "test.sleep",
         }),
         Arc::clone(&timer),
         None,
@@ -276,6 +280,8 @@ async fn on_wake_replaces_the_timer_and_host_resume_wakes_the_task() {
     let opened = open(
         Arc::new(SleepTask {
             invocations: Arc::clone(&invocations),
+            delay: 1_000.0,
+            name: "test.sleep",
         }),
         Arc::clone(&timer),
         Some(on_wake),
@@ -318,6 +324,8 @@ async fn an_early_timer_wake_arms_again_until_due() {
     let opened = open(
         Arc::new(SleepTask {
             invocations: Arc::clone(&invocations),
+            delay: 1_000.0,
+            name: "test.sleep",
         }),
         Arc::clone(&timer),
         None,
@@ -355,6 +363,8 @@ async fn a_declined_host_timer_falls_back_and_still_wakes() {
     let opened = open(
         Arc::new(SleepTask {
             invocations: Arc::clone(&invocations),
+            delay: 1_000.0,
+            name: "test.sleep",
         }),
         Arc::clone(&timer),
         None,
@@ -376,4 +386,86 @@ async fn a_declined_host_timer_falls_back_and_still_wakes() {
     .expect("fallback timer fires")
     .expect("settle");
     assert_eq!(settled.result, serde_json::json!({ "woke": true }));
+}
+
+/// FR-D R4: the wake value reports the earliest of several sleeps.
+#[tokio::test]
+async fn the_earliest_of_several_sleeps_wakes_the_harness() {
+    let timer = Arc::new(FakeTimer::default());
+    let clock = Arc::new(AtomicU64::new(10_000));
+    let first = Arc::new(AtomicU64::new(0));
+    let second = Arc::new(AtomicU64::new(0));
+    let registry = Arc::new(rpi_durable::harness::RegistryImpl::with_builtins(
+        rpi_durable::harness::builtin_tasks(),
+    ));
+    registry
+        .install(Extension {
+            name: "sleeps".into(),
+            tasks: vec![
+                Arc::new(SleepTask {
+                    invocations: Arc::clone(&first),
+                    delay: 500.0,
+                    name: "test.sleep.a",
+                }),
+                Arc::new(SleepTask {
+                    invocations: Arc::clone(&second),
+                    delay: 2_000.0,
+                    name: "test.sleep.b",
+                }),
+            ],
+            ..Extension::default()
+        })
+        .expect("install");
+    let options = HarnessOptions {
+        telemetry: None,
+        models: Models::new(None).into(),
+        identity: None,
+        registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,
+        settings: None,
+        env: None,
+        conversation_created: None,
+        now: Some({
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock.load(Ordering::SeqCst) as f64)
+        }),
+        set_timer: Some(timer.set_timer()),
+        on_wake: None,
+        on_report: None,
+        on_report_info: None,
+    };
+    let storage: Arc<dyn rpi_durable::types::Storage> = Arc::new(MemoryStorage::new());
+    let harness = open_harness(storage, options, &BACKGROUND_CONTEXT.clone())
+        .await
+        .expect("open");
+    let _ = harness
+        .root(&BACKGROUND_CONTEXT.clone(), Default::default())
+        .await
+        .expect("root");
+    let a = create_task(&harness, "test.sleep.a").await;
+    let b = create_task(&harness, "test.sleep.b").await;
+    harness.resume().expect("resume");
+    wait_for_status(&harness, a, TaskStatus::Sleeping).await;
+    wait_for_status(&harness, b, TaskStatus::Sleeping).await;
+    assert_eq!(harness.wake().at, Some(10_500.0));
+    clock.store(10_500, Ordering::SeqCst);
+    timer.fire();
+    let first = harness
+        .wait_for_task(a, &BACKGROUND_CONTEXT.clone())
+        .await
+        .expect("first");
+    assert!(matches!(
+        first.record.state,
+        rpi_durable::types::TaskState::Terminal { .. }
+    ));
+    assert_eq!(harness.wake().at, Some(12_000.0));
+    clock.store(12_000, Ordering::SeqCst);
+    timer.fire();
+    let second = harness
+        .wait_for_task(b, &BACKGROUND_CONTEXT.clone())
+        .await
+        .expect("second");
+    assert!(matches!(
+        second.record.state,
+        rpi_durable::types::TaskState::Terminal { .. }
+    ));
 }

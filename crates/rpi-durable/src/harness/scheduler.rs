@@ -386,6 +386,8 @@ struct SchedulerInner {
     context: Context,
     /// Earliest sleep timer, without `onWake` while scheduling runs.
     wake_timer: Mutex<Option<(f64, TimerDisarm)>>,
+    /// Background timer for the earliest idle-context expiry.
+    expiry_timer: Mutex<Option<(f64, TimerDisarm)>>,
     /// Last value given to `onWake`, so an unchanged one is not repeated.
     last_wake: Mutex<Option<Wake>>,
     submissions: std::sync::OnceLock<Arc<Submissions>>,
@@ -432,6 +434,7 @@ impl SchedulerInner {
                 .unwrap_or_else(crate::chord::telemetry::TelemetryContext::none),
             context: deps.context,
             wake_timer: Mutex::new(None),
+            expiry_timer: Mutex::new(None),
             last_wake: Mutex::new(None),
             submissions: std::sync::OnceLock::new(),
             live: Mutex::new(BTreeMap::new()),
@@ -1349,6 +1352,8 @@ impl SchedulerInner {
                 contexts.remove(&id);
             }
         }
+        drop(contexts);
+        self.schedule_expiry();
     }
 
     // ─── Ownership ──────────────────────────────────────────────────────────
@@ -1817,6 +1822,50 @@ impl SchedulerInner {
             }
         }
         true
+    }
+
+    /// Arm a background timer for the earliest idle-context expiry. A host
+    /// that declines it leaves expiry to the next task change.
+    fn schedule_expiry(self: &Arc<Self>) {
+        if self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let retention = self.settings().context_retention_ms as f64;
+        let at = self.contexts.lock().ok().and_then(|contexts| {
+            contexts
+                .values()
+                .filter_map(|kept| kept.idle_since.map(|since| since + retention))
+                .reduce(f64::min)
+        });
+        let mut slot = match self.expiry_timer.lock() {
+            Ok(slot) => slot,
+            Err(_) => return,
+        };
+        if slot
+            .as_ref()
+            .map(|(current, _)| Some(*current) == at)
+            .unwrap_or(at.is_none())
+        {
+            return;
+        }
+        if let Some((_, disarm)) = slot.take() {
+            disarm();
+        }
+        let Some(at) = at else {
+            return;
+        };
+        let this = Arc::clone(self);
+        let callback = Arc::new(move || {
+            if let Ok(mut slot) = this.expiry_timer.lock() {
+                slot.take();
+            }
+            this.settle_idle();
+            this.schedule_expiry();
+        });
+        let delay = (at - (self.now)()).max(0.0);
+        if let Some(disarm) = self.timers.background(callback, delay) {
+            *slot = Some((at, disarm));
+        }
     }
 
     // ─── Scheduling ─────────────────────────────────────────────────────────

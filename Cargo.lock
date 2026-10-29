@@ -3217,6 +3217,7 @@ dependencies = [
  "async-trait",
  "base64",
  "futures",
+ "image",
  "jsonschema",
  "libc",
  "notify",

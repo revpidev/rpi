@@ -223,7 +223,7 @@ async fn read_returns_images_detected_by_content() {
     )
     .await;
     let result = result.expect("read");
-    assert!(diagnostic_text(&result).contains("Read image image.txt (1x1, image/png)"));
+    assert!(diagnostic_text(&result).contains("Read image file [image/png]"));
     let content = result.output.expect("content");
     assert!(matches!(
         content.first(),
@@ -662,7 +662,9 @@ async fn read_returns_a_supported_image_within_the_limits() {
             if image.mime_type == "image/png" && !image.data.is_empty()
     ));
     assert!(result.diagnostics.iter().flatten().any(|diagnostic| {
-        diagnostic.code.as_deref() == Some("image") && diagnostic.message.contains("1x1")
+        diagnostic.code.as_deref() == Some("image")
+            && diagnostic.message.contains("Read image file [")
+            && diagnostic.message.contains("image/png")
     }));
 }
 
@@ -687,7 +689,104 @@ async fn read_rejects_an_image_over_the_pixel_limit() {
     let result = result.expect("read image");
     assert_eq!(result.is_error, Some(true));
     assert!(result.diagnostics.iter().flatten().any(|diagnostic| {
-        diagnostic.code.as_deref() == Some("image_too_large")
+        diagnostic.code.as_deref() == Some("unsupported_image")
             && diagnostic.message.contains("3000x3000")
     }));
+}
+
+// ---------------------------------------------------------------------------
+// read image processor (V18-06 FR-K)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn read_with_a_processor_converts_bmp_to_png() {
+    use rpi_durable::tools::image_processor::BuiltinImageProcessor;
+    use rpi_durable::tools::read::{ReadToolOptions, create_read_tool_with_options};
+    let dir = TempDir::new("durable-read-bmp");
+    let env = create_env(&dir);
+    let context = rpi_durable::chord::context::BACKGROUND_CONTEXT.clone();
+    let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+    let mut bmp = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+        .expect("bmp");
+    env.write_file("tiny.bmp", FileContent::Bytes(bmp), &context)
+        .await
+        .expect("write");
+    let tool = create_read_tool_with_options(ReadToolOptions {
+        image_processor: Some(Arc::new(BuiltinImageProcessor)),
+    });
+    let (result, _, _) =
+        run_tool(&tool, json!({ "path": "tiny.bmp" }), Some(Arc::clone(&env))).await;
+    let result = result.expect("read");
+    let content = result.output.expect("content");
+    assert!(matches!(
+        content.first(),
+        Some(rpi_ai::types::ToolResultContent::Image(image)) if image.mime_type == "image/png"
+    ));
+    assert!(result.diagnostics.iter().flatten().any(|diagnostic| {
+        diagnostic.code.as_deref() == Some("image")
+            && diagnostic.message.contains("Converted from image/bmp")
+    }));
+}
+
+#[tokio::test]
+async fn read_with_a_processor_resizes_an_image_over_the_pixel_limit() {
+    use rpi_durable::tools::image_processor::BuiltinImageProcessor;
+    use rpi_durable::tools::read::{ReadToolOptions, create_read_tool_with_options};
+    let dir = TempDir::new("durable-read-resize");
+    let env = create_env(&dir);
+    let context = rpi_durable::chord::context::BACKGROUND_CONTEXT.clone();
+    let image = image::RgbaImage::from_pixel(3000, 100, image::Rgba([0, 0, 255, 255]));
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("png");
+    env.write_file("large.png", FileContent::Bytes(png), &context)
+        .await
+        .expect("write");
+    let tool = create_read_tool_with_options(ReadToolOptions {
+        image_processor: Some(Arc::new(BuiltinImageProcessor)),
+    });
+    let (result, _, _) = run_tool(
+        &tool,
+        json!({ "path": "large.png" }),
+        Some(Arc::clone(&env)),
+    )
+    .await;
+    let result = result.expect("read");
+    assert_eq!(result.is_error, None);
+    assert!(result.diagnostics.iter().flatten().any(|diagnostic| {
+        diagnostic.code.as_deref() == Some("image")
+            && diagnostic.message.contains("Resized from 3000x100")
+    }));
+}
+
+#[tokio::test]
+async fn read_without_a_processor_errors_for_bmp() {
+    use rpi_durable::tools::image_processor::BuiltinImageProcessor;
+    let dir = TempDir::new("durable-read-bmp-error");
+    let env = create_env(&dir);
+    let context = rpi_durable::chord::context::BACKGROUND_CONTEXT.clone();
+    let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+    let mut bmp = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+        .expect("bmp");
+    env.write_file("tiny.bmp", FileContent::Bytes(bmp), &context)
+        .await
+        .expect("write");
+    let (result, _, _) = run_tool(
+        &create_read_tool(),
+        json!({ "path": "tiny.bmp" }),
+        Some(Arc::clone(&env)),
+    )
+    .await;
+    let result = result.expect("read");
+    assert_eq!(result.is_error, Some(true));
+    assert!(result.diagnostics.iter().flatten().any(|diagnostic| {
+        diagnostic.code.as_deref() == Some("unsupported_image")
+            && diagnostic.message.contains("needs converting")
+    }));
+    let _ = BuiltinImageProcessor;
 }

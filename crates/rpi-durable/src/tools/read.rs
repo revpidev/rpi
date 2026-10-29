@@ -88,7 +88,16 @@ impl ByteSource for ReaderSource<'_> {
     }
 }
 
-struct ReadTool;
+/// Options of [`create_read_tool_with_options`].
+#[derive(Clone, Default)]
+pub struct ReadToolOptions {
+    /// Optional processor for BMP conversion, EXIF orientation and resizing.
+    pub image_processor: Option<Arc<dyn crate::tools::image_processor::ImageProcessor>>,
+}
+
+struct ReadTool {
+    options: ReadToolOptions,
+}
 
 #[async_trait]
 impl ToolExecute for ReadTool {
@@ -108,7 +117,16 @@ impl ToolExecute for ReadTool {
         let env = require_env(api)?;
         let absolute = resolve_read_tool_path(env.as_ref(), &path, context).await?;
         let reader = env.open_binary_reader(&absolute, None, context).await?;
-        let result = read_stable_text(reader.as_ref(), &path, offset, limit, context).await;
+        let result = read_stable_text_with(
+            reader.as_ref(),
+            &path,
+            offset,
+            limit,
+            context,
+            &self.options,
+            api,
+        )
+        .await;
         reader.close(context).await;
         result
     }
@@ -116,6 +134,7 @@ impl ToolExecute for ReadTool {
 
 /// Read the file, rereading once when a concurrent writer shrank or rewrote it
 /// between the scan and the reads (upstream `createReadTool.execute`'s loop).
+#[cfg(test)]
 async fn read_stable_text(
     reader: &dyn BinaryReader,
     path: &str,
@@ -123,10 +142,62 @@ async fn read_stable_text(
     limit: Option<f64>,
     context: &Context,
 ) -> Result<ToolExecutionResult, ToolExecuteError> {
+    let model = ImageModel {
+        vision: true,
+        limits: crate::tools::image_processor::ImageLimits::default(),
+    };
+    read_stable_text_inner(reader, path, offset, limit, context, None, &model).await
+}
+
+/// Read with image processing and the conversation model's limits.
+async fn read_stable_text_with(
+    reader: &dyn BinaryReader,
+    path: &str,
+    offset: Option<f64>,
+    limit: Option<f64>,
+    context: &Context,
+    options: &ReadToolOptions,
+    api: &dyn ToolExecutionApi,
+) -> Result<ToolExecutionResult, ToolExecuteError> {
+    let model = image_model(api, context).await;
+    read_stable_text_inner(
+        reader,
+        path,
+        offset,
+        limit,
+        context,
+        options.image_processor.as_ref(),
+        &model,
+    )
+    .await
+}
+
+async fn read_stable_text_inner(
+    reader: &dyn BinaryReader,
+    path: &str,
+    offset: Option<f64>,
+    limit: Option<f64>,
+    context: &Context,
+    processor: Option<&Arc<dyn crate::tools::image_processor::ImageProcessor>>,
+    model: &ImageModel,
+) -> Result<ToolExecutionResult, ToolExecuteError> {
     let mut attempt = 0;
     loop {
         let before = reader.info(context).await?;
-        let result = read_text(reader, &before, path, offset, limit, context).await?;
+        let source = ReaderSource {
+            reader,
+            context,
+            size: before.size,
+        };
+        let result = match detect_supported_image_mime_type_of(&source)
+            .await
+            .map_err(|error| tool_error(error.to_string()))?
+        {
+            Some(mime_type) => {
+                read_image(reader, &before, path, &mime_type, processor, model, context).await?
+            }
+            None => read_text(reader, path, offset, limit, context).await?,
+        };
         let after = reader.info(context).await?;
         if after.size > before.size
             || (after.size == before.size && after.mtime_ms == before.mtime_ms)
@@ -140,92 +211,73 @@ async fn read_stable_text(
     }
 }
 
-/// Read a supported image as one image block. Without an image processor,
-/// PNG, JPEG, GIF and WebP pass through undecoded within the default limits
-/// (2000x2000 pixels and about 3.4 MB raw); larger images are error results.
-async fn read_image(
-    reader: &dyn BinaryReader,
-    info: &FileInfo,
-    path: &str,
-    mime_type: &str,
-    context: &Context,
-) -> Result<ToolExecutionResult, ToolExecuteError> {
-    const MAX_PIXELS: u32 = 2000;
-    const MAX_RAW_BYTES: u64 = 3_375_000;
-    let (width, height) = image_dimensions(reader, context).await?;
-    if width > MAX_PIXELS || height > MAX_PIXELS {
-        return Ok(ToolExecutionResult {
-            output: Some(Vec::new()),
-            is_error: Some(true),
-            diagnostics: Some(vec![ToolDiagnostic {
-                severity: DiagnosticSeverity::Error,
-                code: Some("image_too_large".to_string()),
-                message: format!(
-                    "{path} is {width}x{height}; the limit is {MAX_PIXELS}x{MAX_PIXELS}"
-                ),
-            }]),
-            ..Default::default()
-        });
-    }
-    if info.size > MAX_RAW_BYTES {
-        return Ok(ToolExecutionResult {
-            output: Some(Vec::new()),
-            is_error: Some(true),
-            diagnostics: Some(vec![ToolDiagnostic {
-                severity: DiagnosticSeverity::Error,
-                code: Some("image_too_large".to_string()),
-                message: format!(
-                    "{path} is {} bytes; the image limit is {MAX_RAW_BYTES} bytes",
-                    info.size
-                ),
-            }]),
-            ..Default::default()
-        });
-    }
-    let bytes = reader
-        .read(0, info.size, context)
-        .await
-        .map_err(|error| tool_error(error.to_string()))?;
-    let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-    Ok(ToolExecutionResult {
-        output: Some(vec![ToolResultContent::Image(
-            rpi_ai::types::ImageContent {
-                data,
-                mime_type: mime_type.to_string(),
-            },
-        )]),
-        diagnostics: Some(vec![ToolDiagnostic {
-            severity: DiagnosticSeverity::Info,
-            code: Some("image".to_string()),
-            message: format!("Read image {path} ({width}x{height}, {mime_type})"),
-        }]),
-        ..Default::default()
-    })
+/// One image block, prepared by `processor` or, without one, as it is when its
+/// format is inline and it fits the model's limits. What happened is an `info`
+/// diagnostic, so programs get the bare image.
+struct ImageModel {
+    vision: bool,
+    limits: crate::tools::image_processor::ImageLimits,
 }
 
-/// Pixel dimensions from the image header, `(0, 0)` when the format's header
-/// does not carry them in a shape this reader understands.
-async fn image_dimensions(
-    reader: &dyn BinaryReader,
-    context: &Context,
-) -> Result<(u32, u32), ToolExecuteError> {
-    let header = reader
-        .read(0, 64, context)
-        .await
-        .map_err(|error| tool_error(error.to_string()))?;
-    Ok(parse_image_dimensions(&header))
+async fn image_model(api: &dyn ToolExecutionApi, context: &Context) -> ImageModel {
+    let defaults = crate::tools::image_processor::ImageLimits::default();
+    let agent = match api.agent(context).await {
+        Ok(agent) => agent,
+        Err(_) => {
+            return ImageModel {
+                vision: true,
+                limits: defaults,
+            };
+        }
+    };
+    let Some(reference) = agent.model else {
+        return ImageModel {
+            vision: true,
+            limits: defaults,
+        };
+    };
+    let Some(model) = api
+        .models()
+        .get_model(&reference.provider, &reference.model_id)
+    else {
+        return ImageModel {
+            vision: true,
+            limits: defaults,
+        };
+    };
+    let resize = model
+        .input_limits
+        .as_ref()
+        .and_then(|limits| limits.images.as_ref())
+        .and_then(|images| images.resize.as_ref());
+    ImageModel {
+        vision: model.input.contains(&rpi_ai::types::InputModality::Image),
+        limits: crate::tools::image_processor::ImageLimits {
+            max_width: resize
+                .and_then(|resize| resize.max_width)
+                .unwrap_or(defaults.max_width),
+            max_height: resize
+                .and_then(|resize| resize.max_height)
+                .unwrap_or(defaults.max_height),
+            max_bytes: resize
+                .and_then(|resize| resize.max_bytes)
+                .unwrap_or(defaults.max_bytes),
+        },
+    }
 }
 
 fn parse_image_dimensions(bytes: &[u8]) -> (u32, u32) {
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) && bytes.len() >= 24 {
-        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
-        return (width, height);
+        return (
+            u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
+            u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
+        );
     }
     if bytes.starts_with(b"GIF") && bytes.len() >= 10 {
-        let width = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
-        let height = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
-        return (width, height);
+        return (
+            u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
+            u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
+        );
     }
     if bytes.starts_with(&[0xff, 0xd8]) {
         let mut index = 2;
@@ -241,9 +293,10 @@ fn parse_image_dimensions(bytes: &[u8]) -> (u32, u32) {
                 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
             ) && index + 9 <= bytes.len()
             {
-                let height = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u32;
-                let width = u16::from_be_bytes([bytes[index + 7], bytes[index + 8]]) as u32;
-                return (width, height);
+                return (
+                    u16::from_be_bytes([bytes[index + 7], bytes[index + 8]]) as u32,
+                    u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u32,
+                );
             }
             if length < 2 {
                 break;
@@ -255,25 +308,131 @@ fn parse_image_dimensions(bytes: &[u8]) -> (u32, u32) {
     if bytes.starts_with(b"RIFF") && bytes.len() >= 30 && &bytes[8..12] == b"WEBP" {
         match &bytes[12..16] {
             b"VP8X" => {
-                let width = 1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]);
-                let height = 1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]);
-                return (width, height);
+                return (
+                    1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]),
+                    1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]),
+                );
             }
             b"VP8 " => {
-                let width = (u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3fff) as u32;
-                let height = (u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3fff) as u32;
-                return (width, height);
+                return (
+                    (u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3fff) as u32,
+                    (u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3fff) as u32,
+                );
             }
             b"VP8L" => {
                 let bits = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
-                let width = (bits & 0x3fff) + 1;
-                let height = ((bits >> 14) & 0x3fff) + 1;
-                return (width, height);
+                return ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1);
             }
             _ => {}
         }
     }
     (0, 0)
+}
+
+const INLINE_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+fn image_error(message: String) -> ToolExecutionResult {
+    ToolExecutionResult {
+        output: Some(Vec::new()),
+        is_error: Some(true),
+        diagnostics: Some(vec![ToolDiagnostic {
+            severity: DiagnosticSeverity::Error,
+            code: Some("unsupported_image".to_string()),
+            message,
+        }]),
+        ..Default::default()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_image(
+    reader: &dyn BinaryReader,
+    info: &FileInfo,
+    path: &str,
+    mime_type: &str,
+    processor: Option<&Arc<dyn crate::tools::image_processor::ImageProcessor>>,
+    model: &ImageModel,
+    context: &Context,
+) -> Result<ToolExecutionResult, ToolExecuteError> {
+    let mut notes: Vec<String> = Vec::new();
+    let image = if let Some(processor) = processor {
+        let bytes = reader
+            .read(0, info.size, context)
+            .await
+            .map_err(|error| tool_error(error.to_string()))?;
+        let limits = model.limits;
+        let mime = mime_type.to_string();
+        let processor_owned = Arc::clone(processor);
+        let prepared =
+            tokio::task::spawn_blocking(move || processor_owned.prepare(&bytes, &mime, limits))
+                .await
+                .map_err(|error| tool_error(error.to_string()))?;
+        let Some(prepared) = prepared else {
+            return Ok(image_error(format!(
+                "{path} is an image ({mime_type}) that cannot be prepared for the model"
+            )));
+        };
+        if let Some(from) = &prepared.converted_from {
+            notes.push(format!("Converted from {from} to {}.", prepared.mime_type));
+        }
+        if let Some((from_w, from_h, to_w, to_h)) = prepared.resized {
+            let scale = (from_w as f64 / to_w as f64).max(0.01);
+            notes.push(format!(
+                "Resized from {from_w}x{from_h} to {to_w}x{to_h}. Multiply coordinates by {scale:.2} to map them to the original."
+            ));
+        }
+        rpi_ai::types::ImageContent {
+            data: prepared.data,
+            mime_type: prepared.mime_type,
+        }
+    } else {
+        if !INLINE_IMAGE_TYPES.contains(&mime_type) {
+            return Ok(image_error(format!(
+                "{path} is an image ({mime_type}) that needs converting, and no image processor is configured"
+            )));
+        }
+        let base64_len = info.size.div_ceil(3) * 4;
+        if base64_len > model.limits.max_bytes {
+            return Ok(image_error(format!(
+                "{path} is an image ({mime_type}) of {} bytes, too large to send, and no image processor is configured to shrink it",
+                info.size
+            )));
+        }
+        let bytes = reader
+            .read(0, info.size, context)
+            .await
+            .map_err(|error| tool_error(error.to_string()))?;
+        let (width, height) = parse_image_dimensions(&bytes);
+        if width > model.limits.max_width || height > model.limits.max_height {
+            return Ok(image_error(format!(
+                "{path} is an image ({mime_type}) of {width}x{height}, larger than {}x{}, and no image processor is configured to shrink it",
+                model.limits.max_width, model.limits.max_height
+            )));
+        }
+        rpi_ai::types::ImageContent {
+            data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+            mime_type: mime_type.to_string(),
+        }
+    };
+    if !model.vision {
+        notes.push(
+            "The current model does not support images; it sees a placeholder instead.".to_string(),
+        );
+    }
+    let message = if notes.is_empty() {
+        format!("Read image file [{}].", image.mime_type)
+    } else {
+        format!("Read image file [{}]. {}", image.mime_type, notes.join(" "))
+    };
+    Ok(ToolExecutionResult {
+        output: Some(vec![ToolResultContent::Image(image)]),
+        diagnostics: Some(vec![ToolDiagnostic {
+            severity: DiagnosticSeverity::Info,
+            code: Some("image".to_string()),
+            message,
+        }]),
+        ..Default::default()
+    })
 }
 
 /// The read result for the opened file. It equals decoding the whole file,
@@ -282,24 +441,11 @@ fn parse_image_dimensions(bytes: &[u8]) -> (u32, u32) {
 /// the head.
 async fn read_text(
     reader: &dyn BinaryReader,
-    info: &FileInfo,
     path: &str,
     offset: Option<f64>,
     limit: Option<f64>,
     context: &Context,
 ) -> Result<ToolExecutionResult, ToolExecuteError> {
-    let source = ReaderSource {
-        reader,
-        context,
-        size: info.size,
-    };
-    let mime_type = detect_supported_image_mime_type_of(&source)
-        .await
-        .map_err(|error| tool_error(error.to_string()))?;
-    if let Some(mime_type) = mime_type {
-        return read_image(reader, info, path, &mime_type, context).await;
-    }
-
     let start_line = match offset {
         Some(value) if value != 0.0 && !value.is_nan() => (value - 1.0).max(0.0),
         _ => 0.0,
@@ -561,6 +707,11 @@ fn parameters() -> Value {
 /// `createReadTool` (read.ts:73). Remarks about truncation and continuation are
 /// diagnostics; the content is only file text.
 pub fn create_read_tool() -> ToolRegistration {
+    create_read_tool_with_options(ReadToolOptions::default())
+}
+
+/// `createReadTool` with image processing.
+pub fn create_read_tool_with_options(options: ReadToolOptions) -> ToolRegistration {
     ToolRegistration {
         tool: Tool {
             name: "read".to_string(),
@@ -578,7 +729,7 @@ pub fn create_read_tool() -> ToolRegistration {
         structured_output_schema: None,
         callers: None,
         deferred: false,
-        execute: Arc::new(ReadTool),
+        execute: Arc::new(ReadTool { options }),
     }
 }
 

@@ -12,6 +12,7 @@ pub mod edit_diff;
 pub mod env;
 pub mod file_mutation_queue;
 pub mod image;
+pub mod image_processor;
 pub mod path_utils;
 pub mod read;
 pub mod write;
@@ -31,8 +32,9 @@ pub use file_mutation_queue::with_file_mutation_queue;
 pub use image::{
     ByteSource, detect_supported_image_mime_type, detect_supported_image_mime_type_of,
 };
+pub use image_processor::{BuiltinImageProcessor, ImageLimits, ImageProcessor, PreparedImage};
 pub use path_utils::{resolve_read_tool_path, resolve_tool_path};
-pub use read::{ReadToolDetails, create_read_tool};
+pub use read::{ReadToolDetails, ReadToolOptions, create_read_tool, create_read_tool_with_options};
 pub use write::create_write_tool;
 
 use std::sync::Arc;

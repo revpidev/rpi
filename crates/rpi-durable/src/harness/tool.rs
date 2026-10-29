@@ -762,7 +762,15 @@ fn publish_progress(
     let write_reported = Arc::clone(&reported);
     let write_written = Arc::clone(&written);
     let error_shared = Arc::clone(&shared);
-    crate::harness::output::Progress::new(
+    let now_runtime = Arc::clone(&shared);
+    let timer_runtime = Arc::clone(&shared);
+    let clock = crate::harness::output::ProgressClock {
+        now: Arc::new(move || now_runtime.now().unwrap_or(0.0)),
+        arm: Arc::new(move |callback, delay_ms| {
+            let _ = timer_runtime.set_timer(callback, delay_ms.max(0.0).round() as u64);
+        }),
+    };
+    crate::harness::output::Progress::with_clock(
         move || {
             let shared = Arc::clone(&write_shared);
             let reported = Arc::clone(&write_reported);
@@ -781,6 +789,7 @@ fn publish_progress(
             }
         },
         settings.progress.output_interval_ms,
+        clock,
     )
 }
 
