@@ -8,7 +8,8 @@
 
 use std::sync::LazyLock;
 
-use crate::chord::sqlite::validate_sqlite_schema_prefix;
+pub use crate::chord::sqlite::validate_sqlite_schema_prefix;
+
 use crate::errors::StorageResult;
 
 /// Define one identifier group with its textual SQLite names.

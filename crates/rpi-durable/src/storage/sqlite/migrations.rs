@@ -270,14 +270,20 @@ mod tests {
         );
     }
 
+    /// The fixture was extracted verbatim from
+    /// `543e206:crates/rpi-durable/src/storage/sqlite/migrations.rs`
+    /// (`initial_schema()` in v0.1.7). It is an external anchor: if the v1
+    /// renderer changes, this comparison fails even though the test itself
+    /// derives the current history from the same code.
     #[test]
-    fn version_one_history_bytes_are_frozen() {
-        use sha2::{Digest, Sha256};
-        let statements = sqlite_migrations().remove(0).statements;
-        let digest = Sha256::digest(statements.join("\n").as_bytes());
+    fn version_one_history_matches_the_v017_fixture() {
+        let fixture: Vec<String> = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/sqlite-v1-schema.json"
+        ))
+        .expect("v1 schema fixture");
         assert_eq!(
-            format!("{digest:x}"),
-            "5412f8c8953c0dafd38f72616d1b5e38f8971c05e3b23e5bf66eb7983f3643bb",
+            sqlite_migrations().remove(0).statements,
+            fixture,
             "the v1 history is rendered from the schema but must keep its exact v0.1.7 bytes"
         );
     }
