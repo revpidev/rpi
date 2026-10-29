@@ -23,7 +23,7 @@ use test_support::{ReopeningStorage, TempDir, cleanup_temp_dirs};
 async fn open_sqlite(temp: &TempDir) -> SqliteStorage {
     open_node_sqlite_storage(
         &temp.path().join("storage.sqlite").to_string_lossy(),
-        SqliteDatabaseOptions::default(),
+        NodeSqliteStorageOptions::default(),
     )
     .await
     .expect("open storage")
@@ -54,13 +54,13 @@ async fn sqlite_storage_conformance_across_reopen() {
             .join("storage.sqlite")
             .to_string_lossy()
             .into_owned();
-        let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default()).await?;
+        let storage = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default()).await?;
         let reopen_path = path.clone();
         let reopened = ReopeningStorage::new(Box::new(storage), move || {
             let path = reopen_path.clone();
             Box::pin(async move {
                 let storage =
-                    open_node_sqlite_storage(&path, SqliteDatabaseOptions::default()).await?;
+                    open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default()).await?;
                 Ok(Box::new(storage) as Box<dyn Storage>)
             })
         });
@@ -73,6 +73,14 @@ async fn sqlite_storage_conformance_across_reopen() {
         "conformance failures:\n{}",
         result.err().unwrap_or_default()
     );
+}
+
+#[tokio::test]
+async fn default_node_options_open_in_memory_storage() {
+    let storage = open_node_sqlite_storage(":memory:", Default::default())
+        .await
+        .expect("open in-memory storage from default node options");
+    storage.close(&BACKGROUND_CONTEXT).await.expect("close");
 }
 
 fn namespaced_options(prefix: &str) -> NodeSqliteStorageOptions {
@@ -213,7 +221,7 @@ async fn sqlite_storage_conformance_after_version_one_migration() {
         let migrations = sqlite_migrations();
         apply_sqlite_migrations(&database, &migrations[..1]).await?;
         database.close().await?;
-        let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default()).await?;
+        let storage = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default()).await?;
         Ok(Arc::new(storage) as Arc<dyn Storage>)
     })
     .await;
@@ -462,7 +470,7 @@ async fn survives_kill_minus_nine_and_continues_after_reopen() {
     let _ = child.wait();
 
     let storage =
-        open_node_sqlite_storage(&path.to_string_lossy(), SqliteDatabaseOptions::default())
+        open_node_sqlite_storage(&path.to_string_lossy(), NodeSqliteStorageOptions::default())
             .await
             .expect("reopen after crash");
     let stored = storage
@@ -648,7 +656,7 @@ async fn migrations_apply_repeatedly_and_older_or_newer_binaries_are_rejected() 
         .await
         .expect("bump version");
     database.close().await.expect("close");
-    let result = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default()).await;
+    let result = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default()).await;
     match result {
         Err(error) => assert!(
             error
@@ -671,7 +679,7 @@ async fn failed_pending_migration_rolls_back() {
         .into_owned();
     // Commit the current schema first so the failed pending migration rolls
     // back only its own statements (upstream retry test shape).
-    let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+    let storage = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
         .await
         .expect("open storage");
     storage
@@ -708,7 +716,7 @@ async fn version_one_database_migrates_and_keeps_tasks_and_indexes() {
     // Opening storage applies the v2 rebuild; reopened storage does not repeat
     // it and keeps serving the same task row.
     for _ in 0..2 {
-        let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+        let storage = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
             .await
             .expect("open migrated storage");
         let stored = storage
@@ -844,7 +852,7 @@ async fn killed_version_two_migration_rolls_back_to_version_one() {
     database.close().await.expect("close");
 
     let storage =
-        open_node_sqlite_storage(&path.to_string_lossy(), SqliteDatabaseOptions::default())
+        open_node_sqlite_storage(&path.to_string_lossy(), NodeSqliteStorageOptions::default())
             .await
             .expect("open migrates after the interrupted attempt");
     assert!(
@@ -905,7 +913,7 @@ async fn rejects_missing_metadata_on_reopen() {
         .join("storage.sqlite")
         .to_string_lossy()
         .into_owned();
-    let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+    let storage = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
         .await
         .expect("open");
     storage.close(&BACKGROUND_CONTEXT).await.expect("close");
@@ -917,7 +925,7 @@ async fn rejects_missing_metadata_on_reopen() {
         .await
         .expect("delete metadata");
     database.close().await.expect("close");
-    let result = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default()).await;
+    let result = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default()).await;
     match result {
         Err(error) => assert!(
             error
@@ -939,7 +947,7 @@ async fn document_reads_observe_one_committed_state_across_replacements() {
         .to_string_lossy()
         .into_owned();
     let storage = Arc::new(
-        open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+        open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
             .await
             .expect("open"),
     );
@@ -1174,7 +1182,7 @@ async fn facade_reentrant_database_call_reports_explicit_error() {
 async fn facade_defers_ids_until_commit_settles() {
     let dir = TempDir::new("rpi-durable-sqlite-id-adoption");
     let path = dir.path().join("db.sqlite").to_string_lossy().into_owned();
-    let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+    let storage = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
         .await
         .expect("open");
     let entry_id: EntryId = id_from_number(100);
@@ -1201,7 +1209,7 @@ async fn facade_publication_is_atomic_with_secondary_indexes() {
         .join("storage.sqlite")
         .to_string_lossy()
         .into_owned();
-    let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+    let storage = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
         .await
         .expect("open");
     storage
@@ -1368,7 +1376,7 @@ async fn admitted_multi_query_reads_finish_before_storage_closes() {
         .to_string_lossy()
         .into_owned();
     let storage = Arc::new(
-        open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+        open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
             .await
             .expect("open"),
     );
@@ -1543,7 +1551,7 @@ async fn sqlite_document_scan_rejects_cursors_beyond_the_safe_integer() {
         .join("storage.sqlite")
         .to_string_lossy()
         .into_owned();
-    let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+    let storage = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
         .await
         .expect("open");
     let cursor = rpi_durable::types::Cursor {

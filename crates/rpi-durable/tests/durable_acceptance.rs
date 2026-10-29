@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use rpi_durable::fs::StdFileSystem;
 use rpi_durable::storage::open_node_sqlite_storage;
-use rpi_durable::storage::{JsonlStorage, JsonlStorageOptions, SqliteDatabaseOptions};
+use rpi_durable::storage::{JsonlStorage, JsonlStorageOptions, NodeSqliteStorageOptions};
 use rpi_durable::types::{Storage, TaskState, TaskStatus};
 
 use scheduler_support::{
@@ -82,7 +82,7 @@ async fn sqlite_harness_resumes_after_a_crash() {
     let path = dir.path_str() + "/durable.db";
     let id = {
         let storage: Arc<dyn Storage> = Arc::new(
-            open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+            open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
                 .await
                 .expect("open sqlite"),
         );
@@ -93,7 +93,7 @@ async fn sqlite_harness_resumes_after_a_crash() {
         id
     };
     let storage: Arc<dyn Storage> = Arc::new(
-        open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+        open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
             .await
             .expect("reopen sqlite"),
     );

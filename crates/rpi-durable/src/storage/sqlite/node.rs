@@ -21,32 +21,11 @@ pub struct NodeSqliteStorageOptions {
     pub prefix: Option<String>,
 }
 
-impl From<SqliteDatabaseOptions> for NodeSqliteStorageOptions {
-    fn from(options: SqliteDatabaseOptions) -> Self {
-        Self {
-            wal_auto_checkpoint_pages: options.wal_auto_checkpoint_pages,
-            busy_timeout_ms: options.busy_timeout_ms,
-            prefix: None,
-        }
-    }
-}
-
-impl From<SqliteStorageOptions> for NodeSqliteStorageOptions {
-    fn from(options: SqliteStorageOptions) -> Self {
-        Self {
-            wal_auto_checkpoint_pages: None,
-            busy_timeout_ms: None,
-            prefix: options.prefix,
-        }
-    }
-}
-
 /// Open or create file-backed durable storage, optionally under a table prefix.
 pub async fn open_node_sqlite_storage(
     path: &str,
-    options: impl Into<NodeSqliteStorageOptions>,
+    options: NodeSqliteStorageOptions,
 ) -> StorageResult<SqliteStorage> {
-    let options = options.into();
     // Validate before creating the database file, like upstream node.ts. The
     // storage open repeats the check for callers that build it directly.
     if let Some(prefix) = &options.prefix {

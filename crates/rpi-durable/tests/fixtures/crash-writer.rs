@@ -10,8 +10,8 @@
 
 use rpi_durable::chord::context::BACKGROUND_CONTEXT;
 use rpi_durable::storage::{
-    SqliteDatabaseOptions, SqliteValue, apply_sqlite_migrations, open_node_sqlite_database,
-    open_node_sqlite_storage, sqlite_migrations,
+    NodeSqliteStorageOptions, SqliteDatabaseOptions, SqliteValue, apply_sqlite_migrations,
+    open_node_sqlite_database, open_node_sqlite_storage, sqlite_migrations,
 };
 use rpi_durable::types::{ConversationRecord, EntryRecord, Storage, StorageWrite};
 use rpi_durable::{EntryId, ROOT_CONVERSATION_ID, id_from_number};
@@ -26,7 +26,7 @@ async fn main() {
         migrate_then_sleep(&path, &marker).await;
         return;
     }
-    let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+    let storage = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
         .await
         .expect("open storage");
     storage
