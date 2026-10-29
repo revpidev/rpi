@@ -339,6 +339,21 @@ fn strip_focused_fake_cursor(line: &str) -> String {
     result
 }
 
+/// `resolveFakeCursors` line body (tui.ts:1504-1510).
+fn resolve_fake_cursor_line(line: String, show_hardware_cursor: bool) -> String {
+    if !line.contains(FAKE_CURSOR_START) {
+        return line;
+    }
+    let resolved = if show_hardware_cursor {
+        strip_focused_fake_cursor(&line)
+    } else {
+        line
+    };
+    resolved
+        .replace(FAKE_CURSOR_START, "\x1b[7m")
+        .replace(FAKE_CURSOR_END, "\x1b[27m")
+}
+
 impl TuiBase {
     /// Upstream `TuiBase` constructor (tui.ts:363-370 → 478-502 @ 9841914,
     /// c505f4c19 / #8699): the library no longer reads configuration env —
@@ -1190,19 +1205,7 @@ impl TuiBase {
     pub(crate) fn resolve_fake_cursors(&self, lines: Vec<String>) -> Vec<String> {
         lines
             .into_iter()
-            .map(|line| {
-                if !line.contains(FAKE_CURSOR_START) {
-                    return line;
-                }
-                let resolved = if self.show_hardware_cursor {
-                    strip_focused_fake_cursor(&line)
-                } else {
-                    line
-                };
-                resolved
-                    .replace(FAKE_CURSOR_START, "\x1b[7m")
-                    .replace(FAKE_CURSOR_END, "\x1b[27m")
-            })
+            .map(|line| resolve_fake_cursor_line(line, self.show_hardware_cursor))
             .collect()
     }
 
@@ -1730,5 +1733,52 @@ impl TuiBase {
         self.pending_terminal_color_queries
             .iter()
             .any(|query| query.deadline.is_some_and(|deadline| now >= deadline))
+    }
+}
+
+#[cfg(test)]
+mod fake_cursor_tests {
+    use super::*;
+
+    fn focused_line(content: &str) -> String {
+        format!(
+            "a{CURSOR_MARKER}{}b",
+            crate::tui::render_fake_cursor(content)
+        )
+    }
+
+    #[test]
+    fn hardware_cursor_drops_only_the_focused_pair() {
+        assert_eq!(
+            resolve_fake_cursor_line(focused_line("Z"), true),
+            format!("a{CURSOR_MARKER}Zb")
+        );
+        assert_eq!(
+            resolve_fake_cursor_line(focused_line("Z"), false),
+            format!("a{CURSOR_MARKER}\x1b[7mZ\x1b[27mb")
+        );
+    }
+
+    #[test]
+    fn unfocused_markers_become_reverse_video_with_hardware_cursor() {
+        assert_eq!(
+            resolve_fake_cursor_line(crate::tui::render_fake_cursor("Q"), true),
+            "\x1b[7mQ\x1b[27m"
+        );
+    }
+
+    #[test]
+    fn truncated_focused_pair_keeps_the_content_until_end_of_line() {
+        let truncated = format!("a{CURSOR_MARKER}\x1b_pi:fc\x07Z");
+        assert_eq!(
+            resolve_fake_cursor_line(truncated, true),
+            format!("a{CURSOR_MARKER}Z")
+        );
+    }
+
+    #[test]
+    fn marker_without_fake_pair_is_untouched() {
+        let line = format!("a{CURSOR_MARKER}b");
+        assert_eq!(resolve_fake_cursor_line(line.clone(), true), line);
     }
 }
