@@ -224,6 +224,7 @@ enum InvocationMode {
 /// One in-memory execution of a task (upstream `Invocation`).
 struct Invocation {
     task_id: TaskId,
+    task_kind: String,
     conversation_id: ConversationId,
     mode: InvocationMode,
     controller: CancellationToken,
@@ -2161,6 +2162,7 @@ impl SchedulerInner {
         let (done_tx, _done_rx) = tokio::sync::watch::channel(false);
         let invocation = Arc::new(Invocation {
             task_id: record.id,
+            task_kind: record.kind.clone(),
             conversation_id: record.conversation_id,
             mode,
             controller,
@@ -2181,7 +2183,7 @@ impl SchedulerInner {
         self.telemetry.record_metric(
             "pi.durable.tasks.active",
             1.0,
-            serde_json::json!({ "task": reservation.task.name() })
+            serde_json::json!({ "task": reservation.invocation.task_kind })
                 .as_object()
                 .cloned()
                 .unwrap_or_default(),
@@ -2266,10 +2268,14 @@ impl SchedulerInner {
                 runtime.inner.telemetry.record_metric(
                     "pi.durable.phase.duration",
                     ((self.now)() - started).max(0.0),
-                    serde_json::json!({ "task": task.name(), "phase": phase })
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
+                    serde_json::json!({
+                        "task": task.name(),
+                        "phase": phase,
+                        "outcome": if outcome.is_ok() { "ok" } else { "error" },
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
                 );
                 if let Err(error) = &outcome {
                     runtime
