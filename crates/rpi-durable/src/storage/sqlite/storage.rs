@@ -7,11 +7,14 @@ use std::sync::Mutex;
 use crate::chord::context::Context;
 use crate::chord::delta::{Op, apply_immutable_batches};
 use crate::chord::json::{JsonObject, JsonValue};
+use crate::chord::sqlite::database::{SqliteDatabase, SqliteTransaction, SqliteValue};
 use crate::errors::{StorageError, StorageResult};
 use crate::ids::{ConversationId, DocumentId, EntryId, Seq, SubmissionId, TaskId, id_from_number};
 use crate::storage::scan::{ScanStart, scan_start};
-use crate::storage::sqlite::database::{SqliteDatabase, SqliteTransaction, SqliteValue};
-use crate::storage::sqlite::migrations::{apply_sqlite_migrations, sqlite_migrations};
+use crate::storage::sqlite::migrations::{
+    apply_sqlite_migrations_for_schema, create_sqlite_migrations,
+};
+use crate::storage::sqlite::schema::{SqliteSchema, create_sqlite_schema};
 use crate::storage::{is_alive_at, is_current_only, page_values};
 use crate::types::{
     ConversationQuery, ConversationRecord, Cursor, DocumentAddress, DocumentContent,
@@ -111,6 +114,7 @@ struct Admission {
 /// Portable SQLite implementation of the storage contract.
 pub struct SqliteStorage {
     db: SqliteDatabase,
+    schema: SqliteSchema,
     next_id: Mutex<u64>,
     admission: Mutex<Admission>,
     drained: tokio::sync::Notify,
@@ -135,10 +139,28 @@ impl Drop for ReadGuard<'_> {
     }
 }
 
+/// Storage-level SQLite options.
+#[derive(Debug, Clone, Default)]
+pub struct SqliteStorageOptions {
+    /// Prefix for every table and index in the durable schema. It must be a
+    /// SQLite identifier and must not use SQLite's reserved `sqlite_` prefix.
+    /// Existing data is not migrated when this changes.
+    pub prefix: Option<String>,
+}
+
 impl SqliteStorage {
     /// Initialize storage over an owned SQLite database facade.
     pub async fn open(db: SqliteDatabase) -> StorageResult<Self> {
-        match Self::open_inner(&db).await {
+        Self::open_with_options(db, SqliteStorageOptions::default()).await
+    }
+
+    /// Initialize storage over an owned SQLite database facade under optional
+    /// table/index identifiers (upstream `SqliteStorage.open(db, options)`).
+    pub async fn open_with_options(
+        db: SqliteDatabase,
+        options: SqliteStorageOptions,
+    ) -> StorageResult<Self> {
+        match Self::open_inner(&db, &options).await {
             Ok(storage) => Ok(storage),
             Err(error) => {
                 let _ = db.close().await;
@@ -147,24 +169,35 @@ impl SqliteStorage {
         }
     }
 
-    async fn open_inner(db: &SqliteDatabase) -> StorageResult<Self> {
-        apply_sqlite_migrations(db, &sqlite_migrations()).await?;
+    async fn open_inner(
+        db: &SqliteDatabase,
+        options: &SqliteStorageOptions,
+    ) -> StorageResult<Self> {
+        let schema = create_sqlite_schema(options.prefix.as_deref())?;
+        apply_sqlite_migrations_for_schema(db, &schema, &create_sqlite_migrations(&schema)).await?;
+        let metadata = format!(
+            "SELECT next_id FROM {} WHERE singleton = 1",
+            schema.tables.durable_metadata
+        );
         let next_id = db
-            .get_text(
-                "SELECT next_id FROM durable_metadata WHERE singleton = 1",
-                vec![],
-            )
+            .get_text(&metadata, vec![])
             .await?
             .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?
             .parse::<u64>()
             .map_err(|_| StorageError::message("Durable SQLite metadata is missing"))?;
         Ok(Self {
             db: db.clone_handle(),
+            schema,
             next_id: Mutex::new(next_id),
             admission: Mutex::new(Admission::default()),
             drained: tokio::sync::Notify::new(),
             close_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Identifiers this storage uses for its tables and indexes.
+    pub fn schema(&self) -> &SqliteSchema {
+        &self.schema
     }
 
     fn assert_open(&self) -> StorageResult<()> {
@@ -214,7 +247,10 @@ impl SqliteStorage {
     ) -> StorageResult<Option<ConversationRecord>> {
         self.db
             .get(
-                "SELECT record FROM conversations WHERE id = ?",
+                &format!(
+                    "SELECT record FROM {} WHERE id = ?",
+                    self.schema.tables.conversations
+                ),
                 vec![id.get().into()],
             )
             .await
@@ -233,11 +269,14 @@ impl SqliteStorage {
             }
         }
         let id_value = id.get();
+        let sql = format!(
+            "SELECT record, commit_seq FROM {} WHERE id = ?",
+            self.schema.tables.entries
+        );
         let row: Option<(String, i64)> = self
             .db
             .with_connection(move |conn| {
-                let mut statement =
-                    conn.prepare_cached("SELECT record, commit_seq FROM entries WHERE id = ?")?;
+                let mut statement = conn.prepare_cached(&sql)?;
                 let mut rows = statement.query(rusqlite::params![id_value as i64])?;
                 match rows.next()? {
                     None => Ok(None),
@@ -281,20 +320,24 @@ impl SqliteStorage {
             .await?
             .ok_or(StorageError::UnknownConversation(conversation_id))?;
         let mut upper = at_or_before_entry_id.map(EntryId::get);
+        let entries = &self.schema.tables.entries;
+        let latest = format!(
+            "SELECT record FROM {entries} WHERE conversation_id = ? AND head IS NOT NULL ORDER BY id DESC LIMIT 1"
+        );
+        let at_or_before = format!(
+            "SELECT record FROM {entries} WHERE conversation_id = ? AND head IS NOT NULL AND id <= ? ORDER BY id DESC LIMIT 1"
+        );
         loop {
             let record: Option<EntryRecord> = match upper {
                 None => {
                     self.db
-                        .get(
-                            "SELECT record FROM entries WHERE conversation_id = ? AND head IS NOT NULL ORDER BY id DESC LIMIT 1",
-                            vec![conversation.id.get().into()],
-                        )
+                        .get(&latest, vec![conversation.id.get().into()])
                         .await?
                 }
                 Some(upper) => {
                     self.db
                         .get(
-                            "SELECT record FROM entries WHERE conversation_id = ? AND head IS NOT NULL AND id <= ? ORDER BY id DESC LIMIT 1",
+                            &at_or_before,
                             vec![conversation.id.get().into(), upper.into()],
                         )
                         .await?
@@ -344,7 +387,8 @@ impl SqliteStorage {
             }
             params.push((limit + 1 - values.len()).into());
             let sql = format!(
-                "SELECT record FROM entries WHERE {} ORDER BY id DESC LIMIT ?",
+                "SELECT record FROM {} WHERE {} ORDER BY id DESC LIMIT ?",
+                self.schema.tables.entries,
                 clauses.join(" AND ")
             );
             let rows: Vec<EntryRecord> = self.db.all(&sql, params).await?;
@@ -422,7 +466,8 @@ impl SqliteStorage {
             }
             params.push((limit + 1 - values.len()).into());
             let sql = format!(
-                "SELECT record FROM entries WHERE {} ORDER BY id ASC LIMIT ?",
+                "SELECT record FROM {} WHERE {} ORDER BY id ASC LIMIT ?",
+                self.schema.tables.entries,
                 clauses.join(" AND ")
             );
             let rows: Vec<EntryRecord> = self.db.all(&sql, params).await?;
@@ -463,7 +508,10 @@ impl SqliteStorage {
             let id = write.write_id().expect("table implies id");
             let existing = tx
                 .get_text(
-                    "SELECT record_type FROM record_ids WHERE id = ?",
+                    &format!(
+                        "SELECT record_type FROM {} WHERE id = ?",
+                        self.schema.tables.record_ids
+                    ),
                     vec![id.into()],
                 )
                 .await?;
@@ -574,7 +622,10 @@ impl SqliteStorage {
     ) -> StorageResult<Option<DocumentId>> {
         let id = tx
             .get_i64(
-                "SELECT id FROM documents WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ? AND retired_at IS NULL LIMIT 1",
+                &format!(
+                    "SELECT id FROM {} WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ? AND retired_at IS NULL LIMIT 1",
+                    self.schema.tables.documents
+                ),
                 vec![
                     parts.kind.as_str().into(),
                     parts.scope_kind.into(),
@@ -604,7 +655,10 @@ impl SqliteStorage {
             }
             let existing: Option<DocumentRecord> = tx
                 .get(
-                    "SELECT record FROM documents WHERE id = ?",
+                    &format!(
+                        "SELECT record FROM {} WHERE id = ?",
+                        self.schema.tables.documents
+                    ),
                     vec![id.get().into()],
                 )
                 .await?;
@@ -624,7 +678,10 @@ impl SqliteStorage {
             if let Some(DocumentContent::Delta { version, .. }) = &action.content {
                 let previous: Option<i64> = tx
                     .get_i64(
-                        "SELECT version FROM document_revisions WHERE document_id = ? ORDER BY seq DESC LIMIT 1",
+                        &format!(
+                            "SELECT version FROM {} WHERE document_id = ? ORDER BY seq DESC LIMIT 1",
+                            self.schema.tables.document_revisions
+                        ),
                         vec![id.get().into()],
                     )
                     .await?;
@@ -689,11 +746,15 @@ impl SqliteStorage {
         write: &StorageWrite,
         seq: Seq,
     ) -> StorageResult<()> {
+        let tables = &self.schema.tables;
         match write {
             StorageWrite::Conversation { value } => {
                 self.claim_id(tx, value.id.get(), "conversation").await?;
                 tx.run(
-                    "INSERT INTO conversations (id, owner_conversation_id, owner_task_id, record) VALUES (?, ?, ?, ?)",
+                    &format!(
+                        "INSERT INTO {} (id, owner_conversation_id, owner_task_id, record) VALUES (?, ?, ?, ?)",
+                        tables.conversations
+                    ),
                     vec![
                         value.id.get().into(),
                         value.owner.as_ref().map(|owner| owner.conversation_id.get() as i64).into(),
@@ -706,7 +767,10 @@ impl SqliteStorage {
             StorageWrite::Entry { value } => {
                 self.claim_id(tx, value.id.get(), "entry").await?;
                 tx.run(
-                    "INSERT INTO entries (id, conversation_id, head, commit_seq, record) VALUES (?, ?, ?, ?, ?)",
+                    &format!(
+                        "INSERT INTO {} (id, conversation_id, head, commit_seq, record) VALUES (?, ?, ?, ?, ?)",
+                        tables.entries
+                    ),
                     vec![
                         value.id.get().into(),
                         value.conversation_id.get().into(),
@@ -720,11 +784,14 @@ impl SqliteStorage {
             StorageWrite::Task { value } => {
                 self.claim_id(tx, value.id.get(), "task").await?;
                 tx.run(
-                    "INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background, record)
+                    &format!(
+                        "INSERT INTO {} (id, conversation_id, kind, status, abort_requested, background, record)
 						VALUES (?, ?, ?, ?, ?, ?, ?)
 						ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id, kind = excluded.kind,
 						status = excluded.status, abort_requested = excluded.abort_requested,
 						background = excluded.background, record = excluded.record",
+                        tables.tasks
+                    ),
                     vec![
                         value.id.get().into(),
                         value.conversation_id.get().into(),
@@ -740,9 +807,12 @@ impl SqliteStorage {
             StorageWrite::Submission { value } => {
                 self.claim_id(tx, value.id().get(), "submission").await?;
                 tx.run(
-                    "INSERT INTO submissions (id, conversation_id, request_id, status, record) VALUES (?, ?, ?, ?, ?)
+                    &format!(
+                        "INSERT INTO {} (id, conversation_id, request_id, status, record) VALUES (?, ?, ?, ?, ?)
 						ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id,
 						request_id = excluded.request_id, status = excluded.status, record = excluded.record",
+                        tables.submissions
+                    ),
                     vec![
                         value.id().get().into(),
                         value.conversation_id().get().into(),
@@ -767,7 +837,10 @@ impl SqliteStorage {
         table: &'static str,
     ) -> StorageResult<()> {
         tx.run(
-            "INSERT OR IGNORE INTO record_ids (id, record_type) VALUES (?, ?)",
+            &format!(
+                "INSERT OR IGNORE INTO {} (id, record_type) VALUES (?, ?)",
+                self.schema.tables.record_ids
+            ),
             vec![id.into(), table.into()],
         )
         .await
@@ -781,7 +854,10 @@ impl SqliteStorage {
     ) -> StorageResult<Option<StoredDocument>> {
         let row: Option<DocumentRecord> = tx
             .get(
-                "SELECT record FROM documents WHERE id = ?",
+                &format!(
+                    "SELECT record FROM {} WHERE id = ?",
+                    self.schema.tables.documents
+                ),
                 vec![id.get().into()],
             )
             .await?;
@@ -800,12 +876,14 @@ impl SqliteStorage {
         // the maximum representable SQLite integer.
         let upper = at.upper().min(i64::MAX as u64) as i64;
         let id_value = id.get();
+        let base_sql = format!(
+            "SELECT seq, kind, version, content FROM {}
+						WHERE document_id = ? AND kind = 'base' AND seq <= ? ORDER BY seq DESC LIMIT 1",
+            self.schema.tables.document_revisions
+        );
         let base: Option<(i64, String, i64, String)> = tx
             .with_connection(move |conn| {
-                let mut statement = conn.prepare_cached(
-                    "SELECT seq, kind, version, content FROM document_revisions
-						WHERE document_id = ? AND kind = 'base' AND seq <= ? ORDER BY seq DESC LIMIT 1",
-                )?;
+                let mut statement = conn.prepare_cached(&base_sql)?;
                 let mut rows = statement.query(rusqlite::params![id_value as i64, upper])?;
                 match rows.next()? {
                     None => Ok(None),
@@ -819,12 +897,14 @@ impl SqliteStorage {
             )));
         };
         let value: JsonObject = serde_json::from_str(&base_content)?;
+        let tail_sql = format!(
+            "SELECT seq, kind, version, content FROM {}
+						WHERE document_id = ? AND seq > ? AND seq <= ? ORDER BY seq",
+            self.schema.tables.document_revisions
+        );
         let tail: Vec<(i64, String, i64, String)> = tx
             .with_connection(move |conn| {
-                let mut statement = conn.prepare_cached(
-                    "SELECT seq, kind, version, content FROM document_revisions
-						WHERE document_id = ? AND seq > ? AND seq <= ? ORDER BY seq",
-                )?;
+                let mut statement = conn.prepare_cached(&tail_sql)?;
                 let mut rows =
                     statement.query(rusqlite::params![id_value as i64, base_seq, upper])?;
                 let mut values = Vec::new();
@@ -926,7 +1006,10 @@ impl SqliteStorage {
                 let parts = address_parts(&record.kind, &record.scope, record.key.as_deref());
                 self.claim_id(tx, id.get(), "document").await?;
                 tx.run(
-                    "INSERT INTO documents (id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    &format!(
+                        "INSERT INTO {} (id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        self.schema.tables.documents
+                    ),
                     vec![
                         id.get().into(),
                         parts.kind.as_str().into(),
@@ -943,7 +1026,10 @@ impl SqliteStorage {
             } else {
                 record = tx
                     .get::<DocumentRecord>(
-                        "SELECT record FROM documents WHERE id = ?",
+                        &format!(
+                            "SELECT record FROM {} WHERE id = ?",
+                            self.schema.tables.documents
+                        ),
                         vec![id.get().into()],
                     )
                     .await?
@@ -953,7 +1039,10 @@ impl SqliteStorage {
             if let Some(content) = &content {
                 if content.is_base() && is_current_only(&record) {
                     tx.run(
-                        "DELETE FROM document_revisions WHERE document_id = ?",
+                        &format!(
+                            "DELETE FROM {} WHERE document_id = ?",
+                            self.schema.tables.document_revisions
+                        ),
                         vec![id.get().into()],
                     )
                     .await?;
@@ -964,7 +1053,10 @@ impl SqliteStorage {
                 };
                 let kind = if content.is_base() { "base" } else { "delta" };
                 tx.run(
-                    "INSERT INTO document_revisions (document_id, seq, kind, version, content) VALUES (?, ?, ?, ?, ?)",
+                    &format!(
+                        "INSERT INTO {} (document_id, seq, kind, version, content) VALUES (?, ?, ?, ?, ?)",
+                        self.schema.tables.document_revisions
+                    ),
                     vec![
                         id.get().into(),
                         seq.0.into(),
@@ -980,14 +1072,20 @@ impl SqliteStorage {
                 if action.create.is_none() {
                     record.retired_at = Some(seq);
                     tx.run(
-                        "UPDATE documents SET retired_at = ?, record = ? WHERE id = ?",
+                        &format!(
+                            "UPDATE {} SET retired_at = ?, record = ? WHERE id = ?",
+                            self.schema.tables.documents
+                        ),
                         vec![seq.0.into(), encode_json(&record)?.into(), id.get().into()],
                     )
                     .await?;
                 }
                 if is_current_only(&record) {
                     tx.run(
-                        "DELETE FROM document_revisions WHERE document_id = ?",
+                        &format!(
+                            "DELETE FROM {} WHERE document_id = ?",
+                            self.schema.tables.document_revisions
+                        ),
                         vec![id.get().into()],
                     )
                     .await?;
@@ -1007,16 +1105,17 @@ impl Storage for SqliteStorage {
         let seq = self
             .db
             .transaction(move |tx| async move {
+                let metadata = &self.schema.tables.durable_metadata;
                 let metadata_next_id = tx
                     .get_text(
-                        "SELECT next_id FROM durable_metadata WHERE singleton = 1",
+                        &format!("SELECT next_id FROM {metadata} WHERE singleton = 1"),
                         vec![],
                     )
                     .await?
                     .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?;
                 let committed_seq = tx
                     .get_i64(
-                        "SELECT next_seq FROM durable_metadata WHERE singleton = 1",
+                        &format!("SELECT next_seq FROM {metadata} WHERE singleton = 1"),
                         vec![],
                     )
                     .await?
@@ -1034,7 +1133,7 @@ impl Storage for SqliteStorage {
                     .parse::<u64>()
                     .map_err(|_| StorageError::message("Durable SQLite metadata is missing"))?;
                 tx.run(
-                    "UPDATE durable_metadata SET next_id = ?, next_seq = ? WHERE singleton = 1",
+                    &format!("UPDATE {metadata} SET next_id = ?, next_seq = ? WHERE singleton = 1"),
                     vec![
                         current_next_id.max(candidate_next_id).to_string().into(),
                         (committed_seq.0 + 1).into(),
@@ -1093,7 +1192,8 @@ impl Storage for SqliteStorage {
         }
         params.push((limit + 1).into());
         let sql = format!(
-            "SELECT record FROM conversations WHERE {} ORDER BY id {} LIMIT ?",
+            "SELECT record FROM {} WHERE {} ORDER BY id {} LIMIT ?",
+            self.schema.tables.conversations,
             clauses.join(" AND "),
             direction
         );
@@ -1154,7 +1254,10 @@ impl Storage for SqliteStorage {
         self.assert_open()?;
         self.db
             .get(
-                "SELECT record FROM tasks WHERE id = ?",
+                &format!(
+                    "SELECT record FROM {} WHERE id = ?",
+                    self.schema.tables.tasks
+                ),
                 vec![id.get().into()],
             )
             .await
@@ -1194,7 +1297,8 @@ impl Storage for SqliteStorage {
         }
         params.push((limit + 1).into());
         let sql = format!(
-            "SELECT record FROM tasks WHERE {} ORDER BY id {} LIMIT ?",
+            "SELECT record FROM {} WHERE {} ORDER BY id {} LIMIT ?",
+            self.schema.tables.tasks,
             clauses.join(" AND "),
             direction
         );
@@ -1215,7 +1319,10 @@ impl Storage for SqliteStorage {
         self.assert_open()?;
         self.db
             .get(
-                "SELECT record FROM submissions WHERE id = ?",
+                &format!(
+                    "SELECT record FROM {} WHERE id = ?",
+                    self.schema.tables.submissions
+                ),
                 vec![id.get().into()],
             )
             .await
@@ -1243,7 +1350,8 @@ impl Storage for SqliteStorage {
         }
         params.push((limit + 1).into());
         let sql = format!(
-            "SELECT record FROM submissions WHERE {} ORDER BY id {} LIMIT ?",
+            "SELECT record FROM {} WHERE {} ORDER BY id {} LIMIT ?",
+            self.schema.tables.submissions,
             clauses.join(" AND "),
             direction
         );
@@ -1265,7 +1373,10 @@ impl Storage for SqliteStorage {
         self.assert_open()?;
         self.db
             .get(
-                "SELECT record FROM submissions WHERE conversation_id = ? AND request_id = ?",
+                &format!(
+                    "SELECT record FROM {} WHERE conversation_id = ? AND request_id = ?",
+                    self.schema.tables.submissions
+                ),
                 vec![
                     conversation_id.get().into(),
                     encode_indexed_string(request_id).into(),
@@ -1289,24 +1400,29 @@ impl Storage for SqliteStorage {
             parts.family.into(),
             parts.key_value.as_str().into(),
         ];
+        let documents = &self.schema.tables.documents;
         let sql = if at.is_current() {
-            "SELECT record FROM documents
+            format!(
+                "SELECT record FROM {documents}
 				WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ?
 				AND retired_at IS NULL ORDER BY created_at DESC LIMIT 1"
+            )
         } else {
-            "SELECT record FROM documents
+            format!(
+                "SELECT record FROM {documents}
 				WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ?
 				AND created_at <= ? AND (retired_at IS NULL OR retired_at > ?)
 				ORDER BY created_at DESC LIMIT 1"
+            )
         };
         if at.is_current() {
-            self.db.get(sql, params).await
+            self.db.get(&sql, params).await
         } else {
             let bound = at.upper();
             let mut params = params;
             params.push(bound.into());
             params.push(bound.into());
-            self.db.get(sql, params).await
+            self.db.get(&sql, params).await
         }
     }
 
@@ -1362,7 +1478,8 @@ impl Storage for SqliteStorage {
         }
         params.push((limit + 1).into());
         let sql = format!(
-            "SELECT record FROM documents WHERE {} ORDER BY id LIMIT ?",
+            "SELECT record FROM {} WHERE {} ORDER BY id LIMIT ?",
+            self.schema.tables.documents,
             clauses.join(" AND ")
         );
         let rows: Vec<DocumentRecord> = self.db.all(&sql, params).await?;

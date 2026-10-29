@@ -9,13 +9,14 @@ use rpi_durable::chord::context::BACKGROUND_CONTEXT;
 use rpi_durable::errors::StorageError;
 use rpi_durable::ids::{DocumentId, EntryId, ROOT_CONVERSATION_ID, id_from_number};
 use rpi_durable::storage::{
-    SqliteDatabase, SqliteDatabaseOptions, SqliteMigration, SqliteStorage, SqliteValue,
-    apply_sqlite_migrations, open_node_sqlite_storage, sqlite_migrations,
+    CURRENT_SQLITE_SCHEMA_VERSION, DEFAULT_SQLITE_SCHEMA, NodeSqliteStorageOptions, SqliteDatabase,
+    SqliteDatabaseOptions, SqliteMigration, SqliteStorage, SqliteValue, apply_sqlite_migrations,
+    create_sqlite_migrations, open_node_sqlite_storage, sqlite_migrations,
 };
 use rpi_durable::testing::run_storage_conformance;
 use rpi_durable::types::{
-    ConversationRecord, DocumentContent, DocumentCreate, DocumentScope, EntryRecord, Storage,
-    StorageWrite,
+    ConversationRecord, DocumentContent, DocumentCreate, DocumentScope, EntryRecord, JoinPolicy,
+    Storage, StorageWrite, TaskRecord, TaskState,
 };
 use test_support::{ReopeningStorage, TempDir, cleanup_temp_dirs};
 
@@ -72,6 +73,329 @@ async fn sqlite_storage_conformance_across_reopen() {
         "conformance failures:\n{}",
         result.err().unwrap_or_default()
     );
+}
+
+fn namespaced_options(prefix: &str) -> NodeSqliteStorageOptions {
+    NodeSqliteStorageOptions {
+        prefix: Some(prefix.to_string()),
+        ..NodeSqliteStorageOptions::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespaced_sqlite_storage_conformance() {
+    let result = run_storage_conformance(|| async {
+        let dir = TempDir::new("rpi-durable-sqlite-ns-conf");
+        let path = dir
+            .path()
+            .join("storage.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        let storage = open_node_sqlite_storage(&path, namespaced_options("shared_")).await?;
+        Ok(Arc::new(storage) as Arc<dyn Storage>)
+    })
+    .await;
+    cleanup_temp_dirs("rpi-durable-sqlite-ns-conf");
+    assert!(
+        result.is_ok(),
+        "conformance failures:\n{}",
+        result.err().unwrap_or_default()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespaced_sqlite_storage_conformance_across_reopen() {
+    let result = run_storage_conformance(|| async {
+        let dir = TempDir::new("rpi-durable-sqlite-ns-reopen");
+        let path = dir
+            .path()
+            .join("storage.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        let storage = open_node_sqlite_storage(&path, namespaced_options("shared_")).await?;
+        let reopen_path = path.clone();
+        let reopened = ReopeningStorage::new(Box::new(storage), move || {
+            let path = reopen_path.clone();
+            Box::pin(async move {
+                let storage =
+                    open_node_sqlite_storage(&path, namespaced_options("shared_")).await?;
+                Ok(Box::new(storage) as Box<dyn Storage>)
+            })
+        });
+        Ok(Arc::new(reopened) as Arc<dyn Storage>)
+    })
+    .await;
+    cleanup_temp_dirs("rpi-durable-sqlite-ns-reopen");
+    assert!(
+        result.is_ok(),
+        "conformance failures:\n{}",
+        result.err().unwrap_or_default()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_namespaced_storages_commit_concurrently_in_one_database() {
+    let dir = TempDir::new("rpi-durable-sqlite-prefix-concurrent");
+    let path = dir
+        .path()
+        .join("storage.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    let first = open_node_sqlite_storage(&path, namespaced_options("first_"))
+        .await
+        .expect("open first_");
+    let second = open_node_sqlite_storage(&path, namespaced_options("second_"))
+        .await
+        .expect("open second_");
+    let entry_id: EntryId = id_from_number(2);
+    let root = StorageWrite::Conversation {
+        value: ConversationRecord {
+            id: ROOT_CONVERSATION_ID,
+            parent: None,
+            owner: None,
+        },
+    };
+    let first_writes = [
+        root.clone(),
+        StorageWrite::Entry {
+            value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "first"),
+        },
+    ];
+    let second_writes = [
+        root,
+        StorageWrite::Entry {
+            value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "second"),
+        },
+    ];
+    let commit_first = first.commit(&first_writes, &BACKGROUND_CONTEXT);
+    let commit_second = second.commit(&second_writes, &BACKGROUND_CONTEXT);
+    let (first_result, second_result) = tokio::join!(commit_first, commit_second);
+    first_result.expect("first commit");
+    second_result.expect("second commit");
+    assert_eq!(
+        first
+            .entry(entry_id, &BACKGROUND_CONTEXT)
+            .await
+            .expect("first entry")
+            .expect("present")
+            .entry
+            .kind,
+        "first"
+    );
+    assert_eq!(
+        second
+            .entry(entry_id, &BACKGROUND_CONTEXT)
+            .await
+            .expect("second entry")
+            .expect("present")
+            .entry
+            .kind,
+        "second"
+    );
+    first.close(&BACKGROUND_CONTEXT).await.expect("close first");
+    second
+        .close(&BACKGROUND_CONTEXT)
+        .await
+        .expect("close second");
+    cleanup_temp_dirs("rpi-durable-sqlite-prefix-concurrent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_storage_conformance_after_version_one_migration() {
+    let result = run_storage_conformance(|| async {
+        let dir = TempDir::new("rpi-durable-sqlite-v1-conf");
+        let path = dir
+            .path()
+            .join("storage.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        let database = SqliteDatabase::open(&path, SqliteDatabaseOptions::default()).await?;
+        let migrations = sqlite_migrations();
+        apply_sqlite_migrations(&database, &migrations[..1]).await?;
+        database.close().await?;
+        let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default()).await?;
+        Ok(Arc::new(storage) as Arc<dyn Storage>)
+    })
+    .await;
+    cleanup_temp_dirs("rpi-durable-sqlite-v1-conf");
+    assert!(
+        result.is_ok(),
+        "conformance failures:\n{}",
+        result.err().unwrap_or_default()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespaced_storage_shares_a_database_with_host_tables_and_other_prefixes() {
+    let dir = TempDir::new("rpi-durable-sqlite-prefix");
+    let path = dir
+        .path()
+        .join("storage.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    let host = SqliteDatabase::open(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("open host");
+    host.exec("CREATE TABLE tasks (text TEXT) STRICT")
+        .await
+        .expect("host table");
+    host.run("INSERT INTO tasks (text) VALUES ('host')", vec![])
+        .await
+        .expect("host row");
+    host.close().await.expect("close host");
+
+    let entry_id: EntryId = id_from_number(2);
+    let storage = open_node_sqlite_storage(&path, namespaced_options("rpi_"))
+        .await
+        .expect("open rpi_ storage");
+    storage
+        .commit(
+            &[
+                StorageWrite::Conversation {
+                    value: ConversationRecord {
+                        id: ROOT_CONVERSATION_ID,
+                        parent: None,
+                        owner: None,
+                    },
+                },
+                StorageWrite::Entry {
+                    value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "namespaced"),
+                },
+            ],
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("commit rpi_");
+    storage.close(&BACKGROUND_CONTEXT).await.expect("close");
+
+    let reopened = open_node_sqlite_storage(&path, namespaced_options("rpi_"))
+        .await
+        .expect("reopen rpi_");
+    assert!(
+        reopened
+            .conversation(ROOT_CONVERSATION_ID, &BACKGROUND_CONTEXT)
+            .await
+            .expect("conversation")
+            .is_some()
+    );
+    assert_eq!(
+        reopened
+            .entry(entry_id, &BACKGROUND_CONTEXT)
+            .await
+            .expect("entry")
+            .expect("present")
+            .entry
+            .kind,
+        "namespaced"
+    );
+    reopened.close(&BACKGROUND_CONTEXT).await.expect("close");
+
+    let other = open_node_sqlite_storage(&path, namespaced_options("other_"))
+        .await
+        .expect("open other_ storage");
+    assert!(
+        other
+            .conversation(ROOT_CONVERSATION_ID, &BACKGROUND_CONTEXT)
+            .await
+            .expect("conversation")
+            .is_none(),
+        "another prefix must not see rpi_ rows"
+    );
+    assert!(
+        other
+            .entry(entry_id, &BACKGROUND_CONTEXT)
+            .await
+            .expect("entry")
+            .is_none(),
+        "another prefix must not see rpi_ entries"
+    );
+    other
+        .commit(
+            &[StorageWrite::Conversation {
+                value: ConversationRecord {
+                    id: ROOT_CONVERSATION_ID,
+                    parent: None,
+                    owner: None,
+                },
+            }],
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("commit other_");
+    other.close(&BACKGROUND_CONTEXT).await.expect("close");
+
+    let database = SqliteDatabase::open(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("raw open");
+    let names = table_names(&database).await;
+    assert!(names.contains(&"tasks".to_string()), "{names:?}");
+    assert!(names.contains(&"rpi_tasks".to_string()), "{names:?}");
+    assert!(names.contains(&"other_tasks".to_string()), "{names:?}");
+    let unprefixed: Vec<&String> = names
+        .iter()
+        .filter(|name| !name.starts_with("rpi_") && !name.starts_with("other_"))
+        .collect();
+    assert_eq!(unprefixed, vec![&"tasks".to_string()], "{names:?}");
+    assert_eq!(
+        database
+            .get_i64("SELECT count(*) FROM rpi_entries", vec![])
+            .await
+            .expect("rpi entries")
+            .expect("row"),
+        1
+    );
+    assert_eq!(
+        database
+            .get_i64("SELECT count(*) FROM other_entries", vec![])
+            .await
+            .expect("other entries")
+            .expect("row"),
+        0
+    );
+    assert_eq!(
+        database
+            .get_i64("SELECT count(*) FROM tasks", vec![])
+            .await
+            .expect("host rows")
+            .expect("row"),
+        1
+    );
+    assert_eq!(
+        database
+            .get_i64("SELECT count(*) FROM rpi_tasks", vec![])
+            .await
+            .expect("namespaced tasks")
+            .expect("row"),
+        0
+    );
+    database.close().await.expect("close");
+    cleanup_temp_dirs("rpi-durable-sqlite-prefix");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_or_reserved_prefix_fails_before_creating_the_database() {
+    let dir = TempDir::new("rpi-durable-sqlite-prefix-invalid");
+    let nested = dir.path().join("nested");
+    let path = nested.join("storage.sqlite");
+    for prefix in ["", "bad-prefix", "sqlite_rpi_"] {
+        let result =
+            open_node_sqlite_storage(&path.to_string_lossy(), namespaced_options(prefix)).await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("prefix {prefix:?} must be rejected"),
+        };
+        let expected = if prefix.eq_ignore_ascii_case("sqlite_rpi_") {
+            "is reserved"
+        } else {
+            "Invalid SQLite schema prefix"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    assert!(
+        !nested.exists(),
+        "an invalid prefix must fail before creating the database directory"
+    );
+    cleanup_temp_dirs("rpi-durable-sqlite-prefix-invalid");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -162,8 +486,127 @@ async fn survives_kill_minus_nine_and_continues_after_reopen() {
     cleanup_temp_dirs("rpi-durable-sqlite-crash");
 }
 
+async fn schema_version(database: &SqliteDatabase) -> u64 {
+    database
+        .get_i64(
+            "SELECT version FROM durable_schema WHERE singleton = 1",
+            vec![],
+        )
+        .await
+        .expect("version")
+        .expect("row") as u64
+}
+
+async fn tasks_index_names(database: &SqliteDatabase) -> Vec<String> {
+    database
+        .get::<Vec<String>>(
+            "SELECT json_group_array(name) FROM (SELECT name FROM sqlite_schema \
+             WHERE type = 'index' AND tbl_name = 'tasks' ORDER BY name)",
+            vec![],
+        )
+        .await
+        .expect("index names")
+        .expect("row")
+}
+
+async fn table_names(database: &SqliteDatabase) -> Vec<String> {
+    database
+        .get::<Vec<String>>(
+            "SELECT json_group_array(name) FROM (SELECT name FROM sqlite_schema \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name)",
+            vec![],
+        )
+        .await
+        .expect("table names")
+        .expect("row")
+}
+
+async fn table_exists(database: &SqliteDatabase, name: &str) -> bool {
+    database
+        .get_i64(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            vec![name.into()],
+        )
+        .await
+        .expect("table count")
+        .expect("row")
+        > 0
+}
+
+async fn insert_task_row(database: &SqliteDatabase, task: &TaskRecord) {
+    database
+        .run(
+            "INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background, record) \
+             VALUES (?, ?, ?, ?, 0, 0, ?)",
+            vec![
+                task.id.get().into(),
+                task.conversation_id.get().into(),
+                task.kind.as_str().into(),
+                task.status().as_str().into(),
+                serde_json::to_string(task).expect("task json").into(),
+            ],
+        )
+        .await
+        .expect("insert task");
+}
+
+async fn insert_sleeping_task(database: &SqliteDatabase) -> Result<(), StorageError> {
+    database
+        .run(
+            "INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background, record) \
+             VALUES (6, 1, 'test.task', 'sleeping', 0, 0, '{}')",
+            vec![],
+        )
+        .await
+}
+
+fn waiting_task(id: u64) -> TaskRecord {
+    TaskRecord {
+        id: id_from_number(id),
+        conversation_id: ROOT_CONVERSATION_ID,
+        kind: "test.task".to_string(),
+        version: 1,
+        input: serde_json::Value::Null,
+        owner: None,
+        background: false,
+        abort_requested: false,
+        started_at: None,
+        ended_at: None,
+        state: TaskState::Waiting {
+            checkpoint: serde_json::json!({ "phase": "run" }),
+            on: Vec::new(),
+            policy: JoinPolicy::AllSettled,
+        },
+        memos: None,
+    }
+}
+
+/// Build a version 1 database (pre-sleeping task table) with one waiting task.
+async fn version_one_database(dir: &TempDir) -> (String, TaskRecord) {
+    let path = dir
+        .path()
+        .join("storage.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    let database = SqliteDatabase::open(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("open");
+    let migrations = sqlite_migrations();
+    apply_sqlite_migrations(&database, &migrations[..1])
+        .await
+        .expect("apply v1");
+    let task = waiting_task(5);
+    insert_task_row(&database, &task).await;
+    assert!(
+        insert_sleeping_task(&database).await.is_err(),
+        "the v1 task table must reject the sleeping status"
+    );
+    database.close().await.expect("close");
+    (path, task)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn migrations_apply_repeatedly_and_reject_newer_versions() {
+async fn migrations_apply_repeatedly_and_older_or_newer_binaries_are_rejected() {
     let dir = TempDir::new("rpi-durable-sqlite-migrations");
     let path = dir
         .path()
@@ -180,19 +623,27 @@ async fn migrations_apply_repeatedly_and_reject_newer_versions() {
     apply_sqlite_migrations(&database, &migrations)
         .await
         .expect("second apply");
-    let version = database
-        .get_i64(
-            "SELECT version FROM durable_schema WHERE singleton = 1",
-            vec![],
-        )
-        .await
-        .expect("version")
-        .expect("row");
-    assert_eq!(version, 1);
+    assert_eq!(CURRENT_SQLITE_SCHEMA_VERSION, 2);
+    assert_eq!(
+        schema_version(&database).await,
+        CURRENT_SQLITE_SCHEMA_VERSION
+    );
+    // A 1.3.0-or-earlier binary (v1 history only) refuses a version 2 database.
+    let older_history = create_sqlite_migrations(&DEFAULT_SQLITE_SCHEMA);
+    let result = apply_sqlite_migrations(&database, &older_history[..1]).await;
+    match result {
+        Err(error) => assert!(
+            error
+                .to_string()
+                .contains("is newer than supported version 1"),
+            "{error}"
+        ),
+        Ok(()) => panic!("expected the older history to reject version 2"),
+    }
     database
         .run(
             "UPDATE durable_schema SET version = ? WHERE singleton = 1",
-            vec![SqliteValue::Integer(2)],
+            vec![SqliteValue::Integer(3)],
         )
         .await
         .expect("bump version");
@@ -202,7 +653,7 @@ async fn migrations_apply_repeatedly_and_reject_newer_versions() {
         Err(error) => assert!(
             error
                 .to_string()
-                .contains("is newer than supported version"),
+                .contains("is newer than supported version 2"),
             "{error}"
         ),
         Ok(_) => panic!("expected newer-version rejection"),
@@ -218,7 +669,7 @@ async fn failed_pending_migration_rolls_back() {
         .join("storage.sqlite")
         .to_string_lossy()
         .into_owned();
-    // Commit the initial schema first so the failed pending migration rolls
+    // Commit the current schema first so the failed pending migration rolls
     // back only its own statements (upstream retry test shape).
     let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
         .await
@@ -232,7 +683,7 @@ async fn failed_pending_migration_rolls_back() {
         .expect("open");
     let mut migrations = sqlite_migrations();
     migrations.push(SqliteMigration {
-        version: 2,
+        version: CURRENT_SQLITE_SCHEMA_VERSION + 1,
         statements: vec![
             "CREATE TABLE migration_probe (value TEXT) STRICT".to_string(),
             "THIS IS NOT SQL".to_string(),
@@ -240,28 +691,212 @@ async fn failed_pending_migration_rolls_back() {
     });
     let result = apply_sqlite_migrations(&database, &migrations).await;
     assert!(result.is_err(), "expected failed migration");
-    let version = database
-        .get_i64(
-            "SELECT version FROM durable_schema WHERE singleton = 1",
-            vec![],
-        )
-        .await
-        .expect("version")
-        .expect("row");
-    assert_eq!(version, 1);
-    let probe_count = database
-        .get_i64(
-            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'migration_probe'",
-            vec![],
-        )
-        .await
-        .expect("count")
-        .expect("row");
-    assert_eq!(probe_count, 0);
+    assert_eq!(
+        schema_version(&database).await,
+        CURRENT_SQLITE_SCHEMA_VERSION
+    );
+    assert!(!table_exists(&database, "migration_probe").await);
     database.close().await.expect("close");
     cleanup_temp_dirs("rpi-durable-sqlite-migration-rollback");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn version_one_database_migrates_and_keeps_tasks_and_indexes() {
+    let dir = TempDir::new("rpi-durable-sqlite-v1-migration");
+    let (path, task) = version_one_database(&dir).await;
+
+    // Opening storage applies the v2 rebuild; reopened storage does not repeat
+    // it and keeps serving the same task row.
+    for _ in 0..2 {
+        let storage = open_node_sqlite_storage(&path, SqliteDatabaseOptions::default())
+            .await
+            .expect("open migrated storage");
+        let stored = storage
+            .task(task.id, &BACKGROUND_CONTEXT)
+            .await
+            .expect("read task")
+            .expect("task retained");
+        assert_eq!(stored, task);
+        storage.close(&BACKGROUND_CONTEXT).await.expect("close");
+    }
+
+    let database = SqliteDatabase::open(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("raw open");
+    assert_eq!(schema_version(&database).await, 2);
+    assert_eq!(
+        database
+            .get_text("SELECT record FROM tasks WHERE id = 5", vec![])
+            .await
+            .expect("task row")
+            .expect("row"),
+        serde_json::to_string(&task).expect("task json")
+    );
+    insert_sleeping_task(&database)
+        .await
+        .expect("version 2 accepts sleeping tasks");
+    assert_eq!(
+        tasks_index_names(&database).await,
+        vec![
+            "tasks_by_abort_requested",
+            "tasks_by_background",
+            "tasks_by_conversation",
+            "tasks_by_kind",
+            "tasks_by_status",
+        ]
+    );
+    assert!(!table_exists(&database, "tasks_v2").await);
+    database.close().await.expect("close");
+    cleanup_temp_dirs("rpi-durable-sqlite-v1-migration");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_version_two_rebuild_rolls_back_the_task_table() {
+    let dir = TempDir::new("rpi-durable-sqlite-v2-rollback");
+    let (path, task) = version_one_database(&dir).await;
+    let database = SqliteDatabase::open(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("open");
+    let mut migrations = sqlite_migrations();
+    migrations[1].statements.push("THIS IS NOT SQL".to_string());
+    assert!(
+        apply_sqlite_migrations(&database, &migrations)
+            .await
+            .is_err(),
+        "expected the v2 migration to fail"
+    );
+    assert_eq!(schema_version(&database).await, 1);
+    assert_eq!(
+        database
+            .get_text("SELECT record FROM tasks WHERE id = 5", vec![])
+            .await
+            .expect("task row")
+            .expect("row"),
+        serde_json::to_string(&task).expect("task json")
+    );
+    assert!(!table_exists(&database, "tasks_v2").await);
+    assert!(
+        insert_sleeping_task(&database).await.is_err(),
+        "a failed rebuild must leave the v1 task table in place"
+    );
+
+    // The same database still migrates on the next open.
+    apply_sqlite_migrations(&database, &sqlite_migrations())
+        .await
+        .expect("retry migration");
+    assert_eq!(schema_version(&database).await, 2);
+    insert_sleeping_task(&database)
+        .await
+        .expect("retry accepts sleeping tasks");
+    database.close().await.expect("close");
+    cleanup_temp_dirs("rpi-durable-sqlite-v2-rollback");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn killed_version_two_migration_rolls_back_to_version_one() {
+    let dir = TempDir::new("rpi-durable-sqlite-v2-kill");
+    let path = dir.path().join("storage.sqlite");
+    let marker = dir.path().join("ready");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rpi-durable-crash-writer"))
+        .arg(path.to_string_lossy().into_owned())
+        .arg(marker.to_string_lossy().into_owned())
+        .arg("migrate")
+        .spawn()
+        .expect("spawn migration writer");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !marker.exists() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("migration writer did not signal readiness");
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("migration writer exited early: {status}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The child starts the v2 transaction right after the marker; the appended
+    // recursive CTE keeps it running so the SIGKILL lands mid-migration.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    child.kill().expect("kill");
+    let _ = child.wait();
+
+    let database = SqliteDatabase::open(&path.to_string_lossy(), SqliteDatabaseOptions::default())
+        .await
+        .expect("reopen after crash");
+    assert_eq!(
+        schema_version(&database).await,
+        1,
+        "an interrupted migration must roll back to version 1"
+    );
+    assert!(
+        database
+            .get_text("SELECT record FROM tasks WHERE id = 5", vec![])
+            .await
+            .expect("task row")
+            .is_some(),
+        "the v1 task row survives the interrupted rebuild"
+    );
+    assert!(!table_exists(&database, "tasks_v2").await);
+    assert!(
+        insert_sleeping_task(&database).await.is_err(),
+        "the interrupted rebuild must not expose a half-migrated task table"
+    );
+    database.close().await.expect("close");
+
+    let storage =
+        open_node_sqlite_storage(&path.to_string_lossy(), SqliteDatabaseOptions::default())
+            .await
+            .expect("open migrates after the interrupted attempt");
+    assert!(
+        storage
+            .task(id_from_number(5), &BACKGROUND_CONTEXT)
+            .await
+            .expect("read task")
+            .is_some()
+    );
+    storage.close(&BACKGROUND_CONTEXT).await.expect("close");
+    cleanup_temp_dirs("rpi-durable-sqlite-v2-kill");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_contiguous_and_corrupt_versions_are_rejected() {
+    let dir = TempDir::new("rpi-durable-sqlite-version-corruption");
+    let path = dir
+        .path()
+        .join("storage.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    let database = SqliteDatabase::open(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("open");
+    let v1 = sqlite_migrations().remove(0);
+    let non_contiguous = vec![
+        v1.clone(),
+        SqliteMigration {
+            version: 3,
+            statements: vec!["CREATE TABLE skipped (value TEXT) STRICT".to_string()],
+        },
+    ];
+    let result = apply_sqlite_migrations(&database, &non_contiguous).await;
+    assert!(
+        result
+            .expect_err("non-contiguous")
+            .to_string()
+            .contains("contiguous versions"),
+    );
+    apply_sqlite_migrations(&database, &[v1]).await.expect("v1");
+    // Losing the version row leaves a populated schema that cannot be migrated
+    // from scratch; the failure rolls back and keeps the existing tables.
+    database
+        .run("DELETE FROM durable_schema", vec![])
+        .await
+        .expect("drop version");
+    let result = apply_sqlite_migrations(&database, &sqlite_migrations()).await;
+    assert!(result.is_err(), "expected corrupt-metadata rejection");
+    assert!(table_exists(&database, "tasks").await);
+    database.close().await.expect("close");
+    cleanup_temp_dirs("rpi-durable-sqlite-version-corruption");
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejects_missing_metadata_on_reopen() {
     let dir = TempDir::new("rpi-durable-sqlite-metadata");

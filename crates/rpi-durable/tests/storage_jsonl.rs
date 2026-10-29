@@ -145,6 +145,43 @@ async fn open_storage(dir: &TempDir, fsync: bool) -> JsonlStorage {
     .expect("open storage")
 }
 
+/// Legacy anchor: a v1.3-era JSONL directory (format 1, no schema metadata)
+/// opens without a migration and keeps its bytes unchanged.
+#[tokio::test]
+async fn legacy_format_one_directory_reads_without_migration() {
+    let dir = TempDir::new("rpi-durable-jsonl-legacy");
+    let main = dir.path().join("main.jsonl");
+    let legacy = concat!(
+        "{\"format\":1,\"type\":\"commit\",\"seq\":1,\"writes\":[{\"type\":\"conversation\",\"value\":{\"id\":1}}]}\n",
+        "{\"format\":1,\"type\":\"commit\",\"seq\":2,\"writes\":[{\"type\":\"entry\",\"value\":{\"id\":2,\"conversationId\":1,\"kind\":\"legacy\"}}]}\n"
+    );
+    std::fs::write(&main, legacy).expect("write legacy main");
+
+    let storage = open_storage(&dir, false).await;
+    assert!(
+        storage
+            .conversation(ROOT_CONVERSATION_ID, &BACKGROUND_CONTEXT)
+            .await
+            .expect("conversation")
+            .is_some()
+    );
+    let entry = storage
+        .entry(id_from_number(2), &BACKGROUND_CONTEXT)
+        .await
+        .expect("entry")
+        .expect("present");
+    assert_eq!(entry.entry.kind, "legacy");
+    assert_eq!(entry.commit_seq, rpi_durable::Seq(2));
+    storage.close(&BACKGROUND_CONTEXT).await.expect("close");
+    assert_eq!(
+        std::fs::read_to_string(&main).expect("read main"),
+        legacy,
+        "opening legacy JSONL must not rewrite or migrate the file"
+    );
+    assert_eq!(read_lines(&main).len(), 2);
+    cleanup_temp_dirs("rpi-durable-jsonl-legacy");
+}
+
 #[tokio::test]
 async fn publishes_every_commit_before_reclaiming_sidecars() {
     let dir = TempDir::new("rpi-durable-jsonl-reclaim");

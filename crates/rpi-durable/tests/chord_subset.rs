@@ -21,6 +21,60 @@ use rpi_durable::chord::state::{
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn chord_sqlite_drivers_and_generic_migrations_share_the_durable_types() {
+    // The driver types moved to chord/sqlite; the durable entry points are
+    // re-exports, so both paths name the same types.
+    fn same_driver(_: rpi_durable::chord::sqlite::SqliteDatabase) {}
+    let database: rpi_durable::storage::SqliteDatabase =
+        rpi_durable::chord::sqlite::open_node_sqlite_database(
+            ":memory:",
+            rpi_durable::chord::sqlite::SqliteDatabaseOptions::default(),
+        )
+        .await
+        .expect("open in-memory database");
+    same_driver(database.clone_handle());
+    let migrations = [rpi_durable::chord::sqlite::SqliteMigration {
+        version: 1,
+        statements: vec!["CREATE TABLE custom_probe (id INTEGER PRIMARY KEY) STRICT".to_string()],
+    }];
+    rpi_durable::chord::sqlite::apply_sqlite_migrations(
+        &database,
+        &migrations,
+        "custom_schema_version",
+    )
+    .await
+    .expect("generic migration");
+    rpi_durable::chord::sqlite::apply_sqlite_migrations(
+        &database,
+        &migrations,
+        "custom_schema_version",
+    )
+    .await
+    .expect("repeated generic migration");
+    assert_eq!(
+        database
+            .get_i64(
+                "SELECT version FROM custom_schema_version WHERE singleton = 1",
+                vec![],
+            )
+            .await
+            .expect("version")
+            .expect("row"),
+        1
+    );
+    let reserved =
+        rpi_durable::chord::sqlite::apply_sqlite_migrations(&database, &migrations, "sqlite_probe")
+            .await;
+    assert!(
+        reserved
+            .expect_err("reserved")
+            .to_string()
+            .contains("is reserved")
+    );
+    database.close().await.expect("close");
+}
+
+#[tokio::test]
 async fn context_values_are_typed_and_scoped() {
     let key = create_context_key::<u64>("probe");
     let other = create_context_key::<u64>("other");

@@ -10,10 +10,13 @@ pub use jsonl::{JsonlStorage, JsonlStorageOptions};
 pub use memory::{MemoryStorage, PreparedMemoryCommit};
 pub use scan::{ScanStart, scan_start};
 pub use sqlite::{
-    CURRENT_SQLITE_SCHEMA_VERSION, DEFAULT_BUSY_TIMEOUT_MS, DEFAULT_WAL_AUTO_CHECKPOINT_PAGES,
-    SqliteDatabase, SqliteDatabaseOptions, SqliteExecutor, SqliteMigration, SqliteStorage,
-    SqliteTransaction, SqliteValue, SqliteValueRef, apply_sqlite_migrations,
-    open_node_sqlite_database, open_node_sqlite_storage, sqlite_migrations,
+    CURRENT_SQLITE_SCHEMA_VERSION, DEFAULT_BUSY_TIMEOUT_MS, DEFAULT_SQLITE_SCHEMA,
+    DEFAULT_WAL_AUTO_CHECKPOINT_PAGES, NodeSqliteStorageOptions, SqliteDatabase,
+    SqliteDatabaseOptions, SqliteExecutor, SqliteIndexes, SqliteMigration, SqliteSchema,
+    SqliteStorage, SqliteStorageOptions, SqliteTables, SqliteTransaction, SqliteValue,
+    SqliteValueRef, apply_sqlite_migrations, apply_sqlite_migrations_for_schema,
+    create_sqlite_migrations, create_sqlite_schema, open_node_sqlite_database,
+    open_node_sqlite_storage, sqlite_migrations,
 };
 
 use crate::types::{Cursor, DocumentPoint, DocumentRecord, DocumentScope, Page, ScanOrder};

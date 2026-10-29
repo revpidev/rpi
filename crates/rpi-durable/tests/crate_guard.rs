@@ -56,6 +56,26 @@ fn default_host_crate_does_not_depend_on_rpi_durable() {
 }
 
 #[test]
+fn durable_depends_on_rpi_ai_but_not_on_the_host_crate() {
+    let metadata = cargo_metadata();
+    let packages = metadata["packages"].as_array().expect("packages");
+    let durable = packages
+        .iter()
+        .find(|package| package["name"] == "rpi-durable")
+        .expect("rpi-durable package");
+    let dependencies = durable["dependencies"].as_array().expect("dependencies");
+    let names: Vec<&str> = dependencies
+        .iter()
+        .filter_map(|dependency| dependency["name"].as_str())
+        .collect();
+    assert!(names.contains(&"rpi-ai"), "{names:?}");
+    assert!(
+        !names.contains(&"rpi"),
+        "rpi-durable must not write back into the host crate: {names:?}"
+    );
+}
+
+#[test]
 fn crate_docs_carry_the_upstream_experimental_wording() {
     let source = include_str!("../src/lib.rs");
     assert!(

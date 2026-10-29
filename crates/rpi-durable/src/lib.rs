@@ -5,8 +5,15 @@
 //!
 //! One process owns a storage at a time; there is no cross-process locking. The
 //! crate carries the portable storage contract ([`types::Storage`]), the Memory,
-//! JSONL and SQLite backends, the asynchronous SQLite facade, and the consumed
-//! subset of `@earendil-works/chord` (context/json/delta/state).
+//! JSONL and SQLite backends, the asynchronous SQLite facade and schema
+//! identifiers, and the consumed subset of `@earendil-works/chord`
+//! (context/json/delta/state and the portable `/sqlite` drivers).
+//!
+//! The SQLite backend migrates a version 1 database to schema version 2
+//! (the `sleeping` task status) when it first opens it. A migrated database
+//! cannot be opened by an earlier rpi version; JSONL needs no migration. Pass
+//! [`storage::SqliteStorageOptions::prefix`] to keep every durable table and
+//! index under a namespace in a shared database.
 //!
 //! This crate is the storage layer of the durable band. It does not participate
 //! in the default CLI path: `crates/rpi` does not depend on `rpi-durable`.
@@ -26,17 +33,20 @@ pub mod tools;
 pub mod truncate;
 pub mod types;
 
+pub use chord::sqlite::validate_sqlite_schema_prefix;
 pub use errors::{FileError, FileErrorCode, StorageError, StorageResult};
 pub use ids::{
     ConversationId, DocumentId, EntryId, Id, ROOT_CONVERSATION_ID, Seq, SubmissionId, TaskId,
     id_from_number, seq_from_number,
 };
 pub use storage::{
-    CURRENT_SQLITE_SCHEMA_VERSION, DirEntry, DirEntryKind, FileSystem, JsonlStorage,
-    JsonlStorageOptions, MemoryStorage, PreparedMemoryCommit, SqliteDatabase,
-    SqliteDatabaseOptions, SqliteExecutor, SqliteMigration, SqliteStorage, SqliteTransaction,
-    SqliteValue, StdFileSystem, apply_sqlite_migrations, open_node_sqlite_database,
-    open_node_sqlite_storage, sqlite_migrations,
+    CURRENT_SQLITE_SCHEMA_VERSION, DEFAULT_SQLITE_SCHEMA, DirEntry, DirEntryKind, FileSystem,
+    JsonlStorage, JsonlStorageOptions, MemoryStorage, NodeSqliteStorageOptions,
+    PreparedMemoryCommit, SqliteDatabase, SqliteDatabaseOptions, SqliteExecutor, SqliteIndexes,
+    SqliteMigration, SqliteSchema, SqliteStorage, SqliteStorageOptions, SqliteTables,
+    SqliteTransaction, SqliteValue, StdFileSystem, apply_sqlite_migrations,
+    apply_sqlite_migrations_for_schema, create_sqlite_migrations, create_sqlite_schema,
+    open_node_sqlite_database, open_node_sqlite_storage, sqlite_migrations,
 };
 pub use types::{
     ConversationQuery, ConversationRecord, Cursor, DocumentAddress, DocumentContent,
