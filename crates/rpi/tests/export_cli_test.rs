@@ -164,7 +164,6 @@ fn exported_viewer_read_line_range_and_cjk_wiring() {
         "node failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let ranges: Vec<String> =
-        serde_json::from_slice(&output.stdout).expect("range matrix JSON");
+    let ranges: Vec<String> = serde_json::from_slice(&output.stdout).expect("range matrix JSON");
     assert_eq!(ranges, expected);
 }

@@ -6672,6 +6672,61 @@ mod tests {
         assert!(!editor.is_showing_autocomplete());
     }
 
+    /// FR-F R3: the autocomplete popup stays inside 40/80/120 columns with
+    /// CJK labels and descriptions.
+    #[test]
+    fn autocomplete_popup_fits_40_80_120_columns_with_cjk() {
+        for width in [40usize, 80, 120] {
+            let mut editor = editor();
+            let provider = MockProvider::new(|lines, _line, col, force| {
+                if !force {
+                    return None;
+                }
+                let text = lines.first().cloned().unwrap_or_default();
+                let prefix = text[..char_to_byte(&text, col)].to_string();
+                if prefix == "src" {
+                    return Some(AutocompleteSuggestions {
+                        items: vec![
+                            AutocompleteItem {
+                                value: "src/".to_string(),
+                                label: "src/ 源码目录".to_string(),
+                                description: Some(
+                                    "包含较长的中文说明与 ASCII mixed text".to_string(),
+                                ),
+                            },
+                            AutocompleteItem {
+                                value: "src.txt".to_string(),
+                                label: "src.txt 文本文件".to_string(),
+                                description: Some("另一个较长的中文描述".to_string()),
+                            },
+                        ],
+                        prefix: "src".to_string(),
+                    });
+                }
+                None
+            });
+            editor.set_autocomplete_provider(Arc::new(provider));
+            type_text(&mut editor, "src");
+            editor.handle_input("\t");
+            flush_autocomplete(&mut editor);
+            assert!(editor.is_showing_autocomplete(), "width {width}");
+            let lines = editor.render(width);
+            for (index, line) in lines.iter().enumerate() {
+                let line_width = visible_width(line);
+                assert!(
+                    line_width <= width,
+                    "width {width}: popup line {index} is {line_width} columns: {line:?}"
+                );
+            }
+            let joined: String = lines
+                .iter()
+                .map(|line| strip_ansi(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(joined.contains("源码目录"), "width {width}: {joined}");
+        }
+    }
+
     #[test]
     fn keeps_suggestions_open_when_typing_in_force_mode() {
         let mut editor = editor();
