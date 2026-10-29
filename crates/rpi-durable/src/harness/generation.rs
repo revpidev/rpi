@@ -346,7 +346,7 @@ async fn prepare(
             &view,
             &entries,
             model.context_window as u64,
-            settings.compaction,
+            crate::harness::agent::compaction_for(&settings, &reference),
         )
     } else {
         None
@@ -772,11 +772,12 @@ async fn classify(
     }
     let settings = runtime.settings();
     let overflow = message.stop_reason == StopReason::Error && is_context_overflow(&message, None);
-    if overflow && compacted.is_none() && settings.compaction.enabled {
+    let compaction = crate::harness::agent::compaction_for(&settings, &reference);
+    if overflow && compacted.is_none() && compaction.enabled {
         let view = runtime
             .context(conversation_id, context, Some(cutoff))
             .await?;
-        if select_cut(&view, settings.compaction.keep_recent_tokens).is_some() {
+        if select_cut(&view, compaction.keep_recent_tokens).is_some() {
             let text = message
                 .error_message
                 .clone()

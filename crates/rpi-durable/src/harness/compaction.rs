@@ -271,7 +271,7 @@ async fn select_phase(
     else {
         return fail_no_model(runtime, Some(&reference), context).await;
     };
-    let policy = settings.compaction;
+    let policy = crate::harness::agent::compaction_for(&settings, &reference);
     let view = runtime
         .context(runtime.conversation_id(), context, None)
         .await?;

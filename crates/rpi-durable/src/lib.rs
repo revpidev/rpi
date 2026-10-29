@@ -19,6 +19,7 @@
 //! in the default CLI path: `crates/rpi` does not depend on `rpi-durable`.
 
 pub mod chord;
+pub mod codemode;
 pub mod documents;
 pub mod entries;
 pub mod env;

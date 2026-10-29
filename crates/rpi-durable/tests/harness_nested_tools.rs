@@ -425,3 +425,122 @@ async fn open_with_telemetry(
     let _ = (Models::new(None), runs);
     harness
 }
+
+/// V18-06 FR-B: two calls with the same key run the nested tool once; the
+/// second is answered from the journal.
+#[tokio::test]
+async fn codemode_journal_replays_a_delivered_nested_result() {
+    use rpi_durable::codemode::{
+        CODEMODE_TOOL_NAME, CodemodeHost, CodemodeOutcome, CodemodeSandbox, CodemodeStart,
+        CodemodeToolOptions, create_codemode_tool,
+    };
+
+    struct TwiceSandbox;
+    #[async_trait]
+    impl CodemodeSandbox for TwiceSandbox {
+        fn fingerprint(&self) -> String {
+            "fake-1".to_string()
+        }
+        async fn run(
+            &self,
+            _start: CodemodeStart,
+            host: &dyn CodemodeHost,
+            _context: &Context,
+        ) -> Result<CodemodeOutcome, String> {
+            let first = host.call_tool("inner", JsonObject::new(), "c1").await?;
+            let second = host.call_tool("inner", JsonObject::new(), "c1").await?;
+            Ok(CodemodeOutcome::output(format!(
+                "value={} again={}",
+                first
+                    .structured_output
+                    .as_ref()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                second
+                    .structured_output
+                    .as_ref()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            )))
+        }
+    }
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let code = create_codemode_tool(CodemodeToolOptions {
+        sandbox: Arc::new(TwiceSandbox),
+    });
+    let opened = open(
+        vec![extension(vec![
+            code,
+            tool(
+                "inner",
+                Some(vec![ToolCaller::Tools]),
+                Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "answer": { "type": "number" } },
+                    "required": ["answer"]
+                })),
+                Arc::new(InnerTool {
+                    runs: Arc::clone(&runs),
+                    value: Some(serde_json::json!({ "answer": 7 })),
+                }),
+            ),
+        ])],
+        None,
+        test_models(vec![
+            Script::Message(tool_use_message(
+                CODEMODE_TOOL_NAME,
+                "c1",
+                serde_json::json!({ "code": "return 1" }),
+            )),
+            Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
+        ]),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    submission.wait(&context()).await.expect("wait");
+    let results = tool_result_texts(&entries(&conversation).await);
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].contains("value={\"answer\":7}"),
+        "got {}",
+        results[0]
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the keyed call runs once");
+}
+
+#[test]
+fn codemode_journal_keeps_the_first_result_per_key() {
+    use rpi_durable::codemode::{CodemodeJournal, CodemodeJournalEntry};
+    use rpi_durable::harness::NestedToolExecutionResult;
+
+    let result = |value: i64| NestedToolExecutionResult {
+        task_id: TaskId::from_number(1),
+        structured_output: Some(serde_json::json!({ "value": value })),
+        is_error: false,
+        details: None,
+        diagnostics: Vec::new(),
+        usage: None,
+        duration_ms: None,
+    };
+    let mut journal = CodemodeJournal::default();
+    journal.record("1".to_string(), "inner".to_string(), result(1));
+    journal.record("1".to_string(), "inner".to_string(), result(2));
+    assert_eq!(
+        journal
+            .get("1")
+            .and_then(|entry| entry.structured_output.clone()),
+        Some(serde_json::json!({ "value": 1 }))
+    );
+    let encoded = serde_json::to_value(CodemodeJournalEntry {
+        key: "1".to_string(),
+        name: "inner".to_string(),
+        result: result(1),
+    })
+    .expect("encode");
+    assert_eq!(encoded["key"], serde_json::json!("1"));
+}
+
+// `tool_result_texts` above skips the harness's structured results; this test
+// module reuses it because the codemode result is a text item.

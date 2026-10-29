@@ -48,6 +48,30 @@ pub const DEFAULT_PROGRESS_POLICY: crate::harness::types::ProgressPolicy =
         output_interval_ms: 100,
     };
 
+/// The compaction policy for one model: the harness-wide policy with the
+/// model's override fields applied.
+pub fn compaction_for(
+    settings: &Settings,
+    model: &crate::harness::types::ModelRef,
+) -> crate::harness::types::CompactionPolicy {
+    let key = format!("{}/{}", model.provider, model.model_id);
+    let Some(patch) = settings.compaction_overrides.get(&key) else {
+        return settings.compaction;
+    };
+    crate::harness::types::CompactionPolicy {
+        enabled: patch.enabled.unwrap_or(settings.compaction.enabled),
+        reserve_tokens: patch
+            .reserve_tokens
+            .unwrap_or(settings.compaction.reserve_tokens),
+        keep_recent_tokens: patch
+            .keep_recent_tokens
+            .unwrap_or(settings.compaction.keep_recent_tokens),
+        background_tokens: patch
+            .background_tokens
+            .unwrap_or(settings.compaction.background_tokens),
+    }
+}
+
 /// The reserved section key of the agent's `instructions`.
 pub const INSTRUCTIONS_KEY: &str = "instructions";
 
@@ -84,7 +108,7 @@ pub static AGENT_DOC: LazyLock<DocToken> = LazyLock::new(|| {
 /// fields merged.
 pub fn resolve_settings(settings: Option<&crate::harness::types::HarnessSettings>) -> Settings {
     let retry = settings.and_then(|settings| settings.retry);
-    let compaction = settings.and_then(|settings| settings.compaction);
+    let compaction = settings.and_then(|settings| settings.compaction.clone());
     let progress = settings.and_then(|settings| settings.progress);
     Settings {
         extensions: settings.and_then(|settings| settings.extensions.clone()),
@@ -105,17 +129,25 @@ pub fn resolve_settings(settings: Option<&crate::harness::types::HarnessSettings
                 .and_then(|retry| retry.max_agent_delay_ms)
                 .or(DEFAULT_RETRY_POLICY.max_agent_delay_ms),
         },
+        compaction_overrides: compaction
+            .as_ref()
+            .map(|compaction| compaction.model_overrides.clone())
+            .unwrap_or_default(),
         compaction: crate::harness::types::CompactionPolicy {
             enabled: compaction
+                .as_ref()
                 .and_then(|compaction| compaction.enabled)
                 .unwrap_or(DEFAULT_COMPACTION_POLICY.enabled),
             reserve_tokens: compaction
+                .as_ref()
                 .and_then(|compaction| compaction.reserve_tokens)
                 .unwrap_or(DEFAULT_COMPACTION_POLICY.reserve_tokens),
             keep_recent_tokens: compaction
+                .as_ref()
                 .and_then(|compaction| compaction.keep_recent_tokens)
                 .unwrap_or(DEFAULT_COMPACTION_POLICY.keep_recent_tokens),
             background_tokens: compaction
+                .as_ref()
                 .and_then(|compaction| compaction.background_tokens)
                 .unwrap_or(DEFAULT_COMPACTION_POLICY.background_tokens),
         },
@@ -1041,5 +1073,44 @@ mod tests {
             state.model_tools,
             Some(ModelToolsSelection::List(vec!["a".to_string()]))
         );
+    }
+}
+
+#[cfg(test)]
+mod compaction_override_tests {
+    use super::*;
+    use crate::harness::types::{CompactionPolicyPatch, ModelRef};
+
+    #[test]
+    fn per_model_compaction_overrides_apply_field_by_field() {
+        let settings = crate::harness::types::HarnessSettings {
+            compaction: Some(CompactionPolicyPatch {
+                reserve_tokens: Some(10),
+                model_overrides: std::collections::BTreeMap::from([(
+                    "test/model".to_string(),
+                    CompactionPolicyPatch {
+                        reserve_tokens: Some(1),
+                        keep_recent_tokens: Some(2),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_settings(Some(&settings));
+        let model = ModelRef {
+            provider: "test".to_string(),
+            model_id: "model".to_string(),
+        };
+        let policy = compaction_for(&resolved, &model);
+        assert_eq!(policy.reserve_tokens, 1);
+        assert_eq!(policy.keep_recent_tokens, 2);
+        assert_eq!(policy.enabled, DEFAULT_COMPACTION_POLICY.enabled);
+        let other = ModelRef {
+            provider: "test".to_string(),
+            model_id: "other".to_string(),
+        };
+        assert_eq!(compaction_for(&resolved, &other).reserve_tokens, 10);
     }
 }

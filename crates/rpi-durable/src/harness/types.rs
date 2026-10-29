@@ -1299,7 +1299,7 @@ pub struct CompactionPolicy {
 }
 
 /// Partial compaction policy (upstream `Partial<CompactionPolicy>`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompactionPolicyPatch {
     /// Whether compaction is enabled.
     pub enabled: Option<bool>,
@@ -1309,6 +1309,8 @@ pub struct CompactionPolicyPatch {
     pub keep_recent_tokens: Option<u64>,
     /// Background threshold offset.
     pub background_tokens: Option<u64>,
+    /// Per-model overrides keyed by exact `provider/modelId`.
+    pub model_overrides: std::collections::BTreeMap<String, CompactionPolicyPatch>,
 }
 
 /// How often running progress is committed.
@@ -1425,6 +1427,8 @@ pub struct Settings {
     pub retry: ConversationRetryPolicy,
     /// Compaction policy.
     pub compaction: CompactionPolicy,
+    /// Per-model compaction overrides.
+    pub compaction_overrides: std::collections::BTreeMap<String, CompactionPolicyPatch>,
     /// Progress policy.
     pub progress: ProgressPolicy,
     /// Default tool execution mode.
