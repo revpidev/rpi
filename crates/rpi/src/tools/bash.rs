@@ -107,8 +107,27 @@ struct ShellConfig {
 
 static WSL_BASH_REGEX: OnceLock<Option<Regex>> = OnceLock::new();
 
-fn is_legacy_wsl_bash_path(path: &str) -> bool {
+/// `isLegacyWslBashPath` (shell.ts:12-27): the legacy WSL `bash.exe` launcher
+/// is recognized relative to `%SystemRoot%` when that is an absolute drive
+/// path; otherwise the conventional `C:\\Windows` paths are the fallback.
+fn is_legacy_wsl_bash_path_with(path: &str, system_root: Option<&str>) -> bool {
     let normalized = path.replace('/', "\\").to_lowercase();
+    if let Some(root) = system_root {
+        // `if (!/^[a-z]:[\\/]/i.test(systemRoot)) return false;`
+        let absolute_drive = root.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && root.as_bytes().get(1) == Some(&b':')
+            && matches!(root.as_bytes().get(2), Some(b'\\') | Some(b'/'));
+        if !absolute_drive {
+            return false;
+        }
+        let root = root
+            .trim_end_matches(['\\', '/'])
+            .replace('/', "\\")
+            .to_lowercase();
+        return ["system32", "sysnative"].iter().any(|directory| {
+            normalized == format!("{root}\\{directory}\\bash.exe").to_lowercase()
+        });
+    }
     let re = WSL_BASH_REGEX
         .get_or_init(|| Regex::new(r"^[a-z]:\\windows\\(?:system32|sysnative)\\bash\.exe$").ok());
     match re {
@@ -117,8 +136,69 @@ fn is_legacy_wsl_bash_path(path: &str) -> bool {
     }
 }
 
+/// `shellPathExists` (shell.ts:36-44): on Windows the extra stat check behind
+/// `Path::exists` rejects runnable Microsoft Store aliases, so check access
+/// directly; on Unix `access(F_OK)` is what `exists` does anyway.
+fn shell_path_exists(path: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        let Ok(c_path) = CString::new(path) else {
+            return false;
+        };
+        // SAFETY: `c_path` is a valid NUL-terminated C string for the call.
+        unsafe { libc::access(c_path.as_ptr(), libc::F_OK) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new().read(true).open(path).is_ok()
+    }
+}
+
+/// Git for Windows install locations (shell.ts:146-155).
+fn windows_git_bash_candidates(
+    program_files: Option<&str>,
+    program_files_x86: Option<&str>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(program_files) = program_files {
+        candidates.push(format!("{program_files}\\Git\\bin\\bash.exe"));
+    }
+    if let Some(program_files_x86) = program_files_x86 {
+        candidates.push(format!("{program_files_x86}\\Git\\bin\\bash.exe"));
+    }
+    candidates
+}
+
+/// `findExecutableOnPath` (shell.ts:46-78): Windows uses `where` and verifies
+/// the reported path; Unix trusts `which` (Termux and special filesystems).
+fn find_executable_on_path(executable: &str) -> Option<String> {
+    let program = if cfg!(windows) { "where" } else { "which" };
+    let output = std::process::Command::new(program)
+        .arg(executable)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout.lines().next().map(str::trim)?;
+    if first.is_empty() {
+        return None;
+    }
+    if cfg!(windows) && !shell_path_exists(first) {
+        return None;
+    }
+    Some(first.to_string())
+}
+
 fn get_bash_shell_config(shell: &str) -> ShellConfig {
-    if is_legacy_wsl_bash_path(shell) {
+    let system_root = std::env::var("SystemRoot").ok();
+    get_bash_shell_config_with(shell, system_root.as_deref())
+}
+
+fn get_bash_shell_config_with(shell: &str, system_root: Option<&str>) -> ShellConfig {
+    if is_legacy_wsl_bash_path_with(shell, system_root) {
         ShellConfig {
             shell: shell.to_string(),
             args: vec!["-s".into()],
@@ -133,34 +213,47 @@ fn get_bash_shell_config(shell: &str) -> ShellConfig {
     }
 }
 
-fn find_bash_on_path() -> Option<String> {
-    let output = std::process::Command::new("which")
-        .arg("bash")
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let s = String::from_utf8_lossy(&output.stdout);
-        let f = s.lines().next()?;
-        if !f.is_empty() {
-            return Some(f.to_string());
-        }
-    }
-    None
-}
-
 fn get_shell_config(custom: Option<&str>) -> Result<ShellConfig, BashExecError> {
+    // 1. User-specified shell path (shell.ts:132-137).
     if let Some(c) = custom {
-        if Path::new(c).exists() {
+        if shell_path_exists(c) {
             return Ok(get_bash_shell_config(c));
         }
         return Err(BashExecError::Message(format!(
             "Custom shell path not found: {c}"
         )));
     }
-    if Path::new("/bin/bash").exists() {
+
+    if cfg!(windows) {
+        // 2. Git Bash in the known Program Files locations (shell.ts:141-158).
+        let program_files = std::env::var("ProgramFiles").ok();
+        let program_files_x86 = std::env::var("ProgramFiles(x86)").ok();
+        let candidates =
+            windows_git_bash_candidates(program_files.as_deref(), program_files_x86.as_deref());
+        for candidate in &candidates {
+            if shell_path_exists(candidate) {
+                return Ok(get_bash_shell_config(candidate));
+            }
+        }
+        // 3. bash.exe on PATH (Cygwin, MSYS2, WSL, Microsoft Store alias).
+        if let Some(bash) = find_executable_on_path("bash.exe") {
+            return Ok(get_bash_shell_config(&bash));
+        }
+        return Err(BashExecError::Message(format!(
+            "No bash shell found. Options:\n               1. Install Git for Windows: https://git-scm.com/download/win\n               2. Add your bash to PATH (Cygwin, MSYS2, etc.)\n               3. Set shellPath in settings.json\n\nSearched Git Bash in:\n{}",
+            candidates
+                .iter()
+                .map(|path| format!("  {path}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+    }
+
+    // Unix: /bin/bash, then bash on PATH, then sh (shell.ts:161-172).
+    if shell_path_exists("/bin/bash") {
         return Ok(get_bash_shell_config("/bin/bash"));
     }
-    if let Some(b) = find_bash_on_path() {
+    if let Some(b) = find_executable_on_path("bash") {
         return Ok(get_bash_shell_config(&b));
     }
     Ok(ShellConfig {
@@ -851,5 +944,86 @@ mod kill_tests {
             ],
             "force + tree + pid"
         );
+    }
+}
+
+#[cfg(test)]
+mod shell_resolver_tests {
+    use super::*;
+
+    /// #9501: a `%SystemRoot%` anywhere on any drive resolves the legacy WSL
+    /// launchers; a relative/unknown root keeps the conventional fallback
+    /// and never matches a different drive.
+    #[test]
+    fn legacy_wsl_bash_uses_system_root_when_absolute() {
+        assert!(is_legacy_wsl_bash_path_with(
+            r"D:\WinNT\System32\bash.exe",
+            Some(r"D:\WinNT")
+        ));
+        assert!(is_legacy_wsl_bash_path_with(
+            "C:/Windows/Sysnative/bash.exe",
+            Some(r"C:\Windows")
+        ));
+        assert!(!is_legacy_wsl_bash_path_with(
+            r"D:\WinNT\System32\bash.exe",
+            Some("WinNT")
+        ));
+        assert!(!is_legacy_wsl_bash_path_with(
+            r"C:\Windows\System32\bash.exe",
+            Some(r"D:\WinNT")
+        ));
+        // Unknown SystemRoot: conventional `C:\Windows` paths still match.
+        assert!(is_legacy_wsl_bash_path_with(
+            r"E:\WINDOWS\Sysnative\bash.exe",
+            None
+        ));
+        assert!(!is_legacy_wsl_bash_path_with(r"E:\Other\bash.exe", None));
+    }
+
+    /// The legacy launcher gets stdin transport; Git Bash gets argv.
+    #[test]
+    fn shell_config_transport_matches_the_launcher() {
+        let legacy = get_bash_shell_config_with(r"D:\WinNT\System32\bash.exe", Some(r"D:\WinNT"));
+        assert_eq!(legacy.command_transport, CommandTransport::Stdin);
+        assert_eq!(legacy.args, ["-s"]);
+
+        let conventional = get_bash_shell_config_with(r"C:\Windows\System32\bash.exe", None);
+        assert_eq!(conventional.command_transport, CommandTransport::Stdin);
+        assert_eq!(conventional.args, ["-s"]);
+
+        let git_bash = get_bash_shell_config(r"C:\Program Files\Git\bin\bash.exe");
+        assert_eq!(git_bash.command_transport, CommandTransport::Argv);
+        assert_eq!(git_bash.args, ["-c"]);
+    }
+
+    /// #9501: Git Bash is searched in both Program Files roots.
+    #[test]
+    fn git_bash_candidates_cover_both_program_files_roots() {
+        assert_eq!(
+            windows_git_bash_candidates(Some(r"C:\Program Files"), Some(r"C:\Program Files (x86)")),
+            vec![
+                r"C:\Program Files\Git\bin\bash.exe".to_string(),
+                r"C:\Program Files (x86)\Git\bin\bash.exe".to_string(),
+            ]
+        );
+        assert!(windows_git_bash_candidates(None, None).is_empty());
+    }
+
+    /// The Unix branch resolves a real shell on this platform.
+    #[test]
+    fn unix_shell_config_resolves() {
+        if cfg!(windows) {
+            return;
+        }
+        let config = get_shell_config(None).expect("a shell is available");
+        assert!(!config.shell.is_empty());
+        assert_eq!(config.command_transport, CommandTransport::Argv);
+    }
+
+    #[test]
+    fn missing_custom_shell_is_an_error() {
+        let missing = std::env::temp_dir().join("rpi-no-such-shell-xyz");
+        let err = get_shell_config(Some(missing.to_str().unwrap())).expect_err("missing shell");
+        assert!(format!("{err}").contains("Custom shell path not found"));
     }
 }
