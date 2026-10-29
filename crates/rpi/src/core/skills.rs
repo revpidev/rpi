@@ -1769,28 +1769,24 @@ mod tests {
 
     #[test]
     fn test_apply_patterns_expands_tilde_against_home() {
-        // #10765: `!~/skills/pdf` must exclude the absolute home path even
-        // though it is outside the package base dir.
-        let tmp = TempDir::new();
-        let home = tmp.path().join("home");
-        let base = tmp.path().join("package");
-        let skill = home.join("skills/pdf/SKILL.md");
-        let files = vec![base.join("skills/a.md"), skill.clone()];
-        let (_lock, _env) = crate::core::environment::test_env::EnvGuard::set(&[(
-            "HOME",
-            Some(home.to_str().expect("utf8 home")),
-        )]);
-        let enabled = apply_patterns(&files, &["!~/skills/pdf".to_string()], &base);
-        assert!(enabled.contains(&base.join("skills/a.md")));
-        assert!(
-            !enabled.contains(&skill),
-            "tilde exclude must match the home path"
-        );
+        // #10765: `!~/...` must exclude the absolute home path even though it
+        // is outside the package base dir. Use the real home (no global env
+        // mutation: other tests resolve the agent dir through HOME).
+        let Some(home) = config::user_home_dir() else {
+            return;
+        };
+        let relative = format!("rpi-tilde-pattern-test-{}", std::process::id());
+        let base = Path::new("/package");
+        let skill = home.join(&relative).join("SKILL.md");
+        let files = vec![PathBuf::from("/package/skills/a.md"), skill.clone()];
 
-        // Force include/exclude exact paths use the same normalization.
-        let enabled = apply_patterns(&files, &["-~/skills/pdf/SKILL.md".to_string()], &base);
+        let enabled = apply_patterns(&files, &[format!("!~/{relative}/SKILL.md")], base);
+        assert!(enabled.contains(&PathBuf::from("/package/skills/a.md")));
+        assert!(!enabled.contains(&skill), "tilde exclude must match home");
+
+        let enabled = apply_patterns(&files, &[format!("-~/{relative}/SKILL.md")], base);
         assert!(!enabled.contains(&skill));
-        let enabled = apply_patterns(&files, &["+~/skills/pdf/SKILL.md".to_string()], &base);
+        let enabled = apply_patterns(&files, &[format!("+~/{relative}/SKILL.md")], base);
         assert!(enabled.contains(&skill));
     }
 

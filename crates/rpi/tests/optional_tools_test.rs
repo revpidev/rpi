@@ -1256,6 +1256,10 @@ mod grep_ripgrep_config {
             "--fixed-strings\n--ignore-case\n--glob=!*.rs\n",
         );
         let target = tmp.write("target.txt", "abc\na.c\n");
+        // Directory case for the config's ignore-case/glob options: a
+        // case-sensitive match must find only `a.rs`.
+        tmp.write("a.rs", "Needle\n");
+        tmp.write("b.txt", "needle\n");
         let tool = create_grep_tool(&ctx(tmp.path()), GrepToolOptions::default());
 
         rpi_test_env::set_var("RIPGREP_CONFIG_PATH", &config);
@@ -1275,10 +1279,15 @@ mod grep_ripgrep_config {
         )
         .await
         .expect("grep");
+        let walked = run_tool(&tool, json!({ "pattern": "Needle", "path": "." }))
+            .await
+            .expect("grep");
         rpi_test_env::remove_var("RIPGREP_CONFIG_PATH");
 
         // The regex still matches both lines; case-insensitivity and the
         // glob exclusion from the config file are not applied.
+        assert!(walked.contains("a.rs:1: Needle"), "got: {walked}");
+        assert!(!walked.contains("b.txt"), "ignore-case leaked: {walked}");
         assert!(regex_out.contains("target.txt:1: abc"), "got: {regex_out}");
         assert!(regex_out.contains("target.txt:2: a.c"), "got: {regex_out}");
         // `literal: true` is the only source of fixed-string matching.

@@ -34,6 +34,13 @@
 //! - The `themeName ?? currentThemeName ?? getDefaultTheme()` fallback
 //!   (theme.ts:1023) drops the `currentThemeName` global (no theme globals
 //!   in rpi): `None` resolves straight to the terminal-detected default.
+//! - Upstream substitutes the viewer assets with JS
+//!   `String.prototype.replace(placeholder, string)`, whose string
+//!   replacement interprets `$$`, `$&`, `` $` `` and `$'`. rpi uses literal
+//!   `replacen`, so a `$${...}` template literal in `template.js` keeps its
+//!   literal dollar sign here while upstream's exported HTML drops it (for
+//!   example the cost line renders `$0.123` here instead of `0.123`). The
+//!   asset bytes stay identical; this is a deliberate output improvement.
 //! - Async upstream signatures are synchronous here (pure CPU + file IO).
 
 use std::path::{Path, PathBuf};

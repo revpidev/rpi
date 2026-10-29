@@ -98,7 +98,7 @@ impl ClipboardEnv {
                 // Force OSC 52 for remote clients that leave no SSH markers,
                 // such as multiplexer attaches or IDE daemons (#10114,
                 // #10826, #10835). Only the exact value `1` opts in.
-                || clipboard_osc52_forced(truthy),
+                || clipboard_osc52_forced(),
             termux: truthy("TERMUX_VERSION"),
             wayland: truthy("WAYLAND_DISPLAY"),
             x11: truthy("DISPLAY"),
@@ -109,9 +109,9 @@ impl ClipboardEnv {
 }
 
 /// `RPI_CLIPBOARD_OSC52 === "1"` (clipboard.ts:16-18; ADR-0001 rename of
-/// `PI_CLIPBOARD_OSC52`). The `truthy` seam is the environment reader.
-fn clipboard_osc52_forced(truthy: impl Fn(&str) -> bool) -> bool {
-    truthy("RPI_CLIPBOARD_OSC52") && std::env::var("RPI_CLIPBOARD_OSC52").as_deref() == Ok("1")
+/// `PI_CLIPBOARD_OSC52`). Only the exact value `1` opts in.
+fn clipboard_osc52_forced() -> bool {
+    std::env::var("RPI_CLIPBOARD_OSC52").as_deref() == Ok("1")
 }
 
 /// `isWSL` (wsl.ts:5-15, #9688 `6dff740fa`): env keys first, then the

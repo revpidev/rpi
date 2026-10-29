@@ -110,8 +110,26 @@ static WSL_BASH_REGEX: OnceLock<Option<Regex>> = OnceLock::new();
 /// `isLegacyWslBashPath` (shell.ts:12-27): the legacy WSL `bash.exe` launcher
 /// is recognized relative to `%SystemRoot%` when that is an absolute drive
 /// path; otherwise the conventional `C:\\Windows` paths are the fallback.
+fn normalize_windows_path(path: &str) -> String {
+    let unified = path.replace('/', "\\");
+    let mut segments: Vec<&str> = Vec::new();
+    for (index, segment) in unified.split('\\').enumerate() {
+        match segment {
+            "" if index == 0 => segments.push(""),
+            "." | "" => {}
+            ".." => {
+                if segments.len() > 1 {
+                    segments.pop();
+                }
+            }
+            other => segments.push(other),
+        }
+    }
+    segments.join("\\").to_lowercase()
+}
+
 fn is_legacy_wsl_bash_path_with(path: &str, system_root: Option<&str>) -> bool {
-    let normalized = path.replace('/', "\\").to_lowercase();
+    let normalized = normalize_windows_path(path);
     if let Some(root) = system_root {
         // `if (!/^[a-z]:[\\/]/i.test(systemRoot)) return false;`
         let absolute_drive = root.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
@@ -120,10 +138,7 @@ fn is_legacy_wsl_bash_path_with(path: &str, system_root: Option<&str>) -> bool {
         if !absolute_drive {
             return false;
         }
-        let root = root
-            .trim_end_matches(['\\', '/'])
-            .replace('/', "\\")
-            .to_lowercase();
+        let root = normalize_windows_path(root.trim_end_matches(['\\', '/']));
         return ["system32", "sysnative"].iter().any(|directory| {
             normalized == format!("{root}\\{directory}\\bash.exe").to_lowercase()
         });
@@ -978,6 +993,15 @@ mod shell_resolver_tests {
             None
         ));
         assert!(!is_legacy_wsl_bash_path_with(r"E:\Other\bash.exe", None));
+        // win32.normalize collapses `.`/`..` segments before the match.
+        assert!(is_legacy_wsl_bash_path_with(
+            r"D:\WinNT\System32\.\bash.exe",
+            Some(r"D:\WinNT")
+        ));
+        assert!(is_legacy_wsl_bash_path_with(
+            r"D:\WinNT\System32\temp\..\bash.exe",
+            Some(r"D:\WinNT")
+        ));
     }
 
     /// The legacy launcher gets stdin transport; Git Bash gets argv.
