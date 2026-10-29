@@ -117,6 +117,14 @@ impl SchedulerService for RecordingScheduler {
         self.resumed.store(true, Ordering::SeqCst);
     }
 
+    fn wake(&self) -> rpi_durable::harness::Wake {
+        rpi_durable::harness::Wake::default()
+    }
+
+    async fn retry_task(&self, _id: TaskId, _context: &Context) -> SessionResult<()> {
+        Ok(())
+    }
+
     async fn open(&self, _context: &Context) -> SessionResult<()> {
         Ok(())
     }
@@ -214,6 +222,8 @@ pub fn options() -> HarnessOptions {
         env: None,
         conversation_created: None,
         now: None,
+        set_timer: None,
+        on_wake: None,
         on_report: None,
     }
 }

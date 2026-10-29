@@ -54,6 +54,13 @@ pub const INSTRUCTIONS_KEY: &str = "instructions";
 /// Default `settings.contextRetentionMs`: ten minutes.
 pub const DEFAULT_CONTEXT_RETENTION_MS: u64 = 600_000;
 
+/// Default `settings.documentRetentionMs`: ten minutes.
+pub const DEFAULT_DOCUMENT_RETENTION_MS: u64 = 600_000;
+
+/// Default `settings.restartLimit`.
+pub const DEFAULT_RESTART_LIMIT: crate::harness::types::RestartLimit =
+    crate::harness::types::RestartLimit::Limited(5);
+
 fn initial() -> JsonObject {
     JsonObject::new()
 }
@@ -133,6 +140,21 @@ pub fn resolve_settings(settings: Option<&crate::harness::types::HarnessSettings
         context_retention_ms: settings
             .and_then(|settings| settings.context_retention_ms)
             .unwrap_or(DEFAULT_CONTEXT_RETENTION_MS),
+        document_retention_ms: settings
+            .and_then(|settings| settings.document_retention_ms)
+            .unwrap_or(DEFAULT_DOCUMENT_RETENTION_MS),
+        after_failed_run: settings
+            .and_then(|settings| settings.after_failed_run)
+            .unwrap_or_default(),
+        restart_limit: settings
+            .and_then(|settings| settings.restart_limit)
+            .map(|limit| match limit {
+                crate::harness::types::RestartLimit::Limited(value) => {
+                    crate::harness::types::RestartLimit::Limited(value.max(1))
+                }
+                infinite => infinite,
+            })
+            .unwrap_or(DEFAULT_RESTART_LIMIT),
     }
 }
 

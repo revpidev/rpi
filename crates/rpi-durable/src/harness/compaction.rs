@@ -492,7 +492,15 @@ async fn retry_phase(
     request: SummaryRequest,
     until: f64,
 ) -> SessionResult<()> {
-    runtime.sleep(until, context).await?;
+    if until > runtime.now()? {
+        let checkpoint = serde_json::to_value(CompactionCheckpoint::Retry {
+            request: request.clone(),
+            until,
+        })
+        .unwrap_or(JsonValue::Null);
+        runtime.sleep_until(until, checkpoint, context).await?;
+        return Ok(());
+    }
     let attempt = request.attempt + 1;
     let conversation_id = runtime.conversation_id();
     let task_id = runtime.task_id();

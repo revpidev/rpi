@@ -402,11 +402,10 @@ impl HarnessImpl {
     /// Close the harness: seal admission, join task invocations, close storage.
     pub async fn close(&self, context: &Context) -> SessionResult<()> {
         self.closed.store(true, Ordering::SeqCst);
-        let closing = self.session.close(context);
-        let joined = self.tasks.join().await;
-        let closed = closing.await;
-        joined?;
-        closed
+        // Stop invocations and write them back as pending before the Session
+        // closes, so a close is not a crash.
+        self.tasks.join().await?;
+        self.session.close(context).await
     }
 
     async fn create(
@@ -857,6 +856,14 @@ impl Harness for HarnessImpl {
     async fn close(&self, context: &Context) -> SessionResult<()> {
         HarnessImpl::close(self, context).await
     }
+
+    fn wake(&self) -> crate::harness::types::Wake {
+        self.tasks.wake()
+    }
+
+    async fn retry_task(&self, id: TaskId, context: &Context) -> SessionResult<()> {
+        self.tasks.retry_task(id, context).await
+    }
 }
 
 /// Invocation-bound handle for tasks and tools. Every operation, and every
@@ -1044,6 +1051,8 @@ pub async fn open_harness_with_scheduler(
     let scheduler = scheduler_factory(SchedulerDeps {
         session: Arc::clone(&session),
         storage: Arc::clone(session.storage()),
+        set_timer: options.set_timer.clone(),
+        on_wake: options.on_wake.clone(),
         models,
         registry: Arc::clone(&options.registry),
         settings: settings.clone(),

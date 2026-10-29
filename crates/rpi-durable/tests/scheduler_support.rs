@@ -374,16 +374,14 @@ impl TaskDefinition for AbortTask {
             .and_then(|checkpoint| checkpoint.get("count"))
             .and_then(JsonValue::as_u64)
             .unwrap_or(0);
+        let until = runtime.now()? + Duration::from_secs(30).as_millis() as f64;
         runtime
-            .commit(
-                commit_next(NextTaskState::Running {
-                    checkpoint: serde_json::json!({ "phase": "step", "count": count + 1 }),
-                }),
+            .sleep_until(
+                until,
+                serde_json::json!({ "phase": "step", "count": count + 1 }),
                 context,
             )
-            .await?;
-        let until = runtime.now()? + Duration::from_secs(30).as_millis() as f64;
-        runtime.sleep(until, context).await
+            .await
     }
 
     async fn abort(
@@ -653,6 +651,15 @@ pub async fn open_with(tasks: Vec<AnyTask>) -> Opened {
 
 /// Open a Harness over `storage` whose registry holds `tasks`.
 pub async fn open_with_storage(storage: Arc<dyn Storage>, tasks: Vec<AnyTask>) -> Opened {
+    open_with_storage_and_settings(storage, tasks, None).await
+}
+
+/// Open a Harness over `storage` with explicit settings.
+pub async fn open_with_storage_and_settings(
+    storage: Arc<dyn Storage>,
+    tasks: Vec<AnyTask>,
+    settings: Option<rpi_durable::harness::HarnessSettings>,
+) -> Opened {
     let registry = Arc::new(RegistryImpl::with_builtins(builtins()));
     if !tasks.is_empty() {
         let extension = Extension {
@@ -666,10 +673,12 @@ pub async fn open_with_storage(storage: Arc<dyn Storage>, tasks: Vec<AnyTask>) -
         models: Models::new(None),
         identity: None,
         registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,
-        settings: None,
+        settings,
         env: None,
         conversation_created: None,
         now: None,
+        set_timer: None,
+        on_wake: None,
         on_report: None,
     };
     let harness = open_harness(Arc::clone(&storage), options, &context())

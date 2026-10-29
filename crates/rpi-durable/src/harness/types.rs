@@ -53,6 +53,36 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 // FORM: upstream `onReport(error: unknown)`; Rust reports a rendered `String`.
 pub type ReportFn = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Options of one host timer (`SetTimer` options).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TimerOptions {
+    /// A timer that only frees memory or resumes a sleep; it never keeps the
+    /// process alive.
+    pub background: bool,
+}
+
+/// Disarm handle of one host timer.
+pub type TimerDisarm = Arc<dyn Fn() + Send + Sync>;
+
+/// A host timer (`HarnessOptions.setTimer`): call `callback` once, about
+/// `delay_ms` from now. Returns a disarm handle, or `None` when the host
+/// declines the timer.
+pub type SetTimer = Arc<
+    dyn Fn(Arc<dyn Fn() + Send + Sync>, u64, TimerOptions) -> Option<TimerDisarm> + Send + Sync,
+>;
+
+/// When a Harness next needs a running process (`Harness.wake()`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Wake {
+    /// Some task can run now or is running, or a reconcile pass has not landed.
+    pub active: bool,
+    /// The earliest sleep not yet due, when there is one.
+    pub at: Option<f64>,
+}
+
+/// Host wake callback (`HarnessOptions.onWake`): the host arms its own alarm.
+pub type WakeFn = Arc<dyn Fn(Wake) + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // Provider/model references and submissions
 // ---------------------------------------------------------------------------
@@ -243,6 +273,13 @@ pub enum NextTaskState {
         /// How the wait reacts to failures.
         policy: JoinPolicy,
     },
+    /// Park without an invocation until the Harness clock reaches `until`.
+    Sleeping {
+        /// Complete durable state from which execution resumes.
+        checkpoint: JsonValue,
+        /// Deadline on the Harness clock.
+        until: f64,
+    },
     /// The task's outcome; stored `terminal`, or `completing` while owned work drains.
     Terminal {
         /// Decided outcome.
@@ -259,6 +296,11 @@ impl NextTaskState {
     /// A terminal outcome.
     pub fn terminal(outcome: TaskOutcome) -> Self {
         Self::Terminal { outcome }
+    }
+
+    /// Park until the Harness clock reaches `until`.
+    pub fn sleeping(checkpoint: JsonValue, until: f64) -> Self {
+        Self::Sleeping { checkpoint, until }
     }
 }
 
@@ -398,8 +440,21 @@ pub trait TaskRuntime: Send + Sync {
     fn now(&self) -> SessionResult<f64>;
     /// Forward a non-fatal failure; rejects once the invocation ended.
     fn report(&self, message: String) -> SessionResult<()>;
-    /// Resolve once the clock reaches `until`; rejects on invocation or context cancellation.
-    async fn sleep(&self, until: f64, context: &Context) -> SessionResult<()>;
+    /// Call `callback` once after about `delay_ms` on the Harness timer, for
+    /// pacing work inside a phase. The invocation's end disarms it.
+    fn set_timer(
+        &self,
+        callback: Arc<dyn Fn() + Send + Sync>,
+        delay_ms: u64,
+    ) -> SessionResult<TimerDisarm>;
+    /// Commit a sleep: the task holds no invocation until the Harness clock
+    /// reaches `until`, then resumes at `checkpoint`.
+    async fn sleep_until(
+        &self,
+        until: f64,
+        checkpoint: JsonValue,
+        context: &Context,
+    ) -> SessionResult<()>;
 }
 
 /// Erased executable task definition stored in the registry (upstream `AnyTask`).
@@ -1285,6 +1340,37 @@ pub struct CompactionResult {
     pub submission_id: Option<SubmissionId>,
 }
 
+/// How many restarts a task may survive before it is parked (`restartLimit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartLimit {
+    /// Park a task after this many consecutive restarts.
+    Limited(u64),
+    /// Never park (upstream `Infinity`).
+    Infinite,
+}
+
+impl RestartLimit {
+    /// The numeric limit, or `None` for `Infinite`.
+    pub fn limit(self) -> Option<u64> {
+        match self {
+            RestartLimit::Limited(limit) => Some(limit),
+            RestartLimit::Infinite => None,
+        }
+    }
+}
+
+/// What a failed run does with the inputs queued behind it (`afterFailedRun`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AfterFailedRun {
+    /// Leave them queued until the next input or queued write.
+    #[default]
+    Keep,
+    /// Start the next run with them, as an answer would.
+    Continue,
+    /// Settle them `unanswered` with reason `run_failed`.
+    Withdraw,
+}
+
 /// Harness-wide run policy as supplied by the host.
 #[derive(Clone, Default)]
 pub struct HarnessSettings {
@@ -1306,6 +1392,12 @@ pub struct HarnessSettings {
     pub follow_up_mode: Option<QueueMode>,
     /// Idle context retention in milliseconds.
     pub context_retention_ms: Option<u64>,
+    /// How long an unobserved document stays cached, in milliseconds.
+    pub document_retention_ms: Option<u64>,
+    /// What a failed run does with the inputs queued behind it.
+    pub after_failed_run: Option<AfterFailedRun>,
+    /// How many consecutive restarts park a task.
+    pub restart_limit: Option<RestartLimit>,
 }
 
 /// Resolved settings: every field over its built-in default, objects merged.
@@ -1329,6 +1421,12 @@ pub struct Settings {
     pub follow_up_mode: QueueMode,
     /// Idle context retention in milliseconds.
     pub context_retention_ms: u64,
+    /// How long an unobserved document stays cached, in milliseconds.
+    pub document_retention_ms: u64,
+    /// What a failed run does with the inputs queued behind it.
+    pub after_failed_run: AfterFailedRun,
+    /// How many consecutive restarts park a task.
+    pub restart_limit: RestartLimit,
 }
 
 /// What `HarnessOptions.env` builds an environment for.
@@ -1372,6 +1470,10 @@ pub struct HarnessOptions {
     pub conversation_created: Option<ConversationCreatedHook>,
     /// Wall clock.
     pub now: Option<crate::session::NowFn>,
+    /// Host timers; default `setTimeout`/tokio.
+    pub set_timer: Option<SetTimer>,
+    /// Wake the process for sleeping tasks instead of arming a timer.
+    pub on_wake: Option<WakeFn>,
     /// Receives extension failures.
     pub on_report: Option<ReportFn>,
 }
@@ -1400,6 +1502,8 @@ pub enum BlockedReason {
     TaskTooOld,
     /// The registered definition's migration failed.
     MigrationFailed,
+    /// The restart limit parked the task; `retryTask()` runs it again.
+    RestartLimit,
 }
 
 /// What the scheduler would do with one live task.
@@ -1416,6 +1520,11 @@ pub enum TaskInspectionState {
     Waiting {
         /// Waited task IDs.
         on: Vec<TaskId>,
+    },
+    /// Sleeps until the Harness clock reaches `until`.
+    Sleeping {
+        /// Deadline on the Harness clock.
+        until: f64,
     },
     /// Outcome held until its ordinary owned work drains.
     Completing,
@@ -1581,6 +1690,10 @@ pub trait Conversation: Send + Sync {
 pub trait Harness: Send + Sync {
     /// Enable task scheduling (idempotent; errors after close).
     fn resume(&self) -> Result<(), SessionError>;
+    /// When this Session next needs a running process.
+    fn wake(&self) -> Wake;
+    /// Run a task parked by the restart limit again.
+    async fn retry_task(&self, id: TaskId, context: &Context) -> Result<(), SessionError>;
     /// Return the reserved root conversation, creating it when absent.
     async fn root(
         &self,

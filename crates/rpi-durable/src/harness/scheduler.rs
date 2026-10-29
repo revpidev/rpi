@@ -47,7 +47,7 @@ use crate::harness::types::{
     Agent, AgentState, AnyTask, BlockedReason, DocumentReader, EnvFactory, EnvTarget, ExecutionEnv,
     Migration, NextTaskState, RegistryReader, RegistrySnapshot, ReportFn, RunningTask, Scheduling,
     Settings, SettledTask, TaskAbort, TaskCommitFn, TaskInspection, TaskInspectionState,
-    TaskRuntime, read_state, write_state,
+    TaskRuntime, TimerDisarm, Wake, WakeFn, read_state, write_state,
 };
 use crate::harness::util::{WaitFuture, Waiters, closed_error};
 use crate::ids::{ConversationId, EntryId, SubmissionId, TaskId};
@@ -56,6 +56,7 @@ use crate::session::{
     SessionImpl, SessionResult, Subscription, TaskCreate, TaskOwnership, Transaction,
     TransactionScope, commit_fn,
 };
+use crate::timers::Timers;
 // The scheduler couples to the conversation host through `bound_conversation`,
 // which composes the invocation-bound handle from the composition module.
 use crate::harness::harness::bound_conversation;
@@ -67,9 +68,6 @@ use crate::types::{
 
 /// Page size of scheduler scans (upstream `SCAN_PAGE_SIZE`).
 const SCAN_PAGE_SIZE: usize = 256;
-/// Longest delay a single timer step covers (upstream `MAX_TIMER_DELAY`).
-const MAX_TIMER_DELAY: f64 = 2_147_483_647.0;
-
 /// Message every scheduler-backed operation reports while no scheduler is
 /// installed (V17-14 staging seam).
 pub const UNAVAILABLE_MESSAGE: &str =
@@ -102,6 +100,12 @@ pub struct InvocationBinding {
 pub trait SchedulerService: Send + Sync {
     /// Enable scheduling (idempotent); upstream `TaskScheduler.resume()`.
     fn resume(&self);
+
+    /// When the Session next needs a running process.
+    fn wake(&self) -> Wake;
+
+    /// Run a task parked by the restart limit again.
+    async fn retry_task(&self, id: TaskId, context: &Context) -> SessionResult<()>;
 
     /// Load live tasks and rewind surviving `running` tasks to `pending`
     /// (upstream `open()`); part of `Harness.open`.
@@ -188,6 +192,10 @@ pub struct SchedulerDeps {
     pub report: ReportFn,
     /// Wall clock.
     pub now: NowFn,
+    /// Host timers.
+    pub set_timer: Option<crate::harness::types::SetTimer>,
+    /// Host wake callback, replacing the timer for sleeping tasks.
+    pub on_wake: Option<WakeFn>,
     /// Context of scheduler commits and invocations, without caller cancellation.
     pub context: Context,
 }
@@ -218,6 +226,8 @@ struct Invocation {
     context: Context,
     /// Watches acquired through the runtime; stopped at invocation end.
     watches: Mutex<Vec<CommittedWatch>>,
+    /// Timers armed through the runtime; disarmed at invocation end.
+    timers: Mutex<Vec<TimerDisarm>>,
     ended: AtomicBool,
     done_tx: tokio::sync::watch::Sender<bool>,
     notify: Notify,
@@ -363,7 +373,13 @@ struct SchedulerInner {
     env: Option<EnvFactory>,
     report: ReportFn,
     now: NowFn,
+    timers: Arc<Timers>,
+    on_wake: Option<WakeFn>,
     context: Context,
+    /// Earliest sleep timer, without `onWake` while scheduling runs.
+    wake_timer: Mutex<Option<(f64, TimerDisarm)>>,
+    /// Last value given to `onWake`, so an unchanged one is not repeated.
+    last_wake: Mutex<Option<Wake>>,
     submissions: std::sync::OnceLock<Arc<Submissions>>,
     live: Mutex<BTreeMap<TaskId, TaskRecord>>,
     contexts: Mutex<BTreeMap<ConversationId, KeptContext>>,
@@ -398,9 +414,13 @@ impl SchedulerInner {
             registry: deps.registry,
             settings: deps.settings,
             env: deps.env,
-            report: deps.report,
+            report: Arc::clone(&deps.report),
             now: deps.now,
+            timers: Timers::new(deps.set_timer, Arc::clone(&deps.report)),
+            on_wake: deps.on_wake,
             context: deps.context,
+            wake_timer: Mutex::new(None),
+            last_wake: Mutex::new(None),
             submissions: std::sync::OnceLock::new(),
             live: Mutex::new(BTreeMap::new()),
             contexts: Mutex::new(BTreeMap::new()),
@@ -547,6 +567,7 @@ impl SchedulerInner {
             }
             scans.push(records);
         }
+        let mut parked: Vec<TaskRecord> = Vec::new();
         for records in scans {
             for record in records {
                 let mut record = record;
@@ -559,17 +580,29 @@ impl SchedulerInner {
                     tx.set_task(record.clone())?;
                     self.cascade_pending.store(true, Ordering::SeqCst);
                 }
-                if let Ok(mut live) = self.live.lock() {
-                    live.insert(record.id, record.clone());
-                }
                 if let TaskState::Running { checkpoint } = &record.state {
-                    let next = with_state(
+                    // A crash, eviction, or reset cut the phase off: count it and
+                    // write the task back as pending. A normal close writes the
+                    // same state in `join` without counting.
+                    record.restarts = Some(record.restarts.unwrap_or(0) + 1);
+                    let mut pending = with_state(
                         &record,
                         TaskState::Pending {
                             checkpoint: checkpoint.clone(),
                         },
                     );
-                    tx.set_task(next)?;
+                    pending.restarts = record.restarts;
+                    if let Some(limit) = self.restart_limit().limit()
+                        && record.restarts.unwrap_or(0) as u64 >= limit
+                        && !record.abort_requested
+                    {
+                        parked.push(record.clone());
+                    }
+                    tx.set_task(pending.clone())?;
+                    record = pending;
+                }
+                if let Ok(mut live) = self.live.lock() {
+                    live.insert(record.id, record.clone());
                 }
                 if let TaskState::Waiting {
                     policy: JoinPolicy::FailFast,
@@ -581,12 +614,193 @@ impl SchedulerInner {
                 }
             }
         }
+        if let Some(limit) = self.restart_limit().limit() {
+            let _ = limit;
+        }
+        for record in parked {
+            let restarts = record.restarts.unwrap_or(0);
+            (self.report)(format!(
+                "Task {} ({}) was cut off {restarts} times without progress; it is parked until retryTask()",
+                record.id, record.kind
+            ));
+        }
         Ok(())
+    }
+
+    /// The resolved restart limit.
+    fn restart_limit(&self) -> crate::harness::types::RestartLimit {
+        self.settings.restart_limit
+    }
+
+    /// Whether a record is parked by the restart limit.
+    fn parked(&self, record: &TaskRecord) -> bool {
+        !record.abort_requested
+            && self
+                .restart_limit()
+                .limit()
+                .map(|limit| record.restarts.unwrap_or(0) as u64 >= limit)
+                .unwrap_or(false)
     }
 
     fn resume(self: &Arc<Self>) {
         self.enabled.store(true, Ordering::SeqCst);
+        self.schedule_wake();
         self.kick();
+    }
+
+    /// When this Session next needs a running process.
+    fn wake_snapshot(self: &Arc<Self>) -> Wake {
+        let now = (self.now)();
+        let mut active = self
+            .invocations
+            .lock()
+            .map(|map| !map.is_empty())
+            .unwrap_or(false);
+        let mut at: Option<f64> = None;
+        let records: Vec<TaskRecord> = self
+            .live
+            .lock()
+            .map(|live| live.values().cloned().collect())
+            .unwrap_or_default();
+        for record in records {
+            if matches!(record.state, TaskState::Completing { .. }) {
+                continue;
+            }
+            if let TaskState::Waiting { on, .. } = &record.state
+                && !record.abort_requested
+                && on.iter().any(|id| {
+                    self.live
+                        .lock()
+                        .map(|live| live.contains_key(id))
+                        .unwrap_or(false)
+                })
+            {
+                continue;
+            }
+            if let TaskState::Sleeping { until, .. } = &record.state
+                && !record.abort_requested
+                && *until > now
+            {
+                at = Some(at.map_or(*until, |current| current.min(*until)));
+                continue;
+            }
+            if active {
+                continue;
+            }
+            if record.abort_requested
+                && !self.waiting_on(&record, &self.owned_live(None)).is_empty()
+            {
+                continue;
+            }
+            if !record.abort_requested {
+                let snapshot = self.registry.snapshot();
+                if matches!(
+                    self.fit(&record, snapshot.task(&record.kind)),
+                    Fit::Blocked { .. }
+                ) {
+                    continue;
+                }
+            }
+            active = true;
+        }
+        Wake { active, at }
+    }
+
+    /// Deliver the current wake value to the host, or arm the earliest sleep.
+    fn schedule_wake(self: &Arc<Self>) {
+        if self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let wake = self.wake_snapshot();
+        if let Some(on_wake) = self.on_wake.clone() {
+            let same = self
+                .last_wake
+                .lock()
+                .map(|last| {
+                    last.map(|last| last.active == wake.active && last.at == wake.at)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if same {
+                return;
+            }
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_wake(wake))).is_ok() {
+                if let Ok(mut last) = self.last_wake.lock() {
+                    *last = Some(wake);
+                }
+            } else {
+                (self.report)("HarnessOptions.onWake threw".to_string());
+            }
+            return;
+        }
+        self.arm_wake_timer(if self.enabled.load(Ordering::SeqCst) {
+            wake.at
+        } else {
+            None
+        });
+    }
+
+    fn arm_wake_timer(self: &Arc<Self>, at: Option<f64>) {
+        let mut slot = match self.wake_timer.lock() {
+            Ok(slot) => slot,
+            Err(_) => return,
+        };
+        if slot
+            .as_ref()
+            .map(|(current, _)| Some(*current) == at)
+            .unwrap_or(at.is_none())
+        {
+            return;
+        }
+        if let Some((_, disarm)) = slot.take() {
+            disarm();
+        }
+        let Some(at) = at else {
+            return;
+        };
+        let this = Arc::clone(self);
+        let callback = Arc::new(move || {
+            if let Ok(mut slot) = this.wake_timer.lock() {
+                slot.take();
+            }
+            // Recheck the clock in the scheduling pass: an early wake arms again.
+            this.schedule_wake();
+            this.kick();
+        });
+        let delay = (at - (self.now)()).max(0.0);
+        let disarm = self.timers.foreground(callback, delay);
+        *slot = Some((at, disarm));
+    }
+
+    async fn retry_task(self: &Arc<Self>, id: TaskId, context: &Context) -> SessionResult<()> {
+        let this = Arc::clone(self);
+        self.session
+            .commit_with(
+                commit_fn(move |tx| {
+                    let this = Arc::clone(&this);
+                    Box::pin(async move {
+                        let Some(current) = tx.task(id).await? else {
+                            return Err(SessionError::message(format!("Task {id} does not exist")));
+                        };
+                        if matches!(
+                            current.state,
+                            TaskState::Terminal { .. } | TaskState::Completing { .. }
+                        ) || !this.parked(&current)
+                        {
+                            return Ok(());
+                        }
+                        let mut next = current.clone();
+                        next.restarts = None;
+                        tx.set_task(next)?;
+                        Ok(())
+                    })
+                }),
+                context,
+                None,
+            )
+            .await?;
+        self.resume();
+        Ok(())
     }
 
     async fn join(self: &Arc<Self>) -> SessionResult<()> {
@@ -595,9 +809,54 @@ impl SchedulerInner {
             .lock()
             .map(|map| map.values().cloned().collect())
             .unwrap_or_default();
-        for invocation in invocations {
-            wait_invocation(&invocation).await;
+        for invocation in &invocations {
+            invocation.controller.cancel();
+            wait_invocation(invocation).await;
         }
+        if invocations.is_empty() {
+            return Ok(());
+        }
+        // A close is not a crash: write what the stopped invocations ran back as
+        // pending without counting a restart.
+        let ids: Vec<TaskId> = invocations
+            .iter()
+            .map(|invocation| invocation.task_id)
+            .collect();
+        let this = Arc::clone(self);
+        let result = self
+            .session
+            .commit_with(
+                commit_fn(move |tx| {
+                    let this = Arc::clone(&this);
+                    let ids = ids.clone();
+                    Box::pin(async move {
+                        for id in ids {
+                            let record = this
+                                .live
+                                .lock()
+                                .ok()
+                                .and_then(|live| live.get(&id).cloned());
+                            if let Some(record) = record
+                                && let TaskState::Running { checkpoint } = &record.state
+                            {
+                                let mut next = with_state(
+                                    &record,
+                                    TaskState::Pending {
+                                        checkpoint: checkpoint.clone(),
+                                    },
+                                );
+                                next.restarts = None;
+                                tx.set_task(next)?;
+                            }
+                        }
+                        Ok(())
+                    })
+                }),
+                &self.context,
+                None,
+            )
+            .await;
+        result?;
         Ok(())
     }
 
@@ -1474,6 +1733,7 @@ impl SchedulerInner {
     // ─── Scheduling ─────────────────────────────────────────────────────────
 
     fn kick(self: &Arc<Self>) {
+        self.schedule_wake();
         self.dirty.store(true, Ordering::SeqCst);
         if self.draining.load(Ordering::SeqCst)
             || !self.enabled.load(Ordering::SeqCst)
@@ -1578,11 +1838,43 @@ impl SchedulerInner {
             if matches!(record.state, TaskState::Completing { .. }) {
                 continue;
             }
+            if let TaskState::Sleeping { until, .. } = &record.state
+                && !record.abort_requested
+                && *until > (self.now)()
+            {
+                continue;
+            }
+            if self.parked(&record) {
+                continue;
+            }
             let mode = if record.abort_requested {
                 InvocationMode::Abort
             } else {
                 InvocationMode::Run
             };
+            if mode == InvocationMode::Abort
+                && let Some(limit) = self.restart_limit().limit()
+                && record.restarts.unwrap_or(0) as u64 >= limit
+            {
+                let message = format!(
+                    "Abort handler of task {} ({}) was cut off {} times",
+                    record.id,
+                    record.kind,
+                    record.restarts.unwrap_or(0)
+                );
+                self.terminate(
+                    tx,
+                    &record,
+                    TaskOutcome::Faulted {
+                        error: crate::types::TaskOutcomeError {
+                            message,
+                            detail: Some(serde_json::json!({ "reason": "restart_limit" })),
+                        },
+                    },
+                )
+                .await?;
+                continue;
+            }
             let snap = match &snapshot {
                 Some(snapshot) => Arc::clone(snapshot),
                 None => {
@@ -1752,6 +2044,7 @@ impl SchedulerInner {
             controller,
             context,
             watches: Mutex::new(Vec::new()),
+            timers: Mutex::new(Vec::new()),
             ended: AtomicBool::new(false),
             done_tx,
             notify: Notify::new(),
@@ -2056,7 +2349,7 @@ impl SchedulerInner {
             }
             if self.owned_live(Some(&overlay)).contains_key(&current.id()) {
                 tx.set_task(with_state(
-                    &current.record,
+                    &progressed(&current.record),
                     TaskState::Completing {
                         outcome: outcome.clone(),
                     },
@@ -2075,9 +2368,22 @@ impl SchedulerInner {
                 on,
                 policy,
             },
+            NextTaskState::Sleeping { checkpoint, until } => {
+                TaskState::Sleeping { checkpoint, until }
+            }
             NextTaskState::Terminal { outcome } => TaskState::Terminal { outcome },
         };
-        tx.set_task(with_state(&current.record, state))?;
+        // A committed state that differs from the current one is progress: the
+        // restart count starts over. Committing the same checkpoint again, as
+        // intent before an effect, is not.
+        let same =
+            serde_json::to_value(&current.record.state).ok() == serde_json::to_value(&state).ok();
+        let base = if same {
+            current.record.clone()
+        } else {
+            progressed(&current.record)
+        };
+        tx.set_task(with_state(&base, state))?;
         Ok(())
     }
 
@@ -2153,6 +2459,11 @@ impl SchedulerInner {
                 watch.cancel();
             }
         }
+        if let Ok(mut timers) = invocation.timers.lock() {
+            for disarm in timers.drain(..) {
+                disarm();
+            }
+        }
         invocation.controller.cancel();
     }
 
@@ -2200,6 +2511,15 @@ impl SchedulerInner {
         }
         if matches!(record.state, TaskState::Completing { .. }) {
             return TaskInspectionState::Completing;
+        }
+        if let TaskState::Sleeping { until, .. } = &record.state {
+            return TaskInspectionState::Sleeping { until: *until };
+        }
+        if self.parked(record) {
+            return TaskInspectionState::Blocked {
+                reason: BlockedReason::RestartLimit,
+                error: None,
+            };
         }
         let on = self.waiting_on(record, owned);
         if !on.is_empty() {
@@ -2825,36 +3145,34 @@ impl TaskRuntime for InvocationRuntime {
         Ok(())
     }
 
-    async fn sleep(&self, until: f64, context: &Context) -> SessionResult<()> {
-        let task_id = self.invocation.task_id;
-        loop {
-            self.ensure_open()?;
-            if context
-                .abort_signal()
-                .map(|signal| signal.is_cancelled())
-                .unwrap_or(false)
-            {
-                return Err(SessionError::Aborted);
-            }
-            let remaining = until - (self.inner.now)();
-            if remaining <= 0.0 {
-                return Ok(());
-            }
-            let delay = remaining.min(MAX_TIMER_DELAY);
-            let token = self.invocation.controller.clone();
-            let signal = context.abort_signal();
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => return Err(ended_error(task_id)),
-                _ = async move {
-                    match signal {
-                        Some(signal) => signal.cancelled().await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => return Err(SessionError::Aborted),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(delay as u64)) => {}
-            }
+    fn set_timer(
+        &self,
+        callback: Arc<dyn Fn() + Send + Sync>,
+        delay_ms: u64,
+    ) -> SessionResult<TimerDisarm> {
+        self.ensure_open()?;
+        let callback = Arc::new(move || {
+            // After the invocation ends, nothing is armed; a race is harmless.
+            callback();
+        });
+        let disarm = self.inner.timers.foreground(callback, delay_ms as f64);
+        if let Ok(mut timers) = self.invocation.timers.lock() {
+            timers.push(Arc::clone(&disarm));
         }
+        Ok(disarm)
+    }
+
+    async fn sleep_until(
+        &self,
+        until: f64,
+        checkpoint: JsonValue,
+        context: &Context,
+    ) -> SessionResult<()> {
+        let change: TaskCommitFn = Arc::new(move |_tx, _current| {
+            let checkpoint = checkpoint.clone();
+            Box::pin(async move { Ok(Some(NextTaskState::Sleeping { checkpoint, until })) })
+        });
+        self.commit(change, context).await
     }
 }
 
@@ -2892,6 +3210,14 @@ impl TaskScheduler {
 impl SchedulerService for TaskScheduler {
     fn resume(&self) {
         self.inner.resume();
+    }
+
+    fn wake(&self) -> Wake {
+        self.inner.wake_snapshot()
+    }
+
+    async fn retry_task(&self, id: TaskId, context: &Context) -> SessionResult<()> {
+        self.inner.retry_task(id, context).await
     }
 
     async fn open(&self, context: &Context) -> SessionResult<()> {
@@ -2990,6 +3316,14 @@ impl Default for UnavailableScheduler {
 #[async_trait]
 impl SchedulerService for UnavailableScheduler {
     fn resume(&self) {}
+
+    fn wake(&self) -> Wake {
+        Wake::default()
+    }
+
+    async fn retry_task(&self, _id: TaskId, _context: &Context) -> SessionResult<()> {
+        unavailable()
+    }
 
     async fn open(&self, _context: &Context) -> SessionResult<()> {
         Ok(())
@@ -3115,6 +3449,7 @@ fn blocked_reason_str(reason: BlockedReason) -> &'static str {
         BlockedReason::MissingTask => "missing_task",
         BlockedReason::TaskTooOld => "task_too_old",
         BlockedReason::MigrationFailed => "migration_failed",
+        BlockedReason::RestartLimit => "restart_limit",
     }
 }
 
@@ -3168,7 +3503,15 @@ fn with_state(record: &TaskRecord, state: TaskState) -> TaskRecord {
     next.state = state;
     if terminal_like {
         next.memos = None;
+        next.restarts = None;
     }
+    next
+}
+
+/// The record without its restart count, as after a state the task committed.
+fn progressed(record: &TaskRecord) -> TaskRecord {
+    let mut next = record.clone();
+    next.restarts = None;
     next
 }
 

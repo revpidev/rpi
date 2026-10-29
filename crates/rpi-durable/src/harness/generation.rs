@@ -674,7 +674,15 @@ async fn retry(
         } => (attempt, compacted, until),
         _ => return Ok(()),
     };
-    runtime.sleep(until, context).await?;
+    if until > runtime.now()? {
+        let checkpoint = to_checkpoint(GenerationCheckpoint::Retry {
+            attempt,
+            compacted,
+            until,
+        });
+        runtime.sleep_until(until, checkpoint, context).await?;
+        return Ok(());
+    }
     let conversation_id = runtime.conversation_id();
     let next = attempt + 1;
     let change: TaskCommitFn = Arc::new(move |tx, _current| {

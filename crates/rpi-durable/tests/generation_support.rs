@@ -314,6 +314,8 @@ pub async fn open_with_storage_and_identity(
         env: None,
         conversation_created: None,
         now: None,
+        set_timer: None,
+        on_wake: None,
         on_report: Some(Arc::new(move |message| {
             if let Ok(mut log) = captured.0.lock() {
                 log.push(message);
