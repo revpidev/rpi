@@ -899,14 +899,19 @@ impl SchedulerInner {
         Ok(())
     }
 
-    async fn abort(self: &Arc<Self>, id: TaskId, context: &Context) -> SessionResult<TaskAbort> {
+    async fn abort(
+        self: &Arc<Self>,
+        id: TaskId,
+        context: &Context,
+        keep_restart: bool,
+    ) -> SessionResult<TaskAbort> {
         let this = Arc::clone(self);
         let outcome = self
             .session
             .commit_with(
                 commit_fn(move |tx| {
                     let this = Arc::clone(&this);
-                    Box::pin(async move { this.abort_in(tx, id).await })
+                    Box::pin(async move { this.abort_in(tx, id, keep_restart).await })
                 }),
                 context,
                 None,
@@ -929,6 +934,7 @@ impl SchedulerInner {
         self: &Arc<Self>,
         tx: &mut Transaction,
         id: TaskId,
+        keep_restart: bool,
     ) -> SessionResult<AbortCommit> {
         let Some(current) = tx.task(id).await? else {
             return Err(SessionError::message(format!("Task {id} does not exist")));
@@ -967,6 +973,10 @@ impl SchedulerInner {
         if !current.abort_requested {
             let mut marked = current.clone();
             marked.abort_requested = true;
+            if !keep_restart {
+                // An abort request replaces a restart mark.
+                marked.abort_reason = None;
+            }
             tx.set_task(marked)?;
         }
         let run = invocation.filter(|invocation| invocation.mode == InvocationMode::Run);
@@ -3056,7 +3066,7 @@ impl TaskRuntime for InvocationRuntime {
                 self.invocation.task_id
             )));
         }
-        let _ = self.inner.abort(id, context).await?;
+        let _ = self.inner.abort(id, context, true).await?;
         let bound = with_abort_signal(self.invocation.controller.clone(), context);
         let _ = self.inner.wait_for_task(id, &bound).await?;
         Ok(())
@@ -3381,7 +3391,7 @@ impl SchedulerService for TaskScheduler {
     }
 
     async fn abort(&self, id: TaskId, context: &Context) -> SessionResult<TaskAbort> {
-        self.inner.abort(id, context).await
+        self.inner.abort(id, context, false).await
     }
 
     async fn abort_conversation(
