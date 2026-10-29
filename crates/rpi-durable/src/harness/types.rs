@@ -141,6 +141,12 @@ impl ReportInfo {
         self.task_kind = Some(kind.into());
         self
     }
+
+    /// Attach the extension whose code failed.
+    pub fn with_extension(mut self, extension: impl Into<String>) -> Self {
+        self.extension = Some(extension.into());
+        self
+    }
 }
 
 /// Receives fixed-field reports (`HarnessOptions.onReport`'s `info`).
@@ -529,6 +535,8 @@ pub trait TaskRuntime: Send + Sync {
     fn now(&self) -> SessionResult<f64>;
     /// Forward a non-fatal failure; rejects once the invocation ended.
     fn report(&self, message: String) -> SessionResult<()>;
+    /// Forward a fixed-field report about this task.
+    fn report_info(&self, info: ReportInfo);
     /// Call `callback` once after about `delay_ms` on the Harness timer, for
     /// pacing work inside a phase. The invocation's end disarms it.
     fn set_timer(

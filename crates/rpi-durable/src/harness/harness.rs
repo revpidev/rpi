@@ -165,6 +165,7 @@ impl HarnessImpl {
             registry.as_ref(),
             &self.current_settings(),
             &self.report,
+            self.options.on_report_info.as_ref(),
         ))
     }
 
@@ -1083,6 +1084,21 @@ pub async fn open_harness_with_scheduler(
                 report(crate::harness::types::ReportInfo::new(
                     crate::harness::types::ReportKind::SessionFailed,
                 ));
+            }
+        }
+    }));
+    session.set_listener_reporter(Arc::new({
+        let report = Arc::clone(&report);
+        let report_info = options.on_report_info.clone();
+        move |message| {
+            report(message);
+            if let Some(report) = &report_info {
+                report(
+                    crate::harness::types::ReportInfo::new(
+                        crate::harness::types::ReportKind::ListenerError,
+                    )
+                    .with_reason("listener"),
+                );
             }
         }
     }));

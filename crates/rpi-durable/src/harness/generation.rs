@@ -327,6 +327,13 @@ async fn prepare(
                 return Err(error);
             }
             let _ = runtime.report(error.to_string());
+            runtime.report_info(
+                crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::HostError,
+                )
+                .with_task(runtime.task_id(), GENERATION_TASK_NAME)
+                .with_reason("env"),
+            );
             None
         }
     };

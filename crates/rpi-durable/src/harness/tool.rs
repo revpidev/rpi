@@ -665,6 +665,13 @@ async fn run(
                     return Err(SessionError::Aborted);
                 }
                 ending = Ending::Failed(format!("Tool {} threw", call.call.name));
+                runtime.report_info(
+                    crate::harness::types::ReportInfo::new(
+                        crate::harness::types::ReportKind::TaskError,
+                    )
+                    .with_task(runtime.task_id(), TOOL_TASK_NAME)
+                    .with_reason("threw"),
+                );
                 error_result(&error.to_string())
             }
         }

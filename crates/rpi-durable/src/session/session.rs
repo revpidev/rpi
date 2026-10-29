@@ -124,6 +124,8 @@ pub struct SessionImpl {
     end: Mutex<Option<SessionEnd>>,
     end_notify: tokio::sync::Notify,
     failure_reporter: Mutex<Option<FailureReporter>>,
+    /// Reports listener and close-listener panics; never fails the Session.
+    listener_reporter: Mutex<Option<FailureReporter>>,
     /// Callbacks run when the Session fails, before close listeners.
     failure_hooks: Mutex<Vec<FailureHook>>,
     /// Last use of each cached document, by address, for retention.
@@ -168,6 +170,7 @@ impl SessionImpl {
             end: Mutex::new(None),
             end_notify: tokio::sync::Notify::new(),
             failure_reporter: Mutex::new(None),
+            listener_reporter: Mutex::new(None),
             failure_hooks: Mutex::new(Vec::new()),
             idle_since: Mutex::new(HashMap::new()),
             attached: Mutex::new(std::collections::HashSet::new()),
@@ -203,6 +206,13 @@ impl SessionImpl {
     /// Install the host reporter for the error that failed the Session.
     pub fn set_failure_reporter(&self, reporter: FailureReporter) {
         if let Ok(mut slot) = self.failure_reporter.lock() {
+            *slot = Some(reporter);
+        }
+    }
+
+    /// Install the reporter for listener and close-listener panics.
+    pub fn set_listener_reporter(&self, reporter: FailureReporter) {
+        if let Ok(mut slot) = self.listener_reporter.lock() {
             *slot = Some(reporter);
         }
     }
@@ -273,7 +283,7 @@ impl SessionImpl {
         };
         for listener in listeners {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener())).is_err()
-                && let Ok(reporter) = self.failure_reporter.lock()
+                && let Ok(reporter) = self.listener_reporter.lock()
                 && let Some(reporter) = reporter.as_ref()
             {
                 reporter("A close listener panicked".to_string());
@@ -583,7 +593,7 @@ impl SessionImpl {
                 let message = panic_message(payload);
                 if internal {
                     self.fail(format!("A component commit listener failed: {message}"));
-                } else if let Ok(reporter) = self.failure_reporter.lock()
+                } else if let Ok(reporter) = self.listener_reporter.lock()
                     && let Some(reporter) = reporter.as_ref()
                 {
                     reporter(format!("A commit listener failed: {message}"));

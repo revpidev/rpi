@@ -623,3 +623,59 @@ async fn abandon_on_restart_marks_and_aborts_the_task() {
     assert_eq!(terminal_status(&settled.record), Some("aborted"));
     reopened.harness.close(&context()).await.unwrap();
 }
+
+/// R-D11/R-D9: a host listener panic reports `listener_error` and leaves the
+/// Session healthy; it is never `session_failed`.
+#[tokio::test]
+async fn listener_panics_report_listener_error() {
+    use rpi_durable::harness::{ReportInfo, ReportKind};
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let reports: Arc<std::sync::Mutex<Vec<ReportInfo>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&reports);
+    let opened = open_with_storage_settings_and_report(
+        Arc::clone(&storage),
+        all_tasks(),
+        None,
+        Some(Arc::new(move |info| {
+            sink.lock().expect("reports").push(info);
+        })),
+    )
+    .await;
+    let _subscription = opened.harness.session().subscribe_commits(Arc::new(|_, _| {
+        panic!("host listener");
+    }));
+    let conversation = root(&opened.harness).await;
+    opened
+        .harness
+        .session()
+        .commit(
+            rpi_durable::session::commit_fn(move |tx| {
+                Box::pin(async move {
+                    tx.doc(
+                        &rpi_durable::harness::LIVE_DOC,
+                        rpi_durable::session::DocOwner::Conversation(conversation),
+                        None,
+                    )
+                    .await?;
+                    Ok(())
+                })
+            }),
+            &context(),
+        )
+        .await
+        .ok();
+    let captured = reports.lock().expect("reports").clone();
+    assert!(
+        captured
+            .iter()
+            .any(|info| info.kind == ReportKind::ListenerError)
+    );
+    assert!(
+        !captured
+            .iter()
+            .any(|info| info.kind == ReportKind::SessionFailed)
+    );
+    assert!(opened.harness.session().failure().is_none());
+    opened.harness.close(&context()).await.unwrap();
+}

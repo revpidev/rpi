@@ -66,8 +66,11 @@ pub trait TelemetrySink: Send + Sync {
     fn add_event(&self, name: &str, attributes: JsonObject);
     /// Link the current span to an opaque carrier.
     fn add_link(&self, carrier: JsonValue);
-    /// Record one metric value.
-    fn record_metric(&self, name: &str, value: f64);
+    /// Record one metric value with attributes.
+    fn record_metric(&self, name: &str, value: f64, attributes: JsonObject);
+
+    /// Set the current span's status; an error message is kept bounded.
+    fn set_status(&self, _status: &str, _message: Option<&str>) {}
 }
 
 /// A telemetry context; a no-op without a host sink.
@@ -121,10 +124,18 @@ impl TelemetryContext {
         }
     }
 
-    /// Record one metric value.
-    pub fn record_metric(&self, name: &str, value: f64) {
+    /// Record one metric value with attributes.
+    pub fn record_metric(&self, name: &str, value: f64, attributes: JsonObject) {
         if let Some(sink) = &self.sink {
-            sink.record_metric(name, value);
+            sink.record_metric(name, value, attributes);
+        }
+    }
+
+    /// Set the current span's status, capping an error message at 500 characters.
+    pub fn set_status(&self, status: &str, message: Option<&str>) {
+        if let Some(sink) = &self.sink {
+            let message = message.map(|message| message.chars().take(500).collect::<String>());
+            sink.set_status(status, message.as_deref());
         }
     }
 }

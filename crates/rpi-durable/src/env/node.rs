@@ -319,17 +319,15 @@ enum CommandTransport {
     Stdin,
 }
 
-fn is_legacy_wsl_bash_path(path: &str) -> bool {
-    let system_root = std::env::var("SystemRoot").ok();
-    is_legacy_wsl_bash_path_with_root(path, system_root.as_deref())
-}
-
 /// Whether `path` is the legacy WSL `bash.exe` launcher. With `SystemRoot`
 /// set, only the System32 and Sysnative launchers under that root match;
 /// without it, the conventional Windows directory matches.
 fn is_legacy_wsl_bash_path_with_root(path: &str, system_root: Option<&str>) -> bool {
     let normalized = path.replace('/', "\\");
     if let Some(root) = system_root.map(str::trim).filter(|root| !root.is_empty()) {
+        if !is_absolute_windows_root(root) {
+            return false;
+        }
         let root = root.trim_end_matches(['\\', '/']);
         for directory in ["System32", "Sysnative"] {
             let candidate = format!("{root}\\{directory}\\bash.exe");
@@ -353,8 +351,17 @@ fn is_legacy_wsl_bash_path_with_root(path: &str, system_root: Option<&str>) -> b
         && components.next().is_none()
 }
 
-fn bash_shell_config(shell: &str) -> ShellConfig {
-    if is_legacy_wsl_bash_path(shell) {
+/// Whether `root` is a drive-absolute Windows path such as `C:\\Windows`.
+fn is_absolute_windows_root(root: &str) -> bool {
+    let bytes = root.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
+fn shell_config_with_root(shell: &str, system_root: Option<&str>) -> ShellConfig {
+    if is_legacy_wsl_bash_path_with_root(shell, system_root) {
         ShellConfig {
             shell: shell.to_string(),
             args: vec!["-s".to_string()],
@@ -367,6 +374,11 @@ fn bash_shell_config(shell: &str) -> ShellConfig {
             command_transport: CommandTransport::Argv,
         }
     }
+}
+
+fn bash_shell_config(shell: &str) -> ShellConfig {
+    let system_root = std::env::var("SystemRoot").ok();
+    shell_config_with_root(shell, system_root.as_deref())
 }
 
 fn path_exists_blocking(path: &str) -> bool {
@@ -2009,6 +2021,31 @@ mod legacy_wsl_tests {
         assert!(!is_legacy_wsl_bash_path_with_root(
             "D:\\Windows\\System32\\wsl.exe",
             Some("D:\\Windows")
+        ));
+    }
+
+    #[test]
+    fn legacy_launcher_uses_stdin_with_dash_s() {
+        let config =
+            super::shell_config_with_root("C:\\Windows\\System32\\bash.exe", Some("C:\\Windows"));
+        assert_eq!(config.args, vec!["-s".to_string()]);
+        assert!(matches!(
+            config.command_transport,
+            super::CommandTransport::Stdin
+        ));
+        let config = super::shell_config_with_root("C:\\Program Files\\Git\\bin\\bash.exe", None);
+        assert_eq!(config.args, vec!["-c".to_string()]);
+        assert!(matches!(
+            config.command_transport,
+            super::CommandTransport::Argv
+        ));
+    }
+
+    #[test]
+    fn a_relative_system_root_is_ignored() {
+        assert!(!super::is_legacy_wsl_bash_path_with_root(
+            "C:\\Windows\\System32\\bash.exe",
+            Some("Windows")
         ));
     }
 

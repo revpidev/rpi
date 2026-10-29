@@ -1681,7 +1681,7 @@ async fn host_commit_listener_panic_is_contained() {
     let sink = Arc::clone(&reported);
     harness
         .session
-        .set_failure_reporter(Arc::new(move |message| {
+        .set_listener_reporter(Arc::new(move |message| {
             sink.lock().expect("reported").push(message);
         }));
     let _subscription = harness.session.subscribe_commits(Arc::new(|_, _| {

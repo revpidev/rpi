@@ -476,6 +476,7 @@ impl SchedulerInner {
             snapshot.as_ref(),
             &self.settings(),
             &self.report,
+            self.report_info.as_ref(),
         ))
     }
 
@@ -665,7 +666,14 @@ impl SchedulerInner {
             .cloned()
             .unwrap_or_default(),
         );
-        self.telemetry.record_metric("pi.durable.reports", 1.0);
+        self.telemetry.record_metric(
+            "pi.durable.reports",
+            1.0,
+            serde_json::json!({ "type": info.kind })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
         if let Some(report) = &self.report_info {
             report(info);
         }
@@ -2170,7 +2178,14 @@ impl SchedulerInner {
     }
 
     fn start(self: &Arc<Self>, reservation: &Reservation) {
-        self.telemetry.record_metric("pi.durable.tasks.active", 1.0);
+        self.telemetry.record_metric(
+            "pi.durable.tasks.active",
+            1.0,
+            serde_json::json!({ "task": reservation.task.name() })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
         let this = Arc::clone(self);
         let reservation = reservation.clone();
         tokio::spawn(async move {
@@ -2231,6 +2246,18 @@ impl SchedulerInner {
                     .unwrap_or_default(),
                 );
             }
+            if runtime.inner.telemetry.enabled()
+                && let Some(previous) = &previous
+                && previous.phase != phase
+            {
+                runtime.inner.telemetry.add_event(
+                    "pi.durable.checkpoint",
+                    serde_json::json!({ "phase": phase })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
             let started = (self.now)();
             let outcome = task
                 .run_phase(&phase, current, &runtime, &invocation.context)
@@ -2239,7 +2266,17 @@ impl SchedulerInner {
                 runtime.inner.telemetry.record_metric(
                     "pi.durable.phase.duration",
                     ((self.now)() - started).max(0.0),
+                    serde_json::json!({ "task": task.name(), "phase": phase })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
                 );
+                if let Err(error) = &outcome {
+                    runtime
+                        .inner
+                        .telemetry
+                        .set_status("error", Some(&error.to_string()));
+                }
             }
             previous = Some(PhaseResult {
                 checkpoint,
@@ -2587,7 +2624,7 @@ impl SchedulerInner {
             return;
         }
         self.telemetry
-            .record_metric("pi.durable.tasks.active", -1.0);
+            .record_metric("pi.durable.tasks.active", -1.0, JsonObject::new());
         if let Ok(mut map) = self.invocations.lock() {
             let remove = map
                 .get(&invocation.task_id)
@@ -3299,6 +3336,10 @@ impl TaskRuntime for InvocationRuntime {
         self.ensure_open()?;
         (self.inner.report)(message);
         Ok(())
+    }
+
+    fn report_info(&self, info: crate::harness::types::ReportInfo) {
+        self.inner.report_fixed(info);
     }
 
     fn set_timer(

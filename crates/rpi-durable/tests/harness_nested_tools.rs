@@ -339,7 +339,7 @@ async fn telemetry_records_ids_and_replay_events_without_content() {
             self.events.lock().expect("events").push(name.to_string());
         }
         fn add_link(&self, _carrier: JsonValue) {}
-        fn record_metric(&self, _name: &str, _value: f64) {}
+        fn record_metric(&self, _name: &str, _value: f64, _attributes: JsonObject) {}
     }
 
     let sink = Arc::new(Sink::default());
@@ -762,7 +762,7 @@ async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
 #[tokio::test]
 async fn end_to_end_v1_migration_nested_and_sleep() {
     use rpi_durable::harness::{
-        Harness, NextTaskState, Registry, TaskDefinition, TaskRuntime, TaskScheduler,
+        NextTaskState, Registry, TaskDefinition, TaskRuntime, TaskScheduler,
         open_harness_with_scheduler,
     };
     use rpi_durable::session::{EntryDraft, TaskCreate, TaskOwnership, commit_fn};
@@ -962,5 +962,4 @@ async fn end_to_end_v1_migration_nested_and_sleep() {
         .expect("sleep task");
     assert!(matches!(sleep.record.state, TaskState::Terminal { .. }));
     assert_eq!(phases.load(Ordering::SeqCst), 2);
-    let _ = Harness::wake(&*harness);
 }

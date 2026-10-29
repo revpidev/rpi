@@ -401,6 +401,7 @@ pub fn resolve_agent(
     snapshot: &dyn crate::harness::types::RegistrySnapshot,
     settings: &Settings,
     report: &ReportFn,
+    report_info: Option<&crate::harness::types::ReportInfoFn>,
 ) -> Agent {
     let extensions = select_extensions(
         state.and_then(|state| state.extensions.as_ref()),
@@ -423,8 +424,22 @@ pub fn resolve_agent(
     for extension in &extensions {
         for wrap in &extension.wraps {
             match wrap {
-                Wrap::Tool { tool, wrap } => apply_wrap_tool(&mut composed, tool, wrap, report),
-                Wrap::Section { key, wrap } => apply_wrap_section(&mut sections, key, wrap, report),
+                Wrap::Tool { tool, wrap } => apply_wrap_tool(
+                    &mut composed,
+                    tool,
+                    wrap,
+                    report,
+                    report_info,
+                    &extension.name,
+                ),
+                Wrap::Section { key, wrap } => apply_wrap_section(
+                    &mut sections,
+                    key,
+                    wrap,
+                    report,
+                    report_info,
+                    &extension.name,
+                ),
             }
         }
     }
@@ -607,6 +622,8 @@ fn apply_wrap_tool(
     target: &str,
     wrap: &Arc<dyn Fn(ToolRegistration) -> ToolRegistration + Send + Sync>,
     report: &ReportFn,
+    report_info: Option<&crate::harness::types::ReportInfoFn>,
+    extension: &str,
 ) {
     let Some(index) = items.iter().position(|(name, _)| name == target) else {
         return;
@@ -616,6 +633,15 @@ fn apply_wrap_tool(
         let renamed = wrapped.name().to_string();
         items.remove(index);
         report(format!("Wrapper renamed {target} to {renamed}"));
+        if let Some(report) = report_info {
+            report(
+                crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::ExtensionError,
+                )
+                .with_reason("wrapper_renamed")
+                .with_extension(extension),
+            );
+        }
     } else {
         items[index].1 = wrapped;
     }
@@ -626,6 +652,8 @@ fn apply_wrap_section(
     target: &str,
     wrap: &Arc<dyn Fn(PromptSection) -> PromptSection + Send + Sync>,
     report: &ReportFn,
+    report_info: Option<&crate::harness::types::ReportInfoFn>,
+    extension: &str,
 ) {
     let Some(index) = items.iter().position(|(key, _)| key == target) else {
         return;
@@ -635,6 +663,15 @@ fn apply_wrap_section(
         let renamed = wrapped.key.clone();
         items.remove(index);
         report(format!("Wrapper renamed {target} to {renamed}"));
+        if let Some(report) = report_info {
+            report(
+                crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::ExtensionError,
+                )
+                .with_reason("wrapper_renamed")
+                .with_extension(extension),
+            );
+        }
     } else {
         items[index].1 = wrapped;
     }
@@ -821,7 +858,7 @@ mod tests {
             extensions: Some(ExtensionsSelection::List(vec!["b".to_string()])),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report);
+        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report, None);
         assert_eq!(names(&agent), vec!["b"]);
         assert_eq!(agent.tools.len(), 1);
         assert_eq!(agent.tools[0].tool.description, "from b");
@@ -834,7 +871,7 @@ mod tests {
             }),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report);
+        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report, None);
         assert_eq!(names(&agent), vec!["b"]);
 
         // A tool list offers exactly those tools; an unknown name is skipped.
@@ -846,7 +883,7 @@ mod tests {
             instructions: Some("be brief".to_string()),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report);
+        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report, None);
         assert_eq!(
             agent
                 .tools
@@ -885,7 +922,7 @@ mod tests {
             extensions: Some(ExtensionsSelection::List(vec!["a".to_string()])),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report);
+        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report, None);
         assert_eq!(agent.tools[0].tool.description, "plain");
         assert!(agent.sections.iter().any(|s| s.key == "prompt"));
 
@@ -910,7 +947,7 @@ mod tests {
             extensions: Some(ExtensionsSelection::List(vec!["a".to_string()])),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report);
+        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report, None);
         assert!(agent.tools.is_empty());
         assert_eq!(reports.lock().unwrap().len(), 1);
     }
@@ -995,7 +1032,7 @@ mod tests {
         let registry = snapshot(vec![extension.clone()]);
         let settings = resolve_settings(None);
 
-        let agent = resolve_agent(None, registry.as_ref(), &settings, &report);
+        let agent = resolve_agent(None, registry.as_ref(), &settings, &report, None);
         assert_eq!(
             agent
                 .tools
@@ -1029,7 +1066,7 @@ mod tests {
             }),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), registry.as_ref(), &settings, &report);
+        let agent = resolve_agent(Some(&state), registry.as_ref(), &settings, &report, None);
         assert_eq!(
             agent
                 .tools
@@ -1048,7 +1085,7 @@ mod tests {
             ])),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), registry.as_ref(), &settings, &report);
+        let agent = resolve_agent(Some(&state), registry.as_ref(), &settings, &report, None);
         assert_eq!(
             agent
                 .tools
