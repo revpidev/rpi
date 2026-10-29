@@ -335,6 +335,7 @@ pub async fn open_with_sources(
         now: None,
         set_timer: None,
         on_wake: None,
+        on_report_info: None,
         on_report: Some(Arc::new(move |message| {
             if let Ok(mut log) = captured.0.lock() {
                 log.push(message);

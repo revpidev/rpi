@@ -151,6 +151,7 @@ async fn open(
         set_timer: Some(timer.set_timer()),
         on_wake,
         on_report: Some(Arc::new(|message| eprintln!("report: {message}"))),
+        on_report_info: None,
     };
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let harness = open_harness(storage, options, &BACKGROUND_CONTEXT.clone())

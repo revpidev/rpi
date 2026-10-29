@@ -413,6 +413,7 @@ async fn open_with_telemetry(
         set_timer: None,
         on_wake: None,
         on_report: None,
+        on_report_info: None,
     };
     let storage: Arc<dyn rpi_durable::types::Storage> =
         Arc::new(rpi_durable::storage::MemoryStorage::new());
@@ -544,3 +545,192 @@ fn codemode_journal_keeps_the_first_result_per_key() {
 
 // `tool_result_texts` above skips the harness's structured results; this test
 // module reuses it because the codemode result is a text item.
+
+/// V18-06 FR-B: a crash before the code mode call settles reruns the script
+/// from its stored start data; the journal answers its nested call, so the
+/// tool executes once.
+#[tokio::test]
+async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
+    use rpi_durable::codemode::{
+        CODEMODE_JOURNAL_DOC, CODEMODE_RUN_DOC, CODEMODE_TOOL_NAME, CodemodeHost, CodemodeJournal,
+        CodemodeOutcome, CodemodeSandbox, CodemodeStart, CodemodeToolOptions, create_codemode_tool,
+    };
+    use rpi_durable::harness::{Registry, TaskScheduler, open_harness_with_scheduler};
+    use rpi_durable::session::{EntryDraft, TaskCreate, TaskOwnership, commit_fn};
+    use rpi_durable::types::TaskState;
+
+    struct HeldSandbox {
+        called: Arc<tokio::sync::Notify>,
+        hold: Arc<tokio::sync::Notify>,
+        attempts: AtomicUsize,
+    }
+    #[async_trait]
+    impl CodemodeSandbox for HeldSandbox {
+        fn fingerprint(&self) -> String {
+            "fake-1".to_string()
+        }
+        async fn run(
+            &self,
+            _start: CodemodeStart,
+            host: &dyn CodemodeHost,
+            _context: &Context,
+        ) -> Result<CodemodeOutcome, String> {
+            let result = host.call_tool("inner", JsonObject::new(), "c1").await?;
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.called.notify_one();
+                // The first process "crashes" here: it never returns.
+                self.hold.notified().await;
+            }
+            Ok(CodemodeOutcome::output(format!(
+                "value={}",
+                result
+                    .structured_output
+                    .as_ref()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            )))
+        }
+    }
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let called = Arc::new(tokio::sync::Notify::new());
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let registry = Arc::new(rpi_durable::harness::RegistryImpl::with_builtins(
+        rpi_durable::harness::builtin_tasks(),
+    ));
+    registry
+        .install(extension(vec![
+            create_codemode_tool(CodemodeToolOptions {
+                sandbox: Arc::new(HeldSandbox {
+                    called: Arc::clone(&called),
+                    hold: Arc::clone(&hold),
+                    attempts: AtomicUsize::new(0),
+                }),
+            }),
+            tool(
+                "inner",
+                Some(vec![ToolCaller::Tools]),
+                Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "answer": { "type": "number" } },
+                    "required": ["answer"]
+                })),
+                Arc::new(InnerTool {
+                    runs: Arc::clone(&runs),
+                    value: Some(serde_json::json!({ "answer": 7 })),
+                }),
+            ),
+        ]))
+        .expect("install");
+    let storage: Arc<dyn rpi_durable::types::Storage> =
+        Arc::new(rpi_durable::storage::MemoryStorage::new());
+    let options = || rpi_durable::harness::HarnessOptions {
+        telemetry: None,
+        models: test_models(Vec::new()).into(),
+        identity: None,
+        registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,
+        settings: None,
+        env: None,
+        conversation_created: None,
+        now: None,
+        set_timer: None,
+        on_wake: None,
+        on_report: None,
+        on_report_info: None,
+    };
+    let factory: rpi_durable::harness::SchedulerFactory = Arc::new(|deps| {
+        TaskScheduler::new(deps) as Arc<dyn rpi_durable::harness::SchedulerService>
+    });
+    let harness = open_harness_with_scheduler(
+        Arc::clone(&storage),
+        options(),
+        Arc::clone(&factory),
+        &context(),
+    )
+    .await
+    .expect("open");
+    let conversation = harness
+        .root(&context(), Default::default())
+        .await
+        .expect("root")
+        .id();
+    let call = tool_use_message(
+        CODEMODE_TOOL_NAME,
+        "c1",
+        serde_json::json!({ "code": "return 1" }),
+    );
+    let task_id = harness
+        .session()
+        .commit(
+            commit_fn(move |tx| {
+                let call = call.clone();
+                Box::pin(async move {
+                    let mut draft = EntryDraft::new("pi.assistant");
+                    draft.model = Some(vec![Message::Assistant(call)]);
+                    let entry = tx.append_entry(conversation, draft).await?;
+                    tx.create_task(TaskCreate {
+                        kind: "pi.tool".to_string(),
+                        version: 2,
+                        input: serde_json::json!({
+                            "kind": "model",
+                            "assistant": entry.id,
+                            "callId": "c1",
+                        }),
+                        checkpoint: serde_json::json!({ "phase": "call" }),
+                        ownership: TaskOwnership::Conversation(conversation),
+                        conversation_id: Some(conversation),
+                        background: false,
+                        abandon_on_restart: false,
+                    })
+                    .await
+                })
+            }),
+            &context(),
+        )
+        .await
+        .expect("create tool task");
+    harness.resume().expect("resume");
+    called.notified().await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    // The first process held the call after its nested result was journaled;
+    // reopening recovers the running task and reruns the script.
+    let journal = harness
+        .session()
+        .snapshot(&CODEMODE_JOURNAL_DOC, DocOwner::Task(task_id), &context())
+        .await
+        .expect("journal")
+        .expect("present");
+    let journal: CodemodeJournal =
+        serde_json::from_value(JsonValue::Object(journal)).expect("journal json");
+    assert!(journal.get("c1").is_some());
+    assert!(
+        harness
+            .session()
+            .snapshot(&CODEMODE_RUN_DOC, DocOwner::Task(task_id), &context())
+            .await
+            .expect("run")
+            .is_some()
+    );
+
+    let reopened = open_harness_with_scheduler(
+        Arc::clone(&storage),
+        options(),
+        Arc::clone(&factory),
+        &context(),
+    )
+    .await
+    .expect("reopen");
+    reopened.resume().expect("resume");
+    let settled = reopened
+        .wait_for_task(task_id, &context())
+        .await
+        .expect("replayed run");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the journal answered the nested call"
+    );
+    assert!(matches!(settled.record.state, TaskState::Terminal { .. }));
+    drop(hold);
+}

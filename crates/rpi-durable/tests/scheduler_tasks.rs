@@ -266,3 +266,123 @@ async fn inspect_reports_missing_definition() {
     assert_eq!(entry.record.status(), TaskStatus::Pending);
     opened.harness.close(&context()).await.unwrap();
 }
+
+// ─── abortOwned/ownedTasks (V18-06 FR-I) ─────────────────────────────────
+
+struct ChildTask;
+
+#[async_trait::async_trait]
+impl rpi_durable::harness::TaskDefinition for ChildTask {
+    fn name(&self) -> &str {
+        "test.child"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> rpi_durable::chord::json::JsonValue {
+        serde_json::json!({ "phase": "wait" })
+    }
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: rpi_durable::harness::RunningTask,
+        runtime: &dyn rpi_durable::harness::TaskRuntime,
+        _context: &rpi_durable::chord::context::Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        runtime.signal().cancelled().await;
+        Err(rpi_durable::session::SessionError::Aborted)
+    }
+    async fn abort(
+        &self,
+        _task: rpi_durable::harness::RunningTask,
+        runtime: &dyn rpi_durable::harness::TaskRuntime,
+        context: &rpi_durable::chord::context::Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        runtime
+            .commit(
+                scheduler_support::commit_next(rpi_durable::harness::NextTaskState::Terminal {
+                    outcome: rpi_durable::types::TaskOutcome::Aborted {
+                        reason: Some("owned".to_string()),
+                        result: None,
+                    },
+                }),
+                context,
+            )
+            .await
+    }
+}
+
+struct ParentTask;
+
+#[async_trait::async_trait]
+impl rpi_durable::harness::TaskDefinition for ParentTask {
+    fn name(&self) -> &str {
+        "test.parent"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> rpi_durable::chord::json::JsonValue {
+        serde_json::json!({ "phase": "spawn" })
+    }
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: rpi_durable::harness::RunningTask,
+        runtime: &dyn rpi_durable::harness::TaskRuntime,
+        context: &rpi_durable::chord::context::Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        let child: rpi_durable::harness::AnyTask = Arc::new(ChildTask);
+        let child_id = runtime
+            .create_task(
+                child,
+                rpi_durable::chord::json::JsonValue::Null,
+                rpi_durable::session::TaskOwnership::Task(runtime.task_id()),
+                false,
+                context,
+            )
+            .await?;
+        let owned = runtime.owned_tasks(context).await?;
+        let owned_before = owned.iter().filter(|task| task.id == child_id).count();
+        runtime.abort_owned(child_id, context).await?;
+        let child_record = runtime
+            .get_task(child_id, context)
+            .await?
+            .expect("child record");
+        let child_terminal = matches!(
+            child_record.state,
+            rpi_durable::types::TaskState::Terminal { .. }
+        );
+        runtime
+            .commit(
+                scheduler_support::commit_next(rpi_durable::harness::NextTaskState::Terminal {
+                    outcome: rpi_durable::types::TaskOutcome::Completed {
+                        result: serde_json::json!({
+                            "ownedBefore": owned_before,
+                            "childTerminal": child_terminal,
+                        }),
+                    },
+                }),
+                context,
+            )
+            .await
+    }
+}
+
+/// R-D14: `ownedTasks()` copies the direct owned live tasks and `abortOwned()`
+/// waits until the child is terminal.
+#[tokio::test]
+async fn abort_owned_waits_for_the_child_and_lists_it_first() {
+    let opened = open_with(vec![Arc::new(ParentTask), Arc::new(ChildTask)]).await;
+    let conversation = root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.parent", serde_json::json!({})),
+    )
+    .await;
+    let settled = opened.harness.wait_for_task(id, &context()).await.unwrap();
+    assert_eq!(settled.result["ownedBefore"], serde_json::json!(1));
+    assert_eq!(settled.result["childTerminal"], serde_json::json!(true));
+    opened.harness.close(&context()).await.unwrap();
+}

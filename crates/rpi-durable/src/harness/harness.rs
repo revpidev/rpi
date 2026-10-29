@@ -1076,7 +1076,15 @@ pub async fn open_harness_with_scheduler(
     };
     session.set_failure_reporter(Arc::new({
         let report = Arc::clone(&report);
-        move |message| report(message)
+        let report_info = options.on_report_info.clone();
+        move |message| {
+            report(message);
+            if let Some(report) = &report_info {
+                report(crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::SessionFailed,
+                ));
+            }
+        }
     }));
     let scheduler = scheduler_factory(SchedulerDeps {
         session: Arc::clone(&session),
@@ -1089,6 +1097,7 @@ pub async fn open_harness_with_scheduler(
         settings: settings_source.clone(),
         env: options.env.clone(),
         report: Arc::clone(&report),
+        report_info: options.on_report_info.clone(),
         now: Arc::clone(&now),
         context: without_abort_signal(context),
     });

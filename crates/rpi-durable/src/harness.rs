@@ -95,14 +95,14 @@ pub use types::{
     InputEntry, InputSubmissionDraft, Migration, ModelRef, ModelToolsChange, ModelToolsSelection,
     ModelsSource, NestedCallOptions, NestedCallParent, NestedToolExecutionResult, NextTaskState,
     PromptInput, PromptRender, PromptSection, QueueMode, Registry, RegistryError, RegistryListener,
-    RegistryReader, RegistrySnapshot, ReportFn, RequestMessages, RestartLimit, RetainedOutput,
-    RootOptions, RunningTask, Scheduling, SetTimer, Settings, SettingsSource,
-    SettledSubmissionRecord, SettledTask, Submission, SubmissionAbort, SubmissionAbortResult,
-    SubmissionDraft, TaskAbort, TaskCommitFn, TaskDefinition, TaskInspection, TaskInspectionState,
-    TaskRuntime, TimerDisarm, TimerOptions, ToolCaller, ToolCommitFn, ToolControl, ToolDiagnostic,
-    ToolExecute, ToolExecuteError, ToolExecutionApi, ToolExecutionMode, ToolExecutionResult,
-    ToolHookCall, ToolRegistration, ToolReplay, ToolsChange, ToolsSelection, UserInput, Wake,
-    WakeFn, WhenBusy, Wrap, WriteSubmissionDraft,
+    RegistryReader, RegistrySnapshot, ReportFn, ReportInfo, ReportInfoFn, ReportKind,
+    RequestMessages, RestartLimit, RetainedOutput, RootOptions, RunningTask, Scheduling, SetTimer,
+    Settings, SettingsSource, SettledSubmissionRecord, SettledTask, Submission, SubmissionAbort,
+    SubmissionAbortResult, SubmissionDraft, TaskAbort, TaskCommitFn, TaskDefinition,
+    TaskInspection, TaskInspectionState, TaskRuntime, TimerDisarm, TimerOptions, ToolCaller,
+    ToolCommitFn, ToolControl, ToolDiagnostic, ToolExecute, ToolExecuteError, ToolExecutionApi,
+    ToolExecutionMode, ToolExecutionResult, ToolHookCall, ToolRegistration, ToolReplay,
+    ToolsChange, ToolsSelection, UserInput, Wake, WakeFn, WhenBusy, Wrap, WriteSubmissionDraft,
 };
 pub use usage::{USAGE_DOC, UsageBucket, UsageState, add_usage, add_usage_state, record_usage};
 pub use util::{WaitError, WaitFuture, Waiters, closed_error, scan_all};

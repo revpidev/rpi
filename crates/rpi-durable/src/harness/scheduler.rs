@@ -191,6 +191,8 @@ pub struct SchedulerDeps {
     pub env: Option<EnvFactory>,
     /// Receives extension failures.
     pub report: ReportFn,
+    /// Fixed-field report callback.
+    pub report_info: Option<crate::harness::types::ReportInfoFn>,
     /// Wall clock.
     pub now: NowFn,
     /// Host timers.
@@ -375,6 +377,7 @@ struct SchedulerInner {
     settings: SettingsSource,
     env: Option<EnvFactory>,
     report: ReportFn,
+    report_info: Option<crate::harness::types::ReportInfoFn>,
     now: NowFn,
     timers: Arc<Timers>,
     on_wake: Option<WakeFn>,
@@ -419,6 +422,7 @@ impl SchedulerInner {
             settings: deps.settings,
             env: deps.env,
             report: Arc::clone(&deps.report),
+            report_info: deps.report_info,
             now: deps.now,
             timers: Timers::new(deps.set_timer, Arc::clone(&deps.report)),
             on_wake: deps.on_wake,
@@ -630,6 +634,15 @@ impl SchedulerInner {
                 "Task {} ({}) was cut off {restarts} times without progress; it is parked until retryTask()",
                 record.id, record.kind
             ));
+            if let Some(report) = &self.report_info {
+                report(
+                    crate::harness::types::ReportInfo::new(
+                        crate::harness::types::ReportKind::TaskParked,
+                    )
+                    .with_task(record.id, record.kind.clone())
+                    .with_reason("restart_limit"),
+                );
+            }
         }
         Ok(())
     }
@@ -2000,6 +2013,15 @@ impl SchedulerInner {
                             map.insert(record.id, (Arc::clone(&task), message.clone()));
                         }
                         (self.report)(message.clone());
+                        if let Some(report) = &self.report_info {
+                            report(
+                                crate::harness::types::ReportInfo::new(
+                                    crate::harness::types::ReportKind::MigrationFailed,
+                                )
+                                .with_task(record.id, record.kind.clone())
+                                .with_reason("migration_failed"),
+                            );
+                        }
                         Resolution::Blocked {
                             reason: BlockedReason::MigrationFailed,
                         }
@@ -2305,6 +2327,14 @@ impl SchedulerInner {
                         if let Decision::Fault(message) = decision
                             && let Some(current) = &current
                         {
+                            if let Some(report) = &this.report_info {
+                                report(
+                                    crate::harness::types::ReportInfo::new(
+                                        crate::harness::types::ReportKind::TaskFaulted,
+                                    )
+                                    .with_task(current.id(), current.kind().to_string()),
+                                );
+                            }
                             this.terminate(
                                 tx,
                                 &current.record,

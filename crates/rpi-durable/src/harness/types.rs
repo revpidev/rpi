@@ -71,6 +71,81 @@ pub type SetTimer = Arc<
     dyn Fn(Arc<dyn Fn() + Send + Sync>, u64, TimerOptions) -> Option<TimerDisarm> + Send + Sync,
 >;
 
+/// Fixed report kinds (`ReportInfo.type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportKind {
+    /// The Session failed after a storage error.
+    SessionFailed,
+    /// A task faulted.
+    TaskFaulted,
+    /// The restart limit parked a task.
+    TaskParked,
+    /// A definition migration failed.
+    MigrationFailed,
+    /// A stored task is newer than its definition.
+    TaskOutdated,
+    /// A task's own code failed.
+    TaskError,
+    /// Extension code failed.
+    ExtensionError,
+    /// A host callback failed.
+    HostError,
+    /// A listener failed.
+    ListenerError,
+}
+
+/// What happened, for `onReport` (`ReportInfo`). Fixed fields only; never
+/// content, prompts, or credentials.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportInfo {
+    /// Fixed report kind.
+    #[serde(rename = "type")]
+    pub kind: ReportKind,
+    /// Fixed reason, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Task the report is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    /// Registered task name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_kind: Option<String>,
+    /// Extension whose code ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension: Option<String>,
+}
+
+impl ReportInfo {
+    /// A report of `kind` without task fields.
+    pub fn new(kind: ReportKind) -> Self {
+        Self {
+            kind,
+            reason: None,
+            task_id: None,
+            task_kind: None,
+            extension: None,
+        }
+    }
+
+    /// Attach a fixed reason.
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Attach the task the report is about.
+    pub fn with_task(mut self, id: TaskId, kind: impl Into<String>) -> Self {
+        self.task_id = Some(id);
+        self.task_kind = Some(kind.into());
+        self
+    }
+}
+
+/// Receives fixed-field reports (`HarnessOptions.onReport`'s `info`).
+pub type ReportInfoFn = Arc<dyn Fn(ReportInfo) + Send + Sync>;
+
 /// When a Harness next needs a running process (`Harness.wake()`).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Wake {
@@ -1551,6 +1626,8 @@ pub struct HarnessOptions {
     pub on_wake: Option<WakeFn>,
     /// Receives extension failures.
     pub on_report: Option<ReportFn>,
+    /// Receives fixed-field reports; the `info` half of `onReport`.
+    pub on_report_info: Option<ReportInfoFn>,
 }
 
 // ---------------------------------------------------------------------------

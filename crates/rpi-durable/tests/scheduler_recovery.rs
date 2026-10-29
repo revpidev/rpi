@@ -18,7 +18,8 @@ use rpi_durable::types::{Storage, TaskState, TaskStatus};
 
 use scheduler_support::{
     DynamicTask, Spec, add_task, all_tasks, context, open_with, open_with_storage,
-    open_with_storage_and_settings, root, stamp_task, terminal_status,
+    open_with_storage_and_settings, open_with_storage_settings_and_report, root, stamp_task,
+    terminal_status,
 };
 
 /// upstream: "resumes ... task interrupted ... across close/reopen"; a surviving
@@ -494,4 +495,43 @@ async fn normal_close_does_not_count_a_restart() {
     assert_eq!(record.restarts, None, "a close is not a restart");
     reopened.harness.close(&context()).await.unwrap();
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// R-D9: a parked task produces one fixed-field `task_parked` report.
+#[tokio::test]
+async fn parked_tasks_report_task_parked() {
+    use rpi_durable::harness::{HarnessSettings, ReportInfo, ReportKind, RestartLimit};
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
+    let conversation = root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.count", serde_json::json!({ "phases": 3 })),
+    )
+    .await;
+    stamp_running(&opened.harness, id).await;
+    let reports: Arc<std::sync::Mutex<Vec<ReportInfo>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&reports);
+    let reopened = open_with_storage_settings_and_report(
+        Arc::clone(&storage),
+        all_tasks(),
+        Some(HarnessSettings {
+            restart_limit: Some(RestartLimit::Limited(1)),
+            ..Default::default()
+        }),
+        Some(Arc::new(move |info| {
+            sink.lock().expect("reports").push(info);
+        })),
+    )
+    .await;
+    let captured: Vec<ReportInfo> = reports.lock().expect("reports").clone();
+    assert!(captured.iter().any(|info| {
+        info.kind == ReportKind::TaskParked
+            && info.task_id == Some(id)
+            && info.task_kind.as_deref() == Some("test.count")
+            && info.reason.as_deref() == Some("restart_limit")
+    }));
+    reopened.harness.close(&context()).await.unwrap();
 }

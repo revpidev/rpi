@@ -226,6 +226,7 @@ pub fn options() -> HarnessOptions {
         set_timer: None,
         on_wake: None,
         on_report: None,
+        on_report_info: None,
     }
 }
 

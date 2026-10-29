@@ -660,6 +660,16 @@ pub async fn open_with_storage_and_settings(
     tasks: Vec<AnyTask>,
     settings: Option<rpi_durable::harness::HarnessSettings>,
 ) -> Opened {
+    open_with_storage_settings_and_report(storage, tasks, settings, None).await
+}
+
+/// Open a Harness with explicit settings and a fixed-field report callback.
+pub async fn open_with_storage_settings_and_report(
+    storage: Arc<dyn Storage>,
+    tasks: Vec<AnyTask>,
+    settings: Option<rpi_durable::harness::HarnessSettings>,
+    report_info: Option<rpi_durable::harness::ReportInfoFn>,
+) -> Opened {
     let registry = Arc::new(RegistryImpl::with_builtins(builtins()));
     if !tasks.is_empty() {
         let extension = Extension {
@@ -681,6 +691,7 @@ pub async fn open_with_storage_and_settings(
         set_timer: None,
         on_wake: None,
         on_report: None,
+        on_report_info: report_info,
     };
     let harness = open_harness(Arc::clone(&storage), options, &context())
         .await
