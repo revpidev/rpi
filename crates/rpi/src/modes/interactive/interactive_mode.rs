@@ -10184,18 +10184,30 @@ mod tests {
     }
 
     #[tokio::test]
+    // The env lock must stay held across the submit await: other tests set
+    // RPI_CODING_AGENT_DIR globally and would redirect the debug log.
+    #[allow(clippy::await_holding_lock)]
     async fn debug_command_writes_log() {
         let (mut mode, _terminal, _session) = mode_harness().await;
         mode.init().await;
+        // Use an isolated agent dir under the shared env lock: other tests
+        // set RPI_CODING_AGENT_DIR globally, and the real agent dir made this
+        // assertion order-dependent.
+        let tmp = TempDir::new();
+        let agent_dir = tmp.path().join("agent-debug");
+        let guard = crate::modes::interactive::test_support::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
+        let log_path = crate::config::get_agent_dir().join("rpi-debug.log");
         mode.handle_submit("/debug".to_string()).await;
         let rendered = lock(&mode.ui_state.chat_container).render(80).join("\n");
+        rpi_test_env::remove_var("RPI_CODING_AGENT_DIR");
+        drop(guard);
         assert!(
             rendered.contains("Debug log written"),
             "rendered: {rendered}"
         );
-        // The debug log file exists; remove it afterwards (the test writes
-        // through the real agent dir).
-        let log_path = crate::config::get_agent_dir().join("rpi-debug.log");
         assert!(log_path.exists(), "debug log written");
         let _ = std::fs::remove_file(&log_path);
     }
