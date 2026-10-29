@@ -168,9 +168,18 @@ rpi auth check|print-api-key|print-bearer-token ...  # 查看 provider 凭据
 | `RPI_CODING_AGENT_SESSION_DIR` | `~/.rpi/agent/sessions` | 会话存储目录 |
 | `RPI_PACKAGE_DIR` | 可执行文件目录 | 覆盖 package 根目录（Nix/Guix store 路径） |
 | `RPI_PROGRAM_STATUS` | 自动探测 | `1`/`0` 强制开启/关闭 OSC 7501 程序状态上报 |
+| `RPI_CLIPBOARD_OSC52` | — | 设为 `1` 时复制内容同时走 OSC 52，适用于没有 SSH 标记的远程客户端（多路复用器接入、IDE 守护进程） |
 | `RPI_HYPERLINKS` / `RPI_IMAGE_PROTOCOL` / `RPI_TRUE_COLOR` | 自动探测 | 终端能力覆盖 |
 
 同样的 URL 也可在 `settings.json` 中以 `versionCheckUrl`、`modelCatalogUrl`、`telemetryUrl`、`registryUrl` 设置；环境变量优先。
+
+在配置文件里加上 `$schema` 即可获得编辑器补全与校验。四份 schema 与加载器使用同一份生成定义，统一发布在 `revpi.dev`：
+
+```json
+{"$schema": "https://revpi.dev/schemas/settings.schema.json"}
+```
+
+`settings.schema.json`、`models.schema.json`、`keybindings.schema.json` 与 `theme.schema.json` 发布在 `https://revpi.dev/schemas/` 下；内置主题已指向 theme schema。
 
 ## 产品端点（`revpi.dev`）
 
@@ -178,6 +187,7 @@ rpi auth check|print-api-key|print-bearer-token ...  # 查看 provider 凭据
 |---|---|
 | `GET /api/models/providers/{id}` | 各服务商的模型目录 overlay（`{"models":[...]}`）；404 表示"无 overlay，用内置数据" |
 | `GET /api/latest-version` / `GET /api/latest-rc-version.json` | 稳定 / RC 版本检查（`{"version","packageName","note"}`）——驱动更新横幅与 `--rc` |
+| `GET /schemas/{settings,models,keybindings,theme}.schema.json` | `$schema` 引用的配置 JSON Schema（以 `application/json` 提供） |
 | `POST /api/report-install` | 可选的安装计数遥测（204） |
 | `GET /api/extensions/index.json` | 扩展索引，供目录页与 `rpi install` 使用 |
 | `GET /api/extensions/{name}.json` | 单扩展版本矩阵，供 `rpi install` 解析版本 |
