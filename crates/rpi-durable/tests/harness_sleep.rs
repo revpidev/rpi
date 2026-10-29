@@ -90,12 +90,16 @@ type ArmedTimer = (u64, Arc<dyn Fn() + Send + Sync>);
 #[derive(Default)]
 struct FakeTimer {
     armed: Mutex<Vec<ArmedTimer>>,
+    decline: bool,
 }
 
 impl FakeTimer {
     fn set_timer(self: &Arc<Self>) -> SetTimer {
         let timer = Arc::clone(self);
         Arc::new(move |callback, delay_ms, _options: TimerOptions| {
+            if timer.decline {
+                return None;
+            }
             timer
                 .armed
                 .lock()
@@ -336,4 +340,40 @@ async fn an_early_timer_wake_arms_again_until_due() {
         .expect("present");
     assert_eq!(record.status(), TaskStatus::Sleeping);
     assert!(!timer.armed.lock().expect("armed").is_empty());
+}
+
+/// FR-D R3: a host that declines a foreground timer falls back to the runtime
+/// timer, so the sleep still wakes.
+#[tokio::test]
+async fn a_declined_host_timer_falls_back_and_still_wakes() {
+    let invocations = Arc::new(AtomicU64::new(0));
+    let timer = Arc::new(FakeTimer {
+        armed: Mutex::new(Vec::new()),
+        decline: true,
+    });
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let opened = open(
+        Arc::new(SleepTask {
+            invocations: Arc::clone(&invocations),
+        }),
+        Arc::clone(&timer),
+        None,
+        Arc::clone(&clock),
+    )
+    .await;
+    let id = create_task(&opened.harness, "test.sleep").await;
+    let _ = opened.harness.resume();
+    // Real time advances: the sleep is 1s, so shorten it by moving the clock.
+    wait_for_status(&opened.harness, id, TaskStatus::Sleeping).await;
+    clock.store(2_000, Ordering::SeqCst);
+    let settled = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        opened
+            .harness
+            .wait_for_task(id, &BACKGROUND_CONTEXT.clone()),
+    )
+    .await
+    .expect("fallback timer fires")
+    .expect("settle");
+    assert_eq!(settled.result, serde_json::json!({ "woke": true }));
 }

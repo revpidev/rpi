@@ -15,13 +15,46 @@ pub fn durable_telemetry_schema() -> JsonValue {
     serde_json::json!({
         "version": 1,
         "spans": {
+            "pi.durable.submit": {
+                "startAttributes": ["submission.type", "conversation.id"],
+                "endAttributes": ["submission.id", "result"],
+                "events": ["pi.durable.entry", "pi.durable.submission", "pi.durable.report"],
+                "status": { "default": "ok", "errorWhen": "Admission failed." }
+            },
             "pi.durable.phase": {
                 "startAttributes": ["task.id", "task.name", "phase", "kind", "attempt", "resumed"],
                 "endAttributes": ["outcome", "tool.name", "tool.call_id"],
-                "events": ["pi.durable.entry", "pi.durable.submission", "pi.durable.report", "pi.durable.checkpoint", "pi.durable.replay"]
+                "events": {
+                    "pi.durable.entry": ["entry.id", "entry.kind"],
+                    "pi.durable.submission": ["submission.id", "status", "answer.entry_id"],
+                    "pi.durable.report": ["type", "reason", "extension", "task.id"],
+                    "pi.durable.checkpoint": ["phase"],
+                    "pi.durable.replay": ["tool.name"]
+                },
+                "status": {
+                    "default": "ok",
+                    "errorWhen": "Faulted, failed and orphaned outcomes; diagnostics are capped at 500 characters."
+                }
             }
         },
-        "metrics": ["pi.durable.reports", "pi.durable.phase.duration", "pi.durable.tasks.active"]
+        "metrics": {
+            "pi.durable.reports": {
+                "kind": "counter",
+                "description": "Reports raised, grouped by fixed ReportInfo type.",
+                "attributes": ["type"]
+            },
+            "pi.durable.phase.duration": {
+                "kind": "histogram",
+                "unit": "ms",
+                "description": "Duration of a phase invocation and its decision commit.",
+                "attributes": ["task", "phase", "outcome"]
+            },
+            "pi.durable.tasks.active": {
+                "kind": "upDownCounter",
+                "description": "Live tasks held by this Harness.",
+                "attributes": ["task"]
+            }
+        }
     })
 }
 

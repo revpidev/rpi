@@ -1123,8 +1123,8 @@ async fn settle(
         .await?
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    // Mark them all before waiting for any: one may run until a sibling is
-    // cancelled.
+    // Abort each and wait until it is terminal; a nested call may run until
+    // it is cancelled itself.
     for id in nested_ids {
         runtime.abort_owned(id, context).await?;
     }
@@ -1404,7 +1404,16 @@ async fn start_nested_call(
         })
     });
     runtime.commit(change, context).await?;
-    let _ = replayed;
+    let replayed = replayed.lock().map(|flag| *flag).unwrap_or(false);
+    if replayed {
+        context.telemetry().add_event(
+            "pi.durable.replay",
+            serde_json::json!({ "tool.name": name })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
     let id = created.lock().ok().and_then(|slot| *slot);
     id.ok_or_else(|| SessionError::message("Nested call was not created"))
 }

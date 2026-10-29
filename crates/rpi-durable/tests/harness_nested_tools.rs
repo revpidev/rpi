@@ -734,3 +734,211 @@ async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
     assert!(matches!(settled.record.state, TaskState::Terminal { .. }));
     drop(hold);
 }
+
+/// V18-06 FR-K: one harness runs a migrated v1 tool task with a nested call
+/// and then a sleeping task that wakes at its checkpoint.
+#[tokio::test]
+async fn end_to_end_v1_migration_nested_and_sleep() {
+    use rpi_durable::harness::{
+        Harness, NextTaskState, Registry, TaskDefinition, TaskRuntime, TaskScheduler,
+        open_harness_with_scheduler,
+    };
+    use rpi_durable::session::{EntryDraft, TaskCreate, TaskOwnership, commit_fn};
+    use rpi_durable::types::TaskState;
+
+    struct SleepThenDone(Arc<AtomicUsize>);
+    #[async_trait]
+    impl TaskDefinition for SleepThenDone {
+        fn name(&self) -> &str {
+            "test.sleep"
+        }
+        fn version(&self) -> u64 {
+            1
+        }
+        fn initial(&self) -> JsonValue {
+            serde_json::json!({ "phase": "sleep" })
+        }
+        async fn run_phase(
+            &self,
+            phase: &str,
+            _task: rpi_durable::harness::RunningTask,
+            runtime: &dyn TaskRuntime,
+            context: &Context,
+        ) -> rpi_durable::session::SessionResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if phase == "sleep" {
+                let until = runtime.now()? + 10.0;
+                runtime
+                    .sleep_until(until, serde_json::json!({ "phase": "done" }), context)
+                    .await
+            } else {
+                runtime
+                    .commit(
+                        Arc::new(|_tx, _current| {
+                            Box::pin(async move {
+                                Ok(Some(NextTaskState::Terminal {
+                                    outcome: rpi_durable::types::TaskOutcome::Completed {
+                                        result: serde_json::json!({ "woke": true }),
+                                    },
+                                }))
+                            })
+                        }),
+                        context,
+                    )
+                    .await
+            }
+        }
+    }
+
+    struct Outer;
+    #[async_trait]
+    impl ToolExecute for Outer {
+        async fn execute(
+            &self,
+            _args: JsonObject,
+            api: &dyn ToolExecutionApi,
+            context: &Context,
+        ) -> Result<ToolExecutionResult, ToolExecuteError> {
+            let inner = api
+                .execute_tool(
+                    "inner",
+                    JsonObject::new(),
+                    context,
+                    NestedCallOptions::default(),
+                )
+                .await
+                .map_err(|error| -> ToolExecuteError { Box::new(error) })?;
+            api.output(
+                format!(
+                    "inner={}",
+                    inner
+                        .structured_output
+                        .as_ref()
+                        .map(|value| value.to_string())
+                        .unwrap_or_default()
+                )
+                .as_bytes(),
+                None,
+            )
+            .expect("output");
+            Ok(ToolExecutionResult::default())
+        }
+    }
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let phases = Arc::new(AtomicUsize::new(0));
+    let registry = Arc::new(rpi_durable::harness::RegistryImpl::with_builtins(
+        rpi_durable::harness::builtin_tasks(),
+    ));
+    registry
+        .install(extension(vec![
+            tool("outer", None, None, Arc::new(Outer)),
+            tool(
+                "inner",
+                Some(vec![ToolCaller::Tools]),
+                Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "answer": { "type": "number" } },
+                    "required": ["answer"]
+                })),
+                Arc::new(InnerTool {
+                    runs: Arc::clone(&runs),
+                    value: Some(serde_json::json!({ "answer": 7 })),
+                }),
+            ),
+        ]))
+        .expect("install tools");
+    registry
+        .install(Extension {
+            name: "sleep".to_string(),
+            tasks: vec![Arc::new(SleepThenDone(Arc::clone(&phases)))],
+            ..Extension::default()
+        })
+        .expect("install sleep task");
+    let storage: Arc<dyn rpi_durable::types::Storage> =
+        Arc::new(rpi_durable::storage::MemoryStorage::new());
+    let options = rpi_durable::harness::HarnessOptions {
+        telemetry: None,
+        models: test_models(Vec::new()).into(),
+        identity: None,
+        registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,
+        settings: None,
+        env: None,
+        conversation_created: None,
+        now: None,
+        set_timer: None,
+        on_wake: None,
+        on_report: None,
+        on_report_info: None,
+    };
+    let factory: rpi_durable::harness::SchedulerFactory = Arc::new(|deps| {
+        TaskScheduler::new(deps) as Arc<dyn rpi_durable::harness::SchedulerService>
+    });
+    let harness = open_harness_with_scheduler(Arc::clone(&storage), options, factory, &context())
+        .await
+        .expect("open");
+    let conversation = harness
+        .root(&context(), Default::default())
+        .await
+        .expect("root")
+        .id();
+    let call = tool_use_message("outer", "c1", serde_json::json!({}));
+    let (tool_task, sleep_task) = harness
+        .session()
+        .commit(
+            commit_fn(move |tx| {
+                let call = call.clone();
+                Box::pin(async move {
+                    let mut draft = EntryDraft::new("pi.assistant");
+                    draft.model = Some(vec![Message::Assistant(call)]);
+                    let entry = tx.append_entry(conversation, draft).await?;
+                    let tool_task = tx
+                        .create_task(TaskCreate {
+                            kind: "pi.tool".to_string(),
+                            version: 1,
+                            input: serde_json::json!({
+                                "assistant": entry.id,
+                                "callId": "c1",
+                            }),
+                            checkpoint: serde_json::json!({ "phase": "call" }),
+                            ownership: TaskOwnership::Conversation(conversation),
+                            conversation_id: Some(conversation),
+                            background: false,
+                            abandon_on_restart: false,
+                        })
+                        .await?;
+                    let sleep_task = tx
+                        .create_task(TaskCreate {
+                            kind: "test.sleep".to_string(),
+                            version: 1,
+                            input: JsonValue::Null,
+                            checkpoint: serde_json::json!({ "phase": "sleep" }),
+                            ownership: TaskOwnership::Conversation(conversation),
+                            conversation_id: Some(conversation),
+                            background: false,
+                            abandon_on_restart: false,
+                        })
+                        .await?;
+                    Ok((tool_task, sleep_task))
+                })
+            }),
+            &context(),
+        )
+        .await
+        .expect("create tasks");
+    harness.resume().expect("resume");
+    let tool = harness
+        .wait_for_task(tool_task, &context())
+        .await
+        .expect("tool task");
+    assert_eq!(tool.record.version, 2, "v1 task migrated");
+    assert!(matches!(tool.record.state, TaskState::Terminal { .. }));
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    let sleep = harness
+        .wait_for_task(sleep_task, &context())
+        .await
+        .expect("sleep task");
+    assert!(matches!(sleep.record.state, TaskState::Terminal { .. }));
+    assert_eq!(phases.load(Ordering::SeqCst), 2);
+    let _ = Harness::wake(&*harness);
+}

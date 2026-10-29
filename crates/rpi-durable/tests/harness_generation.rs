@@ -814,3 +814,41 @@ async fn after_failed_run_continue_starts_the_next_run() {
     let record = queued.wait(&context()).await.expect("second run");
     assert_eq!(record.status(), "done");
 }
+
+/// `keep` leaves queued inputs queued after the failed run.
+#[tokio::test]
+async fn after_failed_run_keep_leaves_the_queue() {
+    use rpi_durable::harness::{AfterFailedRun, HarnessSettings};
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let settings = HarnessSettings {
+        after_failed_run: Some(AfterFailedRun::Keep),
+        retry: Some(ConversationRetryPolicyPatch {
+            enabled: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let opened = open(
+        vec![blocking_extension(
+            Arc::clone(&started),
+            Arc::clone(&release),
+        )],
+        Some(settings),
+        test_models(vec![
+            Script::Message(tool_use_message("block", "c1", serde_json::json!({}))),
+            Script::Message(error_message("fatal", "bad request")),
+        ]),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let running = submit_input(&conversation, "hi").await;
+    started.notified().await;
+    let queued = queue_follow_up(&conversation, "later").await;
+    release.notify_one();
+    running.wait(&context()).await.expect("first run");
+    assert_eq!(
+        queued.status(&context()).await.expect("status").status(),
+        "queued"
+    );
+}

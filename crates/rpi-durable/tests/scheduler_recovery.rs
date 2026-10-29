@@ -535,3 +535,91 @@ async fn parked_tasks_report_task_parked() {
     }));
     reopened.harness.close(&context()).await.unwrap();
 }
+
+/// R-D14: a task marked `abandonOnRestart` is aborted with reason `restart`
+/// before it runs a phase again.
+#[tokio::test]
+async fn abandon_on_restart_marks_and_aborts_the_task() {
+    use rpi_durable::harness::{NextTaskState, RunningTask, TaskDefinition, TaskRuntime};
+    use rpi_durable::session::{TaskCreate, TaskOwnership, commit_fn};
+
+    struct RestartTask;
+    #[async_trait::async_trait]
+    impl TaskDefinition for RestartTask {
+        fn name(&self) -> &str {
+            "test.restart"
+        }
+        fn version(&self) -> u64 {
+            1
+        }
+        fn initial(&self) -> rpi_durable::chord::json::JsonValue {
+            serde_json::json!({ "phase": "run" })
+        }
+        async fn run_phase(
+            &self,
+            _phase: &str,
+            _task: RunningTask,
+            _runtime: &dyn TaskRuntime,
+            _context: &rpi_durable::chord::context::Context,
+        ) -> rpi_durable::session::SessionResult<()> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+        async fn abort(
+            &self,
+            _task: RunningTask,
+            runtime: &dyn TaskRuntime,
+            context: &rpi_durable::chord::context::Context,
+        ) -> rpi_durable::session::SessionResult<()> {
+            runtime
+                .commit(
+                    scheduler_support::commit_next(NextTaskState::Terminal {
+                        outcome: rpi_durable::types::TaskOutcome::Aborted {
+                            reason: Some("restart".to_string()),
+                            result: None,
+                        },
+                    }),
+                    context,
+                )
+                .await
+        }
+    }
+
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage(Arc::clone(&storage), vec![Arc::new(RestartTask)]).await;
+    let conversation = root(&opened.harness).await;
+    let id = opened
+        .harness
+        .session()
+        .commit(
+            commit_fn(move |tx| {
+                Box::pin(async move {
+                    tx.create_task(TaskCreate {
+                        kind: "test.restart".to_string(),
+                        version: 1,
+                        input: serde_json::Value::Null,
+                        checkpoint: serde_json::json!({ "phase": "run" }),
+                        ownership: TaskOwnership::Conversation(conversation),
+                        conversation_id: Some(conversation),
+                        background: false,
+                        abandon_on_restart: true,
+                    })
+                    .await
+                })
+            }),
+            &context(),
+        )
+        .await
+        .expect("create");
+    stamp_running(&opened.harness, id).await;
+    let reopened = open_with_storage(Arc::clone(&storage), vec![Arc::new(RestartTask)]).await;
+    reopened.harness.resume().unwrap();
+    let settled = reopened
+        .harness
+        .wait_for_task(id, &context())
+        .await
+        .unwrap();
+    assert_eq!(settled.record.abort_reason.as_deref(), Some("restart"));
+    assert_eq!(terminal_status(&settled.record), Some("aborted"));
+    reopened.harness.close(&context()).await.unwrap();
+}

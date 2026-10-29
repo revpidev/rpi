@@ -353,3 +353,38 @@ async fn input_entry_rejects_reserved_kinds() {
         .await;
     assert!(result.is_err(), "reserved kinds must be rejected");
 }
+
+/// R-D13: a queued reset holds a display-only write back.
+#[tokio::test]
+async fn a_queued_reset_holds_display_only_writes() {
+    let (harness, _scheduler) = open_recording().await;
+    let context = context();
+    let conversation = root_conversation(&harness).await;
+    conversation
+        .submit(input("start", None, None), &context)
+        .await
+        .expect("start run");
+    let mut reset = EntryDraft::new("pi.reset");
+    reset.head = Some(rpi_durable::session::EntryHead::This);
+    let queued_reset = conversation
+        .submit(write(reset, None), &context)
+        .await
+        .expect("queued reset");
+    assert_eq!(
+        queued_reset
+            .status(&context)
+            .await
+            .expect("status")
+            .status(),
+        "queued"
+    );
+    let display = conversation
+        .submit(write(note("test.note"), None), &context)
+        .await
+        .expect("display write");
+    assert_eq!(
+        display.status(&context).await.expect("status").status(),
+        "queued",
+        "a display-only write behind a reset waits for the reset"
+    );
+}

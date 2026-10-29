@@ -320,10 +320,34 @@ enum CommandTransport {
 }
 
 fn is_legacy_wsl_bash_path(path: &str) -> bool {
-    let normalized = path.replace('/', "\\").to_lowercase();
-    let mut components = normalized.split('\\');
-    let _drive = components.next();
-    matches!(components.next(), Some("windows"))
+    let system_root = std::env::var("SystemRoot").ok();
+    is_legacy_wsl_bash_path_with_root(path, system_root.as_deref())
+}
+
+/// Whether `path` is the legacy WSL `bash.exe` launcher. With `SystemRoot`
+/// set, only the System32 and Sysnative launchers under that root match;
+/// without it, the conventional Windows directory matches.
+fn is_legacy_wsl_bash_path_with_root(path: &str, system_root: Option<&str>) -> bool {
+    let normalized = path.replace('/', "\\");
+    if let Some(root) = system_root.map(str::trim).filter(|root| !root.is_empty()) {
+        let root = root.trim_end_matches(['\\', '/']);
+        for directory in ["System32", "Sysnative"] {
+            let candidate = format!("{root}\\{directory}\\bash.exe");
+            if normalized.eq_ignore_ascii_case(&candidate) {
+                return true;
+            }
+        }
+        return false;
+    }
+    let lower = normalized.to_lowercase();
+    let mut components = lower.split('\\');
+    let drive = components.next().unwrap_or_default();
+    let drive = drive.strip_suffix(':').unwrap_or(drive);
+    drive.len() == 1
+        && drive
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+        && matches!(components.next(), Some("windows"))
         && matches!(components.next(), Some("system32" | "sysnative"))
         && matches!(components.next(), Some("bash.exe"))
         && components.next().is_none()
@@ -1958,4 +1982,49 @@ async fn list_files_in(
         }
     }
     Ok(FileListing { entries, truncated })
+}
+
+#[cfg(test)]
+mod legacy_wsl_tests {
+    use super::is_legacy_wsl_bash_path_with_root;
+
+    #[test]
+    fn system_root_recognizes_system32_and_sysnative() {
+        assert!(is_legacy_wsl_bash_path_with_root(
+            "D:\\Windows\\System32\\bash.exe",
+            Some("D:\\Windows")
+        ));
+        assert!(is_legacy_wsl_bash_path_with_root(
+            "d:/windows/Sysnative/bash.exe",
+            Some("D:\\Windows\\")
+        ));
+    }
+
+    #[test]
+    fn system_root_rejects_another_root_and_requires_bash() {
+        assert!(!is_legacy_wsl_bash_path_with_root(
+            "C:\\Windows\\System32\\bash.exe",
+            Some("D:\\Windows")
+        ));
+        assert!(!is_legacy_wsl_bash_path_with_root(
+            "D:\\Windows\\System32\\wsl.exe",
+            Some("D:\\Windows")
+        ));
+    }
+
+    #[test]
+    fn unset_system_root_falls_back_to_the_conventional_directory() {
+        assert!(is_legacy_wsl_bash_path_with_root(
+            "C:\\WINDOWS\\system32\\BASH.EXE",
+            None
+        ));
+        assert!(!is_legacy_wsl_bash_path_with_root(
+            "C:\\Windows\\System32\\extra\\bash.exe",
+            None
+        ));
+        assert!(!is_legacy_wsl_bash_path_with_root(
+            "\\server\\share\\windows\\system32\\bash.exe",
+            None
+        ));
+    }
 }

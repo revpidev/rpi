@@ -625,24 +625,19 @@ impl SchedulerInner {
                 }
             }
         }
-        if let Some(limit) = self.restart_limit().limit() {
-            let _ = limit;
-        }
         for record in parked {
             let restarts = record.restarts.unwrap_or(0);
             (self.report)(format!(
                 "Task {} ({}) was cut off {restarts} times without progress; it is parked until retryTask()",
                 record.id, record.kind
             ));
-            if let Some(report) = &self.report_info {
-                report(
-                    crate::harness::types::ReportInfo::new(
-                        crate::harness::types::ReportKind::TaskParked,
-                    )
-                    .with_task(record.id, record.kind.clone())
-                    .with_reason("restart_limit"),
-                );
-            }
+            self.report_fixed(
+                crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::TaskParked,
+                )
+                .with_task(record.id, record.kind.clone())
+                .with_reason("restart_limit"),
+            );
         }
         Ok(())
     }
@@ -654,6 +649,26 @@ impl SchedulerInner {
 
     fn restart_limit(&self) -> crate::harness::types::RestartLimit {
         self.settings().restart_limit
+    }
+
+    fn report_fixed(&self, info: crate::harness::types::ReportInfo) {
+        self.telemetry.add_event(
+            "pi.durable.report",
+            serde_json::json!({
+                "type": info.kind,
+                "reason": info.reason,
+                "task.id": info.task_id.map(|id| id.get()),
+                "task.kind": info.task_kind,
+                "extension": info.extension,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+        self.telemetry.record_metric("pi.durable.reports", 1.0);
+        if let Some(report) = &self.report_info {
+            report(info);
+        }
     }
 
     /// Whether a record is parked by the restart limit.
@@ -1100,6 +1115,37 @@ impl SchedulerInner {
         let mut failed: Vec<TaskId> = Vec::new();
         let mut changed = false;
         for change in &publication.changes {
+            match change {
+                CommitChange::Table(StorageWrite::Entry { value }) => {
+                    self.telemetry.add_event(
+                        "pi.durable.entry",
+                        serde_json::json!({
+                            "entry.id": value.id.get(),
+                            "entry.kind": value.kind,
+                        })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    );
+                    continue;
+                }
+                CommitChange::Table(StorageWrite::Submission { value })
+                    if crate::harness::submissions::is_settled(value) =>
+                {
+                    self.telemetry.add_event(
+                        "pi.durable.submission",
+                        serde_json::json!({
+                            "submission.id": value.id().get(),
+                            "status": value.status(),
+                        })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    );
+                    continue;
+                }
+                _ => {}
+            }
             let CommitChange::Table(StorageWrite::Task { value: record }) = change else {
                 continue;
             };
@@ -2013,15 +2059,13 @@ impl SchedulerInner {
                             map.insert(record.id, (Arc::clone(&task), message.clone()));
                         }
                         (self.report)(message.clone());
-                        if let Some(report) = &self.report_info {
-                            report(
-                                crate::harness::types::ReportInfo::new(
-                                    crate::harness::types::ReportKind::MigrationFailed,
-                                )
-                                .with_task(record.id, record.kind.clone())
-                                .with_reason("migration_failed"),
-                            );
-                        }
+                        self.report_fixed(
+                            crate::harness::types::ReportInfo::new(
+                                crate::harness::types::ReportKind::MigrationFailed,
+                            )
+                            .with_task(record.id, record.kind.clone())
+                            .with_reason("migration_failed"),
+                        );
                         Resolution::Blocked {
                             reason: BlockedReason::MigrationFailed,
                         }
@@ -2101,6 +2145,7 @@ impl SchedulerInner {
     }
 
     fn start(self: &Arc<Self>, reservation: &Reservation) {
+        self.telemetry.record_metric("pi.durable.tasks.active", 1.0);
         let this = Arc::clone(self);
         let reservation = reservation.clone();
         tokio::spawn(async move {
@@ -2161,9 +2206,16 @@ impl SchedulerInner {
                     .unwrap_or_default(),
                 );
             }
+            let started = (self.now)();
             let outcome = task
                 .run_phase(&phase, current, &runtime, &invocation.context)
                 .await;
+            if runtime.inner.telemetry.enabled() {
+                runtime.inner.telemetry.record_metric(
+                    "pi.durable.phase.duration",
+                    ((self.now)() - started).max(0.0),
+                );
+            }
             previous = Some(PhaseResult {
                 checkpoint,
                 phase,
@@ -2327,14 +2379,12 @@ impl SchedulerInner {
                         if let Decision::Fault(message) = decision
                             && let Some(current) = &current
                         {
-                            if let Some(report) = &this.report_info {
-                                report(
-                                    crate::harness::types::ReportInfo::new(
-                                        crate::harness::types::ReportKind::TaskFaulted,
-                                    )
-                                    .with_task(current.id(), current.kind().to_string()),
-                                );
-                            }
+                            this.report_fixed(
+                                crate::harness::types::ReportInfo::new(
+                                    crate::harness::types::ReportKind::TaskFaulted,
+                                )
+                                .with_task(current.id(), current.kind().to_string()),
+                            );
                             this.terminate(
                                 tx,
                                 &current.record,
@@ -2511,6 +2561,8 @@ impl SchedulerInner {
         if invocation.ended.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.telemetry
+            .record_metric("pi.durable.tasks.active", -1.0);
         if let Ok(mut map) = self.invocations.lock() {
             let remove = map
                 .get(&invocation.task_id)
@@ -2991,6 +3043,19 @@ impl TaskRuntime for InvocationRuntime {
 
     async fn abort_owned(&self, id: TaskId, context: &Context) -> SessionResult<()> {
         self.ensure_open()?;
+        let owner = self
+            .inner
+            .live
+            .lock()
+            .ok()
+            .and_then(|live| live.get(&id).cloned())
+            .and_then(|record| record.owner);
+        if owner != Some(self.invocation.task_id) {
+            return Err(SessionError::message(format!(
+                "Task {id} is not owned by task {}",
+                self.invocation.task_id
+            )));
+        }
         let _ = self.inner.abort(id, context).await?;
         let bound = with_abort_signal(self.invocation.controller.clone(), context);
         let _ = self.inner.wait_for_task(id, &bound).await?;
