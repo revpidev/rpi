@@ -63,12 +63,19 @@ fn normalize_to_single_line(text: &str) -> String {
                 | '\u{feff}'
         )
     };
+    // `find`/`rfind` return byte offsets; the end offset must include the
+    // full multi-byte character (CJK labels). Trimming at `index + 1` split
+    // a character and panicked on CJK input.
     let start = collapsed
-        .find(|c| !is_js_whitespace(c))
+        .char_indices()
+        .find(|(_, c)| !is_js_whitespace(*c))
+        .map(|(index, _)| index)
         .unwrap_or(collapsed.len());
     let end = collapsed
-        .rfind(|c| !is_js_whitespace(c))
-        .map(|index| index + 1)
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_js_whitespace(*c))
+        .map(|(index, c)| index + c.len_utf8())
         .unwrap_or(start);
     collapsed[start..end].to_string()
 }
@@ -527,6 +534,17 @@ mod tests {
     //! cases.
 
     use super::*;
+
+    /// CJK labels: trimming must stay on character boundaries (the old
+    /// byte-index `rfind + 1` panicked on a multi-byte trailing character).
+    #[test]
+    fn normalize_to_single_line_handles_cjk_boundaries() {
+        assert_eq!(normalize_to_single_line("  源码目录  "), "源码目录");
+        assert_eq!(normalize_to_single_line("\n源码\n目录\n"), "源码 目录");
+        assert_eq!(normalize_to_single_line("\u{3000}中文\u{3000}"), "中文");
+        assert_eq!(normalize_to_single_line("src/ 源码目录"), "src/ 源码目录");
+        assert_eq!(normalize_to_single_line("  \n\u{3000}  "), "");
+    }
 
     /// `visibleIndexOf` (select-list.test.ts:14-18): column of `text` within
     /// `line`.
