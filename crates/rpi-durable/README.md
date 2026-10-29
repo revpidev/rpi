@@ -33,9 +33,16 @@ prefix fails before the database file is created.
 - `src/chord/sqlite/` — portable SQLite driver interfaces, the generic
   migration runner and prefix validation (upstream v1.3+ location); the
   `storage::sqlite` entry points re-export the same names.
-- `src/session/` — immutable entry stream, transactions, documents, forks.
-- `src/harness/` — registry, scheduler, submissions/inbox, built-in
-  generation/tool/compaction tasks, live task graph.
+- `src/session/` — immutable entry stream, transactions, documents, forks,
+  the storage-failure guard and the bound document cache.
+- `src/harness/` — registry, scheduler, timers/wakeups, submissions/inbox,
+  built-in generation/tool/compaction tasks, live task graph and telemetry.
+- `src/codemode.rs` — durable code mode: host/sandbox contract,
+  `pi.codemode.run`/`journal`, replay of nested calls.
+- `src/tool_search.rs`, `src/search.rs` — BM25 discovery for deferred tools.
+- `src/timers.rs` — host timers for the Session and Harness.
+- `src/documents.rs` — typed document definitions and the required
+  `checkpointWhen`.
 - `src/tools/` — `read`, `write`, `edit`, `bash` (and `powershell`) over the
   execution environment.
 - `src/env/` — portable `ExecutionEnv` surface: file system, shell, streaming
