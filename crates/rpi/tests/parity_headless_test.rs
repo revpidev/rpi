@@ -686,11 +686,28 @@ async fn build_runtime(
     name: &str,
     responses: Vec<FauxResponseStep>,
 ) -> (AgentSessionRuntime, TempDir) {
+    build_runtime_with_settings(name, responses, None).await
+}
+
+/// Like [`build_runtime`], with an `agent_dir/settings.json` written before
+/// the session services load it (for tests that need non-default settings).
+async fn build_runtime_with_settings(
+    name: &str,
+    responses: Vec<FauxResponseStep>,
+    settings: Option<serde_json::Value>,
+) -> (AgentSessionRuntime, TempDir) {
     let tmp = TempDir::new(name);
     let cwd = tmp.path().join("workspace");
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).expect("cwd");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    if let Some(settings) = settings {
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::to_vec(&settings).expect("settings json"),
+        )
+        .expect("write settings");
+    }
 
     let provider = FauxProvider::new(FauxProviderOptions {
         models: Some(vec![FauxModelDefinition {
@@ -983,4 +1000,56 @@ async fn print_mode_error_and_aborted_exit_1() {
     .await;
     assert_eq!(exit, 1);
     assert!(String::from_utf8_lossy(&err).contains("Request was aborted"));
+}
+
+/// print mode: a final response cut off at the output token limit prints the
+/// partial text, warns on stderr and exits 1 (print-mode.ts:134-148, #10799).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn print_mode_truncated_response_prints_partial_and_exits_1() {
+    // Auto-compaction has its own length-stop recovery (covered by the
+    // `length-truncation` parity scenario); disable it so the final response
+    // reaches print mode unchanged.
+    let (mut runtime, _tmp) = build_runtime_with_settings(
+        "print-length",
+        vec![
+            faux_assistant_message(
+                "partial answer",
+                FauxAssistantOptions {
+                    stop_reason: Some(StopReason::Length),
+                    ..Default::default()
+                },
+            )
+            .into(),
+        ],
+        Some(serde_json::json!({"compaction": {"enabled": false}})),
+    )
+    .await;
+    let out = SharedBuf::default();
+    let mut err: Vec<u8> = Vec::new();
+    let exit = run_print_mode(
+        &mut runtime,
+        PrintModeOptions {
+            mode: PrintOutputMode::Text,
+            messages: Vec::new(),
+            initial_message: Some("write a lot.".to_owned()),
+            initial_images: None,
+        },
+        RawStdout::new(Box::new(out.clone())),
+        &mut err,
+    )
+    .await;
+    // This test pins print mode's own truncation branch, not the
+    // compaction-based length recovery (covered by the parity scenario).
+    assert_eq!(exit, 1, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(
+        String::from_utf8(out.bytes()).expect("utf8 out"),
+        "partial answer\n",
+        "partial text is still written before the warning"
+    );
+    assert!(
+        String::from_utf8_lossy(&err)
+            .contains("Response was truncated: the model reached its output token limit."),
+        "stderr: {}",
+        String::from_utf8_lossy(&err)
+    );
 }

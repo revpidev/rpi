@@ -321,3 +321,24 @@ fn expand_loaded_template_end_to_end() {
         "plain text"
     );
 }
+
+/// #10867: an empty quoted argument keeps its position, so the positional
+/// default applies to `$1` and `$2` still receives the next value.
+#[test]
+fn expand_empty_quoted_argument_does_not_shift_positionals() {
+    let tmp = TempDir::new();
+    tmp.write(
+        "review.md",
+        "---\ndescription: Review code\n---\nReview $2. Focus: ${1:-correctness}.",
+    );
+    let templates = load_templates_from_dir(tmp.path()).templates;
+
+    assert_eq!(
+        expand_prompt_template(r#"/review "" src/index.ts"#, &templates),
+        "Review src/index.ts. Focus: correctness."
+    );
+    assert_eq!(
+        expand_prompt_template("/review '' src/index.ts", &templates),
+        "Review src/index.ts. Focus: correctness."
+    );
+}

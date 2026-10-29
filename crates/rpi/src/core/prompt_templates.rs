@@ -99,6 +99,9 @@ pub fn parse_command_args(args_string: &str) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut in_quote: Option<char> = None;
+    // Tracks whether a token has started, so quoted empty strings (`""` or
+    // `''`) keep their position as empty arguments (#10867).
+    let mut has_token = false;
 
     for c in args_string.chars() {
         match in_quote {
@@ -112,18 +115,21 @@ pub fn parse_command_args(args_string: &str) -> Vec<String> {
             None => {
                 if c == '"' || c == '\'' {
                     in_quote = Some(c);
+                    has_token = true;
                 } else if is_js_whitespace(c) {
-                    if !current.is_empty() {
+                    if has_token {
                         args.push(std::mem::take(&mut current));
+                        has_token = false;
                     }
                 } else {
                     current.push(c);
+                    has_token = true;
                 }
             }
         }
     }
 
-    if !current.is_empty() {
+    if has_token {
         args.push(current);
     }
 
@@ -598,8 +604,12 @@ mod tests {
         assert_eq!(parse_command_args(r#""it's" ok"#), args(&["it's", "ok"]));
         // Unterminated quote swallows the rest.
         assert_eq!(parse_command_args(r#"a "bc"#), args(&["a", "bc"]));
-        // Empty quoted string produces no token.
-        assert_eq!(parse_command_args(r#"a "" b"#), args(&["a", "b"]));
+        // Quoted empty strings keep their position as empty arguments
+        // (#10867: otherwise later positional args shift).
+        assert_eq!(parse_command_args(r#"a "" b"#), args(&["a", "", "b"]));
+        assert_eq!(parse_command_args(r#"a '' c"#), args(&["a", "", "c"]));
+        assert_eq!(parse_command_args(r#""" " ""#), args(&["", " "]));
+        assert_eq!(parse_command_args(r#"a """#), args(&["a", ""]));
     }
 
     #[test]
@@ -607,6 +617,15 @@ mod tests {
         // U+FEFF splits tokens in JS (\s) but is not char::is_whitespace.
         assert_eq!(parse_command_args("a\u{feff}b"), args(&["a", "b"]));
         assert_eq!(parse_command_args("a\u{3000}b"), args(&["a", "b"]));
+        // Unquoted newlines separate tokens; quoted newlines stay inside.
+        assert_eq!(
+            parse_command_args("label-2\n\nHere is some description #2."),
+            args(&["label-2", "Here", "is", "some", "description", "#2."])
+        );
+        assert_eq!(
+            parse_command_args("\"line1\nline2\" second"),
+            args(&["line1\nline2", "second"])
+        );
     }
 
     // ---- substitute_args -------------------------------------------------
@@ -641,6 +660,14 @@ mod tests {
         assert_eq!(substitute_args("${2:-}", &a), "");
         // Default containing spaces / dollar patterns (not re-expanded).
         assert_eq!(substitute_args("${2:-$1 d}", &a), "$1 d");
+        // An explicitly empty positional still falls back to the default
+        // (#10867: `""` keeps its position instead of shifting later args).
+        let with_empty = args(&["", "src/index.ts"]);
+        assert_eq!(
+            substitute_args("${1:-correctness}", &with_empty),
+            "correctness"
+        );
+        assert_eq!(substitute_args("$2", &with_empty), "src/index.ts");
     }
 
     #[test]

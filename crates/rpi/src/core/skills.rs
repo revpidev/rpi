@@ -783,7 +783,7 @@ pub(crate) fn match_candidates(file_path: &Path, base_dir: &Path) -> MatchCandid
 /// `matchesAnyPattern` (package-manager.ts:654-670).
 pub(crate) fn matches_any_pattern(candidates: &MatchCandidates, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
-        let pattern = pattern.replace(std::path::MAIN_SEPARATOR, "/");
+        let pattern = normalize_pattern(pattern);
         if glob_match(&pattern, &candidates.rel)
             || glob_match(&pattern, &candidates.name)
             || glob_match(&pattern, &candidates.abs)
@@ -807,13 +807,42 @@ pub(crate) fn matches_any_pattern(candidates: &MatchCandidates, patterns: &[Stri
     })
 }
 
+/// `normalizePath` tilde expansion applied to settings patterns
+/// (utils/paths.ts:76-101, #10765): `~` and `~/...` (`~\...` on Windows)
+/// resolve against the user's home, then separators become POSIX.
+fn normalize_pattern_with_home(pattern: &str, home: Option<&Path>) -> String {
+    let expanded = match home {
+        Some(home) if pattern == "~" => home.to_string_lossy().into_owned(),
+        Some(home) => {
+            let rest = pattern.strip_prefix("~/").or_else(|| {
+                if cfg!(windows) {
+                    pattern.strip_prefix("~\\")
+                } else {
+                    None
+                }
+            });
+            match rest {
+                Some(rest) => home.join(rest).to_string_lossy().into_owned(),
+                None => pattern.to_string(),
+            }
+        }
+        None => pattern.to_string(),
+    };
+    expanded.replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+fn normalize_pattern(pattern: &str) -> String {
+    let home = config::user_home_dir();
+    normalize_pattern_with_home(pattern, home.as_deref())
+}
+
 /// `normalizeExactPattern` (package-manager.ts:672-675).
 fn normalize_exact_pattern(pattern: &str) -> String {
     let normalized = pattern
         .strip_prefix("./")
         .or_else(|| pattern.strip_prefix(".\\"))
         .unwrap_or(pattern);
-    normalized.replace(std::path::MAIN_SEPARATOR, "/")
+    normalize_pattern(normalized)
 }
 
 /// `matchesAnyExactPattern` (package-manager.ts:687-695).
@@ -1707,6 +1736,62 @@ mod tests {
         let files = vec![base.join("skills/myskill/SKILL.md")];
         let enabled = apply_patterns(&files, &["!myskill".to_string()], base);
         assert!(enabled.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_pattern_expands_tilde() {
+        let home = Path::new("/home/tester");
+        assert_eq!(normalize_pattern_with_home("~", Some(home)), "/home/tester");
+        assert_eq!(
+            normalize_pattern_with_home("~/skills/pdf", Some(home)),
+            "/home/tester/skills/pdf"
+        );
+        assert_eq!(
+            normalize_pattern_with_home("!~/skills/pdf", Some(home)),
+            "!~/skills/pdf",
+            "prefix stripping happens before normalization"
+        );
+        assert_eq!(
+            normalize_pattern_with_home("~other/x", Some(home)),
+            "~other/x",
+            "only a leading ~/ segment expands"
+        );
+        assert_eq!(
+            normalize_pattern_with_home("skills/pdf", Some(home)),
+            "skills/pdf"
+        );
+        assert_eq!(
+            normalize_pattern_with_home("~/skills/pdf", None),
+            "~/skills/pdf",
+            "unresolvable home leaves the pattern literal"
+        );
+    }
+
+    #[test]
+    fn test_apply_patterns_expands_tilde_against_home() {
+        // #10765: `!~/skills/pdf` must exclude the absolute home path even
+        // though it is outside the package base dir.
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let base = tmp.path().join("package");
+        let skill = home.join("skills/pdf/SKILL.md");
+        let files = vec![base.join("skills/a.md"), skill.clone()];
+        let (_lock, _env) = crate::core::environment::test_env::EnvGuard::set(&[(
+            "HOME",
+            Some(home.to_str().expect("utf8 home")),
+        )]);
+        let enabled = apply_patterns(&files, &["!~/skills/pdf".to_string()], &base);
+        assert!(enabled.contains(&base.join("skills/a.md")));
+        assert!(
+            !enabled.contains(&skill),
+            "tilde exclude must match the home path"
+        );
+
+        // Force include/exclude exact paths use the same normalization.
+        let enabled = apply_patterns(&files, &["-~/skills/pdf/SKILL.md".to_string()], &base);
+        assert!(!enabled.contains(&skill));
+        let enabled = apply_patterns(&files, &["+~/skills/pdf/SKILL.md".to_string()], &base);
+        assert!(enabled.contains(&skill));
     }
 
     #[test]

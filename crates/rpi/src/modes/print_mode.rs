@@ -250,6 +250,16 @@ pub async fn run_print_mode(
                         out.write(&format!("{}\n", text.text));
                     }
                 }
+                // A response cut off at the output token limit still prints
+                // the partial text, then warns on stderr and exits non-zero
+                // (print-mode.ts:134-148, #10799).
+                if assistant.stop_reason == StopReason::Length {
+                    let _ = writeln!(
+                        err,
+                        "Response was truncated: the model reached its output token limit."
+                    );
+                    exit_code = 1;
+                }
             }
         }
     }

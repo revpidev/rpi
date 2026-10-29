@@ -407,11 +407,13 @@ fn strip_md_suffix(name: &str) -> String {
 /// string using simple shell-style single and double quotes. Only space and
 /// tab separate tokens (upstream — not the JS `\s` set of the coding-agent
 /// copy); quotes pair up without escapes, and an unterminated quote swallows
-/// the rest of the input.
+/// the rest of the input. Quoted empty strings keep their position as empty
+/// arguments (#10867).
 pub fn parse_command_args(args_string: &str) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut in_quote: Option<char> = None;
+    let mut has_token = false;
 
     for char in args_string.chars() {
         match in_quote {
@@ -425,17 +427,20 @@ pub fn parse_command_args(args_string: &str) -> Vec<String> {
             None => {
                 if char == '"' || char == '\'' {
                     in_quote = Some(char);
+                    has_token = true;
                 } else if char == ' ' || char == '\t' {
-                    if !current.is_empty() {
+                    if has_token {
                         args.push(std::mem::take(&mut current));
+                        has_token = false;
                     }
                 } else {
                     current.push(char);
+                    has_token = true;
                 }
             }
         }
     }
-    if !current.is_empty() {
+    if has_token {
         args.push(current);
     }
     args
@@ -750,8 +755,10 @@ mod tests {
         assert_eq!(parse_command_args(r#""it's" ok"#), args(&["it's", "ok"]));
         // Unterminated quote swallows the rest.
         assert_eq!(parse_command_args(r#"a "bc"#), args(&["a", "bc"]));
-        // Empty quoted string produces no token.
-        assert_eq!(parse_command_args(r#"a "" b"#), args(&["a", "b"]));
+        // Quoted empty strings keep their position (#10867).
+        assert_eq!(parse_command_args(r#"a "" b"#), args(&["a", "", "b"]));
+        assert_eq!(parse_command_args(r#"a '' c"#), args(&["a", "", "c"]));
+        assert_eq!(parse_command_args("\"\" \" \""), args(&["", " "]));
         // Tabs split; U+FEFF does NOT (harness copy splits on space/tab only).
         assert_eq!(parse_command_args("a\tb"), args(&["a", "b"]));
         assert_eq!(parse_command_args("a\u{feff}b"), args(&["a\u{feff}b"]));

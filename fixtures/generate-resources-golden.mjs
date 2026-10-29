@@ -225,7 +225,7 @@ const PROMPT_DSL_CASES = [
 	{ name: "slice_beyond_end", content: "none: [${@:5}]", argsString: "a b" },
 	{ name: "quotes_single_and_double", content: "$1|$2|$3", argsString: "'hello world' \"it's\" x" },
 	{ name: "unterminated_quote_swallows_rest", content: "[$1]", argsString: '"abc def' },
-	{ name: "empty_quotes_are_dropped", content: "[$1]", argsString: '""' },
+	{ name: "empty_quotes_keep_position", content: "[$1]", argsString: '""' },
 	{ name: "two_digit_index", content: "ten: $10", argsString: "1 2 3 4 5 6 7 8 9 ten" },
 	{ name: "mixed_dsl_forms", content: "$1 then ${2:-none} then ${@:3}", argsString: "a b c d" },
 	{ name: "dollar_without_pattern", content: "cost is $ 5 and $x stays", argsString: "a" },
@@ -236,7 +236,12 @@ function generatePromptDsl() {
 		const args = parseCommandArgs(c.argsString);
 		return { ...c, args, expected: substituteArgs(c.content, args) };
 	});
-	writeGolden("prompt-dsl", { upstream: UPSTREAM, cases });
+	// Re-recorded at the v0.1.8 pin: #10867 keeps empty quoted arguments, so
+	// the old `empty_quotes_are_dropped` recording no longer applies.
+	writeGolden("prompt-dsl", {
+		upstream: "external/pi @ 4a080252f (v1.4.0), dist build",
+		cases,
+	});
 }
 
 // ---------------------------------------------------------------------------

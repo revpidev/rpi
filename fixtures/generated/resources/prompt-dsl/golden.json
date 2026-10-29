@@ -1,5 +1,5 @@
 {
-  "upstream": "external/pi @ 9841914 (v0.85.0+), dist build",
+  "upstream": "external/pi @ 4a080252f (v1.4.0), dist build",
   "cases": [
     {
       "name": "positional",
@@ -170,10 +170,12 @@
       "expected": "[abc def]"
     },
     {
-      "name": "empty_quotes_are_dropped",
+      "name": "empty_quotes_keep_position",
       "content": "[$1]",
       "argsString": "\"\"",
-      "args": [],
+      "args": [
+        ""
+      ],
       "expected": "[]"
     },
     {

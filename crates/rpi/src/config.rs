@@ -411,10 +411,13 @@ pub fn install_manifest_path_for(exe_path: &Path) -> PathBuf {
 
 /// Read the manifest next to `exe_path`; a missing or corrupt manifest
 /// degrades to "no manifest" (`None`) — self-update stays available and
-/// uninstall falls back to manual guidance (ADR-0011 §3).
+/// uninstall falls back to manual guidance (ADR-0011 §3). A UTF-8 BOM is
+/// accepted because PowerShell 5.1 writes one when it rewrites the file
+/// (Pi v1.4.0 `managed-install.json` BOM fix).
 pub fn read_install_manifest_for(exe_path: &Path) -> Option<InstallManifest> {
     let text = std::fs::read_to_string(install_manifest_path_for(exe_path)).ok()?;
-    serde_json::from_str(&text).ok()
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_json::from_str(text).ok()
 }
 
 /// Persist the manifest next to `exe_path` (atomic write, same crash
@@ -781,6 +784,34 @@ mod self_update_tests {
         assert_eq!(read_install_manifest_for(&exe), None);
         std::fs::write(install_manifest_path_for(&exe), "{}").unwrap();
         assert_eq!(read_install_manifest_for(&exe), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_install_manifest_accepts_utf8_bom() {
+        // Windows PowerShell 5.1 writes a UTF-8 BOM when it rewrites the
+        // manifest; `rpi update` must still recognize the managed install
+        // (Pi v1.4.0 managed-install BOM fix).
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-manifest-test-{}-{}",
+            std::process::id(),
+            "bom"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("rpi");
+        std::fs::write(&exe, b"bin").unwrap();
+        let manifest = InstallManifest {
+            version: "1.2.3".to_string(),
+            target: "x86_64-pc-windows-msvc".to_string(),
+            installed_at: "2026-08-10T05:00:00.000Z".to_string(),
+            source_url: "https://example.test/rpi.zip".to_string(),
+            sha256: "ab".to_string(),
+            install_path: exe.to_string_lossy().into_owned(),
+            method: InstallManifest::METHOD_BINARY.to_string(),
+        };
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        std::fs::write(install_manifest_path_for(&exe), format!("\u{feff}{json}")).unwrap();
+        assert_eq!(read_install_manifest_for(&exe), Some(manifest));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
