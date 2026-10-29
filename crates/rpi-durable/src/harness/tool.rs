@@ -2090,6 +2090,10 @@ impl ToolExecutionApi for ToolApi {
                 sequence.to_string()
             }
         };
+        context.telemetry().add_link(serde_json::json!({
+            "task.id": self.runtime.task_id().get(),
+            "tool.call_id": self.call_id,
+        }));
         // Registered before the memo, so cleanup waits for the admission.
         let admission = self.admissions.begin().map_err(SessionError::message)?;
         let started = start_nested_call(

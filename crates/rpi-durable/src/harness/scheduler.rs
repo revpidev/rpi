@@ -2037,6 +2037,21 @@ impl SchedulerInner {
         snapshot: &Arc<dyn RegistrySnapshot>,
     ) -> Resolution {
         let fit = self.fit(record, snapshot.task(&record.kind));
+        if matches!(
+            fit,
+            Fit::Blocked {
+                reason: BlockedReason::TaskTooOld,
+                ..
+            }
+        ) {
+            self.report_fixed(
+                crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::TaskOutdated,
+                )
+                .with_task(record.id, record.kind.clone())
+                .with_reason("task_too_old"),
+            );
+        }
         match fit {
             Fit::Blocked { reason, .. } => Resolution::Blocked { reason },
             Fit::Ready { task, migrates } => {
