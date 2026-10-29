@@ -1276,52 +1276,22 @@ fn is_escaped_delimiter(chars: &[char], index: usize) -> bool {
     backslashes % 2 == 1
 }
 
-/// CJK character class of upstream's CJK-friendly emphasis tokenizer
-/// (marked-cjk-friendly v0.1.2): Han/Kana/Hangul, CJK punctuation and
-/// fullwidth forms. Delimiters adjacent to these characters use CJK-aware
-/// flanking instead of CommonMark's punctuation rule (#10730).
-fn is_cjk_character(c: char) -> bool {
-    let code = c as u32;
+/// CJK punctuation that upstream's CJK-friendly emphasis tokenizer treats as
+/// ordinary text for flanking purposes (#10730). CJK letters are already
+/// non-punctuation to CommonMark; only punctuation adjacent to a delimiter
+/// changes the decision. Keeping the set to punctuation avoids styling
+/// intraword delimiters such as `foo_bar_中文`.
+fn is_cjk_punctuation(c: char) -> bool {
     matches!(
-        code,
-        0x1100..=0x11ff
-            | 0x20a9
-            | 0x2329..=0x232a
-            | 0x2630..=0x2637
-            | 0x268a..=0x268f
-            | 0x2e80..=0x2e99
-            | 0x2e9b..=0x2ef3
-            | 0x2f00..=0x2fd5
-            | 0x2ff0..=0x303e
-            | 0x3041..=0x3096
-            | 0x3099..=0x30ff
-            | 0x3105..=0x312f
-            | 0x3131..=0x318e
-            | 0x3190..=0x31e5
-            | 0x31ef..=0x321e
-            | 0x3220..=0x3247
-            | 0x3250..=0xa48c
-            | 0xa490..=0xa4c6
-            | 0xa960..=0xa97c
-            | 0xac00..=0xd7a3
-            | 0xd7b0..=0xd7c6
-            | 0xd7cb..=0xd7fb
-            | 0xf900..=0xfaff
+        c as u32,
+        0x3001..=0x303f
+            | 0x30a0
+            | 0x30fb
             | 0xfe10..=0xfe19
-            | 0xfe30..=0xfe52
-            | 0xfe54..=0xfe66
-            | 0xfe68..=0xfe6b
-            | 0xff01..=0xffbe
-            | 0xffc2..=0xffc7
-            | 0xffca..=0xffcf
-            | 0xffd2..=0xffd7
-            | 0xffda..=0xffdc
-            | 0xffe0..=0xffe6
-            | 0xffe8..=0xffee
-            | 0x17000..=0x18cd5
-            | 0x18cff..=0x18d1e
-            | 0x1b000..=0x1b2fb
-            | 0x20000..=0x3fffd
+            | 0xfe30..=0xfe6b
+            | 0xff01..=0xff20
+            | 0xff3b..=0xff40
+            | 0xff5b..=0xff65
     )
 }
 
@@ -1664,8 +1634,10 @@ impl Markdown {
             let opener_cjk = index
                 .checked_sub(1)
                 .and_then(|i| chars.get(i))
-                .is_some_and(|c| is_cjk_character(*c))
-                || chars.get(opener_end).is_some_and(|c| is_cjk_character(*c));
+                .is_some_and(|c| is_cjk_punctuation(*c))
+                || chars
+                    .get(opener_end)
+                    .is_some_and(|c| is_cjk_punctuation(*c));
             let mut search = opener_end;
             let mut closer = None;
             while search < chars.len() {
@@ -1689,8 +1661,10 @@ impl Markdown {
                 let closer_cjk = search
                     .checked_sub(1)
                     .and_then(|i| chars.get(i))
-                    .is_some_and(|c| is_cjk_character(*c))
-                    || chars.get(closer_end).is_some_and(|c| is_cjk_character(*c));
+                    .is_some_and(|c| is_cjk_punctuation(*c))
+                    || chars
+                        .get(closer_end)
+                        .is_some_and(|c| is_cjk_punctuation(*c));
                 if closer_len == run_len && content_ok && (opener_cjk || closer_cjk) {
                     closer = Some((search, closer_end));
                     break;
@@ -2994,6 +2968,13 @@ mod tests {
             "。*x*",
             "escaped asterisks must not become emphasis"
         );
+    }
+
+    /// Intraword delimiters must stay literal even when a CJK letter follows
+    /// (upstream's tokenizer also leaves these alone).
+    #[test]
+    fn intraword_delimiters_next_to_cjk_letters_stay_literal() {
+        assert_eq!(render("foo_bar_中文"), ["foo_bar_中文"]);
     }
 
     fn theme() -> Arc<MarkdownTheme> {
