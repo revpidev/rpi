@@ -206,7 +206,7 @@ async fn read_rejects_offsets_beyond_the_file() {
 }
 
 #[tokio::test]
-async fn read_reports_images_by_content_as_unsupported() {
+async fn read_returns_images_detected_by_content() {
     let dir = TempDir::new("durable-read-image");
     let env = create_env(&dir);
     let png = base64_decode(
@@ -223,12 +223,13 @@ async fn read_reports_images_by_content_as_unsupported() {
     )
     .await;
     let result = result.expect("read");
-    assert_eq!(result.output, Some(Vec::new()));
-    assert_eq!(result.is_error, Some(true));
-    assert_eq!(
-        diagnostic_text(&result),
-        "image.txt is an image (image/png); reading images is not supported"
-    );
+    assert!(diagnostic_text(&result).contains("Read image image.txt (1x1, image/png)"));
+    let content = result.output.expect("content");
+    assert!(matches!(
+        content.first(),
+        Some(rpi_ai::types::ToolResultContent::Image(image))
+            if image.mime_type == "image/png"
+    ));
 }
 
 fn base64_decode(input: &str) -> Vec<u8> {
@@ -621,4 +622,72 @@ async fn fake_api_collects_details() {
 #[allow(dead_code)]
 fn _registration_is_public(tool: &ToolRegistration) -> &str {
     tool.name()
+}
+
+// ---------------------------------------------------------------------------
+// read images (V18-06 FR-K)
+// ---------------------------------------------------------------------------
+
+fn tiny_png() -> Vec<u8> {
+    // 1x1 transparent PNG.
+    vec![
+        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ]
+}
+
+#[tokio::test]
+async fn read_returns_a_supported_image_within_the_limits() {
+    let dir = TempDir::new("durable-read-image");
+    let env = create_env(&dir);
+    let context = rpi_durable::chord::context::BACKGROUND_CONTEXT.clone();
+    env.write_file("tiny.png", FileContent::Bytes(tiny_png()), &context)
+        .await
+        .expect("write image");
+    let (result, _, _) = run_tool(
+        &create_read_tool(),
+        json!({ "path": "tiny.png" }),
+        Some(Arc::clone(&env)),
+    )
+    .await;
+    let result = result.expect("read image");
+    let content = result.output.expect("content");
+    assert_eq!(content.len(), 1);
+    assert!(matches!(
+        &content[0],
+        rpi_ai::types::ToolResultContent::Image(image)
+            if image.mime_type == "image/png" && !image.data.is_empty()
+    ));
+    assert!(result.diagnostics.iter().flatten().any(|diagnostic| {
+        diagnostic.code.as_deref() == Some("image") && diagnostic.message.contains("1x1")
+    }));
+}
+
+#[tokio::test]
+async fn read_rejects_an_image_over_the_pixel_limit() {
+    let dir = TempDir::new("durable-read-image-large");
+    let env = create_env(&dir);
+    let context = rpi_durable::chord::context::BACKGROUND_CONTEXT.clone();
+    let mut header = tiny_png();
+    // IHDR width/height: 3000x3000.
+    header[16..20].copy_from_slice(&3000u32.to_be_bytes());
+    header[20..24].copy_from_slice(&3000u32.to_be_bytes());
+    env.write_file("large.png", FileContent::Bytes(header), &context)
+        .await
+        .expect("write image");
+    let (result, _, _) = run_tool(
+        &create_read_tool(),
+        json!({ "path": "large.png" }),
+        Some(Arc::clone(&env)),
+    )
+    .await;
+    let result = result.expect("read image");
+    assert_eq!(result.is_error, Some(true));
+    assert!(result.diagnostics.iter().flatten().any(|diagnostic| {
+        diagnostic.code.as_deref() == Some("image_too_large")
+            && diagnostic.message.contains("3000x3000")
+    }));
 }

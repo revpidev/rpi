@@ -3215,6 +3215,7 @@ name = "rpi-durable"
 version = "0.1.7"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
  "jsonschema",
  "libc",

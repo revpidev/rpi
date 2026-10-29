@@ -140,6 +140,142 @@ async fn read_stable_text(
     }
 }
 
+/// Read a supported image as one image block. Without an image processor,
+/// PNG, JPEG, GIF and WebP pass through undecoded within the default limits
+/// (2000x2000 pixels and about 3.4 MB raw); larger images are error results.
+async fn read_image(
+    reader: &dyn BinaryReader,
+    info: &FileInfo,
+    path: &str,
+    mime_type: &str,
+    context: &Context,
+) -> Result<ToolExecutionResult, ToolExecuteError> {
+    const MAX_PIXELS: u32 = 2000;
+    const MAX_RAW_BYTES: u64 = 3_375_000;
+    let (width, height) = image_dimensions(reader, context).await?;
+    if width > MAX_PIXELS || height > MAX_PIXELS {
+        return Ok(ToolExecutionResult {
+            output: Some(Vec::new()),
+            is_error: Some(true),
+            diagnostics: Some(vec![ToolDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                code: Some("image_too_large".to_string()),
+                message: format!(
+                    "{path} is {width}x{height}; the limit is {MAX_PIXELS}x{MAX_PIXELS}"
+                ),
+            }]),
+            ..Default::default()
+        });
+    }
+    if info.size > MAX_RAW_BYTES {
+        return Ok(ToolExecutionResult {
+            output: Some(Vec::new()),
+            is_error: Some(true),
+            diagnostics: Some(vec![ToolDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                code: Some("image_too_large".to_string()),
+                message: format!(
+                    "{path} is {} bytes; the image limit is {MAX_RAW_BYTES} bytes",
+                    info.size
+                ),
+            }]),
+            ..Default::default()
+        });
+    }
+    let bytes = reader
+        .read(0, info.size, context)
+        .await
+        .map_err(|error| tool_error(error.to_string()))?;
+    let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+    Ok(ToolExecutionResult {
+        output: Some(vec![ToolResultContent::Image(
+            rpi_ai::types::ImageContent {
+                data,
+                mime_type: mime_type.to_string(),
+            },
+        )]),
+        diagnostics: Some(vec![ToolDiagnostic {
+            severity: DiagnosticSeverity::Info,
+            code: Some("image".to_string()),
+            message: format!("Read image {path} ({width}x{height}, {mime_type})"),
+        }]),
+        ..Default::default()
+    })
+}
+
+/// Pixel dimensions from the image header, `(0, 0)` when the format's header
+/// does not carry them in a shape this reader understands.
+async fn image_dimensions(
+    reader: &dyn BinaryReader,
+    context: &Context,
+) -> Result<(u32, u32), ToolExecuteError> {
+    let header = reader
+        .read(0, 64, context)
+        .await
+        .map_err(|error| tool_error(error.to_string()))?;
+    Ok(parse_image_dimensions(&header))
+}
+
+fn parse_image_dimensions(bytes: &[u8]) -> (u32, u32) {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) && bytes.len() >= 24 {
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        return (width, height);
+    }
+    if bytes.starts_with(b"GIF") && bytes.len() >= 10 {
+        let width = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
+        let height = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
+        return (width, height);
+    }
+    if bytes.starts_with(&[0xff, 0xd8]) {
+        let mut index = 2;
+        while index + 9 < bytes.len() {
+            if bytes[index] != 0xff {
+                index += 1;
+                continue;
+            }
+            let marker = bytes[index + 1];
+            let length = u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]) as usize;
+            if matches!(
+                marker,
+                0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
+            ) && index + 9 <= bytes.len()
+            {
+                let height = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u32;
+                let width = u16::from_be_bytes([bytes[index + 7], bytes[index + 8]]) as u32;
+                return (width, height);
+            }
+            if length < 2 {
+                break;
+            }
+            index += 2 + length;
+        }
+        return (0, 0);
+    }
+    if bytes.starts_with(b"RIFF") && bytes.len() >= 30 && &bytes[8..12] == b"WEBP" {
+        match &bytes[12..16] {
+            b"VP8X" => {
+                let width = 1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]);
+                let height = 1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]);
+                return (width, height);
+            }
+            b"VP8 " => {
+                let width = (u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3fff) as u32;
+                let height = (u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3fff) as u32;
+                return (width, height);
+            }
+            b"VP8L" => {
+                let bits = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
+                let width = (bits & 0x3fff) + 1;
+                let height = ((bits >> 14) & 0x3fff) + 1;
+                return (width, height);
+            }
+            _ => {}
+        }
+    }
+    (0, 0)
+}
+
 /// The read result for the opened file. It equals decoding the whole file,
 /// splitting it on `\n`, and bounding the selected lines with
 /// [`truncate_head_of`], while reading only one scan's worth of the file plus
@@ -161,19 +297,7 @@ async fn read_text(
         .await
         .map_err(|error| tool_error(error.to_string()))?;
     if let Some(mime_type) = mime_type {
-        // Image content is not supported yet.
-        return Ok(ToolExecutionResult {
-            output: Some(Vec::new()),
-            is_error: Some(true),
-            diagnostics: Some(vec![ToolDiagnostic {
-                severity: DiagnosticSeverity::Error,
-                code: Some("unsupported_image".to_string()),
-                message: format!(
-                    "{path} is an image ({mime_type}); reading images is not supported"
-                ),
-            }]),
-            ..Default::default()
-        });
+        return read_image(reader, info, path, &mime_type, context).await;
     }
 
     let start_line = match offset {
