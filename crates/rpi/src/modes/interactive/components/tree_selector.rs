@@ -1571,18 +1571,14 @@ fn format_tool_call(name: &str, arguments: &Map<String, Value>) -> String {
     match name {
         "read" => {
             let path = shorten_path(path_arg(arguments));
-            let offset = arguments.get("offset").and_then(|value| value.as_i64());
-            let limit = arguments.get("limit").and_then(|value| value.as_i64());
-            let mut display = path;
-            if offset.is_some() || limit.is_some() {
-                let start = offset.unwrap_or(1);
-                let end = limit.map(|limit| start + limit - 1);
-                display = format!("{display}:{start}");
-                if let Some(end) = end {
-                    display = format!("{display}-{end}");
-                }
-            }
-            format!("[read: {display}]")
+            // Shared with the expanded read call and the HTML export
+            // template: numbers, numeric strings and nulls (#9887).
+            let range =
+                crate::modes::interactive::tool_renderers::render_utils::format_read_line_range(
+                    arguments.get("offset"),
+                    arguments.get("limit"),
+                );
+            format!("[read: {path}{range}]")
         }
         "write" => {
             let path = shorten_path(path_arg(arguments));
@@ -2542,21 +2538,8 @@ mod tests {
     }
 
     fn strip_ansi(input: &str) -> String {
-        let mut out = String::with_capacity(input.len());
-        let mut chars = input.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\u{1b}' && chars.peek() == Some(&'[') {
-                chars.next();
-                for c in chars.by_ref() {
-                    if c == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
+        // Strips SGR plus the APC marker pairs the input emits.
+        rpi_test_support::vt::strip_ansi(input)
     }
 
     fn known(entry: SessionEntry) -> StoredEntry {
@@ -3961,6 +3944,28 @@ mod tests {
                 &args(serde_json::json!({"file_path": "/a", "offset": 3, "limit": 5}))
             ),
             "[read: /a:3-7]"
+        );
+        // #9887: numeric strings and nulls keep the range.
+        assert_eq!(
+            format_tool_call(
+                "read",
+                &args(serde_json::json!({"path": "/a", "offset": "25", "limit": "13"}))
+            ),
+            "[read: /a:25-37]"
+        );
+        assert_eq!(
+            format_tool_call(
+                "read",
+                &args(serde_json::json!({"path": "/a", "offset": null, "limit": "13"}))
+            ),
+            "[read: /a:1-13]"
+        );
+        assert_eq!(
+            format_tool_call(
+                "read",
+                &args(serde_json::json!({"path": "/a", "offset": "abc", "limit": 13}))
+            ),
+            "[read: /a]"
         );
         assert_eq!(
             format_tool_call("bash", &args(serde_json::json!({"command": "ls -la"}))),

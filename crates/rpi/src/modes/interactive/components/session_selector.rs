@@ -1976,21 +1976,8 @@ mod tests {
     }
 
     fn strip_ansi(input: &str) -> String {
-        let mut out = String::with_capacity(input.len());
-        let mut chars = input.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\u{1b}' && chars.peek() == Some(&'[') {
-                chars.next();
-                for c in chars.by_ref() {
-                    if c == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
+        // Strips SGR plus the APC marker pairs the input emits.
+        rpi_test_support::vt::strip_ansi(input)
     }
 
     fn rendered(component: &SessionSelectorComponent, width: usize) -> Vec<String> {
@@ -3016,19 +3003,19 @@ mod tests {
         let mut component = build(&harness, &callbacks, false, false, None);
 
         component.set_focused(true);
-        // The focused search input emits the cursor marker in its line; the
-        // reverse-video fake cursor (`\x1b[7m`) is unique to the input line.
+        // The focused search input emits the cursor marker plus the
+        // fake-cursor marker pair; both are unique to the input line.
         let raw = component.render(80);
         let input_line = raw
             .iter()
-            .find(|l| l.contains("\x1b[7m"))
+            .find(|l| l.contains(rpi_tui::tui::FAKE_CURSOR_START))
             .expect("input line");
         assert!(input_line.contains("\u{1b}_pi:c\u{07}"));
         component.set_focused(false);
         let raw = component.render(80);
         let input_line = raw
             .iter()
-            .find(|l| l.contains("\x1b[7m"))
+            .find(|l| l.contains(rpi_tui::tui::FAKE_CURSOR_START))
             .expect("input line");
         assert!(!input_line.contains("\u{1b}_pi:c\u{07}"));
     }

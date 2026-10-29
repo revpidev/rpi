@@ -3499,13 +3499,20 @@ fn run_clipboard_command_with_cap(
 ) -> Option<Vec<u8>> {
     use std::io::Read;
 
-    let mut child = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    // Keep clipboard helpers out of the foreground process group so Ctrl+Z
+    // does not suspend them (#11179).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().ok()?;
     let mut stdout = child.stdout.take()?;
     let (reader_tx, reader_rx) = std::sync::mpsc::channel();
     // Detached on purpose: a command that leaves a descendant holding the
@@ -7325,5 +7332,32 @@ mod tests {
         let _path_restore = prepend_path(&bin);
         let _tmux_restore = set_tmux_env("1");
         assert_eq!(run_tmux_check(Duration::from_millis(2000)), None);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod clipboard_process_group_tests {
+    use super::*;
+
+    /// #11179: the paste/read clipboard path is detached too.
+    #[test]
+    fn clipboard_read_commands_lead_their_own_process_group() {
+        let out = run_clipboard_command(
+            "sh",
+            &[
+                "-c",
+                "read -r _ _ _ _ pgrp _ < /proc/self/stat; echo \"$$ $pgrp\"",
+            ],
+            Duration::from_secs(5),
+        )
+        .expect("query command succeeds");
+        let text = String::from_utf8(out).expect("utf8 output");
+        let mut fields = text.split_whitespace();
+        let pid: i32 = fields.next().expect("pid").parse().expect("pid int");
+        let pgrp: i32 = fields.next().expect("pgrp").parse().expect("pgrp int");
+        assert_eq!(
+            pid, pgrp,
+            "clipboard reader must lead its own process group"
+        );
     }
 }

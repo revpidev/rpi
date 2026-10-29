@@ -1236,3 +1236,59 @@ mod default_tools_setting {
         assert_eq!(session.get_active_tool_names(), vec!["read".to_string()]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// grep: RIPGREP_CONFIG_PATH isolation (V18-04 FR-A R1, #11203/#11230)
+// ---------------------------------------------------------------------------
+
+mod grep_ripgrep_config {
+    use super::*;
+
+    /// Upstream runs `rg --no-config`, so `RIPGREP_CONFIG_PATH` can never
+    /// inject options such as `--fixed-strings` into a regex search. The
+    /// native walker never reads that file at all; this test pins the
+    /// observable contract with a hostile global config.
+    #[tokio::test]
+    async fn hostile_ripgrep_config_does_not_change_search_semantics() {
+        let tmp = TempDir::new();
+        let config = tmp.write(
+            "ripgreprc",
+            "--fixed-strings\n--ignore-case\n--glob=!*.rs\n",
+        );
+        let target = tmp.write("target.txt", "abc\na.c\n");
+        let tool = create_grep_tool(&ctx(tmp.path()), GrepToolOptions::default());
+
+        rpi_test_env::set_var("RIPGREP_CONFIG_PATH", &config);
+        let regex_out = run_tool(
+            &tool,
+            json!({ "pattern": "a.c", "path": target.to_string_lossy() }),
+        )
+        .await
+        .expect("grep");
+        let literal_out = run_tool(
+            &tool,
+            json!({
+                "pattern": "a.c",
+                "path": target.to_string_lossy(),
+                "literal": true
+            }),
+        )
+        .await
+        .expect("grep");
+        rpi_test_env::remove_var("RIPGREP_CONFIG_PATH");
+
+        // The regex still matches both lines; case-insensitivity and the
+        // glob exclusion from the config file are not applied.
+        assert!(regex_out.contains("target.txt:1: abc"), "got: {regex_out}");
+        assert!(regex_out.contains("target.txt:2: a.c"), "got: {regex_out}");
+        // `literal: true` is the only source of fixed-string matching.
+        assert!(
+            !literal_out.contains("target.txt:1: abc"),
+            "got: {literal_out}"
+        );
+        assert!(
+            literal_out.contains("target.txt:2: a.c"),
+            "got: {literal_out}"
+        );
+    }
+}

@@ -46,7 +46,7 @@ use crate::keys::{decode_printable_key, matches_key};
 use crate::kill_ring::{KillRing, KillRingPushOptions};
 use crate::tui::{
     CURSOR_MARKER, Component, Focusable, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult,
-    TuiMouseEventType, TuiMouseHandlerResult,
+    TuiMouseEventType, TuiMouseHandlerResult, render_fake_cursor,
 };
 use crate::tui_handle::TuiHandle;
 use crate::undo_stack::UndoStack;
@@ -3286,13 +3286,13 @@ impl Component for Editor {
                         .map(|grapheme| grapheme.segment)
                         .unwrap_or("");
                     let rest_after = after[first_grapheme.len()..].to_string();
-                    let cursor = format!("\x1b[7m{first_grapheme}\x1b[0m");
+                    let cursor = render_fake_cursor(first_grapheme);
                     display_text = format!("{before}{marker}{cursor}{rest_after}");
                     // lineVisibleWidth stays the same — we're replacing,
                     // not adding.
                 } else {
                     // Cursor is at the end — add highlighted space.
-                    let cursor = "\x1b[7m \x1b[0m";
+                    let cursor = &render_fake_cursor(" ");
                     display_text = format!("{before}{marker}{cursor}");
                     line_visible_width += 1;
                     // If cursor overflows content width into the padding,
@@ -5134,6 +5134,36 @@ mod tests {
         assert_eq!(content_lines[1], "ト"); // 1 char = 2 columns (+ padding)
     }
 
+    /// FR-F R3 width matrix: 40/80/120 columns with CJK content keeps every
+    /// line within the terminal width and preserves the text.
+    #[test]
+    fn renders_cjk_content_within_40_80_120_columns() {
+        let text = "中文内容 mixed with ASCII 和 emoji 🙂 以及较长的说明文字";
+        for width in [40usize, 80, 120] {
+            let mut editor = editor();
+            editor.set_text(text);
+            let lines = editor.render(width);
+            for (index, line) in lines.iter().enumerate() {
+                let line_width = visible_width(line);
+                assert!(
+                    line_width <= width,
+                    "width {width}: line {index} is {line_width} columns: {line:?}"
+                );
+            }
+            let joined: String = lines
+                .iter()
+                .map(|line| strip_ansi(line))
+                .collect::<Vec<_>>()
+                .join("");
+            for expected in ["中文内容", "ASCII", "🙂"] {
+                assert!(
+                    joined.contains(expected),
+                    "width {width}: missing {expected:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn handles_mixed_ascii_and_wide_characters_in_wrapping() {
         let mut editor = editor();
@@ -5163,8 +5193,8 @@ mod tests {
         // The cursor (reverse video space) should be visible.
         let content_line = &lines[1];
         assert!(
-            content_line.contains("\x1b[7m"),
-            "Should have reverse video cursor"
+            content_line.contains(crate::tui::FAKE_CURSOR_START),
+            "Should mark the fake cursor cell"
         );
 
         // Line should still be correct width.
@@ -5219,7 +5249,7 @@ mod tests {
                 "Should be 1 content line before wrap"
             );
             assert!(
-                content_lines[0].ends_with("\x1b[7m \x1b[0m"),
+                content_lines[0].ends_with(&render_fake_cursor(" ")),
                 "Cursor should be at end of line"
             );
 

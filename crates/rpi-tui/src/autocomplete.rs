@@ -85,7 +85,10 @@ fn escape_regex(value: &str) -> String {
 fn build_fd_path_query(query: &str) -> String {
     let normalized = to_display_path(query);
     if !normalized.contains('/') {
-        return normalized;
+        // fd treats the query as a regex; escape metacharacters so a query
+        // such as `[` or `(` still matches file names (autocomplete.ts:21-23,
+        // #10972).
+        return escape_regex(&normalized);
     }
 
     let has_trailing_separator = normalized.ends_with('/');
@@ -1532,6 +1535,18 @@ mod tests {
     }
 
     // --- fd @ file suggestions (skip when fd is not installed) ------------
+
+    /// #10972: a query without `/` is passed to fd as a regex, so regex
+    /// metacharacters must be escaped (`@[` used to match nothing or fail).
+    #[test]
+    fn fd_path_query_escapes_regex_metacharacters() {
+        assert_eq!(build_fd_path_query("plain"), "plain");
+        assert_eq!(build_fd_path_query("["), "\\[");
+        assert_eq!(build_fd_path_query("a(b"), "a\\(b");
+        assert_eq!(build_fd_path_query("foo+"), "foo\\+");
+        // Path queries escape each segment; the separator stays a class.
+        assert_eq!(build_fd_path_query("a(b/c[d"), "a\\(b[\\\\/]c\\[d");
+    }
 
     fn fd_path() -> Option<String> {
         resolve_fd_path()

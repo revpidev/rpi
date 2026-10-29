@@ -1274,8 +1274,10 @@ impl TuiMainScreenInner {
         let mut viewport_top = prev_viewport_top;
         let mut hardware_cursor_row = self.hardware_cursor_row;
 
-        // Render all components to get new lines.
-        let mut new_lines = self.render_children(width);
+        // Render all components to get new lines. Resolve fake cursors before
+        // compositing so overlays and line slicing see plain SGR codes
+        // (tui-main-screen.ts:265).
+        let mut new_lines = self.resolve_fake_cursors(self.render_children(width));
 
         // Composite overlays into the rendered lines (before differential compare).
         if !self.overlay_stack.is_empty() {
@@ -1856,9 +1858,9 @@ mod tests {
         EnvGuard, TestTui, VirtualTerminal, render_and_flush, send_input, settle, state_lock,
     };
     use crate::tui::{
-        CURSOR_MARKER, Component, Focusable, OverlayAnchor, OverlayMargin, OverlayMarginSpec,
-        OverlayOptions, OverlayUnfocusOptions, SizeValue, TuiInputListenerResult,
-        composite_tui_line, shared_component,
+        CURSOR_MARKER, Component, FAKE_CURSOR_START, Focusable, OverlayAnchor, OverlayMargin,
+        OverlayMarginSpec, OverlayOptions, OverlayUnfocusOptions, SizeValue,
+        TuiInputListenerResult, composite_tui_line, render_fake_cursor, shared_component,
     };
     use crate::tui_base::TuiBase;
     use crate::utils::slice_by_column;
@@ -3728,6 +3730,61 @@ mod tests {
             terminal.get_viewport()[0].contains("FIRST"),
             "FIRST should be visible after hiding SECOND"
         );
+        tui.stop(TuiStopOptions::default());
+    }
+
+    /// #10648/#10999: an extension overlay's own `done()` closes its own
+    /// entry, not the topmost one; a lower overlay's handle must leave the
+    /// upper overlay visible and focused.
+    #[test]
+    fn lower_overlay_handle_hides_only_its_own_entry() {
+        let terminal = VirtualTerminal::new(80, 24);
+        let tui = new_tui(&terminal);
+        tui.add_child(empty_content());
+        let (first, _) = static_overlay(&["FIRST"]);
+        let first_handle = tui.show_overlay(
+            first,
+            Some(OverlayOptions {
+                row: Some(SizeValue::Absolute(0)),
+                col: Some(SizeValue::Absolute(0)),
+                width: Some(SizeValue::Absolute(10)),
+                ..Default::default()
+            }),
+        );
+        let (second, _) = static_overlay(&["SECOND"]);
+        let second_component = second.clone();
+        let second_handle = tui.show_overlay(
+            second,
+            Some(OverlayOptions {
+                row: Some(SizeValue::Absolute(2)),
+                col: Some(SizeValue::Absolute(0)),
+                width: Some(SizeValue::Absolute(10)),
+                ..Default::default()
+            }),
+        );
+        tui.start();
+        render_and_flush(&tui);
+        assert!(terminal.get_viewport()[0].contains("FIRST"));
+        assert!(terminal.get_viewport()[2].contains("SECOND"));
+
+        // The lower overlay finishes first: the upper one stays on screen
+        // and keeps focus.
+        first_handle.hide();
+        render_and_flush(&tui);
+        let viewport = terminal.get_viewport();
+        assert!(!viewport.join("\n").contains("FIRST"), "{viewport:?}");
+        assert!(viewport[2].contains("SECOND"), "{viewport:?}");
+        let focused = tui.lock_inner().base.focused_component.clone();
+        assert!(
+            focused
+                .as_ref()
+                .is_some_and(|focused| same_component(focused, &second_component)),
+            "upper overlay keeps focus"
+        );
+
+        second_handle.hide();
+        render_and_flush(&tui);
+        assert!(!terminal.get_viewport().join("\n").contains("SECOND"));
         tui.stop(TuiStopOptions::default());
     }
 
@@ -5912,6 +5969,69 @@ mod tests {
             vec![release],
             "opted-in component receives release events"
         );
+        tui.stop(TuiStopOptions::default());
+    }
+
+    /// v1.2.0: `showHardwareCursor` uses only the terminal cursor — the
+    /// focused fake cursor is dropped, while an unfocused component keeps its
+    /// reverse-video cursor (tui.ts:1504-1510).
+    #[test]
+    fn hardware_cursor_suppresses_the_focused_fake_cursor() {
+        let terminal = VirtualTerminal::new(40, 10);
+        let tui = TuiMainScreen::with_options(
+            Box::new(terminal.clone()),
+            Some(true),
+            Some(temp_log_dir()),
+        );
+        let (component, lines) = test_component(&[""]);
+        *lock_shared(&lines) = vec![format!(
+            "left{}right",
+            format_args!("{}{}{}", CURSOR_MARKER, render_fake_cursor("Z"), "")
+        )];
+        tui.add_child(component.clone());
+        tui.set_focus(Some(component));
+        tui.start();
+        settle(&tui);
+
+        let writes = terminal.get_writes();
+        assert!(
+            !writes.contains(FAKE_CURSOR_START),
+            "markers resolved: {writes:?}"
+        );
+        assert!(
+            !writes.contains("\x1b[7mZ"),
+            "no fake cursor for the focused component"
+        );
+        assert!(
+            writes.contains("leftZright"),
+            "cursor text stays: {writes:?}"
+        );
+        assert_eq!(
+            terminal.get_cursor_position(),
+            (4, 0),
+            "hardware cursor on Z"
+        );
+        tui.stop(TuiStopOptions::default());
+
+        // Without the hardware cursor the same line renders reverse video.
+        let terminal = VirtualTerminal::new(40, 10);
+        let tui = TuiMainScreen::with_options(
+            Box::new(terminal.clone()),
+            Some(false),
+            Some(temp_log_dir()),
+        );
+        let (component, lines) = test_component(&[""]);
+        *lock_shared(&lines) = vec![format!("left{}right", render_fake_cursor("Z"))];
+        tui.add_child(component.clone());
+        tui.set_focus(Some(component));
+        tui.start();
+        settle(&tui);
+        let writes = terminal.get_writes();
+        assert!(
+            writes.contains("\x1b[7mZ\x1b[27m"),
+            "reverse-video fake cursor: {writes:?}"
+        );
+        assert!(!writes.contains(FAKE_CURSOR_START));
         tui.stop(TuiStopOptions::default());
     }
 

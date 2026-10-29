@@ -320,14 +320,25 @@ fn detect_capabilities_inner(
         };
     }
 
-    // Herdr supports OSC 8 but not images (terminal-image.ts:89-93 @
-    // b2363841a, #10573). Checked BEFORE the Kitty branch so leaked
-    // environment variables such as KITTY_WINDOW_ID do not enable images
-    // inside Herdr panes.
+    // Herdr forwards OSC 8 and supports the Kitty graphics protocol
+    // (terminal-image.ts:85-89 @ 4a080252f, #10774). Checked BEFORE the Kitty
+    // branch so leaked variables such as KITTY_WINDOW_ID do not change the
+    // reported capabilities inside Herdr panes.
     if term_program == "herdr" {
         return TerminalCapabilities {
-            images: None,
+            images: Some(ImageProtocol::Kitty),
             true_color: has_true_color_hint,
+            hyperlinks: true,
+        };
+    }
+
+    // Rex supports OSC 8 and partially implements the Kitty graphics
+    // protocol (no Unicode placeholders), which is enough for rpi
+    // (terminal-image.ts:91-96, #11131/#11150/#11183).
+    if term_program == "rex" {
+        return TerminalCapabilities {
+            images: Some(ImageProtocol::Kitty),
+            true_color: true,
             hyperlinks: true,
         };
     }
@@ -1647,20 +1658,20 @@ mod tests {
         });
     }
 
-    // terminal-image.test.ts: "enables hyperlinks without images for Herdr"
-    // (#10573, b2363841a).
+    // terminal-image.test.ts: "enables kitty images and hyperlinks for
+    // Herdr" (#10774).
     #[test]
-    fn test_detect_capabilities_enables_hyperlinks_without_images_for_herdr() {
+    fn test_detect_capabilities_enables_kitty_images_for_herdr() {
         with_env(
             &[
                 ("TERM_PROGRAM", Some("herdr")),
-                // A leaked Kitty variable must not turn images on inside a
-                // Herdr pane (the branch is checked before the Kitty one).
+                // A leaked Kitty variable must not change the Herdr branch
+                // (it is checked before the Kitty one).
                 ("KITTY_WINDOW_ID", Some("1")),
             ],
             || {
                 let caps = detect_capabilities();
-                assert_eq!(caps.images, None);
+                assert_eq!(caps.images, Some(ImageProtocol::Kitty));
                 assert!(caps.hyperlinks);
             },
         );
@@ -1673,6 +1684,21 @@ mod tests {
             || {
                 let caps = detect_capabilities();
                 assert!(!caps.hyperlinks);
+            },
+        );
+    }
+
+    // terminal-image.test.ts: Rex gets OSC 8, truecolor and kitty images
+    // (#11131/#11150/#11183).
+    #[test]
+    fn test_detect_capabilities_enables_rex_kitty_images_and_truecolor() {
+        with_env(
+            &[("TERM_PROGRAM", Some("rex")), ("COLORTERM", None)],
+            || {
+                let caps = detect_capabilities();
+                assert_eq!(caps.images, Some(ImageProtocol::Kitty));
+                assert!(caps.true_color);
+                assert!(caps.hyperlinks);
             },
         );
     }

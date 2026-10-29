@@ -25,7 +25,9 @@ use rpi_tui::components::select_list::{SelectItem, SelectList, SelectListTheme};
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
 use rpi_tui::components::truncated_text::TruncatedText;
-use rpi_tui::tui::{Component, Container, Focusable, RenderHandle};
+use rpi_tui::tui::{
+    Component, Container, FAKE_CURSOR_END, FAKE_CURSOR_START, Focusable, RenderHandle,
+};
 
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")
@@ -34,6 +36,16 @@ fn snapshot_dir() -> PathBuf {
 /// Compare `lines` against `tests/snapshots/<name>.snap`; rewrite the golden
 /// when `RPI_UPDATE_SNAPSHOTS=1` is set.
 fn assert_snapshot(name: &str, lines: &[String]) {
+    // Components emit fake-cursor markers; a started TUI resolves them to
+    // reverse video (or drops the focused one when the hardware cursor is
+    // shown). Snapshots capture the resolved, visible frame (tui.ts:1504).
+    let lines: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            line.replace(FAKE_CURSOR_START, "\x1b[7m")
+                .replace(FAKE_CURSOR_END, "\x1b[27m")
+        })
+        .collect();
     let actual = format!("{}\n", lines.join("\n"));
     let path = snapshot_dir().join(format!("{name}.snap"));
 

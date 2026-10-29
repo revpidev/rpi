@@ -42,6 +42,65 @@ const ESC: &str = "\x1b";
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 
+/// `isControlString` (stdin-buffer.ts:30-32): OSC, DCS and APC replies.
+fn is_control_string(data: &str) -> bool {
+    data.starts_with("\x1b]") || data.starts_with("\x1bP") || data.starts_with("\x1b_")
+}
+
+/// `TERMINAL_REPLY_HEADER_PATTERN` (stdin-buffer.ts:27-29): color replies
+/// (`OSC 10;`/`OSC 11;`/`OSC 4;<n>;`), program status (`OSC 7501;?`),
+/// XTVersion (`DCS >|`) and Kitty graphics (`APC G...;`). Until the header is
+/// complete the input may be batched legacy Alt keystrokes. Delayed replies
+/// must stay buffered until their terminator: flushing them would turn an
+/// OSC BEL into Ctrl+G (the external-editor shortcut) (#10256/#10657).
+fn is_terminal_reply_header(data: &str) -> bool {
+    let Some(rest) = data.strip_prefix('\x1b') else {
+        return false;
+    };
+    if let Some(osc) = rest.strip_prefix(']') {
+        if osc.starts_with("10;") || osc.starts_with("11;") {
+            return true;
+        }
+        if let Some(after_prefix) = osc.strip_prefix("4;") {
+            let digits = after_prefix.bytes().take_while(u8::is_ascii_digit).count();
+            return (1..=3).contains(&digits) && after_prefix[digits..].starts_with(';');
+        }
+        return osc.starts_with("7501;?");
+    }
+    if let Some(dcs) = rest.strip_prefix('P') {
+        return dcs.starts_with(">|");
+    }
+    let Some(apc) = rest.strip_prefix('_') else {
+        return false;
+    };
+    let Some(graphics) = apc.strip_prefix('G') else {
+        return false;
+    };
+    // `(?:[a-z]=\d+,)*[a-z]=\d+;`
+    let mut rest = graphics;
+    loop {
+        let Some(key) = rest.chars().next() else {
+            return false;
+        };
+        if !key.is_ascii_lowercase() {
+            return false;
+        }
+        let Some(after_key) = rest[1..].strip_prefix('=') else {
+            return false;
+        };
+        let digits = after_key.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        let after_digits = &after_key[digits..];
+        if let Some(after_comma) = after_digits.strip_prefix(',') {
+            rest = after_comma;
+            continue;
+        }
+        return after_digits.starts_with(';');
+    }
+}
+
 /// `DEFAULT_SEQUENCE_TIMEOUT_MS` (stdin-buffer.ts:23 @ 9841914): wait for an
 /// incomplete CSI/mouse fragment. Was 10ms before #7899 split the single
 /// timeout.
@@ -289,9 +348,30 @@ fn extract_complete_sequences(buffer: &str) -> (Vec<String>, String) {
 
         // Try to extract a sequence starting at this position
         if remaining.starts_with(ESC) {
+            let terminal_reply =
+                is_control_string(remaining) && is_terminal_reply_header(remaining);
             // Find the end of this escape sequence
             let mut seq_end = 1;
             while seq_end <= remaining.len() {
+                if terminal_reply && seq_end > 2 {
+                    let previous = remaining[..seq_end].chars().next_back();
+                    if matches!(previous, Some('\u{18}') | Some('\u{1a}')) {
+                        // CAN and SUB cancel the string, not subsequent
+                        // keyboard input.
+                        pos += seq_end;
+                        break;
+                    }
+                    if previous == Some('\u{1b}')
+                        && seq_end < remaining.len()
+                        && remaining.as_bytes()[seq_end] != b'\\'
+                    {
+                        // A new escape sequence aborts an unterminated reply.
+                        // Keep a trailing ESC buffered until we can distinguish
+                        // it from ST.
+                        pos += seq_end - 1;
+                        break;
+                    }
+                }
                 let candidate = &remaining[..seq_end];
                 let status = is_complete_sequence(candidate);
 
@@ -503,16 +583,24 @@ impl StdinBuffer {
         }
 
         if !self.buffer.is_empty() {
-            // `this.buffer === ESC ? this.escapeTimeoutMs : this.timeoutMs`
-            // (stdin-buffer.ts:285-293, 2a95ef70d / #7899): a lone ESC uses
-            // the escape timeout; any other incomplete tail (CSI/mouse
-            // fragments) uses the sequence timeout.
-            let timeout_ms = if self.buffer == "\x1b" {
-                self.escape_timeout
+            // Only a recognizable reply header establishes a delimited string.
+            // Flushing it would turn a delayed tail into text and an OSC's BEL
+            // terminator into Ctrl+G. Other input, including Alt+] followed by
+            // text, keeps the bounded ambiguous-input timeout.
+            if is_terminal_reply_header(&self.buffer) {
+                self.deadline = None;
             } else {
-                self.timeout
-            };
-            self.deadline = Some(Instant::now() + timeout_ms);
+                // `this.buffer === ESC ? this.escapeTimeoutMs : this.timeoutMs`
+                // (stdin-buffer.ts:285-293, 2a95ef70d / #7899): a lone ESC uses
+                // the escape timeout; any other incomplete tail (CSI/mouse
+                // fragments) uses the sequence timeout.
+                let timeout_ms = if self.buffer == "\x1b" {
+                    self.escape_timeout
+                } else {
+                    self.timeout
+                };
+                self.deadline = Some(Instant::now() + timeout_ms);
+            }
         }
 
         events
@@ -548,7 +636,26 @@ impl StdinBuffer {
     /// timer callback (flush + emit `data`).
     pub fn flush_expired(&mut self, now: Instant) -> Vec<String> {
         match self.deadline {
-            Some(deadline) if now >= deadline => self.flush(),
+            Some(deadline) if now >= deadline => {
+                let flushed = self.flush();
+                let mut sequences = Vec::new();
+                for sequence in flushed {
+                    if sequence.len() > 2 && is_control_string(&sequence) {
+                        // Recover the Alt key and reparse its tail so batched
+                        // text, Enter and control keys are not swallowed as
+                        // one event (stdin-buffer.ts:417-426).
+                        sequences.push(sequence.chars().take(2).collect());
+                        for event in self.process(&sequence[2..]) {
+                            if let StdinBufferEvent::Data(data) = event {
+                                sequences.push(data);
+                            }
+                        }
+                    } else {
+                        sequences.push(sequence);
+                    }
+                }
+                sequences
+            }
             _ => Vec::new(),
         }
     }
@@ -1237,5 +1344,137 @@ mod tests {
 
         // Wait longer than timeout: nothing is flushed.
         assert!(buffer.flush_expired(past_timeout()).is_empty());
+    }
+
+    /// stdin-buffer.test.ts "Terminal Reply Strings": every split after the
+    /// reply header stays buffered until the terminator, so a delayed tail is
+    /// never emitted as text and an OSC BEL is never Ctrl+G (#10256/#10657).
+    #[test]
+    fn delayed_terminal_replies_stay_buffered_until_their_terminator() {
+        let replies = [
+            ("\x1b]4;1;", "\x1b]4;1;rgb:eaea/6c6c/6d6d\x07"),
+            ("\x1b]10;", "\x1b]10;rgb:ffff/ffff/ffff\x1b\\"),
+            ("\x1b]11;", "\x1b]11;rgb:0000/0000/0000\x07"),
+            ("\x1bP>|", "\x1bP>|Ghostty 1.3.1\x1b\\"),
+            ("\x1b_Gi=1;", "\x1b_Gi=1;OK\x1b\\"),
+            ("\x1b]7501;?", "\x1b]7501;?\x1b\\"),
+        ];
+        for (header, reply) in replies {
+            for split in header.len()..reply.len() {
+                let mut buffer = StdinBuffer::default();
+                let mut sequences = data_events(&buffer.process(&reply[..split]));
+                assert!(
+                    buffer.flush_deadline().is_none(),
+                    "a reply header must not schedule an ambiguous-input flush: {reply:?} @ {split}"
+                );
+                // An expired (former) timeout must not break the reply.
+                sequences.extend(buffer.flush_expired(past_timeout()));
+                let rest = format!("{}x", &reply[split..]);
+                sequences.extend(data_events(&buffer.process(&rest)));
+                assert_eq!(
+                    sequences,
+                    vec![reply.to_string(), "x".to_string()],
+                    "{reply:?} split at {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn osc_reply_survives_multiple_expired_sequence_timeouts() {
+        let mut buffer = StdinBuffer::default();
+        let mut sequences = data_events(&buffer.process("\x1b]4;1;rgb:eaea/6c"));
+        sequences.extend(buffer.flush_expired(past_timeout()));
+        sequences.extend(data_events(&buffer.process("6c/6d6d")));
+        sequences.extend(buffer.flush_expired(past_timeout()));
+        assert!(sequences.is_empty(), "{sequences:?}");
+        sequences.extend(data_events(&buffer.process("\x07")));
+        assert_eq!(sequences, ["\x1b]4;1;rgb:eaea/6c6c/6d6d\x07"]);
+    }
+
+    /// Bare string introducers stay ambiguous input and time out as Alt keys.
+    #[test]
+    fn bare_string_introducers_time_out_as_alt_keys() {
+        for introducer in ["\x1b]", "\x1bP", "\x1b_"] {
+            let mut buffer = StdinBuffer::default();
+            assert!(data_events(&buffer.process(introducer)).is_empty());
+            assert!(buffer.flush_deadline().is_some());
+            assert_eq!(buffer.flush_expired(past_timeout()), [introducer]);
+        }
+    }
+
+    /// stdin-buffer.test.ts "recovers batched legacy Alt input": the flushed
+    /// string also recovers the tail as separate keys/Ctrl sequences.
+    #[test]
+    fn ambiguous_reply_prefixes_flush_with_a_reparsed_tail() {
+        for ambiguous in [
+            "\x1b]a",
+            "\x1b]1",
+            "\x1b]10",
+            "\x1b]0;title",
+            "\x1b]4;",
+            "\x1b]4;a;",
+            "\x1bPa",
+            "\x1bP>",
+            "\x1b_a",
+            "\x1b_G",
+            "\x1b_Gi=1",
+        ] {
+            let mut buffer = StdinBuffer::default();
+            let mut sequences = data_events(&buffer.process(ambiguous));
+            assert!(sequences.is_empty(), "{ambiguous:?}");
+            sequences.extend(data_events(&buffer.process("x\r\x03\x04")));
+            sequences.extend(buffer.flush_expired(past_timeout()));
+            let mut expected = vec![ambiguous[..2].to_string()];
+            expected.extend(ambiguous[2..].chars().map(String::from));
+            expected.extend(["x", "\r", "\x03", "\x04"].map(String::from));
+            assert_eq!(sequences, expected, "{ambiguous:?}");
+            assert_eq!(buffer.get_buffer(), "");
+
+            // Subsequent input is no longer ambiguous.
+            assert_eq!(
+                data_events(&buffer.process("y\r\x03\x04")),
+                ["y", "\r", "\x03", "\x04"]
+            );
+        }
+    }
+
+    #[test]
+    fn reply_header_assembled_within_the_ambiguous_timeout_stays_buffered() {
+        let mut buffer = StdinBuffer::default();
+        assert!(data_events(&buffer.process("\x1b]1")).is_empty());
+        assert!(buffer.flush_deadline().is_some());
+        assert!(data_events(&buffer.process("0;")).is_empty());
+        assert!(
+            buffer.flush_deadline().is_none(),
+            "the completed header cancels the ambiguous timeout"
+        );
+        assert!(buffer.flush_expired(past_timeout()).is_empty());
+        assert_eq!(
+            data_events(&buffer.process("rgb:ffff/ffff/ffff\x1b\\")),
+            ["\x1b]10;rgb:ffff/ffff/ffff\x1b\\"]
+        );
+    }
+
+    #[test]
+    fn unterminated_reply_recovers_when_a_new_escape_sequence_arrives() {
+        let mut buffer = StdinBuffer::default();
+        assert!(data_events(&buffer.process("\x1b]4;1;rgb:eaea/6c")).is_empty());
+        assert!(buffer.flush_expired(past_timeout()).is_empty());
+        assert!(data_events(&buffer.process("\x1b")).is_empty());
+        assert!(buffer.flush_expired(past_timeout()).is_empty());
+        assert_eq!(
+            data_events(&buffer.process("[Ahello")),
+            ["\x1b[A", "h", "e", "l", "l", "o"]
+        );
+    }
+
+    #[test]
+    fn canceled_reply_is_discarded_without_swallowing_input() {
+        for cancel in ['\u{18}', '\u{1a}'] {
+            let mut buffer = StdinBuffer::default();
+            let input = format!("\x1b]11;rgb:0000{cancel}x");
+            assert_eq!(data_events(&buffer.process(&input)), ["x"], "{cancel:?}");
+        }
     }
 }

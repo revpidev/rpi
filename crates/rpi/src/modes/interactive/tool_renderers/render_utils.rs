@@ -283,6 +283,53 @@ fn format_js_number(value: f64) -> String {
     }
 }
 
+/// `parseLineNumber` (render-utils.ts:31-34): finite numbers and non-empty
+/// numeric strings; everything else (null, bool, malformed text, Infinity) is
+/// not a line number.
+fn parse_line_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite()),
+        Value::Number(number) => number.as_f64().filter(|value| value.is_finite()),
+        _ => None,
+    }
+}
+
+/// `formatReadLineRange` (render-utils.ts:37-49): the `:start-end` suffix for
+/// a read call. Omitted optional arguments may arrive as `null` (strict
+/// schemas); numeric strings are accepted. A malformed offset or limit omits
+/// the whole range instead of rendering `NaN` (#9887).
+pub fn format_read_line_range(offset: Option<&Value>, limit: Option<&Value>) -> String {
+    let offset = offset.filter(|value| !value.is_null());
+    let limit = limit.filter(|value| !value.is_null());
+    if offset.is_none() && limit.is_none() {
+        return String::new();
+    }
+    let start = match offset {
+        None => 1.0,
+        Some(value) => match parse_line_number(value) {
+            Some(start) => start,
+            None => return String::new(),
+        },
+    };
+    let Some(limit) = limit else {
+        return format!(":{}", format_js_number(start));
+    };
+    let Some(count) = parse_line_number(limit) else {
+        return String::new();
+    };
+    let end = start + count - 1.0;
+    let range = format!(":{}", format_js_number(start));
+    if end != 0.0 {
+        format!("{range}-{}", format_js_number(end))
+    } else {
+        range
+    }
+}
+
 /// `shortenPath` (render-utils.ts:10-17): replace the home-dir prefix with
 /// `~` (unix `HOME`, same convention as `tools/path_utils.rs`).
 pub fn shorten_path(path: &str) -> String {

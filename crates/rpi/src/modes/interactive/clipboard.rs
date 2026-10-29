@@ -62,7 +62,8 @@ pub(crate) enum ClipboardPlatform {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClipboardEnv {
     pub platform: ClipboardPlatform,
-    /// `SSH_CONNECTION || SSH_CLIENT || MOSH_CONNECTION` (isRemoteSession).
+    /// `SSH_CONNECTION || SSH_CLIENT || MOSH_CONNECTION ||
+    /// RPI_CLIPBOARD_OSC52=1` (isRemoteSession, #10826/#10835/#10114).
     pub remote_session: bool,
     /// `TERMUX_VERSION`.
     pub termux: bool,
@@ -93,7 +94,11 @@ impl ClipboardEnv {
             platform,
             remote_session: truthy("SSH_CONNECTION")
                 || truthy("SSH_CLIENT")
-                || truthy("MOSH_CONNECTION"),
+                || truthy("MOSH_CONNECTION")
+                // Force OSC 52 for remote clients that leave no SSH markers,
+                // such as multiplexer attaches or IDE daemons (#10114,
+                // #10826, #10835). Only the exact value `1` opts in.
+                || clipboard_osc52_forced(truthy),
             termux: truthy("TERMUX_VERSION"),
             wayland: truthy("WAYLAND_DISPLAY"),
             x11: truthy("DISPLAY"),
@@ -101,6 +106,12 @@ impl ClipboardEnv {
             windows_terminal: truthy("WT_SESSION"),
         }
     }
+}
+
+/// `RPI_CLIPBOARD_OSC52 === "1"` (clipboard.ts:16-18; ADR-0001 rename of
+/// `PI_CLIPBOARD_OSC52`). The `truthy` seam is the environment reader.
+fn clipboard_osc52_forced(truthy: impl Fn(&str) -> bool) -> bool {
+    truthy("RPI_CLIPBOARD_OSC52") && std::env::var("RPI_CLIPBOARD_OSC52").as_deref() == Ok("1")
 }
 
 /// `isWSL` (wsl.ts:5-15, #9688 `6dff740fa`): env keys first, then the
@@ -310,7 +321,8 @@ pub(crate) fn run_clipboard_write_command(
     timeout_ms: u64,
 ) -> Option<Vec<u8>> {
     let is_query = input.is_none();
-    let mut child = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .stdin(if is_query {
             std::process::Stdio::null()
@@ -322,9 +334,16 @@ pub(crate) fn run_clipboard_write_command(
         } else {
             std::process::Stdio::null()
         })
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    // Clipboard writers can daemonize; detach on POSIX so Ctrl+Z (SIGTSTP to
+    // the foreground process group) does not suspend the clipboard owner
+    // (#11179, clipboard-command.ts:12-17).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().ok()?;
     // The writer may exit before consuming all input (stdin errors are
     // ignored, upstream: `child.stdin?.on("error", () => {})`). The
     // write runs on its own thread so the timeout loop stays in charge:
@@ -579,6 +598,28 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert_eq!(recorder.names(), vec!["wl-copy", "xclip", "xsel"]);
         assert_eq!(osc52, 0);
+    }
+
+    /// #10826/#10835/#10114: `RPI_CLIPBOARD_OSC52=1` opts a non-SSH remote
+    /// session into OSC 52; other values do not.
+    #[test]
+    fn rpi_clipboard_osc52_one_forces_remote_session() {
+        for value in [Some("1"), Some("0"), Some(""), None] {
+            let env = {
+                let (_lock, _guard) = crate::core::environment::test_env::EnvGuard::set(&[
+                    ("SSH_CONNECTION", None),
+                    ("SSH_CLIENT", None),
+                    ("MOSH_CONNECTION", None),
+                    ("RPI_CLIPBOARD_OSC52", value),
+                ]);
+                ClipboardEnv::from_env()
+            };
+            assert_eq!(
+                env.remote_session,
+                value == Some("1"),
+                "RPI_CLIPBOARD_OSC52={value:?}"
+            );
+        }
     }
 
     #[test]
@@ -1014,4 +1055,26 @@ mod tests {
         assert!(recorded.contains("'\\wsl.localhost\\Ubuntu\\tmp\\clip.txt'"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// #11179: clipboard helpers leave the foreground process group, so Ctrl+Z
+/// (SIGTSTP to the group) cannot suspend a daemonized clipboard owner.
+#[cfg(target_os = "linux")]
+#[test]
+fn clipboard_commands_lead_their_own_process_group() {
+    let out = run_clipboard_write_command(
+        "sh",
+        &[
+            "-c",
+            "read -r _ _ _ _ pgrp _ < /proc/self/stat; echo \"$$ $pgrp\"",
+        ],
+        None,
+        5_000,
+    )
+    .expect("query command succeeds");
+    let text = String::from_utf8(out).expect("utf8 output");
+    let mut fields = text.split_whitespace();
+    let pid: i32 = fields.next().expect("pid").parse().expect("pid int");
+    let pgrp: i32 = fields.next().expect("pgrp").parse().expect("pgrp int");
+    assert_eq!(pid, pgrp, "clipboard child must lead its own process group");
 }

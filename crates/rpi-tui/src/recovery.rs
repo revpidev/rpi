@@ -47,16 +47,19 @@ use crate::tui_main_screen::TuiMainScreen;
 /// (progress keepalive clear, cursor repositioning):
 /// 0. `\x1b[?1049l` — exit alternate screen (T32: the panic hook may fire
 ///    while the fullscreen renderer is active; this restores the main screen)
-/// 1. `\x1b[?2031l` — color scheme notifications off (`TuiMainScreen::stop_internal`)
-/// 2. `\x1b[?2004l` — bracketed paste off
-/// 3. `\x1b[<u` — pop Kitty keyboard protocol
-/// 4. `\x1b[>4;0m` — modifyOtherKeys off
-/// 5. `\x1b[?25h` — show cursor
+/// 1. `\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l` — mouse
+///    tracking and focus reporting off (upstream `getExitRestorePrefix`
+///    disables mouse unconditionally on the crash path, #11170)
+/// 2. `\x1b[?7h` — autowrap back on (upstream `ENABLE_AUTOWRAP`)
+/// 3. `\x1b[?2031l` — color scheme notifications off (`TuiMainScreen::stop_internal`)
+/// 4. `\x1b[?2004l` — bracketed paste off
+/// 5. `\x1b[<u` — pop Kitty keyboard protocol
+/// 6. `\x1b[>4;0m` — modifyOtherKeys off
+/// 7. `\x1b[?25h` — show cursor
 ///
 /// Raw mode restore (`crossterm::terminal::disable_raw_mode`) is a syscall,
 /// not part of this byte sequence.
-const MINIMAL_RESTORE_SEQUENCE: &str =
-    "\x1b[?1049l\x1b[?2031l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[?25h";
+const MINIMAL_RESTORE_SEQUENCE: &str = "\x1b[?1049l\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[?2031l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[?25h";
 
 /// Restore the terminal via `tui.stop()`; fall back to a fixed restore
 /// sequence + raw-mode reset when the `TuiMainScreen` lock is held by the panicking
@@ -341,6 +344,12 @@ mod tests {
     #[test]
     fn minimal_restore_sequence_covers_terminal_state() {
         for sequence in [
+            "\x1b[?1006l",
+            "\x1b[?1004l",
+            "\x1b[?1003l",
+            "\x1b[?1002l",
+            "\x1b[?1000l",
+            "\x1b[?7h",
             "\x1b[?2031l",
             "\x1b[?2004l",
             "\x1b[<u",

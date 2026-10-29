@@ -250,6 +250,32 @@ fn is_symbol_key(ch: char) -> bool {
     )
 }
 
+/// `SHIFTED_SYMBOL_KEYS` (keys.ts:292): symbols produced by Shift on a
+/// US/QWERTY layout. Used to accept a produced symbol (e.g. `+`) when the
+/// terminal reports the physical key (`=`) plus an implicit Shift.
+fn is_shifted_symbol_key(ch: char) -> bool {
+    "~!@#$%^&*()_+|{}:<>?".contains(ch)
+}
+
+/// `getLogicalShiftedSymbolCandidate` (keys.ts:372-381): consume the implicit
+/// Shift from a reported shifted key when its codepoint is an allowed symbol.
+fn get_logical_shifted_symbol_candidate(
+    codepoint: Option<i32>,
+    modifier: i32,
+    allowed: impl Fn(char) -> bool,
+) -> Option<(i32, i32)> {
+    let codepoint = codepoint?;
+    if modifier & MOD_SHIFT == 0 {
+        return None;
+    }
+    let normalized = normalize_kitty_functional_codepoint(codepoint);
+    let character = char::from_u32(normalized as u32)?;
+    if !allowed(character) {
+        return None;
+    }
+    Some((normalized, modifier & !MOD_SHIFT))
+}
+
 const MOD_SHIFT: i32 = 1;
 const MOD_ALT: i32 = 2;
 const MOD_CTRL: i32 = 4;
@@ -791,7 +817,18 @@ fn matches_kitty_sequence(data: &str, expected_codepoint: i32, expected_modifier
     let actual_mod = parsed.modifier & !LOCK_MASK;
     let expected_mod = expected_modifier & !LOCK_MASK;
 
-    // Check if modifiers match
+    // Logical match: Kitty reports symbols such as "+" as Shift plus the
+    // physical "=" key. Bindings name the produced symbol, so consume that
+    // implicit Shift while preserving Ctrl, Alt and Super. The physical
+    // "shift+=" spelling remains valid through the primary match below.
+    if let Some((codepoint, modifier)) =
+        get_logical_shifted_symbol_candidate(parsed.shifted_key, actual_mod, is_symbol_key)
+        && modifier == expected_mod
+        && codepoint == normalize_kitty_functional_codepoint(expected_codepoint)
+    {
+        return true;
+    }
+
     if actual_mod != expected_mod {
         return false;
     }
@@ -940,17 +977,23 @@ fn matches_printable_modify_other_keys(
     expected_keycode: i32,
     expected_modifier: i32,
 ) -> bool {
-    if expected_modifier == 0 {
-        return false;
-    }
     let Some(parsed) = parse_modify_other_keys_sequence(data) else {
         return false;
     };
-    if parsed.modifier != expected_modifier {
-        return false;
+    let physical_match = parsed.modifier == expected_modifier
+        && normalize_shifted_letter_identity_codepoint(parsed.codepoint, parsed.modifier)
+            == normalize_shifted_letter_identity_codepoint(expected_keycode, expected_modifier);
+    if physical_match {
+        return true;
     }
-    normalize_shifted_letter_identity_codepoint(parsed.codepoint, parsed.modifier)
-        == normalize_shifted_letter_identity_codepoint(expected_keycode, expected_modifier)
+    get_logical_shifted_symbol_candidate(
+        Some(parsed.codepoint),
+        parsed.modifier,
+        is_shifted_symbol_key,
+    )
+    .is_some_and(|(codepoint, modifier)| {
+        modifier == expected_modifier && codepoint == expected_keycode
+    })
 }
 
 /// `formatKeyNameWithModifiers` (keys.ts:776-786).
@@ -991,18 +1034,31 @@ struct ParsedKeyId {
 /// `parseKeyId` (keys.ts:788-801). Key identifiers are matched
 /// case-insensitively; modifier flags come from the split parts.
 fn parse_key_id(key_id: &str) -> Option<ParsedKeyId> {
-    let lower = key_id.to_lowercase();
-    let parts: Vec<&str> = lower.split('+').collect();
-    let key = *parts.last()?;
-    if key.is_empty() {
+    // `parseKeyId` (keys.ts:820-840): peel known modifier prefixes in
+    // `MODIFIER_NAMES` order so a key of `+` stays spellable as `ctrl++` and
+    // `+`. Duplicate modifiers and embedded `+` are invalid.
+    const MODIFIER_NAMES: [&str; 4] = ["shift", "alt", "ctrl", "super"];
+    let mut key = key_id.to_lowercase();
+    let mut modifiers: Vec<&str> = Vec::new();
+    while let Some(modifier) = MODIFIER_NAMES
+        .iter()
+        .find(|name| key.starts_with(&format!("{name}+")))
+    {
+        if modifiers.contains(modifier) {
+            return None;
+        }
+        modifiers.push(modifier);
+        key = key[modifier.len() + 1..].to_string();
+    }
+    if key.is_empty() || (key.contains('+') && key != "+") {
         return None;
     }
     Some(ParsedKeyId {
-        key: key.to_string(),
-        ctrl: parts.contains(&"ctrl"),
-        shift: parts.contains(&"shift"),
-        alt: parts.contains(&"alt"),
-        super_modifier: parts.contains(&"super"),
+        key,
+        ctrl: modifiers.contains(&"ctrl"),
+        shift: modifiers.contains(&"shift"),
+        alt: modifiers.contains(&"alt"),
+        super_modifier: modifiers.contains(&"super"),
     })
 }
 
@@ -1380,9 +1436,11 @@ pub fn matches_key(data: &str, key_id: &str) -> bool {
                             || matches_printable_modify_other_keys(data, codepoint, modifier);
                     }
 
-                    // Check both raw char and Kitty sequence (needed for release events)
+                    // Check raw char, Kitty and modifyOtherKeys (needed for
+                    // release events and unmodified symbol replies).
                     return (data.len() == 1 && data.as_bytes()[0] == ch as u8)
-                        || matches_kitty_sequence(data, codepoint, 0);
+                        || matches_kitty_sequence(data, codepoint, 0)
+                        || matches_printable_modify_other_keys(data, codepoint, 0);
                 }
             }
             false
@@ -1448,16 +1506,23 @@ fn format_parsed_key(
 pub fn parse_key(data: &str) -> Option<String> {
     let kitty = parse_kitty_sequence(data);
     if let Some(kitty) = kitty {
-        return format_parsed_key(kitty.codepoint, kitty.modifier, kitty.base_layout_key);
+        let logical_shifted_symbol =
+            get_logical_shifted_symbol_candidate(kitty.shifted_key, kitty.modifier, is_symbol_key);
+        let (codepoint, modifier) =
+            logical_shifted_symbol.unwrap_or((kitty.codepoint, kitty.modifier));
+        return format_parsed_key(codepoint, modifier, kitty.base_layout_key);
     }
 
     let modify_other_keys = parse_modify_other_keys_sequence(data);
     if let Some(modify_other_keys) = modify_other_keys {
-        return format_parsed_key(
-            modify_other_keys.codepoint,
+        let logical_shifted_symbol = get_logical_shifted_symbol_candidate(
+            Some(modify_other_keys.codepoint),
             modify_other_keys.modifier,
-            None,
+            is_shifted_symbol_key,
         );
+        let (codepoint, modifier) = logical_shifted_symbol
+            .unwrap_or((modify_other_keys.codepoint, modify_other_keys.modifier));
+        return format_parsed_key(codepoint, modifier, None);
     }
 
     // Mode-aware legacy sequences
@@ -2457,5 +2522,60 @@ mod tests {
             assert_eq!(Key::ctrl_shift_alt("x"), "ctrl+shift+alt+x");
             assert_eq!(Key::ctrl_shift_super("x"), "ctrl+shift+super+x");
         }
+    }
+
+    /// #9880: Kitty reports `+` as the physical `=` plus Shift; a binding for
+    /// the produced symbol matches, and the physical spelling keeps working.
+    #[test]
+    fn kitty_shifted_symbol_matches_the_produced_character() {
+        let _lock = lock_globals();
+        let _kitty = with_kitty(true);
+        assert!(matches_key("\x1b[61:43;2u", "+"));
+        assert!(matches_key("\x1b[61:43;2u", "shift+="));
+        assert_eq!(parse_key("\x1b[61:43;2u").as_deref(), Some("+"));
+        assert!(matches_key("\x1b[61:43;6u", "ctrl++"));
+        assert_eq!(parse_key("\x1b[61:43;6u").as_deref(), Some("ctrl++"));
+    }
+
+    /// #9880: xterm modifyOtherKeys reports the produced symbol for `+`.
+    #[test]
+    fn modify_other_keys_shifted_symbol_matches_the_produced_character() {
+        let _lock = lock_globals();
+        let _kitty = with_kitty(false);
+        assert!(matches_key("\x1b[27;6;43~", "ctrl++"));
+        assert_eq!(parse_key("\x1b[27;6;43~").as_deref(), Some("ctrl++"));
+        assert!(matches_key("\x1b[27;2;43~", "+"));
+        assert_eq!(parse_key("\x1b[27;2;43~").as_deref(), Some("+"));
+    }
+
+    /// The logical-shift rewrite keeps shifted letters and physical symbol
+    /// combos working (no regression in the earlier shifted-key paths).
+    #[test]
+    fn shifted_letter_and_physical_symbols_still_match() {
+        let _lock = lock_globals();
+        let _kitty = with_kitty(true);
+        assert!(matches_key("\x1b[99:67:99;2u", "shift+c"));
+        assert!(matches_key("\x1b[61:43;2u", "shift+="));
+        assert!(!matches_key("\x1b[61:43;2u", "ctrl++"));
+    }
+
+    /// `parseKeyId` (keys.ts:820-840): `+` is a valid key, so `ctrl++` and
+    /// `+` parse; embedded/duplicate `+` spellings are rejected.
+    #[test]
+    fn parse_key_id_accepts_the_plus_key() {
+        let parsed = parse_key_id("ctrl++").expect("ctrl++");
+        assert_eq!(parsed.key, "+");
+        assert!(parsed.ctrl);
+        assert!(!parsed.shift);
+
+        let parsed = parse_key_id("+").expect("+");
+        assert_eq!(parsed.key, "+");
+
+        let parsed = parse_key_id("shift+ctrl++").expect("shift+ctrl++");
+        assert_eq!(parsed.key, "+");
+        assert!(parsed.shift && parsed.ctrl);
+
+        assert!(parse_key_id("ctrl+a+b").is_none());
+        assert!(parse_key_id("ctrl+ctrl+a").is_none());
     }
 }

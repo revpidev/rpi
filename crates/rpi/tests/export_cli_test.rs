@@ -90,3 +90,77 @@ fn export_missing_file_exits_1() {
         "stderr: {stderr}"
     );
 }
+
+/// FR-B R3 behavior review of the synced export assets: the viewer's
+/// `formatReadLineRange` accepts numeric strings and nulls like the TUI
+/// (shared contract, #9887), and the CJK-friendly tokenizer stays wired
+/// (#10154). The asset itself is byte-pinned by the rpi test
+/// `embedded_assets_match_upstream_byte_for_byte`; this test executes the
+/// extracted function with Node so a future template change cannot silently
+/// drop the behavior. Skipped when Node is unavailable (recorded boundary).
+#[test]
+fn exported_viewer_read_line_range_and_cjk_wiring() {
+    let template =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/core/export_html/template.js");
+    let source = std::fs::read_to_string(&template).expect("embedded template.js");
+    assert!(
+        source.contains("emStrong: markedCjkFriendly().tokenizer.emStrong"),
+        "CJK-friendly emphasis tokenizer must stay wired"
+    );
+
+    let start = source
+        .find("function parseLineNumber")
+        .expect("viewer parseLineNumber");
+    let end = source[start..]
+        .find("function getLanguageFromPath")
+        .map(|offset| start + offset)
+        .expect("function after formatReadLineRange");
+    let functions = &source[start..end];
+
+    let node = Command::new("node").arg("--version").output();
+    let Ok(version) = node else {
+        eprintln!("skipping: node is not installed");
+        return;
+    };
+    if !version.status.success() {
+        eprintln!("skipping: node is not usable");
+        return;
+    }
+
+    let cases = r#"
+const cases = [
+  [undefined, undefined],
+  [25, 13],
+  ["25", "13"],
+  [null, "13"],
+  ["25", null],
+  [undefined, undefined],
+  ["abc", 13],
+  [25, "abc"],
+  [25, 0],
+  [0, 10],
+];
+"#;
+    let script = format!(
+        "{functions}\n{cases}\nconsole.log(JSON.stringify(cases.map(([o, l]) => formatReadLineRange(o, l))));"
+    );
+    let tmp = TempDir::new();
+    let script_path = tmp.path().join("read-range.js");
+    std::fs::write(&script_path, script).expect("write script");
+    let output = Command::new("node")
+        .arg(&script_path)
+        .output()
+        .expect("run node");
+    assert!(
+        output.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ranges: Vec<String> = serde_json::from_slice(&output.stdout).expect("range matrix JSON");
+    assert_eq!(
+        ranges,
+        [
+            "", ":25-37", ":25-37", ":1-13", ":25", "", "", "", ":25-24", ":0-9"
+        ]
+    );
+}

@@ -25,7 +25,10 @@ use rpi_tui::components::text::Text;
 use rpi_tui::tui::Component;
 use serde_json::Value;
 
-use super::render_utils::{render_tool_path, replace_tabs, resolve_to_cwd, str_value};
+use super::render_utils::{
+    format_read_line_range as shared_read_line_range, render_tool_path, replace_tabs,
+    resolve_to_cwd, str_value,
+};
 use crate::config::get_package_dir;
 use crate::core::highlight::{get_language_from_path, highlight_code};
 use crate::core::themes::Theme;
@@ -60,39 +63,17 @@ fn read_render_path(args: &Value) -> Option<String> {
     }
 }
 
-/// JS `Number#toString` for interpolated numbers: integral values print
-/// without a decimal point (same helper as the bash renderer's).
-fn format_js_number(value: f64) -> String {
-    if value.fract() == 0.0 && value.abs() < 1e15 {
-        format!("{}", value as i64)
-    } else {
-        format!("{value}")
-    }
-}
-
-/// `formatReadLineRange` (read.ts:72-77): the `:start-end` suffix for the
-/// `offset`/`limit` args. No suffix when both are absent; `limit` is
-/// 1-based-inclusive, so `offset: 10, limit: 11` renders `:10-20`.
+/// `formatReadLineRange` (render-utils.ts:37-49): the `:start-end` suffix for
+/// the `offset`/`limit` args, themed for the expanded call line. The shared
+/// helper accepts numbers, numeric strings and nulls so the session tree and
+/// the HTML export (whose template.js has the same contract) agree with it.
 fn format_read_line_range(args: &Value, theme: &Theme) -> String {
-    let offset = args.get("offset").and_then(Value::as_f64);
-    let limit = args.get("limit").and_then(Value::as_f64);
-    if offset.is_none() && limit.is_none() {
-        return String::new();
+    let range = shared_read_line_range(args.get("offset"), args.get("limit"));
+    if range.is_empty() {
+        String::new()
+    } else {
+        theme.fg("warning", &range)
     }
-    // read.ts:74: `startLine = args.offset ?? 1`.
-    let start_line = offset.unwrap_or(1.0);
-    // read.ts:75: `endLine = startLine + args.limit - 1`, and the JS
-    // truthiness of the computed end line decides the suffix (`0` is falsy,
-    // so `offset: 1, limit: 0` renders `:1`).
-    let end_line = match limit.map(|l| start_line + l - 1.0) {
-        Some(v) if v != 0.0 => format_js_number(v),
-        _ => String::new(),
-    };
-    let mut range = format!(":{}", format_js_number(start_line));
-    if !end_line.is_empty() {
-        range.push_str(&format!("-{end_line}"));
-    }
-    theme.fg("warning", &range)
 }
 
 /// `formatReadCall` (read.ts:79-82): the expanded call line.
@@ -576,6 +557,51 @@ mod tests {
                 &theme
             )),
             ":0-9"
+        );
+        // #9887: numeric strings and nulls share the same contract as the
+        // session tree and the exported viewer.
+        assert_eq!(
+            strip_escape_sequences(&format_read_line_range(
+                &json!({"offset": "25", "limit": "13"}),
+                &theme
+            )),
+            ":25-37"
+        );
+        assert_eq!(
+            strip_escape_sequences(&format_read_line_range(
+                &json!({"offset": null, "limit": "13"}),
+                &theme
+            )),
+            ":1-13"
+        );
+        assert_eq!(
+            strip_escape_sequences(&format_read_line_range(
+                &json!({"offset": "25", "limit": null}),
+                &theme
+            )),
+            ":25"
+        );
+        // Malformed numbers omit the whole range instead of rendering NaN.
+        assert_eq!(
+            strip_escape_sequences(&format_read_line_range(
+                &json!({"offset": "abc", "limit": 13}),
+                &theme
+            )),
+            ""
+        );
+        assert_eq!(
+            strip_escape_sequences(&format_read_line_range(
+                &json!({"offset": "Infinity", "limit": 13}),
+                &theme
+            )),
+            ""
+        );
+        assert_eq!(
+            strip_escape_sequences(&format_read_line_range(
+                &json!({"offset": 25, "limit": "abc"}),
+                &theme
+            )),
+            ""
         );
         // #9996 (`49681e1b7`): strict tool schemas make models send null for
         // omitted optional fields, which must render as a full-file read.

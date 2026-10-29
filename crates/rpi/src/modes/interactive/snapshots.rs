@@ -28,6 +28,7 @@ use rpi_ai::types::{
 };
 use rpi_tui::tui::Component as _;
 use rpi_tui::tui::RenderHandle;
+use rpi_tui::tui::{FAKE_CURSOR_END, FAKE_CURSOR_START};
 
 use crate::core::agent_session::ParsedSkillBlock;
 use crate::core::themes::{Theme, load_theme};
@@ -49,6 +50,15 @@ fn snapshot_dir() -> PathBuf {
 /// Compare `lines` against `tests/snapshots/<name>.snap`; rewrite the golden
 /// when `RPI_UPDATE_SNAPSHOTS=1` is set.
 pub(crate) fn assert_snapshot(name: &str, lines: &[String]) {
+    // Components emit fake-cursor markers; a started TUI resolves them to
+    // reverse video (tui.ts:1504). Snapshots capture the visible frame.
+    let lines: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            line.replace(FAKE_CURSOR_START, "\x1b[7m")
+                .replace(FAKE_CURSOR_END, "\x1b[27m")
+        })
+        .collect();
     let actual = format!("{}\n", lines.join("\n"));
     let path = snapshot_dir().join(format!("{name}.snap"));
 

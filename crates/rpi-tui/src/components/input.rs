@@ -17,7 +17,7 @@ use crate::keys::decode_kitty_printable;
 use crate::kill_ring::{KillRing, KillRingPushOptions};
 use crate::tui::{
     CURSOR_MARKER, Component, Focusable, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult,
-    TuiMouseEventType, TuiMouseHandlerResult,
+    TuiMouseEventType, TuiMouseHandlerResult, render_fake_cursor,
 };
 use crate::undo_stack::UndoStack;
 use crate::utils::{
@@ -393,7 +393,7 @@ impl Component for Input {
             let after_cursor = &placeholder[at_cursor.len()..];
             let marker = if self.focused { CURSOR_MARKER } else { "" };
             let placeholder_style = &self.placeholder_style;
-            let cursor_char = format!("\x1b[7m{}\x1b[27m", placeholder_style(at_cursor));
+            let cursor_char = render_fake_cursor(&placeholder_style(at_cursor));
             let text_with_cursor =
                 format!("{marker}{cursor_char}{}", placeholder_style(after_cursor));
             let padding =
@@ -474,8 +474,9 @@ impl Component for Input {
         // IME positioning)
         let marker = if self.focused { CURSOR_MARKER } else { "" };
 
-        // Use inverse video to show cursor
-        let cursor_char = format!("\x1b[7m{at_cursor}\x1b[27m"); // ESC[7m = reverse video, ESC[27m = normal
+        // TUI draws the fake cursor in reverse video, or omits it when the
+        // hardware cursor is shown.
+        let cursor_char = render_fake_cursor(at_cursor);
         let text_with_cursor = format!("{before_cursor}{marker}{cursor_char}{after_cursor}");
 
         // Calculate visual width
@@ -1475,6 +1476,35 @@ mod tests {
             let mut event = input_mouse_event(TuiMouseEventType::Press, 3, 0);
             event.button = button;
             assert!(field.handle_mouse(&event).is_none());
+        }
+    }
+
+    fn strip_ansi_input(input: &str) -> String {
+        rpi_test_support::vt::strip_ansi(input)
+    }
+
+    /// FR-F R3 width matrix: 40/80/120 columns with CJK input.
+    #[test]
+    fn renders_cjk_input_within_40_80_120_columns() {
+        let value = "中文 mixed ASCII 以及较长的说明文字";
+        for width in [40usize, 80, 120] {
+            let mut input = Input::new();
+            input.set_focused(true);
+            input.set_value(value);
+            let lines = input.render(width);
+            for (index, line) in lines.iter().enumerate() {
+                let line_width = visible_width(line);
+                assert!(
+                    line_width <= width,
+                    "width {width}: line {index} is {line_width} columns: {line:?}"
+                );
+            }
+            let joined: String = lines
+                .iter()
+                .map(|line| strip_ansi_input(line))
+                .collect::<Vec<_>>()
+                .join("");
+            assert!(joined.contains("中文"), "width {width}: {joined:?}");
         }
     }
 }

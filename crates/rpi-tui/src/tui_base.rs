@@ -41,10 +41,11 @@ use crate::terminal_colors::{
 };
 use crate::terminal_image::{CellDimensions, get_capabilities, is_image_line, set_cell_dimensions};
 use crate::tui::{
-    CURSOR_MARKER, Component, OverlayAnchor, OverlayBounds, OverlayMargin, OverlayMarginSpec,
-    OverlayOptions, OverlayUnfocusOptions, SEGMENT_RESET, SharedComponent, SharedTerminal,
-    SizeValue, TerminalColorLateReply, TerminalColorSchemeListener, TuiInputListener,
-    composite_tui_line, lock_component, lock_shared, parse_size_value, same_component,
+    CURSOR_MARKER, Component, FAKE_CURSOR_END, FAKE_CURSOR_START, OverlayAnchor, OverlayBounds,
+    OverlayMargin, OverlayMarginSpec, OverlayOptions, OverlayUnfocusOptions, SEGMENT_RESET,
+    SharedComponent, SharedTerminal, SizeValue, TerminalColorLateReply,
+    TerminalColorSchemeListener, TuiInputListener, composite_tui_line, lock_component, lock_shared,
+    parse_size_value, same_component,
 };
 use crate::utils::{normalize_terminal_output, slice_by_column, visible_width};
 
@@ -310,6 +311,32 @@ pub(crate) struct RenderedOverlayLayout {
     pub(crate) col: i32,
     pub(crate) width: i32,
     pub(crate) height: i32,
+}
+
+/// `FOCUSED_FAKE_CURSOR` (tui.ts:202, first match only, dotall): remove the
+/// marker pair that follows a [`CURSOR_MARKER`], keeping the text (the
+/// hardware cursor is positioned there). A truncated line (no end marker)
+/// resolves to the end of the line.
+fn strip_focused_fake_cursor(line: &str) -> String {
+    let Some(marker_index) = line.find(CURSOR_MARKER) else {
+        return line.to_string();
+    };
+    let after_marker = marker_index + CURSOR_MARKER.len();
+    if !line[after_marker..].starts_with(FAKE_CURSOR_START) {
+        return line.to_string();
+    }
+    let content_start = after_marker + FAKE_CURSOR_START.len();
+    let content_end = line[content_start..]
+        .find(FAKE_CURSOR_END)
+        .map(|offset| content_start + offset)
+        .unwrap_or(line.len());
+    let mut result = String::with_capacity(line.len());
+    result.push_str(&line[..after_marker]);
+    result.push_str(&line[content_start..content_end]);
+    if content_end < line.len() {
+        result.push_str(&line[content_end + FAKE_CURSOR_END.len()..]);
+    }
+    result
 }
 
 impl TuiBase {
@@ -1055,9 +1082,11 @@ impl TuiBase {
             let initial =
                 TuiBase::resolve_overlay_layout(entry.options.as_ref(), 0, term_width, term_height);
 
-            // Render component at calculated width.
-            let mut overlay_lines =
-                lock_component(&entry.component).render(initial.width.max(0) as usize);
+            // Render component at calculated width; overlays resolve their
+            // own fake cursors (tui.ts:1399).
+            let mut overlay_lines = self.resolve_fake_cursors(
+                lock_component(&entry.component).render(initial.width.max(0) as usize),
+            );
 
             // Apply maxHeight if specified.
             if let Some(max_height) = initial.max_height
@@ -1151,6 +1180,30 @@ impl TuiBase {
                 *line = normalize_terminal_output(line) + SEGMENT_RESET;
             }
         }
+    }
+
+    /// `resolveFakeCursors` (tui.ts:1504-1510): turn fake-cursor markers into
+    /// reverse video. With `showHardwareCursor` the focused component's fake
+    /// cursor (`CURSOR_MARKER` immediately followed by the marker pair) is
+    /// dropped so only the terminal's hardware cursor is drawn (no double
+    /// cursor, v1.2.0); unfocused components keep their reverse-video cursor.
+    pub(crate) fn resolve_fake_cursors(&self, lines: Vec<String>) -> Vec<String> {
+        lines
+            .into_iter()
+            .map(|line| {
+                if !line.contains(FAKE_CURSOR_START) {
+                    return line;
+                }
+                let resolved = if self.show_hardware_cursor {
+                    strip_focused_fake_cursor(&line)
+                } else {
+                    line
+                };
+                resolved
+                    .replace(FAKE_CURSOR_START, "\x1b[7m")
+                    .replace(FAKE_CURSOR_END, "\x1b[27m")
+            })
+            .collect()
     }
 
     /// `extractCursorPosition` (tui.ts:1238-1256): find CURSOR_MARKER in the

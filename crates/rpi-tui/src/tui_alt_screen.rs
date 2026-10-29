@@ -1694,6 +1694,7 @@ impl TuiAltScreenInner {
                 .iter()
                 .map(|line| strip_osc133_zone_prefix(line).to_string())
                 .collect();
+            let document_lines = self.resolve_fake_cursors(document_lines);
             let mut processed: Vec<String> = document_lines
                 .iter()
                 .map(|line| line.replace(CURSOR_MARKER, ""))
@@ -2284,9 +2285,9 @@ impl TuiAltScreenInner {
                 }
                 return Some(consume());
             }
-            if self.should_defer_viewport_input_to_overlay() {
-                return None;
-            }
+            // A focused fullscreen overlay does not block transcript wheel
+            // scrolling (tui-alt-screen.ts:729, #10769); it only gets the
+            // event when its dispatch consumed it above.
             self.route_wheel(wheel_event, wheel_delta);
             return Some(consume());
         }
@@ -4037,11 +4038,14 @@ impl TuiAltScreenInner {
         if self.refresh_search(&next_layout) {
             next_layout = render_layout_frame(&root, width, height, self.render_handle.clone());
         }
-        let mut screen: Vec<String> = next_layout
+        let screen: Vec<String> = next_layout
             .lines
             .iter()
             .map(|line| strip_osc133_zone_prefix(line).to_string())
             .collect();
+        // Resolve fake cursors before highlighting and compositing, which only
+        // track SGR codes (tui-alt-screen.ts:1699-1700).
+        let mut screen = self.resolve_fake_cursors(screen);
         screen = self.apply_search_highlights(screen, &next_layout);
         screen = self.composite_scroll_to_end_indicator(screen, &next_layout, width);
         screen = self.composite_overlays(screen, width as i32, height as i32);
@@ -7489,7 +7493,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_handler_receives_clicks_and_focused_overlay_defers_viewport_keys() {
+    fn overlay_handler_receives_clicks_and_focused_overlay_defers_page_keys() {
         let _caps = CapsGuard::lock_only();
         let terminal = RecordingTerminal::new(20, 4);
         let tui = TuiAltScreen::new(Box::new(terminal.clone()));
@@ -7536,16 +7540,23 @@ mod tests {
             "overlay handler receives click: {events:?}"
         );
 
-        // FR-G (2e4d23959): wheel and PageUp defer to the focused overlay —
-        // the viewport must not scroll.
+        // #10769: unconsumed wheel events still scroll the transcript while
+        // an overlay holds focus (the overlay only gets what it consumes).
         send_input(&terminal, &tui, "\x1b[<64;1;1M");
         send_input(&terminal, &tui, "\x1b[<64;1;1M");
+        settle(&tui);
+        let after_wheel = tui.viewport_top();
+        assert!(
+            after_wheel < before_top,
+            "focused overlay does not block wheel scrolling: {after_wheel} vs {before_top}"
+        );
+        // Page keys still defer to the focused overlay.
         send_input(&terminal, &tui, "\x1b[5~");
         settle(&tui);
         assert_eq!(
             tui.viewport_top(),
-            before_top,
-            "focused overlay defers viewport scrolling"
+            after_wheel,
+            "focused overlay defers PageUp"
         );
 
         // Closing the overlay restores viewport scrolling.
@@ -7554,7 +7565,7 @@ mod tests {
         assert!(!tui.lock_inner().base.is_overlay_focused());
         send_input(&terminal, &tui, "\x1b[<64;1;1M");
         settle(&tui);
-        assert_eq!(tui.viewport_top(), before_top - 1);
+        assert_eq!(tui.viewport_top(), after_wheel - 1);
         let _ = handle;
 
         stop(&tui);

@@ -99,8 +99,8 @@ pub fn strip_ansi(input: &str) -> String {
                     i = (j + 1).min(bytes.len());
                     continue;
                 }
-                Some(b']') => {
-                    // OSC: ESC ] … terminated by BEL or ESC\
+                Some(b']') | Some(b'P') | Some(b'_') | Some(b'X') | Some(b'^') => {
+                    // OSC/DCS/APC/PM/SOS: ESC <introducer> … terminated by BEL or ST (ESC \\)
                     let mut j = i + 2;
                     while j < bytes.len() {
                         if bytes[j] == 0x07 {

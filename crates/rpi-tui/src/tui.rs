@@ -163,6 +163,22 @@ use crate::utils::{extract_segments, slice_by_column, slice_with_width, visible_
 /// hardware cursor there (IME candidate window positioning).
 pub const CURSOR_MARKER: &str = "\x1b_pi:c\x07";
 
+/// `FAKE_CURSOR_START` (tui.ts:199): zero-width APC around the text drawn as
+/// the cursor. [`TuiBase`](crate::tui_base::TuiBase) resolves the markers to
+/// reverse video, or drops them on the focused component when the hardware
+/// cursor is shown ([`render_fake_cursor`]).
+pub const FAKE_CURSOR_START: &str = "\x1b_pi:fc\x07";
+/// `FAKE_CURSOR_END` (tui.ts:200).
+pub const FAKE_CURSOR_END: &str = "\x1b_pi:/fc\x07";
+
+/// `renderFakeCursor` (tui.ts:205-207): wrap the cursor cell in fake-cursor
+/// markers. `CURSOR_MARKER + FAKE_CURSOR_START + text + FAKE_CURSOR_END`
+/// (truncating the line right after the cursor cell drops the end marker,
+/// which resolves as a focus-less fake cursor).
+pub fn render_fake_cursor(text: &str) -> String {
+    format!("{FAKE_CURSOR_START}{text}{FAKE_CURSOR_END}")
+}
+
 /// Component interface - all components must implement this
 /// (upstream `Component`, tui.ts:64).
 ///
