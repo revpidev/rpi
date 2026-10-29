@@ -30,8 +30,8 @@ use rpi_durable::session::{DocOwner, EntryDraft};
 use rpi_durable::types::{EntryRecord, InputSubmissionStatus, SubmissionRecord};
 
 use generation_support::{
-    Script, context, entries, error_message, open, root_ready, submit_input, test_models,
-    text_message, tool_use_message,
+    Script, context, entries, error_message, open, open_with_sources, root_ready, submit_input,
+    test_models, text_message, tool_use_message,
 };
 
 /// Assistant text of every `pi.assistant` entry, in order.
@@ -608,4 +608,60 @@ async fn manual_compaction_places_summary() {
         })
         .unwrap_or_default();
     assert!(text.contains("the summary"), "got {text}");
+}
+
+/// V18-06 FR-F: a dynamic model source is read at each use, not cached at open.
+#[tokio::test]
+async fn dynamic_models_source_is_read_for_each_request() {
+    use rpi_durable::harness::ModelsSource;
+    use rpi_durable::storage::MemoryStorage;
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let base = test_models(vec![Script::Message(text_message("ok", StopReason::Stop))]);
+    let counter = Arc::clone(&calls);
+    let source = ModelsSource::Dynamic(Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        base.clone()
+    }));
+    let opened = open_with_sources(
+        Arc::new(MemoryStorage::new()),
+        Vec::new(),
+        None,
+        source,
+        None,
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    submission.wait(&context()).await.expect("wait");
+    assert!(calls.load(Ordering::SeqCst) >= 1);
+}
+
+/// V18-06 FR-F: a dynamic settings source is read at each scheduling use.
+#[tokio::test]
+async fn dynamic_settings_source_is_read_for_each_use() {
+    use rpi_durable::harness::{HarnessSettings, ModelsSource, SettingsSource};
+    use rpi_durable::storage::MemoryStorage;
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let source = SettingsSource::Dynamic(Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Some(HarnessSettings::default())
+    }));
+    let opened = open_with_sources(
+        Arc::new(MemoryStorage::new()),
+        Vec::new(),
+        Some(source),
+        ModelsSource::Fixed(test_models(vec![Script::Message(text_message(
+            "ok",
+            StopReason::Stop,
+        ))])),
+        None,
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    submission.wait(&context()).await.expect("wait");
+    assert!(calls.load(Ordering::SeqCst) >= 1);
 }

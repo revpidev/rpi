@@ -27,10 +27,10 @@ use crate::env::decode::StreamDecoder;
 use crate::env::node_watch::{NodeFileWatcher, NodeWatchMode, NodeWatchOptions};
 use crate::env::types::{
     BinaryReader, CreateDirOptions, CreateTempFileOptions, DirPage, DirReader, ExecutionError,
-    ExecutionErrorCode, FileContent, FileInfo, FileKind, FileSystem, FileWatcher, LineScan,
-    OpenBinaryReaderOptions, ReadTextLinesOptions, RemoveOptions, ScanLinesOptions, Shell,
-    ShellCommand, ShellExecOptions, ShellExecResult, ShellOutputInfo, ShellStream, TextLine,
-    TextLineReader, WatchTarget,
+    ExecutionErrorCode, FileContent, FileInfo, FileKind, FileListEntry, FileListing, FileSystem,
+    FileWatcher, LineScan, ListFilesOptions, OpenBinaryReaderOptions, ReadTextLinesOptions,
+    RemoveOptions, ScanLinesOptions, Shell, ShellCommand, ShellExecOptions, ShellExecResult,
+    ShellOutputInfo, ShellStream, TextLine, TextLineReader, WatchTarget,
 };
 use crate::errors::{FileError, FileErrorCode};
 
@@ -1423,6 +1423,28 @@ impl FileSystem for NodeExecutionEnv {
         Ok(infos)
     }
 
+    async fn list_files(
+        &self,
+        path: &str,
+        options: Option<ListFilesOptions>,
+        context: &Context,
+    ) -> Result<FileListing, FileError> {
+        abort_result(context, None)?;
+        let resolved = PathBuf::from(self.resolve(path));
+        let metadata = tokio::fs::symlink_metadata(&resolved)
+            .await
+            .map_err(|error| to_file_error(&error, Some(&resolved.to_string_lossy())))?;
+        if !metadata.is_dir() {
+            return Err(FileError::with_path(
+                crate::errors::FileErrorCode::NotDirectory,
+                "Not a directory",
+                resolved.to_string_lossy(),
+            ));
+        }
+        let options = options.unwrap_or_default();
+        list_files_in(&resolved, options, context).await
+    }
+
     async fn open_dir_reader(
         &self,
         path: &str,
@@ -1610,4 +1632,330 @@ pub fn default_watch_mode() -> NodeWatchMode {
     } else {
         NodeWatchMode::Native
     }
+}
+
+// ---------------------------------------------------------------------------
+// list_files
+// ---------------------------------------------------------------------------
+
+const DEFAULT_LIST_MAX_ENTRIES: usize = 50_000;
+const DEFAULT_LIST_MAX_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LIST_MAX_BYTES: usize = 15_900_000;
+const DEFAULT_LIST_TIMEOUT_MS: u64 = 10_000;
+
+#[derive(Debug, Clone)]
+struct IgnoreRule {
+    base: String,
+    pattern: String,
+    negated: bool,
+    dir_only: bool,
+    anchored: bool,
+}
+
+fn find_worktree_root(start: &std::path::Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(dir) = current {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn path_relative(root: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
+fn parse_ignore_file(text: &str, base: &str) -> Vec<IgnoreRule> {
+    let mut rules = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r').trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut pattern = line.to_string();
+        let negated = pattern.starts_with('!');
+        if negated {
+            pattern.remove(0);
+        }
+        if pattern.is_empty() {
+            continue;
+        }
+        let dir_only = pattern.ends_with('/');
+        if dir_only {
+            pattern.pop();
+        }
+        let anchored = pattern.starts_with('/');
+        if anchored {
+            pattern.remove(0);
+        }
+        if pattern.is_empty() {
+            continue;
+        }
+        rules.push(IgnoreRule {
+            base: base.trim_matches('/').to_string(),
+            pattern,
+            negated,
+            dir_only,
+            anchored,
+        });
+    }
+    rules
+}
+
+async fn load_ignore_file(path: &std::path::Path, base: &str, rules: &mut Vec<IgnoreRule>) {
+    if let Ok(text) = tokio::fs::read_to_string(path).await {
+        rules.extend(parse_ignore_file(&text, base));
+    }
+}
+
+async fn initial_ignore_rules(root: &std::path::Path, listed: &std::path::Path) -> Vec<IgnoreRule> {
+    let mut rules = Vec::new();
+    load_ignore_file(&root.join(".gitignore"), "", &mut rules).await;
+    load_ignore_file(
+        &root.join(".git").join("info").join("exclude"),
+        "",
+        &mut rules,
+    )
+    .await;
+    let relative = listed
+        .strip_prefix(root)
+        .unwrap_or(std::path::Path::new(""));
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let base = path_relative(root, &current);
+        load_ignore_file(&current.join(".gitignore"), &base, &mut rules).await;
+    }
+    rules
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    fn go(
+        pattern: &[char],
+        text: &[char],
+        pi: usize,
+        ti: usize,
+        memo: &mut std::collections::HashMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(value) = memo.get(&(pi, ti)) {
+            return *value;
+        }
+        let result = if pi == pattern.len() {
+            ti == text.len()
+        } else if pattern[pi] == '*' {
+            if pi + 1 < pattern.len() && pattern[pi + 1] == '*' {
+                go(pattern, text, pi + 2, ti, memo)
+                    || (ti < text.len() && go(pattern, text, pi, ti + 1, memo))
+            } else {
+                go(pattern, text, pi + 1, ti, memo)
+                    || (ti < text.len() && text[ti] != '/' && go(pattern, text, pi, ti + 1, memo))
+            }
+        } else if ti < text.len()
+            && (pattern[pi] == '?' && text[ti] != '/' || pattern[pi] == text[ti])
+        {
+            go(pattern, text, pi + 1, ti + 1, memo)
+        } else {
+            false
+        };
+        memo.insert((pi, ti), result);
+        result
+    }
+    go(&pattern, &text, 0, 0, &mut std::collections::HashMap::new())
+}
+
+fn rule_matches(rule: &IgnoreRule, relative: &str, kind: FileKind) -> bool {
+    if rule.dir_only && kind != FileKind::Directory {
+        return false;
+    }
+    let within = if rule.base.is_empty() {
+        relative
+    } else if let Some(rest) = relative.strip_prefix(&format!("{}/", rule.base)) {
+        rest
+    } else {
+        return false;
+    };
+    let has_slash = rule.pattern.contains('/');
+    if rule.anchored || has_slash {
+        glob_match(&rule.pattern, within)
+    } else {
+        within
+            .split('/')
+            .any(|segment| glob_match(&rule.pattern, segment))
+    }
+}
+
+fn ignored(rules: &[IgnoreRule], relative: &str, kind: FileKind) -> bool {
+    let mut ignored = false;
+    for rule in rules {
+        if rule_matches(rule, relative, kind) {
+            ignored = !rule.negated;
+        }
+    }
+    ignored
+}
+
+async fn list_files_in(
+    root: &std::path::Path,
+    options: ListFilesOptions,
+    context: &Context,
+) -> Result<FileListing, FileError> {
+    let max_entries = options.max_entries.unwrap_or(DEFAULT_LIST_MAX_ENTRIES);
+    let max_bytes = options
+        .max_bytes
+        .unwrap_or(DEFAULT_LIST_MAX_BYTES)
+        .min(MAX_LIST_MAX_BYTES);
+    let timeout =
+        std::time::Duration::from_millis(options.timeout_ms.unwrap_or(DEFAULT_LIST_TIMEOUT_MS));
+    let started = std::time::Instant::now();
+    let show_hidden = options.hidden.unwrap_or(true);
+    let use_gitignore = options.gitignore.unwrap_or(true);
+    let worktree = if use_gitignore {
+        find_worktree_root(root)
+    } else {
+        None
+    };
+    let rules = match &worktree {
+        Some(worktree) => initial_ignore_rules(worktree, root).await,
+        None => Vec::new(),
+    };
+    let mut entries: Vec<FileListEntry> = Vec::new();
+    let mut bytes = 0usize;
+    let mut truncated = false;
+    struct Pending {
+        path: PathBuf,
+        relative: String,
+        kind: FileKind,
+        rules: Vec<IgnoreRule>,
+    }
+    let read_children = |path: &std::path::Path| {
+        let path = path.to_path_buf();
+        async move {
+            let mut reader = match tokio::fs::read_dir(&path).await {
+                Ok(reader) => reader,
+                Err(_) => return Vec::new(),
+            };
+            let mut children: Vec<(String, PathBuf)> = Vec::new();
+            loop {
+                let entry = match reader.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    _ => break,
+                };
+                children.push((
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.path(),
+                ));
+            }
+            children.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+            children
+        }
+    };
+    let mut pending: Vec<Pending> = Vec::new();
+    let mut seed = Vec::new();
+    for (name, path) in read_children(root).await {
+        seed.push((name, path));
+    }
+    for (name, path) in seed.into_iter().rev() {
+        if name == ".git" || options.exclude.iter().any(|excluded| excluded == &name) {
+            continue;
+        }
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let kind = if metadata.file_type().is_symlink() {
+            FileKind::Symlink
+        } else if metadata.is_dir() {
+            FileKind::Directory
+        } else if metadata.is_file() {
+            FileKind::File
+        } else {
+            continue;
+        };
+        pending.push(Pending {
+            path,
+            relative: name,
+            kind,
+            rules: rules.clone(),
+        });
+    }
+    while let Some(node) = pending.pop() {
+        if started.elapsed() > timeout {
+            truncated = true;
+            break;
+        }
+        if context
+            .abort_signal()
+            .is_some_and(|signal| signal.is_cancelled())
+        {
+            return Err(FileError::new(
+                crate::errors::FileErrorCode::Aborted,
+                "File listing was aborted",
+            ));
+        }
+        if use_gitignore
+            && let Some(worktree) = &worktree
+            && ignored(&node.rules, &path_relative(worktree, &node.path), node.kind)
+        {
+            continue;
+        }
+        if entries.len() >= max_entries || bytes + node.relative.len() + 2 > max_bytes {
+            truncated = true;
+            break;
+        }
+        bytes += node.relative.len() + 2;
+        entries.push(FileListEntry {
+            path: node.relative.clone(),
+            kind: node.kind,
+        });
+        if node.kind != FileKind::Directory {
+            continue;
+        }
+        let mut child_rules = node.rules.clone();
+        if use_gitignore && let Some(worktree) = &worktree {
+            load_ignore_file(
+                &node.path.join(".gitignore"),
+                &path_relative(worktree, &node.path),
+                &mut child_rules,
+            )
+            .await;
+        }
+        let children = read_children(&node.path).await;
+        for (name, path) in children.into_iter().rev() {
+            if name == ".git" || options.exclude.iter().any(|excluded| excluded == &name) {
+                continue;
+            }
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            let metadata = match tokio::fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let kind = if metadata.file_type().is_symlink() {
+                FileKind::Symlink
+            } else if metadata.is_dir() {
+                FileKind::Directory
+            } else if metadata.is_file() {
+                FileKind::File
+            } else {
+                continue;
+            };
+            pending.push(Pending {
+                path,
+                relative: format!("{}/{name}", node.relative),
+                kind,
+                rules: child_rules.clone(),
+            });
+        }
+    }
+    Ok(FileListing { entries, truncated })
 }

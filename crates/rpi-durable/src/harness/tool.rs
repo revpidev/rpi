@@ -1901,7 +1901,7 @@ impl ToolExecutionApi for ToolApi {
         self.runtime.agent(context).await
     }
 
-    fn models(&self) -> &Models {
+    fn models(&self) -> Models {
         self.runtime.models()
     }
 

@@ -45,9 +45,10 @@ use crate::harness::registry::{COMPACTION_TASK_NAME, GENERATION_TASK_NAME};
 use crate::harness::submissions::Submissions;
 use crate::harness::types::{
     Agent, AgentState, AnyTask, BlockedReason, DocumentReader, EnvFactory, EnvTarget, ExecutionEnv,
-    Migration, NextTaskState, RegistryReader, RegistrySnapshot, ReportFn, RunningTask, Scheduling,
-    Settings, SettledTask, TaskAbort, TaskCommitFn, TaskInspection, TaskInspectionState,
-    TaskRuntime, TimerDisarm, Wake, WakeFn, read_state, write_state,
+    Migration, ModelsSource, NextTaskState, RegistryReader, RegistrySnapshot, ReportFn,
+    RunningTask, Scheduling, Settings, SettingsSource, SettledTask, TaskAbort, TaskCommitFn,
+    TaskInspection, TaskInspectionState, TaskRuntime, TimerDisarm, Wake, WakeFn, read_state,
+    write_state,
 };
 use crate::harness::util::{WaitFuture, Waiters, closed_error};
 use crate::ids::{ConversationId, EntryId, SubmissionId, TaskId};
@@ -181,11 +182,11 @@ pub struct SchedulerDeps {
     /// Storage backend.
     pub storage: Arc<dyn Storage>,
     /// pi-ai model catalog.
-    pub models: Models,
+    pub models: ModelsSource,
     /// Application-owned registry reader.
     pub registry: Arc<dyn RegistryReader>,
     /// Resolved harness settings.
-    pub settings: Settings,
+    pub settings: SettingsSource,
     /// Environment factory.
     pub env: Option<EnvFactory>,
     /// Receives extension failures.
@@ -367,9 +368,9 @@ struct AbortCommit {
 struct SchedulerInner {
     session: Arc<SessionImpl>,
     storage: Arc<dyn Storage>,
-    models: Models,
+    models: ModelsSource,
     registry: Arc<dyn RegistryReader>,
-    settings: Settings,
+    settings: SettingsSource,
     env: Option<EnvFactory>,
     report: ReportFn,
     now: NowFn,
@@ -463,7 +464,7 @@ impl SchedulerInner {
         Ok(resolve_agent(
             state.as_ref(),
             snapshot.as_ref(),
-            &self.settings,
+            &self.settings(),
             &self.report,
         ))
     }
@@ -628,8 +629,12 @@ impl SchedulerInner {
     }
 
     /// The resolved restart limit.
+    fn settings(&self) -> Settings {
+        crate::harness::agent::resolve_settings(self.settings.current().as_ref())
+    }
+
     fn restart_limit(&self) -> crate::harness::types::RestartLimit {
-        self.settings.restart_limit
+        self.settings().restart_limit
     }
 
     /// Whether a record is parked by the restart limit.
@@ -1231,7 +1236,7 @@ impl SchedulerInner {
             }
         }
         let now = (self.now)();
-        let retention = self.settings.context_retention_ms as f64;
+        let retention = self.settings().context_retention_ms as f64;
         let Ok(mut contexts) = self.contexts.lock() else {
             return;
         };
@@ -2744,12 +2749,12 @@ impl TaskRuntime for InvocationRuntime {
         self.current_snapshot()
     }
 
-    fn models(&self) -> &Models {
-        &self.inner.models
+    fn models(&self) -> Models {
+        self.inner.models.current()
     }
 
     fn settings(&self) -> Settings {
-        self.inner.settings.clone()
+        self.inner.settings()
     }
 
     async fn agent(&self, context: &Context) -> SessionResult<Agent> {
@@ -3080,7 +3085,7 @@ impl TaskRuntime for InvocationRuntime {
                             },
                         );
                     }
-                } else if inner.settings.context_retention_ms > 0 {
+                } else if inner.settings().context_retention_ms > 0 {
                     let now = (inner.now)();
                     if let Ok(mut contexts) = inner.contexts.lock() {
                         contexts.insert(

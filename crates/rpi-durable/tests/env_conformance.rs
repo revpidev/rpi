@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use rpi_durable::chord::context::{BACKGROUND_CONTEXT, Context, with_abort_signal};
 use rpi_durable::env::node::{NodeExecutionEnv, NodeExecutionEnvOptions};
 use rpi_durable::env::types::{
-    CreateDirOptions, DirPage, ExecutionErrorCode, FileContent, FileSystem, RemoveOptions,
-    ScanLinesOptions, Shell, ShellCommand, ShellExecOptions, ShellExecResult, ShellOutputInfo,
-    ShellOutputWindow, ShellStream, WatchChange, WatchTarget,
+    CreateDirOptions, DirPage, ExecutionErrorCode, FileContent, FileKind, FileSystem,
+    ListFilesOptions, RemoveOptions, ScanLinesOptions, Shell, ShellCommand, ShellExecOptions,
+    ShellExecResult, ShellOutputInfo, ShellOutputWindow, ShellStream, WatchChange, WatchTarget,
 };
 use rpi_durable::errors::{FileError, FileErrorCode};
 use tokio_util::sync::CancellationToken;
@@ -1062,3 +1062,169 @@ async fn watch_reports_changes_to_the_file_a_watched_symbolic_link_points_to() {
 /// Keep the helper imports used across cfg gates.
 #[allow(dead_code)]
 fn _unused(_: CreateDirOptions, _: RemoveOptions) {}
+
+// ---------------------------------------------------------------------------
+// listFiles (V18-06 FR-J)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_files_walks_depth_first_with_relative_paths() {
+    let dir = TempDir::new("env-list-files");
+    let env = create_env(&dir);
+    write(&env, "b.txt", "b");
+    write(&env, "a/inner.txt", "inner");
+    env.create_dir(
+        "z",
+        Some(CreateDirOptions {
+            recursive: Some(true),
+        }),
+        &context(),
+    )
+    .await
+    .expect("mkdir");
+    let listing = env.list_files(".", None, &context()).await.expect("list");
+    let paths: Vec<&str> = listing
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(paths, vec!["a", "a/inner.txt", "b.txt", "z"]);
+    assert_eq!(listing.entries[0].kind, FileKind::Directory);
+    assert_eq!(listing.entries[1].kind, FileKind::File);
+    assert!(!listing.truncated);
+}
+
+#[tokio::test]
+async fn list_files_skips_git_and_gitignored_paths() {
+    let dir = TempDir::new("env-list-gitignore");
+    let env = create_env(&dir);
+    env.create_dir(
+        ".git/info",
+        Some(CreateDirOptions {
+            recursive: Some(true),
+        }),
+        &context(),
+    )
+    .await
+    .expect("git dir");
+    write(
+        &env,
+        ".gitignore",
+        "ignored.txt\nbuild/\n*.log\n!keep.log\n",
+    );
+    write(&env, "ignored.txt", "x");
+    write(&env, "keep.log", "x");
+    write(&env, "trace.log", "x");
+    write(&env, "build/out.txt", "x");
+    write(&env, "src/main.rs", "x");
+    let listing = env.list_files(".", None, &context()).await.expect("list");
+    let paths: Vec<&str> = listing
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert!(paths.contains(&"src"), "got {paths:?}");
+    assert!(paths.contains(&"src/main.rs"), "got {paths:?}");
+    assert!(paths.contains(&"keep.log"), "negation keeps it: {paths:?}");
+    assert!(!paths.contains(&"ignored.txt"), "got {paths:?}");
+    assert!(!paths.contains(&"trace.log"), "got {paths:?}");
+    assert!(!paths.contains(&"build"), "got {paths:?}");
+    assert!(
+        !paths
+            .iter()
+            .any(|path| *path == ".git" || path.starts_with(".git/")),
+        "got {paths:?}"
+    );
+
+    let listing = env
+        .list_files(
+            ".",
+            Some(ListFilesOptions {
+                gitignore: Some(false),
+                ..Default::default()
+            }),
+            &context(),
+        )
+        .await
+        .expect("list without gitignore");
+    assert!(
+        listing
+            .entries
+            .iter()
+            .any(|entry| entry.path == "ignored.txt"),
+        "ignored files are listed without gitignore"
+    );
+}
+
+#[tokio::test]
+async fn list_files_is_bounded_and_reports_truncation() {
+    let dir = TempDir::new("env-list-bounds");
+    let env = create_env(&dir);
+    for index in 0..10 {
+        write(&env, &format!("file{index}.txt"), "x");
+    }
+    let listing = env
+        .list_files(
+            ".",
+            Some(ListFilesOptions {
+                max_entries: Some(3),
+                ..Default::default()
+            }),
+            &context(),
+        )
+        .await
+        .expect("list");
+    assert_eq!(listing.entries.len(), 3);
+    assert!(listing.truncated);
+
+    let listing = env
+        .list_files(
+            ".",
+            Some(ListFilesOptions {
+                max_bytes: Some(30),
+                ..Default::default()
+            }),
+            &context(),
+        )
+        .await
+        .expect("list");
+    assert!(listing.truncated);
+    assert!(listing.entries.len() < 10);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn list_files_lists_symlinks_without_following_them() {
+    let dir = TempDir::new("env-list-symlink");
+    let env = create_env(&dir);
+    write(&env, "target/inside.txt", "x");
+    std::os::unix::fs::symlink(dir.path().join("target"), dir.path().join("link"))
+        .expect("symlink");
+    let listing = env.list_files(".", None, &context()).await.expect("list");
+    let link = listing
+        .entries
+        .iter()
+        .find(|entry| entry.path == "link")
+        .expect("symlink entry");
+    assert_eq!(link.kind, FileKind::Symlink);
+    assert!(
+        !listing
+            .entries
+            .iter()
+            .any(|entry| entry.path == "link/inside.txt"),
+        "symlinks are not followed"
+    );
+}
+
+#[tokio::test]
+async fn list_files_reports_missing_paths_and_files() {
+    let dir = TempDir::new("env-list-errors");
+    let env = create_env(&dir);
+    write(&env, "file.txt", "x");
+    let missing = env.list_files("missing", None, &context()).await;
+    assert_eq!(error_code(&missing), Some("not_found"));
+    let file = env.list_files("file.txt", None, &context()).await;
+    assert_eq!(error_code(&file), Some("not_directory"));
+    let aborted = env.list_files(".", None, &aborted_context()).await;
+    assert_eq!(error_code(&aborted), Some("aborted"));
+}

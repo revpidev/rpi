@@ -113,7 +113,7 @@ impl ToolExecutionApi for FakeApi {
         unimplemented!("agent is not used by the tool tests")
     }
 
-    fn models(&self) -> &rpi_ai::models::Models {
+    fn models(&self) -> rpi_ai::models::Models {
         unimplemented!("models are not used by the tool tests")
     }
 

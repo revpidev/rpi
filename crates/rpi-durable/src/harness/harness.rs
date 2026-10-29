@@ -102,7 +102,7 @@ pub struct HarnessImpl {
     session: Arc<SessionImpl>,
     storage: Arc<dyn Storage>,
     options: HarnessOptions,
-    settings: crate::harness::types::Settings,
+    settings: crate::harness::types::SettingsSource,
     report: crate::harness::types::ReportFn,
     tasks: Arc<dyn SchedulerService>,
     submissions: Arc<Submissions>,
@@ -114,6 +114,10 @@ impl HarnessImpl {
     /// The owned Session kernel.
     pub fn session(&self) -> &Arc<SessionImpl> {
         &self.session
+    }
+
+    fn current_settings(&self) -> crate::harness::types::Settings {
+        resolve_settings(self.settings.current().as_ref())
     }
 
     fn shared(&self) -> SessionResult<Arc<HarnessImpl>> {
@@ -159,7 +163,7 @@ impl HarnessImpl {
         Ok(resolve_agent(
             state.as_ref(),
             registry.as_ref(),
-            &self.settings,
+            &self.current_settings(),
             &self.report,
         ))
     }
@@ -1029,7 +1033,13 @@ pub async fn open_harness_with_scheduler(
         .now
         .clone()
         .unwrap_or_else(|| Arc::new(crate::session::default_now));
-    let settings = resolve_settings(options.settings.as_ref());
+    let settings_source =
+        options
+            .settings
+            .clone()
+            .unwrap_or(crate::harness::types::SettingsSource::Fixed(
+                crate::harness::types::HarnessSettings::default(),
+            ));
     let report = options
         .on_report
         .clone()
@@ -1043,7 +1053,19 @@ pub async fn open_harness_with_scheduler(
         options.identity.clone(),
     )
     .unwrap_or_else(crate::harness::types::default_harness_identity);
-    let models = rpi_ai::utils::identity::with_client_identity(&options.models, identity);
+    let models = match options.models.clone() {
+        crate::harness::types::ModelsSource::Fixed(models) => {
+            crate::harness::types::ModelsSource::Fixed(
+                rpi_ai::utils::identity::with_client_identity(&models, identity.clone()),
+            )
+        }
+        crate::harness::types::ModelsSource::Dynamic(current) => {
+            let identity = identity.clone();
+            crate::harness::types::ModelsSource::Dynamic(Arc::new(move || {
+                rpi_ai::utils::identity::with_client_identity(&current(), identity.clone())
+            }))
+        }
+    };
     session.set_failure_reporter(Arc::new({
         let report = Arc::clone(&report);
         move |message| report(message)
@@ -1055,7 +1077,7 @@ pub async fn open_harness_with_scheduler(
         on_wake: options.on_wake.clone(),
         models,
         registry: Arc::clone(&options.registry),
-        settings: settings.clone(),
+        settings: settings_source.clone(),
         env: options.env.clone(),
         report: Arc::clone(&report),
         now: Arc::clone(&now),
@@ -1066,10 +1088,13 @@ pub async fn open_harness_with_scheduler(
         Arc::new(move || scheduler.resume())
     };
     let queue_modes: Box<dyn Fn() -> QueueModes + Send + Sync> = {
-        let settings = settings.clone();
-        Box::new(move || QueueModes {
-            steering_mode: settings.steering_mode,
-            follow_up_mode: settings.follow_up_mode,
+        let settings = settings_source.clone();
+        Box::new(move || {
+            let settings = resolve_settings(settings.current().as_ref());
+            QueueModes {
+                steering_mode: settings.steering_mode,
+                follow_up_mode: settings.follow_up_mode,
+            }
         })
     };
     let submissions = Submissions::open(
@@ -1087,7 +1112,7 @@ pub async fn open_harness_with_scheduler(
         session,
         storage,
         options,
-        settings,
+        settings: settings_source,
         report,
         tasks: scheduler,
         submissions,

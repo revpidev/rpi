@@ -44,7 +44,7 @@ fn conversation_doc(
         family: false,
         initial: Arc::new(initial),
         migrate: None,
-        checkpoint_when: None,
+        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
     })
 }
 
@@ -64,7 +64,7 @@ fn conversation_family(
         family: true,
         initial: Arc::new(initial),
         migrate: None,
-        checkpoint_when: None,
+        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
     })
 }
 
@@ -82,7 +82,7 @@ fn session_doc(
         family: false,
         initial: Arc::new(initial),
         migrate: None,
-        checkpoint_when: None,
+        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
     })
 }
 
@@ -100,7 +100,7 @@ fn task_doc(
         family: false,
         initial: Arc::new(initial),
         migrate: None,
-        checkpoint_when: None,
+        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
     })
 }
 
@@ -570,7 +570,7 @@ async fn migration_writes_base_then_delta() {
             family: false,
             initial: Arc::new(|_| object(serde_json::json!({"count": 0}))),
             migrate: None,
-            checkpoint_when: None,
+            checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
         };
         definition.migrate = Some(Arc::new(|value, from| {
             let count = value.get("count").and_then(JsonValue::as_u64).unwrap_or(0);
@@ -653,7 +653,7 @@ async fn checkpoint_predicate_upgrades_delta_to_base() {
             family: false,
             initial: Arc::new(|_| object(serde_json::json!({"count": 0}))),
             migrate: None,
-            checkpoint_when: None,
+            checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
         };
         definition.checkpoint_when = Some(Arc::new(|_value, _ops, _deltas_since_base| true));
         define_doc(definition)
@@ -1311,7 +1311,7 @@ async fn terminal_task_retires_task_documents() {
             family: true,
             initial: Arc::new(|_| object(serde_json::json!({"lines": []}))),
             migrate: None,
-            checkpoint_when: None,
+            checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
         })
     });
     let harness = open_test_session();
@@ -1419,7 +1419,7 @@ async fn family_first_seed_wins() {
                 }))
             }),
             migrate: None,
-            checkpoint_when: None,
+            checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
         })
     });
     let harness = open_test_session();

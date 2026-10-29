@@ -300,6 +300,24 @@ pub async fn open_with_storage_and_identity(
     models: Models,
     identity: Option<rpi_ai::utils::identity::ClientIdentity>,
 ) -> Opened {
+    open_with_sources(
+        storage,
+        extensions,
+        settings.map(Into::into),
+        models.into(),
+        identity,
+    )
+    .await
+}
+
+/// Open a Harness with dynamic model and settings sources.
+pub async fn open_with_sources(
+    storage: Arc<dyn Storage>,
+    extensions: Vec<Extension>,
+    settings: Option<rpi_durable::harness::SettingsSource>,
+    models: rpi_durable::harness::ModelsSource,
+    identity: Option<rpi_ai::utils::identity::ClientIdentity>,
+) -> Opened {
     let registry = Arc::new(RegistryImpl::with_builtins(builtin_tasks()));
     for extension in extensions {
         registry.install(extension).expect("install extension");
@@ -378,6 +396,7 @@ pub async fn submit_input(
                 request_id: None,
                 content: rpi_ai::types::UserContent::Text(content.to_string()),
                 when_busy: None,
+                entry: None,
             }),
             &context(),
         )

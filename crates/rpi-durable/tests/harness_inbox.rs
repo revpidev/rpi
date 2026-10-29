@@ -70,6 +70,7 @@ async fn seed(
                         items.push(InboxItem::Steer {
                             id: record.id(),
                             content: UserContent::Text(text.to_string()),
+                            entry: None,
                         });
                         ids.push(record.id());
                     }
@@ -83,6 +84,7 @@ async fn seed(
                         items.push(InboxItem::FollowUp {
                             id: record.id(),
                             content: UserContent::Text(text.to_string()),
+                            entry: None,
                         });
                         ids.push(record.id());
                     }

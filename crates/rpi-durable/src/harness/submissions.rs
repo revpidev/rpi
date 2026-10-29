@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use crate::chord::context::Context;
 use crate::errors::StorageError;
 use crate::harness::inbox::{
-    INBOX_DOC, InboxItem, InboxState, QueueModes, apply_boundary, entry_to_json, is_stale,
-    prepare_boundary, remove_inbox_item,
+    INBOX_DOC, InboxItem, InboxState, QueueModes, apply_boundary, entry_to_json, has_queued_reset,
+    is_display_only, is_stale, prepare_boundary, remove_inbox_item,
 };
 use crate::harness::live::LIVE_DOC;
 use crate::harness::scheduler::SchedulerService;
@@ -320,6 +320,12 @@ pub async fn admit_submission(
     queue_modes: QueueModes,
     scheduler: &dyn SchedulerService,
 ) -> SessionResult<SubmissionId> {
+    if let SubmissionDraft::Input(InputSubmissionDraft {
+        entry: Some(entry), ..
+    }) = draft
+    {
+        check_input_entry(entry)?;
+    }
     let (request_id, is_write) = match draft {
         SubmissionDraft::Input(input) => (input.request_id.as_deref(), false),
         SubmissionDraft::Write(write) => (write.request_id.as_deref(), true),
@@ -337,6 +343,30 @@ pub async fn admit_submission(
             )));
         }
         return Ok(existing.id());
+    }
+    // A display-only write changes nothing the model sees: append it at once,
+    // busy or not. Only a queued reset holds it back, so it lands after the
+    // reset instead of before it in the context the reset ends.
+    if let SubmissionDraft::Write(write) = draft
+        && is_display_only(&write.entry)
+    {
+        let inbox = tx
+            .doc(&INBOX_DOC, DocOwner::Conversation(conversation_id), None)
+            .await?;
+        let state: InboxState = read_state(&inbox)?;
+        if !has_queued_reset(&state.items) {
+            let entry = tx
+                .append_entry(conversation_id, write.entry.clone())
+                .await?;
+            let record = tx
+                .create_submission(crate::session::SubmissionCreate::Write {
+                    conversation_id,
+                    request_id: request_id.map(str::to_string),
+                })
+                .await?;
+            tx.place_submission(record.id(), entry.id)?;
+            return Ok(record.id());
+        }
     }
     let live = tx
         .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
@@ -388,15 +418,18 @@ pub async fn admit_submission(
                     Some(WhenBusy::Steer) => "steer",
                     _ => "followUp",
                 };
+                let entry = input.entry.clone();
                 if mode == "steer" {
                     InboxItem::Steer {
                         id,
                         content: input.content.clone(),
+                        entry,
                     }
                 } else {
                     InboxItem::FollowUp {
                         id,
                         content: input.content.clone(),
+                        entry,
                     }
                 }
             }
@@ -465,6 +498,18 @@ pub async fn admit_submission(
     }
 }
 
+/// Reject an input entry an untyped caller got wrong: its kind must be a
+/// non-empty string outside the `pi.` prefix.
+fn check_input_entry(entry: &crate::harness::types::InputEntry) -> SessionResult<()> {
+    if entry.kind.is_empty() || entry.kind.starts_with("pi.") {
+        return Err(SessionError::message(format!(
+            "An input entry's kind must be a non-empty string not starting with \"pi.\", got {}",
+            entry.kind
+        )));
+    }
+    Ok(())
+}
+
 fn live_is_busy(live: &crate::session::DocDraft) -> SessionResult<bool> {
     let state: crate::harness::live::LiveState = read_state(live)?;
     Ok(state.run.is_some())
@@ -482,8 +527,13 @@ async fn append_user_entry(
         content: input.content.clone(),
         timestamp: now as i64,
     });
-    let mut draft = crate::session::EntryDraft::new(crate::entries::USER_ENTRY);
+    let (kind, data) = match &input.entry {
+        Some(entry) => (entry.kind.clone(), entry.data.clone()),
+        None => (crate::entries::USER_ENTRY.to_string(), None),
+    };
+    let mut draft = crate::session::EntryDraft::new(kind);
     draft.model = Some(vec![message]);
+    draft.data = data;
     tx.append_entry(conversation_id, draft).await
 }
 

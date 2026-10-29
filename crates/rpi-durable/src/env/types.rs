@@ -21,6 +21,42 @@ pub enum FileKind {
     Symlink,
 }
 
+/// Options of `FileSystem.list_files` (`ListFilesOptions`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListFilesOptions {
+    /// Include names starting with `.` (and on Windows hidden files); default true.
+    pub hidden: Option<bool>,
+    /// Inside a git work tree, skip what git ignores; default true.
+    pub gitignore: Option<bool>,
+    /// Entry names to skip with everything below them.
+    pub exclude: Vec<String>,
+    /// Most entries to list; default 50,000.
+    pub max_entries: Option<usize>,
+    /// Most bytes of the listing; default 4 MiB, at most 15.9 MiB.
+    pub max_bytes: Option<usize>,
+    /// Time after which the listing stops; default 10,000 ms.
+    pub timeout_ms: Option<u64>,
+}
+
+/// One entry of a [`FileListing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileListEntry {
+    /// Relative to the listed directory, with `/` separators on every system.
+    pub path: String,
+    /// A symbolic link is listed as such and not followed.
+    pub kind: FileKind,
+}
+
+/// Files, directories and symbolic links below a directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileListing {
+    /// Depth first, parents before their entries, siblings in byte order of
+    /// their names.
+    pub entries: Vec<FileListEntry>,
+    /// A bound in [`ListFilesOptions`] ended the listing early.
+    pub truncated: bool,
+}
+
 /// Metadata of one file-system entry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileInfo {
@@ -312,6 +348,23 @@ pub trait FileSystem: Send + Sync {
     async fn file_info(&self, path: &str, context: &Context) -> Result<FileInfo, FileError>;
     /// List a directory's entries.
     async fn list_dir(&self, path: &str, context: &Context) -> Result<Vec<FileInfo>, FileError>;
+    /// The files, directories and symbolic links below a directory, at any
+    /// depth, for indexes such as file completion. Symbolic links are not
+    /// followed and other kinds are not listed. The default declines with
+    /// `not_supported`, so callers fall back to their own walk.
+    async fn list_files(
+        &self,
+        path: &str,
+        options: Option<ListFilesOptions>,
+        context: &Context,
+    ) -> Result<FileListing, FileError> {
+        let _ = (path, options, context);
+        Err(FileError::new(
+            crate::errors::FileErrorCode::NotSupported,
+            "listFiles is not supported by this environment",
+        ))
+    }
+
     /// Open a paged directory reader.
     async fn open_dir_reader(
         &self,

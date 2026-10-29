@@ -215,7 +215,7 @@ pub fn options() -> HarnessOptions {
         .map(|name| Arc::new(FakeTask(name)) as AnyTask)
         .collect();
     HarnessOptions {
-        models: Models::new(None),
+        models: Models::new(None).into(),
         identity: None,
         registry: Arc::new(RegistryImpl::with_builtins(builtins)),
         settings: None,
@@ -303,6 +303,21 @@ pub fn input(
         request_id: request_id.map(str::to_string),
         content: UserContent::Text(content.to_string()),
         when_busy,
+        entry: None,
+    })
+}
+
+/// An input submission placed as `entry`.
+pub fn input_with_entry(
+    content: &str,
+    entry: rpi_durable::harness::InputEntry,
+    when_busy: Option<WhenBusy>,
+) -> SubmissionDraft {
+    SubmissionDraft::Input(InputSubmissionDraft {
+        request_id: None,
+        content: UserContent::Text(content.to_string()),
+        when_busy,
+        entry: Some(entry),
     })
 }
 
@@ -327,6 +342,7 @@ pub fn inbox_steer(id: SubmissionId, content: &str) -> InboxItem {
     InboxItem::Steer {
         id,
         content: UserContent::Text(content.to_string()),
+        entry: None,
     }
 }
 
@@ -335,5 +351,6 @@ pub fn inbox_follow_up(id: SubmissionId, content: &str) -> InboxItem {
     InboxItem::FollowUp {
         id,
         content: UserContent::Text(content.to_string()),
+        entry: None,
     }
 }

@@ -111,6 +111,11 @@ pub fn define_doc_family(mut definition: DocDefinition) -> DocToken {
 
 fn validate_definition(definition: &DocDefinition) {
     assert!(
+        definition.checkpoint_when.is_some(),
+        "Document {} must declare checkpointWhen",
+        definition.kind
+    );
+    assert!(
         definition.version >= 1,
         "Document {} version must be a positive integer",
         definition.kind
@@ -441,7 +446,7 @@ mod tests {
                 _ => JsonObject::new(),
             }),
             migrate: None,
-            checkpoint_when: None,
+            checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
         }
     }
 
@@ -558,5 +563,28 @@ mod tests {
         let materialized = materialize_document(&def, &stored).unwrap();
         assert_eq!(materialized.get("migrated"), Some(&JsonValue::Bool(true)));
         let _ = DocumentPoint::Current(CurrentMarker::Current);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn a_definition_without_checkpoint_when_fails_at_registration() {
+        let definition = DocDefinition {
+            kind: "test.missing-checkpoint".to_string(),
+            version: 1,
+            scope: DocScope::Session,
+            history: None,
+            fork: None,
+            family: false,
+            initial: Arc::new(|_seed| JsonObject::new()),
+            migrate: None,
+            checkpoint_when: None,
+        };
+        let result = catch_unwind(AssertUnwindSafe(|| define_doc(definition)));
+        assert!(result.is_err(), "checkpointWhen must be required");
     }
 }

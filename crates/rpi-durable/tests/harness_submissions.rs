@@ -10,9 +10,9 @@ mod harness_support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness_support::{clear_run, context, input, open_recording, write};
+use harness_support::{clear_run, context, input, input_with_entry, open_recording, write};
 use rpi_durable::chord::context::with_abort_signal;
-use rpi_durable::harness::{RootOptions, SubmissionAbort, WhenBusy};
+use rpi_durable::harness::{InputEntry, RootOptions, SubmissionAbort, WhenBusy};
 use rpi_durable::session::EntryDraft;
 use tokio_util::sync::CancellationToken;
 
@@ -231,4 +231,125 @@ async fn cancelling_a_wait_does_not_cancel_the_queued_work() {
     );
     assert_eq!(scheduler.started_runs().len(), 1);
     harness.close(&context).await.expect("close");
+}
+
+/// R-D13: a display-only write is appended and settled done at once, even busy.
+#[tokio::test]
+async fn display_only_write_appends_while_busy() {
+    let (harness, _scheduler) = open_recording().await;
+    let context = context();
+    let conversation = root_conversation(&harness).await;
+    // Start a run so the conversation is busy.
+    let running = conversation
+        .submit(input("start", None, None), &context)
+        .await
+        .expect("start");
+    assert_eq!(
+        running.status(&context).await.expect("status").status(),
+        "placed"
+    );
+
+    let display = conversation
+        .submit(write(note("test.note"), None), &context)
+        .await
+        .expect("display write");
+    assert_eq!(
+        display.status(&context).await.expect("status").status(),
+        "done",
+        "a display-only write lands at once"
+    );
+    let entries = conversation
+        .entries(
+            rpi_durable::types::EntryQuery {
+                conversation_id: conversation.id(),
+                min_entry_id: None,
+                max_entry_id: None,
+                order: None,
+            },
+            50,
+            None,
+            &context,
+        )
+        .await
+        .expect("entries");
+    assert!(
+        entries.items.iter().any(|entry| entry.kind == "test.note"),
+        "the entry is in the transcript"
+    );
+
+    // A write that changes model context still queues behind the run.
+    let mut contextual = note("test.context");
+    contextual.model = Some(Vec::new());
+    let queued = conversation
+        .submit(write(contextual, None), &context)
+        .await
+        .expect("context write");
+    assert_eq!(
+        queued.status(&context).await.expect("status").status(),
+        "queued"
+    );
+}
+
+/// R-D13: an input's `entry` kind and data replace `pi.user`.
+#[tokio::test]
+async fn input_entry_places_the_application_kind() {
+    let (harness, _scheduler) = open_recording().await;
+    let context = context();
+    let conversation = root_conversation(&harness).await;
+    conversation
+        .submit(
+            input_with_entry(
+                "hello",
+                InputEntry {
+                    kind: "app.message".to_string(),
+                    data: Some(serde_json::json!({ "author": "ada" })),
+                },
+                None,
+            ),
+            &context,
+        )
+        .await
+        .expect("submit");
+    let entries = conversation
+        .entries(
+            rpi_durable::types::EntryQuery {
+                conversation_id: conversation.id(),
+                min_entry_id: None,
+                max_entry_id: None,
+                order: None,
+            },
+            50,
+            None,
+            &context,
+        )
+        .await
+        .expect("entries");
+    let entry = entries
+        .items
+        .iter()
+        .find(|entry| entry.kind == "app.message")
+        .expect("application entry");
+    assert_eq!(entry.data, Some(serde_json::json!({ "author": "ada" })));
+}
+
+/// R-D13: an input entry kind may not use the reserved `pi.` prefix.
+#[tokio::test]
+async fn input_entry_rejects_reserved_kinds() {
+    let (harness, _scheduler) = open_recording().await;
+    let context = context();
+    let conversation = root_conversation(&harness).await;
+    let result = conversation
+        .submit(
+            input_with_entry(
+                "hello",
+                InputEntry {
+                    kind: "pi.user".to_string(),
+                    data: None,
+                },
+                None,
+            ),
+            &context,
+        )
+        .await;
+    assert!(result.is_err(), "reserved kinds must be rejected");
 }

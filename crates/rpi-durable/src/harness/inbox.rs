@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::chord::json::{JsonObject, JsonValue};
 use crate::documents::{DocDefinition, DocScope, DocToken, define_doc};
 use crate::entries::USER_ENTRY;
-use crate::harness::types::{QueueMode, read_state, write_state};
+use crate::harness::types::{InputEntry, QueueMode, read_state, write_state};
 use crate::ids::{ConversationId, Entry, EntryId, SubmissionId, id_from_number};
 use crate::session::{
     DocDraft, DocOwner, EntryDraft, EntryHead, SessionError, SessionResult, SubmissionSettlement,
@@ -44,6 +44,9 @@ pub enum InboxItem {
         id: SubmissionId,
         /// User input content.
         content: UserContent,
+        /// Entry the input is placed as; absent for `pi.user`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry: Option<InputEntry>,
     },
     /// User input queued for the next run's `final` boundary.
     #[serde(rename = "followUp")]
@@ -52,6 +55,9 @@ pub enum InboxItem {
         id: SubmissionId,
         /// User input content.
         content: UserContent,
+        /// Entry the input is placed as; absent for `pi.user`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry: Option<InputEntry>,
     },
     /// Passive entry write, placed at any boundary.
     #[serde(rename = "write")]
@@ -201,12 +207,7 @@ pub async fn apply_boundary(
 ) -> SessionResult<BoundaryResult> {
     let state: InboxState = read_state(&boundary.inbox)?;
     let mut items = state.items;
-    let reset = items.iter().any(|item| match item {
-        InboxItem::Write { entry, .. } => {
-            entry.get("head").and_then(JsonValue::as_str) == Some("self")
-        }
-        _ => false,
-    });
+    let reset = has_queued_reset(&items);
     let final_at = at == BoundaryAt::Final || reset;
     let pick = |mode: &str, queue_mode: QueueMode| -> Vec<usize> {
         let indexes: Vec<usize> = items
@@ -264,10 +265,9 @@ pub async fn apply_boundary(
     }
     let mut placed: Vec<SubmissionId> = Vec::new();
     for index in &users {
-        let (id, content) = match &items[*index] {
-            InboxItem::Steer { id, content } | InboxItem::FollowUp { id, content } => {
-                (*id, content.clone())
-            }
+        let (id, content, entry) = match &items[*index] {
+            InboxItem::Steer { id, content, entry }
+            | InboxItem::FollowUp { id, content, entry } => (*id, content.clone(), entry.clone()),
             // Invariant: `users` only collects steer/followUp indexes.
             _ => continue,
         };
@@ -276,8 +276,13 @@ pub async fn apply_boundary(
             content,
             timestamp: now as i64,
         });
-        let mut draft = EntryDraft::new(USER_ENTRY);
+        let (kind, data) = match entry {
+            Some(entry) => (entry.kind, entry.data),
+            None => (USER_ENTRY.to_string(), None),
+        };
+        let mut draft = EntryDraft::new(kind);
         draft.model = Some(vec![message]);
+        draft.data = data;
         let record = tx.append_entry(boundary.conversation_id, draft).await?;
         tx.place_submission(id, record.id)?;
         placed.push(id);
@@ -293,6 +298,23 @@ pub async fn apply_boundary(
         users: placed,
         reset,
     })
+}
+
+/// Whether a reset (`head: "self"` write) is queued; entries appended before it
+/// leave the active range when it lands.
+pub fn has_queued_reset(items: &[InboxItem]) -> bool {
+    items.iter().any(|item| match item {
+        InboxItem::Write { entry, .. } => {
+            entry.get("head").and_then(JsonValue::as_str) == Some("self")
+        }
+        _ => false,
+    })
+}
+
+/// Whether a write is display-only: it has no `model`, `head`, or `edits`
+/// (present counts, even if empty), so it changes nothing the model sees.
+pub fn is_display_only(entry: &EntryDraft) -> bool {
+    entry.model.is_none() && entry.head.is_none() && entry.edits.is_none()
 }
 
 /// Whether a head write targets an entry before the active range, so placing it
@@ -438,10 +460,12 @@ mod tests {
                 InboxItem::Steer {
                     id: id_from_number::<Submission>(2),
                     content: UserContent::Text("go".to_string()),
+                    entry: None,
                 },
                 InboxItem::FollowUp {
                     id: id_from_number::<Submission>(3),
                     content: UserContent::Text("next".to_string()),
+                    entry: None,
                 },
             ],
         };

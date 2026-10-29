@@ -39,7 +39,9 @@ use crate::harness::agent::{add_tools, agent_hooks};
 use crate::harness::compaction::{
     create_compaction, estimate_context, reasoning_level, request_stream_options, select_cut,
 };
-use crate::harness::inbox::{BoundaryAt, QueueModes, apply_boundary, prepare_boundary};
+use crate::harness::inbox::{
+    BoundaryAt, INBOX_DOC, InboxItem, InboxState, QueueModes, apply_boundary, prepare_boundary,
+};
 use crate::harness::json::assign_json;
 use crate::harness::live::{
     LIVE_DOC, LiveState, SlotProgress, ToolSlot, ToolSlotStatus, convert_partial, end_run,
@@ -48,8 +50,9 @@ use crate::harness::prompt::{plan_system_entries, render_sections, replay_sectio
 use crate::harness::registry::{GENERATION_TASK_NAME, TOOL_TASK_NAME};
 use crate::harness::tool::{append_tool_result, harness_error};
 use crate::harness::types::{
-    ConversationStreamOptions, HookHandlers, ModelRef, NextTaskState, PromptInput, RunningTask,
-    TaskCommitFn, TaskDefinition, TaskRuntime, ToolControl, ToolExecutionMode,
+    AfterFailedRun, ConversationStreamOptions, HookHandlers, ModelRef, NextTaskState, PromptInput,
+    RunningTask, TaskCommitFn, TaskDefinition, TaskRuntime, ToolControl, ToolExecutionMode,
+    read_state, write_state,
 };
 use crate::harness::usage::{UsageBucket, record_usage};
 use crate::ids::{ConversationId, EntryId, SubmissionId, TaskId};
@@ -1341,6 +1344,13 @@ async fn fail_no_model(
     };
     let conversation_id = runtime.conversation_id();
     let task_id = runtime.task_id();
+    let settings = runtime.settings();
+    let after = settings.after_failed_run;
+    let modes = QueueModes {
+        steering_mode: settings.steering_mode,
+        follow_up_mode: settings.follow_up_mode,
+    };
+    let now = runtime.now()?;
     let change: TaskCommitFn = Arc::new(move |tx, _current| {
         let message = message.clone();
         Box::pin(async move {
@@ -1357,6 +1367,7 @@ async fn fail_no_model(
                 },
             )
             .await?;
+            apply_after_failed_run(tx, conversation_id, &live, after, modes, now).await?;
             Ok(Some(NextTaskState::Terminal {
                 outcome: TaskOutcome::Failed {
                     error: TaskOutcomeError {
@@ -1369,6 +1380,55 @@ async fn fail_no_model(
         })
     });
     runtime.commit(change, context).await
+}
+
+/// What a failed run does with the inputs queued behind it (`afterFailedRun`).
+async fn apply_after_failed_run(
+    tx: &mut Transaction,
+    conversation_id: ConversationId,
+    live: &DocDraft,
+    after: AfterFailedRun,
+    modes: QueueModes,
+    now: f64,
+) -> SessionResult<()> {
+    match after {
+        AfterFailedRun::Keep => Ok(()),
+        AfterFailedRun::Withdraw => {
+            let inbox = tx
+                .doc(&INBOX_DOC, DocOwner::Conversation(conversation_id), None)
+                .await?;
+            let mut state: InboxState = read_state(&inbox)?;
+            let mut kept = Vec::new();
+            for item in state.items {
+                match item {
+                    InboxItem::Steer { id, .. } | InboxItem::FollowUp { id, .. } => {
+                        tx.settle_submission(
+                            id,
+                            SubmissionSettlement::Unanswered {
+                                reason: "run_failed".to_string(),
+                                detail: None,
+                            },
+                        )?;
+                    }
+                    write => kept.push(write),
+                }
+            }
+            state.items = kept;
+            write_state(&inbox, &state)
+        }
+        AfterFailedRun::Continue => {
+            let boundary = prepare_boundary(tx, conversation_id, modes).await?;
+            let pending: InboxState = read_state(&boundary.inbox)?;
+            if pending.items.is_empty() {
+                return Ok(());
+            }
+            let result = apply_boundary(tx, boundary, BoundaryAt::Final, now).await?;
+            if !result.users.is_empty() {
+                start_run(tx, conversation_id, live, result.users).await?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Create a tool task for call `call_id`, owned by the generation.

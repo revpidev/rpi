@@ -138,7 +138,7 @@ async fn open(
         .expect("install");
     let clock_for_now = Arc::clone(&clock);
     let options = HarnessOptions {
-        models: Models::new(None),
+        models: Models::new(None).into(),
         identity: None,
         registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,
         settings: None,

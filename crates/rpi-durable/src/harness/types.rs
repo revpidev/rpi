@@ -112,6 +112,18 @@ pub enum WhenBusy {
     Reject,
 }
 
+/// The entry an input is placed as, instead of `pi.user`: an application kind,
+/// and data the transcript shows, such as its author.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputEntry {
+    /// Application entry kind; must not start with `pi.`.
+    pub kind: String,
+    /// Application-facing payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<JsonValue>,
+}
+
 /// Host input submission: user input that may start a run.
 #[derive(Debug, Clone)]
 pub struct InputSubmissionDraft {
@@ -121,6 +133,8 @@ pub struct InputSubmissionDraft {
     pub content: UserInput,
     /// Busy-queue behaviour.
     pub when_busy: Option<WhenBusy>,
+    /// Entry to place the input as; default `pi.user` without data.
+    pub entry: Option<InputEntry>,
 }
 
 /// Host write submission: a passive entry write.
@@ -352,7 +366,7 @@ pub trait TaskRuntime: Send + Sync {
     /// Registry snapshot of the current phase; refreshed at every phase boundary.
     fn registry(&self) -> Arc<dyn RegistrySnapshot>;
     /// pi-ai model catalog.
-    fn models(&self) -> &Models;
+    fn models(&self) -> Models;
     /// `HarnessOptions.settings`, resolved.
     fn settings(&self) -> Settings;
     /// The task's conversation's agent, resolved at most once per phase.
@@ -1429,6 +1443,60 @@ pub struct Settings {
     pub restart_limit: RestartLimit,
 }
 
+/// pi-ai model access: a fixed catalog, or a function returning the current one,
+/// read at each use so a host can replace its model configuration.
+#[derive(Clone)]
+pub enum ModelsSource {
+    /// One catalog.
+    Fixed(Models),
+    /// The current catalog, read at each use.
+    Dynamic(Arc<dyn Fn() -> Models + Send + Sync>),
+}
+
+impl ModelsSource {
+    /// The catalog to use now.
+    pub fn current(&self) -> Models {
+        match self {
+            ModelsSource::Fixed(models) => models.clone(),
+            ModelsSource::Dynamic(current) => current(),
+        }
+    }
+}
+
+impl From<Models> for ModelsSource {
+    fn from(models: Models) -> Self {
+        ModelsSource::Fixed(models)
+    }
+}
+
+/// Run settings: fixed values, or a function returning the current ones, read
+/// at each use.
+#[derive(Clone)]
+// The upstream union holds the settings object directly on its fixed arm.
+#[allow(clippy::large_enum_variant)]
+pub enum SettingsSource {
+    /// One set of settings.
+    Fixed(HarnessSettings),
+    /// The current settings; `None` means the built-in defaults.
+    Dynamic(Arc<dyn Fn() -> Option<HarnessSettings> + Send + Sync>),
+}
+
+impl SettingsSource {
+    /// The settings to use now.
+    pub fn current(&self) -> Option<HarnessSettings> {
+        match self {
+            SettingsSource::Fixed(settings) => Some(settings.clone()),
+            SettingsSource::Dynamic(current) => current(),
+        }
+    }
+}
+
+impl From<HarnessSettings> for SettingsSource {
+    fn from(settings: HarnessSettings) -> Self {
+        SettingsSource::Fixed(settings)
+    }
+}
+
 /// What `HarnessOptions.env` builds an environment for.
 #[derive(Clone)]
 pub struct EnvTarget {
@@ -1456,14 +1524,14 @@ pub fn default_harness_identity() -> rpi_ai::utils::identity::ClientIdentity {
 /// Harness construction options (`HarnessOptions`).
 pub struct HarnessOptions {
     /// pi-ai model access used by generation.
-    pub models: Models,
+    pub models: ModelsSource,
     /// Request identity merged over [`default_harness_identity`]. An explicit
     /// `attribution: None` disables provider attribution headers.
     pub identity: Option<rpi_ai::utils::identity::ClientIdentity>,
     /// Application-owned registry reader.
     pub registry: Arc<dyn RegistryReader>,
-    /// Host settings overrides.
-    pub settings: Option<HarnessSettings>,
+    /// Host settings overrides, fixed or read at each use.
+    pub settings: Option<SettingsSource>,
     /// Environment factory.
     pub env: Option<EnvFactory>,
     /// Runs in every commit that creates or forks a conversation.
@@ -1765,7 +1833,7 @@ pub trait HookApi: Send + Sync {
     /// Asking conversation.
     fn conversation_id(&self) -> ConversationId;
     /// pi-ai model catalog.
-    fn models(&self) -> &Models;
+    fn models(&self) -> Models;
     /// Read one memo.
     async fn memo(&self, name: &str, context: &Context) -> Result<Option<JsonValue>, SessionError>;
     /// Write one memo when absent, returning the retained value.
@@ -1794,7 +1862,7 @@ impl HookApi for RuntimeHookApi<'_> {
         self.runtime.conversation_id()
     }
 
-    fn models(&self) -> &Models {
+    fn models(&self) -> Models {
         self.runtime.models()
     }
 
@@ -2020,7 +2088,7 @@ pub trait ToolExecutionApi: Send + Sync {
     /// The calling conversation's agent.
     async fn agent(&self, context: &Context) -> Result<Agent, SessionError>;
     /// pi-ai model catalog.
-    fn models(&self) -> &Models;
+    fn models(&self) -> Models;
     /// Environment built for this call, if any.
     fn env(&self) -> Option<Arc<dyn ExecutionEnv>>;
     /// The Harness clock (`HarnessOptions.now`), for times a rerun after a
