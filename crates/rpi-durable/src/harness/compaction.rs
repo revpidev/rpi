@@ -643,6 +643,7 @@ pub async fn create_compaction(
             ownership,
             conversation_id: Some(conversation_id),
             background,
+            abandon_on_restart: false,
         })
         .await?;
     let status = CompactionStatus {

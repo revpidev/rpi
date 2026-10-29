@@ -567,6 +567,7 @@ impl TaskDefinition for FanoutTask {
                         ownership: TaskOwnership::Task(parent),
                         conversation_id: Some(conversation_id),
                         background: false,
+                        abandon_on_restart: false,
                     })
                     .await?;
                 let slow = tx
@@ -578,6 +579,7 @@ impl TaskDefinition for FanoutTask {
                         ownership: TaskOwnership::Task(parent),
                         conversation_id: Some(conversation_id),
                         background: false,
+                        abandon_on_restart: false,
                     })
                     .await?;
                 Ok(Some(NextTaskState::Waiting {
@@ -765,6 +767,7 @@ pub async fn add_task(
                 ownership: spec.ownership,
                 conversation_id: Some(conversation_id),
                 background: spec.background,
+                abandon_on_restart: false,
             })
             .await
         })
@@ -797,6 +800,7 @@ pub async fn add_family(
                     ownership: TaskOwnership::Conversation(conversation_id),
                     conversation_id: Some(conversation_id),
                     background: false,
+                    abandon_on_restart: false,
                 })
                 .await?;
             let mut ids = Vec::new();
@@ -810,6 +814,7 @@ pub async fn add_family(
                         ownership: TaskOwnership::Task(parent_id),
                         conversation_id: Some(conversation_id),
                         background: false,
+                        abandon_on_restart: false,
                     })
                     .await?,
                 );
@@ -842,7 +847,8 @@ pub fn checkpoint(record: &rpi_durable::types::TaskRecord) -> JsonValue {
     match &record.state {
         TaskState::Pending { checkpoint }
         | TaskState::Running { checkpoint }
-        | TaskState::Waiting { checkpoint, .. } => checkpoint.clone(),
+        | TaskState::Waiting { checkpoint, .. }
+        | TaskState::Sleeping { checkpoint, .. } => checkpoint.clone(),
         TaskState::Completing { .. } | TaskState::Terminal { .. } => JsonValue::Null,
     }
 }

@@ -109,6 +109,9 @@ fn task_record(id: TaskId, phase: &str, terminal: bool) -> TaskRecord {
         owner: None,
         background: false,
         abort_requested: false,
+        abort_reason: None,
+        abandon_on_restart: false,
+        restarts: None,
         started_at: None,
         ended_at: None,
         state: if terminal {

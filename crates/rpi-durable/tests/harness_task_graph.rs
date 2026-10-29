@@ -42,6 +42,7 @@ async fn create_task(
                 ownership: TaskOwnership::Conversation(conversation),
                 conversation_id: Some(conversation),
                 background: false,
+                abandon_on_restart: false,
             })
             .await
         })

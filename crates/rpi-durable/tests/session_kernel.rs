@@ -1326,6 +1326,7 @@ async fn terminal_task_retires_task_documents() {
                 ownership: rpi_durable::session::TaskOwnership::Conversation(conversation),
                 conversation_id: None,
                 background: false,
+                abandon_on_restart: false,
             })
             .await
         })

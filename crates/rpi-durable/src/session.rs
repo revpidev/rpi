@@ -167,6 +167,8 @@ pub enum DocOwner<'a> {
 
 /// One table or document change carried by a [`CommitPublication`].
 #[derive(Debug, Clone, PartialEq)]
+// The upstream union carries the full record on its table arm.
+#[allow(clippy::large_enum_variant)]
 pub enum CommitChange {
     /// A table write (`conversation`/`entry`/`task`/`submission`), in staging order.
     Table(StorageWrite),

@@ -43,6 +43,13 @@ pub enum TaskGraphState {
         /// Current checkpoint phase.
         phase: String,
     },
+    /// Sleeping until the Harness clock reaches a deadline.
+    Sleeping {
+        /// Current checkpoint phase.
+        phase: String,
+        /// Deadline on the harness clock.
+        until: f64,
+    },
     /// Parked on other tasks.
     Waiting {
         /// Current checkpoint phase.
@@ -473,6 +480,10 @@ fn state_of(record: &TaskRecord) -> TaskGraphState {
             on: on.clone(),
             policy: *policy,
         },
+        TaskState::Sleeping { checkpoint, until } => TaskGraphState::Sleeping {
+            phase: phase_of(checkpoint),
+            until: *until,
+        },
         // Terminal records never reach here: they leave the graph.
         TaskState::Completing { outcome } | TaskState::Terminal { outcome } => {
             TaskGraphState::Completing {
@@ -538,6 +549,7 @@ mod tests {
                             ownership: TaskOwnership::Conversation(conversation),
                             conversation_id: Some(conversation),
                             background,
+                            abandon_on_restart: false,
                         })
                         .await
                     })

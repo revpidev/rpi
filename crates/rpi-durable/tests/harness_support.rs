@@ -106,6 +106,7 @@ async fn create_owned_task(
         ownership: TaskOwnership::Conversation(conversation_id),
         conversation_id: Some(conversation_id),
         background: false,
+        abandon_on_restart: false,
     })
     .await
 }

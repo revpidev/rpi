@@ -522,6 +522,7 @@ impl SchedulerInner {
             TaskStatus::Pending,
             TaskStatus::Running,
             TaskStatus::Waiting,
+            TaskStatus::Sleeping,
             TaskStatus::Completing,
         ];
         for status in statuses {
@@ -548,6 +549,16 @@ impl SchedulerInner {
         }
         for records in scans {
             for record in records {
+                let mut record = record;
+                // A task its creator awaited only in memory is abandoned after a
+                // restart: mark it `restart` so its abort handler runs instead of
+                // a phase, and let the cascade reach its owned work.
+                if record.abandon_on_restart && !record.abort_requested {
+                    record.abort_requested = true;
+                    record.abort_reason = Some("restart".to_string());
+                    tx.set_task(record.clone())?;
+                    self.cascade_pending.store(true, Ordering::SeqCst);
+                }
                 if let Ok(mut live) = self.live.lock() {
                     live.insert(record.id, record.clone());
                 }
@@ -2237,6 +2248,7 @@ impl SchedulerInner {
                 ownership: TaskOwnership::Conversation(conversation_id),
                 conversation_id: Some(conversation_id),
                 background: false,
+                abandon_on_restart: false,
             })
             .await?;
         let mut state: LiveState = read_state(live)?;
@@ -2269,6 +2281,7 @@ impl SchedulerInner {
             ownership: TaskOwnership::Conversation(conversation_id),
             conversation_id: Some(conversation_id),
             background: false,
+            abandon_on_restart: false,
         })
         .await
     }
@@ -2523,6 +2536,7 @@ impl TaskRuntime for InvocationRuntime {
                     ownership,
                     conversation_id: Some(conversation_id),
                     background,
+                    abandon_on_restart: false,
                 })
                 .await
             })
@@ -3163,7 +3177,8 @@ fn record_checkpoint(record: &TaskRecord) -> JsonValue {
     match &record.state {
         TaskState::Pending { checkpoint }
         | TaskState::Running { checkpoint }
-        | TaskState::Waiting { checkpoint, .. } => checkpoint.clone(),
+        | TaskState::Waiting { checkpoint, .. }
+        | TaskState::Sleeping { checkpoint, .. } => checkpoint.clone(),
         TaskState::Completing { .. } | TaskState::Terminal { .. } => JsonValue::Null,
     }
 }

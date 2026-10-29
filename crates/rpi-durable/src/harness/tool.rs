@@ -1295,7 +1295,6 @@ async fn start_nested_call(
     abandon_on_restart: bool,
     context: &Context,
 ) -> SessionResult<TaskId> {
-    let _ = abandon_on_restart;
     let call = ToolCall {
         id: format!("{parent_call_id}/{key}"),
         name: name.to_string(),
@@ -1373,6 +1372,7 @@ async fn start_nested_call(
                     ownership: TaskOwnership::Task(parent_task),
                     conversation_id: Some(conversation_id),
                     background: false,
+                    abandon_on_restart,
                 })
                 .await?;
             state.task_id = Some(task);

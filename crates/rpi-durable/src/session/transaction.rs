@@ -62,7 +62,7 @@ pub enum ConversationOwnership {
 }
 
 /// Ownership argument of [`Transaction::create_task`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskOwnership {
     /// Owned by the conversation.
     Conversation(ConversationId),
@@ -749,6 +749,9 @@ impl Transaction {
             owner: owner_record.as_ref().map(|owner| owner.id),
             background: create.background,
             abort_requested: false,
+            abort_reason: None,
+            abandon_on_restart: create.abandon_on_restart,
+            restarts: None,
             started_at: None,
             ended_at: None,
             state: TaskState::Pending {
@@ -1648,6 +1651,8 @@ pub struct TaskCreate {
     pub conversation_id: Option<ConversationId>,
     /// Whether a conversation-owned task is excluded from idle waits.
     pub background: bool,
+    /// Abort the task before it runs again after a restart.
+    pub abandon_on_restart: bool,
 }
 
 pub(crate) fn doc_target<'a>(

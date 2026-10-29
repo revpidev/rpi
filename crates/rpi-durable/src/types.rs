@@ -14,6 +14,7 @@ use crate::chord::delta::Op;
 use crate::chord::json::{JsonObject, JsonValue};
 use crate::errors::{StorageError, StorageResult};
 use crate::ids::{ConversationId, DocumentId, EntryId, Id, Seq, SubmissionId, TaskId};
+use crate::session::TaskOwnership;
 
 /// `Message` is reused from rpi-ai (upstream `types.ts:3` type-only import).
 pub use rpi_ai::types::Message;
@@ -192,6 +193,13 @@ pub enum TaskState {
         /// How the wait reacts to failures.
         policy: JoinPolicy,
     },
+    /// Parked without an invocation until the Harness clock reaches `until`.
+    Sleeping {
+        /// Complete durable state from which execution resumes.
+        checkpoint: JsonValue,
+        /// Deadline on the `HarnessOptions.now` clock, in milliseconds.
+        until: f64,
+    },
     /// Outcome decided; runs no more code.
     Completing {
         /// Decided outcome.
@@ -211,6 +219,7 @@ impl TaskState {
             TaskState::Pending { .. } => "pending",
             TaskState::Running { .. } => "running",
             TaskState::Waiting { .. } => "waiting",
+            TaskState::Sleeping { .. } => "sleeping",
             TaskState::Completing { .. } => "completing",
             TaskState::Terminal { .. } => "terminal",
         }
@@ -227,6 +236,8 @@ pub enum TaskStatus {
     Running,
     /// Waiting.
     Waiting,
+    /// Sleeping until the Harness clock reaches a deadline.
+    Sleeping,
     /// Completing.
     Completing,
     /// Terminal.
@@ -240,6 +251,7 @@ impl TaskStatus {
             TaskStatus::Pending => "pending",
             TaskStatus::Running => "running",
             TaskStatus::Waiting => "waiting",
+            TaskStatus::Sleeping => "sleeping",
             TaskStatus::Completing => "completing",
             TaskStatus::Terminal => "terminal",
         }
@@ -265,6 +277,17 @@ pub struct TaskRecord {
     pub background: bool,
     /// Durable abort mark checked before run-mode progress is committed.
     pub abort_requested: bool,
+    /// Why the mark was set when not by an abort request: `restart` for a task
+    /// abandoned after a restart. A later abort request clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort_reason: Option<String>,
+    /// Set from `TaskOptions.abandon_on_restart`. Immutable.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub abandon_on_restart: bool,
+    /// How many times in a row a crash, eviction, or reset cut the task off
+    /// while it ran without it changing state since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarts: Option<u32>,
     /// Wall-clock milliseconds of the first change to `running`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<f64>,
@@ -279,6 +302,24 @@ pub struct TaskRecord {
     pub memos: Option<JsonObject>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Options of `Tx.createTask` / `TaskRuntime.createTask` (upstream `TaskOptions`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskOptions {
+    /// Ownership of the new task.
+    pub ownership: TaskOwnership,
+    /// Conversation the task belongs to; `None` uses the creating scope.
+    pub conversation_id: Option<ConversationId>,
+    /// Whether this conversation-owned task is excluded from ordinary idle waits.
+    pub background: bool,
+    /// Abort this task before it runs again after a restart: its creator awaited
+    /// it only in memory.
+    pub abandon_on_restart: bool,
+}
+
 impl TaskRecord {
     /// The status discriminator of the current state.
     pub fn status(&self) -> TaskStatus {
@@ -286,6 +327,7 @@ impl TaskRecord {
             TaskState::Pending { .. } => TaskStatus::Pending,
             TaskState::Running { .. } => TaskStatus::Running,
             TaskState::Waiting { .. } => TaskStatus::Waiting,
+            TaskState::Sleeping { .. } => TaskStatus::Sleeping,
             TaskState::Completing { .. } => TaskStatus::Completing,
             TaskState::Terminal { .. } => TaskStatus::Terminal,
         }

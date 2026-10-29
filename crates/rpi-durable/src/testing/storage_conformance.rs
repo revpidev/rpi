@@ -98,6 +98,9 @@ fn pending_task(id: TaskId, conversation_id: ConversationId, phase: &str) -> Tas
         owner: None,
         background: false,
         abort_requested: false,
+        abort_reason: None,
+        abandon_on_restart: false,
+        restarts: None,
         started_at: None,
         ended_at: None,
         state: TaskState::Pending {
