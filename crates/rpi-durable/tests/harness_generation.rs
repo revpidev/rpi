@@ -665,3 +665,152 @@ async fn dynamic_settings_source_is_read_for_each_use() {
     submission.wait(&context()).await.expect("wait");
     assert!(calls.load(Ordering::SeqCst) >= 1);
 }
+
+// ---------------------------------------------------------------------------
+// afterFailedRun (V18-06 FR-H R4)
+// ---------------------------------------------------------------------------
+
+struct BlockingTool {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ToolExecute for BlockingTool {
+    async fn execute(
+        &self,
+        _args: rpi_durable::chord::json::JsonObject,
+        api: &dyn ToolExecutionApi,
+        _context: &Context,
+    ) -> Result<ToolExecutionResult, ToolExecuteError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        api.output(b"released", None).expect("output");
+        Ok(ToolExecutionResult::default())
+    }
+}
+
+fn blocking_extension(
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) -> Extension {
+    Extension {
+        name: "blocking".to_string(),
+        tools: vec![ToolRegistration {
+            tool: AiTool {
+                name: "block".to_string(),
+                description: "block".to_string(),
+                parameters: serde_json::json!({ "type": "object", "properties": {} }),
+                constrained_sampling: None,
+            },
+            replay: ToolReplay::Safe,
+            execution_mode: None,
+            prepare_arguments: None,
+            output_limits: None,
+            structured_output_schema: None,
+            callers: None,
+            deferred: false,
+            execute: Arc::new(BlockingTool { started, release }),
+        }],
+        ..Extension::default()
+    }
+}
+
+async fn queue_follow_up(
+    conversation: &Arc<dyn rpi_durable::harness::Conversation>,
+    content: &str,
+) -> Arc<dyn rpi_durable::harness::Submission> {
+    use rpi_durable::harness::{InputSubmissionDraft, SubmissionDraft, WhenBusy};
+    conversation
+        .submit(
+            SubmissionDraft::Input(InputSubmissionDraft {
+                request_id: None,
+                content: rpi_ai::types::UserContent::Text(content.to_string()),
+                when_busy: Some(WhenBusy::FollowUp),
+                entry: None,
+            }),
+            &context(),
+        )
+        .await
+        .expect("queue follow-up")
+}
+
+/// `withdraw` settles the queued input `unanswered` with reason `run_failed`.
+#[tokio::test]
+async fn after_failed_run_withdraw_settles_queued_inputs() {
+    use rpi_durable::harness::{AfterFailedRun, HarnessSettings};
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let settings = HarnessSettings {
+        after_failed_run: Some(AfterFailedRun::Withdraw),
+        retry: Some(ConversationRetryPolicyPatch {
+            enabled: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let opened = open(
+        vec![blocking_extension(
+            Arc::clone(&started),
+            Arc::clone(&release),
+        )],
+        Some(settings),
+        test_models(vec![
+            Script::Message(tool_use_message("block", "c1", serde_json::json!({}))),
+            Script::Message(error_message("fatal", "bad request")),
+        ]),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let running = submit_input(&conversation, "hi").await;
+    started.notified().await;
+    let queued = queue_follow_up(&conversation, "later").await;
+    release.notify_one();
+    let _first = running.wait(&context()).await.expect("first run");
+    let record = queued.status(&context()).await.expect("queued status");
+    assert_eq!(record.status(), "unanswered");
+    match record {
+        SubmissionRecord::Input {
+            status: InputSubmissionStatus::Unanswered { reason, .. },
+            ..
+        } => assert_eq!(reason, "run_failed"),
+        other => panic!("unexpected record {other:?}"),
+    }
+}
+
+/// `continue` starts the next run with the queued input.
+#[tokio::test]
+async fn after_failed_run_continue_starts_the_next_run() {
+    use rpi_durable::harness::{AfterFailedRun, HarnessSettings};
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let settings = HarnessSettings {
+        after_failed_run: Some(AfterFailedRun::Continue),
+        retry: Some(ConversationRetryPolicyPatch {
+            enabled: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let opened = open(
+        vec![blocking_extension(
+            Arc::clone(&started),
+            Arc::clone(&release),
+        )],
+        Some(settings),
+        test_models(vec![
+            Script::Message(tool_use_message("block", "c1", serde_json::json!({}))),
+            Script::Message(error_message("fatal", "bad request")),
+            Script::Message(text_message("recovered", StopReason::Stop)),
+        ]),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let running = submit_input(&conversation, "hi").await;
+    started.notified().await;
+    let queued = queue_follow_up(&conversation, "later").await;
+    release.notify_one();
+    running.wait(&context()).await.expect("first run");
+    let record = queued.wait(&context()).await.expect("second run");
+    assert_eq!(record.status(), "done");
+}

@@ -1048,6 +1048,14 @@ pub async fn open_harness_with_scheduler(
     session.set_conversation_created_hook(conversation_created_hook(
         options.conversation_created.clone(),
     ));
+    {
+        let settings = settings_source.clone();
+        session.set_document_retention(Arc::new(move || {
+            settings
+                .current()
+                .and_then(|settings| settings.document_retention_ms)
+        }));
+    }
     let identity = rpi_ai::utils::identity::merge_client_identity(
         Some(crate::harness::types::default_harness_identity()),
         options.identity.clone(),

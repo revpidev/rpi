@@ -816,6 +816,12 @@ async fn classify(
         }
     }
     let policy = settings.retry;
+    let after = settings.after_failed_run;
+    let modes = QueueModes {
+        steering_mode: settings.steering_mode,
+        follow_up_mode: settings.follow_up_mode,
+    };
+    let now = runtime.now()?;
     // An overflow is never retried: only a compaction can make the next request fit.
     let retry = message.stop_reason == StopReason::Error
         && !overflow
@@ -838,6 +844,11 @@ async fn classify(
             let live = tx
                 .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
                 .await?;
+            let prepared = if !retry && after == AfterFailedRun::Continue {
+                Some(prepare_boundary(tx, conversation_id, modes).await?)
+            } else {
+                None
+            };
             append_assistant(tx, conversation_id, &message).await?;
             let mut state: LiveState = crate::harness::types::read_state(&live)?;
             if retry {
@@ -874,6 +885,7 @@ async fn classify(
                 },
             )
             .await?;
+            apply_after_failed_run(tx, conversation_id, &live, after, modes, now, prepared).await?;
             Ok(Some(NextTaskState::Terminal {
                 outcome: TaskOutcome::Failed {
                     error: TaskOutcomeError {
@@ -1301,12 +1313,24 @@ async fn fail_model_error(
 ) -> SessionResult<()> {
     let conversation_id = runtime.conversation_id();
     let task_id = runtime.task_id();
+    let settings = runtime.settings();
+    let after = settings.after_failed_run;
+    let modes = QueueModes {
+        steering_mode: settings.steering_mode,
+        follow_up_mode: settings.follow_up_mode,
+    };
+    let now = runtime.now()?;
     let change: TaskCommitFn = Arc::new(move |tx, _current| {
         let text = text.clone();
         Box::pin(async move {
             let live = tx
                 .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
                 .await?;
+            let prepared = if after == AfterFailedRun::Continue {
+                Some(prepare_boundary(tx, conversation_id, modes).await?)
+            } else {
+                None
+            };
             end_run(
                 tx,
                 &live,
@@ -1317,6 +1341,7 @@ async fn fail_model_error(
                 },
             )
             .await?;
+            apply_after_failed_run(tx, conversation_id, &live, after, modes, now, prepared).await?;
             Ok(Some(NextTaskState::Terminal {
                 outcome: TaskOutcome::Failed {
                     error: TaskOutcomeError {
@@ -1358,6 +1383,11 @@ async fn fail_no_model(
             let live = tx
                 .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
                 .await?;
+            let prepared = if after == AfterFailedRun::Continue {
+                Some(prepare_boundary(tx, conversation_id, modes).await?)
+            } else {
+                None
+            };
             end_run(
                 tx,
                 &live,
@@ -1368,7 +1398,7 @@ async fn fail_no_model(
                 },
             )
             .await?;
-            apply_after_failed_run(tx, conversation_id, &live, after, modes, now).await?;
+            apply_after_failed_run(tx, conversation_id, &live, after, modes, now, prepared).await?;
             Ok(Some(NextTaskState::Terminal {
                 outcome: TaskOutcome::Failed {
                     error: TaskOutcomeError {
@@ -1391,6 +1421,7 @@ async fn apply_after_failed_run(
     after: AfterFailedRun,
     modes: QueueModes,
     now: f64,
+    prepared: Option<crate::harness::inbox::Boundary>,
 ) -> SessionResult<()> {
     match after {
         AfterFailedRun::Keep => Ok(()),
@@ -1418,7 +1449,10 @@ async fn apply_after_failed_run(
             write_state(&inbox, &state)
         }
         AfterFailedRun::Continue => {
-            let boundary = prepare_boundary(tx, conversation_id, modes).await?;
+            let boundary = match prepared {
+                Some(boundary) => boundary,
+                None => prepare_boundary(tx, conversation_id, modes).await?,
+            };
             let pending: InboxState = read_state(&boundary.inbox)?;
             if pending.items.is_empty() {
                 return Ok(());

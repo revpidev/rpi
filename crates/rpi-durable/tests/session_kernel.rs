@@ -1740,3 +1740,98 @@ async fn internal_commit_listener_panic_fails_the_session() {
         Err(SessionError::Failed { .. })
     ));
 }
+
+/// R-D10: `documentRetentionMs` drops an unobserved document after its last
+/// use, so the next access loads it from Storage again.
+#[tokio::test]
+async fn document_retention_reloads_an_unobserved_document() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft
+                .write()?
+                .as_object_mut()
+                .unwrap()
+                .insert("message".into(), serde_json::json!("kept"));
+            Ok(())
+        })
+    })
+    .await;
+    harness.session.set_document_retention(Arc::new(|| Some(0)));
+    let before = harness.storage.document_read_count.load(Ordering::SeqCst);
+    harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("first");
+    harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("second");
+    let after = harness.storage.document_read_count.load(Ordering::SeqCst);
+    assert!(
+        after >= before + 2,
+        "each access reloads after retention 0: {before} -> {after}"
+    );
+}
+
+/// R-D10: a watch keeps its document cached.
+#[tokio::test]
+async fn document_retention_keeps_an_observed_document() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft
+                .write()?
+                .as_object_mut()
+                .unwrap()
+                .insert("message".into(), serde_json::json!("kept"));
+            Ok(())
+        })
+    })
+    .await;
+    harness.session.set_document_retention(Arc::new(|| Some(0)));
+    let watch = harness
+        .session
+        .watch_doc(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("watch")
+        .expect("document");
+    let before = harness.storage.document_read_count.load(Ordering::SeqCst);
+    harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        harness.storage.document_read_count.load(Ordering::SeqCst),
+        before,
+        "an observed document stays cached"
+    );
+    watch.stop().await;
+}
