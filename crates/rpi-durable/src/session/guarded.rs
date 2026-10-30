@@ -322,6 +322,10 @@ impl Storage for GuardedStorage {
         }
         loop {
             let settled = self.settled.notified();
+            tokio::pin!(settled);
+            // `notify_waiters` stores no permit: register before reading the
+            // count so a call that finishes now cannot lose its wakeup.
+            settled.as_mut().enable();
             let done = self
                 .underway
                 .lock()

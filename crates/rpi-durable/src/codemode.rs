@@ -412,12 +412,7 @@ impl CodemodeJournal {
         };
         let fingerprint = args_fingerprint(args);
         let actual = format!("{name}({})", canonical_json(&Value::Object(args.clone())));
-        if entry.name != name
-            || entry
-                .args_fingerprint
-                .as_ref()
-                .is_some_and(|recorded| recorded != &fingerprint)
-        {
+        if entry.name != name || entry.args_fingerprint.as_ref() != Some(&fingerprint) {
             return Err(CodemodeJournalError::Divergence {
                 key: key.to_string(),
                 expected: entry.name.clone(),
@@ -613,9 +608,12 @@ pub trait CodemodeHost: Send + Sync {
     /// The Harness clock.
     fn now(&self) -> Result<f64, String>;
 
-    /// The sandbox has processed result `seq` (`0`: its initial drain) and is
-    /// idle after issuing `issued` calls. Replay validates and persists the
-    /// acknowledged count here, then releases calls not present in the journal.
+    /// The sandbox has processed result `seq` and is idle after issuing
+    /// `issued` calls. `seq` `0` means that the first batch of calls has been
+    /// issued and the VM waits before any result is delivered; do not report
+    /// `idle(0, 0)` at script start when the first batch is issued afterwards.
+    /// Replay validates and persists the acknowledged count here, then
+    /// releases calls not present in the journal.
     async fn idle(&self, seq: u64, issued: u64) -> Result<(), String>;
 
     /// The host's reply to the script start; persisted with the start data and
@@ -1068,6 +1066,11 @@ impl<'a> DurableHost<'a> {
         let mut counted = false;
         loop {
             let changed = self.replay_changed.notified();
+            tokio::pin!(changed);
+            // Register before checking: `notify_waiters` does not store a
+            // permit, so a notification between creating the future and its
+            // first poll would otherwise be lost.
+            changed.as_mut().enable();
             if self.advance_call(key, &mut counted)? {
                 return Ok(());
             }
@@ -1078,7 +1081,7 @@ impl<'a> DurableHost<'a> {
                 .insert(key.to_string());
             if let Some(signal) = self.context.abort_signal() {
                 tokio::select! {
-                    _ = changed => {},
+                    _ = &mut changed => {},
                     _ = signal.cancelled() => {
                         return Err("The code mode replay was aborted".to_string());
                     }
@@ -1208,7 +1211,7 @@ impl<'a> DurableHost<'a> {
     }
 
     async fn finish_replay(&self) -> Result<(), String> {
-        let (issued, complete, released) = self
+        let (issued, complete, released, divergence) = self
             .replay
             .lock()
             .map(|replay| {
@@ -1216,9 +1219,13 @@ impl<'a> DurableHost<'a> {
                     replay.issued,
                     replay.next == self.replay_len,
                     replay.released,
+                    replay.divergence.clone(),
                 )
             })
-            .unwrap_or((0, false, false));
+            .unwrap_or((0, false, false, None));
+        if let Some(message) = divergence {
+            return Err(message);
+        }
         if !complete {
             return Err(
                 "The script took a different path when resumed after a restart: it ended before consuming the journal"
@@ -1427,40 +1434,47 @@ impl CodemodeHost for DurableHost<'_> {
         key: &str,
     ) -> Result<NestedToolExecutionResult, String> {
         let fingerprint = args_fingerprint(&args);
-        {
+        let divergence = {
             let journal = self
                 .journal
                 .lock()
                 .map_err(|_| "codemode journal lock poisoned".to_string())?;
-            if let Some(entry) = journal.entry(key)
-                && (entry.name != name
-                    || entry.args_fingerprint.as_ref() != Some(&fingerprint)
-                    || entry.global.is_some())
-            {
-                return Err(Self::divergence(key, name, entry));
-            }
+            journal
+                .entry(key)
+                .filter(|entry| {
+                    entry.name != name
+                        || entry.args_fingerprint.as_ref() != Some(&fingerprint)
+                        || entry.global.is_some()
+                })
+                .map(|entry| Self::divergence(key, name, entry))
+        };
+        if let Some(message) = divergence {
+            return Err(self.replay_divergence(message));
         }
         self.wait_for_call(key).await?;
         self.begin_row(key, name, &args);
-        {
+        let stored = {
             let journal = self
                 .journal
                 .lock()
                 .map_err(|_| "codemode journal lock poisoned".to_string())?;
-            if let Some(entry) = journal.entry(key) {
-                let stored = entry.result.clone().ok_or_else(|| {
-                    format!("The code mode journal has no delivered result for call {key}")
-                })?;
-                self.finish_row(key, &stored);
-                self.context.telemetry().add_event(
-                    "pi.durable.replay",
-                    json!({ "tool.name": name })
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
-                );
-                return Ok(stored);
-            }
+            journal.entry(key).map(|entry| entry.result.clone())
+        };
+        if let Some(stored) = stored {
+            let Some(stored) = stored else {
+                return Err(self.replay_divergence(format!(
+                    "The code mode journal has no delivered result for call {key}"
+                )));
+            };
+            self.finish_row(key, &stored);
+            self.context.telemetry().add_event(
+                "pi.durable.replay",
+                json!({ "tool.name": name })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            return Ok(stored);
         }
         self.acknowledge_delivered().await?;
         let result = self
@@ -1577,40 +1591,42 @@ impl CodemodeHost for DurableHost<'_> {
             }
             return Ok(result.structured_output.unwrap_or(JsonValue::Null));
         }
-        {
+        let divergence = {
             let journal = self
                 .journal
                 .lock()
                 .map_err(|_| "codemode journal lock poisoned".to_string())?;
-            if let Some(entry) = journal.entry(key) {
+            journal.entry(key).and_then(|entry| {
                 let different_args = entry.global.as_ref().is_none_or(|global| {
                     global
                         .args
                         .as_ref()
                         .is_none_or(|stored| canonical_json(stored) != canonical_json(args))
                 });
-                if entry.name != name || entry.result.is_some() || different_args {
-                    return Err(Self::divergence(key, name, entry));
-                }
-            }
+                (entry.name != name || entry.result.is_some() || different_args)
+                    .then(|| Self::divergence(key, name, entry))
+            })
+        };
+        if let Some(message) = divergence {
+            return Err(self.replay_divergence(message));
         }
         self.wait_for_call(key).await?;
-        {
+        let stored = {
             let journal = self
                 .journal
                 .lock()
                 .map_err(|_| "codemode journal lock poisoned".to_string())?;
-            if let Some(entry) = journal.entry(key) {
-                return entry
-                    .global
-                    .as_ref()
-                    .map(|global| global.outcome.clone())
-                    .ok_or_else(|| {
-                        format!(
-                            "The code mode journal has no delivered global outcome for call {key}"
-                        )
-                    });
-            }
+            journal
+                .entry(key)
+                .map(|entry| entry.global.as_ref().map(|global| global.outcome.clone()))
+        };
+        if let Some(stored) = stored {
+            let Some(outcome) = stored else {
+                return Err(self.replay_divergence(format!(
+                    "The code mode journal has no delivered global outcome for call {key}"
+                )));
+            };
+            return Ok(outcome);
         }
         self.acknowledge_delivered().await?;
         let outcome = if DISCOVERY_GLOBALS.contains(&name) {

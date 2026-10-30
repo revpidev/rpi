@@ -260,6 +260,9 @@ impl SessionImpl {
     pub async fn closed(&self) -> SessionEnd {
         loop {
             let notified = self.end_notify.notified();
+            tokio::pin!(notified);
+            // Register before checking: `notify_waiters` stores no permit.
+            notified.as_mut().enable();
             if let Some(end) = self.end.lock().ok().and_then(|end| end.clone()) {
                 return end;
             }
@@ -507,7 +510,10 @@ impl SessionImpl {
         scope: Option<TransactionScope>,
     ) -> SessionResult<T> {
         let _guard = self.line.lock().await;
-        self.assert_healthy()?;
+        // Re-check close after waiting on the line: `commit_with` checked it
+        // before the future was polled, but a concurrent close may have won
+        // the line first. It must not run the callback or fail the Session.
+        self.assert_usable()?;
         if context
             .abort_signal()
             .is_some_and(|signal| signal.is_cancelled())

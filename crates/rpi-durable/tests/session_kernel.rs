@@ -6,7 +6,7 @@
 
 mod session_support;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rpi_durable::chord::context::BACKGROUND_CONTEXT;
@@ -1695,6 +1695,43 @@ async fn an_underway_commit_rejects_when_the_session_fails() {
         committing.await.expect("join"),
         Err(SessionError::Failed { cause }) if cause == "concurrent failure"
     ));
+}
+
+/// A commit future created before a close must not run its callback after
+/// the close won the session line, and must not fail the Session.
+#[tokio::test]
+async fn a_commit_polled_after_close_rejects_without_running() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_in_commit = Arc::clone(&ran);
+    let pending = harness.session.commit(
+        commit_fn(move |tx| {
+            let ran = Arc::clone(&ran_in_commit);
+            Box::pin(async move {
+                ran.store(true, Ordering::SeqCst);
+                let draft = tx
+                    .doc(live(), DocOwner::Conversation(conversation), None)
+                    .await?;
+                draft.write()?["nested"]["count"] = serde_json::json!(9);
+                Ok(())
+            })
+        }),
+        &BACKGROUND_CONTEXT,
+    );
+    harness
+        .session
+        .close(&BACKGROUND_CONTEXT)
+        .await
+        .expect("close");
+    let result = pending.await;
+    assert!(matches!(result, Err(SessionError::Closed)), "{result:?}");
+    assert!(
+        !ran.load(Ordering::SeqCst),
+        "the commit callback ran after close"
+    );
+    assert!(harness.session.failure().is_none());
+    assert!(matches!(harness.session.closed().await, SessionEnd::Closed));
 }
 
 /// The guarded close seals new calls and waits for calls already underway.

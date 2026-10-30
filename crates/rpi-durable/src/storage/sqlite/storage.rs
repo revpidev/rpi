@@ -1506,6 +1506,9 @@ impl Storage for SqliteStorage {
         }
         loop {
             let notified = self.drained.notified();
+            tokio::pin!(notified);
+            // Register before checking: `notify_waiters` stores no permit.
+            notified.as_mut().enable();
             let admitted = self
                 .admission
                 .lock()

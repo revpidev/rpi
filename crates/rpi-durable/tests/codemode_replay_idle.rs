@@ -425,3 +425,221 @@ async fn a_call_delayed_beyond_one_yield_can_arrive_before_idle() {
         Some(2)
     );
 }
+
+struct SwallowedDivergenceSandbox {
+    attempts: AtomicUsize,
+    journaled: Arc<tokio::sync::Notify>,
+    crash: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl CodemodeSandbox for SwallowedDivergenceSandbox {
+    fn fingerprint(&self) -> String {
+        "swallowed-divergence-1".to_string()
+    }
+
+    async fn run(
+        &self,
+        _start: CodemodeStart,
+        host: &dyn CodemodeHost,
+        _context: &Context,
+    ) -> Result<CodemodeOutcome, String> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            host.call_tool("inner", JsonObject::new(), "c1").await?;
+            self.journaled.notify_one();
+            self.crash.notified().await;
+            return Ok(CodemodeOutcome::output("unreachable"));
+        }
+        host.call_tool("inner", JsonObject::new(), "c1").await?;
+        host.idle(1, 1).await?;
+        let different = serde_json::json!({ "different": true });
+        let _ = host
+            .call_tool(
+                "inner",
+                different.as_object().cloned().unwrap_or_default(),
+                "c1",
+            )
+            .await;
+        Ok(CodemodeOutcome::output("swallowed"))
+    }
+}
+
+/// A sandbox that ignores a divergence error still fails the run; the host
+/// latches the divergence and checks it after the sandbox returns.
+#[tokio::test]
+async fn an_ignored_divergence_still_fails_the_run() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let journaled = Arc::new(tokio::sync::Notify::new());
+    let crash = Arc::new(tokio::sync::Notify::new());
+    let sandbox = Arc::new(SwallowedDivergenceSandbox {
+        attempts: AtomicUsize::new(0),
+        journaled: Arc::clone(&journaled),
+        crash,
+    });
+    let extensions = || {
+        vec![extension(vec![
+            create_codemode_tool(CodemodeToolOptions {
+                sandbox: Arc::clone(&sandbox) as Arc<dyn CodemodeSandbox>,
+                ..Default::default()
+            }),
+            tool(
+                "inner",
+                Arc::new(ReplayTool {
+                    runs: Arc::clone(&runs),
+                    gate_key: None,
+                    gate_open: AtomicBool::new(false),
+                    started: None,
+                    release: None,
+                }),
+            ),
+        ])]
+    };
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage(Arc::clone(&storage), extensions(), None, models()).await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    journaled.notified().await;
+
+    let reopened = open_with_storage(
+        Arc::clone(&storage),
+        extensions(),
+        None,
+        test_models(vec![Script::Message(text_message(
+            "done",
+            rpi_ai::types::StopReason::Stop,
+        ))]),
+    )
+    .await;
+    reopened.harness.resume().expect("resume");
+    let recovered = reopened
+        .harness
+        .submission(submission.id(), &context())
+        .await
+        .expect("submission")
+        .expect("present");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        recovered.wait(&context()),
+    )
+    .await
+    .expect("divergence did not settle")
+    .expect("replay settled");
+
+    let results = tool_result_texts(&entries(&root_ready(&reopened.harness).await).await);
+    assert!(
+        results.iter().any(|text| text.contains("different path")),
+        "{results:?}"
+    );
+    assert!(
+        !results.iter().any(|text| text.contains("swallowed")),
+        "{results:?}"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "no nested call ran twice");
+}
+
+struct ConcurrentDivergenceSandbox {
+    attempts: AtomicUsize,
+    journaled: Arc<tokio::sync::Notify>,
+    crash: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl CodemodeSandbox for ConcurrentDivergenceSandbox {
+    fn fingerprint(&self) -> String {
+        "concurrent-divergence-1".to_string()
+    }
+
+    async fn run(
+        &self,
+        _start: CodemodeStart,
+        host: &dyn CodemodeHost,
+        _context: &Context,
+    ) -> Result<CodemodeOutcome, String> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            host.call_tool("inner", JsonObject::new(), "c1").await?;
+            self.journaled.notify_one();
+            self.crash.notified().await;
+            return Ok(CodemodeOutcome::output("unreachable"));
+        }
+        let different = serde_json::json!({ "different": true });
+        let bad = host.call_tool(
+            "inner",
+            different.as_object().cloned().unwrap_or_default(),
+            "c1",
+        );
+        let new = host.call_tool("inner", JsonObject::new(), "c2");
+        let (bad, new) = tokio::join!(bad, new);
+        bad?;
+        new?;
+        Ok(CodemodeOutcome::output("unreachable"))
+    }
+}
+
+/// A divergence in one concurrent call wakes every other waiter instead of
+/// leaving it blocked behind a journal that will never advance.
+#[tokio::test]
+async fn a_divergence_releases_concurrent_waiters() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let journaled = Arc::new(tokio::sync::Notify::new());
+    let crash = Arc::new(tokio::sync::Notify::new());
+    let sandbox = Arc::new(ConcurrentDivergenceSandbox {
+        attempts: AtomicUsize::new(0),
+        journaled: Arc::clone(&journaled),
+        crash,
+    });
+    let extensions = || {
+        vec![extension(vec![
+            create_codemode_tool(CodemodeToolOptions {
+                sandbox: Arc::clone(&sandbox) as Arc<dyn CodemodeSandbox>,
+                ..Default::default()
+            }),
+            tool(
+                "inner",
+                Arc::new(ReplayTool {
+                    runs: Arc::clone(&runs),
+                    gate_key: None,
+                    gate_open: AtomicBool::new(false),
+                    started: None,
+                    release: None,
+                }),
+            ),
+        ])]
+    };
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage(Arc::clone(&storage), extensions(), None, models()).await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    journaled.notified().await;
+
+    let reopened = open_with_storage(
+        Arc::clone(&storage),
+        extensions(),
+        None,
+        test_models(vec![Script::Message(text_message(
+            "done",
+            rpi_ai::types::StopReason::Stop,
+        ))]),
+    )
+    .await;
+    reopened.harness.resume().expect("resume");
+    let recovered = reopened
+        .harness
+        .submission(submission.id(), &context())
+        .await
+        .expect("submission")
+        .expect("present");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        recovered.wait(&context()),
+    )
+    .await
+    .expect("concurrent divergence deadlocked")
+    .expect("replay settled");
+
+    let results = tool_result_texts(&entries(&root_ready(&reopened.harness).await).await);
+    assert!(
+        results.iter().any(|text| text.contains("different path")),
+        "{results:?}"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "no nested call ran twice");
+}

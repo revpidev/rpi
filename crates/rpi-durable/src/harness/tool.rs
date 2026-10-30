@@ -571,6 +571,9 @@ impl AdmissionTracker {
     async fn drain(&self) {
         loop {
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register before checking: `notify_waiters` stores no permit.
+            notified.as_mut().enable();
             let active = self.state.lock().map(|state| state.1).unwrap_or(0);
             if active == 0 {
                 return;

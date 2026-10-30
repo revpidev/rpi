@@ -1753,13 +1753,16 @@ async fn initial_ignore_rules(root: &std::path::Path, listed: &std::path::Path) 
     if let Some(global) = ignore::gitignore::gitconfig_excludes_path() {
         load_ignore_file(&global, "", &mut rules).await;
     }
-    load_ignore_file(&root.join(".gitignore"), "", &mut rules).await;
+    // Git precedence: the global excludes file has the lowest priority, then
+    // `$GIT_DIR/info/exclude`, then any `.gitignore` (deeper files override
+    // higher ones). Later rules win, so load them in that order.
     load_ignore_file(
         &root.join(".git").join("info").join("exclude"),
         "",
         &mut rules,
     )
     .await;
+    load_ignore_file(&root.join(".gitignore"), "", &mut rules).await;
     let relative = listed
         .strip_prefix(root)
         .unwrap_or(std::path::Path::new(""));

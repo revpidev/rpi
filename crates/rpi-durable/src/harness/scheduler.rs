@@ -312,6 +312,9 @@ async fn wait_invocation(invocation: &Arc<Invocation>) {
             return;
         }
         let notified = invocation.notify.notified();
+        tokio::pin!(notified);
+        // Register before checking: `notify_waiters` stores no permit.
+        notified.as_mut().enable();
         if invocation.ended.load(Ordering::SeqCst) {
             return;
         }

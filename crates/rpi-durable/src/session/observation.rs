@@ -187,6 +187,9 @@ impl CommittedWatch {
     pub async fn closed(&self) -> WatchEnd {
         loop {
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register before checking: `notify_waiters` stores no permit.
+            notified.as_mut().enable();
             {
                 if let Ok(state) = self.inner.lock()
                     && let Some(end) = state.end.clone()
@@ -279,6 +282,10 @@ impl CommittedWatch {
 async fn drain(inner: Arc<Mutex<WatchState>>, notify: Arc<tokio::sync::Notify>) {
     loop {
         let notified = notify.notified();
+        tokio::pin!(notified);
+        // Register before draining and checking: the drain loop has await
+        // points, and `notify_waiters` stores no permit.
+        notified.as_mut().enable();
         // Drain every buffered frame.
         loop {
             let frame = {

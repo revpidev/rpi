@@ -283,6 +283,20 @@ fn journal_divergence_is_an_error_and_the_first_result_stays() {
             .is_err()
     );
 
+    // A journal entry without a fingerprint cannot prove that a replay made
+    // the same call; it is corrupt, not a wildcard.
+    let mut legacy = CodemodeJournal::default();
+    legacy.entries.push(CodemodeJournalEntry {
+        key: "c1".to_string(),
+        name: "inner".to_string(),
+        args_fingerprint: None,
+        at: 0.0,
+        issued_after: None,
+        global: None,
+        result: Some(nested_result(1)),
+    });
+    assert!(legacy.validate("c1", "inner", &args).is_err());
+
     // Entries keep delivery order, and a global's outcome is journaled too.
     journal
         .record("c2", "inner", &args, 7.0, nested_result(4))
