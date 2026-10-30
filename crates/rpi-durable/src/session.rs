@@ -79,11 +79,9 @@ pub type SessionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SessionErr
 
 /// Failure surface of the session kernel.
 ///
-/// Upstream throws plain `Error` subclasses and branches on `instanceof
-/// StorageRejected`; the Rust port preserves the message text and keeps the
-/// storage error reachable through [`SessionError::Storage`] so
-/// [`StorageError::ReadAfterWrite`] and [`StorageError::Rejected`] stay
-/// inspectable.
+/// Upstream throws plain `Error` subclasses; the Rust port keeps the original
+/// storage error reachable through [`SessionError::Storage`], except for the
+/// guard's own failure marker, which becomes [`SessionError::Failed`].
 #[derive(Debug, Error)]
 pub enum SessionError {
     /// Admission is sealed; every later operation rejects (upstream
@@ -97,10 +95,10 @@ pub enum SessionError {
         /// The first error's message.
         cause: String,
     },
-    /// Storage failure surfaced unchanged (including `Rejected` and
-    /// `ReadAfterWrite`).
+    /// Storage failure surfaced unchanged, including `StorageRequestError` and
+    /// `ReadAfterWrite`.
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Storage(StorageError),
     /// Typed document definition mismatch (`documents.ts` errors).
     #[error(transparent)]
     Document(#[from] DocumentError),
@@ -113,6 +111,15 @@ pub enum SessionError {
     /// Transaction, validation, or callback failure carrying the upstream text.
     #[error("{0}")]
     Message(String),
+}
+
+impl From<StorageError> for SessionError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::SessionFailed(cause) => Self::Failed { cause },
+            error => Self::Storage(error),
+        }
+    }
 }
 
 impl SessionError {

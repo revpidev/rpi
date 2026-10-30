@@ -203,6 +203,18 @@ impl ToolExecutionApi for FakeApi {
         unimplemented!("memo_set is not used by the tool tests")
     }
 
+    async fn create_task(
+        &self,
+        _definition: rpi_durable::harness::AnyTask,
+        _input: JsonValue,
+        _ownership: rpi_durable::session::TaskOwnership,
+        _background: bool,
+        _abandon_on_restart: Option<bool>,
+        _context: &Context,
+    ) -> Result<TaskId, SessionError> {
+        unimplemented!("create_task is not used by the tool tests")
+    }
+
     async fn get_task(
         &self,
         _id: TaskId,

@@ -1621,6 +1621,75 @@ async fn other_read_error_fails_the_session() {
     );
 }
 
+/// R-D11: once failed, guarded calls do not reach the backend and return the
+/// guard's failure marker instead of a successful read.
+#[tokio::test]
+async fn guarded_reads_reject_after_the_session_fails() {
+    let harness = open_test_session();
+    harness.session.fail("platform reset");
+    let result = harness
+        .session
+        .storage()
+        .conversation(rpi_durable::ids::ROOT_CONVERSATION_ID, &BACKGROUND_CONTEXT)
+        .await;
+    assert!(matches!(
+        result,
+        Err(StorageError::SessionFailed(cause)) if cause == "platform reset"
+    ));
+}
+
+/// R-D11: a read that was underway when another path failed cannot return its
+/// now-untrusted value; it ends with `SessionFailed` after the backend settles.
+#[tokio::test]
+async fn an_underway_read_rejects_when_the_session_fails() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    let gate = harness.storage.hold_find_document();
+    let session = Arc::clone(&harness.session);
+    let reading = tokio::spawn(async move {
+        session
+            .snapshot(
+                live(),
+                DocOwner::Conversation(conversation),
+                &BACKGROUND_CONTEXT,
+            )
+            .await
+    });
+    gate.entered().await;
+    harness.session.fail("concurrent failure");
+    gate.release();
+    assert!(matches!(
+        reading.await.expect("join"),
+        Err(SessionError::Failed { cause }) if cause == "concurrent failure"
+    ));
+}
+
+/// The guarded close seals new calls and waits for calls already underway.
+#[tokio::test]
+async fn guarded_close_waits_for_an_underway_read() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    let gate = harness.storage.hold_find_document();
+    let session = Arc::clone(&harness.session);
+    let reading = tokio::spawn(async move {
+        session
+            .snapshot(
+                live(),
+                DocOwner::Conversation(conversation),
+                &BACKGROUND_CONTEXT,
+            )
+            .await
+    });
+    gate.entered().await;
+    let storage = Arc::clone(harness.session.storage());
+    let closing = tokio::spawn(async move { storage.close(&BACKGROUND_CONTEXT).await });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(!closing.is_finished(), "close passed the underway read");
+    gate.release();
+    assert!(reading.await.expect("join").is_ok());
+    closing.await.expect("join").expect("close");
+}
+
 /// R-D11: `mintId()` storage failure fails the Session, even from a
 /// scheduler/transaction commit path.
 #[tokio::test]

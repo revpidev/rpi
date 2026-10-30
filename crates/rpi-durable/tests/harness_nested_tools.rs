@@ -1059,3 +1059,1004 @@ async fn end_to_end_v1_migration_nested_and_sleep() {
     assert!(matches!(sleep.record.state, TaskState::Terminal { .. }));
     assert_eq!(phases.load(Ordering::SeqCst), 2);
 }
+
+/// FR-B R3/R4: concurrent calls are delivered in journal order after a reopen,
+/// without rerunning either nested tool.
+#[tokio::test]
+async fn concurrent_codemode_calls_replay_in_delivery_order() {
+    use futures::{StreamExt, stream::FuturesUnordered};
+    use generation_support::open_with_storage;
+    use rpi_durable::codemode::{
+        CODEMODE_JOURNAL_DOC, CODEMODE_TOOL_NAME, CodemodeHost, CodemodeJournal, CodemodeOutcome,
+        CodemodeSandbox, CodemodeStart, CodemodeToolOptions, create_codemode_tool,
+    };
+    use rpi_durable::storage::MemoryStorage;
+    use rpi_durable::types::Storage;
+    use std::pin::Pin;
+
+    struct OrderedSandbox {
+        attempts: AtomicUsize,
+        orders: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        fast_delivered: Arc<tokio::sync::Notify>,
+        journaled: Arc<tokio::sync::Notify>,
+        hold: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl CodemodeSandbox for OrderedSandbox {
+        fn fingerprint(&self) -> String {
+            "ordered-replay-1".to_string()
+        }
+
+        async fn run(
+            &self,
+            _start: CodemodeStart,
+            host: &dyn CodemodeHost,
+            _context: &Context,
+        ) -> Result<CodemodeOutcome, String> {
+            type CallFuture<'a> =
+                Pin<Box<dyn Future<Output = (String, NestedToolExecutionResult)> + Send + 'a>>;
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 2 {
+                host.call_tool("slow", JsonObject::new(), "c1").await?;
+                return Err("sequential out-of-order replay was accepted".to_string());
+            }
+            let mut calls: FuturesUnordered<CallFuture<'_>> = FuturesUnordered::new();
+            calls.push(Box::pin(async {
+                (
+                    "c1".to_string(),
+                    host.call_tool("slow", JsonObject::new(), "c1")
+                        .await
+                        .expect("slow call"),
+                )
+            }));
+            calls.push(Box::pin(async {
+                (
+                    "c2".to_string(),
+                    host.call_tool("fast", JsonObject::new(), "c2")
+                        .await
+                        .expect("fast call"),
+                )
+            }));
+            let mut order = Vec::new();
+            while let Some((key, _)) = calls.next().await {
+                order.push(key.clone());
+                if attempt == 0 && key == "c2" {
+                    self.fast_delivered.notify_one();
+                }
+            }
+            if attempt == 1 {
+                host.call_tool("later", JsonObject::new(), "c3").await?;
+                host.call_tool("later", JsonObject::new(), "c4").await?;
+            }
+            self.orders.lock().expect("orders").push(order.clone());
+            if attempt == 0 {
+                self.journaled.notify_one();
+                self.hold.notified().await;
+            }
+            Ok(CodemodeOutcome::output(order.join(",")))
+        }
+    }
+
+    struct GateTool {
+        runs: Arc<AtomicUsize>,
+        value: &'static str,
+        started: Option<Arc<tokio::sync::Notify>>,
+        release: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait]
+    impl ToolExecute for GateTool {
+        async fn execute(
+            &self,
+            _args: JsonObject,
+            _api: &dyn ToolExecutionApi,
+            _context: &Context,
+        ) -> Result<ToolExecutionResult, ToolExecuteError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            if let Some(started) = &self.started {
+                started.notify_one();
+            }
+            if let Some(release) = &self.release {
+                release.notified().await;
+            }
+            Ok(ToolExecutionResult {
+                structured_output: Some(serde_json::json!({ "tool": self.value })),
+                ..Default::default()
+            })
+        }
+    }
+
+    let slow_started = Arc::new(tokio::sync::Notify::new());
+    let slow_release = Arc::new(tokio::sync::Notify::new());
+    let fast_delivered = Arc::new(tokio::sync::Notify::new());
+    let journaled = Arc::new(tokio::sync::Notify::new());
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let slow_runs = Arc::new(AtomicUsize::new(0));
+    let fast_runs = Arc::new(AtomicUsize::new(0));
+    let later_runs = Arc::new(AtomicUsize::new(0));
+    let orders = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sandbox = Arc::new(OrderedSandbox {
+        attempts: AtomicUsize::new(0),
+        orders: Arc::clone(&orders),
+        fast_delivered: Arc::clone(&fast_delivered),
+        journaled: Arc::clone(&journaled),
+        hold,
+    });
+    let extensions = || {
+        vec![extension(vec![
+            create_codemode_tool(CodemodeToolOptions {
+                sandbox: Arc::clone(&sandbox) as Arc<dyn CodemodeSandbox>,
+                ..Default::default()
+            }),
+            tool(
+                "slow",
+                Some(vec![ToolCaller::Tools]),
+                Some(serde_json::json!({})),
+                Arc::new(GateTool {
+                    runs: Arc::clone(&slow_runs),
+                    value: "slow",
+                    started: Some(Arc::clone(&slow_started)),
+                    release: Some(Arc::clone(&slow_release)),
+                }),
+            ),
+            tool(
+                "fast",
+                Some(vec![ToolCaller::Tools]),
+                Some(serde_json::json!({})),
+                Arc::new(GateTool {
+                    runs: Arc::clone(&fast_runs),
+                    value: "fast",
+                    started: None,
+                    release: None,
+                }),
+            ),
+            tool(
+                "later",
+                Some(vec![ToolCaller::Tools]),
+                Some(serde_json::json!({})),
+                Arc::new(GateTool {
+                    runs: Arc::clone(&later_runs),
+                    value: "later",
+                    started: None,
+                    release: None,
+                }),
+            ),
+        ])]
+    };
+    let models = || {
+        test_models(vec![
+            Script::Message(tool_use_message(
+                CODEMODE_TOOL_NAME,
+                "c1",
+                serde_json::json!({ "code": "return 1" }),
+            )),
+            Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
+        ])
+    };
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage(Arc::clone(&storage), extensions(), None, models()).await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    slow_started.notified().await;
+    fast_delivered.notified().await;
+    slow_release.notify_one();
+    journaled.notified().await;
+
+    let parent = opened
+        .harness
+        .inspect(&context())
+        .await
+        .expect("inspect")
+        .tasks
+        .into_iter()
+        .find(|task| task.record.kind == "pi.tool" && task.record.input["kind"] == "model")
+        .expect("codemode parent")
+        .record
+        .id;
+    let journal = opened
+        .harness
+        .session()
+        .snapshot(&CODEMODE_JOURNAL_DOC, DocOwner::Task(parent), &context())
+        .await
+        .expect("journal")
+        .expect("present");
+    let journal: CodemodeJournal =
+        serde_json::from_value(JsonValue::Object(journal)).expect("journal json");
+    assert_eq!(
+        journal
+            .entries
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c2", "c1"]
+    );
+
+    let reopened = open_with_storage(
+        Arc::clone(&storage),
+        extensions(),
+        None,
+        test_models(vec![Script::Message(text_message(
+            "done",
+            rpi_ai::types::StopReason::Stop,
+        ))]),
+    )
+    .await;
+    let recovered = reopened
+        .harness
+        .submission(submission.id(), &context())
+        .await
+        .expect("submission")
+        .expect("present");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        recovered.wait(&context()),
+    )
+    .await
+    .expect("replay did not deadlock")
+    .expect("replay settled");
+    assert_eq!(
+        orders.lock().expect("orders").as_slice(),
+        &[
+            vec!["c2".to_string(), "c1".to_string()],
+            vec!["c2".to_string(), "c1".to_string()]
+        ]
+    );
+    assert_eq!(slow_runs.load(Ordering::SeqCst), 1);
+    assert_eq!(fast_runs.load(Ordering::SeqCst), 1);
+    assert_eq!(later_runs.load(Ordering::SeqCst), 2);
+    let results = tool_result_texts(&entries(&root_ready(&reopened.harness).await).await);
+    assert!(
+        results.iter().any(|text| text.contains("c2,c1")),
+        "replay result: {results:?}"
+    );
+    assert!(
+        !results.iter().any(|text| text.contains("different path")),
+        "replay result: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn multiple_out_of_order_replay_waiters_are_rejected() {
+    use futures::{StreamExt, stream::FuturesUnordered};
+    use generation_support::open_with_storage;
+    use rpi_durable::codemode::{
+        CODEMODE_TOOL_NAME, CodemodeHost, CodemodeOutcome, CodemodeSandbox, CodemodeStart,
+        CodemodeToolOptions, create_codemode_tool,
+    };
+    use rpi_durable::storage::MemoryStorage;
+    use rpi_durable::types::Storage;
+    use std::pin::Pin;
+
+    struct SlowTool {
+        runs: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl ToolExecute for SlowTool {
+        async fn execute(
+            &self,
+            _args: JsonObject,
+            api: &dyn ToolExecutionApi,
+            _context: &Context,
+        ) -> Result<ToolExecutionResult, ToolExecuteError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            if api.call_id().ends_with("/c1") {
+                self.release.notified().await;
+            }
+            Ok(ToolExecutionResult {
+                structured_output: Some(serde_json::json!({ "slow": true })),
+                ..Default::default()
+            })
+        }
+    }
+
+    struct OutOfOrderSandbox {
+        attempts: AtomicUsize,
+        journaled: Arc<tokio::sync::Notify>,
+        hold: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl CodemodeSandbox for OutOfOrderSandbox {
+        fn fingerprint(&self) -> String {
+            "multiple-out-of-order-waiters-1".to_string()
+        }
+
+        async fn run(
+            &self,
+            _start: CodemodeStart,
+            host: &dyn CodemodeHost,
+            _context: &Context,
+        ) -> Result<CodemodeOutcome, String> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 1 {
+                type CallFuture<'a> = Pin<
+                    Box<dyn Future<Output = Result<NestedToolExecutionResult, String>> + Send + 'a>,
+                >;
+                let mut calls: FuturesUnordered<CallFuture<'_>> = FuturesUnordered::new();
+                calls.push(Box::pin(host.call_tool("slow", JsonObject::new(), "c3")));
+                calls.push(Box::pin(host.call_tool("slow", JsonObject::new(), "c1")));
+                while let Some(result) = calls.next().await {
+                    result?;
+                }
+                return Err("out-of-order replay was accepted".to_string());
+            }
+            host.call_tool("slow", JsonObject::new(), "c2").await?;
+            host.call_tool("slow", JsonObject::new(), "c1").await?;
+            host.call_tool("slow", JsonObject::new(), "c3").await?;
+            self.journaled.notify_one();
+            self.hold.notified().await;
+            Ok(CodemodeOutcome::output("done"))
+        }
+    }
+
+    let slow_started = Arc::new(tokio::sync::Notify::new());
+    let slow_release = Arc::new(tokio::sync::Notify::new());
+    let journaled = Arc::new(tokio::sync::Notify::new());
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let slow_runs = Arc::new(AtomicUsize::new(0));
+    let sandbox = Arc::new(OutOfOrderSandbox {
+        attempts: AtomicUsize::new(0),
+        journaled: Arc::clone(&journaled),
+        hold,
+    });
+    let extensions = || {
+        vec![extension(vec![
+            create_codemode_tool(CodemodeToolOptions {
+                sandbox: Arc::clone(&sandbox) as Arc<dyn CodemodeSandbox>,
+                ..Default::default()
+            }),
+            tool(
+                "slow",
+                Some(vec![ToolCaller::Tools]),
+                Some(serde_json::json!({})),
+                Arc::new(SlowTool {
+                    runs: Arc::clone(&slow_runs),
+                    started: Arc::clone(&slow_started),
+                    release: Arc::clone(&slow_release),
+                }),
+            ),
+        ])]
+    };
+    let models = || {
+        test_models(vec![
+            Script::Message(tool_use_message(
+                CODEMODE_TOOL_NAME,
+                "c1",
+                serde_json::json!({ "code": "return 1" }),
+            )),
+            Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
+        ])
+    };
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage(Arc::clone(&storage), extensions(), None, models()).await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    slow_started.notified().await;
+    slow_release.notify_one();
+    journaled.notified().await;
+
+    let reopened = open_with_storage(
+        Arc::clone(&storage),
+        extensions(),
+        None,
+        test_models(vec![Script::Message(text_message(
+            "done",
+            rpi_ai::types::StopReason::Stop,
+        ))]),
+    )
+    .await;
+    let recovered = reopened
+        .harness
+        .submission(submission.id(), &context())
+        .await
+        .expect("submission")
+        .expect("present");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        recovered.wait(&context()),
+    )
+    .await
+    .expect("multiple out-of-order waiters deadlocked")
+    .expect("settled");
+    let results = tool_result_texts(&entries(&root_ready(&reopened.harness).await).await);
+    assert!(
+        results.iter().any(|text| text.contains("out of order")),
+        "out-of-order divergence was not reported: {results:?}"
+    );
+    assert_eq!(slow_runs.load(Ordering::SeqCst), 3);
+}
+
+async fn assert_crash_window_replay(underway: bool, replay_empty_calls: bool) {
+    use generation_support::open_with_storage;
+    use rpi_durable::codemode::{
+        CODEMODE_JOURNAL_DOC, CODEMODE_TOOL_NAME, CodemodeHost, CodemodeJournal, CodemodeOutcome,
+        CodemodeSandbox, CodemodeStart, CodemodeToolOptions, create_codemode_tool,
+    };
+    use rpi_durable::storage::MemoryStorage;
+    use rpi_durable::types::Storage;
+
+    struct WindowTool {
+        attempts: Arc<AtomicUsize>,
+        runs: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        hold: Arc<tokio::sync::Notify>,
+        hold_keys: &'static [&'static str],
+    }
+
+    #[async_trait]
+    impl ToolExecute for WindowTool {
+        async fn execute(
+            &self,
+            _args: JsonObject,
+            api: &dyn ToolExecutionApi,
+            _context: &Context,
+        ) -> Result<ToolExecutionResult, ToolExecuteError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            if self.attempts.load(Ordering::SeqCst) == 1
+                && self
+                    .hold_keys
+                    .iter()
+                    .any(|key| api.call_id().ends_with(&format!("/{key}")))
+            {
+                self.hold.notified().await;
+            }
+            Ok(ToolExecutionResult {
+                structured_output: Some(serde_json::json!({ "ok": true })),
+                ..Default::default()
+            })
+        }
+    }
+
+    struct WindowSandbox {
+        attempts: Arc<AtomicUsize>,
+        underway: bool,
+        replay_empty_calls: bool,
+        tool_started: Arc<tokio::sync::Notify>,
+        journaled: Arc<tokio::sync::Notify>,
+        hold: Arc<tokio::sync::Notify>,
+        replay_hold: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl CodemodeSandbox for WindowSandbox {
+        fn fingerprint(&self) -> String {
+            "crash-window-1".to_string()
+        }
+
+        async fn run(
+            &self,
+            _start: CodemodeStart,
+            host: &dyn CodemodeHost,
+            _context: &Context,
+        ) -> Result<CodemodeOutcome, String> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 1 {
+                if self.underway {
+                    host.call_tool("inner", JsonObject::new(), "a").await?;
+                    host.call_tool("inner", JsonObject::new(), "b").await?;
+                    self.journaled.notify_one();
+                    self.replay_hold.notified().await;
+                } else if self.replay_empty_calls {
+                    let (a, b) = tokio::join!(
+                        host.call_tool("inner", JsonObject::new(), "a"),
+                        host.call_tool("inner", JsonObject::new(), "b")
+                    );
+                    a?;
+                    b?;
+                }
+                return Ok(CodemodeOutcome::output("done"));
+            }
+            if !self.underway && !self.replay_empty_calls {
+                let next = host.call_tool("inner", JsonObject::new(), "a");
+                tokio::pin!(next);
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(20), &mut next).await;
+                self.tool_started.notified().await;
+                self.journaled.notify_one();
+                self.hold.notified().await;
+                next.await?;
+                return Ok(CodemodeOutcome::output("done"));
+            }
+            if self.underway {
+                host.call_tool("inner", JsonObject::new(), "a").await?;
+            }
+            let next = host.call_tool("inner", JsonObject::new(), "b");
+            tokio::pin!(next);
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(20), &mut next).await;
+            let last = host.call_tool(
+                "inner",
+                JsonObject::new(),
+                if self.underway { "c" } else { "a" },
+            );
+            tokio::pin!(last);
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(20), &mut last).await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                self.tool_started.notified(),
+            )
+            .await
+            .expect("nested tools started");
+            self.journaled.notify_one();
+            self.hold.notified().await;
+            let (next, last) = tokio::join!(next, last);
+            next?;
+            last?;
+            Ok(CodemodeOutcome::output("done"))
+        }
+    }
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let tool_started = Arc::new(tokio::sync::Notify::new());
+    let journaled = Arc::new(tokio::sync::Notify::new());
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let replay_hold = Arc::new(tokio::sync::Notify::new());
+    let immediate_runs = Arc::new(AtomicUsize::new(0));
+    let held_runs = Arc::new(AtomicUsize::new(0));
+    let sandbox = Arc::new(WindowSandbox {
+        attempts: Arc::clone(&attempts),
+        underway,
+        replay_empty_calls,
+        tool_started: Arc::clone(&tool_started),
+        journaled: Arc::clone(&journaled),
+        hold: Arc::clone(&hold),
+        replay_hold: Arc::clone(&replay_hold),
+    });
+    let extensions = || {
+        let immediate = tool(
+            "inner",
+            Some(vec![ToolCaller::Tools]),
+            Some(serde_json::json!({})),
+            Arc::new(WindowTool {
+                attempts: Arc::clone(&attempts),
+                runs: Arc::clone(&immediate_runs),
+                started: Arc::clone(&tool_started),
+                hold: Arc::clone(&hold),
+                hold_keys: &["b", "c"],
+            }),
+        );
+        let held = tool(
+            "inner",
+            Some(vec![ToolCaller::Tools]),
+            Some(serde_json::json!({})),
+            Arc::new(WindowTool {
+                attempts: Arc::clone(&attempts),
+                runs: Arc::clone(&held_runs),
+                started: Arc::clone(&tool_started),
+                hold: Arc::clone(&hold),
+                hold_keys: &["a", "b"],
+            }),
+        );
+        vec![extension(vec![
+            create_codemode_tool(CodemodeToolOptions {
+                sandbox: Arc::clone(&sandbox) as Arc<dyn CodemodeSandbox>,
+                ..Default::default()
+            }),
+            if underway { immediate } else { held },
+        ])]
+    };
+    let models = || {
+        test_models(vec![
+            Script::Message(tool_use_message(
+                CODEMODE_TOOL_NAME,
+                "c1",
+                serde_json::json!({ "code": "return 1" }),
+            )),
+            Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
+        ])
+    };
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage(Arc::clone(&storage), extensions(), None, models()).await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), journaled.notified())
+        .await
+        .expect("first run did not reach the crash window");
+
+    let parent = opened
+        .harness
+        .inspect(&context())
+        .await
+        .expect("inspect")
+        .tasks
+        .into_iter()
+        .find(|task| task.record.kind == "pi.tool" && task.record.input["kind"] == "model")
+        .expect("codemode parent")
+        .record
+        .id;
+    let journal = opened
+        .harness
+        .session()
+        .snapshot(&CODEMODE_JOURNAL_DOC, DocOwner::Task(parent), &context())
+        .await
+        .expect("journal")
+        .expect("present");
+    let journal: CodemodeJournal =
+        serde_json::from_value(JsonValue::Object(journal)).expect("journal json");
+    if underway {
+        assert_eq!(journal.entries.len(), 1);
+        assert_eq!(journal.entries[0].issued_after, Some(3));
+    } else {
+        assert!(journal.entries.is_empty());
+        assert_eq!(
+            journal.first_issued,
+            Some(if replay_empty_calls { 2 } else { 1 })
+        );
+    }
+
+    let reopened = open_with_storage(
+        Arc::clone(&storage),
+        extensions(),
+        None,
+        test_models(vec![Script::Message(text_message(
+            "done",
+            rpi_ai::types::StopReason::Stop,
+        ))]),
+    )
+    .await;
+    reopened.harness.resume().expect("resume");
+    let recovered = reopened
+        .harness
+        .submission(submission.id(), &context())
+        .await
+        .expect("submission")
+        .expect("present");
+    if underway {
+        tokio::time::timeout(std::time::Duration::from_secs(2), journaled.notified())
+            .await
+            .expect("replay did not acknowledge the next call");
+        let journal = reopened
+            .harness
+            .session()
+            .snapshot(&CODEMODE_JOURNAL_DOC, DocOwner::Task(parent), &context())
+            .await
+            .expect("journal")
+            .expect("present");
+        let journal: CodemodeJournal =
+            serde_json::from_value(JsonValue::Object(journal)).expect("journal json");
+        assert_eq!(journal.entries[0].key, "a");
+        assert_eq!(journal.entries[0].issued_after, Some(3));
+        replay_hold.notify_one();
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        recovered.wait(&context()),
+    )
+    .await
+    .expect("crash-window replay deadlocked")
+    .expect("settled");
+    let parent_task = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        reopened.harness.wait_for_task(parent, &context()),
+    )
+    .await
+    .expect("codemode parent did not settle")
+    .expect("codemode parent");
+    let parent_state =
+        serde_json::to_string(&parent_task.record.state).expect("codemode parent state");
+    let results = tool_result_texts(&entries(&root_ready(&reopened.harness).await).await);
+    let replay_output = format!("{parent_state}\n{}", results.join("\n"));
+    if replay_empty_calls {
+        assert!(
+            replay_output.contains("done") && !replay_output.contains("different path"),
+            "legitimate concurrent replay was rejected: {replay_output}"
+        );
+    } else {
+        assert!(
+            replay_output.contains("different path"),
+            "divergent crash-window replay was accepted: attempts={} output={replay_output}",
+            attempts.load(Ordering::SeqCst)
+        );
+    }
+    assert_eq!(
+        immediate_runs.load(Ordering::SeqCst),
+        if underway { 3 } else { 0 },
+        "attempts={} results={results:?}",
+        attempts.load(Ordering::SeqCst)
+    );
+    assert_eq!(
+        held_runs.load(Ordering::SeqCst),
+        if underway {
+            0
+        } else if replay_empty_calls {
+            2
+        } else {
+            1
+        }
+    );
+}
+
+#[tokio::test]
+async fn empty_journal_divergence_is_rejected() {
+    assert_crash_window_replay(false, false).await;
+}
+
+#[tokio::test]
+async fn concurrent_empty_journal_replay_is_accepted() {
+    assert_crash_window_replay(false, true).await;
+}
+
+#[tokio::test]
+async fn underway_next_call_divergence_is_rejected() {
+    assert_crash_window_replay(true, false).await;
+}
+
+struct ChildDefinition;
+
+#[async_trait]
+impl rpi_durable::harness::TaskDefinition for ChildDefinition {
+    fn name(&self) -> &str {
+        "test.child"
+    }
+
+    fn version(&self) -> u64 {
+        1
+    }
+
+    fn initial(&self) -> JsonValue {
+        serde_json::json!({ "phase": "done" })
+    }
+
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: rpi_durable::harness::RunningTask,
+        runtime: &dyn rpi_durable::harness::TaskRuntime,
+        context: &Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        runtime
+            .commit(
+                Arc::new(|_tx, _current| {
+                    Box::pin(async move {
+                        Ok(Some(rpi_durable::harness::NextTaskState::Terminal {
+                            outcome: rpi_durable::types::TaskOutcome::Completed {
+                                result: JsonValue::Null,
+                            },
+                        }))
+                    })
+                }),
+                context,
+            )
+            .await
+    }
+}
+
+struct CreateChildTool {
+    definition: rpi_durable::harness::AnyTask,
+    created: Arc<std::sync::Mutex<Vec<TaskId>>>,
+    abandon_on_restart: Option<bool>,
+    conversation: Option<rpi_durable::ids::ConversationId>,
+}
+
+#[async_trait]
+impl ToolExecute for CreateChildTool {
+    async fn execute(
+        &self,
+        _args: JsonObject,
+        api: &dyn ToolExecutionApi,
+        context: &Context,
+    ) -> Result<ToolExecutionResult, ToolExecuteError> {
+        let ownership = match self.conversation {
+            Some(conversation) => rpi_durable::session::TaskOwnership::Conversation(conversation),
+            None => rpi_durable::session::TaskOwnership::Task(api.task_id()),
+        };
+        let id = api
+            .create_task(
+                Arc::clone(&self.definition),
+                JsonValue::Null,
+                ownership,
+                false,
+                self.abandon_on_restart,
+                context,
+            )
+            .await?;
+        self.created.lock().expect("created").push(id);
+        Ok(ToolExecutionResult::default())
+    }
+}
+
+/// FR-I R2: tool-created children inherit abandonment only from an unsafe
+/// caller, and an explicit option always takes precedence.
+#[tokio::test]
+async fn tool_created_tasks_apply_the_abandonment_default_and_override() {
+    for (replay, explicit, expected) in [
+        (ToolReplay::Unsafe, None, true),
+        (ToolReplay::Safe, None, false),
+        (ToolReplay::Unsafe, Some(false), false),
+        (ToolReplay::Safe, Some(true), true),
+    ] {
+        let definition = Arc::new(ChildDefinition) as rpi_durable::harness::AnyTask;
+        let created = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let creator = tool(
+            "creator",
+            None,
+            None,
+            Arc::new(CreateChildTool {
+                definition: Arc::clone(&definition),
+                created: Arc::clone(&created),
+                abandon_on_restart: explicit,
+                conversation: None,
+            }),
+        );
+        let mut creator = creator;
+        creator.replay = replay;
+        let opened = open(
+            vec![Extension {
+                name: "nested".to_string(),
+                tools: vec![creator],
+                tasks: vec![definition],
+                ..Extension::default()
+            }],
+            None,
+            test_models(vec![
+                Script::Message(tool_use_message("creator", "c1", serde_json::json!({}))),
+                Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
+            ]),
+        )
+        .await;
+        let conversation = root_ready(&opened.harness).await;
+        let submission = submit_input(&conversation, "hi").await;
+        submission.wait(&context()).await.expect("wait");
+        let child = created.lock().expect("created")[0];
+        let record = opened
+            .harness
+            .get_task(child, &context())
+            .await
+            .expect("child")
+            .expect("record");
+        assert_eq!(record.abandon_on_restart, expected);
+        assert!(record.owner.is_some(), "the child is task-owned");
+    }
+}
+
+/// Conversation-owned children do not inherit the unsafe caller's abandonment
+/// default, because their lifetime is not an in-memory wait owned by the tool.
+#[tokio::test]
+async fn conversation_owned_children_do_not_inherit_abandonment() {
+    let definition = Arc::new(ChildDefinition) as rpi_durable::harness::AnyTask;
+    let created = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut creator = tool(
+        "creator",
+        None,
+        None,
+        Arc::new(CreateChildTool {
+            definition: Arc::clone(&definition),
+            created: Arc::clone(&created),
+            abandon_on_restart: None,
+            conversation: Some(rpi_durable::ids::ROOT_CONVERSATION_ID),
+        }),
+    );
+    creator.replay = ToolReplay::Unsafe;
+    let opened = open(
+        vec![Extension {
+            name: "nested".to_string(),
+            tools: vec![creator],
+            tasks: vec![definition],
+            ..Extension::default()
+        }],
+        None,
+        test_models(vec![
+            Script::Message(tool_use_message("creator", "c1", serde_json::json!({}))),
+            Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
+        ]),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    submission.wait(&context()).await.expect("wait");
+    let child = created.lock().expect("created")[0];
+    let record = opened
+        .harness
+        .get_task(child, &context())
+        .await
+        .expect("child")
+        .expect("record");
+    assert!(!record.abandon_on_restart);
+    assert_eq!(record.owner, None);
+}
+
+/// FR-A R3/R4: a second-level nested slot keeps its complete direct parent
+/// call ID and parent task ID until the outermost call settles.
+#[tokio::test]
+async fn deeply_nested_slots_keep_the_direct_parent_call_id() {
+    struct LeafTool;
+    #[async_trait]
+    impl ToolExecute for LeafTool {
+        async fn execute(
+            &self,
+            _args: JsonObject,
+            _api: &dyn ToolExecutionApi,
+            _context: &Context,
+        ) -> Result<ToolExecutionResult, ToolExecuteError> {
+            Ok(ToolExecutionResult::default())
+        }
+    }
+
+    struct MiddleTool {
+        leaf_done: Arc<tokio::sync::Notify>,
+        finish: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl ToolExecute for MiddleTool {
+        async fn execute(
+            &self,
+            _args: JsonObject,
+            api: &dyn ToolExecutionApi,
+            context: &Context,
+        ) -> Result<ToolExecutionResult, ToolExecuteError> {
+            api.execute_tool("leaf", JsonObject::new(), context, Default::default())
+                .await?;
+            self.leaf_done.notify_one();
+            self.finish.notified().await;
+            Ok(ToolExecutionResult::default())
+        }
+    }
+
+    struct OuterTool;
+    #[async_trait]
+    impl ToolExecute for OuterTool {
+        async fn execute(
+            &self,
+            _args: JsonObject,
+            api: &dyn ToolExecutionApi,
+            context: &Context,
+        ) -> Result<ToolExecutionResult, ToolExecuteError> {
+            api.execute_tool("middle", JsonObject::new(), context, Default::default())
+                .await?;
+            Ok(ToolExecutionResult::default())
+        }
+    }
+
+    let middle_done = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let opened = open(
+        vec![extension(vec![
+            tool("outer", None, None, Arc::new(OuterTool)),
+            tool(
+                "middle",
+                None,
+                None,
+                Arc::new(MiddleTool {
+                    leaf_done: Arc::clone(&middle_done),
+                    finish: Arc::clone(&finish),
+                }),
+            ),
+            tool("leaf", None, None, Arc::new(LeafTool)),
+        ])],
+        None,
+        test_models(vec![
+            Script::Message(tool_use_message("outer", "c1", serde_json::json!({}))),
+            Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
+        ]),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    middle_done.notified().await;
+    let live = opened
+        .harness
+        .session()
+        .snapshot(
+            &rpi_durable::harness::LIVE_DOC,
+            DocOwner::Conversation(conversation.id()),
+            &context(),
+        )
+        .await
+        .expect("live")
+        .expect("present");
+    let live: rpi_durable::harness::LiveState =
+        serde_json::from_value(JsonValue::Object(live)).expect("live state");
+    let nested = live.nested_tools.expect("nested slots");
+    let middle = nested
+        .iter()
+        .find(|slot| slot.progress.call_id == "c1/1")
+        .expect("middle slot");
+    let leaf = nested
+        .iter()
+        .find(|slot| slot.progress.call_id == "c1/1/1")
+        .expect("leaf slot");
+    assert_eq!(leaf.parent_call_id, "c1/1");
+    assert_eq!(leaf.parent_task_id, middle.task_id);
+    finish.notify_one();
+    submission.wait(&context()).await.expect("wait");
+}

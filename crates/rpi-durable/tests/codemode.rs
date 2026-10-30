@@ -862,6 +862,17 @@ impl ToolExecutionApi for PanicApi {
     ) -> Result<JsonValue, rpi_durable::session::SessionError> {
         Self::never()
     }
+    async fn create_task(
+        &self,
+        _definition: rpi_durable::harness::AnyTask,
+        _input: JsonValue,
+        _ownership: rpi_durable::session::TaskOwnership,
+        _background: bool,
+        _abandon_on_restart: Option<bool>,
+        _context: &Context,
+    ) -> Result<TaskId, rpi_durable::session::SessionError> {
+        Self::never()
+    }
     async fn get_task(
         &self,
         _id: TaskId,

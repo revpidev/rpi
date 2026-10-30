@@ -1836,6 +1836,137 @@ fn ignored(rules: &[IgnoreRule], relative: &str, kind: FileKind) -> bool {
     ignored
 }
 
+#[derive(Clone)]
+struct Pending {
+    path: PathBuf,
+    relative: String,
+    kind: FileKind,
+    rules: Vec<IgnoreRule>,
+}
+
+struct ListScan<'a> {
+    worktree: Option<&'a Path>,
+    show_hidden: bool,
+    use_gitignore: bool,
+    exclude: &'a [String],
+    started: Instant,
+    timeout: Duration,
+    context: &'a Context,
+}
+
+struct Children {
+    items: Vec<Pending>,
+    truncated: bool,
+    timed_out: bool,
+}
+
+fn scan_expired(scan: &ListScan<'_>) -> bool {
+    scan.started.elapsed() > scan.timeout
+}
+
+fn scan_aborted(scan: &ListScan<'_>) -> Result<(), FileError> {
+    if scan
+        .context
+        .abort_signal()
+        .is_some_and(|signal| signal.is_cancelled())
+    {
+        return Err(FileError::new(
+            crate::errors::FileErrorCode::Aborted,
+            "File listing was aborted",
+        ));
+    }
+    Ok(())
+}
+
+async fn read_children(
+    scan: &ListScan<'_>,
+    parent: &Pending,
+    limit: usize,
+) -> Result<Children, FileError> {
+    let mut reader = match tokio::fs::read_dir(&parent.path).await {
+        Ok(reader) => reader,
+        Err(_) => {
+            return Ok(Children {
+                items: Vec::new(),
+                truncated: false,
+                timed_out: false,
+            });
+        }
+    };
+    let mut candidates: BTreeMap<String, Pending> = BTreeMap::new();
+    let mut truncated = false;
+    let mut timed_out = false;
+    loop {
+        if scan_expired(scan) {
+            timed_out = true;
+            break;
+        }
+        scan_aborted(scan)?;
+        let entry = match reader.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".git" || scan.exclude.iter().any(|excluded| excluded == &name) {
+            continue;
+        }
+        if !scan.show_hidden && name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let relative = if parent.relative.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{name}", parent.relative)
+        };
+        if candidates.len() >= limit
+            && candidates
+                .last_key_value()
+                .is_some_and(|(last, _)| name.as_str() >= last.as_str())
+        {
+            continue;
+        }
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let kind = if metadata.file_type().is_symlink() {
+            FileKind::Symlink
+        } else if metadata.is_dir() {
+            FileKind::Directory
+        } else if metadata.is_file() {
+            FileKind::File
+        } else {
+            continue;
+        };
+        if scan.use_gitignore
+            && let Some(worktree) = scan.worktree
+            && ignored(&parent.rules, &path_relative(worktree, &path), kind)
+        {
+            continue;
+        }
+        candidates.insert(
+            name,
+            Pending {
+                path,
+                relative,
+                kind,
+                rules: parent.rules.clone(),
+            },
+        );
+        if candidates.len() > limit {
+            candidates.pop_last();
+            truncated = true;
+        }
+    }
+    Ok(Children {
+        items: candidates.into_values().collect(),
+        truncated,
+        timed_out,
+    })
+}
+
 async fn list_files_in(
     root: &std::path::Path,
     options: ListFilesOptions,
@@ -1860,89 +1991,35 @@ async fn list_files_in(
         Some(worktree) => initial_ignore_rules(worktree, root).await,
         None => Vec::new(),
     };
+    let scan = ListScan {
+        worktree: worktree.as_deref(),
+        show_hidden,
+        use_gitignore,
+        exclude: &options.exclude,
+        started,
+        timeout,
+        context,
+    };
+    let parent = Pending {
+        path: root.to_path_buf(),
+        relative: String::new(),
+        kind: FileKind::Directory,
+        rules,
+    };
+    let children = read_children(&scan, &parent, max_entries.saturating_add(1)).await?;
+    let mut pending: Vec<Pending> = children.items.into_iter().rev().collect();
     let mut entries: Vec<FileListEntry> = Vec::new();
     let mut bytes = 0usize;
-    let mut truncated = false;
-    struct Pending {
-        path: PathBuf,
-        relative: String,
-        kind: FileKind,
-        rules: Vec<IgnoreRule>,
-    }
-    let read_children = |path: &std::path::Path| {
-        let path = path.to_path_buf();
-        async move {
-            let mut reader = match tokio::fs::read_dir(&path).await {
-                Ok(reader) => reader,
-                Err(_) => return Vec::new(),
-            };
-            let mut children: Vec<(String, PathBuf)> = Vec::new();
-            loop {
-                let entry = match reader.next_entry().await {
-                    Ok(Some(entry)) => entry,
-                    _ => break,
-                };
-                children.push((
-                    entry.file_name().to_string_lossy().into_owned(),
-                    entry.path(),
-                ));
-            }
-            children.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
-            children
-        }
-    };
-    let mut pending: Vec<Pending> = Vec::new();
-    let mut seed = Vec::new();
-    for (name, path) in read_children(root).await {
-        seed.push((name, path));
-    }
-    for (name, path) in seed.into_iter().rev() {
-        if name == ".git" || options.exclude.iter().any(|excluded| excluded == &name) {
-            continue;
-        }
-        if !show_hidden && name.starts_with('.') {
-            continue;
-        }
-        let metadata = match tokio::fs::symlink_metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        let kind = if metadata.file_type().is_symlink() {
-            FileKind::Symlink
-        } else if metadata.is_dir() {
-            FileKind::Directory
-        } else if metadata.is_file() {
-            FileKind::File
-        } else {
-            continue;
-        };
-        pending.push(Pending {
-            path,
-            relative: name,
-            kind,
-            rules: rules.clone(),
-        });
+    let mut truncated = children.truncated || children.timed_out;
+    if children.timed_out {
+        return Ok(FileListing { entries, truncated });
     }
     while let Some(node) = pending.pop() {
-        if started.elapsed() > timeout {
+        if scan_expired(&scan) {
             truncated = true;
             break;
         }
-        if context
-            .abort_signal()
-            .is_some_and(|signal| signal.is_cancelled())
-        {
-            return Err(FileError::new(
-                crate::errors::FileErrorCode::Aborted,
-                "File listing was aborted",
-            ));
-        }
-        if use_gitignore
-            && let Some(worktree) = &worktree
-            && ignored(&node.rules, &path_relative(worktree, &node.path), node.kind)
-        {
-            continue;
-        }
+        scan_aborted(&scan)?;
         if entries.len() >= max_entries || bytes + node.relative.len() + 2 > max_bytes {
             truncated = true;
             break;
@@ -1955,42 +2032,30 @@ async fn list_files_in(
         if node.kind != FileKind::Directory {
             continue;
         }
-        let mut child_rules = node.rules.clone();
-        if use_gitignore && let Some(worktree) = &worktree {
+        let mut parent = node;
+        if scan.use_gitignore
+            && let Some(worktree) = scan.worktree
+        {
             load_ignore_file(
-                &node.path.join(".gitignore"),
-                &path_relative(worktree, &node.path),
-                &mut child_rules,
+                &parent.path.join(".gitignore"),
+                &path_relative(worktree, &parent.path),
+                &mut parent.rules,
             )
             .await;
         }
-        let children = read_children(&node.path).await;
-        for (name, path) in children.into_iter().rev() {
-            if name == ".git" || options.exclude.iter().any(|excluded| excluded == &name) {
-                continue;
-            }
-            if !show_hidden && name.starts_with('.') {
-                continue;
-            }
-            let metadata = match tokio::fs::symlink_metadata(&path).await {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            let kind = if metadata.file_type().is_symlink() {
-                FileKind::Symlink
-            } else if metadata.is_dir() {
-                FileKind::Directory
-            } else if metadata.is_file() {
-                FileKind::File
-            } else {
-                continue;
-            };
-            pending.push(Pending {
-                path,
-                relative: format!("{}/{name}", node.relative),
-                kind,
-                rules: child_rules.clone(),
-            });
+        let remaining = max_entries.saturating_sub(entries.len());
+        let children = read_children(&scan, &parent, remaining.saturating_add(1)).await?;
+        pending.extend(children.items.into_iter().rev());
+        let capacity = remaining.saturating_add(1);
+        if pending.len() > capacity {
+            let excess = pending.len() - capacity;
+            pending.drain(..excess);
+            truncated = true;
+        }
+        truncated |= children.truncated;
+        if children.timed_out {
+            truncated = true;
+            break;
         }
     }
     Ok(FileListing { entries, truncated })

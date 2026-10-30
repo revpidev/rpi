@@ -1407,7 +1407,7 @@ async fn start_nested_call(
                     status: ToolSlotStatus::Pending,
                     ..Default::default()
                 },
-                parent_call_id: call.id.split('/').next().unwrap_or("").to_string(),
+                parent_call_id: parent_call_id.clone(),
                 parent_task_id: parent_task,
                 task_id: task,
                 arguments: call.arguments.clone(),
@@ -2064,6 +2064,51 @@ impl ToolExecutionApi for ToolApi {
         context: &Context,
     ) -> Result<JsonValue, SessionError> {
         self.runtime.memo_set(name, value, context).await
+    }
+
+    async fn create_task(
+        &self,
+        definition: crate::harness::types::AnyTask,
+        input: JsonValue,
+        ownership: TaskOwnership,
+        background: bool,
+        abandon_on_restart: Option<bool>,
+        context: &Context,
+    ) -> Result<TaskId, SessionError> {
+        self.assert_live().map_err(SessionError::message)?;
+        let abandon_on_restart = abandon_on_restart
+            .unwrap_or(matches!(ownership, TaskOwnership::Task(_)) && !self.resumes);
+        let conversation_id = self.runtime.conversation_id();
+        let kind = definition.name().to_string();
+        let version = definition.version();
+        let checkpoint = definition.initial();
+        let change: ToolCommitFn = Arc::new(move |tx| {
+            let kind = kind.clone();
+            let input = input.clone();
+            let checkpoint = checkpoint.clone();
+            Box::pin(async move {
+                let task = tx
+                    .create_task(TaskCreate {
+                        kind,
+                        version,
+                        input,
+                        checkpoint,
+                        ownership,
+                        conversation_id: Some(conversation_id),
+                        background,
+                        abandon_on_restart,
+                        trace: Default::default(),
+                        links: Vec::new(),
+                    })
+                    .await?;
+                Ok(JsonValue::from(task.get()))
+            })
+        });
+        let created = self.commit(change, context).await?;
+        created
+            .as_u64()
+            .map(TaskId::from_number)
+            .ok_or_else(|| SessionError::message("Created task ID is unavailable"))
     }
 
     async fn get_task(

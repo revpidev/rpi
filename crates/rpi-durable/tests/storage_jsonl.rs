@@ -187,6 +187,54 @@ async fn legacy_format_one_directory_reads_without_migration() {
     cleanup_temp_dirs("rpi-durable-jsonl-legacy");
 }
 
+/// A format-1 JSONL sleeping record stays sleeping on reopen; it is never
+/// recovered as a runnable pending task.
+#[tokio::test]
+async fn legacy_sleeping_task_does_not_resume_as_pending() {
+    let dir = TempDir::new("rpi-durable-jsonl-sleeping");
+    let main = dir.path().join("main.jsonl");
+    let conversation = ConversationRecord {
+        id: ROOT_CONVERSATION_ID,
+        parent: None,
+        owner: None,
+    };
+    let mut task = task_record(id_from_number(2), "step", false);
+    task.state = TaskState::Sleeping {
+        until: 42.0,
+        checkpoint: serde_json::json!({ "phase": "step" }),
+    };
+    let line = serde_json::json!({
+        "format": 1,
+        "type": "commit",
+        "seq": 1,
+        "writes": [
+            { "type": "conversation", "value": conversation },
+            { "type": "task.sidecar", "id": 2, "ordinal": 0 },
+        ],
+    });
+    std::fs::write(&main, format!("{line}\n")).expect("write sleeping marker");
+    let sidecar = serde_json::json!({
+        "format": 1,
+        "type": "record",
+        "seq": 1,
+        "ordinal": 0,
+        "payload": { "type": "task", "value": task },
+    });
+    std::fs::write(dir.path().join("task-2.jsonl"), format!("{sidecar}\n"))
+        .expect("write sleeping sidecar");
+    let storage = open_storage(&dir, false).await;
+    let record = storage
+        .task(id_from_number(2), &BACKGROUND_CONTEXT)
+        .await
+        .expect("task")
+        .expect("record");
+    assert!(matches!(
+        record.state,
+        TaskState::Sleeping { until, .. } if until == 42.0
+    ));
+    storage.close(&BACKGROUND_CONTEXT).await.expect("close");
+}
+
 #[tokio::test]
 async fn publishes_every_commit_before_reclaiming_sidecars() {
     let dir = TempDir::new("rpi-durable-jsonl-reclaim");

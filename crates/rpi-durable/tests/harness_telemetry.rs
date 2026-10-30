@@ -327,16 +327,24 @@ async fn phase_spans_use_the_stored_trace_and_links() {
     let last = recorder.last_span("pi.durable.phase");
     assert_eq!(last.end_attributes["outcome"], "done");
     assert_eq!(last.status, "ok");
+    let metrics = recorder.0.metrics.lock().expect("metrics").clone();
     assert!(
-        recorder
-            .0
-            .metrics
-            .lock()
-            .expect("metrics")
+        metrics
             .iter()
             .any(|(name, _, attributes)| name == "pi.durable.phase.duration"
                 && attributes["task"] == "test.memo")
     );
+    for value in [1.0, -1.0] {
+        assert!(
+            metrics.iter().any(|(name, recorded, attributes)| {
+                name == "pi.durable.tasks.active"
+                    && *recorded == value
+                    && attributes["task"] == "test.memo"
+            }),
+            "missing active-task sample {value}: {metrics:?}"
+        );
+    }
+    drop(metrics);
     opened.harness.close(&context()).await.expect("close");
 }
 

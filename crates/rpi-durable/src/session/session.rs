@@ -994,7 +994,7 @@ impl SessionImpl {
             if let Ok(mut listeners) = this.commit_listeners.lock() {
                 listeners.clear();
             }
-            let result = this.raw.close(&context).await;
+            let result = this.guarded.close(&context).await;
             if let Err(error) = &result {
                 this.fail(error.to_string());
             }

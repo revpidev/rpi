@@ -559,6 +559,32 @@ pub enum SimpleToolChoice {
     None,
 }
 
+/// Options for fetching a provider-side deferred response. `wait` is the
+/// provider long-poll duration in milliseconds; zero or omitted means one
+/// status check.
+#[derive(Clone, Default)]
+pub struct DeferredFetchOptions {
+    pub stream: StreamOptions,
+    pub wait: Option<u64>,
+}
+
+impl std::ops::Deref for DeferredFetchOptions {
+    type Target = ProviderRequestOptions;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stream.request
+    }
+}
+
+impl std::ops::DerefMut for DeferredFetchOptions {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stream.request
+    }
+}
+
+/// Options for best-effort deferred-response cancellation.
+pub type DeferredCancelOptions = ProviderRequestOptions;
+
 // ---------------------------------------------------------------------------
 // Content blocks and messages
 // ---------------------------------------------------------------------------
@@ -1249,10 +1275,10 @@ pub trait ProviderImageGenerator: Send + Sync {
 /// `message_end`) — requirements §4.1.
 ///
 /// `deferred` (v0.84, R2.1.1) marks a request handed off to a provider-side
-/// background/deferred lifecycle. The lifecycle itself is [DEFER] (R2.2.1):
-/// no rpi provider produces it, but every protocol/serialization layer must
-/// handle the variant explicitly (upstream server protocol v1 rejects it
-/// rather than silently swallowing it).
+/// background/deferred lifecycle. Providers opt into fetch/cancel support;
+/// every protocol/serialization layer handles the variant explicitly
+/// (upstream server protocol v1 rejects it rather than silently swallowing
+/// it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopReason {
     #[serde(rename = "pending")]
@@ -1274,9 +1300,9 @@ pub enum StopReason {
 /// `DeferredHandle` (v0.84, R2.1.2/R2.2.1) — durable handle to a
 /// provider-side deferred response.
 ///
-/// **Type placeholder only**: `fetchDeferred`/`cancelDeferred` and the `wait`
-/// long-poll semantics are [DEFER] (R2.2.1); this struct exists so
-/// `AssistantMessage.deferred` round-trips on the wire.
+/// Providers that support the deferred lifecycle use this handle for status
+/// fetches, cancellation, and durable recovery. It also round-trips on the wire
+/// for providers without lifecycle support.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeferredHandle {
@@ -1419,10 +1445,9 @@ pub struct AssistantMessage {
     pub usage: Usage,
     pub stop_reason: StopReason,
     /// Handle to a provider-side deferred response when `stop_reason` is
-    /// `Deferred` (v0.84, R2.1.2). Type placeholder only — the deferred
-    /// request lifecycle is [DEFER] (R2.2.1). Boxed to keep the `Message`
-    /// enum small (`clippy::large_enum_variant`); the serde shape is
-    /// unchanged.
+    /// `Deferred` (v0.84, R2.1.2). Used for status fetches, cancellation and
+    /// durable recovery. Boxed to keep the `Message` enum small
+    /// (`clippy::large_enum_variant`); the serde shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deferred: Option<Box<DeferredHandle>>,
     #[serde(skip_serializing_if = "Option::is_none")]

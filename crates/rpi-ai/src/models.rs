@@ -43,9 +43,10 @@ use crate::models_store::{
 };
 use crate::types::{
     AnyModel, AssistantImages, ClassifierContext, ClassifierModel, ClassifierOptions,
-    ClassifierResult, Context, ImageModel, ImagesContext, ImagesOptions, Model, ModelThinkingLevel,
-    ProviderClassifier, ProviderEnv, ProviderHeaders, ProviderImageGenerator, SimpleStreamOptions,
-    StreamOptions, TranscriptContext, classifier_error_result, image_error_result,
+    ClassifierResult, Context, DeferredFetchOptions, DeferredHandle, ImageModel, ImagesContext,
+    ImagesOptions, Model, ModelThinkingLevel, ProviderClassifier, ProviderEnv, ProviderHeaders,
+    ProviderImageGenerator, ProviderRequestOptions, SimpleStreamOptions, StreamOptions,
+    TranscriptContext, classifier_error_result, image_error_result,
 };
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::merge_headers;
@@ -80,6 +81,24 @@ pub trait ProviderStreams: Send + Sync {
         context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String>;
+
+    fn fetch_deferred(
+        &self,
+        _model: &Model,
+        _handle: &DeferredHandle,
+        _options: Option<DeferredFetchOptions>,
+    ) -> Option<AssistantMessageEventStream> {
+        None
+    }
+
+    fn cancel_deferred(
+        &self,
+        _model: &Model,
+        _handle: &DeferredHandle,
+        _options: Option<ProviderRequestOptions>,
+    ) -> Option<BoxFuture<'static, Result<(), ModelsError>>> {
+        None
+    }
 }
 
 /// `ModelsRequestTransforms` — the `transformHeaders` callback
@@ -123,6 +142,25 @@ impl From<SimpleStreamOptions> for ModelsSimpleStreamOptions {
         }
     }
 }
+
+/// Options for deferred fetching, including header transformation.
+#[derive(Clone, Default)]
+pub struct ModelsDeferredFetchOptions {
+    pub deferred: DeferredFetchOptions,
+    pub transform_headers: Option<ModelsRequestTransforms>,
+}
+
+impl From<DeferredFetchOptions> for ModelsDeferredFetchOptions {
+    fn from(deferred: DeferredFetchOptions) -> Self {
+        Self {
+            deferred,
+            transform_headers: None,
+        }
+    }
+}
+
+/// Options for deferred cancellation, including header transformation.
+pub type ModelsDeferredCancelOptions = ModelsStreamOptions;
 
 /// `Provider` — the concrete runtime unit (T03 subset, see module docs).
 pub trait Provider: Send + Sync {
@@ -214,6 +252,24 @@ pub trait Provider: Send + Sync {
         context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String>;
+
+    fn fetch_deferred(
+        &self,
+        _model: &Model,
+        _handle: &DeferredHandle,
+        _options: Option<DeferredFetchOptions>,
+    ) -> Option<AssistantMessageEventStream> {
+        None
+    }
+
+    fn cancel_deferred(
+        &self,
+        _model: &Model,
+        _handle: &DeferredHandle,
+        _options: Option<ProviderRequestOptions>,
+    ) -> Option<BoxFuture<'static, Result<(), ModelsError>>> {
+        None
+    }
 
     /// `generateImages?` (models.ts:221-226 @ 4a080252f): present when the
     /// provider supports dedicated image models. Never rejects: the
@@ -903,6 +959,26 @@ impl Provider for CreatedProvider {
                 }))
             }
         }
+    }
+
+    fn fetch_deferred(
+        &self,
+        model: &Model,
+        handle: &DeferredHandle,
+        options: Option<DeferredFetchOptions>,
+    ) -> Option<AssistantMessageEventStream> {
+        self.api_for(model)
+            .and_then(|streams| streams.fetch_deferred(model, handle, options))
+    }
+
+    fn cancel_deferred(
+        &self,
+        model: &Model,
+        handle: &DeferredHandle,
+        options: Option<ProviderRequestOptions>,
+    ) -> Option<BoxFuture<'static, Result<(), ModelsError>>> {
+        self.api_for(model)
+            .and_then(|streams| streams.cancel_deferred(model, handle, options))
     }
 }
 
@@ -2286,6 +2362,86 @@ impl Models {
     ) -> Option<crate::types::AssistantMessage> {
         self.stream_simple(model, context, options).result().await
     }
+
+    /// Stream one provider-side deferred response with request-time auth.
+    pub fn stream_deferred(
+        &self,
+        model: &Model,
+        handle: &DeferredHandle,
+        options: Option<ModelsDeferredFetchOptions>,
+    ) -> AssistantMessageEventStream {
+        let this = self.clone();
+        let model = model.clone();
+        let handle = handle.clone();
+        lazy_stream(&model.clone(), async move {
+            let provider = this.require_provider(&model)?;
+            let wait = options.as_ref().and_then(|options| options.deferred.wait);
+            let (request_model, request_options) = this
+                .apply_auth(
+                    &model,
+                    options.as_ref().map(|options| &options.deferred.stream),
+                    options
+                        .as_ref()
+                        .and_then(|options| options.transform_headers.as_ref()),
+                )
+                .await?;
+            let deferred = DeferredFetchOptions {
+                stream: request_options.unwrap_or_default(),
+                wait,
+            };
+            let Some(stream) = provider.fetch_deferred(&request_model, &handle, Some(deferred))
+            else {
+                return Err(ModelsError::new(
+                    ModelsErrorCode::Provider,
+                    format!(
+                        "Provider {} does not support deferred responses",
+                        model.provider
+                    ),
+                ));
+            };
+            Ok(stream)
+        })
+    }
+
+    /// Fetch one provider-side deferred response to completion.
+    pub async fn fetch_deferred(
+        &self,
+        model: &Model,
+        handle: &DeferredHandle,
+        options: Option<ModelsDeferredFetchOptions>,
+    ) -> Option<crate::types::AssistantMessage> {
+        self.stream_deferred(model, handle, options).result().await
+    }
+
+    /// Best-effort cancellation of a provider-side deferred response.
+    pub async fn cancel_deferred(
+        &self,
+        model: &Model,
+        handle: &DeferredHandle,
+        options: Option<ModelsDeferredCancelOptions>,
+    ) -> Result<(), ModelsError> {
+        let provider = self.require_provider(model)?;
+        let (request_model, request_options) = self
+            .apply_auth(
+                model,
+                options.as_ref().map(|options| &options.stream),
+                options
+                    .as_ref()
+                    .and_then(|options| options.transform_headers.as_ref()),
+            )
+            .await?;
+        let request_options = request_options.map(|options| options.request);
+        let Some(cancel) = provider.cancel_deferred(&request_model, handle, request_options) else {
+            return Err(ModelsError::new(
+                ModelsErrorCode::Provider,
+                format!(
+                    "Provider {} does not support deferred responses",
+                    model.provider
+                ),
+            ));
+        };
+        cancel.await
+    }
 }
 
 /// `assertChatModel` (utils/model-operations.ts:26-30 @ 4a080252f): reject
@@ -2478,6 +2634,34 @@ mod tests {
         }
     }
 
+    struct HeaderAuth;
+
+    #[async_trait::async_trait]
+    impl ApiKeyAuth for HeaderAuth {
+        fn name(&self) -> &str {
+            "Header auth"
+        }
+
+        async fn resolve(
+            &self,
+            _ctx: &dyn AuthContext,
+            _credential: Option<&crate::auth::ApiKeyCredential>,
+        ) -> Result<Option<AuthResult>, ModelsError> {
+            Ok(Some(AuthResult {
+                auth: ModelAuth {
+                    api_key: Some("sk-test".to_owned()),
+                    headers: Some(std::collections::HashMap::from([(
+                        "x-provider".to_owned(),
+                        Some("provider".to_owned()),
+                    )])),
+                    base_url: Some("https://auth.example/v2".to_owned()),
+                },
+                env: None,
+                source: Some("TEST_API_KEY".to_owned()),
+            }))
+        }
+    }
+
     struct EchoStreams;
 
     impl ProviderStreams for EchoStreams {
@@ -2533,6 +2717,106 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingDeferredStreams {
+        fetches: Mutex<Vec<(String, DeferredFetchOptions)>>,
+        cancels: Mutex<Vec<String>>,
+    }
+
+    impl RecordingDeferredStreams {
+        fn response(model: &Model) -> AssistantMessageEventStream {
+            let stream = AssistantMessageEventStream::new();
+            let message: crate::types::AssistantMessage = serde_json::from_value(json!({
+                "role": "assistant",
+                "content": [],
+                "api": model.api,
+                "provider": model.provider,
+                "model": model.id,
+                "usage": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "totalTokens": 0,
+                    "cost": {
+                        "input": 0.0,
+                        "output": 0.0,
+                        "cacheRead": 0.0,
+                        "cacheWrite": 0.0,
+                        "total": 0.0
+                    }
+                },
+                "stopReason": "stop",
+                "timestamp": 0
+            }))
+            .expect("deferred response");
+            stream.push(StreamEvent::Done {
+                reason: DoneReason::Stop,
+                message,
+            });
+            stream.end(None);
+            stream
+        }
+    }
+
+    impl ProviderStreams for RecordingDeferredStreams {
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: &crate::types::TranscriptContext,
+            _options: Option<StreamOptions>,
+        ) -> AssistantMessageEventStream {
+            unreachable!("deferred tests use fetch_deferred")
+        }
+
+        fn stream_simple(
+            &self,
+            _model: &Model,
+            _context: &crate::types::TranscriptContext,
+            _options: Option<SimpleStreamOptions>,
+        ) -> Result<AssistantMessageEventStream, String> {
+            unreachable!("deferred tests use fetch_deferred")
+        }
+
+        fn fetch_deferred(
+            &self,
+            model: &Model,
+            _handle: &DeferredHandle,
+            options: Option<DeferredFetchOptions>,
+        ) -> Option<AssistantMessageEventStream> {
+            self.fetches
+                .lock()
+                .expect("fetches")
+                .push((model.base_url.clone(), options.expect("fetch options")));
+            Some(Self::response(model))
+        }
+
+        fn cancel_deferred(
+            &self,
+            _model: &Model,
+            handle: &DeferredHandle,
+            _options: Option<ProviderRequestOptions>,
+        ) -> Option<BoxFuture<'static, Result<(), ModelsError>>> {
+            self.cancels
+                .lock()
+                .expect("cancels")
+                .push(handle.id.clone());
+            Some(Box::pin(async { Ok(()) }))
+        }
+    }
+
+    fn deferred_handle(id: &str) -> DeferredHandle {
+        DeferredHandle {
+            provider: "test".to_owned(),
+            model_id: "m".to_owned(),
+            api: ApiKind::ANTHROPIC_MESSAGES.to_owned(),
+            id: id.to_owned(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: None,
+        }
+    }
+
     fn test_provider(id: &str, api: ProviderApi) -> Arc<dyn Provider> {
         create_provider(CreateProviderOptions {
             id: id.to_owned(),
@@ -2547,6 +2831,90 @@ mod tests {
             api,
             ..Default::default()
         })
+    }
+
+    #[tokio::test]
+    async fn deferred_fetch_and_cancel_apply_auth_headers_base_url_and_identity() {
+        let recording = Arc::new(RecordingDeferredStreams::default());
+        let provider = create_provider(CreateProviderOptions {
+            id: "test".to_owned(),
+            name: None,
+            base_url: None,
+            headers: Some(std::collections::HashMap::from([(
+                "x-provider".to_owned(),
+                Some("provider".to_owned()),
+            )])),
+            auth: ProviderAuth {
+                api_key: Some(Arc::new(HeaderAuth)),
+                oauth: None,
+            },
+            models: vec![model("test", ApiKind::ANTHROPIC_MESSAGES)],
+            api: ProviderApi::Single(recording.clone()),
+            ..Default::default()
+        });
+        let models = Models::new(None);
+        models.set_provider(provider);
+        let model = models.get_model("test", "m").expect("model");
+        let identity = crate::utils::identity::ClientIdentity::new("1.2.3", true);
+        let options = ModelsDeferredFetchOptions::from(DeferredFetchOptions {
+            stream: StreamOptions {
+                request: ProviderRequestOptions {
+                    headers: Some(std::collections::HashMap::from([(
+                        "x-request".to_owned(),
+                        Some("request".to_owned()),
+                    )])),
+                    identity: Some(identity.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            wait: Some(25),
+        });
+        let result = models
+            .fetch_deferred(&model, &deferred_handle("d1"), Some(options))
+            .await
+            .expect("deferred result");
+        assert_eq!(result.stop_reason, StopReason::Stop);
+        {
+            let fetches = recording.fetches.lock().expect("fetches");
+            assert_eq!(fetches.len(), 1);
+            assert_eq!(fetches[0].0, "https://auth.example/v2");
+            let options = &fetches[0].1;
+            assert_eq!(options.wait, Some(25));
+            assert_eq!(options.api_key.as_deref(), Some("sk-test"));
+            let headers = options.headers.as_ref().expect("headers");
+            assert_eq!(headers["x-provider"].as_deref(), Some("provider"));
+            assert_eq!(headers["x-request"].as_deref(), Some("request"));
+            assert_eq!(options.identity, Some(identity));
+        }
+
+        models
+            .cancel_deferred(&model, &deferred_handle("d1"), None)
+            .await
+            .expect("cancel");
+        assert_eq!(
+            recording.cancels.lock().expect("cancels").as_slice(),
+            &["d1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_fetch_rejects_an_unsupported_provider() {
+        let models = Models::new(None);
+        models.set_provider(test_provider("test", ProviderApi::Map(HashMap::new())));
+        let model = models.get_model("test", "m").expect("model");
+        let result = models
+            .fetch_deferred(&model, &deferred_handle("d1"), None)
+            .await
+            .expect("error result");
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("does not support deferred responses")),
+            "unexpected error: {result:?}"
+        );
     }
 
     #[tokio::test]

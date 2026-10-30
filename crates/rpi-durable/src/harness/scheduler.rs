@@ -28,7 +28,7 @@
 //! settle-idle pass (no unref'd timer exists here; V17-14 §7.3 shape difference).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -291,7 +291,8 @@ struct Invocation {
     /// Watches acquired through the runtime; stopped at invocation end.
     watches: Mutex<Vec<CommittedWatch>>,
     /// Timers armed through the runtime; disarmed at invocation end.
-    timers: Mutex<Vec<TimerDisarm>>,
+    timers: Mutex<Vec<(u64, TimerDisarm)>>,
+    next_timer_id: AtomicU64,
     ended: AtomicBool,
     done_tx: tokio::sync::watch::Sender<bool>,
     notify: Notify,
@@ -2415,6 +2416,7 @@ impl SchedulerInner {
             context,
             watches: Mutex::new(Vec::new()),
             timers: Mutex::new(Vec::new()),
+            next_timer_id: AtomicU64::new(1),
             ended: AtomicBool::new(false),
             done_tx,
             notify: Notify::new(),
@@ -2997,8 +2999,14 @@ impl SchedulerInner {
         if invocation.ended.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.telemetry
-            .record_metric("pi.durable.tasks.active", -1.0, JsonObject::new());
+        self.telemetry.record_metric(
+            "pi.durable.tasks.active",
+            -1.0,
+            serde_json::json!({ "task": invocation.task_kind })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
         if let Ok(mut map) = self.invocations.lock() {
             let remove = map
                 .get(&invocation.task_id)
@@ -3013,10 +3021,13 @@ impl SchedulerInner {
                 watch.cancel();
             }
         }
-        if let Ok(mut timers) = invocation.timers.lock() {
-            for disarm in timers.drain(..) {
-                disarm();
-            }
+        let timers = invocation
+            .timers
+            .lock()
+            .map(|mut timers| std::mem::take(&mut *timers))
+            .unwrap_or_default();
+        for (_, disarm) in timers {
+            disarm();
         }
         invocation.controller.cancel();
     }
@@ -3757,9 +3768,17 @@ impl TaskRuntime for InvocationRuntime {
             // After the invocation ends, nothing is armed; a race is harmless.
             callback();
         });
-        let disarm = self.inner.timers.foreground(callback, delay_ms as f64);
+        let native = self.inner.timers.foreground(callback, delay_ms as f64);
+        let id = self.invocation.next_timer_id.fetch_add(1, Ordering::SeqCst);
+        let invocation = Arc::clone(&self.invocation);
+        let disarm: TimerDisarm = Arc::new(move || {
+            native();
+            if let Ok(mut timers) = invocation.timers.lock() {
+                timers.retain(|(timer_id, _)| *timer_id != id);
+            }
+        });
         if let Ok(mut timers) = self.invocation.timers.lock() {
-            timers.push(Arc::clone(&disarm));
+            timers.push((id, Arc::clone(&disarm)));
         }
         Ok(disarm)
     }

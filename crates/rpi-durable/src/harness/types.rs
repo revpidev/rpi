@@ -683,7 +683,7 @@ pub struct ToolDiagnostic {
 // FORM: upstream is generic over `TDetails` and omits absent fields; Rust fixes
 // details to `JsonValue` and represents absent fields as `None`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolExecutionResult {
     /// Omitted: the retained `output()` text becomes the output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2213,6 +2213,17 @@ pub trait ToolExecutionApi: Send + Sync {
         value: JsonValue,
         context: &Context,
     ) -> Result<JsonValue, SessionError>;
+    /// Create a task in one commit. A task-owned child of a tool that is not
+    /// replay-safe defaults to `abandonOnRestart`; an explicit value wins.
+    async fn create_task(
+        &self,
+        definition: AnyTask,
+        input: JsonValue,
+        ownership: TaskOwnership,
+        background: bool,
+        abandon_on_restart: Option<bool>,
+        context: &Context,
+    ) -> Result<TaskId, SessionError>;
     /// Read a committed task record (upstream `api.getTask`).
     async fn get_task(
         &self,

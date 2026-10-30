@@ -68,6 +68,8 @@ impl ApiKeyAuth for AlwaysAuth {
 
 /// Identity values observed at the provider boundary.
 pub type IdentityLog = Arc<Mutex<Vec<Option<rpi_ai::utils::identity::ClientIdentity>>>>;
+/// Deferred fetch/cancel calls observed at the provider boundary.
+pub type DeferredLog = Arc<Mutex<Vec<String>>>;
 
 /// A provider that returns scripted responses in order.
 pub struct ScriptedProvider {
@@ -75,6 +77,7 @@ pub struct ScriptedProvider {
     auth: ProviderAuth,
     scripts: Mutex<VecDeque<Script>>,
     identity_log: Option<IdentityLog>,
+    deferred_log: Option<DeferredLog>,
 }
 
 impl ScriptedProvider {
@@ -185,6 +188,36 @@ impl Provider for ScriptedProvider {
         self.record_identity(options.and_then(|options| options.stream.identity.clone()));
         Ok(self.stream_of(self.next()))
     }
+
+    fn fetch_deferred(
+        &self,
+        _model: &Model,
+        handle: &rpi_ai::types::DeferredHandle,
+        options: Option<rpi_ai::types::DeferredFetchOptions>,
+    ) -> Option<AssistantMessageEventStream> {
+        self.record_identity(options.and_then(|options| options.stream.identity.clone()));
+        if let Some(log) = &self.deferred_log {
+            log.lock()
+                .expect("deferred log")
+                .push(format!("fetch:{}", handle.id));
+        }
+        Some(self.stream_of(self.next()))
+    }
+
+    fn cancel_deferred(
+        &self,
+        _model: &Model,
+        handle: &rpi_ai::types::DeferredHandle,
+        options: Option<rpi_ai::types::ProviderRequestOptions>,
+    ) -> Option<futures::future::BoxFuture<'static, Result<(), rpi_ai::auth::ModelsError>>> {
+        self.record_identity(options.and_then(|options| options.identity.clone()));
+        if let Some(log) = &self.deferred_log {
+            log.lock()
+                .expect("deferred log")
+                .push(format!("cancel:{}", handle.id));
+        }
+        Some(Box::pin(async { Ok(()) }))
+    }
 }
 
 /// The scripted test model.
@@ -226,10 +259,29 @@ pub fn test_models_with_identity_log(scripts: Vec<Script>) -> (Models, IdentityL
         },
         scripts: Mutex::new(scripts.into()),
         identity_log: Some(Arc::clone(&identity_log)),
+        deferred_log: None,
     });
     let models = Models::new(None);
     models.set_provider(provider);
     (models, identity_log)
+}
+
+/// Build a `Models` handle and capture deferred fetch/cancel calls.
+pub fn test_models_with_deferred_log(scripts: Vec<Script>) -> (Models, DeferredLog) {
+    let deferred_log = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider {
+        model: model(),
+        auth: ProviderAuth {
+            api_key: Some(Arc::new(AlwaysAuth)),
+            oauth: None,
+        },
+        scripts: Mutex::new(scripts.into()),
+        identity_log: None,
+        deferred_log: Some(Arc::clone(&deferred_log)),
+    });
+    let models = Models::new(None);
+    models.set_provider(provider);
+    (models, deferred_log)
 }
 
 /// The shared background context.
@@ -318,6 +370,19 @@ pub async fn open_with_sources(
     models: rpi_durable::harness::ModelsSource,
     identity: Option<rpi_ai::utils::identity::ClientIdentity>,
 ) -> Opened {
+    open_with_timing(storage, extensions, settings, models, identity, None, None).await
+}
+
+/// Open a Harness with an explicit logical clock and host timer.
+pub async fn open_with_timing(
+    storage: Arc<dyn Storage>,
+    extensions: Vec<Extension>,
+    settings: Option<rpi_durable::harness::SettingsSource>,
+    models: rpi_durable::harness::ModelsSource,
+    identity: Option<rpi_ai::utils::identity::ClientIdentity>,
+    now: Option<rpi_durable::session::NowFn>,
+    set_timer: Option<rpi_durable::harness::SetTimer>,
+) -> Opened {
     let registry = Arc::new(RegistryImpl::with_builtins(builtin_tasks()));
     for extension in extensions {
         registry.install(extension).expect("install extension");
@@ -332,8 +397,8 @@ pub async fn open_with_sources(
         settings,
         env: None,
         conversation_created: None,
-        now: None,
-        set_timer: None,
+        now,
+        set_timer,
         on_wake: None,
         on_report_info: None,
         on_report: Some(Arc::new(move |message| {

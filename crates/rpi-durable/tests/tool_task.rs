@@ -277,3 +277,62 @@ async fn conversation_entries(
         .expect("scan")
         .items
 }
+
+/// ToolTask v2 and the execution result round-trip their tagged output shapes;
+/// legacy `content` is rejected explicitly instead of being dropped.
+#[test]
+fn tool_task_v2_round_trips_and_rejects_legacy_content() {
+    let input = rpi_durable::harness::ToolTaskInput::Nested {
+        parent: TaskId::from_number(7),
+        parent_call_id: "root/1".to_string(),
+        key: "k1".to_string(),
+        call: ToolCall {
+            id: "root/1/k1".to_string(),
+            name: "inner".to_string(),
+            arguments: serde_json::Map::new(),
+            arguments_error: None,
+            namespace: None,
+            thought_signature: None,
+        },
+        progress: Some(false),
+    };
+    let encoded = serde_json::to_value(&input).expect("encode input");
+    assert_eq!(encoded["kind"], "nested");
+    assert_eq!(encoded["parentCallId"], "root/1");
+    let decoded: rpi_durable::harness::ToolTaskInput =
+        serde_json::from_value(encoded).expect("decode input");
+    assert_eq!(decoded, input);
+
+    for result in [
+        rpi_durable::harness::ToolTaskResult::Nested,
+        rpi_durable::harness::ToolTaskResult::Model {
+            entry_id: rpi_durable::ids::EntryId::from_number(9),
+            control: None,
+        },
+    ] {
+        let encoded = serde_json::to_value(&result).expect("encode result");
+        let decoded: rpi_durable::harness::ToolTaskResult =
+            serde_json::from_value(encoded).expect("decode result");
+        assert_eq!(decoded, result);
+    }
+
+    let execution = ToolExecutionResult {
+        output: Some(vec![ToolResultContent::Text(rpi_ai::types::TextContent {
+            text: "hello".to_string(),
+            text_signature: None,
+        })]),
+        structured_output: Some(serde_json::json!({ "value": 1 })),
+        ..Default::default()
+    };
+    let encoded = serde_json::to_value(&execution).expect("encode execution");
+    assert!(encoded.get("output").is_some());
+    assert!(encoded.get("content").is_none());
+    let decoded: ToolExecutionResult = serde_json::from_value(encoded).expect("decode execution");
+    assert_eq!(decoded, execution);
+    assert!(
+        serde_json::from_value::<ToolExecutionResult>(serde_json::json!({
+            "content": []
+        }))
+        .is_err()
+    );
+}

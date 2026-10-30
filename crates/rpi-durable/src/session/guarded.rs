@@ -7,9 +7,11 @@
 //! Session. That call still gets the backend's error; every later call and
 //! every Storage call still underway gets `SessionFailed`.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
+use tokio::sync::Notify;
 
 use crate::chord::context::Context;
 use crate::errors::{StorageError, StorageResult};
@@ -21,10 +23,33 @@ use crate::types::{
     StoredEntry, SubmissionQuery, SubmissionRecord, TaskQuery, TaskRecord,
 };
 
+#[derive(Default)]
+struct Underway {
+    closing: bool,
+    calls: usize,
+}
+
 /// Storage wrapper that latches the first fatal error into its Session.
 pub struct GuardedStorage {
     inner: Arc<dyn Storage>,
     session: Mutex<Weak<SessionImpl>>,
+    underway: Mutex<Underway>,
+    settled: Notify,
+}
+
+struct CallGuard<'a> {
+    storage: &'a GuardedStorage,
+}
+
+impl Drop for CallGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut underway) = self.storage.underway.lock() {
+            underway.calls -= 1;
+            if underway.calls == 0 {
+                self.storage.settled.notify_waiters();
+            }
+        }
+    }
 }
 
 impl GuardedStorage {
@@ -33,6 +58,8 @@ impl GuardedStorage {
         Arc::new(Self {
             inner,
             session: Mutex::new(Weak::new()),
+            underway: Mutex::new(Underway::default()),
+            settled: Notify::new(),
         })
     }
 
@@ -47,6 +74,53 @@ impl GuardedStorage {
         let session = self.session.lock().ok().and_then(|slot| slot.upgrade());
         if let Some(session) = session {
             session.fail(error.to_string());
+        }
+    }
+
+    fn assert_healthy(&self) -> StorageResult<()> {
+        let failure = self
+            .session
+            .lock()
+            .ok()
+            .and_then(|slot| slot.upgrade())
+            .and_then(|session| session.failure());
+        match failure {
+            Some(cause) => Err(StorageError::SessionFailed(cause)),
+            None => Ok(()),
+        }
+    }
+
+    fn begin_call(&self) -> StorageResult<CallGuard<'_>> {
+        let mut underway = self
+            .underway
+            .lock()
+            .map_err(|_| StorageError::message("Storage guard is poisoned"))?;
+        if underway.closing {
+            return Err(StorageError::Closed("Session"));
+        }
+        underway.calls += 1;
+        Ok(CallGuard { storage: self })
+    }
+
+    async fn call<T>(
+        &self,
+        read: Option<&Context>,
+        run: impl Future<Output = StorageResult<T>> + Send,
+    ) -> StorageResult<T> {
+        self.assert_healthy()?;
+        let _call = self.begin_call()?;
+        let result = run.await;
+        self.assert_healthy()?;
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if let Some(context) = read {
+                    self.guard_read(&error, context);
+                } else {
+                    self.guard_write(&error);
+                }
+                Err(error)
+            }
         }
     }
 
@@ -73,23 +147,11 @@ impl GuardedStorage {
 #[async_trait]
 impl Storage for GuardedStorage {
     async fn commit(&self, writes: &[StorageWrite], context: &Context) -> StorageResult<Seq> {
-        match self.inner.commit(writes, context).await {
-            Ok(seq) => Ok(seq),
-            Err(error) => {
-                self.guard_write(&error);
-                Err(error)
-            }
-        }
+        self.call(None, self.inner.commit(writes, context)).await
     }
 
     async fn mint_id(&self) -> StorageResult<u64> {
-        match self.inner.mint_id().await {
-            Ok(id) => Ok(id),
-            Err(error) => {
-                self.guard_write(&error);
-                Err(error)
-            }
-        }
+        self.call(None, self.inner.mint_id()).await
     }
 
     async fn conversation(
@@ -97,13 +159,8 @@ impl Storage for GuardedStorage {
         id: ConversationId,
         context: &Context,
     ) -> StorageResult<Option<ConversationRecord>> {
-        match self.inner.conversation(id, context).await {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(Some(context), self.inner.conversation(id, context))
+            .await
     }
 
     async fn scan_conversations(
@@ -113,27 +170,16 @@ impl Storage for GuardedStorage {
         cursor: Option<Cursor>,
         context: &Context,
     ) -> StorageResult<Page<ConversationRecord>> {
-        match self
-            .inner
-            .scan_conversations(query, limit, cursor, context)
-            .await
-        {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(
+            Some(context),
+            self.inner.scan_conversations(query, limit, cursor, context),
+        )
+        .await
     }
 
     async fn entry(&self, id: EntryId, context: &Context) -> StorageResult<Option<StoredEntry>> {
-        match self.inner.entry(id, context).await {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(Some(context), self.inner.entry(id, context))
+            .await
     }
 
     async fn entry_in_conversation(
@@ -142,17 +188,12 @@ impl Storage for GuardedStorage {
         id: EntryId,
         context: &Context,
     ) -> StorageResult<Option<StoredEntry>> {
-        match self
-            .inner
-            .entry_in_conversation(conversation_id, id, context)
-            .await
-        {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(
+            Some(context),
+            self.inner
+                .entry_in_conversation(conversation_id, id, context),
+        )
+        .await
     }
 
     async fn find_latest_head_marker(
@@ -161,17 +202,12 @@ impl Storage for GuardedStorage {
         at_or_before_entry_id: Option<EntryId>,
         context: &Context,
     ) -> StorageResult<Option<EntryRecord>> {
-        match self
-            .inner
-            .find_latest_head_marker(conversation_id, at_or_before_entry_id, context)
-            .await
-        {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(
+            Some(context),
+            self.inner
+                .find_latest_head_marker(conversation_id, at_or_before_entry_id, context),
+        )
+        .await
     }
 
     async fn scan_entries(
@@ -181,23 +217,15 @@ impl Storage for GuardedStorage {
         cursor: Option<Cursor>,
         context: &Context,
     ) -> StorageResult<Page<EntryRecord>> {
-        match self.inner.scan_entries(query, limit, cursor, context).await {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(
+            Some(context),
+            self.inner.scan_entries(query, limit, cursor, context),
+        )
+        .await
     }
 
     async fn task(&self, id: TaskId, context: &Context) -> StorageResult<Option<TaskRecord>> {
-        match self.inner.task(id, context).await {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(Some(context), self.inner.task(id, context)).await
     }
 
     async fn scan_tasks(
@@ -207,13 +235,11 @@ impl Storage for GuardedStorage {
         cursor: Option<Cursor>,
         context: &Context,
     ) -> StorageResult<Page<TaskRecord>> {
-        match self.inner.scan_tasks(query, limit, cursor, context).await {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(
+            Some(context),
+            self.inner.scan_tasks(query, limit, cursor, context),
+        )
+        .await
     }
 
     async fn submission(
@@ -221,13 +247,8 @@ impl Storage for GuardedStorage {
         id: SubmissionId,
         context: &Context,
     ) -> StorageResult<Option<SubmissionRecord>> {
-        match self.inner.submission(id, context).await {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(Some(context), self.inner.submission(id, context))
+            .await
     }
 
     async fn scan_submissions(
@@ -237,17 +258,11 @@ impl Storage for GuardedStorage {
         cursor: Option<Cursor>,
         context: &Context,
     ) -> StorageResult<Page<SubmissionRecord>> {
-        match self
-            .inner
-            .scan_submissions(query, limit, cursor, context)
-            .await
-        {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(
+            Some(context),
+            self.inner.scan_submissions(query, limit, cursor, context),
+        )
+        .await
     }
 
     async fn submission_by_request(
@@ -256,17 +271,12 @@ impl Storage for GuardedStorage {
         request_id: &str,
         context: &Context,
     ) -> StorageResult<Option<SubmissionRecord>> {
-        match self
-            .inner
-            .submission_by_request(conversation_id, request_id, context)
-            .await
-        {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(
+            Some(context),
+            self.inner
+                .submission_by_request(conversation_id, request_id, context),
+        )
+        .await
     }
 
     async fn find_document(
@@ -275,13 +285,11 @@ impl Storage for GuardedStorage {
         at: DocumentPoint,
         context: &Context,
     ) -> StorageResult<Option<DocumentRecord>> {
-        match self.inner.find_document(address, at, context).await {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(
+            Some(context),
+            self.inner.find_document(address, at, context),
+        )
+        .await
     }
 
     async fn document(
@@ -290,13 +298,8 @@ impl Storage for GuardedStorage {
         at: DocumentPoint,
         context: &Context,
     ) -> StorageResult<Option<StoredDocument>> {
-        match self.inner.document(id, at, context).await {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(Some(context), self.inner.document(id, at, context))
+            .await
     }
 
     async fn scan_documents(
@@ -306,20 +309,29 @@ impl Storage for GuardedStorage {
         cursor: Option<Cursor>,
         context: &Context,
     ) -> StorageResult<Page<DocumentRecord>> {
-        match self
-            .inner
-            .scan_documents(query, limit, cursor, context)
-            .await
-        {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.guard_read(&error, context);
-                Err(error)
-            }
-        }
+        self.call(
+            Some(context),
+            self.inner.scan_documents(query, limit, cursor, context),
+        )
+        .await
     }
 
     async fn close(&self, context: &Context) -> StorageResult<()> {
+        if let Ok(mut underway) = self.underway.lock() {
+            underway.closing = true;
+        }
+        loop {
+            let settled = self.settled.notified();
+            let done = self
+                .underway
+                .lock()
+                .map(|underway| underway.calls == 0)
+                .unwrap_or(true);
+            if done {
+                break;
+            }
+            settled.await;
+        }
         self.inner.close(context).await
     }
 }

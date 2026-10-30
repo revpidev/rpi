@@ -1192,6 +1192,47 @@ async fn list_files_is_bounded_and_reports_truncation() {
     assert!(listing.entries.len() < 10);
 }
 
+#[tokio::test]
+async fn list_files_keeps_a_sorted_prefix_and_stops_on_timeout() {
+    let dir = TempDir::new("env-list-stream-bounds");
+    let env = create_env(&dir);
+    for index in (0..25).rev() {
+        write(&env, &format!("file{index:03}.txt"), "x");
+    }
+    let listing = env
+        .list_files(
+            ".",
+            Some(ListFilesOptions {
+                max_entries: Some(3),
+                ..Default::default()
+            }),
+            &context(),
+        )
+        .await
+        .expect("bounded list");
+    let paths: Vec<&str> = listing
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(paths, vec!["file000.txt", "file001.txt", "file002.txt"]);
+    assert!(listing.truncated);
+
+    let timed = env
+        .list_files(
+            ".",
+            Some(ListFilesOptions {
+                timeout_ms: Some(0),
+                ..Default::default()
+            }),
+            &context(),
+        )
+        .await
+        .expect("timeout list");
+    assert!(timed.truncated);
+    assert!(timed.entries.is_empty());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn list_files_lists_symlinks_without_following_them() {

@@ -6,10 +6,7 @@
 //! runs tool rounds. The run's inputs live in `pi.live.run`; the task that owns
 //! `run.taskId` settles them.
 //!
-//! Ported phases: `prepare`, `request`, `retry`, `tools`. The upstream `poll`
-//! phase and `fetchDeferred`/`cancelDeferred` are [DEFER] (R2.2.1); a deferred
-//! provider response settles the run `unanswered`/`model_error` (registered
-//! FORM, V17-14 task §7.3 item 12).
+//! Ported phases: `prepare`, `request`, `retry`, `poll`, `tools`.
 //!
 //! Rust shape notes: upstream `streamResponse` throttles partials with a timer
 //! and one commit in flight; the port commits synchronously when
@@ -22,10 +19,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use rpi_ai::models::ModelsSimpleStreamOptions;
+use rpi_ai::models::{
+    ModelsDeferredCancelOptions, ModelsDeferredFetchOptions, ModelsSimpleStreamOptions,
+};
 use rpi_ai::types::{
-    AssistantContent, AssistantMessage, Context as ModelContext, Message, ModelThinkingLevel,
-    SimpleStreamOptions, StopReason, StreamEvent, Tool, ToolCall, UserMessage, UserRole,
+    AssistantContent, AssistantMessage, Context as ModelContext, DeferredFetchOptions, Message,
+    ModelThinkingLevel, ProviderRequestOptions, SimpleStreamOptions, StopReason, StreamEvent, Tool,
+    ToolCall, UserMessage, UserRole,
 };
 use rpi_ai::utils::overflow::is_context_overflow;
 use rpi_ai::utils::retry::{is_retryable_assistant_error, retry_delay_ms};
@@ -51,8 +51,8 @@ use crate::harness::registry::{GENERATION_TASK_NAME, TOOL_TASK_NAME};
 use crate::harness::tool::{append_tool_result, harness_error};
 use crate::harness::types::{
     AfterFailedRun, ConversationStreamOptions, HookHandlers, ModelRef, NextTaskState, PromptInput,
-    RunningTask, TaskCommitFn, TaskDefinition, TaskRuntime, ToolControl, ToolExecutionMode,
-    read_state, write_state,
+    RunningTask, TaskCommitFn, TaskDefinition, TaskRuntime, TimerDisarm, ToolControl,
+    ToolExecutionMode, read_state, write_state,
 };
 use crate::harness::usage::{UsageBucket, record_usage};
 use crate::ids::{ConversationId, EntryId, SubmissionId, TaskId};
@@ -114,6 +114,24 @@ enum GenerationCheckpoint {
         /// Wall-clock time of the next attempt.
         until: f64,
     },
+    /// Polling a provider-side deferred response.
+    #[serde(rename = "poll")]
+    Poll {
+        /// Attempt number.
+        attempt: u64,
+        /// The blocking compaction this generation waited for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compacted: Option<TaskId>,
+        /// Resolved model.
+        model: ModelRef,
+        /// Newest entry included in the request.
+        cutoff: EntryId,
+        /// Provider handle persisted across restarts.
+        handle: rpi_ai::types::DeferredHandle,
+        /// Harness-clock time of the next poll.
+        #[serde(rename = "pollAt")]
+        poll_at: f64,
+    },
     /// Waiting on the round's tool tasks.
     #[serde(rename = "tools")]
     Tools {
@@ -132,6 +150,8 @@ struct Request {
     compacted: Option<TaskId>,
     model: ModelRef,
     cutoff: EntryId,
+    /// Previous poll time, used to keep repeated polls strictly increasing.
+    poll_at: Option<f64>,
     /// Committed model context through `cutoff`.
     messages: Vec<Message>,
 }
@@ -141,6 +161,14 @@ struct Request {
 enum ThresholdKind {
     Blocking,
     Background,
+}
+
+struct DisarmOnDrop(TimerDisarm);
+
+impl Drop for DisarmOnDrop {
+    fn drop(&mut self) {
+        (self.0)();
+    }
 }
 
 /// Built-in generation task (`pi.generation`).
@@ -172,6 +200,7 @@ impl TaskDefinition for GenerationTask {
             "prepare" => prepare(&task, runtime, context, checkpoint).await,
             "request" => request(runtime, context, checkpoint).await,
             "retry" => retry(runtime, context, checkpoint).await,
+            "poll" => poll(runtime, context, checkpoint).await,
             "tools" => tools(runtime, context, checkpoint).await,
             _ => Ok(()),
         }
@@ -184,10 +213,34 @@ impl TaskDefinition for GenerationTask {
         context: &Context,
     ) -> SessionResult<()> {
         let checkpoint = parse_checkpoint(task.checkpoint());
-        let unstarted = match checkpoint {
+        if let GenerationCheckpoint::Poll {
+            model: reference,
+            handle,
+            ..
+        } = &checkpoint
+            && let Some(model) = runtime
+                .models()
+                .get_model(&reference.provider, &reference.model_id)
+        {
+            let options = ModelsDeferredCancelOptions::from(rpi_ai::types::StreamOptions {
+                request: ProviderRequestOptions {
+                    signal: Some(runtime.signal()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            if let Err(error) = runtime
+                .models()
+                .cancel_deferred(&model, handle, Some(options))
+                .await
+            {
+                let _ = runtime.report(error.message);
+            }
+        }
+        let unstarted = match &checkpoint {
             GenerationCheckpoint::Tools {
                 assistant, pending, ..
-            } => read_calls(runtime, assistant, &pending, context).await?,
+            } => read_calls(runtime, *assistant, pending, context).await?,
             _ => Vec::new(),
         };
         let conversation_id = runtime.conversation_id();
@@ -582,6 +635,77 @@ async fn request(
         compacted,
         model: reference,
         cutoff,
+        poll_at: None,
+        messages: view.messages,
+    };
+    classify(runtime, request, message, context).await
+}
+
+const DEFAULT_POLL_AFTER_MS: u64 = 5_000;
+
+async fn poll(
+    runtime: &dyn TaskRuntime,
+    context: &Context,
+    checkpoint: GenerationCheckpoint,
+) -> SessionResult<()> {
+    let GenerationCheckpoint::Poll {
+        attempt,
+        compacted,
+        model: reference,
+        cutoff,
+        handle,
+        poll_at,
+    } = checkpoint
+    else {
+        return Ok(());
+    };
+    if poll_at > runtime.now()? {
+        let checkpoint = GenerationCheckpoint::Poll {
+            attempt,
+            compacted,
+            model: reference,
+            cutoff,
+            handle,
+            poll_at,
+        };
+        return runtime
+            .sleep_until(
+                poll_at,
+                serde_json::to_value(checkpoint).unwrap_or(JsonValue::Null),
+                context,
+            )
+            .await;
+    }
+    let Some(model) = runtime
+        .models()
+        .get_model(&reference.provider, &reference.model_id)
+    else {
+        return fail_no_model(runtime, Some(&reference), context).await;
+    };
+    let options = ModelsDeferredFetchOptions::from(DeferredFetchOptions {
+        stream: rpi_ai::types::StreamOptions {
+            request: ProviderRequestOptions {
+                signal: Some(runtime.signal()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        wait: None,
+    });
+    let message = runtime
+        .models()
+        .fetch_deferred(&model, &handle, Some(options))
+        .await
+        .ok_or_else(|| SessionError::message("Deferred fetch ended without a result"))?;
+    let view = runtime
+        .context(runtime.conversation_id(), context, Some(cutoff))
+        .await?;
+    let request = Request {
+        attempt,
+        compacted,
+        model: reference,
+        cutoff,
+        poll_at: Some(poll_at),
         messages: view.messages,
     };
     classify(runtime, request, message, context).await
@@ -605,15 +729,20 @@ async fn stream_response(
     );
     let token = runtime.signal();
     let mut pending: Option<Arc<AssistantMessage>> = None;
-    let wait = std::time::Duration::from_millis(interval.max(1.0) as u64);
     loop {
         if token.is_cancelled() {
             return Err(SessionError::Aborted);
         }
+        let fired = Arc::new(tokio::sync::Notify::new());
+        let callback = Arc::clone(&fired);
+        let _disarm = DisarmOnDrop(runtime.set_timer(
+            Arc::new(move || callback.notify_one()),
+            interval.max(0.0) as u64,
+        )?);
         let next = tokio::select! {
             biased;
             _ = token.cancelled() => return Err(SessionError::Aborted),
-            () = tokio::time::sleep(wait) => {
+            _ = fired.notified() => {
                 if let Some(partial) = pending.take() {
                     commit_partial(runtime, &partial, attempt, context).await?;
                 }
@@ -757,14 +886,53 @@ async fn classify(
         compacted,
         model: reference,
         cutoff,
+        poll_at: previous_poll_at,
         messages,
     } = request;
+    if message.stop_reason == StopReason::Deferred
+        && let Some(handle) = message.deferred.clone()
+    {
+        let requested =
+            runtime.now()? + handle.poll_after_ms.unwrap_or(DEFAULT_POLL_AFTER_MS) as f64;
+        let poll_at = requested.max(
+            previous_poll_at
+                .map(|previous| previous + 1.0)
+                .unwrap_or(f64::NEG_INFINITY),
+        );
+        let checkpoint = GenerationCheckpoint::Poll {
+            attempt,
+            compacted,
+            model: reference,
+            cutoff,
+            handle: *handle,
+            poll_at,
+        };
+        let change: TaskCommitFn = Arc::new(move |_tx, _current| {
+            let checkpoint = checkpoint.clone();
+            Box::pin(async move {
+                let live = _tx
+                    .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
+                    .await?;
+                let mut state: LiveState = read_state(&live)?;
+                state.generation = Some(crate::harness::live::LiveGeneration {
+                    attempt,
+                    message: None,
+                    retry: None,
+                    deferred: Some(crate::harness::live::DeferredStatus { poll_at }),
+                });
+                write_state(&live, &state)?;
+                Ok(Some(NextTaskState::Sleeping {
+                    checkpoint: serde_json::to_value(checkpoint).unwrap_or(JsonValue::Null),
+                    until: poll_at,
+                }))
+            })
+        });
+        return runtime.commit(change, context).await;
+    }
     if message.stop_reason == StopReason::Deferred {
-        // [DEFER] R2.2.1: a deferred provider response settles the run
-        // `unanswered`/`model_error` (registered FORM; V17-14 task §7.3 item 12).
         return fail_model_error(
             runtime,
-            "Deferred model responses are not supported".to_string(),
+            "Deferred model response has no handle".to_string(),
             context,
         )
         .await;

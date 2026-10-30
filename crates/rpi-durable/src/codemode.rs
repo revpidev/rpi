@@ -340,6 +340,9 @@ pub enum CodemodeJournalError {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodemodeJournal {
+    /// Number of calls issued before the first result was delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_issued: Option<u64>,
     /// Delivered results in delivery order.
     #[serde(default)]
     pub entries: Vec<CodemodeJournalEntry>,
@@ -495,7 +498,7 @@ impl CodemodeJournal {
     /// Record the acknowledged issued-call count of `key`.
     pub fn record_issued_after(&mut self, key: &str, issued: u64) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key == key) {
-            entry.issued_after = Some(issued);
+            entry.issued_after = Some(entry.issued_after.unwrap_or(0).max(issued));
         }
     }
 }
@@ -913,11 +916,37 @@ struct CodemodeTool {
     globals: Vec<CodemodeGlobalSpec>,
 }
 
+#[derive(Default)]
+struct ReplayState {
+    issued: u64,
+    next: usize,
+    delivered: BTreeSet<String>,
+    pending: BTreeSet<String>,
+}
+
+struct PendingCall<'a> {
+    host: &'a DurableHost<'a>,
+    key: &'a str,
+}
+
+impl Drop for PendingCall<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut replay) = self.host.replay.lock() {
+            replay.pending.remove(self.key);
+            self.host.replay_changed.notify_waiters();
+        }
+    }
+}
+
 /// Host backed by one tool invocation, the run's journal, and the store.
 struct DurableHost<'a> {
     api: &'a dyn ToolExecutionApi,
     journal: Mutex<CodemodeJournal>,
     journal_commit: tokio::sync::Mutex<()>,
+    replay: Mutex<ReplayState>,
+    replay_changed: tokio::sync::Notify,
+    replay_len: usize,
+    rerun: bool,
     store: Mutex<JsonObject>,
     store_writes: Mutex<BTreeMap<String, JsonValue>>,
     task_id: TaskId,
@@ -928,6 +957,7 @@ struct DurableHost<'a> {
 }
 
 impl<'a> DurableHost<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         api: &'a dyn ToolExecutionApi,
         task_id: TaskId,
@@ -936,11 +966,17 @@ impl<'a> DurableHost<'a> {
         store: JsonObject,
         start: &CodemodeStart,
         start_reply: Option<JsonValue>,
+        rerun: bool,
     ) -> Self {
+        let replay_len = journal.entries.len();
         Self {
             api,
             journal: Mutex::new(journal),
             journal_commit: tokio::sync::Mutex::new(()),
+            replay: Mutex::new(ReplayState::default()),
+            replay_changed: tokio::sync::Notify::new(),
+            replay_len,
+            rerun,
             store: Mutex::new(store),
             store_writes: Mutex::new(BTreeMap::new()),
             task_id,
@@ -962,6 +998,172 @@ impl<'a> DurableHost<'a> {
             .lock()
             .map(|mut writes| std::mem::take(&mut *writes))
             .unwrap_or_default()
+    }
+
+    fn issued(&self) -> u64 {
+        self.replay.lock().map(|replay| replay.issued).unwrap_or(0)
+    }
+
+    fn check_issued(entry: &CodemodeJournalEntry, issued: u64) -> Result<(), String> {
+        if let Some(expected) = entry.issued_after
+            && expected != issued
+        {
+            return Err(format!(
+                "The script took a different path when resumed after a restart: after call {} it had issued {expected} calls, but has now issued {issued}",
+                entry.key
+            ));
+        }
+        Ok(())
+    }
+
+    fn advance_call(&self, key: &str, counted: &mut bool) -> Result<bool, String> {
+        let journal = self
+            .journal
+            .lock()
+            .map_err(|_| "codemode journal lock poisoned".to_string())?
+            .clone();
+        let entries = &journal.entries;
+        let mut replay = self
+            .replay
+            .lock()
+            .map_err(|_| "codemode replay lock poisoned".to_string())?;
+        if !*counted {
+            replay.issued += 1;
+            *counted = true;
+        }
+        if replay.delivered.contains(key) {
+            return Ok(true);
+        }
+        if let Some(index) = entries.iter().position(|entry| entry.key == key) {
+            if replay.next != index {
+                return Ok(false);
+            }
+            if index > 0 {
+                Self::check_issued(&entries[index - 1], replay.issued)?;
+            }
+            replay.next += 1;
+            replay.delivered.insert(key.to_string());
+            drop(replay);
+            self.replay_changed.notify_waiters();
+            return Ok(true);
+        }
+        if replay.next != self.replay_len {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    async fn wait_for_call(&self, key: &str) -> Result<(), String> {
+        let _pending = PendingCall { host: self, key };
+        let mut counted = false;
+        let mut yielded = false;
+        loop {
+            let changed = self.replay_changed.notified();
+            let advanced = self.advance_call(key, &mut counted);
+            if advanced? {
+                return Ok(());
+            }
+            {
+                let journal = self
+                    .journal
+                    .lock()
+                    .map_err(|_| "codemode journal lock poisoned".to_string())?;
+                let mut replay = self
+                    .replay
+                    .lock()
+                    .map_err(|_| "codemode replay lock poisoned".to_string())?;
+                replay.pending.insert(key.to_string());
+                if yielded
+                    && journal
+                        .entries
+                        .get(replay.next)
+                        .is_some_and(|entry| !replay.pending.contains(&entry.key))
+                {
+                    return Err(format!(
+                        "The script took a different path when resumed after a restart: call {key} is out of order and cannot make progress"
+                    ));
+                }
+            }
+            if !yielded {
+                yielded = true;
+                tokio::task::yield_now().await;
+                continue;
+            }
+            if let Some(signal) = self.context.abort_signal() {
+                tokio::select! {
+                    _ = changed => {},
+                    _ = signal.cancelled() => {
+                        return Err("The code mode replay was aborted".to_string());
+                    }
+                }
+            } else {
+                changed.await;
+            }
+        }
+    }
+
+    fn mark_delivered(&self, key: &str) {
+        if let Ok(mut replay) = self.replay.lock() {
+            replay.delivered.insert(key.to_string());
+        }
+    }
+
+    async fn acknowledge_delivered(&self) -> Result<(), String> {
+        let issued = self.issued();
+        self.record_journal(|journal| {
+            if let Some(last) = journal.entries.last_mut() {
+                last.issued_after = Some(last.issued_after.unwrap_or(0).max(issued));
+            } else {
+                journal.first_issued = Some(journal.first_issued.unwrap_or(0).max(issued));
+            }
+            Ok::<(), String>(())
+        })
+        .await
+    }
+
+    async fn finish_replay(&self) -> Result<(), String> {
+        let (issued, complete) = self
+            .replay
+            .lock()
+            .map(|replay| (replay.issued, replay.next == self.replay_len))
+            .unwrap_or((0, false));
+        if !complete {
+            return Err(
+                "The script took a different path when resumed after a restart: it ended before consuming the journal"
+                    .to_string(),
+            );
+        }
+        self.record_journal(|journal| {
+            if self.rerun {
+                if journal
+                    .first_issued
+                    .is_some_and(|expected| expected > issued)
+                {
+                    return Err(format!(
+                        "The script took a different path when resumed after a restart: its first run issued {} calls, but it has now issued {issued}",
+                        journal.first_issued.unwrap_or(0)
+                    ));
+                }
+                if let Some(entry) = journal
+                    .entries
+                    .iter()
+                    .find(|entry| entry.issued_after.is_some_and(|expected| expected > issued))
+                {
+                    return Err(format!(
+                        "The script took a different path when resumed after a restart: after call {} it had issued {} calls, but it has now issued {issued}",
+                        entry.key,
+                        entry.issued_after.unwrap_or(0)
+                    ));
+                }
+            }
+            if let Some(last) = journal.entries.last_mut()
+                && last.issued_after.is_none()
+            {
+                last.issued_after = Some(issued);
+            }
+            Ok::<(), String>(())
+        })
+        .await
     }
 
     fn begin_row(&self, key: &str, name: &str, args: &JsonObject) -> u64 {
@@ -1038,17 +1240,23 @@ impl<'a> DurableHost<'a> {
         Ok(())
     }
 
-    async fn record_journal<F>(&self, record: F) -> Result<(), String>
+    async fn record_journal<F, E>(&self, record: F) -> Result<(), String>
     where
-        F: FnOnce(&mut CodemodeJournal) -> Result<(), CodemodeJournalError>,
+        F: FnOnce(&mut CodemodeJournal) -> Result<(), E>,
+        E: std::fmt::Display,
     {
         let _guard = self.journal_commit.lock().await;
+        let issued = self.issued();
         let state = {
             let mut journal = self
                 .journal
                 .lock()
                 .map_err(|_| "codemode journal lock poisoned".to_string())?;
             record(&mut journal).map_err(|error| error.to_string())?;
+            let len = journal.entries.len();
+            if len > 1 && journal.entries[len - 2].issued_after.is_none() {
+                journal.entries[len - 2].issued_after = Some(issued);
+            }
             journal.clone()
         };
         self.persist_journal(&state).await
@@ -1120,27 +1328,35 @@ impl CodemodeHost for DurableHost<'_> {
                 .journal
                 .lock()
                 .map_err(|_| "codemode journal lock poisoned".to_string())?;
-            if let Some(entry) = journal.entry(key) {
-                if entry.name != name
-                    || entry
-                        .args_fingerprint
-                        .as_ref()
-                        .is_some_and(|recorded| recorded != &fingerprint)
-                {
-                    return Err(Self::divergence(key, name, entry));
-                }
-                if let Some(stored) = &entry.result {
-                    self.context.telemetry().add_event(
-                        "pi.durable.replay",
-                        json!({ "tool.name": name })
-                            .as_object()
-                            .cloned()
-                            .unwrap_or_default(),
-                    );
-                    return Ok(stored.clone());
-                }
+            if let Some(entry) = journal.entry(key)
+                && (entry.name != name
+                    || entry.args_fingerprint.as_ref() != Some(&fingerprint)
+                    || entry.global.is_some())
+            {
+                return Err(Self::divergence(key, name, entry));
             }
         }
+        self.wait_for_call(key).await?;
+        {
+            let journal = self
+                .journal
+                .lock()
+                .map_err(|_| "codemode journal lock poisoned".to_string())?;
+            if let Some(entry) = journal.entry(key) {
+                let stored = entry.result.clone().ok_or_else(|| {
+                    format!("The code mode journal has no delivered result for call {key}")
+                })?;
+                self.context.telemetry().add_event(
+                    "pi.durable.replay",
+                    json!({ "tool.name": name })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+                return Ok(stored);
+            }
+        }
+        self.acknowledge_delivered().await?;
         self.begin_row(key, name, &args);
         let result = self
             .api
@@ -1160,6 +1376,8 @@ impl CodemodeHost for DurableHost<'_> {
         let stored = result.clone();
         self.record_journal(|journal| journal.record(key, name, &args, at, stored))
             .await?;
+        self.acknowledge_delivered().await?;
+        self.mark_delivered(key);
         Ok(result)
     }
 
@@ -1256,24 +1474,36 @@ impl CodemodeHost for DurableHost<'_> {
                 .lock()
                 .map_err(|_| "codemode journal lock poisoned".to_string())?;
             if let Some(entry) = journal.entry(key) {
-                if entry.name != name {
-                    return Err(Self::divergence(key, name, entry));
-                }
-                if let Some(global) = &entry.global {
-                    if global
+                let different_args = entry.global.as_ref().is_none_or(|global| {
+                    global
                         .args
                         .as_ref()
-                        .is_some_and(|stored| canonical_json(stored) != canonical_json(args))
-                    {
-                        return Err(Self::divergence(key, name, entry));
-                    }
-                    return Ok(global.outcome.clone());
-                }
-                if entry.result.is_some() {
+                        .is_none_or(|stored| canonical_json(stored) != canonical_json(args))
+                });
+                if entry.name != name || entry.result.is_some() || different_args {
                     return Err(Self::divergence(key, name, entry));
                 }
             }
         }
+        self.wait_for_call(key).await?;
+        {
+            let journal = self
+                .journal
+                .lock()
+                .map_err(|_| "codemode journal lock poisoned".to_string())?;
+            if let Some(entry) = journal.entry(key) {
+                return entry
+                    .global
+                    .as_ref()
+                    .map(|global| global.outcome.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "The code mode journal has no delivered global outcome for call {key}"
+                        )
+                    });
+            }
+        }
+        self.acknowledge_delivered().await?;
         let outcome = if DISCOVERY_GLOBALS.contains(&name) {
             self.discover(name, args).await?
         } else if CATALOG_GLOBALS.contains(&name) {
@@ -1290,6 +1520,8 @@ impl CodemodeHost for DurableHost<'_> {
             journal.record_global(key, &name_owned, &args, at, outcome_for_record)
         })
         .await?;
+        self.acknowledge_delivered().await?;
+        self.mark_delivered(key);
         Ok(outcome)
     }
 
@@ -1493,6 +1725,7 @@ impl ToolExecute for CodemodeTool {
             store,
             &start,
             lookup.start_reply.clone(),
+            lookup.rerun,
         );
         if lookup.start_reply.is_none() {
             let reply = host
@@ -1503,7 +1736,10 @@ impl ToolExecute for CodemodeTool {
             self.store_start_reply(api, task_id, reply, context).await?;
         }
         let outcome = match self.sandbox.run(start.clone(), &host, context).await {
-            Ok(outcome) => outcome,
+            Ok(outcome) => match host.finish_replay().await {
+                Ok(()) => outcome,
+                Err(message) => CodemodeOutcome::error(message),
+            },
             Err(message) => CodemodeOutcome::error(message),
         };
         let wall_ms = api.now().map(|now| now - start.started_at).unwrap_or(0.0);

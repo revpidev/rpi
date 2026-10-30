@@ -34,6 +34,10 @@ pub enum StorageError {
     #[error("{0} is closed")]
     Closed(&'static str),
 
+    /// The Session failed while this guarded call was admitted or underway.
+    #[error("Session failed after a storage error; close and reopen it")]
+    SessionFailed(String),
+
     /// Minting would leave the safe integer ID space.
     #[error("ID space is exhausted")]
     IdSpaceExhausted,

@@ -8,7 +8,7 @@
 mod generation_support;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -30,8 +30,9 @@ use rpi_durable::session::{DocOwner, EntryDraft};
 use rpi_durable::types::{EntryRecord, InputSubmissionStatus, SubmissionRecord};
 
 use generation_support::{
-    Script, context, entries, error_message, open, open_with_sources, root_ready, submit_input,
-    test_models, text_message, tool_use_message,
+    Script, context, entries, error_message, open, open_with_sources, open_with_storage,
+    open_with_timing, root_ready, submit_input, test_models, test_models_with_deferred_log,
+    text_message, tool_use_message,
 };
 
 /// Assistant text of every `pi.assistant` entry, in order.
@@ -194,6 +195,43 @@ async fn harness_model_requests_apply_identity_overrides() {
     }
 }
 
+/// Deferred polling preserves the Harness identity on the initial request and
+/// every later fetch.
+#[tokio::test]
+async fn deferred_requests_apply_identity_overrides() {
+    let custom = rpi_ai::utils::identity::ClientAttribution {
+        name: "deferred-harness".to_owned(),
+        url: "https://example.test".to_owned(),
+        categories: None,
+    };
+    let (models, identity_log) = generation_support::test_models_with_identity_log(vec![
+        Script::Message(deferred_message("d1", Some(0))),
+        Script::Message(text_message("done", StopReason::Stop)),
+    ]);
+    let opened = generation_support::open_with_identity(
+        Vec::new(),
+        None,
+        models,
+        Some(rpi_ai::utils::identity::ClientIdentity {
+            attribution: Some(Some(custom.clone())),
+            ..Default::default()
+        }),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    submission.wait(&context()).await.expect("wait");
+    let identities = identity_log.lock().expect("identity log").clone();
+    assert_eq!(identities.len(), 2);
+    for identity in identities {
+        let actual = identity
+            .as_ref()
+            .and_then(|identity| identity.attribution.as_ref())
+            .and_then(|attribution| attribution.as_ref());
+        assert_eq!(actual, Some(&custom));
+    }
+}
+
 /// upstream: "retries a retryable assistant error, then succeeds".
 #[tokio::test]
 async fn retryable_error_retries_then_succeeds() {
@@ -260,34 +298,356 @@ async fn overflow_without_compaction_fails_model_error() {
     }
 }
 
-/// upstream: "settles a deferred response as model_error (deferred is [DEFER])".
-#[tokio::test]
-async fn deferred_response_fails_model_error() {
-    let mut deferred = text_message("", StopReason::Deferred);
-    deferred.deferred = Some(Box::new(rpi_ai::types::DeferredHandle {
+fn deferred_message(id: &str, poll_after_ms: Option<u64>) -> AssistantMessage {
+    let mut message = text_message("", StopReason::Deferred);
+    message.deferred = Some(Box::new(rpi_ai::types::DeferredHandle {
         provider: "test".to_string(),
         model_id: "test-model".to_string(),
         api: "openai".to_string(),
-        id: "d1".to_string(),
+        id: id.to_string(),
         expires_at: None,
-        poll_after_ms: None,
+        poll_after_ms,
         data: None,
     }));
-    let opened = open(
+    message
+}
+
+async fn wait_for_sleeping(opened: &generation_support::Opened, id: TaskId) {
+    for _ in 0..200 {
+        let record = opened
+            .harness
+            .get_task(id, &context())
+            .await
+            .expect("task")
+            .expect("record");
+        if matches!(record.state, rpi_durable::types::TaskState::Sleeping { .. }) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("task did not enter sleeping");
+}
+
+fn poll_at(record: &rpi_durable::types::TaskRecord) -> f64 {
+    match &record.state {
+        rpi_durable::types::TaskState::Pending { checkpoint }
+        | rpi_durable::types::TaskState::Running { checkpoint }
+        | rpi_durable::types::TaskState::Sleeping { checkpoint, .. } => {
+            checkpoint["pollAt"].as_f64().expect("persisted pollAt")
+        }
+        other => panic!("expected poll checkpoint, got {other:?}"),
+    }
+}
+
+/// A deferred response sleeps, fetches through Models, and then completes.
+#[tokio::test]
+async fn deferred_response_polls_and_completes() {
+    let (models, deferred) = test_models_with_deferred_log(vec![
+        Script::Message(deferred_message("d1", Some(0))),
+        Script::Message(text_message("done", StopReason::Stop)),
+    ]);
+    let opened = open(Vec::new(), None, models).await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    let settled = submission.wait(&context()).await.expect("wait");
+    assert!(matches!(
+        input_status(&settled),
+        Some(InputSubmissionStatus::Done { .. })
+    ));
+    assert_eq!(deferred.lock().expect("deferred").as_slice(), &["fetch:d1"]);
+}
+
+/// A second deferred result polls strictly later than the previous `pollAt`.
+#[tokio::test]
+async fn consecutive_deferred_responses_poll_until_the_final_answer() {
+    type TimerList = Arc<std::sync::Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>>;
+
+    let timer: TimerList = Arc::new(std::sync::Mutex::new(
+        Vec::<Arc<dyn Fn() + Send + Sync>>::new(),
+    ));
+    let set_timer: rpi_durable::harness::SetTimer = {
+        let timer = Arc::clone(&timer);
+        Arc::new(
+            move |callback: Arc<dyn Fn() + Send + Sync>, _delay, _options| {
+                timer.lock().expect("timers").push(callback);
+                Some(Arc::new(|| {}) as rpi_durable::harness::TimerDisarm)
+            },
+        )
+    };
+    let fire = |timer: &TimerList| {
+        let callbacks: Vec<_> = timer.lock().expect("timers").drain(..).collect();
+        for callback in callbacks {
+            callback();
+        }
+    };
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let now = Arc::clone(&clock);
+    let (models, deferred) = test_models_with_deferred_log(vec![
+        Script::Message(deferred_message("d1", Some(50))),
+        Script::Message(deferred_message("d2", Some(0))),
+        Script::Message(text_message("done", StopReason::Stop)),
+    ]);
+    let opened = open_with_timing(
+        Arc::new(rpi_durable::storage::MemoryStorage::new()),
         Vec::new(),
         None,
-        test_models(vec![Script::Message(deferred)]),
+        models.into(),
+        None,
+        Some(Arc::new(move || now.load(Ordering::SeqCst) as f64)),
+        Some(set_timer),
     )
     .await;
     let conversation = root_ready(&opened.harness).await;
     let submission = submit_input(&conversation, "hi").await;
-    let settled = submission.wait(&context()).await.expect("wait");
-    match input_status(&settled) {
-        Some(InputSubmissionStatus::Unanswered { reason, .. }) => {
-            assert_eq!(reason, "model_error");
+    let task = run_task_id(&opened, conversation.id()).await.expect("run");
+    wait_for_sleeping(&opened, task).await;
+    let record = opened
+        .harness
+        .get_task(task, &context())
+        .await
+        .expect("task")
+        .expect("record");
+    assert_eq!(poll_at(&record), 1_050.0);
+
+    clock.store(1_050, Ordering::SeqCst);
+    fire(&timer);
+    for _ in 0..200 {
+        if deferred.lock().expect("deferred").len() == 2 {
+            break;
         }
-        other => panic!("expected Unanswered(model_error), got {other:?}"),
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    let record = opened
+        .harness
+        .get_task(task, &context())
+        .await
+        .expect("task")
+        .expect("record");
+    assert_eq!(poll_at(&record), 1_051.0);
+
+    clock.store(1_051, Ordering::SeqCst);
+    fire(&timer);
+    let settled = submission.wait(&context()).await.expect("wait");
+    assert!(matches!(
+        input_status(&settled),
+        Some(InputSubmissionStatus::Done { .. })
+    ));
+    assert_eq!(
+        deferred.lock().expect("deferred").as_slice(),
+        &["fetch:d1", "fetch:d2"]
+    );
+}
+
+/// Aborting a sleeping poll cancels the provider handle without rerunning it.
+#[tokio::test]
+async fn aborting_a_sleeping_deferred_run_cancels_the_handle() {
+    let (models, deferred) =
+        test_models_with_deferred_log(vec![Script::Message(deferred_message("d1", Some(60_000)))]);
+    let opened = open(Vec::new(), None, models).await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    let task = run_task_id(&opened, conversation.id()).await.expect("run");
+    wait_for_sleeping(&opened, task).await;
+    assert!(deferred.lock().expect("deferred").is_empty());
+    let _ = opened
+        .harness
+        .abort_task(task, &context())
+        .await
+        .expect("abort");
+    let settled = opened
+        .harness
+        .wait_for_task(task, &context())
+        .await
+        .expect("settled");
+    assert!(matches!(
+        settled.record.state,
+        rpi_durable::types::TaskState::Terminal {
+            outcome: rpi_durable::types::TaskOutcome::Aborted { .. }
+        }
+    ));
+    assert_eq!(
+        deferred.lock().expect("deferred").as_slice(),
+        &["cancel:d1"]
+    );
+    let settled = submission.wait(&context()).await.expect("wait");
+    assert!(matches!(
+        input_status(&settled),
+        Some(InputSubmissionStatus::Unanswered { reason, .. }) if reason == "aborted"
+    ));
+}
+
+/// A reopened Harness resumes the persisted poll checkpoint and handle.
+#[tokio::test]
+async fn a_reopened_harness_resumes_deferred_polling() {
+    let dir = std::env::temp_dir().join(format!(
+        "rpi-durable-deferred-reopen-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let database = dir.join("durable.db");
+    let open_storage = || {
+        let database = database.clone();
+        async move {
+            Arc::new(
+                rpi_durable::storage::open_node_sqlite_storage(
+                    database.to_string_lossy().as_ref(),
+                    rpi_durable::storage::NodeSqliteStorageOptions::default(),
+                )
+                .await
+                .expect("open SQLite"),
+            ) as Arc<dyn rpi_durable::types::Storage>
+        }
+    };
+    let (models, deferred) = test_models_with_deferred_log(vec![
+        Script::Message(deferred_message("d1", Some(50))),
+        Script::Message(text_message("done", StopReason::Stop)),
+    ]);
+    let opened = open_with_storage(open_storage().await, Vec::new(), None, models.clone()).await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    let task = run_task_id(&opened, conversation.id()).await.expect("run");
+    wait_for_sleeping(&opened, task).await;
+    opened.harness.close(&context()).await.expect("close");
+
+    let reopened = open_with_storage(open_storage().await, Vec::new(), None, models).await;
+    let recovered = reopened
+        .harness
+        .submission(submission.id(), &context())
+        .await
+        .expect("submission")
+        .expect("present");
+    let settled = recovered.wait(&context()).await.expect("wait");
+    assert!(matches!(
+        input_status(&settled),
+        Some(InputSubmissionStatus::Done { .. })
+    ));
+    assert_eq!(deferred.lock().expect("deferred").as_slice(), &["fetch:d1"]);
+    reopened.harness.close(&context()).await.expect("close");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Generation partials are committed only when the host timer fires.
+#[tokio::test]
+async fn partial_progress_uses_the_harness_timer() {
+    type Armed = std::sync::Mutex<Vec<(u64, Arc<dyn Fn() + Send + Sync>)>>;
+
+    #[derive(Default)]
+    struct FakeTimer {
+        armed: Armed,
+        armed_total: Arc<AtomicUsize>,
+        disarmed: Arc<AtomicUsize>,
+    }
+    impl FakeTimer {
+        fn set_timer(self: &Arc<Self>) -> rpi_durable::harness::SetTimer {
+            let timer = Arc::clone(self);
+            Arc::new(move |callback, delay, _options| {
+                timer.armed_total.fetch_add(1, Ordering::SeqCst);
+                timer.armed.lock().expect("armed").push((delay, callback));
+                let disarmed = Arc::clone(&timer.disarmed);
+                Some(Arc::new(move || {
+                    disarmed.fetch_add(1, Ordering::SeqCst);
+                }))
+            })
+        }
+
+        fn fire(&self) {
+            let callbacks: Vec<_> = self.armed.lock().expect("armed").drain(..).collect();
+            for (_, callback) in callbacks {
+                callback();
+            }
+        }
+    }
+
+    let timer = Arc::new(FakeTimer::default());
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let now = Arc::clone(&clock);
+    let settings = HarnessSettings {
+        progress: Some(rpi_durable::harness::types::ProgressPolicyPatch {
+            partial_interval_ms: Some(500),
+            output_interval_ms: None,
+        }),
+        ..Default::default()
+    };
+    let opened = open_with_timing(
+        Arc::new(rpi_durable::storage::MemoryStorage::new()),
+        Vec::new(),
+        Some(settings.into()),
+        test_models(vec![Script::Pending("partial".to_string())]).into(),
+        None,
+        Some(Arc::new(move || now.load(Ordering::SeqCst) as f64)),
+        Some(timer.set_timer()),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let _submission = submit_input(&conversation, "partial").await;
+    for _ in 0..200 {
+        if !timer.armed.lock().expect("armed").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(timer.armed.lock().expect("armed")[0].0, 500);
+    let live = opened
+        .harness
+        .session()
+        .snapshot(
+            &LIVE_DOC,
+            DocOwner::Conversation(conversation.id()),
+            &context(),
+        )
+        .await
+        .expect("live")
+        .expect("present");
+    let state: LiveState =
+        serde_json::from_value(serde_json::Value::Object(live)).expect("live state");
+    assert!(
+        state
+            .generation
+            .and_then(|generation| generation.message)
+            .is_none()
+    );
+
+    timer.fire();
+    for _ in 0..200 {
+        let live = opened
+            .harness
+            .session()
+            .snapshot(
+                &LIVE_DOC,
+                DocOwner::Conversation(conversation.id()),
+                &context(),
+            )
+            .await
+            .expect("live")
+            .expect("present");
+        let state: LiveState =
+            serde_json::from_value(serde_json::Value::Object(live)).expect("live state");
+        if state
+            .generation
+            .and_then(|generation| generation.message)
+            .is_some()
+        {
+            let armed = timer.armed_total.load(Ordering::SeqCst);
+            let disarmed = timer.disarmed.load(Ordering::SeqCst);
+            assert!(
+                armed - disarmed <= 1,
+                "timers accumulated: armed={armed}, disarmed={disarmed}"
+            );
+            opened.harness.close(&context()).await.expect("close");
+            assert_eq!(
+                timer.armed_total.load(Ordering::SeqCst),
+                timer.disarmed.load(Ordering::SeqCst),
+                "every timer is disarmed after close"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("host timer did not commit the partial");
 }
 
 /// upstream: "fails no_model when the agent has no model".

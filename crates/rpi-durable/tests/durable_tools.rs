@@ -460,6 +460,64 @@ async fn bash_reports_a_nonzero_exit_as_an_error_and_keeps_the_output() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn bash_distinguishes_spawn_failure_from_a_nonzero_exit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("durable-bash-spawn");
+    let shell = dir.path().join("not-executable");
+    std::fs::write(&shell, "not a shell").expect("shell fixture");
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o644))
+        .expect("shell permissions");
+    let env: Arc<dyn ExecutionEnv> = Arc::new(NodeExecutionEnv::new(NodeExecutionEnvOptions {
+        cwd: Some(dir.path_str()),
+        shell_path: Some(shell.to_string_lossy().into_owned()),
+        ..Default::default()
+    }));
+    let (result, _, _) = run_tool(
+        &create_bash_tool(None),
+        json!({ "command": "exit 0" }),
+        Some(env),
+    )
+    .await;
+    let error = result.expect_err("a non-executable shell is a spawn failure");
+    let execution = error
+        .downcast::<rpi_durable::env::types::ExecutionError>()
+        .expect("execution error");
+    assert_eq!(
+        execution.code,
+        rpi_durable::env::types::ExecutionErrorCode::SpawnError
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_distinguishes_cancellation_from_a_nonzero_exit() {
+    let dir = TempDir::new("durable-bash-cancel");
+    let env = create_env(&dir);
+    let tool = create_bash_tool(None);
+    let api = FakeApi::new(Some(env));
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
+    let context = rpi_durable::chord::context::with_abort_signal(
+        token,
+        &rpi_durable::chord::context::BACKGROUND_CONTEXT,
+    );
+    let result = tool
+        .execute
+        .execute(serde_json::Map::new(), &api, &context)
+        .await;
+    let error = result.expect_err("a cancelled command is not a process result");
+    let execution = error
+        .downcast::<rpi_durable::env::types::ExecutionError>()
+        .expect("execution error");
+    assert_eq!(
+        execution.code,
+        rpi_durable::env::types::ExecutionErrorCode::Aborted
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn bash_spills_large_output_and_reports_the_file() {
     if !shell_available() {
         return;
