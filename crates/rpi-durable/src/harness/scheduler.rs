@@ -281,8 +281,10 @@ struct Invocation {
     mode: InvocationMode,
     /// Adapter-owned parent carrier stored on the task record.
     trace: Option<crate::chord::telemetry::TelemetryCarrier>,
-    /// Immutable creation-time links, taken by the first phase invocation.
-    links: Mutex<Option<Vec<crate::chord::telemetry::TelemetryCarrier>>>,
+    /// Immutable creation-time links, attached to every phase span.
+    links: Option<Vec<crate::chord::telemetry::TelemetryCarrier>>,
+    /// Terminal outcome committed by this invocation, for the phase span.
+    terminal_outcome: Mutex<Option<TaskOutcome>>,
     controller: CancellationToken,
     /// Context passed to handlers; cancelled by `controller`.
     context: Context,
@@ -456,6 +458,8 @@ struct SchedulerInner {
     failed_migrations: Mutex<BTreeMap<TaskId, (AnyTask, String)>>,
     /// Tasks loaded by this Harness that have not run their first phase yet.
     resumed: Mutex<BTreeSet<TaskId>>,
+    /// A panicking registry snapshot was reported once.
+    registry_snapshot_reported: AtomicBool,
     /// Task-graph listeners for blocked reasons that changed without a commit.
     blocked_listeners: Mutex<BTreeMap<u64, BlockedListener>>,
     /// Next blocked-listener id.
@@ -506,6 +510,7 @@ impl SchedulerInner {
             idle_waiters: Waiters::new(),
             failed_migrations: Mutex::new(BTreeMap::new()),
             resumed: Mutex::new(BTreeSet::new()),
+            registry_snapshot_reported: AtomicBool::new(false),
             blocked_listeners: Mutex::new(BTreeMap::new()),
             next_blocked_listener: std::sync::atomic::AtomicU64::new(1),
             edges: Mutex::new(BTreeMap::new()),
@@ -587,8 +592,8 @@ impl SchedulerInner {
     async fn open(self: &Arc<Self>, context: &Context) -> SessionResult<()> {
         let observer = Arc::clone(self);
         self.session
-            .subscribe_internal_commits(Arc::new(move |publication, _| {
-                observer.observe(publication);
+            .subscribe_internal_commits(Arc::new(move |publication, context| {
+                observer.observe(publication, context);
             }));
         let sealer = Arc::clone(self);
         self.session
@@ -751,7 +756,17 @@ impl SchedulerInner {
         if self.parked_subject(record) {
             return Some(BlockedReason::RestartLimit);
         }
-        let snapshot = self.registry.snapshot();
+        let snapshot = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.registry.snapshot()
+        })) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                if !self.registry_snapshot_reported.swap(true, Ordering::SeqCst) {
+                    (self.report)("The task registry snapshot failed".to_string());
+                }
+                return None;
+            }
+        };
         let task = snapshot.task(&record.kind);
         match self.fit_subject(record.id, record.version, task.clone()) {
             Fit::Blocked { reason, .. } => Some(reason),
@@ -778,7 +793,18 @@ impl SchedulerInner {
     }
 
     fn report_fixed(&self, info: crate::harness::types::ReportInfo) {
-        self.telemetry.add_event(
+        self.report_fixed_with(info, None);
+    }
+
+    fn report_fixed_with(
+        &self,
+        info: crate::harness::types::ReportInfo,
+        context: Option<&Context>,
+    ) {
+        let telemetry = context
+            .map(Context::telemetry)
+            .unwrap_or_else(|| self.telemetry.clone());
+        telemetry.add_event(
             "pi.durable.report",
             serde_json::json!({
                 "type": info.kind,
@@ -791,7 +817,7 @@ impl SchedulerInner {
             .cloned()
             .unwrap_or_default(),
         );
-        self.telemetry.record_metric(
+        telemetry.record_metric(
             "pi.durable.reports",
             1.0,
             serde_json::json!({ "type": info.kind })
@@ -1259,14 +1285,15 @@ impl SchedulerInner {
 
     // ─── Observation ────────────────────────────────────────────────────────
 
-    fn observe(self: &Arc<Self>, publication: &CommitPublication) {
+    fn observe(self: &Arc<Self>, publication: &CommitPublication, context: &Context) {
+        let telemetry = context.telemetry();
         let mut updated: Vec<TaskRecord> = Vec::new();
         let mut failed: Vec<TaskId> = Vec::new();
         let mut changed = false;
         for change in &publication.changes {
             match change {
                 CommitChange::Table(StorageWrite::Entry { value }) => {
-                    self.telemetry.add_event(
+                    telemetry.add_event(
                         "pi.durable.entry",
                         serde_json::json!({
                             "entry.id": value.id.get(),
@@ -1281,16 +1308,22 @@ impl SchedulerInner {
                 CommitChange::Table(StorageWrite::Submission { value })
                     if crate::harness::submissions::is_settled(value) =>
                 {
-                    self.telemetry.add_event(
-                        "pi.durable.submission",
-                        serde_json::json!({
-                            "submission.id": value.id().get(),
-                            "status": value.status(),
-                        })
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
-                    );
+                    let mut attributes = serde_json::json!({
+                        "submission.id": value.id().get(),
+                        "status": value.status(),
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                    if let SubmissionRecord::Input {
+                        status: crate::types::InputSubmissionStatus::Done { answer, .. },
+                        ..
+                    } = value
+                    {
+                        attributes
+                            .insert("answer.entry_id".to_string(), JsonValue::from(answer.get()));
+                    }
+                    telemetry.add_event("pi.durable.submission", attributes);
                     continue;
                 }
                 _ => {}
@@ -2245,21 +2278,6 @@ impl SchedulerInner {
         snapshot: &Arc<dyn RegistrySnapshot>,
     ) -> Resolution {
         let fit = self.fit(record, snapshot.task(&record.kind));
-        if matches!(
-            fit,
-            Fit::Blocked {
-                reason: BlockedReason::TaskTooOld,
-                ..
-            }
-        ) {
-            self.report_fixed(
-                crate::harness::types::ReportInfo::new(
-                    crate::harness::types::ReportKind::TaskOutdated,
-                )
-                .with_task(record.id, record.kind.clone())
-                .with_reason("task_too_old"),
-            );
-        }
         match fit {
             Fit::Blocked { reason, .. } => Resolution::Blocked { reason },
             Fit::Ready { task, migrates } => {
@@ -2380,7 +2398,8 @@ impl SchedulerInner {
             conversation_id: record.conversation_id,
             mode,
             trace: record.trace.clone(),
-            links: Mutex::new(links),
+            links,
+            terminal_outcome: Mutex::new(None),
             controller,
             context,
             watches: Mutex::new(Vec::new()),
@@ -2469,7 +2488,7 @@ impl SchedulerInner {
                 reported: Arc::clone(&reported),
             };
             let next = self.step(&invocation, decider, &phase_context).await?;
-            let terminal = self.phase_outcome(invocation.task_id, next.as_ref());
+            let terminal = self.phase_outcome(&invocation, next.as_ref());
             span.context().record_metric(
                 "pi.durable.phase.duration",
                 ((self.now)() - started).max(0.0),
@@ -2482,8 +2501,8 @@ impl SchedulerInner {
                 .cloned()
                 .unwrap_or_default(),
             );
-            if let Some(failure) = &previous.failure {
-                span.set_status("error", Some(failure));
+            if let Some(failure) = Self::phase_status_error(&invocation, Some(&previous)) {
+                span.set_status("error", Some(&failure));
             }
             span.end(
                 serde_json::json!({ "outcome": terminal })
@@ -2504,12 +2523,7 @@ impl SchedulerInner {
             .as_ref()
             .map(|carrier| self.telemetry.extract(carrier))
             .unwrap_or_else(|| self.telemetry.clone());
-        let links = invocation
-            .links
-            .lock()
-            .ok()
-            .and_then(|mut links| links.take())
-            .unwrap_or_default();
+        let links = invocation.links.clone().unwrap_or_default();
         let resumed = self
             .resumed
             .lock()
@@ -2532,9 +2546,23 @@ impl SchedulerInner {
         parent.start_span("pi.durable.phase", attributes, links)
     }
 
-    /// The end outcome of a finished phase, from the next state or the live
-    /// record it left behind.
-    fn phase_outcome(&self, id: TaskId, next: Option<&RunningTask>) -> String {
+    /// The end outcome of a finished phase, from its terminal outcome, the
+    /// next state, or the live record it left behind.
+    fn phase_outcome(&self, invocation: &Invocation, next: Option<&RunningTask>) -> String {
+        if let Some(outcome) = invocation
+            .terminal_outcome
+            .lock()
+            .ok()
+            .and_then(|outcome| outcome.clone())
+        {
+            return match outcome {
+                TaskOutcome::Completed { .. } => "done".to_string(),
+                TaskOutcome::Aborted { .. } => "aborted".to_string(),
+                TaskOutcome::Failed { .. }
+                | TaskOutcome::Orphaned { .. }
+                | TaskOutcome::Faulted { .. } => "faulted".to_string(),
+            };
+        }
         if let Some(next) = next {
             return format!("next={}", next.phase().unwrap_or(""));
         }
@@ -2542,14 +2570,34 @@ impl SchedulerInner {
             .live
             .lock()
             .ok()
-            .and_then(|live| live.get(&id).map(|record| record.status()));
+            .and_then(|live| live.get(&invocation.task_id).map(|record| record.status()));
         match state {
             Some(TaskStatus::Waiting) => "waiting".to_string(),
             Some(TaskStatus::Sleeping) => "sleeping".to_string(),
-            Some(TaskStatus::Completing) => "completing".to_string(),
-            Some(TaskStatus::Running) => "running".to_string(),
             _ => "done".to_string(),
         }
+    }
+
+    /// The phase-span error message for a terminal or thrown outcome.
+    fn phase_status_error(
+        invocation: &Invocation,
+        previous: Option<&PhaseResult>,
+    ) -> Option<String> {
+        if let Some(outcome) = invocation
+            .terminal_outcome
+            .lock()
+            .ok()
+            .and_then(|outcome| outcome.clone())
+        {
+            match outcome {
+                TaskOutcome::Completed { .. } | TaskOutcome::Aborted { .. } => return None,
+                TaskOutcome::Failed { error, .. } | TaskOutcome::Faulted { error } => {
+                    return Some(error.message);
+                }
+                TaskOutcome::Orphaned { reason } => return Some(reason),
+            }
+        }
+        previous.and_then(|previous| previous.failure.clone())
     }
 
     async fn run_abort(self: &Arc<Self>, reservation: &Reservation) -> SessionResult<()> {
@@ -2594,9 +2642,9 @@ impl SchedulerInner {
                 &phase_context,
             )
             .await?;
-        let outcome = self.phase_outcome(invocation.task_id, next.as_ref());
-        if let Some(failure) = &failure {
-            span.set_status("error", Some(failure));
+        let outcome = self.phase_outcome(invocation, next.as_ref());
+        if let Some(failure) = Self::phase_status_error(invocation, None) {
+            span.set_status("error", Some(&failure));
         }
         span.end(
             serde_json::json!({ "outcome": outcome })
@@ -2612,6 +2660,7 @@ impl SchedulerInner {
         decider: &Decider,
         tx: &mut Transaction,
         current: &RunningTask,
+        context: &Context,
     ) -> SessionResult<Decision> {
         match decider {
             Decider::Abort { failure } => {
@@ -2690,12 +2739,13 @@ impl SchedulerInner {
                             current.id(),
                             current.kind()
                         ));
-                        self.report_fixed(
+                        self.report_fixed_with(
                             crate::harness::types::ReportInfo::new(
                                 crate::harness::types::ReportKind::TaskOutdated,
                             )
                             .with_task(current.id(), current.kind().to_string())
                             .with_reason(cause),
+                            Some(context),
                         );
                     }
                 }
@@ -2712,6 +2762,7 @@ impl SchedulerInner {
     ) -> SessionResult<Option<RunningTask>> {
         let this = Arc::clone(self);
         let inv = Arc::clone(invocation);
+        let telemetry_context = context.clone();
         let result: SessionResult<Option<RunningTask>> = self
             .session
             .commit_with(
@@ -2719,6 +2770,7 @@ impl SchedulerInner {
                     let this = Arc::clone(&this);
                     let inv = Arc::clone(&inv);
                     let decider = decider.clone();
+                    let telemetry_context = telemetry_context.clone();
                     Box::pin(async move {
                         let found = this
                             .live
@@ -2730,7 +2782,7 @@ impl SchedulerInner {
                             .map(RunningTask::new);
                         let decision = match &current {
                             Some(current) if !this.closing.load(Ordering::SeqCst) => {
-                                this.decide(&decider, tx, current)?
+                                this.decide(&decider, tx, current, &telemetry_context)?
                             }
                             _ => Decision::End,
                         };
@@ -2741,23 +2793,23 @@ impl SchedulerInner {
                         if let Decision::Fault(message) = decision
                             && let Some(current) = &current
                         {
-                            this.report_fixed(
+                            this.report_fixed_with(
                                 crate::harness::types::ReportInfo::new(
                                     crate::harness::types::ReportKind::TaskFaulted,
                                 )
                                 .with_task(current.id(), current.kind().to_string()),
+                                Some(&telemetry_context),
                             );
-                            this.terminate(
-                                tx,
-                                &current.record,
-                                TaskOutcome::Faulted {
-                                    error: TaskOutcomeError {
-                                        message,
-                                        detail: None,
-                                    },
+                            let outcome = TaskOutcome::Faulted {
+                                error: TaskOutcomeError {
+                                    message,
+                                    detail: None,
                                 },
-                            )
-                            .await?;
+                            };
+                            if let Ok(mut slot) = inv.terminal_outcome.lock() {
+                                *slot = Some(outcome.clone());
+                            }
+                            this.terminate(tx, &current.record, outcome).await?;
                         }
                         Ok(None)
                     })
@@ -2812,6 +2864,11 @@ impl SchedulerInner {
         current: &RunningTask,
         next: NextTaskState,
     ) -> SessionResult<()> {
+        if let NextTaskState::Terminal { outcome } = &next
+            && let Ok(mut slot) = invocation.terminal_outcome.lock()
+        {
+            *slot = Some(outcome.clone());
+        }
         if let NextTaskState::Waiting { on, policy, .. } = &next {
             self.validate_wait(tx, invocation, current, on, *policy)
                 .await?;
@@ -3265,14 +3322,29 @@ impl TaskRuntime for InvocationRuntime {
     async fn commit(&self, change: TaskCommitFn, context: &Context) -> SessionResult<()> {
         let inner = Arc::clone(&self.inner);
         let invocation = Arc::clone(&self.invocation);
+        let telemetry = context.telemetry();
         let wrapper: Arc<GatedFn<()>> = Arc::new(move |tx, current| {
             let change = Arc::clone(&change);
             let inner = Arc::clone(&inner);
             let invocation = Arc::clone(&invocation);
+            let telemetry = telemetry.clone();
             Box::pin(async move {
                 let next = change(tx, current.clone()).await?;
+                let checkpoint = next.as_ref().and_then(next_running_phase);
+                let previous_phase = current.phase().map(str::to_string);
                 if let Some(next) = next {
                     inner.commit_state(tx, &invocation, &current, next).await?;
+                }
+                if let Some(checkpoint) = checkpoint
+                    && previous_phase.as_deref() != Some(checkpoint.as_str())
+                {
+                    telemetry.add_event(
+                        "pi.durable.checkpoint",
+                        serde_json::json!({ "phase": checkpoint })
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
                 }
                 Ok(())
             })
@@ -3916,6 +3988,17 @@ impl SchedulerService for UnavailableScheduler {
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
+
+/// The phase a `NextTaskState::Running` checkpoint moves to, if any.
+fn next_running_phase(next: &NextTaskState) -> Option<String> {
+    match next {
+        NextTaskState::Running { checkpoint } => checkpoint
+            .get("phase")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
 
 /// A live owner's durable cancellation intent (upstream `cancellationIntent`).
 fn cancellation_intent(record: &TaskRecord) -> bool {

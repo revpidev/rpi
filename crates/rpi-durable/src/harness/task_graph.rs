@@ -111,10 +111,11 @@ pub struct TaskGraph {
 /// A serialized exact-frame watch of the graph (upstream `TaskGraphWatch`).
 pub type TaskGraphWatch = CommittedWatch;
 
-const LIVE_STATUSES: [TaskStatus; 4] = [
+const LIVE_STATUSES: [TaskStatus; 5] = [
     TaskStatus::Pending,
     TaskStatus::Running,
     TaskStatus::Waiting,
+    TaskStatus::Sleeping,
     TaskStatus::Completing,
 ];
 const SCAN_PAGE_SIZE: usize = 256;
@@ -358,14 +359,8 @@ impl TaskGraphView {
         if self.closed.load(Ordering::SeqCst) {
             return;
         }
-        if self
-            .mount
-            .lock()
-            .map(|mount| mount.is_none())
-            .unwrap_or(true)
-        {
-            return;
-        }
+        // Do not probe `mount` here: a host callback may call this while
+        // `publish` holds the mount lock. The spawned refresh rechecks it.
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let refresh = Arc::clone(&this);

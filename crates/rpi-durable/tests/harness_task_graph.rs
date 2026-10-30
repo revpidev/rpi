@@ -366,3 +366,77 @@ async fn the_graph_reports_and_clears_the_restart_limit() {
         .await
         .expect("close");
 }
+
+/// R-D5/D7: a persisted sleeping task is present when the graph is first
+/// mounted after a reopen.
+#[tokio::test]
+async fn a_sleeping_task_is_in_the_first_graph_mount() {
+    let opened = open_with(all_tasks()).await;
+    let conversation = scheduler_support::root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.count", serde_json::json!({ "phases": 2 })),
+    )
+    .await;
+    let mut record = opened
+        .harness
+        .get_task(id, &scheduler_context())
+        .await
+        .expect("task")
+        .expect("record");
+    record.state = TaskState::Sleeping {
+        checkpoint: serde_json::json!({ "phase": "step", "count": 1 }),
+        until: 42_000.0,
+    };
+    stamp_task(&opened.harness, record).await;
+
+    let state = opened
+        .harness
+        .task_graph(&scheduler_context())
+        .await
+        .expect("graph");
+    let node = &state.value()["tasks"][id.get().to_string()];
+    assert_eq!(node["state"]["status"], "sleeping");
+    assert_eq!(node["state"]["until"], serde_json::json!(42_000.0));
+    state.dispose();
+    opened
+        .harness
+        .close(&scheduler_context())
+        .await
+        .expect("close");
+}
+
+/// R-D7: an older record under a newer definition without a migration, and a
+/// newer record under an older definition, both surface in the graph.
+#[tokio::test]
+async fn the_graph_reports_too_old_and_missing_migration() {
+    let opened = open_with(all_tasks()).await;
+    let conversation = scheduler_support::root(&opened.harness).await;
+    let mut newer = Spec::owned("test.count", serde_json::json!({ "phases": 1 }));
+    newer.version = 2;
+    let too_old = add_task(&opened.harness, conversation, newer).await;
+    let no_migration = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.old", serde_json::json!({})),
+    )
+    .await;
+    let state = opened
+        .harness
+        .task_graph(&scheduler_context())
+        .await
+        .expect("graph");
+    let value = state.value();
+    assert_eq!(blocked(&value, too_old), Some(BlockedReason::TaskTooOld));
+    assert_eq!(
+        blocked(&value, no_migration),
+        Some(BlockedReason::MigrationFailed)
+    );
+    state.dispose();
+    opened
+        .harness
+        .close(&scheduler_context())
+        .await
+        .expect("close");
+}

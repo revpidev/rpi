@@ -127,15 +127,15 @@ impl Submissions {
                     let scheduler = Arc::clone(&scheduler);
                     let draft = draft.clone();
                     Box::pin(async move {
-                        admit_submission(tx, conversation_id, &draft, now, modes, &*scheduler).await
+                        admit(tx, conversation_id, &draft, now, modes, &*scheduler).await
                     })
                 }),
                 &span_context,
                 None,
             )
             .await;
-        let id = match admitted {
-            Ok(id) => id,
+        let admission = match admitted {
+            Ok(admission) => admission,
             Err(error) => {
                 // Error text may contain caller content: record only the status.
                 span.set_status("error", None);
@@ -143,17 +143,9 @@ impl Submissions {
                 return Err(error);
             }
         };
-        let status = self
-            .session
-            .storage()
-            .submission(id, &crate::chord::context::BACKGROUND_CONTEXT)
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.status().to_string())
-            .unwrap_or_else(|| "queued".to_string());
+        let id = admission.id;
         span.set_attributes(
-            serde_json::json!({ "submission.id": id.get(), "result": status })
+            serde_json::json!({ "submission.id": id.get(), "result": admission.status })
                 .as_object()
                 .cloned()
                 .unwrap_or_default(),
@@ -356,6 +348,13 @@ impl Submission for SubmissionHandle {
     }
 }
 
+/// One admission's identity and its status at admission time.
+#[derive(Debug, Clone, Copy)]
+struct Admission {
+    id: SubmissionId,
+    status: &'static str,
+}
+
 /// Admit a submission inside a commit; `Conversation.submit()` and
 /// conversation-owned compactions share it. A known request ID returns its
 /// existing submission without writing. A busy conversation queues it in
@@ -372,6 +371,21 @@ pub async fn admit_submission(
     queue_modes: QueueModes,
     scheduler: &dyn SchedulerService,
 ) -> SessionResult<SubmissionId> {
+    Ok(
+        admit(tx, conversation_id, draft, now, queue_modes, scheduler)
+            .await?
+            .id,
+    )
+}
+
+async fn admit(
+    tx: &mut crate::session::Transaction,
+    conversation_id: ConversationId,
+    draft: &SubmissionDraft,
+    now: f64,
+    queue_modes: QueueModes,
+    scheduler: &dyn SchedulerService,
+) -> SessionResult<Admission> {
     if let SubmissionDraft::Input(InputSubmissionDraft {
         entry: Some(entry), ..
     }) = draft
@@ -394,7 +408,14 @@ pub async fn admit_submission(
                 "Request {request_id} already identifies a submission of type {existing_type}"
             )));
         }
-        return Ok(existing.id());
+        return Ok(Admission {
+            id: existing.id(),
+            status: if existing.status() == "unanswered" {
+                "done"
+            } else {
+                existing.status()
+            },
+        });
     }
     // A display-only write changes nothing the model sees: append it at once,
     // busy or not. Only a queued reset holds it back, so it lands after the
@@ -417,7 +438,10 @@ pub async fn admit_submission(
                 })
                 .await?;
             tx.place_submission(record.id(), entry.id)?;
-            return Ok(record.id());
+            return Ok(Admission {
+                id: record.id(),
+                status: "done",
+            });
         }
     }
     let live = tx
@@ -500,16 +524,29 @@ pub async fn admit_submission(
         };
         push_item(tx, conversation_id, boundary.as_ref(), item).await?;
         let Some(boundary) = boundary else {
-            return Ok(id);
+            return Ok(Admission {
+                id,
+                status: "queued",
+            });
         };
         let result =
             apply_boundary(tx, boundary, crate::harness::inbox::BoundaryAt::Final, now).await?;
+        let placed = !result.users.is_empty() && result.users.last() == Some(&id);
         if !result.users.is_empty() {
             scheduler
                 .start_run(tx, conversation_id, &live, result.users)
                 .await?;
         }
-        return Ok(id);
+        return Ok(Admission {
+            id,
+            status: if is_write {
+                "done"
+            } else if placed {
+                "placed"
+            } else {
+                "queued"
+            },
+        });
     }
     // Idle path.
     let boundary = boundary
@@ -531,7 +568,10 @@ pub async fn admit_submission(
                         detail: None,
                     },
                 )?;
-                return Ok(record.id());
+                return Ok(Admission {
+                    id: record.id(),
+                    status: "done",
+                });
             }
             let entry = tx
                 .append_entry(conversation_id, write.entry.clone())
@@ -543,7 +583,10 @@ pub async fn admit_submission(
                 })
                 .await?;
             tx.place_submission(record.id(), entry.id)?;
-            Ok(record.id())
+            Ok(Admission {
+                id: record.id(),
+                status: "done",
+            })
         }
         SubmissionDraft::Input(input) => {
             let entry = append_user_entry(tx, conversation_id, input, now).await?;
@@ -557,7 +600,10 @@ pub async fn admit_submission(
             scheduler
                 .start_run(tx, conversation_id, &live, vec![record.id()])
                 .await?;
-            Ok(record.id())
+            Ok(Admission {
+                id: record.id(),
+                status: "placed",
+            })
         }
     }
 }

@@ -36,6 +36,7 @@ struct Span {
     events: Vec<String>,
     end_attributes: JsonObject,
     status: String,
+    message: Option<String>,
     ended: bool,
 }
 
@@ -43,7 +44,10 @@ struct SpanSnapshot {
     parent: Option<u64>,
     attributes: JsonObject,
     links: Vec<TelemetryCarrier>,
+    events: Vec<String>,
     end_attributes: JsonObject,
+    status: String,
+    message: Option<String>,
     ended: bool,
 }
 
@@ -64,6 +68,16 @@ impl Recorder {
         }
     }
 
+    fn has_event(&self, name: &str, event: &str) -> bool {
+        self.0
+            .spans
+            .lock()
+            .expect("spans")
+            .iter()
+            .filter(|span| span.name == name)
+            .any(|span| span.events.iter().any(|candidate| candidate == event))
+    }
+
     fn span_count(&self, name: &str) -> usize {
         self.0
             .spans
@@ -74,6 +88,25 @@ impl Recorder {
             .count()
     }
 
+    fn last_span(&self, name: &str) -> SpanSnapshot {
+        let spans = self.0.spans.lock().expect("spans");
+        let span = spans
+            .iter()
+            .rev()
+            .find(|span| span.name == name)
+            .expect("span");
+        SpanSnapshot {
+            parent: span.parent,
+            attributes: span.attributes.clone(),
+            links: span.links.clone(),
+            events: span.events.clone(),
+            end_attributes: span.end_attributes.clone(),
+            status: span.status.clone(),
+            message: span.message.clone(),
+            ended: span.ended,
+        }
+    }
+
     fn span(&self, name: &str) -> SpanSnapshot {
         let spans = self.0.spans.lock().expect("spans");
         let span = spans.iter().find(|span| span.name == name).expect("span");
@@ -81,7 +114,10 @@ impl Recorder {
             parent: span.parent,
             attributes: span.attributes.clone(),
             links: span.links.clone(),
+            events: span.events.clone(),
             end_attributes: span.end_attributes.clone(),
+            status: span.status.clone(),
+            message: span.message.clone(),
             ended: span.ended,
         }
     }
@@ -139,6 +175,7 @@ impl TelemetrySink for RecordingSink {
             events: Vec::new(),
             end_attributes: JsonObject::new(),
             status: "ok".to_string(),
+            message: None,
             ended: false,
         });
         Some(Arc::new(RecordingSink {
@@ -162,16 +199,20 @@ impl TelemetrySink for RecordingSink {
         }))
     }
 
-    fn set_status(&self, status: &str, _message: Option<&str>) {
-        self.with_span(|span| span.status = status.to_string());
+    fn set_status(&self, status: &str, message: Option<&str>) {
+        self.with_span(|span| {
+            span.status = status.to_string();
+            span.message = message.map(str::to_string);
+        });
     }
 }
 
 impl TelemetrySpanSink for RecordingSink {
-    fn end_span(&self, attributes: JsonObject, status: &str, _message: Option<&str>) {
+    fn end_span(&self, attributes: JsonObject, status: &str, message: Option<&str>) {
         self.with_span(|span| {
             span.end_attributes = attributes;
             span.status = status.to_string();
+            span.message = message.map(str::to_string);
             span.ended = true;
         });
     }
@@ -211,7 +252,7 @@ async fn create_in_span(
                     tx.create_task(TaskCreate {
                         kind,
                         version: 1,
-                        input: serde_json::json!({ "phases": 1 }),
+                        input: serde_json::json!({ "phases": 2 }),
                         checkpoint: serde_json::json!({ "phase": "step", "count": 0 }),
                         ownership: TaskOwnership::Conversation(conversation),
                         conversation_id: Some(conversation),
@@ -252,7 +293,7 @@ async fn phase_spans_use_the_stored_trace_and_links() {
         &opened.harness,
         &creator,
         conversation,
-        "test.count",
+        "test.memo",
         vec![link.clone()],
     )
     .await;
@@ -274,7 +315,15 @@ async fn phase_spans_use_the_stored_trace_and_links() {
     assert_eq!(span.attributes["resumed"], JsonValue::Bool(false));
     assert_eq!(span.links, vec![link]);
     assert!(span.ended);
-    assert_eq!(span.end_attributes["outcome"], "done");
+    assert_eq!(span.end_attributes["outcome"], "next=second");
+    assert_eq!(span.status, "ok");
+    assert!(
+        span.events
+            .iter()
+            .any(|event| event == "pi.durable.checkpoint"),
+        "phase events: {:?}",
+        span.events
+    );
     assert!(
         recorder
             .0
@@ -283,7 +332,7 @@ async fn phase_spans_use_the_stored_trace_and_links() {
             .expect("metrics")
             .iter()
             .any(|(name, _, attributes)| name == "pi.durable.phase.duration"
-                && attributes["task"] == "test.count")
+                && attributes["task"] == "test.memo")
     );
     opened.harness.close(&context()).await.expect("close");
 }
@@ -387,9 +436,204 @@ async fn a_submission_stores_its_admission_trace() {
     assert_eq!(span.attributes["result"], "done");
     assert!(span.links.is_empty());
     assert!(span.ended);
+    assert!(
+        span.events
+            .iter()
+            .any(|event| event == "pi.durable.submission"),
+        "submit events: {:?}",
+        span.events
+    );
     // The carrier stored on the record is the span that was just started; the
     // recording sink numbers spans from one, so the only submit span matches.
     assert_eq!(recorder.span_count("pi.durable.submit"), 1);
     assert!(carrier_id > 0);
+    opened.harness.close(&context()).await.expect("close");
+}
+
+struct EntryTask;
+
+#[async_trait::async_trait]
+impl rpi_durable::harness::TaskDefinition for EntryTask {
+    fn name(&self) -> &str {
+        "test.entry-span"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> JsonValue {
+        serde_json::json!({ "phase": "step" })
+    }
+    async fn run_phase(
+        &self,
+        phase: &str,
+        task: rpi_durable::harness::RunningTask,
+        runtime: &dyn rpi_durable::harness::TaskRuntime,
+        context: &rpi_durable::chord::context::Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        if phase == "step" {
+            let conversation = task.conversation_id();
+            runtime
+                .commit(
+                    Arc::new(move |tx, _current| {
+                        Box::pin(async move {
+                            let mut draft = rpi_durable::session::EntryDraft::new("test.entry");
+                            draft.data = Some(serde_json::json!({}));
+                            tx.append_entry(conversation, draft).await?;
+                            Ok(Some(rpi_durable::harness::NextTaskState::Running {
+                                checkpoint: serde_json::json!({ "phase": "done" }),
+                            }))
+                        })
+                    }),
+                    context,
+                )
+                .await
+        } else {
+            runtime
+                .commit(
+                    Arc::new(|_tx, _current| {
+                        Box::pin(async move {
+                            Ok(Some(rpi_durable::harness::NextTaskState::Terminal {
+                                outcome: rpi_durable::types::TaskOutcome::Completed {
+                                    result: serde_json::json!({}),
+                                },
+                            }))
+                        })
+                    }),
+                    context,
+                )
+                .await
+        }
+    }
+}
+
+struct ThrowTask;
+
+#[async_trait::async_trait]
+impl rpi_durable::harness::TaskDefinition for ThrowTask {
+    fn name(&self) -> &str {
+        "test.throw-span"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> JsonValue {
+        serde_json::json!({ "phase": "step" })
+    }
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: rpi_durable::harness::RunningTask,
+        _runtime: &dyn rpi_durable::harness::TaskRuntime,
+        _context: &rpi_durable::chord::context::Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        Err(rpi_durable::session::SessionError::message("boom"))
+    }
+}
+
+struct AbortOutcomeTask;
+
+#[async_trait::async_trait]
+impl rpi_durable::harness::TaskDefinition for AbortOutcomeTask {
+    fn name(&self) -> &str {
+        "test.abort-span"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> JsonValue {
+        serde_json::json!({ "phase": "step" })
+    }
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: rpi_durable::harness::RunningTask,
+        runtime: &dyn rpi_durable::harness::TaskRuntime,
+        context: &rpi_durable::chord::context::Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        runtime
+            .commit(
+                Arc::new(|_tx, _current| {
+                    Box::pin(async move {
+                        Ok(Some(rpi_durable::harness::NextTaskState::Terminal {
+                            outcome: rpi_durable::types::TaskOutcome::Aborted {
+                                reason: Some("stop".to_string()),
+                                result: None,
+                            },
+                        }))
+                    })
+                }),
+                context,
+            )
+            .await
+    }
+}
+
+/// R-D9: a faulted phase ends `faulted` with an error status; an aborted
+/// outcome ends `aborted` and stays ok.
+#[tokio::test]
+async fn phase_spans_carry_faulted_and_aborted_status() {
+    let recorder = Recorder::default();
+    let telemetry = TelemetryContext::new(Arc::new(recorder.root()) as Arc<dyn TelemetrySink>);
+    let opened = open_with_telemetry(
+        Arc::new(MemoryStorage::new()),
+        vec![
+            Arc::new(ThrowTask) as rpi_durable::harness::AnyTask,
+            Arc::new(AbortOutcomeTask) as rpi_durable::harness::AnyTask,
+            Arc::new(EntryTask) as rpi_durable::harness::AnyTask,
+        ],
+        telemetry,
+    )
+    .await;
+    let conversation = root(&opened.harness).await;
+    let thrown = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.throw-span", serde_json::json!({})),
+    )
+    .await;
+    opened.harness.resume().expect("resume");
+    wait_terminal(&opened.harness, thrown).await;
+    let span = recorder.span("pi.durable.phase");
+    assert_eq!(span.end_attributes["outcome"], "faulted");
+    assert_eq!(span.status, "error");
+    assert!(
+        span.message
+            .as_deref()
+            .is_some_and(|message| message.contains("boom")),
+        "message: {:?}",
+        span.message
+    );
+    let _ = opened.harness.wait_for_task(thrown, &context()).await;
+
+    let aborted = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.abort-span", serde_json::json!({})),
+    )
+    .await;
+    let _ = opened
+        .harness
+        .wait_for_task(aborted, &context())
+        .await
+        .expect("abort task");
+    let span = recorder.last_span("pi.durable.phase");
+    assert_eq!(span.end_attributes["outcome"], "aborted");
+    assert_eq!(span.status, "ok");
+
+    let entry_task = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.entry-span", serde_json::json!({})),
+    )
+    .await;
+    let _ = opened
+        .harness
+        .wait_for_task(entry_task, &context())
+        .await
+        .expect("entry task");
+    assert!(
+        recorder.has_event("pi.durable.phase", "pi.durable.entry"),
+        "no phase span carried the entry event"
+    );
     opened.harness.close(&context()).await.expect("close");
 }
