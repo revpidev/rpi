@@ -1723,7 +1723,10 @@ fn find_worktree_root(start: &std::path::Path) -> Option<PathBuf> {
 /// Build one gitignore matcher from `file`, rooted at the directory whose
 /// patterns it contains. Invalid patterns are skipped like Git's own parser.
 async fn load_gitignore(root: &Path, file: &Path) -> Option<Gitignore> {
-    let text = tokio::fs::read_to_string(file).await.ok()?;
+    // Git's ignore files are byte-oriented. Decode lossily so one invalid
+    // line cannot discard every rule in the file.
+    let bytes = tokio::fs::read(file).await.ok()?;
+    let text = String::from_utf8_lossy(&bytes);
     let mut builder = GitignoreBuilder::new(root);
     for (index, line) in text.lines().enumerate() {
         let line = if index == 0 {

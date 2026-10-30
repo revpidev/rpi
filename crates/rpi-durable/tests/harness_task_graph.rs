@@ -347,6 +347,18 @@ async fn the_graph_reports_and_clears_the_restart_limit() {
             ..
         }
     ));
+    // A parked task waits for retryTask(), so a host may idle. Reconcile work
+    // from the stamping commit may still be in flight; wait for it to land.
+    for _ in 0..100 {
+        if !opened.harness.wake().active {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert!(
+        !opened.harness.wake().active,
+        "a parked task must not keep the host awake"
+    );
 
     opened
         .harness

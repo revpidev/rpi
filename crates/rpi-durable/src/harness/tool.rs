@@ -10,7 +10,7 @@
 //! input is a tagged union, the nested call's result lives in its caller's
 //! `NestedCallDoc`, and both publish progress in `pi.live`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
@@ -111,7 +111,7 @@ pub enum ToolCheckpoint {
 /// A version 1 task that was already holding its outcome as `completing` when
 /// the Harness upgraded finishes with a version 1 result, `{ entryId, control? }`
 /// without `kind`; a result without `kind` is a model-issued call's.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
@@ -128,6 +128,50 @@ pub enum ToolTaskResult {
     },
     /// Nested call: the result lives in the caller's `NestedCallDoc`.
     Nested,
+}
+
+impl<'de> Deserialize<'de> for ToolTaskResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = JsonValue::deserialize(deserializer)?;
+        if value.get("kind").is_none() {
+            // A version 1 task already `completing` when the Harness upgraded
+            // stored `{ entryId, control? }`; treat it as a model call.
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Legacy {
+                entry_id: EntryId,
+                #[serde(default)]
+                control: Option<crate::harness::types::ToolControl>,
+            }
+            let legacy: Legacy = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            return Ok(Self::Model {
+                entry_id: legacy.entry_id,
+                control: legacy.control,
+            });
+        }
+        #[derive(Deserialize)]
+        #[serde(
+            tag = "kind",
+            rename_all = "camelCase",
+            rename_all_fields = "camelCase"
+        )]
+        enum Tagged {
+            Model {
+                entry_id: EntryId,
+                #[serde(default)]
+                control: Option<crate::harness::types::ToolControl>,
+            },
+            Nested,
+        }
+        let tagged: Tagged = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(match tagged {
+            Tagged::Model { entry_id, control } => Self::Model { entry_id, control },
+            Tagged::Nested => Self::Nested,
+        })
+    }
 }
 
 /// One nested call of a running tool: its task, and once it ended, its result.
@@ -245,12 +289,14 @@ impl TaskDefinition for ToolTask {
     ) -> SessionResult<()> {
         let input = parse_input(&task)?;
         let call = read_call(runtime, &input, context).await?;
-        let message = format!("Tool {} was aborted", call.call.name);
-        let result = from_slot(
-            read_slot(runtime, context).await?.as_ref(),
-            "aborted",
-            &message,
+        // Abandoned after a restart (`TaskOptions.abandonOnRestart`): say
+        // whether the call may have run.
+        let (code, message) = abort_text(
+            task.record.abort_reason.as_deref(),
+            task.checkpoint(),
+            &call.call.name,
         );
+        let result = from_slot(read_slot(runtime, context).await?.as_ref(), code, &message);
         settle(
             runtime,
             &input,
@@ -264,6 +310,32 @@ impl TaskDefinition for ToolTask {
             None,
         )
         .await
+    }
+}
+
+/// The abort diagnostic: a restart-abandoned call says whether it may have run.
+fn abort_text(
+    reason: Option<&str>,
+    checkpoint: Option<&JsonValue>,
+    name: &str,
+) -> (&'static str, String) {
+    if reason != Some("restart") {
+        return ("aborted", format!("Tool {name} was aborted"));
+    }
+    let executed = checkpoint
+        .and_then(|checkpoint| checkpoint.get("phase"))
+        .and_then(JsonValue::as_str)
+        == Some("execute");
+    if executed {
+        (
+            "interrupted",
+            format!("Tool {name} was interrupted by a restart and may have partially run"),
+        )
+    } else {
+        (
+            "abandoned",
+            format!("Tool {name} was not started: its caller ended with a restart"),
+        )
     }
 }
 
@@ -1142,10 +1214,13 @@ async fn settle(
         .await?
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    // Abort each and wait until it is terminal; a nested call may run until
-    // it is cancelled itself.
-    for id in nested_ids {
-        runtime.abort_owned(id, context).await?;
+    // Mark every nested call before waiting for any: one may run until a
+    // sibling is cancelled, so aborting them serially could deadlock.
+    let aborts = nested_ids
+        .into_iter()
+        .map(|id| runtime.abort_owned(id, context));
+    for result in futures::future::join_all(aborts).await {
+        result?;
     }
     let conversation_id = runtime.conversation_id();
     let task_id = runtime.task_id();
@@ -1884,6 +1959,8 @@ struct ToolApi {
     admissions: Arc<AdmissionTracker>,
     sequence: Arc<AtomicUsize>,
     resumes: bool,
+    /// `MADE_NESTED_CALLS` is committed once per attempt.
+    made_nested: AtomicBool,
 }
 
 impl ToolApi {
@@ -1907,6 +1984,7 @@ impl ToolApi {
             admissions,
             sequence,
             resumes,
+            made_nested: AtomicBool::new(false),
         }
     }
 
@@ -2160,7 +2238,15 @@ impl ToolExecutionApi for ToolApi {
             "task.id": self.runtime.task_id().get(),
             "tool.call_id": self.call_id,
         }));
-        // Registered before the memo, so cleanup waits for the admission.
+        // The memo first, once per attempt, before any admission: settlement
+        // scans the slots only when this is durable.
+        if !self.made_nested.load(Ordering::SeqCst) {
+            self.runtime
+                .memo_set(MADE_NESTED_CALLS, JsonValue::Bool(true), context)
+                .await?;
+            self.made_nested.store(true, Ordering::SeqCst);
+        }
+        // Registered after the memo, so cleanup waits for the admission.
         let admission = self.admissions.begin().map_err(SessionError::message)?;
         let started = start_nested_call(
             self.runtime.as_ref(),
@@ -2175,10 +2261,6 @@ impl ToolExecutionApi for ToolApi {
         .await;
         drop(admission);
         let id = started?;
-        let _ = self
-            .runtime
-            .memo_set(MADE_NESTED_CALLS, JsonValue::Bool(true), context)
-            .await?;
         let settled = self.runtime.wait_for_task(id, context).await?;
         let stored = self
             .runtime
@@ -2207,6 +2289,40 @@ impl ToolApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_abort_says_whether_the_tool_may_have_run() {
+        assert_eq!(
+            abort_text(
+                Some("restart"),
+                Some(&serde_json::json!({ "phase": "execute" })),
+                "bash"
+            ),
+            (
+                "interrupted",
+                "Tool bash was interrupted by a restart and may have partially run".to_string()
+            )
+        );
+        assert_eq!(
+            abort_text(
+                Some("restart"),
+                Some(&serde_json::json!({ "phase": "call" })),
+                "bash"
+            ),
+            (
+                "abandoned",
+                "Tool bash was not started: its caller ended with a restart".to_string()
+            )
+        );
+        assert_eq!(
+            abort_text(
+                None,
+                Some(&serde_json::json!({ "phase": "execute" })),
+                "bash"
+            ),
+            ("aborted", "Tool bash was aborted".to_string())
+        );
+    }
 
     #[test]
     fn harness_error_has_one_diagnostic_and_error_flag() {

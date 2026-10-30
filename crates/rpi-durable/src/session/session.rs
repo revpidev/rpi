@@ -232,9 +232,6 @@ impl SessionImpl {
             *failure = Some(cause.clone());
         }
         self.closing.store(true, Ordering::SeqCst);
-        self.set_end(SessionEnd::Failed {
-            error: cause.clone(),
-        });
         let hooks: Vec<FailureHook> = match self.failure_hooks.lock() {
             Ok(hooks) => hooks.clone(),
             Err(_) => Vec::new(),
@@ -252,6 +249,12 @@ impl SessionImpl {
             let this = Arc::clone(self);
             handle.spawn(async move {
                 let _ = this.close(&crate::chord::context::BACKGROUND_CONTEXT).await;
+            });
+        } else {
+            // Without a runtime no close can run; settle the terminal state so
+            // `closed()` cannot hang forever.
+            self.set_end(SessionEnd::Failed {
+                error: cause.clone(),
             });
         }
     }
@@ -532,6 +535,12 @@ impl SessionImpl {
                 return Err(error);
             }
         };
+        // A callback may have swallowed a read error; the guard latched the
+        // Session, so this commit must not commit or report success.
+        if let Err(error) = self.assert_healthy() {
+            tx.settle_failure().await;
+            return Err(error);
+        }
         let writes = tx.settle_success().await?;
         if writes.is_empty() {
             tx.discard();
@@ -721,24 +730,25 @@ impl SessionImpl {
         let observed = Arc::new(AtomicU64::new(loaded.value_version));
         let record_id = loaded.record.id;
         let source_commit = Arc::clone(&source);
-        let subscription_commit = self.subscribe_commits(Arc::new(move |publication, context| {
-            for change in &publication.changes {
-                if let CommitChange::Document(document) = change {
-                    if document.record.id != record_id {
-                        continue;
+        let subscription_commit =
+            self.subscribe_internal_commits(Arc::new(move |publication, context| {
+                for change in &publication.changes {
+                    if let CommitChange::Document(document) = change {
+                        if document.record.id != record_id {
+                            continue;
+                        }
+                        let ops = observed_operations(&observed, document);
+                        if ops.is_empty() {
+                            continue;
+                        }
+                        source_commit.advance(
+                            document.frame_value(),
+                            ops,
+                            without_abort_signal(context),
+                        );
                     }
-                    let ops = observed_operations(&observed, document);
-                    if ops.is_empty() {
-                        continue;
-                    }
-                    source_commit.advance(
-                        document.frame_value(),
-                        ops,
-                        without_abort_signal(context),
-                    );
                 }
-            }
-        }));
+            }));
         let source_close = Arc::clone(&source);
         let weak = Arc::downgrade(self);
         let subscription_close = self.subscribe_close(Arc::new(move || {
@@ -813,20 +823,21 @@ impl SessionImpl {
         let observed = Arc::new(AtomicU64::new(loaded.value_version));
         let record_id = loaded.record.id;
         let watch_commit = watch.clone();
-        let subscription_commit = self.subscribe_commits(Arc::new(move |publication, context| {
-            for change in &publication.changes {
-                if let CommitChange::Document(document) = change {
-                    if document.record.id != record_id {
-                        continue;
+        let subscription_commit =
+            self.subscribe_internal_commits(Arc::new(move |publication, context| {
+                for change in &publication.changes {
+                    if let CommitChange::Document(document) = change {
+                        if document.record.id != record_id {
+                            continue;
+                        }
+                        let ops = observed_operations(&observed, document);
+                        if ops.is_empty() {
+                            continue;
+                        }
+                        watch_commit.advance(document.frame_value(), ops, context.clone());
                     }
-                    let ops = observed_operations(&observed, document);
-                    if ops.is_empty() {
-                        continue;
-                    }
-                    watch_commit.advance(document.frame_value(), ops, context.clone());
                 }
-            }
-        }));
+            }));
         let watch_close = watch.clone();
         let weak = Arc::downgrade(self);
         let subscription_close = self.subscribe_close(Arc::new(move || {
@@ -985,9 +996,7 @@ impl SessionImpl {
         Box::pin(async move {
             let _guard = this.line.lock().await;
             if this.cleanup_done.swap(true, Ordering::SeqCst) {
-                if this.failure().is_none() {
-                    this.set_end(SessionEnd::Closed);
-                }
+                this.settle_end();
                 return Ok(());
             }
             // If closing is cancelled or fails, the flag must go back to
@@ -1004,13 +1013,20 @@ impl SessionImpl {
             if let Err(error) = &result {
                 this.fail(error.to_string());
             }
-            if this.failure().is_none() {
-                this.set_end(SessionEnd::Closed);
-            }
+            // `closed` settles only after the backend close, like upstream.
+            this.settle_end();
             reset.disarm();
             result?;
             Ok(())
         })
+    }
+
+    /// Resolve the terminal session state once closing has finished.
+    fn settle_end(&self) {
+        match self.failure() {
+            Some(error) => self.set_end(SessionEnd::Failed { error }),
+            None => self.set_end(SessionEnd::Closed),
+        }
     }
 
     // ─── Listeners ──────────────────────────────────────────────────────────

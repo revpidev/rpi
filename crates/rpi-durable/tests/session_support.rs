@@ -79,6 +79,7 @@ pub struct ControlledStorage {
     mint_failure: Mutex<Option<StorageError>>,
     read_failure: Mutex<Option<StorageError>>,
     close_failure: Mutex<Option<StorageError>>,
+    close_gate: Mutex<Option<Arc<Held>>>,
 }
 
 impl Default for ControlledStorage {
@@ -101,6 +102,7 @@ impl ControlledStorage {
             mint_failure: Mutex::new(None),
             read_failure: Mutex::new(None),
             close_failure: Mutex::new(None),
+            close_gate: Mutex::new(None),
         }
     }
 
@@ -108,6 +110,13 @@ impl ControlledStorage {
     pub fn hold_commits(&self) -> Gate {
         let (gate, held) = Gate::new();
         *self.commit_gate.lock().expect("gate") = Some(held);
+        gate
+    }
+
+    /// Hold the backend close and report when it arrives.
+    pub fn hold_close(&self) -> Gate {
+        let (gate, held) = Gate::new();
+        *self.close_gate.lock().expect("gate") = Some(held);
         gate
     }
 
@@ -315,6 +324,10 @@ impl Storage for ControlledStorage {
     }
 
     async fn close(&self, context: &Context) -> StorageResult<()> {
+        let held = self.close_gate.lock().expect("gate").take();
+        if let Some(held) = held {
+            held.wait().await;
+        }
         if let Some(error) = self.close_failure.lock().expect("close failure").take() {
             return Err(error);
         }

@@ -259,7 +259,9 @@ async fn calls_issued_after_an_earlier_result_replay_without_false_divergence() 
     let journal = journal(&opened.harness, parent).await;
     assert_eq!(journal.entries.len(), 2);
     assert_eq!(journal.entries[0].key, "c1");
-    assert_eq!(journal.entries[0].issued_after, Some(1));
+    // The count is written with the next journal commit; c2 and c3 were
+    // issued concurrently, so either boundary may have won the race.
+    assert!(matches!(journal.entries[0].issued_after, Some(2) | Some(3)));
     assert_eq!(journal.entries[1].key, "c2");
 
     let reopened = open_with_storage(

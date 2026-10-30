@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use rpi_durable::errors::StorageError;
 use rpi_durable::harness::{
-    BlockedReason, Extension, Harness, Registry, TaskAbort, TaskInspectionState,
+    BlockedReason, Extension, Harness, Registry, ReportInfo, ReportKind, TaskAbort,
+    TaskInspectionState,
 };
 use rpi_durable::storage::MemoryStorage;
 use rpi_durable::types::{Storage, TaskState, TaskStatus};
@@ -248,6 +249,105 @@ async fn five_restarts_park_the_task() {
     reopened.harness.close(&context()).await.unwrap();
 }
 
+/// R-D7: a normal close does not count a restart, and it keeps the count a
+/// previous crash already accumulated (otherwise crash→close loops evade the
+/// limit).
+#[tokio::test]
+async fn normal_close_keeps_an_existing_restart_count() {
+    struct HeldTask {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl rpi_durable::harness::TaskDefinition for HeldTask {
+        fn name(&self) -> &str {
+            "test.held"
+        }
+        fn version(&self) -> u64 {
+            1
+        }
+        fn initial(&self) -> rpi_durable::chord::json::JsonValue {
+            serde_json::json!({ "phase": "step" })
+        }
+        async fn run_phase(
+            &self,
+            _phase: &str,
+            _task: rpi_durable::harness::RunningTask,
+            runtime: &dyn rpi_durable::harness::TaskRuntime,
+            _context: &rpi_durable::chord::context::Context,
+        ) -> rpi_durable::session::SessionResult<()> {
+            self.started.notify_one();
+            runtime.signal().cancelled().await;
+            Err(rpi_durable::session::SessionError::Aborted)
+        }
+    }
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dir = std::env::temp_dir().join(format!(
+        "rpi-durable-close-count-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let path = dir.to_string_lossy().into_owned();
+    let open_jsonl = |path: &str| {
+        let path = path.to_string();
+        let context = context();
+        async move {
+            use rpi_durable::fs::{FileSystem, StdFileSystem};
+            use rpi_durable::storage::{JsonlStorage, JsonlStorageOptions};
+            let fs: Arc<dyn FileSystem> = Arc::new(StdFileSystem::new(&path));
+            let storage = JsonlStorage::open(&path, fs, JsonlStorageOptions::default(), &context)
+                .await
+                .expect("jsonl");
+            Arc::new(storage) as Arc<dyn Storage>
+        }
+    };
+    let storage = open_jsonl(&path).await;
+    let opened = open_with_storage(
+        Arc::clone(&storage),
+        vec![Arc::new(HeldTask {
+            started: Arc::clone(&started),
+        })],
+    )
+    .await;
+    let conversation = root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.held", serde_json::json!({})),
+    )
+    .await;
+    let mut record = opened
+        .harness
+        .get_task(id, &context())
+        .await
+        .unwrap()
+        .expect("task");
+    record.restarts = Some(4);
+    stamp_task(&opened.harness, record).await;
+    opened.harness.resume().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .expect("task did not start");
+    opened.harness.close(&context()).await.unwrap();
+
+    let storage = open_jsonl(&path).await;
+    let reopened = open_with_storage(storage, all_tasks()).await;
+    let record = reopened
+        .harness
+        .get_task(id, &context())
+        .await
+        .unwrap()
+        .expect("task");
+    assert_eq!(record.status(), TaskStatus::Pending);
+    assert_eq!(record.restarts, Some(4), "a close is not a restart");
+    reopened.harness.close(&context()).await.unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// R-D7: `Infinity` never parks.
 #[tokio::test]
 async fn infinite_restart_limit_never_parks() {
@@ -371,7 +471,18 @@ async fn retry_task_unparks() {
 #[tokio::test]
 async fn abort_handler_at_the_limit_faults() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let opened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
+    let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&reports);
+    let sink_again = Arc::clone(&reports);
+    let opened = open_with_storage_settings_and_report(
+        Arc::clone(&storage),
+        all_tasks(),
+        None,
+        Some(Arc::new(move |info: ReportInfo| {
+            sink.lock().expect("reports").push(info);
+        })),
+    )
+    .await;
     let conversation = root(&opened.harness).await;
     let id = add_task(
         &opened.harness,
@@ -391,7 +502,15 @@ async fn abort_handler_at_the_limit_faults() {
     record.abort_requested = true;
     record.restarts = Some(5);
     stamp_task(&opened.harness, record).await;
-    let reopened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
+    let reopened = open_with_storage_settings_and_report(
+        Arc::clone(&storage),
+        all_tasks(),
+        None,
+        Some(Arc::new(move |info: ReportInfo| {
+            sink_again.lock().expect("reports").push(info);
+        })),
+    )
+    .await;
     reopened.harness.resume().unwrap();
     let settled = reopened
         .harness
@@ -399,6 +518,17 @@ async fn abort_handler_at_the_limit_faults() {
         .await
         .unwrap();
     assert_eq!(terminal_status(&settled.record), Some("faulted"));
+    {
+        let reports = reports.lock().expect("reports");
+        assert!(
+            reports
+                .iter()
+                .any(|info| info.kind == ReportKind::TaskFaulted
+                    && info.reason.as_deref() == Some("restart_limit")
+                    && info.task_id == Some(id)),
+            "missing task_faulted report: {reports:?}"
+        );
+    }
     match settled.record.state {
         TaskState::Terminal {
             outcome: rpi_durable::types::TaskOutcome::Faulted { error },

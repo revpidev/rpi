@@ -646,6 +646,11 @@ pub trait CodemodeHost: Send + Sync {
         Err("the host has no code mode store".to_string())
     }
 
+    /// Delete one stored value (`store(key, undefined)` in the script).
+    async fn delete(&self, _key: &str) -> Result<(), String> {
+        Err("the host has no code mode store".to_string())
+    }
+
     /// `searchTools()`: BM25 over the callable tools.
     async fn search_tools(
         &self,
@@ -949,6 +954,13 @@ impl Drop for PendingCall<'_> {
     }
 }
 
+/// Store values one attempt set or deleted (`store(key, undefined)`).
+#[derive(Debug, Default)]
+struct StoreChanges {
+    set: BTreeMap<String, JsonValue>,
+    delete: BTreeSet<String>,
+}
+
 /// Host backed by one tool invocation, the run's journal, and the store.
 struct DurableHost<'a> {
     api: &'a dyn ToolExecutionApi,
@@ -959,7 +971,7 @@ struct DurableHost<'a> {
     replay_len: usize,
     rerun: bool,
     store: Mutex<JsonObject>,
-    store_writes: Mutex<BTreeMap<String, JsonValue>>,
+    store_changes: Mutex<StoreChanges>,
     task_id: TaskId,
     context: Context,
     start_reply: Mutex<JsonValue>,
@@ -992,7 +1004,7 @@ impl<'a> DurableHost<'a> {
             replay_len,
             rerun,
             store: Mutex::new(store),
-            store_writes: Mutex::new(BTreeMap::new()),
+            store_changes: Mutex::new(StoreChanges::default()),
             task_id,
             context: context.clone(),
             start_reply: Mutex::new(start_reply.unwrap_or(JsonValue::Null)),
@@ -1007,10 +1019,10 @@ impl<'a> DurableHost<'a> {
         }
     }
 
-    fn take_store_writes(&self) -> BTreeMap<String, JsonValue> {
-        self.store_writes
+    fn take_store_changes(&self) -> StoreChanges {
+        self.store_changes
             .lock()
-            .map(|mut writes| std::mem::take(&mut *writes))
+            .map(|mut changes| std::mem::take(&mut *changes))
             .unwrap_or_default()
     }
 
@@ -1102,19 +1114,19 @@ impl<'a> DurableHost<'a> {
         }
     }
 
-    async fn acknowledge_delivered(&self) -> Result<(), String> {
+    async fn acknowledge_first_batch(&self) -> Result<(), String> {
         let issued = self.issued();
         self.record_journal(|journal| {
             if journal.entries.is_empty() {
                 // Before the first result, every issued call belongs to the
-                // initial batch. An idle report later replaces this fallback.
+                // initial batch. A later idle report replaces this fallback.
                 journal.first_issued = Some(journal.first_issued.unwrap_or(0).max(issued));
-            } else if let Some(last) = journal.entries.last_mut()
-                && last.issued_after.is_none()
-            {
-                // Backfill only: a sandbox idle report is authoritative.
-                last.issued_after = Some(issued);
             }
+            // Do not backfill `issued_after` here: a result may have been
+            // delivered but not processed yet, and the count it will report at
+            // idle can be larger. Upstream records that count only from
+            // `idle()`, so an unacknowledged boundary stays unknown and a
+            // crash there replays without a false divergence.
             Ok::<(), String>(())
         })
         .await
@@ -1248,9 +1260,12 @@ impl<'a> DurableHost<'a> {
                     .to_string(),
             );
         }
-        if self.rerun && !released {
+        if self.rerun && !released && issued > self.replay_len as u64 {
+            // New calls were issued after the journal ended but the sandbox
+            // never reported the idle boundary that releases them.
             return Err(
-                "The code mode sandbox ended without reporting idle after the replay".to_string(),
+                "The code mode sandbox ended without releasing its new calls after the replay"
+                    .to_string(),
             );
         }
         self.record_journal(|journal| {
@@ -1287,18 +1302,18 @@ impl<'a> DurableHost<'a> {
     }
 
     fn begin_row(&self, key: &str, name: &str, args: &JsonObject) -> u64 {
-        if let Some(id) = self.rows.lock().ok().and_then(|rows| {
-            rows.iter()
-                .find(|(stored, _)| stored == key)
-                .map(|(_, row)| row.id)
-        }) {
+        let mut rows = match self.rows.lock() {
+            Ok(rows) => rows,
+            Err(_) => return 1,
+        };
+        if let Some(id) = rows
+            .iter()
+            .find(|(stored, _)| stored == key)
+            .map(|(_, row)| row.id)
+        {
             return id;
         }
-        let id = self
-            .rows
-            .lock()
-            .map(|rows| rows.len() as u64 + 1)
-            .unwrap_or(1);
+        let id = rows.len() as u64 + 1;
         let args = serde_json::to_string(args).unwrap_or_default();
         let row = CodemodeNestedCall {
             id,
@@ -1311,9 +1326,7 @@ impl<'a> DurableHost<'a> {
             duration_ms: None,
             error: None,
         };
-        if let Ok(mut rows) = self.rows.lock() {
-            rows.push((key.to_string(), row));
-        }
+        rows.push((key.to_string(), row));
         id
     }
 
@@ -1492,7 +1505,7 @@ impl CodemodeHost for DurableHost<'_> {
             );
             return Ok(stored);
         }
-        self.acknowledge_delivered().await?;
+        self.acknowledge_first_batch().await?;
         let result = self
             .api
             .execute_tool(
@@ -1505,13 +1518,12 @@ impl CodemodeHost for DurableHost<'_> {
                 },
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| self.replay_divergence(error.to_string()))?;
         self.finish_row(key, &result);
         let at = self.now()?;
         let stored = result.clone();
         self.record_journal(|journal| journal.record(key, name, &args, at, stored))
             .await?;
-        self.acknowledge_delivered().await?;
         self.mark_delivered(key);
         Ok(result)
     }
@@ -1553,10 +1565,29 @@ impl CodemodeHost for DurableHost<'_> {
                 .map_err(|_| "codemode store lock poisoned".to_string())?;
             store.insert(key.to_string(), value.clone());
         }
-        self.store_writes
+        let mut changes = self
+            .store_changes
             .lock()
-            .map_err(|_| "codemode store lock poisoned".to_string())?
-            .insert(key.to_string(), value);
+            .map_err(|_| "codemode store lock poisoned".to_string())?;
+        changes.delete.remove(key);
+        changes.set.insert(key.to_string(), value);
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        {
+            let mut store = self
+                .store
+                .lock()
+                .map_err(|_| "codemode store lock poisoned".to_string())?;
+            store.remove(key);
+        }
+        let mut changes = self
+            .store_changes
+            .lock()
+            .map_err(|_| "codemode store lock poisoned".to_string())?;
+        changes.set.remove(key);
+        changes.delete.insert(key.to_string());
         Ok(())
     }
 
@@ -1644,7 +1675,7 @@ impl CodemodeHost for DurableHost<'_> {
             };
             return Ok(outcome);
         }
-        self.acknowledge_delivered().await?;
+        self.acknowledge_first_batch().await?;
         let outcome = if DISCOVERY_GLOBALS.contains(&name) {
             self.discover(name, args).await?
         } else if CATALOG_GLOBALS.contains(&name) {
@@ -1661,7 +1692,6 @@ impl CodemodeHost for DurableHost<'_> {
             journal.record_global(key, &name_owned, &args, at, outcome_for_record)
         })
         .await?;
-        self.acknowledge_delivered().await?;
         self.mark_delivered(key);
         Ok(outcome)
     }
@@ -1704,7 +1734,11 @@ impl ToolExecute for CodemodeTool {
             .abort_signal()
             .is_some_and(|signal| signal.is_cancelled())
         {
-            return Ok(CodemodeOutcome::error("Script aborted before it started").into_result());
+            // Not a decision about the script: leave `pi.codemode.run` without
+            // an outcome so a later attempt replays it.
+            return Err(tool_error(
+                "The code mode run was aborted before it started",
+            ));
         }
         let source = args
             .get("code")
@@ -1831,7 +1865,7 @@ impl ToolExecute for CodemodeTool {
                 task_id,
                 conversation_id,
                 &result,
-                &BTreeMap::new(),
+                &StoreChanges::default(),
                 context,
             )
             .await?;
@@ -1848,7 +1882,7 @@ impl ToolExecute for CodemodeTool {
                 task_id,
                 conversation_id,
                 &result,
-                &BTreeMap::new(),
+                &StoreChanges::default(),
                 context,
             )
             .await?;
@@ -1877,11 +1911,30 @@ impl ToolExecute for CodemodeTool {
             self.store_start_reply(api, task_id, reply, context).await?;
         }
         let outcome = match self.sandbox.run(start.clone(), &host, context).await {
-            Ok(outcome) => match host.finish_replay().await {
-                Ok(()) => outcome,
-                Err(message) => CodemodeOutcome::error(message),
-            },
-            Err(message) => CodemodeOutcome::error(message),
+            Ok(outcome) => {
+                // A host close or caller abort is not the script's result.
+                if context
+                    .abort_signal()
+                    .is_some_and(|signal| signal.is_cancelled())
+                {
+                    return Err(tool_error("The code mode run was aborted"));
+                }
+                match host.finish_replay().await {
+                    Ok(()) => outcome,
+                    Err(message) => CodemodeOutcome::error(message),
+                }
+            }
+            Err(message) => {
+                // Upstream distinguishes an abort it did not cause (host close)
+                // from a script/sandbox failure: the former stores no result.
+                if context
+                    .abort_signal()
+                    .is_some_and(|signal| signal.is_cancelled())
+                {
+                    return Err(tool_error(message));
+                }
+                CodemodeOutcome::error(message)
+            }
         };
         let wall_ms = api.now().map(|now| now - start.started_at).unwrap_or(0.0);
         let writer = api
@@ -1911,12 +1964,12 @@ impl ToolExecute for CodemodeTool {
             ..Default::default()
         };
         // As upstream: a failed script does not commit its store writes.
-        let writes = if outcome.is_error {
-            BTreeMap::new()
+        let changes = if outcome.is_error {
+            StoreChanges::default()
         } else {
-            host.take_store_writes()
+            host.take_store_changes()
         };
-        self.store_result(api, task_id, conversation_id, &result, &writes, context)
+        self.store_result(api, task_id, conversation_id, &result, &changes, context)
             .await?;
         Ok(result)
     }
@@ -1954,14 +2007,16 @@ impl CodemodeTool {
         task_id: TaskId,
         conversation_id: ConversationId,
         result: &ToolExecutionResult,
-        writes: &BTreeMap<String, JsonValue>,
+        changes: &StoreChanges,
         context: &Context,
     ) -> Result<(), ToolExecuteError> {
         let result = result.clone();
-        let writes = writes.clone();
+        let writes = changes.set.clone();
+        let deletes = changes.delete.clone();
         let commit: ToolCommitFn = Arc::new(move |tx: &mut Transaction| {
             let result = result.clone();
             let writes = writes.clone();
+            let deletes = deletes.clone();
             Box::pin(async move {
                 let doc = tx
                     .doc(&CODEMODE_RUN_DOC, DocOwner::Task(task_id), None)
@@ -1969,7 +2024,7 @@ impl CodemodeTool {
                 let mut state: CodemodeRunState = read_state(&doc)?;
                 state.result = Some(result);
                 write_state(&doc, &state)?;
-                if !writes.is_empty() {
+                if !writes.is_empty() || !deletes.is_empty() {
                     let store_doc = tx
                         .doc(
                             &CODEMODE_STORE_DOC,
@@ -1978,6 +2033,9 @@ impl CodemodeTool {
                         )
                         .await?;
                     let mut store: CodemodeStoreState = read_state(&store_doc)?;
+                    for key in deletes {
+                        store.values.remove(&key);
+                    }
                     for (key, value) in writes {
                         store.values.insert(key, value);
                     }

@@ -753,6 +753,37 @@ async fn read_rejects_an_image_over_the_pixel_limit() {
     }));
 }
 
+/// A supported image whose header cannot be read is an explicit error, not an
+/// inline image of unknown size.
+#[tokio::test]
+async fn read_rejects_an_image_whose_size_cannot_be_read() {
+    let dir = TempDir::new("durable-read-image-unreadable");
+    let env = create_env(&dir);
+    let context = rpi_durable::chord::context::BACKGROUND_CONTEXT.clone();
+    // A JPEG SOI/APP0 prefix without a frame header.
+    env.write_file(
+        "broken.jpg",
+        FileContent::Bytes(vec![
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F',
+        ]),
+        &context,
+    )
+    .await
+    .expect("write image");
+    let (result, _, _) = run_tool(
+        &create_read_tool(),
+        json!({ "path": "broken.jpg" }),
+        Some(Arc::clone(&env)),
+    )
+    .await;
+    let result = result.expect("read image");
+    assert_eq!(result.is_error, Some(true));
+    assert!(result.diagnostics.iter().flatten().any(|diagnostic| {
+        diagnostic.code.as_deref() == Some("unsupported_image")
+            && diagnostic.message.contains("size cannot be read")
+    }));
+}
+
 // ---------------------------------------------------------------------------
 // read image processor (V18-06 FR-K)
 // ---------------------------------------------------------------------------

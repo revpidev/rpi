@@ -266,18 +266,18 @@ async fn image_model(api: &dyn ToolExecutionApi, context: &Context) -> ImageMode
     }
 }
 
-fn parse_image_dimensions(bytes: &[u8]) -> (u32, u32) {
+fn parse_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) && bytes.len() >= 24 {
-        return (
+        return Some((
             u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
             u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
-        );
+        ));
     }
     if bytes.starts_with(b"GIF") && bytes.len() >= 10 {
-        return (
+        return Some((
             u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
             u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
-        );
+        ));
     }
     if bytes.starts_with(&[0xff, 0xd8]) {
         let mut index = 2;
@@ -293,40 +293,40 @@ fn parse_image_dimensions(bytes: &[u8]) -> (u32, u32) {
                 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
             ) && index + 9 <= bytes.len()
             {
-                return (
+                return Some((
                     u16::from_be_bytes([bytes[index + 7], bytes[index + 8]]) as u32,
                     u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u32,
-                );
+                ));
             }
             if length < 2 {
                 break;
             }
             index += 2 + length;
         }
-        return (0, 0);
+        return None;
     }
     if bytes.starts_with(b"RIFF") && bytes.len() >= 30 && &bytes[8..12] == b"WEBP" {
         match &bytes[12..16] {
             b"VP8X" => {
-                return (
+                return Some((
                     1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]),
                     1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]),
-                );
+                ));
             }
             b"VP8 " => {
-                return (
+                return Some((
                     (u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3fff) as u32,
                     (u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3fff) as u32,
-                );
+                ));
             }
             b"VP8L" => {
                 let bits = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
-                return ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1);
+                return Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1));
             }
             _ => {}
         }
     }
-    (0, 0)
+    None
 }
 
 const INLINE_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
@@ -402,7 +402,11 @@ async fn read_image(
             .read(0, info.size, context)
             .await
             .map_err(|error| tool_error(error.to_string()))?;
-        let (width, height) = parse_image_dimensions(&bytes);
+        let Some((width, height)) = parse_image_dimensions(&bytes) else {
+            return Ok(image_error(format!(
+                "{path} is an image ({mime_type}) whose size cannot be read"
+            )));
+        };
         if width > model.limits.max_width || height > model.limits.max_height {
             return Ok(image_error(format!(
                 "{path} is an image ({mime_type}) of {width}x{height}, larger than {}x{}, and no image processor is configured to shrink it",

@@ -316,6 +316,18 @@ fn tool_task_v2_round_trips_and_rejects_legacy_content() {
         assert_eq!(decoded, result);
     }
 
+    // A version 1 task that was already `completing` stored a result without
+    // `kind`; it is a model-issued call's result.
+    let legacy: rpi_durable::harness::ToolTaskResult =
+        serde_json::from_value(serde_json::json!({ "entryId": 9 })).expect("decode legacy result");
+    assert_eq!(
+        legacy,
+        rpi_durable::harness::ToolTaskResult::Model {
+            entry_id: rpi_durable::ids::EntryId::from_number(9),
+            control: None,
+        }
+    );
+
     let execution = ToolExecutionResult {
         output: Some(vec![ToolResultContent::Text(rpi_ai::types::TextContent {
             text: "hello".to_string(),

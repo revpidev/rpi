@@ -9,7 +9,7 @@ mod session_support;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rpi_durable::chord::context::BACKGROUND_CONTEXT;
+use rpi_durable::chord::context::{BACKGROUND_CONTEXT, with_abort_signal};
 use rpi_durable::chord::delta::Op;
 use rpi_durable::chord::json::{JsonObject, JsonValue};
 use rpi_durable::documents::{DocDefinition, DocScope, DocToken, define_doc, define_doc_family};
@@ -19,6 +19,7 @@ use rpi_durable::session::{
     DocOwner, SessionEnd, SessionError, WatchEnd, commit_fn, watch_listener,
 };
 use rpi_durable::types::{DocumentFork, DocumentHistory};
+use tokio_util::sync::CancellationToken;
 
 use session_support::{
     commit, create_conversation, document_copy_changes, flush, open_test_session, try_commit,
@@ -1581,6 +1582,86 @@ async fn read_request_error_fails_only_its_call() {
     assert!(harness.session.failure().is_none());
 }
 
+/// R-D11: a read whose caller was cancelled is the second exempt case: it
+/// fails only that call, even when the backend throws.
+#[tokio::test]
+async fn a_cancelled_read_error_fails_only_its_call() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    let gate = harness.storage.hold_find_document();
+    harness
+        .storage
+        .fail_next_read(StorageError::message("cancelled read"));
+    let token = CancellationToken::new();
+    let context = with_abort_signal(token.clone(), &BACKGROUND_CONTEXT);
+    let future = harness
+        .session
+        .snapshot(live(), DocOwner::Conversation(conversation), &context);
+    tokio::pin!(future);
+    tokio::select! {
+        _ = gate.entered() => {}
+        result = &mut future => panic!("read did not reach storage: {result:?}"),
+    }
+    token.cancel();
+    gate.release();
+    let result = future.await;
+    assert!(matches!(
+        result,
+        Err(SessionError::Storage(StorageError::Message(_)))
+    ));
+    assert!(harness.session.failure().is_none());
+
+    let value = harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await;
+    assert!(value.is_ok(), "a cancelled read must not fail the Session");
+}
+
+/// R-D11: a callback that swallows a failing read must not commit or report
+/// success; the guard's failure wins.
+#[tokio::test]
+async fn a_swallowed_read_failure_fails_the_commit() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    harness
+        .session
+        .unload_documents()
+        .await
+        .expect("unload documents");
+    harness
+        .storage
+        .fail_next_read(StorageError::message("swallowed read"));
+    let commits_before = harness.storage.commits.lock().expect("commits").len();
+    let result = harness
+        .session
+        .commit(
+            commit_fn(move |tx| {
+                Box::pin(async move {
+                    let _ = tx
+                        .doc(live(), DocOwner::Conversation(conversation), None)
+                        .await;
+                    Ok::<(), SessionError>(())
+                })
+            }),
+            &BACKGROUND_CONTEXT,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(SessionError::Failed { .. })),
+        "swallowed read was accepted: {result:?}"
+    );
+    assert_eq!(
+        harness.storage.commits.lock().expect("commits").len(),
+        commits_before,
+        "no batch may commit after the guard failed"
+    );
+}
+
 /// R-D11: any other read error fails the Session; later calls and `closed`
 /// report `SessionFailed`.
 #[tokio::test]
@@ -1787,6 +1868,43 @@ async fn a_mint_failure_fails_the_session() {
         harness.session.closed().await,
         SessionEnd::Failed {
             error: "mint failed".to_string()
+        }
+    );
+}
+
+/// R-D11: `closed` settles only after the Storage has actually closed, so a
+/// host may reopen the backend as soon as it reads the terminal state.
+#[tokio::test]
+async fn a_failed_session_closed_waits_for_storage_close() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    let close_gate = harness.storage.hold_close();
+    harness
+        .storage
+        .fail_next_read(StorageError::message("disk vanished"));
+    let _ = harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), close_gate.entered())
+        .await
+        .expect("the failed Session did not start closing storage");
+    let mut closed = Box::pin(harness.session.closed());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut closed)
+            .await
+            .is_err(),
+        "closed settled before storage.close"
+    );
+    close_gate.release();
+    assert_eq!(
+        closed.await,
+        SessionEnd::Failed {
+            error: "disk vanished".to_string()
         }
     );
 }

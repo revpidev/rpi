@@ -407,7 +407,10 @@ impl CodemodeSandbox for StoreSandbox {
         host: &dyn CodemodeHost,
         _context: &Context,
     ) -> Result<CodemodeOutcome, String> {
-        if start.code.contains("load") {
+        if start.code.contains("delete") {
+            host.delete("greeting").await?;
+            Ok(CodemodeOutcome::output("deleted"))
+        } else if start.code.contains("load") {
             let value = host.load("greeting").await?;
             Ok(CodemodeOutcome::output(
                 value
@@ -472,6 +475,60 @@ async fn store_round_trips_across_codemode_calls() {
     );
 
     assert_eq!(tool_tasks(&opened, "pi.tool").await.len(), 2);
+}
+
+#[tokio::test]
+async fn store_delete_round_trips() {
+    let code = create_codemode_tool(CodemodeToolOptions {
+        sandbox: Arc::new(StoreSandbox),
+        ..Default::default()
+    });
+    let opened = open(
+        vec![extension(vec![code])],
+        None,
+        test_models(vec![
+            Script::Message(tool_use_message(
+                CODEMODE_TOOL_NAME,
+                "c1",
+                serde_json::json!({ "code": "store" }),
+            )),
+            Script::Message(tool_use_message(
+                CODEMODE_TOOL_NAME,
+                "c2",
+                serde_json::json!({ "code": "delete" }),
+            )),
+            Script::Message(tool_use_message(
+                CODEMODE_TOOL_NAME,
+                "c3",
+                serde_json::json!({ "code": "load" }),
+            )),
+            Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
+        ]),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    submission.wait(&context()).await.expect("wait");
+    let results = tool_result_texts(&entries(&conversation).await);
+    assert_eq!(results.len(), 3, "three code mode results: {results:?}");
+    assert!(results[0].contains("stored"), "got {}", results[0]);
+    assert!(results[1].contains("deleted"), "got {}", results[1]);
+    assert!(results[2].contains("missing"), "got {}", results[2]);
+
+    let store = opened
+        .harness
+        .session()
+        .snapshot(
+            &CODEMODE_STORE_DOC,
+            DocOwner::Conversation(conversation.id()),
+            &context(),
+        )
+        .await
+        .expect("store snapshot")
+        .expect("store document");
+    let store: CodemodeStoreState =
+        serde_json::from_value(JsonValue::Object(store)).expect("store state");
+    assert!(!store.values.contains_key("greeting"));
 }
 
 struct NestedErrorSandbox {
@@ -941,7 +998,7 @@ impl CodemodeSandbox for UnusedSandbox {
 }
 
 #[tokio::test]
-async fn a_cancelled_context_returns_an_error_result_without_running() {
+async fn a_cancelled_context_does_not_run_or_store_a_result() {
     let tool = create_codemode_tool(CodemodeToolOptions {
         sandbox: Arc::new(UnusedSandbox),
         ..Default::default()
@@ -953,25 +1010,10 @@ async fn a_cancelled_context_returns_an_error_result_without_running() {
         .as_object()
         .cloned()
         .expect("arguments");
-    let result = tool
+    let error = tool
         .execute
         .execute(args, &PanicApi, &cancelled)
         .await
-        .expect("result");
-    assert_eq!(result.is_error, Some(true));
-    let text = result
-        .output
-        .as_ref()
-        .map(|content| {
-            content
-                .iter()
-                .filter_map(|block| match block {
-                    ToolResultContent::Text(text) => Some(text.text.as_str()),
-                    ToolResultContent::Image(_) => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    assert!(text.contains("aborted"), "got {text}");
+        .expect_err("a cancelled run is not a tool result");
+    assert!(error.to_string().contains("aborted"), "got {error}");
 }

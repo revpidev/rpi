@@ -195,7 +195,7 @@ impl TaskDefinition for GenerationTask {
         runtime: &dyn TaskRuntime,
         context: &Context,
     ) -> SessionResult<()> {
-        let checkpoint = parse_checkpoint(task.checkpoint());
+        let checkpoint = parse_checkpoint(task.checkpoint())?;
         match phase {
             "prepare" => prepare(&task, runtime, context, checkpoint).await,
             "request" => request(runtime, context, checkpoint).await,
@@ -212,7 +212,7 @@ impl TaskDefinition for GenerationTask {
         runtime: &dyn TaskRuntime,
         context: &Context,
     ) -> SessionResult<()> {
-        let checkpoint = parse_checkpoint(task.checkpoint());
+        let checkpoint = parse_checkpoint(task.checkpoint())?;
         if let GenerationCheckpoint::Poll {
             model: reference,
             handle,
@@ -280,22 +280,17 @@ impl TaskDefinition for GenerationTask {
     }
 }
 
-fn parse_checkpoint(checkpoint: Option<&JsonValue>) -> GenerationCheckpoint {
+fn parse_checkpoint(checkpoint: Option<&JsonValue>) -> SessionResult<GenerationCheckpoint> {
     match checkpoint {
-        Some(value) => {
-            serde_json::from_value(value.clone()).unwrap_or(GenerationCheckpoint::Prepare {
-                attempt: 1,
-                compacted: None,
-                overflow: None,
-                threshold: None,
-            })
-        }
-        None => GenerationCheckpoint::Prepare {
+        Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+            SessionError::message(format!("Invalid generation checkpoint: {error}"))
+        }),
+        None => Ok(GenerationCheckpoint::Prepare {
             attempt: 1,
             compacted: None,
             overflow: None,
             threshold: None,
-        },
+        }),
     }
 }
 

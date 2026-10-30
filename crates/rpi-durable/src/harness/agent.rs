@@ -181,9 +181,10 @@ pub fn resolve_settings(settings: Option<&crate::harness::types::HarnessSettings
         restart_limit: settings
             .and_then(|settings| settings.restart_limit)
             .map(|limit| match limit {
-                crate::harness::types::RestartLimit::Limited(value) => {
-                    crate::harness::types::RestartLimit::Limited(value.max(1))
+                crate::harness::types::RestartLimit::Limited(value) if value >= 1 => {
+                    crate::harness::types::RestartLimit::Limited(value)
                 }
+                crate::harness::types::RestartLimit::Limited(_) => DEFAULT_RESTART_LIMIT,
                 infinite => infinite,
             })
             .unwrap_or(DEFAULT_RESTART_LIMIT),

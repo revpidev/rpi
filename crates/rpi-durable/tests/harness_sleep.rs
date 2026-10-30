@@ -92,6 +92,7 @@ type ArmedTimer = (u64, Arc<dyn Fn() + Send + Sync>);
 #[derive(Default)]
 struct FakeTimer {
     armed: Mutex<Vec<ArmedTimer>>,
+    disarmed: AtomicU64,
     decline: bool,
 }
 
@@ -107,7 +108,10 @@ impl FakeTimer {
                 .lock()
                 .expect("armed")
                 .push((delay_ms, Arc::clone(&callback)));
-            Some(Arc::new(|| {}))
+            let timer = Arc::clone(&timer);
+            Some(Arc::new(move || {
+                timer.disarmed.fetch_add(1, Ordering::SeqCst);
+            }))
         })
     }
 
@@ -360,6 +364,7 @@ async fn a_declined_host_timer_falls_back_and_still_wakes() {
     let timer = Arc::new(FakeTimer {
         armed: Mutex::new(Vec::new()),
         decline: true,
+        ..Default::default()
     });
     let clock = Arc::new(AtomicU64::new(1_000));
     let opened = open(
@@ -527,4 +532,154 @@ async fn repeated_wake_is_stable_and_a_backwards_clock_rearms() {
         .close(&BACKGROUND_CONTEXT.clone())
         .await
         .expect("close");
+}
+
+/// Invalid sleep: sleep until a value that is not a Harness-clock time.
+struct InvalidSleepTask {
+    until: f64,
+}
+
+#[async_trait]
+impl TaskDefinition for InvalidSleepTask {
+    fn name(&self) -> &str {
+        "test.invalid_sleep"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> JsonValue {
+        serde_json::json!({ "phase": "sleep" })
+    }
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: RunningTask,
+        runtime: &dyn TaskRuntime,
+        context: &Context,
+    ) -> SessionResult<()> {
+        runtime
+            .sleep_until(self.until, serde_json::json!({ "phase": "done" }), context)
+            .await
+    }
+}
+
+async fn invalid_sleep_is_rejected(until: f64) -> String {
+    let timer = Arc::new(FakeTimer::default());
+    let opened = open(
+        Arc::new(InvalidSleepTask { until }),
+        timer,
+        None,
+        Arc::new(AtomicU64::new(1_000)),
+    )
+    .await;
+    let id = create_task(&opened.harness, "test.invalid_sleep").await;
+    let _ = opened.harness.resume();
+    let settled = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        opened
+            .harness
+            .wait_for_task(id, &BACKGROUND_CONTEXT.clone()),
+    )
+    .await
+    .expect("task did not settle")
+    .expect("settle");
+    let message = match settled.record.state {
+        rpi_durable::types::TaskState::Terminal {
+            outcome: rpi_durable::types::TaskOutcome::Faulted { error },
+        } => error.message,
+        other => panic!("unexpected state {other:?}"),
+    };
+    let _ = opened.harness.close(&BACKGROUND_CONTEXT.clone()).await;
+    message
+}
+
+#[tokio::test]
+async fn a_sleep_until_a_non_finite_or_negative_time_is_rejected() {
+    for until in [f64::NAN, f64::INFINITY, -1.0] {
+        let message = invalid_sleep_is_rejected(until).await;
+        assert!(
+            message.contains("cannot sleep until"),
+            "until={until} message={message}"
+        );
+    }
+}
+
+/// Closing disarms the earliest-sleep timer, so a long sleep does not keep a
+/// host timer alive after the Harness is gone.
+#[tokio::test]
+async fn closing_disarms_the_sleep_timer() {
+    let timer = Arc::new(FakeTimer::default());
+    let opened = open(
+        Arc::new(SleepTask {
+            invocations: Arc::new(AtomicU64::new(0)),
+            delay: 60_000.0,
+            name: "test.sleep",
+        }),
+        Arc::clone(&timer),
+        None,
+        Arc::new(AtomicU64::new(1_000)),
+    )
+    .await;
+    let id = create_task(&opened.harness, "test.sleep").await;
+    let _ = opened.harness.resume();
+    for _ in 0..100 {
+        let record = opened
+            .harness
+            .get_task(id, &BACKGROUND_CONTEXT.clone())
+            .await
+            .expect("task")
+            .expect("present");
+        if record.status() == TaskStatus::Sleeping {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert!(!timer.armed.lock().expect("armed").is_empty());
+    let before = timer.disarmed.load(Ordering::SeqCst);
+    opened
+        .harness
+        .close(&BACKGROUND_CONTEXT.clone())
+        .await
+        .unwrap();
+    assert!(
+        timer.disarmed.load(Ordering::SeqCst) > before,
+        "close did not disarm the wake timer"
+    );
+}
+
+/// The host wake callback runs off the commit line (upstream schedules it in a
+/// microtask), so a host that reads or commits inside it cannot deadlock.
+#[tokio::test]
+async fn on_wake_is_not_called_synchronously_from_resume() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let sink = Arc::clone(&calls);
+    let on_wake: WakeFn = Arc::new(move |_wake| {
+        sink.fetch_add(1, Ordering::SeqCst);
+    });
+    let timer = Arc::new(FakeTimer::default());
+    let opened = open(
+        Arc::new(FakeTask("test.fake")),
+        timer,
+        Some(on_wake),
+        Arc::new(AtomicU64::new(1_000)),
+    )
+    .await;
+    opened.harness.resume().expect("resume");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "onWake ran on the caller's synchronous path"
+    );
+    for _ in 0..100 {
+        if calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(calls.load(Ordering::SeqCst) > 0, "onWake never ran");
+    opened
+        .harness
+        .close(&BACKGROUND_CONTEXT.clone())
+        .await
+        .unwrap();
 }

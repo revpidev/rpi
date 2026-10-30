@@ -1699,7 +1699,7 @@ async fn assert_crash_window_replay(underway: bool, replay_empty_calls: bool) {
         serde_json::from_value(JsonValue::Object(journal)).expect("journal json");
     if underway {
         assert_eq!(journal.entries.len(), 1);
-        assert_eq!(journal.entries[0].issued_after, Some(1));
+        assert_eq!(journal.entries[0].issued_after, None);
     } else {
         assert!(journal.entries.is_empty());
         assert_eq!(
@@ -1739,7 +1739,7 @@ async fn assert_crash_window_replay(underway: bool, replay_empty_calls: bool) {
         let journal: CodemodeJournal =
             serde_json::from_value(JsonValue::Object(journal)).expect("journal json");
         assert_eq!(journal.entries[0].key, "a");
-        assert_eq!(journal.entries[0].issued_after, Some(1));
+        assert_eq!(journal.entries[0].issued_after, None);
         replay_hold.notify_one();
     }
     tokio::time::timeout(
@@ -1760,7 +1760,7 @@ async fn assert_crash_window_replay(underway: bool, replay_empty_calls: bool) {
         serde_json::to_string(&parent_task.record.state).expect("codemode parent state");
     let results = tool_result_texts(&entries(&root_ready(&reopened.harness).await).await);
     let replay_output = format!("{parent_state}\n{}", results.join("\n"));
-    if replay_empty_calls {
+    if replay_empty_calls || underway {
         assert!(
             replay_output.contains("done") && !replay_output.contains("different path"),
             "legitimate concurrent replay was rejected: {replay_output}"
@@ -1801,7 +1801,7 @@ async fn concurrent_empty_journal_replay_is_accepted() {
 }
 
 #[tokio::test]
-async fn underway_next_call_divergence_is_rejected() {
+async fn underway_next_call_replay_is_accepted() {
     assert_crash_window_replay(true, false).await;
 }
 
