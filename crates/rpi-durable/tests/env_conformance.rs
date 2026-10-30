@@ -1363,6 +1363,38 @@ async fn list_files_git_exclude_does_not_override_gitignore() {
 }
 
 #[tokio::test]
+async fn list_files_reads_info_exclude_from_a_git_file_worktree() {
+    let dir = TempDir::new("env-list-git-file");
+    let env = create_env(&dir);
+    env.create_dir(
+        ".real-git/worktrees/wt",
+        Some(CreateDirOptions {
+            recursive: Some(true),
+        }),
+        &context(),
+    )
+    .await
+    .expect("git dir");
+    write(&env, ".git", "gitdir: .real-git/worktrees/wt\n");
+    write(&env, ".real-git/worktrees/wt/commondir", "../..\n");
+    write(&env, ".real-git/info/exclude", "ignored.txt\n");
+    write(&env, "ignored.txt", "x");
+    write(&env, "keep.txt", "x");
+
+    let listing = env.list_files(".", None, &context()).await.expect("list");
+    let paths: Vec<&str> = listing
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert!(
+        !paths.contains(&"ignored.txt"),
+        "the linked worktree's common info/exclude applies: {paths:?}"
+    );
+    assert!(paths.contains(&"keep.txt"), "{paths:?}");
+}
+
+#[tokio::test]
 async fn list_files_loads_the_global_git_excludes_file() {
     struct Restore(Option<std::ffi::OsString>);
     impl Drop for Restore {

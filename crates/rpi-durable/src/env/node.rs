@@ -1736,6 +1736,38 @@ async fn load_gitignore(root: &Path, file: &Path) -> Option<Gitignore> {
     builder.build().ok().filter(|matcher| !matcher.is_empty())
 }
 
+/// The `info/exclude` file of the repository at `root`, including a linked
+/// worktree or submodule whose `.git` is a file. The file lives in the common
+/// git directory when `commondir` names one.
+async fn git_exclude_file(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let metadata = tokio::fs::metadata(&dot_git).await.ok()?;
+    let git_dir = if metadata.is_dir() {
+        dot_git
+    } else {
+        let text = tokio::fs::read_to_string(&dot_git).await.ok()?;
+        let path = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        }
+    };
+    let common = match tokio::fs::read_to_string(git_dir.join("commondir")).await {
+        Ok(text) => {
+            let path = Path::new(text.trim());
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                git_dir.join(path)
+            }
+        }
+        Err(_) => git_dir,
+    };
+    Some(common.join("info").join("exclude"))
+}
+
 async fn initial_ignore_chain(root: &Path, listed: &Path) -> IgnoreChain {
     let mut chain = IgnoreChain::default();
     // Git precedence: global excludes, then `$GIT_DIR/info/exclude`, then the
@@ -1745,8 +1777,8 @@ async fn initial_ignore_chain(root: &Path, listed: &Path) -> IgnoreChain {
     {
         chain = chain.push(matcher);
     }
-    if let Some(matcher) =
-        load_gitignore(root, &root.join(".git").join("info").join("exclude")).await
+    if let Some(exclude) = git_exclude_file(root).await
+        && let Some(matcher) = load_gitignore(root, &exclude).await
     {
         chain = chain.push(matcher);
     }
