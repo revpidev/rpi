@@ -1157,6 +1157,65 @@ async fn list_files_skips_git_and_gitignored_paths() {
 }
 
 #[tokio::test]
+async fn list_files_uses_gitignore_glob_syntax_and_nested_precedence() {
+    let dir = TempDir::new("env-list-git-globs");
+    let env = create_env(&dir);
+    env.create_dir(
+        ".git/info",
+        Some(CreateDirOptions {
+            recursive: Some(true),
+        }),
+        &context(),
+    )
+    .await
+    .expect("git dir");
+    write(
+        &env,
+        ".gitignore",
+        "**/generated.log\n[ab].tmp\n\\!literal.txt\n*.log\n!keep.log\n",
+    );
+    write(&env, "sub/.gitignore", "keep.log\n");
+    for path in [
+        "generated.log",
+        "a.tmp",
+        "b.tmp",
+        "c.tmp",
+        "!literal.txt",
+        "trace.log",
+        "keep.log",
+        "sub/generated.log",
+        "sub/c.tmp",
+        "sub/keep.log",
+    ] {
+        write(&env, path, "x");
+    }
+    let listing = env.list_files(".", None, &context()).await.expect("list");
+    let paths: Vec<&str> = listing
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+
+    for ignored in [
+        "generated.log",
+        "a.tmp",
+        "b.tmp",
+        "!literal.txt",
+        "trace.log",
+        "sub/generated.log",
+        "sub/keep.log",
+    ] {
+        assert!(
+            !paths.contains(&ignored),
+            "{ignored} should be ignored: {paths:?}"
+        );
+    }
+    for kept in ["c.tmp", "keep.log", "sub/c.tmp"] {
+        assert!(paths.contains(&kept), "{kept} should be listed: {paths:?}");
+    }
+}
+
+#[tokio::test]
 async fn list_files_is_bounded_and_reports_truncation() {
     let dir = TempDir::new("env-list-bounds");
     let env = create_env(&dir);

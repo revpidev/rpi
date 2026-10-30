@@ -644,6 +644,9 @@ impl Progress {
         }
         loop {
             let notified = self.inner.idle.notified();
+            tokio::pin!(notified);
+            // Register before checking: `notify_waiters` stores no permit.
+            notified.as_mut().enable();
             {
                 let state = self
                     .inner
@@ -776,7 +779,8 @@ async fn run_write(
     if dirty {
         Progress { inner }.schedule();
     } else {
-        inner.idle.notify_one();
+        // Every `stop()` waiter must observe the settled commit.
+        inner.idle.notify_waiters();
     }
 }
 
@@ -1165,6 +1169,41 @@ mod tests {
         let result = waiter.await.expect("waiter");
         assert_eq!(result, Err("commit failed".to_string()));
         assert_eq!(errors.lock().expect("errors").len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_concurrent_stop_wakes_when_the_commit_settles() {
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
+        let progress = Progress::new(
+            {
+                let started = Arc::clone(&started);
+                let gate = Arc::clone(&gate);
+                move || {
+                    let started = Arc::clone(&started);
+                    let gate = Arc::clone(&gate);
+                    Box::pin(async move {
+                        started.notify_one();
+                        gate.notified().await;
+                        Ok(0)
+                    })
+                }
+            },
+            |_error| {},
+            100,
+        );
+        let _in_flight = progress.mark_and_wait();
+        started.notified().await;
+        let _pending = progress.mark_and_wait();
+        let stopping = async { tokio::join!(progress.stop(), progress.stop()) };
+        tokio::pin!(stopping);
+        let early = tokio::time::timeout(std::time::Duration::from_millis(20), &mut stopping).await;
+        assert!(early.is_err(), "both stops wait for the in-flight commit");
+        gate.notify_one();
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(1), stopping)
+            .await
+            .expect("both stops wake");
+        assert_eq!(first.len() + second.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

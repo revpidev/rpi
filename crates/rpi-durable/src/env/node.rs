@@ -33,6 +33,8 @@ use crate::env::types::{
     ShellOutputInfo, ShellStream, TextLine, TextLineReader, WatchTarget,
 };
 use crate::errors::{FileError, FileErrorCode};
+use ignore::Match;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS: f64 = MAX_TIMEOUT_MS as f64 / 1000.0;
@@ -1679,13 +1681,32 @@ const DEFAULT_LIST_MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LIST_MAX_BYTES: usize = 15_900_000;
 const DEFAULT_LIST_TIMEOUT_MS: u64 = 10_000;
 
-#[derive(Debug, Clone)]
-struct IgnoreRule {
-    base: String,
-    pattern: String,
-    negated: bool,
-    dir_only: bool,
-    anchored: bool,
+/// The ignore matchers that apply to one path, shallowest first. Replaying
+/// them in reverse makes a deeper `.gitignore` override a higher one.
+#[derive(Debug, Clone, Default)]
+struct IgnoreChain(Arc<Vec<Gitignore>>);
+
+impl IgnoreChain {
+    fn push(&self, matcher: Gitignore) -> Self {
+        let mut matchers = (*self.0).clone();
+        matchers.push(matcher);
+        Self(Arc::new(matchers))
+    }
+
+    fn is_ignored(&self, path: &Path, kind: FileKind) -> bool {
+        let is_dir = kind == FileKind::Directory;
+        for matcher in self.0.iter().rev() {
+            if !path.starts_with(matcher.path()) {
+                continue;
+            }
+            match matcher.matched(path, is_dir) {
+                Match::Ignore(_) => return true,
+                Match::Whitelist(_) => return false,
+                Match::None => {}
+            }
+        }
+        false
+    }
 }
 
 fn find_worktree_root(start: &std::path::Path) -> Option<PathBuf> {
@@ -1699,147 +1720,50 @@ fn find_worktree_root(start: &std::path::Path) -> Option<PathBuf> {
     None
 }
 
-fn path_relative(root: &std::path::Path, path: &std::path::Path) -> String {
-    path.strip_prefix(root)
-        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default()
+/// Build one gitignore matcher from `file`, rooted at the directory whose
+/// patterns it contains. Invalid patterns are skipped like Git's own parser.
+async fn load_gitignore(root: &Path, file: &Path) -> Option<Gitignore> {
+    let text = tokio::fs::read_to_string(file).await.ok()?;
+    let mut builder = GitignoreBuilder::new(root);
+    for (index, line) in text.lines().enumerate() {
+        let line = if index == 0 {
+            line.trim_start_matches('\u{feff}')
+        } else {
+            line
+        };
+        let _ = builder.add_line(Some(file.to_path_buf()), line);
+    }
+    builder.build().ok().filter(|matcher| !matcher.is_empty())
 }
 
-fn parse_ignore_file(text: &str, base: &str) -> Vec<IgnoreRule> {
-    let mut rules = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r').trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut pattern = line.to_string();
-        let negated = pattern.starts_with('!');
-        if negated {
-            pattern.remove(0);
-        }
-        if pattern.is_empty() {
-            continue;
-        }
-        let dir_only = pattern.ends_with('/');
-        if dir_only {
-            pattern.pop();
-        }
-        let anchored = pattern.starts_with('/');
-        if anchored {
-            pattern.remove(0);
-        }
-        if pattern.is_empty() {
-            continue;
-        }
-        rules.push(IgnoreRule {
-            base: base.trim_matches('/').to_string(),
-            pattern,
-            negated,
-            dir_only,
-            anchored,
-        });
+async fn initial_ignore_chain(root: &Path, listed: &Path) -> IgnoreChain {
+    let mut chain = IgnoreChain::default();
+    // Git precedence: global excludes, then `$GIT_DIR/info/exclude`, then the
+    // root `.gitignore`, then each deeper `.gitignore` as it is entered.
+    if let Some(global) = ignore::gitignore::gitconfig_excludes_path()
+        && let Some(matcher) = load_gitignore(root, &global).await
+    {
+        chain = chain.push(matcher);
     }
-    rules
-}
-
-async fn load_ignore_file(path: &std::path::Path, base: &str, rules: &mut Vec<IgnoreRule>) {
-    if let Ok(text) = tokio::fs::read_to_string(path).await {
-        rules.extend(parse_ignore_file(&text, base));
+    if let Some(matcher) =
+        load_gitignore(root, &root.join(".git").join("info").join("exclude")).await
+    {
+        chain = chain.push(matcher);
     }
-}
-
-async fn initial_ignore_rules(root: &std::path::Path, listed: &std::path::Path) -> Vec<IgnoreRule> {
-    let mut rules = Vec::new();
-    if let Some(global) = ignore::gitignore::gitconfig_excludes_path() {
-        load_ignore_file(&global, "", &mut rules).await;
+    if let Some(matcher) = load_gitignore(root, &root.join(".gitignore")).await {
+        chain = chain.push(matcher);
     }
-    // Git precedence: the global excludes file has the lowest priority, then
-    // `$GIT_DIR/info/exclude`, then any `.gitignore` (deeper files override
-    // higher ones). Later rules win, so load them in that order.
-    load_ignore_file(
-        &root.join(".git").join("info").join("exclude"),
-        "",
-        &mut rules,
-    )
-    .await;
-    load_ignore_file(&root.join(".gitignore"), "", &mut rules).await;
     let relative = listed
         .strip_prefix(root)
         .unwrap_or(std::path::Path::new(""));
     let mut current = root.to_path_buf();
     for component in relative.components() {
         current.push(component);
-        let base = path_relative(root, &current);
-        load_ignore_file(&current.join(".gitignore"), &base, &mut rules).await;
-    }
-    rules
-}
-
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let text: Vec<char> = text.chars().collect();
-    fn go(
-        pattern: &[char],
-        text: &[char],
-        pi: usize,
-        ti: usize,
-        memo: &mut std::collections::HashMap<(usize, usize), bool>,
-    ) -> bool {
-        if let Some(value) = memo.get(&(pi, ti)) {
-            return *value;
-        }
-        let result = if pi == pattern.len() {
-            ti == text.len()
-        } else if pattern[pi] == '*' {
-            if pi + 1 < pattern.len() && pattern[pi + 1] == '*' {
-                go(pattern, text, pi + 2, ti, memo)
-                    || (ti < text.len() && go(pattern, text, pi, ti + 1, memo))
-            } else {
-                go(pattern, text, pi + 1, ti, memo)
-                    || (ti < text.len() && text[ti] != '/' && go(pattern, text, pi, ti + 1, memo))
-            }
-        } else if ti < text.len()
-            && (pattern[pi] == '?' && text[ti] != '/' || pattern[pi] == text[ti])
-        {
-            go(pattern, text, pi + 1, ti + 1, memo)
-        } else {
-            false
-        };
-        memo.insert((pi, ti), result);
-        result
-    }
-    go(&pattern, &text, 0, 0, &mut std::collections::HashMap::new())
-}
-
-fn rule_matches(rule: &IgnoreRule, relative: &str, kind: FileKind) -> bool {
-    if rule.dir_only && kind != FileKind::Directory {
-        return false;
-    }
-    let within = if rule.base.is_empty() {
-        relative
-    } else if let Some(rest) = relative.strip_prefix(&format!("{}/", rule.base)) {
-        rest
-    } else {
-        return false;
-    };
-    let has_slash = rule.pattern.contains('/');
-    if rule.anchored || has_slash {
-        glob_match(&rule.pattern, within)
-    } else {
-        within
-            .split('/')
-            .any(|segment| glob_match(&rule.pattern, segment))
-    }
-}
-
-fn ignored(rules: &[IgnoreRule], relative: &str, kind: FileKind) -> bool {
-    let mut ignored = false;
-    for rule in rules {
-        if rule_matches(rule, relative, kind) {
-            ignored = !rule.negated;
+        if let Some(matcher) = load_gitignore(&current, &current.join(".gitignore")).await {
+            chain = chain.push(matcher);
         }
     }
-    ignored
+    chain
 }
 
 #[derive(Clone)]
@@ -1847,13 +1771,12 @@ struct Pending {
     path: PathBuf,
     relative: String,
     kind: FileKind,
-    rules: Vec<IgnoreRule>,
+    matchers: IgnoreChain,
 }
 
 struct ListScan<'a> {
-    worktree: Option<&'a Path>,
+    git: bool,
     show_hidden: bool,
-    use_gitignore: bool,
     exclude: &'a [String],
     started: Instant,
     timeout: Duration,
@@ -1946,10 +1869,7 @@ async fn read_children(
         } else {
             continue;
         };
-        if scan.use_gitignore
-            && let Some(worktree) = scan.worktree
-            && ignored(&parent.rules, &path_relative(worktree, &path), kind)
-        {
+        if scan.git && parent.matchers.is_ignored(&path, kind) {
             continue;
         }
         candidates.insert(
@@ -1958,7 +1878,7 @@ async fn read_children(
                 path,
                 relative,
                 kind,
-                rules: parent.rules.clone(),
+                matchers: parent.matchers.clone(),
             },
         );
         if candidates.len() > limit {
@@ -1993,14 +1913,13 @@ async fn list_files_in(
     } else {
         None
     };
-    let rules = match &worktree {
-        Some(worktree) => initial_ignore_rules(worktree, root).await,
-        None => Vec::new(),
+    let matchers = match &worktree {
+        Some(worktree) => initial_ignore_chain(worktree, root).await,
+        None => IgnoreChain::default(),
     };
     let scan = ListScan {
-        worktree: worktree.as_deref(),
+        git: worktree.is_some(),
         show_hidden,
-        use_gitignore,
         exclude: &options.exclude,
         started,
         timeout,
@@ -2010,7 +1929,7 @@ async fn list_files_in(
         path: root.to_path_buf(),
         relative: String::new(),
         kind: FileKind::Directory,
-        rules,
+        matchers,
     };
     let children = read_children(&scan, &parent, max_entries.saturating_add(1)).await?;
     let mut pending: Vec<Pending> = children.items.into_iter().rev().collect();
@@ -2039,15 +1958,11 @@ async fn list_files_in(
             continue;
         }
         let mut parent = node;
-        if scan.use_gitignore
-            && let Some(worktree) = scan.worktree
+        if scan.git
+            && let Some(matcher) =
+                load_gitignore(&parent.path, &parent.path.join(".gitignore")).await
         {
-            load_ignore_file(
-                &parent.path.join(".gitignore"),
-                &path_relative(worktree, &parent.path),
-                &mut parent.rules,
-            )
-            .await;
+            parent.matchers = parent.matchers.push(matcher);
         }
         let remaining = max_entries.saturating_sub(entries.len());
         let children = read_children(&scan, &parent, remaining.saturating_add(1)).await?;
