@@ -67,6 +67,10 @@ pub struct FakeApi {
     pub diagnostics: Mutex<Vec<ToolDiagnostic>>,
     /// Last value recorded through `details()`.
     pub details: Mutex<Option<JsonValue>>,
+    /// Agent model selection, when a test needs one.
+    pub model: Option<rpi_durable::harness::ModelRef>,
+    /// Model catalog, when a test needs one.
+    pub models: Option<rpi_ai::models::Models>,
 }
 
 impl FakeApi {
@@ -77,6 +81,8 @@ impl FakeApi {
             output: Mutex::new(String::new()),
             diagnostics: Mutex::new(Vec::new()),
             details: Mutex::new(None),
+            model: None,
+            models: None,
         }
     }
 
@@ -111,7 +117,7 @@ impl ToolExecutionApi for FakeApi {
 
     async fn agent(&self, _context: &Context) -> Result<Agent, SessionError> {
         Ok(Agent {
-            model: None,
+            model: self.model.clone(),
             thinking_level: rpi_ai::types::ModelThinkingLevel::Off,
             extensions: Vec::new(),
             tools: Vec::new(),
@@ -124,7 +130,9 @@ impl ToolExecutionApi for FakeApi {
     }
 
     fn models(&self) -> rpi_ai::models::Models {
-        unimplemented!("models are not used by the tool tests")
+        self.models
+            .clone()
+            .unwrap_or_else(|| rpi_ai::models::Models::new(None))
     }
 
     fn env(&self) -> Option<Arc<dyn ExecutionEnv>> {
@@ -241,7 +249,20 @@ pub async fn run_tool(
     String,
     Vec<ToolDiagnostic>,
 ) {
-    let api = FakeApi::new(env);
+    run_tool_with_api(tool, args, FakeApi::new(env)).await
+}
+
+/// Run one tool against an existing fake api, for tests that configure the
+/// agent model or catalog.
+pub async fn run_tool_with_api(
+    tool: &ToolRegistration,
+    args: JsonValue,
+    api: FakeApi,
+) -> (
+    Result<ToolExecutionResult, ToolExecuteError>,
+    String,
+    Vec<ToolDiagnostic>,
+) {
     let context = rpi_durable::chord::context::BACKGROUND_CONTEXT.clone();
     let args: JsonObject = args.as_object().cloned().unwrap_or_default();
     let result = tool.execute.execute(args, &api, &context).await;

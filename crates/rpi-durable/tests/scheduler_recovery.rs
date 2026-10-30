@@ -7,9 +7,11 @@
 //! migration.
 
 mod scheduler_support;
+mod session_support;
 
 use std::sync::Arc;
 
+use rpi_durable::errors::StorageError;
 use rpi_durable::harness::{
     BlockedReason, Extension, Harness, Registry, TaskAbort, TaskInspectionState,
 };
@@ -603,6 +605,8 @@ async fn abandon_on_restart_marks_and_aborts_the_task() {
                         conversation_id: Some(conversation),
                         background: false,
                         abandon_on_restart: true,
+                        trace: Default::default(),
+                        links: Vec::new(),
                     })
                     .await
                 })
@@ -678,4 +682,39 @@ async fn listener_panics_report_listener_error() {
     );
     assert!(opened.harness.session().failure().is_none());
     opened.harness.close(&context()).await.unwrap();
+}
+
+/// R-D11: a scheduler-owned commit failure fails the Session through the
+/// guarded storage, not just the current call.
+#[tokio::test]
+async fn a_scheduler_commit_failure_fails_the_session() {
+    let storage = Arc::new(session_support::ControlledStorage::new());
+    let shared: Arc<dyn Storage> = Arc::clone(&storage) as Arc<dyn Storage>;
+    let opened = open_with_storage(Arc::clone(&shared), all_tasks()).await;
+    let conversation = root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.count", serde_json::json!({ "phases": 3 })),
+    )
+    .await;
+    let mut record = opened
+        .harness
+        .get_task(id, &context())
+        .await
+        .unwrap()
+        .expect("task");
+    record.restarts = Some(5);
+    scheduler_support::stamp_task(&opened.harness, record).await;
+    storage.fail_next_commit(StorageError::Message("commit failed".into()));
+    let _ = opened.harness.retry_task(id, &context()).await;
+    assert!(
+        opened
+            .harness
+            .session()
+            .failure()
+            .is_some_and(|failure| failure.contains("commit failed")),
+        "got {:?}",
+        opened.harness.session().failure()
+    );
 }

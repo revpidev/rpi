@@ -979,7 +979,13 @@ async fn answer(
                     timestamp: now as i64,
                 })]);
                 tx.append_entry(conversation_id, draft).await?;
-                let next = create_generation(tx, conversation_id).await?;
+                let next = create_generation(
+                    tx,
+                    conversation_id,
+                    crate::session::TaskTrace::Inherit,
+                    Vec::new(),
+                )
+                .await?;
                 hand_over(&live, task_id, next)?;
                 let mut state: LiveState = crate::harness::types::read_state(&live)?;
                 state.generation = None;
@@ -1294,7 +1300,13 @@ async fn finish_tool_round(
                         run.inputs.extend(result.users);
                     }
                     crate::harness::types::write_state(&live, &state)?;
-                    let next = create_generation(tx, conversation_id).await?;
+                    let next = create_generation(
+                        tx,
+                        conversation_id,
+                        crate::session::TaskTrace::Inherit,
+                        Vec::new(),
+                    )
+                    .await?;
                     hand_over(&live, task_id, next)?;
                     let mut state: LiveState = crate::harness::types::read_state(&live)?;
                     state.generation = None;
@@ -1522,6 +1534,8 @@ async fn create_tool_task(
         conversation_id: Some(conversation_id),
         background: false,
         abandon_on_restart: false,
+        trace: Default::default(),
+        links: Vec::new(),
     })
     .await
 }
@@ -1534,7 +1548,8 @@ pub async fn start_run(
     live: &DocDraft,
     inputs: Vec<SubmissionId>,
 ) -> SessionResult<()> {
-    let task_id = create_generation(tx, conversation_id).await?;
+    let (trace, links) = tx.task_trace(&inputs).await?;
+    let task_id = create_generation(tx, conversation_id, trace, links).await?;
     let mut state: LiveState = crate::harness::types::read_state(live)?;
     state.run = Some(crate::harness::live::LiveRun { task_id, inputs });
     crate::harness::types::write_state(live, &state)
@@ -1544,6 +1559,8 @@ pub async fn start_run(
 async fn create_generation(
     tx: &mut Transaction,
     conversation_id: ConversationId,
+    trace: crate::session::TaskTrace,
+    links: Vec<crate::chord::telemetry::TelemetryCarrier>,
 ) -> SessionResult<TaskId> {
     tx.create_task(TaskCreate {
         kind: GENERATION_TASK_NAME.to_string(),
@@ -1554,6 +1571,8 @@ async fn create_generation(
         conversation_id: Some(conversation_id),
         background: false,
         abandon_on_restart: false,
+        trace,
+        links,
     })
     .await
 }

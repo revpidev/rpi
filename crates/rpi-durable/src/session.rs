@@ -48,7 +48,7 @@ pub use session::{
 pub(crate) use transaction::doc_target;
 pub use transaction::{
     ConversationOwnership, DocDraft, EntryDraft, EntryHead, LoadedDocument, SubmissionCreate,
-    SubmissionSettlement, TaskCreate, TaskOwnership, Transaction, TransactionScope,
+    SubmissionSettlement, TaskCreate, TaskOwnership, TaskTrace, Transaction, TransactionScope,
 };
 
 /// An idempotent unsubscribe handle (upstream's returned unsubscribe function).

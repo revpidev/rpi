@@ -106,6 +106,8 @@ fn task_record(id: TaskId, phase: &str, terminal: bool) -> TaskRecord {
         kind: "test.task".to_string(),
         version: 1,
         input: serde_json::Value::Null,
+        trace: None,
+        links: Vec::new(),
         owner: None,
         background: false,
         abort_requested: false,

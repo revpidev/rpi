@@ -1389,6 +1389,8 @@ async fn start_nested_call(
                     conversation_id: Some(conversation_id),
                     background: false,
                     abandon_on_restart,
+                    trace: Default::default(),
+                    links: Vec::new(),
                 })
                 .await?;
             state.task_id = Some(task);

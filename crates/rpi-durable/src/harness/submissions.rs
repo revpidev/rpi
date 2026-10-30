@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
-use crate::chord::context::Context;
+use crate::chord::context::{Context, TELEMETRY_CONTEXT_KEY, with_context_value};
+use crate::chord::json::{JsonObject, JsonValue};
+use crate::chord::telemetry::TelemetryContext;
 use crate::errors::StorageError;
 use crate::harness::inbox::{
     INBOX_DOC, InboxItem, InboxState, QueueModes, apply_boundary, entry_to_json, has_queued_reset,
@@ -37,6 +39,7 @@ use crate::types::SubmissionRecord;
 pub struct Submissions {
     session: Arc<SessionImpl>,
     scheduler: Arc<dyn SchedulerService>,
+    telemetry: TelemetryContext,
     now: NowFn,
     queue_modes: Box<dyn Fn() -> QueueModes + Send + Sync>,
     resume: Arc<dyn Fn() + Send + Sync>,
@@ -51,6 +54,7 @@ impl Submissions {
     pub fn open(
         session: Arc<SessionImpl>,
         scheduler: Arc<dyn SchedulerService>,
+        telemetry: TelemetryContext,
         now: NowFn,
         queue_modes: Box<dyn Fn() -> QueueModes + Send + Sync>,
         resume: Arc<dyn Fn() + Send + Sync>,
@@ -58,6 +62,7 @@ impl Submissions {
         let submissions = Arc::new(Self {
             session,
             scheduler,
+            telemetry,
             now,
             queue_modes,
             resume,
@@ -90,10 +95,32 @@ impl Submissions {
         context: &Context,
     ) -> SessionResult<Arc<dyn Submission>> {
         (self.resume)();
+        let is_input = matches!(draft, SubmissionDraft::Input(_));
+        let parent = if is_input {
+            self.telemetry.clone()
+        } else {
+            context.telemetry()
+        };
+        let mut links = Vec::new();
+        if is_input && let Some(carrier) = context.telemetry().inject() {
+            links.push(carrier);
+        }
+        let span = parent.start_span(
+            "pi.durable.submit",
+            serde_json::json!({
+                "submission.type": if is_input { "input" } else { "write" },
+                "conversation.id": conversation_id.get(),
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+            links,
+        );
+        let span_context = with_context_value(&TELEMETRY_CONTEXT_KEY, span.context(), context);
         let scheduler = Arc::clone(&self.scheduler);
         let now = (self.now)();
         let modes = (self.queue_modes)();
-        let id = self
+        let admitted = self
             .session
             .commit_with(
                 commit_fn(move |tx| {
@@ -103,10 +130,35 @@ impl Submissions {
                         admit_submission(tx, conversation_id, &draft, now, modes, &*scheduler).await
                     })
                 }),
-                context,
+                &span_context,
                 None,
             )
-            .await?;
+            .await;
+        let id = match admitted {
+            Ok(id) => id,
+            Err(error) => {
+                // Error text may contain caller content: record only the status.
+                span.set_status("error", None);
+                span.end(JsonObject::new());
+                return Err(error);
+            }
+        };
+        let status = self
+            .session
+            .storage()
+            .submission(id, &crate::chord::context::BACKGROUND_CONTEXT)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| record.status().to_string())
+            .unwrap_or_else(|| "queued".to_string());
+        span.set_attributes(
+            serde_json::json!({ "submission.id": id.get(), "result": status })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        span.end(JsonObject::new());
         Ok(Arc::new(SubmissionHandle {
             id,
             submissions: Arc::clone(self),
@@ -374,6 +426,18 @@ pub async fn admit_submission(
     let busy = live_is_busy(&live)?;
     if busy
         && let SubmissionDraft::Input(InputSubmissionDraft {
+            when_busy: Some(WhenBusy::Steer),
+            ..
+        }) = draft
+        && let Ok(run) = crate::harness::types::read_state::<crate::harness::live::LiveState>(&live)
+        && let Some(run) = run.run
+        && let Some(record) = tx.task(run.task_id).await?
+        && let Some(trace) = record.trace
+    {
+        tx.telemetry().add_link(JsonValue::Object(trace));
+    }
+    if busy
+        && let SubmissionDraft::Input(InputSubmissionDraft {
             when_busy: Some(WhenBusy::Reject),
             ..
         }) = draft
@@ -567,6 +631,7 @@ mod tests {
         let done = SubmissionRecord::Input {
             id: id_from_number(1),
             conversation_id: id_from_number(1),
+            trace: None,
             request_id: None,
             status: InputSubmissionStatus::Done {
                 entry: id_from_number(1),
@@ -577,6 +642,7 @@ mod tests {
         let queued = SubmissionRecord::Write {
             id: id_from_number(2),
             conversation_id: id_from_number(1),
+            trace: None,
             request_id: None,
             status: WriteSubmissionStatus::Queued,
         };

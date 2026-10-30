@@ -8,13 +8,19 @@
 mod scheduler_support;
 
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
-use rpi_durable::harness::{BlockedReason, TaskAbort, TaskInspectionState};
+use rpi_durable::harness::{
+    BlockedReason, Extension, Registry, ReportInfo, ReportKind, TaskAbort, TaskInspectionState,
+};
 use rpi_durable::storage::MemoryStorage;
 use rpi_durable::types::{Storage, TaskStatus};
 
 use scheduler_support::{
-    Spec, add_task, all_tasks, context, open_with, open_with_storage, root, terminal_status,
+    Spec, add_task, all_tasks, context, open_with, open_with_storage,
+    open_with_storage_settings_and_report, root, terminal_status,
 };
 
 /// upstream: "continues one invocation through checkpoint progress".
@@ -384,5 +390,285 @@ async fn abort_owned_waits_for_the_child_and_lists_it_first() {
     let settled = opened.harness.wait_for_task(id, &context()).await.unwrap();
     assert_eq!(settled.result["ownedBefore"], serde_json::json!(1));
     assert_eq!(settled.result["childTerminal"], serde_json::json!(true));
+    opened.harness.close(&context()).await.unwrap();
+}
+
+/// A parent that creates a conversation-owned task (not its child) and tries to
+/// abort it.
+struct NegativeParentTask;
+
+#[async_trait::async_trait]
+impl rpi_durable::harness::TaskDefinition for NegativeParentTask {
+    fn name(&self) -> &str {
+        "test.negative-parent"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> rpi_durable::chord::json::JsonValue {
+        serde_json::json!({ "phase": "spawn" })
+    }
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: rpi_durable::harness::RunningTask,
+        runtime: &dyn rpi_durable::harness::TaskRuntime,
+        context: &rpi_durable::chord::context::Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        let child: rpi_durable::harness::AnyTask = Arc::new(ChildTask);
+        let child_id = runtime
+            .create_task(
+                child,
+                rpi_durable::chord::json::JsonValue::Null,
+                rpi_durable::session::TaskOwnership::Conversation(runtime.conversation_id()),
+                false,
+                context,
+            )
+            .await?;
+        let owned = runtime.owned_tasks(context).await?;
+        let not_owned = owned.iter().all(|task| task.id != child_id);
+        let error = runtime
+            .abort_owned(child_id, context)
+            .await
+            .expect_err("a conversation-owned task is not owned by this task");
+        runtime
+            .commit(
+                scheduler_support::commit_next(rpi_durable::harness::NextTaskState::Terminal {
+                    outcome: rpi_durable::types::TaskOutcome::Completed {
+                        result: serde_json::json!({
+                            "notOwned": not_owned,
+                            "error": error.to_string(),
+                        }),
+                    },
+                }),
+                context,
+            )
+            .await
+    }
+}
+
+/// R-D14: `abortOwned()` rejects a task that is not directly owned, and
+/// `ownedTasks()` never lists it.
+#[tokio::test]
+async fn abort_owned_rejects_a_task_it_does_not_own() {
+    let opened = open_with(vec![Arc::new(NegativeParentTask), Arc::new(ChildTask)]).await;
+    let conversation = root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.negative-parent", serde_json::json!({})),
+    )
+    .await;
+    let settled = opened.harness.wait_for_task(id, &context()).await.unwrap();
+    assert_eq!(settled.result["notOwned"], serde_json::json!(true));
+    assert!(
+        settled.result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("is not owned by task")),
+        "got {}",
+        settled.result
+    );
+    opened.harness.close(&context()).await.unwrap();
+}
+
+struct SleepOwner;
+
+#[async_trait::async_trait]
+impl rpi_durable::harness::TaskDefinition for SleepOwner {
+    fn name(&self) -> &str {
+        "test.sleep-owner"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> rpi_durable::chord::json::JsonValue {
+        serde_json::json!({ "phase": "sleep" })
+    }
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: rpi_durable::harness::RunningTask,
+        runtime: &dyn rpi_durable::harness::TaskRuntime,
+        context: &rpi_durable::chord::context::Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        let until = runtime.now()? + 3_600_000.0;
+        runtime
+            .sleep_until(until, serde_json::json!({ "phase": "done" }), context)
+            .await
+    }
+}
+
+struct CountingTask(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl rpi_durable::harness::TaskDefinition for CountingTask {
+    fn name(&self) -> &str {
+        "test.counting"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> rpi_durable::chord::json::JsonValue {
+        serde_json::json!({ "phase": "step" })
+    }
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: rpi_durable::harness::RunningTask,
+        runtime: &dyn rpi_durable::harness::TaskRuntime,
+        context: &rpi_durable::chord::context::Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        runtime
+            .commit(
+                scheduler_support::commit_next(rpi_durable::harness::NextTaskState::Terminal {
+                    outcome: rpi_durable::types::TaskOutcome::Completed {
+                        result: serde_json::json!({}),
+                    },
+                }),
+                context,
+            )
+            .await
+    }
+}
+
+/// R-D14: a cancellation intent above a task parks it before any run phase.
+#[tokio::test]
+async fn a_cancelled_owner_prevents_below_run_phases() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let opened = open_with(vec![
+        Arc::new(SleepOwner),
+        Arc::new(CountingTask(Arc::clone(&runs))),
+    ])
+    .await;
+    let conversation = root(&opened.harness).await;
+    let owner = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.sleep-owner", serde_json::json!({})),
+    )
+    .await;
+    let child = add_task(
+        &opened.harness,
+        conversation,
+        Spec::child("test.counting", serde_json::json!({}), owner),
+    )
+    .await;
+    let mut record = opened
+        .harness
+        .get_task(owner, &context())
+        .await
+        .unwrap()
+        .expect("owner");
+    record.abort_requested = true;
+    scheduler_support::stamp_task(&opened.harness, record).await;
+
+    opened.harness.resume().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "a child below a cancelled owner must not run"
+    );
+    let child_record = opened
+        .harness
+        .get_task(child, &context())
+        .await
+        .unwrap()
+        .expect("child");
+    assert!(matches!(
+        child_record.state,
+        rpi_durable::types::TaskState::Terminal { .. }
+            | rpi_durable::types::TaskState::Completing { .. }
+    ));
+    opened.harness.close(&context()).await.unwrap();
+}
+
+struct SlowTask(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl rpi_durable::harness::TaskDefinition for SlowTask {
+    fn name(&self) -> &str {
+        "test.slow"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> rpi_durable::chord::json::JsonValue {
+        serde_json::json!({ "phase": "step", "count": 0 })
+    }
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        task: rpi_durable::harness::RunningTask,
+        runtime: &dyn rpi_durable::harness::TaskRuntime,
+        context: &rpi_durable::chord::context::Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        let count = task
+            .checkpoint()
+            .and_then(|checkpoint| checkpoint.get("count"))
+            .and_then(rpi_durable::chord::json::JsonValue::as_u64)
+            .unwrap_or(0);
+        self.0.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let next = if count + 1 >= 6 {
+            rpi_durable::harness::NextTaskState::Terminal {
+                outcome: rpi_durable::types::TaskOutcome::Completed {
+                    result: serde_json::json!({ "count": count + 1 }),
+                },
+            }
+        } else {
+            rpi_durable::harness::NextTaskState::Running {
+                checkpoint: serde_json::json!({ "phase": "step", "count": count + 1 }),
+            }
+        };
+        runtime
+            .commit(scheduler_support::commit_next(next), context)
+            .await
+    }
+}
+
+/// R-D7: an invocation under an uninstalled definition reports `task_outdated`
+/// once, not once per phase.
+#[tokio::test]
+async fn an_outdated_definition_reports_once_per_invocation() {
+    let phases = Arc::new(AtomicUsize::new(0));
+    let reports = Arc::new(Mutex::new(Vec::<ReportKind>::new()));
+    let sink = Arc::clone(&reports);
+    let opened = open_with_storage_settings_and_report(
+        Arc::new(MemoryStorage::new()),
+        vec![Arc::new(SlowTask(Arc::clone(&phases)))],
+        None,
+        Some(Arc::new(move |info: ReportInfo| {
+            sink.lock().expect("reports").push(info.kind);
+        })),
+    )
+    .await;
+    let conversation = root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.slow", serde_json::json!({})),
+    )
+    .await;
+    opened.harness.resume().unwrap();
+    for _ in 0..200 {
+        if phases.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    opened.registry.uninstall(&Extension {
+        name: "test".to_string(),
+        ..Extension::default()
+    });
+    let _ = opened.harness.wait_for_task(id, &context()).await.unwrap();
+    let outdated = reports
+        .lock()
+        .expect("reports")
+        .iter()
+        .filter(|kind| **kind == ReportKind::TaskOutdated)
+        .count();
+    assert_eq!(outdated, 1, "got {:?}", reports.lock().expect("reports"));
     opened.harness.close(&context()).await.unwrap();
 }

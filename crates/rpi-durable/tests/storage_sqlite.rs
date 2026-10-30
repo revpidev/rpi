@@ -575,6 +575,8 @@ fn waiting_task(id: u64) -> TaskRecord {
         kind: "test.task".to_string(),
         version: 1,
         input: serde_json::Value::Null,
+        trace: None,
+        links: Vec::new(),
         owner: None,
         background: false,
         abort_requested: false,

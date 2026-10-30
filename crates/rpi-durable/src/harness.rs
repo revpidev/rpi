@@ -38,7 +38,10 @@ pub mod types;
 pub mod usage;
 pub mod util;
 
-pub use crate::chord::telemetry::{TelemetryContext, TelemetrySink, durable_telemetry_schema};
+pub use crate::chord::telemetry::{
+    TelemetryCarrier, TelemetryContext, TelemetrySink, TelemetrySpan, TelemetrySpanSink,
+    durable_telemetry_schema,
+};
 pub use crate::codemode::{
     CodemodeHost, CodemodeImage, CodemodeJournal, CodemodeJournalEntry, CodemodeNamespace,
     CodemodeOutcome, CodemodeSandbox, CodemodeStart, CodemodeStoreState, CodemodeTextItem,

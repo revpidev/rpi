@@ -95,6 +95,8 @@ fn pending_task(id: TaskId, conversation_id: ConversationId, phase: &str) -> Tas
         kind: "test.task".to_string(),
         version: 1,
         input: serde_json::json!({ "value": id.get() }),
+        trace: None,
+        links: Vec::new(),
         owner: None,
         background: false,
         abort_requested: false,
@@ -135,7 +137,15 @@ fn input_queued(
         conversation_id,
         request_id: request_id.map(str::to_string),
         status: InputSubmissionStatus::Queued,
+        trace: None,
     }
+}
+
+/// An adapter-owned carrier with one opaque id, to check record round-trips.
+fn carrier(span: u64) -> crate::chord::telemetry::TelemetryCarrier {
+    let mut carrier = JsonObject::new();
+    carrier.insert("span".to_string(), JsonValue::from(span));
+    carrier
 }
 
 fn task_by_id(
@@ -217,6 +227,7 @@ fn case_2_mixed_commit_rollback(storage: Arc<dyn Storage>) -> ConformanceFuture 
             conversation_id: root,
             request_id: Some("request-1".to_string()),
             status: InputSubmissionStatus::Placed { entry: entry_id },
+            trace: None,
         };
         let initial_seq = storage
             .commit(
@@ -261,6 +272,7 @@ fn case_2_mixed_commit_rollback(storage: Arc<dyn Storage>) -> ConformanceFuture 
                 entry: entry_id,
                 answer: transient_entry_id,
             },
+            trace: None,
         };
         check_err(
             storage
@@ -337,6 +349,7 @@ fn case_3_detaches_writes(storage: Arc<dyn Storage>) -> ConformanceFuture {
                 reason: "failed".to_string(),
                 detail: Some(serde_json::json!({ "codes": ["initial"] })),
             },
+            trace: None,
         };
         storage
             .commit(
@@ -1570,6 +1583,8 @@ fn case_11_task_replacement_and_pages(storage: Arc<dyn Storage>) -> ConformanceF
         let second: TaskId = id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         let third: TaskId = id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         let mut first_task = pending_task(first, root, "ready");
+        first_task.trace = Some(carrier(11));
+        first_task.links = vec![carrier(12), carrier(13)];
         first_task.memos = Some({
             let mut memos = JsonObject::new();
             memos.insert("winner".to_string(), JsonValue::String("first".to_string()));
@@ -1847,7 +1862,9 @@ fn case_13_request_ids(storage: Arc<dyn Storage>) -> ConformanceFuture {
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         let other: SubmissionId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
-        let first_record = input_queued(first, root, Some("same"));
+        let mut first_record = input_queued(first, root, Some("same"));
+        first_record.set_trace(Some(carrier(14)));
+        let first_record = first_record;
         let second_record = input_queued(second, root, Some("other"));
         let other_record = input_queued(other, second_conversation, Some("same"));
         storage
@@ -1888,6 +1905,7 @@ fn case_13_request_ids(storage: Arc<dyn Storage>) -> ConformanceFuture {
             status: InputSubmissionStatus::Placed {
                 entry: id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?),
             },
+            trace: None,
         };
         storage
             .commit(
@@ -1994,12 +2012,14 @@ fn case_14_passive_submissions(storage: Arc<dyn Storage>) -> ConformanceFuture {
             conversation_id: root,
             request_id: Some("passive-done".to_string()),
             status: crate::types::WriteSubmissionStatus::Queued,
+            trace: None,
         };
         let queued_failed = SubmissionRecord::Write {
             id: failed_id,
             conversation_id: root,
             request_id: Some("passive-failed".to_string()),
             status: crate::types::WriteSubmissionStatus::Queued,
+            trace: None,
         };
         storage
             .commit(
@@ -2022,6 +2042,7 @@ fn case_14_passive_submissions(storage: Arc<dyn Storage>) -> ConformanceFuture {
             status: crate::types::WriteSubmissionStatus::Done {
                 entry: id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?),
             },
+            trace: None,
         };
         let unanswered = SubmissionRecord::Write {
             id: failed_id,
@@ -2031,6 +2052,7 @@ fn case_14_passive_submissions(storage: Arc<dyn Storage>) -> ConformanceFuture {
                 reason: "closed".to_string(),
                 detail: Some(serde_json::json!({ "retryable": false })),
             },
+            trace: None,
         };
         storage
             .commit(
@@ -3412,6 +3434,7 @@ fn case_21_document_rollback(storage: Arc<dyn Storage>) -> ConformanceFuture {
                                     reason: "failed".to_string(),
                                     detail: None,
                                 },
+                                trace: None,
                             },
                         },
                         StorageWrite::Entry {

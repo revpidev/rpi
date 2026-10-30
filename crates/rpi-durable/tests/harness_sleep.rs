@@ -189,6 +189,8 @@ async fn create_task(harness: &Arc<HarnessImpl>, kind: &str) -> TaskId {
                         conversation_id: Some(rpi_durable::ids::ROOT_CONVERSATION_ID),
                         background: false,
                         abandon_on_restart: false,
+                        trace: Default::default(),
+                        links: Vec::new(),
                     })
                     .await
                 })
@@ -468,4 +470,61 @@ async fn the_earliest_of_several_sleeps_wakes_the_harness() {
         second.record.state,
         rpi_durable::types::TaskState::Terminal { .. }
     ));
+}
+
+/// R-D6: `wake()` is a pure snapshot, and a clock that moves backwards does not
+/// wake a task early; the timer re-arms until the deadline.
+#[tokio::test]
+async fn repeated_wake_is_stable_and_a_backwards_clock_rearms() {
+    let invocations = Arc::new(AtomicU64::new(0));
+    let timer = Arc::new(FakeTimer::default());
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let opened = open(
+        Arc::new(SleepTask {
+            invocations: Arc::clone(&invocations),
+            delay: 1_000.0,
+            name: "test.sleep",
+        }),
+        Arc::clone(&timer),
+        None,
+        Arc::clone(&clock),
+    )
+    .await;
+    let id = create_task(&opened.harness, "test.sleep").await;
+    opened.harness.resume().expect("resume");
+    wait_for_status(&opened.harness, id, TaskStatus::Sleeping).await;
+
+    let first = opened.harness.wake();
+    let second = opened.harness.wake();
+    assert_eq!(first, second);
+    assert!(!first.active);
+    assert_eq!(first.at, Some(2_000.0));
+
+    // A clock wind-back makes the early wake not due; the task sleeps again.
+    clock.store(500, Ordering::SeqCst);
+    timer.fire();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let record = opened
+        .harness
+        .get_task(id, &BACKGROUND_CONTEXT.clone())
+        .await
+        .expect("task")
+        .expect("record");
+    assert_eq!(record.status(), TaskStatus::Sleeping);
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+    clock.store(2_000, Ordering::SeqCst);
+    timer.fire();
+    for _ in 0..200 {
+        if invocations.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(invocations.load(Ordering::SeqCst), 2);
+    opened
+        .harness
+        .close(&BACKGROUND_CONTEXT.clone())
+        .await
+        .expect("close");
 }

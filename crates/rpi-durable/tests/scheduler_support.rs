@@ -566,6 +566,8 @@ impl TaskDefinition for FanoutTask {
                         conversation_id: Some(conversation_id),
                         background: false,
                         abandon_on_restart: false,
+                        trace: Default::default(),
+                        links: Vec::new(),
                     })
                     .await?;
                 let slow = tx
@@ -578,6 +580,8 @@ impl TaskDefinition for FanoutTask {
                         conversation_id: Some(conversation_id),
                         background: false,
                         abandon_on_restart: false,
+                        trace: Default::default(),
+                        links: Vec::new(),
                     })
                     .await?;
                 Ok(Some(NextTaskState::Waiting {
@@ -703,6 +707,46 @@ pub async fn open_with_storage_settings_and_report(
     }
 }
 
+/// Open a Harness over `storage` whose registry holds `tasks`, with the
+/// given host telemetry context.
+pub async fn open_with_telemetry(
+    storage: Arc<dyn Storage>,
+    tasks: Vec<AnyTask>,
+    telemetry: rpi_durable::harness::TelemetryContext,
+) -> Opened {
+    let registry = Arc::new(RegistryImpl::with_builtins(builtins()));
+    if !tasks.is_empty() {
+        let extension = Extension {
+            name: "test".into(),
+            tasks,
+            ..Extension::default()
+        };
+        registry.install(extension).expect("install test extension");
+    }
+    let options = HarnessOptions {
+        telemetry: Some(telemetry),
+        models: Models::new(None).into(),
+        identity: None,
+        registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,
+        settings: None,
+        env: None,
+        conversation_created: None,
+        now: None,
+        set_timer: None,
+        on_wake: None,
+        on_report: None,
+        on_report_info: None,
+    };
+    let harness = open_harness(Arc::clone(&storage), options, &context())
+        .await
+        .expect("open harness");
+    Opened {
+        harness,
+        registry,
+        storage,
+    }
+}
+
 /// All test definitions, each registered under `test.*`.
 pub fn all_tasks() -> Vec<AnyTask> {
     vec![
@@ -789,6 +833,8 @@ pub async fn add_task(
                 conversation_id: Some(conversation_id),
                 background: spec.background,
                 abandon_on_restart: false,
+                trace: Default::default(),
+                links: Vec::new(),
             })
             .await
         })
@@ -822,6 +868,8 @@ pub async fn add_family(
                     conversation_id: Some(conversation_id),
                     background: false,
                     abandon_on_restart: false,
+                    trace: Default::default(),
+                    links: Vec::new(),
                 })
                 .await?;
             let mut ids = Vec::new();
@@ -836,6 +884,8 @@ pub async fn add_family(
                         conversation_id: Some(conversation_id),
                         background: false,
                         abandon_on_restart: false,
+                        trace: Default::default(),
+                        links: Vec::new(),
                     })
                     .await?,
                 );

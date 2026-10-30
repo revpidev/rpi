@@ -1654,7 +1654,8 @@ pub enum Scheduling {
 }
 
 /// Why a live task is blocked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BlockedReason {
     /// No registered definition matches the task kind.
     MissingTask,

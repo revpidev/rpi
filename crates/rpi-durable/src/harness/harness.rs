@@ -1134,13 +1134,21 @@ pub async fn open_harness_with_scheduler(
     let submissions = Submissions::open(
         Arc::clone(&session),
         Arc::clone(&scheduler),
+        options
+            .telemetry
+            .clone()
+            .unwrap_or_else(crate::chord::telemetry::TelemetryContext::none),
         now,
         queue_modes,
         resume,
     );
     // Let an invocation-bound conversation handle admit input.
     scheduler.install_submissions(Arc::clone(&submissions));
-    let task_graph = TaskGraphView::open(Arc::clone(&session), Arc::clone(&storage));
+    let task_graph = TaskGraphView::open(
+        Arc::clone(&session),
+        Arc::clone(&storage),
+        Arc::clone(&scheduler),
+    );
     let harness = Arc::new_cyclic(|weak| HarnessImpl {
         weak: weak.clone(),
         session,

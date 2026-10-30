@@ -76,6 +76,7 @@ pub struct ControlledStorage {
     commit_gate: Mutex<Option<Arc<Held>>>,
     find_gate: Mutex<Option<Arc<Held>>>,
     commit_failure: Mutex<Option<StorageError>>,
+    mint_failure: Mutex<Option<StorageError>>,
     read_failure: Mutex<Option<StorageError>>,
     close_failure: Mutex<Option<StorageError>>,
 }
@@ -97,6 +98,7 @@ impl ControlledStorage {
             commit_gate: Mutex::new(None),
             find_gate: Mutex::new(None),
             commit_failure: Mutex::new(None),
+            mint_failure: Mutex::new(None),
             read_failure: Mutex::new(None),
             close_failure: Mutex::new(None),
         }
@@ -119,6 +121,11 @@ impl ControlledStorage {
     /// Inject one commit failure.
     pub fn fail_next_commit(&self, error: StorageError) {
         *self.commit_failure.lock().expect("failure") = Some(error);
+    }
+
+    /// Inject one ID-mint failure.
+    pub fn fail_next_mint(&self, error: StorageError) {
+        *self.mint_failure.lock().expect("mint failure") = Some(error);
     }
 
     /// Inject one document-read failure.
@@ -162,6 +169,9 @@ impl Storage for ControlledStorage {
 
     async fn mint_id(&self) -> StorageResult<u64> {
         self.mint_count.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.mint_failure.lock().expect("mint failure").take() {
+            return Err(error);
+        }
         self.inner.mint_id().await
     }
 

@@ -653,6 +653,8 @@ pub async fn create_compaction(
             conversation_id: Some(conversation_id),
             background,
             abandon_on_restart: false,
+            trace: Default::default(),
+            links: Vec::new(),
         })
         .await?;
     let status = CompactionStatus {

@@ -1327,6 +1327,8 @@ async fn terminal_task_retires_task_documents() {
                 conversation_id: None,
                 background: false,
                 abandon_on_restart: false,
+                trace: Default::default(),
+                links: Vec::new(),
             })
             .await
         })
@@ -1619,6 +1621,37 @@ async fn other_read_error_fails_the_session() {
     );
 }
 
+/// R-D11: `mintId()` storage failure fails the Session, even from a
+/// scheduler/transaction commit path.
+#[tokio::test]
+async fn a_mint_failure_fails_the_session() {
+    let harness = open_test_session();
+    harness
+        .storage
+        .fail_next_mint(StorageError::Message("mint failed".into()));
+    let result = harness
+        .session
+        .commit(
+            commit_fn(|tx: &mut rpi_durable::session::Transaction| {
+                Box::pin(async move {
+                    Ok(tx
+                        .create_conversation(rpi_durable::session::ConversationOwnership::Ownerless)
+                        .await?
+                        .id)
+                })
+            }),
+            &BACKGROUND_CONTEXT,
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        harness.session.closed().await,
+        SessionEnd::Failed {
+            error: "mint failed".to_string()
+        }
+    );
+}
+
 /// R-D11: a normal close ends `Session.closed` with `closed`.
 #[tokio::test]
 async fn normal_close_reports_closed() {
@@ -1709,6 +1742,37 @@ async fn host_commit_listener_panic_is_contained() {
             .expect("reported")
             .iter()
             .any(|message| message.contains("commit listener failed")),
+        "got {reported:?}"
+    );
+}
+
+/// R-D11: a `subscribeClose` listener's panic is contained and reported; the
+/// close still completes.
+#[tokio::test]
+async fn host_close_listener_panic_is_contained() {
+    let harness = open_test_session();
+    let reported = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&reported);
+    harness
+        .session
+        .set_listener_reporter(Arc::new(move |message| {
+            sink.lock().expect("reported").push(message);
+        }));
+    let _subscription = harness.session.subscribe_close(Arc::new(|| {
+        panic!("close listener exploded");
+    }));
+    harness
+        .session
+        .close(&BACKGROUND_CONTEXT)
+        .await
+        .expect("close");
+    assert_eq!(harness.session.closed().await, SessionEnd::Closed);
+    assert!(
+        reported
+            .lock()
+            .expect("reported")
+            .iter()
+            .any(|message| message.contains("close listener")),
         "got {reported:?}"
     );
 }

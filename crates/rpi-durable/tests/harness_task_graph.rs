@@ -43,6 +43,8 @@ async fn create_task(
                 conversation_id: Some(conversation),
                 background: false,
                 abandon_on_restart: false,
+                trace: Default::default(),
+                links: Vec::new(),
             })
             .await
         })
@@ -222,4 +224,145 @@ async fn a_noop_commit_publishes_no_revision() {
         .expect("noop");
     assert_eq!(graph.value(), value);
     graph.dispose();
+}
+
+mod scheduler_support;
+
+use rpi_durable::harness::BlockedReason;
+use rpi_durable::harness::{Extension, Harness, Registry, TaskInspectionState};
+use scheduler_support::{
+    FakeTask, Spec, add_task, all_tasks, context as scheduler_context, open_with, stamp_task,
+};
+
+fn blocked(harness_value: &JsonValue, id: TaskId) -> Option<BlockedReason> {
+    let node = &harness_value["tasks"][id.get().to_string()];
+    node.get("blocked")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+/// R-D7: the task graph derives blocked reasons and follows registry changes
+/// without a commit.
+#[tokio::test]
+async fn the_graph_reports_missing_and_registered_definitions() {
+    let opened = open_with(all_tasks()).await;
+    let conversation = scheduler_support::root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.missing", serde_json::json!({})),
+    )
+    .await;
+
+    let state = opened
+        .harness
+        .task_graph(&scheduler_context())
+        .await
+        .expect("graph");
+    assert_eq!(
+        blocked(&state.value(), id),
+        Some(BlockedReason::MissingTask)
+    );
+    state.dispose();
+
+    opened
+        .registry
+        .install(Extension {
+            name: "missing".into(),
+            tasks: vec![Arc::new(FakeTask("test.missing"))],
+            ..Extension::default()
+        })
+        .expect("install definition");
+
+    let mut cleared = false;
+    for _ in 0..100 {
+        let state = opened
+            .harness
+            .task_graph(&scheduler_context())
+            .await
+            .expect("graph");
+        if blocked(&state.value(), id).is_none() {
+            cleared = true;
+            state.dispose();
+            break;
+        }
+        state.dispose();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(cleared, "blocked reason did not follow the registry");
+    opened
+        .harness
+        .close(&scheduler_context())
+        .await
+        .expect("close");
+}
+
+/// R-D7: a parked task is blocked in the graph, consistent with inspect(), and
+/// retryTask() clears both.
+#[tokio::test]
+async fn the_graph_reports_and_clears_the_restart_limit() {
+    let opened = open_with(all_tasks()).await;
+    let conversation = scheduler_support::root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.count", serde_json::json!({ "phases": 5 })),
+    )
+    .await;
+    let mut record = opened
+        .harness
+        .get_task(id, &scheduler_context())
+        .await
+        .expect("task")
+        .expect("record");
+    record.restarts = Some(5);
+    stamp_task(&opened.harness, record).await;
+
+    let state = opened
+        .harness
+        .task_graph(&scheduler_context())
+        .await
+        .expect("graph");
+    assert_eq!(
+        blocked(&state.value(), id),
+        Some(BlockedReason::RestartLimit)
+    );
+    state.dispose();
+    let inspection = opened
+        .harness
+        .inspect(&scheduler_context())
+        .await
+        .expect("inspect");
+    let inspected = inspection
+        .tasks
+        .iter()
+        .find(|task| task.record.id == id)
+        .expect("inspected task")
+        .state
+        .clone();
+    assert!(matches!(
+        inspected,
+        TaskInspectionState::Blocked {
+            reason: BlockedReason::RestartLimit,
+            ..
+        }
+    ));
+
+    opened
+        .harness
+        .retry_task(id, &scheduler_context())
+        .await
+        .expect("retry");
+    let state = opened
+        .harness
+        .task_graph(&scheduler_context())
+        .await
+        .expect("graph");
+    assert_eq!(blocked(&state.value(), id), None);
+    state.dispose();
+    opened
+        .harness
+        .close(&scheduler_context())
+        .await
+        .expect("close");
 }

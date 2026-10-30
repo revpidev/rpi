@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chord::delta::Op;
 use crate::chord::json::{JsonObject, JsonValue};
+use crate::chord::telemetry::TelemetryCarrier;
 use crate::errors::{StorageError, StorageResult};
 use crate::ids::{ConversationId, DocumentId, EntryId, Id, Seq, SubmissionId, TaskId};
 use crate::session::TaskOwnership;
@@ -270,6 +271,13 @@ pub struct TaskRecord {
     pub version: u64,
     /// Original task input retained while the task is live or terminal.
     pub input: JsonValue,
+    /// Adapter-owned context that created this task; phase invocations extract
+    /// it as their parent (upstream `trace`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<TelemetryCarrier>,
+    /// Immutable creation-time links for the task's first invocation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<TelemetryCarrier>,
     /// Owning task of a child task; absent for a task its conversation owns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<TaskId>,
@@ -395,6 +403,10 @@ pub enum SubmissionRecord {
         id: SubmissionId,
         /// Conversation the submission belongs to.
         conversation_id: ConversationId,
+        /// Adapter-owned context of the admission span; absent without
+        /// propagation (upstream `trace`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace: Option<TelemetryCarrier>,
         /// Host-provided deduplication key, scoped to the conversation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
@@ -407,6 +419,10 @@ pub enum SubmissionRecord {
         id: SubmissionId,
         /// Conversation the submission belongs to.
         conversation_id: ConversationId,
+        /// Adapter-owned context of the admission span; absent without
+        /// propagation (upstream `trace`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace: Option<TelemetryCarrier>,
         /// Host-provided deduplication key, scoped to the conversation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
@@ -440,6 +456,23 @@ impl SubmissionRecord {
         match self {
             SubmissionRecord::Input { request_id, .. }
             | SubmissionRecord::Write { request_id, .. } => request_id.as_deref(),
+        }
+    }
+
+    /// Adapter-owned admission trace.
+    pub fn trace(&self) -> Option<&TelemetryCarrier> {
+        match self {
+            SubmissionRecord::Input { trace, .. } | SubmissionRecord::Write { trace, .. } => {
+                trace.as_ref()
+            }
+        }
+    }
+
+    /// Set the adapter-owned admission trace.
+    pub fn set_trace(&mut self, trace: Option<TelemetryCarrier>) {
+        match self {
+            SubmissionRecord::Input { trace: slot, .. }
+            | SubmissionRecord::Write { trace: slot, .. } => *slot = trace,
         }
     }
 

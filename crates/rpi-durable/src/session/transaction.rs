@@ -135,7 +135,11 @@ impl SubmissionCreate {
         }
     }
 
-    fn into_record(self, id: SubmissionId) -> SubmissionRecord {
+    fn into_record(
+        self,
+        id: SubmissionId,
+        trace: Option<crate::chord::telemetry::TelemetryCarrier>,
+    ) -> SubmissionRecord {
         use crate::types::{InputSubmissionStatus, WriteSubmissionStatus};
         match self {
             SubmissionCreate::Input {
@@ -144,6 +148,7 @@ impl SubmissionCreate {
             } => SubmissionRecord::Input {
                 id,
                 conversation_id,
+                trace,
                 request_id,
                 status: InputSubmissionStatus::Queued,
             },
@@ -153,6 +158,7 @@ impl SubmissionCreate {
             } => SubmissionRecord::Write {
                 id,
                 conversation_id,
+                trace,
                 request_id,
                 status: WriteSubmissionStatus::Queued,
             },
@@ -526,6 +532,35 @@ impl Transaction {
         Ok(self.host.storage().submission(id, &self.context).await?)
     }
 
+    /// The telemetry context of this commit (the admission or phase span).
+    pub fn telemetry(&self) -> crate::chord::telemetry::TelemetryContext {
+        self.context.telemetry()
+    }
+
+    /// Resolve a run's parent trace and links from its input submissions: the
+    /// first submission's trace is the parent, later ones become links (upstream
+    /// `createTask({ submissionIds })`).
+    pub async fn task_trace(
+        &self,
+        inputs: &[SubmissionId],
+    ) -> SessionResult<(TaskTrace, Vec<crate::chord::telemetry::TelemetryCarrier>)> {
+        let mut trace = TaskTrace::Root;
+        let mut links = Vec::new();
+        for (index, id) in inputs.iter().enumerate() {
+            let record = match self.submissions.get(id) {
+                Some(record) => Some(record.clone()),
+                None => self.host.storage().submission(*id, &self.context).await?,
+            };
+            let carrier = record.as_ref().and_then(|record| record.trace().cloned());
+            if index == 0 {
+                trace = carrier.map_or(TaskTrace::Root, TaskTrace::Carrier);
+            } else if let Some(carrier) = carrier {
+                links.push(carrier);
+            }
+        }
+        Ok((trace, links))
+    }
+
     /// Committed submission with a conversation-scoped request ID.
     pub async fn submission_by_request(
         &self,
@@ -740,12 +775,19 @@ impl Transaction {
         self.assert_open()?;
         let id = id_from_number::<crate::ids::Task>(self.host.storage().mint_id().await?);
         self.assert_open()?;
+        let trace = match &create.trace {
+            TaskTrace::Inherit => self.context.telemetry().inject(),
+            TaskTrace::Root => None,
+            TaskTrace::Carrier(trace) => Some(trace.clone()),
+        };
         let record = TaskRecord {
             id,
             conversation_id,
             kind: create.kind,
             version: create.version,
             input: create.input,
+            trace,
+            links: create.links,
             owner: owner_record.as_ref().map(|owner| owner.id),
             background: create.background,
             abort_requested: false,
@@ -778,7 +820,8 @@ impl Transaction {
         self.assert_open()?;
         let id = id_from_number::<crate::ids::Submission>(self.host.storage().mint_id().await?);
         self.assert_open()?;
-        let record = create.into_record(id);
+        let trace = self.context.telemetry().inject();
+        let record = create.into_record(id, trace);
         self.submissions.insert(id, record.clone());
         Ok(record)
     }
@@ -1634,6 +1677,19 @@ impl Transaction {
     }
 }
 
+/// Where a new task's adapter-owned trace comes from (upstream
+/// `TaskOptions.trace`).
+#[derive(Debug, Clone, Default)]
+pub enum TaskTrace {
+    /// Inherit the transaction's current span carrier.
+    #[default]
+    Inherit,
+    /// Start at the adapter root without a stored carrier.
+    Root,
+    /// Use this carrier as the parent.
+    Carrier(crate::chord::telemetry::TelemetryCarrier),
+}
+
 /// Fields of one task created by [`Transaction::create_task`].
 #[derive(Debug, Clone)]
 pub struct TaskCreate {
@@ -1653,6 +1709,10 @@ pub struct TaskCreate {
     pub background: bool,
     /// Abort the task before it runs again after a restart.
     pub abandon_on_restart: bool,
+    /// Adapter-owned parent trace for the task's first invocation.
+    pub trace: TaskTrace,
+    /// Immutable creation-time links for the task's first invocation.
+    pub links: Vec<crate::chord::telemetry::TelemetryCarrier>,
 }
 
 pub(crate) fn doc_target<'a>(
@@ -1836,22 +1896,26 @@ fn apply_submission_change(
             SubmissionRecord::Input {
                 id,
                 conversation_id,
+                trace,
                 request_id,
                 status: InputSubmissionStatus::Queued,
             } => Ok(SubmissionRecord::Input {
                 id,
                 conversation_id,
+                trace,
                 request_id,
                 status: InputSubmissionStatus::Placed { entry },
             }),
             SubmissionRecord::Write {
                 id,
                 conversation_id,
+                trace,
                 request_id,
                 status: WriteSubmissionStatus::Queued,
             } => Ok(SubmissionRecord::Write {
                 id,
                 conversation_id,
+                trace,
                 request_id,
                 status: WriteSubmissionStatus::Done { entry },
             }),
@@ -1865,6 +1929,7 @@ fn apply_submission_change(
                 SubmissionRecord::Input {
                     id,
                     conversation_id,
+                    trace,
                     request_id,
                     status: InputSubmissionStatus::Placed { entry },
                 },
@@ -1872,6 +1937,7 @@ fn apply_submission_change(
             ) => Ok(SubmissionRecord::Input {
                 id,
                 conversation_id,
+                trace,
                 request_id,
                 status: InputSubmissionStatus::Done { entry, answer },
             }),
@@ -1879,6 +1945,7 @@ fn apply_submission_change(
                 SubmissionRecord::Input {
                     id,
                     conversation_id,
+                    trace,
                     request_id,
                     status,
                 },
@@ -1891,6 +1958,7 @@ fn apply_submission_change(
                 Ok(SubmissionRecord::Input {
                     id,
                     conversation_id,
+                    trace,
                     request_id,
                     status: InputSubmissionStatus::Unanswered {
                         entry,
@@ -1903,6 +1971,7 @@ fn apply_submission_change(
                 SubmissionRecord::Write {
                     id,
                     conversation_id,
+                    trace,
                     request_id,
                     ..
                 },
@@ -1910,6 +1979,7 @@ fn apply_submission_change(
             ) => Ok(SubmissionRecord::Write {
                 id,
                 conversation_id,
+                trace,
                 request_id,
                 status: WriteSubmissionStatus::Unanswered { reason, detail },
             }),

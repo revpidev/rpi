@@ -20,9 +20,16 @@ use crate::chord::context::{Context, without_abort_signal};
 use crate::chord::delta::diff_json;
 use crate::chord::json::JsonValue;
 use crate::chord::state::AttachedReplicatedState;
+use crate::harness::scheduler::{BlockedListener, BlockedSubject, SchedulerService};
+
+/// Derives one task's blocked reason for the graph.
+pub type BlockedFn = Arc<dyn Fn(&BlockedSubject) -> Option<BlockedReason> + Send + Sync>;
+use crate::harness::types::BlockedReason;
 use crate::ids::{ConversationId, TaskId};
 use crate::session::observation::{CommittedStateSource, CommittedWatch};
-use crate::session::{CommitChange, CommitPublication, SessionError, SessionImpl, SessionResult};
+use crate::session::{
+    CommitChange, CommitPublication, SessionError, SessionImpl, SessionResult, Subscription,
+};
 use crate::types::{
     ConversationQuery, ConversationRecord, Page, Storage, StorageWrite, TaskOutcome, TaskQuery,
     TaskRecord, TaskState, TaskStatus,
@@ -85,6 +92,11 @@ pub struct TaskGraphNode {
     pub abort_requested: bool,
     /// Durable status without payloads.
     pub state: TaskGraphState,
+    /// Why it cannot run here, when it cannot: no registered definition takes it
+    /// (`missing_task`, `task_too_old`, `migration_failed`), or the restart
+    /// limit parked it (`restart_limit`). Follows registry changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<BlockedReason>,
     /// Conversations this task owns, in ID order.
     pub conversations: Vec<ConversationId>,
 }
@@ -114,6 +126,9 @@ enum Observer {
 
 struct Mount {
     value: TaskGraph,
+    /// What the blocked reason reads of each live task, so a registry change can
+    /// derive it again without payloads.
+    records: BTreeMap<String, BlockedSubject>,
     observers: Vec<Observer>,
 }
 
@@ -122,6 +137,8 @@ struct Mount {
 pub struct TaskGraphView {
     session: Arc<SessionImpl>,
     storage: Arc<dyn Storage>,
+    blocked: BlockedFn,
+    blocked_subscription: Mutex<Option<Subscription>>,
     mount: Mutex<Option<Mount>>,
     closed: AtomicBool,
     next_observer: AtomicU64,
@@ -130,10 +147,17 @@ pub struct TaskGraphView {
 impl TaskGraphView {
     /// Build the view and subscribe it to the session's commit and close
     /// publications.
-    pub fn open(session: Arc<SessionImpl>, storage: Arc<dyn Storage>) -> Arc<Self> {
+    pub fn open(
+        session: Arc<SessionImpl>,
+        storage: Arc<dyn Storage>,
+        scheduler: Arc<dyn SchedulerService>,
+    ) -> Arc<Self> {
+        let blocking = Arc::clone(&scheduler);
         let view = Arc::new(Self {
             session: Arc::clone(&session),
             storage,
+            blocked: Arc::new(move |subject: &BlockedSubject| blocking.blocked_reason(subject)),
+            blocked_subscription: Mutex::new(None),
             mount: Mutex::new(None),
             closed: AtomicBool::new(false),
             next_observer: AtomicU64::new(1),
@@ -146,6 +170,12 @@ impl TaskGraphView {
         session.subscribe_close(Arc::new(move || {
             closing.close_session();
         }));
+        let refreshing = Arc::clone(&view);
+        let listener: BlockedListener = Arc::new(move || refreshing.refresh_blocked());
+        let subscription = scheduler.subscribe_blocked(listener);
+        if let Ok(mut slot) = view.blocked_subscription.lock() {
+            *slot = Some(subscription);
+        }
         view
     }
 
@@ -159,11 +189,16 @@ impl TaskGraphView {
         let Some(mount) = guard.as_mut() else {
             return;
         };
-        advance(mount, publication, context);
+        advance(mount, publication, context, &*self.blocked);
     }
 
     fn close_session(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        if let Ok(mut slot) = self.blocked_subscription.lock()
+            && let Some(subscription) = slot.take()
+        {
+            subscription.unsubscribe();
+        }
         let observers = match self.mount.lock() {
             Ok(mut guard) => guard.take().map(|mount| mount.observers),
             Err(_) => None,
@@ -264,7 +299,7 @@ impl TaskGraphView {
         {
             return Ok(mount.value.clone());
         }
-        let value = self.build(context).await?;
+        let (value, records) = self.build(context).await?;
         let mut guard = self
             .mount
             .lock()
@@ -274,6 +309,7 @@ impl TaskGraphView {
             None => {
                 *guard = Some(Mount {
                     value: value.clone(),
+                    records,
                     observers: Vec::new(),
                 });
                 Ok(value)
@@ -316,7 +352,62 @@ impl TaskGraphView {
         }
     }
 
-    async fn build(&self, context: &Context) -> SessionResult<TaskGraph> {
+    /// On the Session line: derive every node's blocked reason again, and
+    /// publish the ones that changed.
+    fn refresh_blocked(self: &Arc<Self>) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        if self
+            .mount
+            .lock()
+            .map(|mount| mount.is_none())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let refresh = Arc::clone(&this);
+            let _ = this
+                .session
+                .read_on_line(move || {
+                    Box::pin(async move {
+                        refresh.apply_blocked_refresh();
+                        Ok(())
+                    })
+                })
+                .await;
+        });
+    }
+
+    fn apply_blocked_refresh(&self) {
+        let Ok(mut guard) = self.mount.lock() else {
+            return;
+        };
+        let Some(mount) = guard.as_mut() else {
+            return;
+        };
+        let mut next = mount.value.clone();
+        let mut changed = false;
+        for (key, subject) in &mount.records {
+            let blocked = (self.blocked)(subject);
+            if let Some(node) = next.tasks.get_mut(key)
+                && node.blocked != blocked
+            {
+                node.blocked = blocked;
+                changed = true;
+            }
+        }
+        if changed {
+            publish(mount, next, &crate::chord::context::BACKGROUND_CONTEXT);
+        }
+    }
+
+    async fn build(
+        &self,
+        context: &Context,
+    ) -> SessionResult<(TaskGraph, BTreeMap<String, BlockedSubject>)> {
         let mut records: Vec<TaskRecord> = Vec::new();
         for status in LIVE_STATUSES {
             let mut cursor = None;
@@ -342,14 +433,21 @@ impl TaskGraphView {
         }
         records.sort_by_key(|record| record.id);
         let mut tasks: BTreeMap<String, TaskGraphNode> = BTreeMap::new();
+        let mut subjects: BTreeMap<String, BlockedSubject> = BTreeMap::new();
         for record in &records {
             let owned = self.scan_owned(record.id, context).await?;
             let mut conversations: Vec<ConversationId> =
                 owned.iter().map(|conversation| conversation.id).collect();
             conversations.sort();
-            tasks.insert(record.id.get().to_string(), node_of(record, conversations));
+            let key = record.id.get().to_string();
+            let subject = BlockedSubject::of(record);
+            tasks.insert(
+                key.clone(),
+                node_of(record, conversations, (self.blocked)(&subject)),
+            );
+            subjects.insert(key, subject);
         }
-        Ok(TaskGraph { tasks })
+        Ok((TaskGraph { tasks }, subjects))
     }
 
     async fn scan_owned(
@@ -392,23 +490,34 @@ fn is_cancelled(context: &Context) -> bool {
 /// observer.
 // FORM: upstream applies a hand-built `Op` batch; the port recomputes the graph
 // value and emits `diff_json(previous, next)` at the registered tracker shape.
-fn advance(mount: &mut Mount, publication: &CommitPublication, context: &Context) {
+fn advance(
+    mount: &mut Mount,
+    publication: &CommitPublication,
+    context: &Context,
+    blocked: &(dyn Fn(&BlockedSubject) -> Option<BlockedReason> + Send + Sync),
+) {
     let mut next = mount.value.clone();
     for change in &publication.changes {
         if let CommitChange::Table(StorageWrite::Task { value }) = change {
             let key = value.id.get().to_string();
             let previous = next.tasks.get(&key).cloned();
             if value.status() == TaskStatus::Terminal {
+                mount.records.remove(&key);
                 if previous.is_some() {
                     next.tasks.remove(&key);
                 }
                 continue;
             }
-            let conversations = previous
-                .as_ref()
-                .map(|node| node.conversations.clone())
-                .unwrap_or_default();
-            let node = node_of(value, conversations);
+            let subject = BlockedSubject::of(value);
+            let node = node_of(
+                value,
+                previous
+                    .as_ref()
+                    .map(|node| node.conversations.clone())
+                    .unwrap_or_default(),
+                blocked(&subject),
+            );
+            mount.records.insert(key.clone(), subject);
             if previous.as_ref() == Some(&node) {
                 continue;
             }
@@ -431,6 +540,11 @@ fn advance(mount: &mut Mount, publication: &CommitPublication, context: &Context
             }
         }
     }
+    publish(mount, next, context);
+}
+
+/// Apply a recomputed graph and hand the revision to every observer.
+fn publish(mount: &mut Mount, next: TaskGraph, context: &Context) {
     if next == mount.value {
         return;
     }
@@ -450,7 +564,11 @@ fn advance(mount: &mut Mount, publication: &CommitPublication, context: &Context
     }
 }
 
-fn node_of(record: &TaskRecord, conversations: Vec<ConversationId>) -> TaskGraphNode {
+fn node_of(
+    record: &TaskRecord,
+    conversations: Vec<ConversationId>,
+    blocked: Option<BlockedReason>,
+) -> TaskGraphNode {
     TaskGraphNode {
         id: record.id,
         kind: record.kind.clone(),
@@ -459,6 +577,7 @@ fn node_of(record: &TaskRecord, conversations: Vec<ConversationId>) -> TaskGraph
         background: record.background,
         abort_requested: record.abort_requested,
         state: state_of(record),
+        blocked,
         conversations,
     }
 }
@@ -550,6 +669,8 @@ mod tests {
                             conversation_id: Some(conversation),
                             background,
                             abandon_on_restart: false,
+                            trace: Default::default(),
+                            links: Vec::new(),
                         })
                         .await
                     })
@@ -564,7 +685,11 @@ mod tests {
     async fn follows_task_status_and_publishes_no_noop_revision() {
         let session = create_session(Arc::new(MemoryStorage::new()), None);
         let storage: Arc<dyn Storage> = Arc::clone(session.storage());
-        let view = TaskGraphView::open(Arc::clone(&session), storage);
+        let view = TaskGraphView::open(
+            Arc::clone(&session),
+            storage,
+            Arc::new(crate::harness::scheduler::UnavailableScheduler::new()),
+        );
         let conversation = session
             .commit(
                 commit_fn(|tx| {
@@ -606,7 +731,11 @@ mod tests {
     async fn lists_owned_conversations_in_id_order() {
         let session = create_session(Arc::new(MemoryStorage::new()), None);
         let storage: Arc<dyn Storage> = Arc::clone(session.storage());
-        let view = TaskGraphView::open(Arc::clone(&session), storage);
+        let view = TaskGraphView::open(
+            Arc::clone(&session),
+            storage,
+            Arc::new(crate::harness::scheduler::UnavailableScheduler::new()),
+        );
         let context = context();
         let root = session
             .commit(
@@ -658,7 +787,11 @@ mod tests {
     async fn shares_one_mount_between_observers() {
         let session = create_session(Arc::new(MemoryStorage::new()), None);
         let storage: Arc<dyn Storage> = Arc::clone(session.storage());
-        let view = TaskGraphView::open(Arc::clone(&session), storage);
+        let view = TaskGraphView::open(
+            Arc::clone(&session),
+            storage,
+            Arc::new(crate::harness::scheduler::UnavailableScheduler::new()),
+        );
         let first = view.state(&context()).await.expect("first");
         let second = view.state(&context()).await.expect("second");
         assert_eq!(first.value(), second.value());

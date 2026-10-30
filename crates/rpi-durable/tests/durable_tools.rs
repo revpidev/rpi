@@ -1,6 +1,7 @@
 //! Durable tool integration tests (port of `packages/durable/test/tools.test.ts`
 //! @ `4a080252f` and the environment-facing cases of `harness-tools`).
 
+mod generation_support;
 #[path = "tools_support.rs"]
 mod tools_support;
 
@@ -14,7 +15,7 @@ use rpi_durable::tools::{
     create_write_tool, prepare_edit_arguments,
 };
 use serde_json::json;
-use tools_support::{FakeApi, TempDir, diagnostic_text, run_tool, text_output};
+use tools_support::{FakeApi, TempDir, diagnostic_text, run_tool, run_tool_with_api, text_output};
 
 fn create_env(dir: &TempDir) -> Arc<dyn ExecutionEnv> {
     Arc::new(NodeExecutionEnv::new(NodeExecutionEnvOptions {
@@ -789,4 +790,34 @@ async fn read_without_a_processor_errors_for_bmp() {
             && diagnostic.message.contains("needs converting")
     }));
     let _ = BuiltinImageProcessor;
+}
+
+/// R-D10/read images: a model without image input gets the placeholder note
+/// while the image remains visible to the transcript.
+#[tokio::test]
+async fn read_notes_a_model_without_vision() {
+    let dir = TempDir::new("durable-read-no-vision");
+    let env = create_env(&dir);
+    let context = rpi_durable::chord::context::BACKGROUND_CONTEXT.clone();
+    env.write_file("tiny.png", FileContent::Bytes(tiny_png()), &context)
+        .await
+        .expect("write image");
+    let model = generation_support::model();
+    let mut api = FakeApi::new(Some(Arc::clone(&env)));
+    api.model = Some(rpi_durable::harness::ModelRef {
+        provider: model.provider.clone(),
+        model_id: model.id.clone(),
+    });
+    api.models = Some(generation_support::test_models(Vec::new()));
+    let (result, _, _) =
+        run_tool_with_api(&create_read_tool(), json!({ "path": "tiny.png" }), api).await;
+    let result = result.expect("read image");
+    assert!(matches!(
+        result.output.as_deref(),
+        Some([rpi_ai::types::ToolResultContent::Image(_)])
+    ));
+    assert!(result.diagnostics.iter().flatten().any(|diagnostic| {
+        diagnostic.code.as_deref() == Some("image")
+            && diagnostic.message.contains("does not support images")
+    }));
 }

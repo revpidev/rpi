@@ -557,7 +557,7 @@ fn codemode_journal_keeps_the_first_result_per_key() {
 /// from its stored start data; the journal answers its nested call, so the
 /// tool executes once.
 #[tokio::test]
-async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
+async fn v1_migration_nested_replay_then_sleep_is_one_chain() {
     use rpi_durable::codemode::{
         CODEMODE_JOURNAL_DOC, CODEMODE_RUN_DOC, CODEMODE_TOOL_NAME, CodemodeHost, CodemodeJournal,
         CodemodeOutcome, CodemodeSandbox, CodemodeStart, CodemodeToolOptions, create_codemode_tool,
@@ -565,6 +565,50 @@ async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
     use rpi_durable::harness::{Registry, TaskScheduler, open_harness_with_scheduler};
     use rpi_durable::session::{EntryDraft, TaskCreate, TaskOwnership, commit_fn};
     use rpi_durable::types::TaskState;
+
+    struct SleepThenDone(Arc<AtomicUsize>);
+    #[async_trait]
+    impl rpi_durable::harness::TaskDefinition for SleepThenDone {
+        fn name(&self) -> &str {
+            "test.chain.sleep"
+        }
+        fn version(&self) -> u64 {
+            1
+        }
+        fn initial(&self) -> JsonValue {
+            serde_json::json!({ "phase": "sleep" })
+        }
+        async fn run_phase(
+            &self,
+            phase: &str,
+            _task: rpi_durable::harness::RunningTask,
+            runtime: &dyn rpi_durable::harness::TaskRuntime,
+            context: &Context,
+        ) -> rpi_durable::session::SessionResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if phase == "sleep" {
+                let until = runtime.now()? + 10.0;
+                runtime
+                    .sleep_until(until, serde_json::json!({ "phase": "done" }), context)
+                    .await
+            } else {
+                runtime
+                    .commit(
+                        Arc::new(|_tx, _current| {
+                            Box::pin(async move {
+                                Ok(Some(rpi_durable::harness::NextTaskState::Terminal {
+                                    outcome: rpi_durable::types::TaskOutcome::Completed {
+                                        result: serde_json::json!({ "woke": true }),
+                                    },
+                                }))
+                            })
+                        }),
+                        context,
+                    )
+                    .await
+            }
+        }
+    }
 
     struct HeldSandbox {
         called: Arc<tokio::sync::Notify>,
@@ -601,6 +645,7 @@ async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
     }
 
     let runs = Arc::new(AtomicUsize::new(0));
+    let phases = Arc::new(AtomicUsize::new(0));
     let called = Arc::new(tokio::sync::Notify::new());
     let hold = Arc::new(tokio::sync::Notify::new());
     let registry = Arc::new(rpi_durable::harness::RegistryImpl::with_builtins(
@@ -631,6 +676,13 @@ async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
             ),
         ]))
         .expect("install");
+    registry
+        .install(rpi_durable::harness::Extension {
+            name: "chain-sleep".to_string(),
+            tasks: vec![Arc::new(SleepThenDone(Arc::clone(&phases)))],
+            ..rpi_durable::harness::Extension::default()
+        })
+        .expect("install sleep task");
     let storage: Arc<dyn rpi_durable::types::Storage> =
         Arc::new(rpi_durable::storage::MemoryStorage::new());
     let options = || rpi_durable::harness::HarnessOptions {
@@ -679,9 +731,8 @@ async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
                     let entry = tx.append_entry(conversation, draft).await?;
                     tx.create_task(TaskCreate {
                         kind: "pi.tool".to_string(),
-                        version: 2,
+                        version: 1,
                         input: serde_json::json!({
-                            "kind": "model",
                             "assistant": entry.id,
                             "callId": "c1",
                         }),
@@ -690,6 +741,8 @@ async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
                         conversation_id: Some(conversation),
                         background: false,
                         abandon_on_restart: false,
+                        trace: Default::default(),
+                        links: Vec::new(),
                     })
                     .await
                 })
@@ -748,12 +801,51 @@ async fn codemode_replay_after_restart_does_not_repeat_a_nested_call() {
         1,
         "the journal answered the nested call"
     );
+    assert_eq!(settled.record.version, 2, "the v1 task migrated to v2");
+    assert!(matches!(
+        settled.record.input,
+        JsonValue::Object(ref input) if input.get("kind").and_then(JsonValue::as_str) == Some("model")
+    ));
     assert!(matches!(settled.record.state, TaskState::Terminal { .. }));
     let texts = tool_result_texts(&entries(&root_ready(&reopened).await).await);
     assert!(
         texts.iter().any(|text| text.contains("reply=null")),
         "the replay reused the stored start reply: {texts:?}"
     );
+
+    // The same chain continues into a sleeping phase that wakes at its
+    // checkpoint after the replay has settled.
+    let sleep_task = reopened
+        .session()
+        .commit(
+            commit_fn(move |tx| {
+                Box::pin(async move {
+                    tx.create_task(TaskCreate {
+                        kind: "test.chain.sleep".to_string(),
+                        version: 1,
+                        input: JsonValue::Null,
+                        checkpoint: serde_json::json!({ "phase": "sleep" }),
+                        ownership: TaskOwnership::Conversation(conversation),
+                        conversation_id: Some(conversation),
+                        background: false,
+                        abandon_on_restart: false,
+                        trace: Default::default(),
+                        links: Vec::new(),
+                    })
+                    .await
+                })
+            }),
+            &context(),
+        )
+        .await
+        .expect("create sleep task");
+    let slept = reopened
+        .wait_for_task(sleep_task, &context())
+        .await
+        .expect("sleep task");
+    assert!(matches!(slept.record.state, TaskState::Terminal { .. }));
+    assert_eq!(phases.load(Ordering::SeqCst), 2);
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "no second side effect");
     drop(hold);
 }
 
@@ -927,6 +1019,8 @@ async fn end_to_end_v1_migration_nested_and_sleep() {
                             conversation_id: Some(conversation),
                             background: false,
                             abandon_on_restart: false,
+                            trace: Default::default(),
+                            links: Vec::new(),
                         })
                         .await?;
                     let sleep_task = tx
@@ -939,6 +1033,8 @@ async fn end_to_end_v1_migration_nested_and_sleep() {
                             conversation_id: Some(conversation),
                             background: false,
                             abandon_on_restart: false,
+                            trace: Default::default(),
+                            links: Vec::new(),
                         })
                         .await?;
                     Ok((tool_task, sleep_task))

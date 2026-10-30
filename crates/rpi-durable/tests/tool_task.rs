@@ -108,6 +108,8 @@ async fn create_tool_task(
                 conversation_id: Some(conversation_id),
                 background: false,
                 abandon_on_restart: false,
+                trace: Default::default(),
+                links: Vec::new(),
             })
             .await
         })
