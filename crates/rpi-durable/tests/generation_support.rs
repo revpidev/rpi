@@ -37,6 +37,12 @@ pub enum Script {
     Message(AssistantMessage),
     /// A partial that never terminates (drives abort).
     Pending(String),
+    /// Deltas released one at a time by the test, with a count of emitted deltas.
+    ControlledDeltas {
+        deltas: Vec<String>,
+        gates: Vec<Arc<tokio::sync::Notify>>,
+        emitted: Arc<std::sync::atomic::AtomicUsize>,
+    },
 }
 
 /// An api-key auth that always resolves, so `Models::stream_simple` reaches the
@@ -138,6 +144,31 @@ impl ScriptedProvider {
                     partial: Arc::new(message),
                 });
                 // Never finish.
+            }
+            Script::ControlledDeltas {
+                deltas,
+                gates,
+                emitted,
+            } => {
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    let mut start = text_message("", StopReason::Pending);
+                    start.content.clear();
+                    producer.push(StreamEvent::Start {
+                        partial: Arc::new(start),
+                    });
+                    let mut text = String::new();
+                    for (delta, gate) in deltas.into_iter().zip(gates) {
+                        gate.notified().await;
+                        text.push_str(&delta);
+                        producer.push(StreamEvent::TextDelta {
+                            content_index: 0,
+                            delta,
+                            partial: Arc::new(text_message(&text, StopReason::Pending)),
+                        });
+                        emitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
             }
         }
         stream
@@ -246,6 +277,23 @@ pub fn model() -> Model {
 /// Build a `Models` handle with one scripted provider.
 pub fn test_models(scripts: Vec<Script>) -> Models {
     test_models_with_identity_log(scripts).0
+}
+
+/// Build a `Models` handle with one scripted provider and a custom model.
+pub fn test_models_with_model(scripts: Vec<Script>, model: Model) -> Models {
+    let provider = Arc::new(ScriptedProvider {
+        model,
+        auth: ProviderAuth {
+            api_key: Some(Arc::new(AlwaysAuth)),
+            oauth: None,
+        },
+        scripts: Mutex::new(scripts.into()),
+        identity_log: None,
+        deferred_log: None,
+    });
+    let models = Models::new(None);
+    models.set_provider(provider);
+    models
 }
 
 /// Build a `Models` handle and capture identity at each provider call.

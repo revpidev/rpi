@@ -32,7 +32,7 @@ use rpi_durable::types::{EntryRecord, InputSubmissionStatus, SubmissionRecord};
 use generation_support::{
     Script, context, entries, error_message, open, open_with_sources, open_with_storage,
     open_with_timing, root_ready, submit_input, test_models, test_models_with_deferred_log,
-    text_message, tool_use_message,
+    test_models_with_model, text_message, tool_use_message,
 };
 
 /// Assistant text of every `pi.assistant` entry, in order.
@@ -58,6 +58,75 @@ fn assistant_texts(entries: &[EntryRecord]) -> Vec<String> {
         }
     }
     texts
+}
+
+type PartialArmed = std::sync::Mutex<Vec<(u64, Arc<dyn Fn() + Send + Sync>)>>;
+
+#[derive(Default)]
+struct PartialTimer {
+    armed: PartialArmed,
+    delays: std::sync::Mutex<Vec<u64>>,
+    armed_total: Arc<AtomicUsize>,
+    disarmed: Arc<AtomicUsize>,
+}
+
+impl PartialTimer {
+    fn set_timer(self: &Arc<Self>) -> rpi_durable::harness::SetTimer {
+        let timer = Arc::clone(self);
+        Arc::new(move |callback, delay, _options| {
+            timer.armed_total.fetch_add(1, Ordering::SeqCst);
+            timer.delays.lock().expect("delays").push(delay);
+            timer.armed.lock().expect("armed").push((delay, callback));
+            let disarmed = Arc::clone(&timer.disarmed);
+            Some(Arc::new(move || {
+                disarmed.fetch_add(1, Ordering::SeqCst);
+            }))
+        })
+    }
+
+    fn arms_with_delay(&self, delay: u64) -> usize {
+        self.delays
+            .lock()
+            .expect("delays")
+            .iter()
+            .filter(|candidate| **candidate == delay)
+            .count()
+    }
+
+    fn fire(&self) {
+        let callbacks: Vec<_> = self.armed.lock().expect("armed").drain(..).collect();
+        for (_, callback) in callbacks {
+            callback();
+        }
+    }
+}
+
+async fn partial_text(
+    harness: &rpi_durable::harness::HarnessImpl,
+    conversation: ConversationId,
+) -> Option<String> {
+    let live = harness
+        .session()
+        .snapshot(&LIVE_DOC, DocOwner::Conversation(conversation), &context())
+        .await
+        .expect("live")
+        .expect("present");
+    let state: LiveState =
+        serde_json::from_value(serde_json::Value::Object(live)).expect("live state");
+    state
+        .generation
+        .and_then(|generation| generation.message)
+        .and_then(|message| serde_json::from_value::<AssistantMessage>(message).ok())
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    AssistantContent::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect()
+        })
 }
 
 /// The text of every `pi.tool-result` entry's message.
@@ -533,36 +602,7 @@ async fn a_reopened_harness_resumes_deferred_polling() {
 /// Generation partials are committed only when the host timer fires.
 #[tokio::test]
 async fn partial_progress_uses_the_harness_timer() {
-    type Armed = std::sync::Mutex<Vec<(u64, Arc<dyn Fn() + Send + Sync>)>>;
-
-    #[derive(Default)]
-    struct FakeTimer {
-        armed: Armed,
-        armed_total: Arc<AtomicUsize>,
-        disarmed: Arc<AtomicUsize>,
-    }
-    impl FakeTimer {
-        fn set_timer(self: &Arc<Self>) -> rpi_durable::harness::SetTimer {
-            let timer = Arc::clone(self);
-            Arc::new(move |callback, delay, _options| {
-                timer.armed_total.fetch_add(1, Ordering::SeqCst);
-                timer.armed.lock().expect("armed").push((delay, callback));
-                let disarmed = Arc::clone(&timer.disarmed);
-                Some(Arc::new(move || {
-                    disarmed.fetch_add(1, Ordering::SeqCst);
-                }))
-            })
-        }
-
-        fn fire(&self) {
-            let callbacks: Vec<_> = self.armed.lock().expect("armed").drain(..).collect();
-            for (_, callback) in callbacks {
-                callback();
-            }
-        }
-    }
-
-    let timer = Arc::new(FakeTimer::default());
+    let timer = Arc::new(PartialTimer::default());
     let clock = Arc::new(AtomicU64::new(1_000));
     let now = Arc::clone(&clock);
     let settings = HarnessSettings {
@@ -648,6 +688,174 @@ async fn partial_progress_uses_the_harness_timer() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     panic!("host timer did not commit the partial");
+}
+
+#[tokio::test]
+async fn continuous_partials_do_not_rearm_the_timer_until_a_flush() {
+    const INTERVAL: u64 = 123_457;
+    let timer = Arc::new(PartialTimer::default());
+    let emitted = Arc::new(AtomicUsize::new(0));
+    let gates: Vec<Arc<tokio::sync::Notify>> = (0..3)
+        .map(|_| Arc::new(tokio::sync::Notify::new()))
+        .collect();
+    let settings = HarnessSettings {
+        progress: Some(rpi_durable::harness::types::ProgressPolicyPatch {
+            partial_interval_ms: Some(INTERVAL),
+            output_interval_ms: None,
+        }),
+        ..Default::default()
+    };
+    let opened = open_with_timing(
+        Arc::new(rpi_durable::storage::MemoryStorage::new()),
+        Vec::new(),
+        Some(settings.into()),
+        test_models(vec![Script::ControlledDeltas {
+            deltas: ["one", "two", "three"].map(str::to_string).to_vec(),
+            gates: gates.clone(),
+            emitted: Arc::clone(&emitted),
+        }])
+        .into(),
+        None,
+        None,
+        Some(timer.set_timer()),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let _submission = submit_input(&conversation, "partial").await;
+
+    gates[0].notify_one();
+    for _ in 0..200 {
+        if emitted.load(Ordering::SeqCst) == 1 && timer.arms_with_delay(INTERVAL) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(timer.arms_with_delay(INTERVAL), 1);
+    timer.fire();
+    for _ in 0..200 {
+        if partial_text(&opened.harness, conversation.id())
+            .await
+            .as_deref()
+            == Some("one")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        partial_text(&opened.harness, conversation.id())
+            .await
+            .as_deref(),
+        Some("one")
+    );
+
+    gates[1].notify_one();
+    for _ in 0..200 {
+        if emitted.load(Ordering::SeqCst) == 2 && timer.arms_with_delay(INTERVAL) == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(timer.arms_with_delay(INTERVAL), 2);
+    gates[2].notify_one();
+    for _ in 0..200 {
+        if emitted.load(Ordering::SeqCst) == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(emitted.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        timer.arms_with_delay(INTERVAL),
+        2,
+        "the third delta must not replace the pending timer"
+    );
+    timer.fire();
+    for _ in 0..200 {
+        if partial_text(&opened.harness, conversation.id())
+            .await
+            .as_deref()
+            == Some("onetwothree")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        partial_text(&opened.harness, conversation.id())
+            .await
+            .as_deref(),
+        Some("onetwothree")
+    );
+    opened.harness.close(&context()).await.expect("close");
+    assert_eq!(
+        timer.armed_total.load(Ordering::SeqCst),
+        timer.disarmed.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn zero_partial_interval_does_not_arm_without_pending_output() {
+    let timer = Arc::new(PartialTimer::default());
+    let emitted = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let settings = HarnessSettings {
+        progress: Some(rpi_durable::harness::types::ProgressPolicyPatch {
+            partial_interval_ms: Some(0),
+            output_interval_ms: None,
+        }),
+        ..Default::default()
+    };
+    let opened = open_with_timing(
+        Arc::new(rpi_durable::storage::MemoryStorage::new()),
+        Vec::new(),
+        Some(settings.into()),
+        test_models(vec![Script::ControlledDeltas {
+            deltas: vec!["zero".to_string()],
+            gates: vec![Arc::clone(&gate)],
+            emitted: Arc::clone(&emitted),
+        }])
+        .into(),
+        None,
+        None,
+        Some(timer.set_timer()),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let _submission = submit_input(&conversation, "partial").await;
+    let baseline = timer.arms_with_delay(0);
+    gate.notify_one();
+    for _ in 0..200 {
+        if emitted.load(Ordering::SeqCst) == 1 && timer.arms_with_delay(0) > baseline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let armed_after_partial = timer.arms_with_delay(0);
+    assert!(armed_after_partial > baseline);
+    timer.fire();
+    for _ in 0..200 {
+        if partial_text(&opened.harness, conversation.id())
+            .await
+            .as_deref()
+            == Some("zero")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        partial_text(&opened.harness, conversation.id())
+            .await
+            .as_deref(),
+        Some("zero")
+    );
+    assert_eq!(timer.arms_with_delay(0), armed_after_partial);
+    opened.harness.close(&context()).await.expect("close");
+    assert_eq!(
+        timer.armed_total.load(Ordering::SeqCst),
+        timer.disarmed.load(Ordering::SeqCst)
+    );
 }
 
 /// upstream: "fails no_model when the agent has no model".
@@ -968,6 +1176,113 @@ async fn manual_compaction_places_summary() {
         })
         .unwrap_or_default();
     assert!(text.contains("the summary"), "got {text}");
+}
+
+#[tokio::test]
+async fn blocking_compaction_failure_is_visible_and_cleared_by_a_summary() {
+    let settings = HarnessSettings {
+        retry: Some(ConversationRetryPolicyPatch {
+            enabled: Some(false),
+            ..Default::default()
+        }),
+        compaction: Some(CompactionPolicyPatch {
+            reserve_tokens: Some(0),
+            keep_recent_tokens: Some(1),
+            background_tokens: Some(0),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut model = generation_support::model();
+    model.context_window = 1;
+    let opened = open(
+        Vec::new(),
+        Some(settings),
+        test_models_with_model(
+            vec![
+                Script::Message(error_message("compaction exploded", "compaction exploded")),
+                Script::Message(text_message("the next summary", StopReason::Stop)),
+            ],
+            model,
+        ),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let conversation_id = conversation.id();
+    for index in 0..4 {
+        let change = rpi_durable::session::commit_fn(move |tx| {
+            Box::pin(async move {
+                let mut draft = EntryDraft::new(rpi_durable::entries::USER_ENTRY);
+                draft.model = Some(vec![Message::User(rpi_ai::types::UserMessage {
+                    role: rpi_ai::types::UserRole::User,
+                    content: rpi_ai::types::UserContent::Text(format!("history {index}")),
+                    timestamp: index as i64,
+                })]);
+                tx.append_entry(conversation_id, draft).await?;
+                Ok(())
+            })
+        });
+        opened
+            .harness
+            .session()
+            .commit(change, &context())
+            .await
+            .expect("append history");
+    }
+    let submission = submit_input(&conversation, "hi").await;
+    let settled = submission.wait(&context()).await.expect("wait");
+    match input_status(&settled) {
+        Some(InputSubmissionStatus::Unanswered { reason, detail, .. }) => {
+            assert_eq!(reason, "model_error");
+            assert!(
+                detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.to_string().contains("Compaction failed")),
+                "unexpected detail: {detail:?}"
+            );
+        }
+        other => panic!("expected a compaction failure, got {other:?}"),
+    }
+
+    let compaction_failure = || async {
+        let live = opened
+            .harness
+            .session()
+            .snapshot(
+                &LIVE_DOC,
+                DocOwner::Conversation(conversation_id),
+                &context(),
+            )
+            .await
+            .expect("live")
+            .expect("present");
+        let state: LiveState =
+            serde_json::from_value(serde_json::Value::Object(live)).expect("live state");
+        state.compaction_failure
+    };
+    let failure = compaction_failure().await.expect("compaction failure");
+    assert!(failure.error.contains("compaction exploded"), "{failure:?}");
+
+    let create = rpi_durable::session::commit_fn(move |tx| {
+        Box::pin(async move {
+            create_compaction(tx, conversation_id, CompactionReason::Manual, None, None).await
+        })
+    });
+    let task_id = opened
+        .harness
+        .session()
+        .commit(create, &context())
+        .await
+        .expect("create compaction");
+    opened
+        .harness
+        .wait_for_task(task_id, &context())
+        .await
+        .expect("wait compaction");
+    assert!(
+        compaction_failure().await.is_none(),
+        "a summary clears the old failure"
+    );
 }
 
 /// V18-06 FR-F: a dynamic model source is read at each use, not cached at open.

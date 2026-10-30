@@ -1664,6 +1664,39 @@ async fn an_underway_read_rejects_when_the_session_fails() {
     ));
 }
 
+/// R-D11: a commit already admitted by the guard exposes the same SessionFailed
+/// shape as later calls when another path fails while storage is underway.
+#[tokio::test]
+async fn an_underway_commit_rejects_when_the_session_fails() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    let gate = harness.storage.hold_commits();
+    let session = Arc::clone(&harness.session);
+    let committing = tokio::spawn(async move {
+        session
+            .commit(
+                commit_fn(move |tx| {
+                    Box::pin(async move {
+                        let draft = tx
+                            .doc(live(), DocOwner::Conversation(conversation), None)
+                            .await?;
+                        draft.write()?["nested"]["count"] = serde_json::json!(9);
+                        Ok(())
+                    })
+                }),
+                &BACKGROUND_CONTEXT,
+            )
+            .await
+    });
+    gate.entered().await;
+    harness.session.fail("concurrent failure");
+    gate.release();
+    assert!(matches!(
+        committing.await.expect("join"),
+        Err(SessionError::Failed { cause }) if cause == "concurrent failure"
+    ));
+}
+
 /// The guarded close seals new calls and waits for calls already underway.
 #[tokio::test]
 async fn guarded_close_waits_for_an_underway_read() {

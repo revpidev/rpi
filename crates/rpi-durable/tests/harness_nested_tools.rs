@@ -631,6 +631,8 @@ async fn v1_migration_nested_replay_then_sleep_is_one_chain() {
                 self.called.notify_one();
                 // The first process "crashes" here: it never returns.
                 self.hold.notified().await;
+            } else {
+                host.idle(1, 1).await?;
             }
             Ok(CodemodeOutcome::output(format!(
                 "value={} reply={}",
@@ -1126,6 +1128,7 @@ async fn concurrent_codemode_calls_replay_in_delivery_order() {
                 }
             }
             if attempt == 1 {
+                host.idle(2, 2).await?;
                 host.call_tool("later", JsonObject::new(), "c3").await?;
                 host.call_tool("later", JsonObject::new(), "c4").await?;
             }
@@ -1377,6 +1380,14 @@ async fn multiple_out_of_order_replay_waiters_are_rejected() {
                 let mut calls: FuturesUnordered<CallFuture<'_>> = FuturesUnordered::new();
                 calls.push(Box::pin(host.call_tool("slow", JsonObject::new(), "c3")));
                 calls.push(Box::pin(host.call_tool("slow", JsonObject::new(), "c1")));
+                {
+                    let pending = calls.next();
+                    tokio::pin!(pending);
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_millis(20), &mut pending)
+                            .await;
+                }
+                host.idle(0, 2).await?;
                 while let Some(result) = calls.next().await {
                     result?;
                 }
@@ -1462,7 +1473,7 @@ async fn multiple_out_of_order_replay_waiters_are_rejected() {
     .expect("settled");
     let results = tool_result_texts(&entries(&root_ready(&reopened.harness).await).await);
     assert!(
-        results.iter().any(|text| text.contains("out of order")),
+        results.iter().any(|text| text.contains("different path")),
         "out-of-order divergence was not reported: {results:?}"
     );
     assert_eq!(slow_runs.load(Ordering::SeqCst), 3);
@@ -1535,16 +1546,29 @@ async fn assert_crash_window_replay(underway: bool, replay_empty_calls: bool) {
             if self.attempts.fetch_add(1, Ordering::SeqCst) == 1 {
                 if self.underway {
                     host.call_tool("inner", JsonObject::new(), "a").await?;
-                    host.call_tool("inner", JsonObject::new(), "b").await?;
+                    let next = host.call_tool("inner", JsonObject::new(), "b");
+                    tokio::pin!(next);
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_millis(20), &mut next).await;
                     self.journaled.notify_one();
                     self.replay_hold.notified().await;
+                    host.idle(1, 2).await?;
+                    next.await?;
                 } else if self.replay_empty_calls {
-                    let (a, b) = tokio::join!(
-                        host.call_tool("inner", JsonObject::new(), "a"),
-                        host.call_tool("inner", JsonObject::new(), "b")
-                    );
-                    a?;
-                    b?;
+                    let next = host.call_tool("inner", JsonObject::new(), "a");
+                    tokio::pin!(next);
+                    let last = host.call_tool("inner", JsonObject::new(), "b");
+                    tokio::pin!(last);
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_millis(20), &mut next).await;
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_millis(20), &mut last).await;
+                    host.idle(0, 2).await?;
+                    let (next, last) = tokio::join!(next, last);
+                    next?;
+                    last?;
+                } else {
+                    host.idle(0, 0).await?;
                 }
                 return Ok(CodemodeOutcome::output("done"));
             }

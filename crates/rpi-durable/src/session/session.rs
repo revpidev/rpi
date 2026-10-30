@@ -540,7 +540,7 @@ impl SessionImpl {
             Err(error) => {
                 tx.discard();
                 self.fail(error.to_string());
-                return Err(SessionError::Storage(error));
+                return Err(error.into());
             }
         };
         let documents = match tx.adopt(seq) {

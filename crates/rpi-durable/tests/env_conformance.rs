@@ -1238,22 +1238,93 @@ async fn list_files_keeps_a_sorted_prefix_and_stops_on_timeout() {
 async fn list_files_lists_symlinks_without_following_them() {
     let dir = TempDir::new("env-list-symlink");
     let env = create_env(&dir);
-    write(&env, "target/inside.txt", "x");
-    std::os::unix::fs::symlink(dir.path().join("target"), dir.path().join("link"))
-        .expect("symlink");
+    write(&env, "dir/inner.txt", "x");
+    std::os::unix::fs::symlink("dir", dir.path().join("link")).expect("symlink");
+    std::os::unix::fs::symlink("missing", dir.path().join("dangling")).expect("symlink");
+    std::os::unix::fs::symlink("..", dir.path().join("dir/loop")).expect("symlink");
     let listing = env.list_files(".", None, &context()).await.expect("list");
-    let link = listing
+    let paths: Vec<&str> = listing
         .entries
         .iter()
-        .find(|entry| entry.path == "link")
-        .expect("symlink entry");
-    assert_eq!(link.kind, FileKind::Symlink);
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["dangling", "dir", "dir/inner.txt", "dir/loop", "link"]
+    );
+    assert_eq!(listing.entries[4].kind, FileKind::Symlink);
+
+    let linked = env
+        .list_files("link", None, &context())
+        .await
+        .expect("list through a root symlink");
+    let paths: Vec<(&str, FileKind)> = linked
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry.kind))
+        .collect();
+    assert_eq!(
+        paths,
+        vec![("inner.txt", FileKind::File), ("loop", FileKind::Symlink)]
+    );
+}
+
+#[tokio::test]
+async fn list_files_loads_the_global_git_excludes_file() {
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match self.0.as_ref() {
+                Some(value) => rpi_test_env::set_var("GIT_CONFIG_GLOBAL", value),
+                None => rpi_test_env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+    }
+
+    let config = TempDir::new("env-list-global-config");
+    let ignore = config.path().join("ignore");
+    std::fs::write(&ignore, "global-only.tmp\n").expect("global ignore");
+    let gitconfig = config.path().join("gitconfig");
+    std::fs::write(
+        &gitconfig,
+        format!("[core]\nexcludesFile = {}\n", ignore.display()),
+    )
+    .expect("git config");
+    let restore = Restore(std::env::var_os("GIT_CONFIG_GLOBAL"));
+    rpi_test_env::set_var("GIT_CONFIG_GLOBAL", &gitconfig);
+    let _restore = restore;
+
+    let dir = TempDir::new("env-list-global-ignore");
+    let env = create_env(&dir);
+    env.create_dir(".git", None, &context())
+        .await
+        .expect(".git");
+    write(&env, "global-only.tmp", "ignored");
+    write(&env, "keep.txt", "kept");
+    let listing = env.list_files(".", None, &context()).await.expect("list");
     assert!(
-        !listing
+        listing
             .entries
             .iter()
-            .any(|entry| entry.path == "link/inside.txt"),
-        "symlinks are not followed"
+            .all(|entry| entry.path != "global-only.tmp")
+    );
+    assert!(listing.entries.iter().any(|entry| entry.path == "keep.txt"));
+
+    let all = env
+        .list_files(
+            ".",
+            Some(ListFilesOptions {
+                gitignore: Some(false),
+                ..Default::default()
+            }),
+            &context(),
+        )
+        .await
+        .expect("list without gitignore");
+    assert!(
+        all.entries
+            .iter()
+            .any(|entry| entry.path == "global-only.tmp")
     );
 }
 

@@ -9,8 +9,8 @@
 //! Ported phases: `prepare`, `request`, `retry`, `poll`, `tools`.
 //!
 //! Rust shape notes: upstream `streamResponse` throttles partials with a timer
-//! and one commit in flight; the port commits synchronously when
-//! `progress.partialIntervalMs` elapsed since the last flush. `author` hooks
+//! and one commit in flight; the port arms one Harness timer while a partial is
+//! pending and commits synchronously when it fires. `author` hooks
 //! take an erased [`RuntimeHookApi`]. `renderSections`' error path collapses to
 //! an infallible renderer.
 
@@ -729,20 +729,25 @@ async fn stream_response(
     );
     let token = runtime.signal();
     let mut pending: Option<Arc<AssistantMessage>> = None;
+    let mut fired = Arc::new(tokio::sync::Notify::new());
+    let mut timer = None;
     loop {
         if token.is_cancelled() {
             return Err(SessionError::Aborted);
         }
-        let fired = Arc::new(tokio::sync::Notify::new());
-        let callback = Arc::clone(&fired);
-        let _disarm = DisarmOnDrop(runtime.set_timer(
-            Arc::new(move || callback.notify_one()),
-            interval.max(0.0) as u64,
-        )?);
+        if pending.is_some() && timer.is_none() {
+            fired = Arc::new(tokio::sync::Notify::new());
+            let callback = Arc::clone(&fired);
+            timer = Some(DisarmOnDrop(runtime.set_timer(
+                Arc::new(move || callback.notify_one()),
+                interval.max(0.0) as u64,
+            )?));
+        }
         let next = tokio::select! {
             biased;
             _ = token.cancelled() => return Err(SessionError::Aborted),
-            _ = fired.notified() => {
+            _ = fired.notified(), if timer.is_some() => {
+                timer.take();
                 if let Some(partial) = pending.take() {
                     commit_partial(runtime, &partial, attempt, context).await?;
                 }

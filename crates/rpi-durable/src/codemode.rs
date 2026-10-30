@@ -613,6 +613,11 @@ pub trait CodemodeHost: Send + Sync {
     /// The Harness clock.
     fn now(&self) -> Result<f64, String>;
 
+    /// The sandbox has processed result `seq` (`0`: its initial drain) and is
+    /// idle after issuing `issued` calls. Replay validates and persists the
+    /// acknowledged count here, then releases calls not present in the journal.
+    async fn idle(&self, seq: u64, issued: u64) -> Result<(), String>;
+
     /// The host's reply to the script start; persisted with the start data and
     /// reused on replay. The default replies `null`.
     async fn start(&self, _start: &CodemodeStart) -> Result<JsonValue, String> {
@@ -687,7 +692,9 @@ pub trait CodemodeSandbox: Send + Sync {
     /// Identifies everything that turns stored results into script behavior; a
     /// changed fingerprint refuses replay.
     fn fingerprint(&self) -> String;
-    /// Run the script from `start`.
+    /// Run the script from `start`. Call [`CodemodeHost::idle`] whenever the VM
+    /// has processed everything delivered and waits again; replay requires that
+    /// signal to validate counts and admit new calls.
     async fn run(
         &self,
         start: CodemodeStart,
@@ -922,6 +929,8 @@ struct ReplayState {
     next: usize,
     delivered: BTreeSet<String>,
     pending: BTreeSet<String>,
+    released: bool,
+    divergence: Option<String>,
 }
 
 struct PendingCall<'a> {
@@ -973,7 +982,10 @@ impl<'a> DurableHost<'a> {
             api,
             journal: Mutex::new(journal),
             journal_commit: tokio::sync::Mutex::new(()),
-            replay: Mutex::new(ReplayState::default()),
+            replay: Mutex::new(ReplayState {
+                released: !rerun,
+                ..Default::default()
+            }),
             replay_changed: tokio::sync::Notify::new(),
             replay_len,
             rerun,
@@ -1004,16 +1016,14 @@ impl<'a> DurableHost<'a> {
         self.replay.lock().map(|replay| replay.issued).unwrap_or(0)
     }
 
-    fn check_issued(entry: &CodemodeJournalEntry, issued: u64) -> Result<(), String> {
-        if let Some(expected) = entry.issued_after
-            && expected != issued
+    fn replay_divergence(&self, message: String) -> String {
+        if let Ok(mut replay) = self.replay.lock()
+            && replay.divergence.is_none()
         {
-            return Err(format!(
-                "The script took a different path when resumed after a restart: after call {} it had issued {expected} calls, but has now issued {issued}",
-                entry.key
-            ));
+            replay.divergence = Some(message.clone());
         }
-        Ok(())
+        self.replay_changed.notify_waiters();
+        message
     }
 
     fn advance_call(&self, key: &str, counted: &mut bool) -> Result<bool, String> {
@@ -1027,6 +1037,9 @@ impl<'a> DurableHost<'a> {
             .replay
             .lock()
             .map_err(|_| "codemode replay lock poisoned".to_string())?;
+        if let Some(message) = &replay.divergence {
+            return Err(message.clone());
+        }
         if !*counted {
             replay.issued += 1;
             *counted = true;
@@ -1038,16 +1051,13 @@ impl<'a> DurableHost<'a> {
             if replay.next != index {
                 return Ok(false);
             }
-            if index > 0 {
-                Self::check_issued(&entries[index - 1], replay.issued)?;
-            }
             replay.next += 1;
             replay.delivered.insert(key.to_string());
             drop(replay);
             self.replay_changed.notify_waiters();
             return Ok(true);
         }
-        if replay.next != self.replay_len {
+        if replay.next != self.replay_len || !replay.released {
             return Ok(false);
         }
         Ok(true)
@@ -1056,39 +1066,16 @@ impl<'a> DurableHost<'a> {
     async fn wait_for_call(&self, key: &str) -> Result<(), String> {
         let _pending = PendingCall { host: self, key };
         let mut counted = false;
-        let mut yielded = false;
         loop {
             let changed = self.replay_changed.notified();
-            let advanced = self.advance_call(key, &mut counted);
-            if advanced? {
+            if self.advance_call(key, &mut counted)? {
                 return Ok(());
             }
-            {
-                let journal = self
-                    .journal
-                    .lock()
-                    .map_err(|_| "codemode journal lock poisoned".to_string())?;
-                let mut replay = self
-                    .replay
-                    .lock()
-                    .map_err(|_| "codemode replay lock poisoned".to_string())?;
-                replay.pending.insert(key.to_string());
-                if yielded
-                    && journal
-                        .entries
-                        .get(replay.next)
-                        .is_some_and(|entry| !replay.pending.contains(&entry.key))
-                {
-                    return Err(format!(
-                        "The script took a different path when resumed after a restart: call {key} is out of order and cannot make progress"
-                    ));
-                }
-            }
-            if !yielded {
-                yielded = true;
-                tokio::task::yield_now().await;
-                continue;
-            }
+            self.replay
+                .lock()
+                .map_err(|_| "codemode replay lock poisoned".to_string())?
+                .pending
+                .insert(key.to_string());
             if let Some(signal) = self.context.abort_signal() {
                 tokio::select! {
                     _ = changed => {},
@@ -1121,16 +1108,126 @@ impl<'a> DurableHost<'a> {
         .await
     }
 
+    async fn idle(&self, seq: u64, issued: u64) -> Result<(), String> {
+        let seq = usize::try_from(seq)
+            .map_err(|_| "The code mode idle sequence is too large".to_string())?;
+        let prepared = (|| {
+            let journal = self
+                .journal
+                .lock()
+                .map_err(|_| "codemode journal lock poisoned".to_string())?
+                .clone();
+            let replay = self
+                .replay
+                .lock()
+                .map_err(|_| "codemode replay lock poisoned".to_string())?;
+            if let Some(message) = &replay.divergence {
+                return Err(message.clone());
+            }
+            if issued != replay.issued {
+                return Err(format!(
+                    "The script took a different path when resumed after a restart: the sandbox reported {issued} issued calls, but the host observed {}",
+                    replay.issued
+                ));
+            }
+            if self.rerun && seq < replay.next {
+                return Ok((false, false));
+            }
+            if self.rerun && seq != replay.next && seq <= self.replay_len {
+                return Err(
+                    "The script took a different path when resumed after a restart: the sandbox reported idle at an unexpected result"
+                        .to_string(),
+                );
+            }
+            if self.rerun && seq <= self.replay_len {
+                let recorded = if seq == 0 {
+                    journal.first_issued
+                } else {
+                    journal.entries[seq - 1].issued_after
+                };
+                if recorded.is_some_and(|expected| expected != issued) {
+                    let message = if seq == 0 {
+                        format!(
+                            "The script took a different path when resumed after a restart: its first run issued {} calls, but it has now issued {issued}",
+                            recorded.unwrap_or(0)
+                        )
+                    } else {
+                        format!(
+                            "The script took a different path when resumed after a restart: after call {} it had issued {} calls, but it has now issued {issued}",
+                            journal.entries[seq - 1].key,
+                            recorded.unwrap_or(0)
+                        )
+                    };
+                    return Err(message);
+                }
+                if let Some(next) = journal.entries.get(replay.next)
+                    && replay.next < self.replay_len
+                    && !replay.pending.contains(&next.key)
+                {
+                    return Err(format!(
+                        "The script took a different path when resumed after a restart: it waits without making call {}, which it made before",
+                        next.key
+                    ));
+                }
+            }
+            let acknowledge = if seq == 0 {
+                journal.first_issued.is_none()
+            } else {
+                journal
+                    .entries
+                    .get(seq - 1)
+                    .is_some_and(|entry| entry.issued_after.is_none())
+            };
+            let release = self.rerun && replay.next == self.replay_len && seq == self.replay_len;
+            Ok((acknowledge, release))
+        })();
+        let (acknowledge, release) = match prepared {
+            Ok(prepared) => prepared,
+            Err(message) => return Err(self.replay_divergence(message)),
+        };
+        if acknowledge {
+            self.record_journal(|journal| {
+                if seq == 0 {
+                    if journal.first_issued.is_none() {
+                        journal.first_issued = Some(issued);
+                    }
+                } else if let Some(entry) = journal.entries.get_mut(seq - 1)
+                    && entry.issued_after.is_none()
+                {
+                    entry.issued_after = Some(issued);
+                }
+                Ok::<(), String>(())
+            })
+            .await?;
+        }
+        if release && let Ok(mut replay) = self.replay.lock() {
+            replay.released = true;
+        }
+        self.replay_changed.notify_waiters();
+        Ok(())
+    }
+
     async fn finish_replay(&self) -> Result<(), String> {
-        let (issued, complete) = self
+        let (issued, complete, released) = self
             .replay
             .lock()
-            .map(|replay| (replay.issued, replay.next == self.replay_len))
-            .unwrap_or((0, false));
+            .map(|replay| {
+                (
+                    replay.issued,
+                    replay.next == self.replay_len,
+                    replay.released,
+                )
+            })
+            .unwrap_or((0, false, false));
         if !complete {
             return Err(
                 "The script took a different path when resumed after a restart: it ended before consuming the journal"
                     .to_string(),
+            );
+        }
+        if self.rerun && !released {
+            return Err(
+                "The code mode sandbox ended without reporting idle after the replay".to_string(),
             );
         }
         self.record_journal(|journal| {
@@ -1167,6 +1264,13 @@ impl<'a> DurableHost<'a> {
     }
 
     fn begin_row(&self, key: &str, name: &str, args: &JsonObject) -> u64 {
+        if let Some(id) = self.rows.lock().ok().and_then(|rows| {
+            rows.iter()
+                .find(|(stored, _)| stored == key)
+                .map(|(_, row)| row.id)
+        }) {
+            return id;
+        }
         let id = self
             .rows
             .lock()
@@ -1337,6 +1441,7 @@ impl CodemodeHost for DurableHost<'_> {
             }
         }
         self.wait_for_call(key).await?;
+        self.begin_row(key, name, &args);
         {
             let journal = self
                 .journal
@@ -1346,6 +1451,7 @@ impl CodemodeHost for DurableHost<'_> {
                 let stored = entry.result.clone().ok_or_else(|| {
                     format!("The code mode journal has no delivered result for call {key}")
                 })?;
+                self.finish_row(key, &stored);
                 self.context.telemetry().add_event(
                     "pi.durable.replay",
                     json!({ "tool.name": name })
@@ -1357,7 +1463,6 @@ impl CodemodeHost for DurableHost<'_> {
             }
         }
         self.acknowledge_delivered().await?;
-        self.begin_row(key, name, &args);
         let result = self
             .api
             .execute_tool(
@@ -1383,6 +1488,10 @@ impl CodemodeHost for DurableHost<'_> {
 
     fn now(&self) -> Result<f64, String> {
         self.api.now().map_err(|error| error.to_string())
+    }
+
+    async fn idle(&self, seq: u64, issued: u64) -> Result<(), String> {
+        DurableHost::idle(self, seq, issued).await
     }
 
     fn start_reply(&self) -> JsonValue {

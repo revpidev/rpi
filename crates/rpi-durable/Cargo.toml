@@ -43,9 +43,12 @@ base64.workspace = true
 # Optional read-tool image processing (BMP conversion, EXIF orientation, resize).
 image.workspace = true
 uuid.workspace = true
+# Git's global excludes-file discovery for listFiles.
+ignore.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+rpi-test-env.workspace = true

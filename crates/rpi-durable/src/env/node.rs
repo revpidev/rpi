@@ -1467,7 +1467,7 @@ impl FileSystem for NodeExecutionEnv {
     ) -> Result<FileListing, FileError> {
         abort_result(context, None)?;
         let resolved = PathBuf::from(self.resolve(path));
-        let metadata = tokio::fs::symlink_metadata(&resolved)
+        let metadata = tokio::fs::metadata(&resolved)
             .await
             .map_err(|error| to_file_error(&error, Some(&resolved.to_string_lossy())))?;
         if !metadata.is_dir() {
@@ -1750,6 +1750,9 @@ async fn load_ignore_file(path: &std::path::Path, base: &str, rules: &mut Vec<Ig
 
 async fn initial_ignore_rules(root: &std::path::Path, listed: &std::path::Path) -> Vec<IgnoreRule> {
     let mut rules = Vec::new();
+    if let Some(global) = ignore::gitignore::gitconfig_excludes_path() {
+        load_ignore_file(&global, "", &mut rules).await;
+    }
     load_ignore_file(&root.join(".gitignore"), "", &mut rules).await;
     load_ignore_file(
         &root.join(".git").join("info").join("exclude"),
