@@ -763,6 +763,12 @@ impl SchedulerInner {
             Err(_) => {
                 if !self.registry_snapshot_reported.swap(true, Ordering::SeqCst) {
                     (self.report)("The task registry snapshot failed".to_string());
+                    self.report_fixed(
+                        crate::harness::types::ReportInfo::new(
+                            crate::harness::types::ReportKind::HostError,
+                        )
+                        .with_reason("registry"),
+                    );
                 }
                 return None;
             }
@@ -804,19 +810,21 @@ impl SchedulerInner {
         let telemetry = context
             .map(Context::telemetry)
             .unwrap_or_else(|| self.telemetry.clone());
-        telemetry.add_event(
-            "pi.durable.report",
-            serde_json::json!({
-                "type": info.kind,
-                "reason": info.reason,
-                "task.id": info.task_id.map(|id| id.get()),
-                "task.kind": info.task_kind,
-                "extension": info.extension,
-            })
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
+        let mut attributes = JsonObject::new();
+        attributes.insert(
+            "type".to_string(),
+            serde_json::to_value(info.kind).unwrap_or(JsonValue::Null),
         );
+        if let Some(reason) = &info.reason {
+            attributes.insert("reason".to_string(), JsonValue::from(reason.clone()));
+        }
+        if let Some(extension) = &info.extension {
+            attributes.insert("extension".to_string(), JsonValue::from(extension.clone()));
+        }
+        if let Some(task) = info.task_id {
+            attributes.insert("task.id".to_string(), JsonValue::from(task.get()));
+        }
+        telemetry.add_event("pi.durable.report", attributes);
         telemetry.record_metric(
             "pi.durable.reports",
             1.0,
@@ -997,6 +1005,9 @@ impl SchedulerInner {
     }
 
     async fn join(self: &Arc<Self>) -> SessionResult<()> {
+        // A close is not a crash: mark the scheduler closing before cancelling
+        // invocations, so a phase ended by the close is `aborted`, not faulted.
+        self.closing.store(true, Ordering::SeqCst);
         let invocations: Vec<Arc<Invocation>> = self
             .invocations
             .lock()
@@ -2501,7 +2512,7 @@ impl SchedulerInner {
                 .cloned()
                 .unwrap_or_default(),
             );
-            if let Some(failure) = Self::phase_status_error(&invocation, Some(&previous)) {
+            if let Some(failure) = self.phase_status_error(&invocation, Some(&previous)) {
                 span.set_status("error", Some(&failure));
             }
             span.end(
@@ -2574,12 +2585,16 @@ impl SchedulerInner {
         match state {
             Some(TaskStatus::Waiting) => "waiting".to_string(),
             Some(TaskStatus::Sleeping) => "sleeping".to_string(),
+            _ if invocation.ended.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) => {
+                "aborted".to_string()
+            }
             _ => "done".to_string(),
         }
     }
 
     /// The phase-span error message for a terminal or thrown outcome.
     fn phase_status_error(
+        &self,
         invocation: &Invocation,
         previous: Option<&PhaseResult>,
     ) -> Option<String> {
@@ -2596,6 +2611,9 @@ impl SchedulerInner {
                 }
                 TaskOutcome::Orphaned { reason } => return Some(reason),
             }
+        }
+        if invocation.ended.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) {
+            return None;
         }
         previous.and_then(|previous| previous.failure.clone())
     }
@@ -2643,7 +2661,7 @@ impl SchedulerInner {
             )
             .await?;
         let outcome = self.phase_outcome(invocation, next.as_ref());
-        if let Some(failure) = Self::phase_status_error(invocation, None) {
+        if let Some(failure) = self.phase_status_error(invocation, None) {
             span.set_status("error", Some(&failure));
         }
         span.end(
@@ -2797,7 +2815,8 @@ impl SchedulerInner {
                                 crate::harness::types::ReportInfo::new(
                                     crate::harness::types::ReportKind::TaskFaulted,
                                 )
-                                .with_task(current.id(), current.kind().to_string()),
+                                .with_task(current.id(), current.kind().to_string())
+                                .with_reason("threw"),
                                 Some(&telemetry_context),
                             );
                             let outcome = TaskOutcome::Faulted {
@@ -3323,11 +3342,13 @@ impl TaskRuntime for InvocationRuntime {
         let inner = Arc::clone(&self.inner);
         let invocation = Arc::clone(&self.invocation);
         let telemetry = context.telemetry();
+        let changed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let changed_in_commit = Arc::clone(&changed);
         let wrapper: Arc<GatedFn<()>> = Arc::new(move |tx, current| {
             let change = Arc::clone(&change);
             let inner = Arc::clone(&inner);
             let invocation = Arc::clone(&invocation);
-            let telemetry = telemetry.clone();
+            let changed = Arc::clone(&changed_in_commit);
             Box::pin(async move {
                 let next = change(tx, current.clone()).await?;
                 let checkpoint = next.as_ref().and_then(next_running_phase);
@@ -3337,19 +3358,26 @@ impl TaskRuntime for InvocationRuntime {
                 }
                 if let Some(checkpoint) = checkpoint
                     && previous_phase.as_deref() != Some(checkpoint.as_str())
+                    && let Ok(mut slot) = changed.lock()
                 {
-                    telemetry.add_event(
-                        "pi.durable.checkpoint",
-                        serde_json::json!({ "phase": checkpoint })
-                            .as_object()
-                            .cloned()
-                            .unwrap_or_default(),
-                    );
+                    *slot = Some(checkpoint);
                 }
                 Ok(())
             })
         });
-        self.gated(wrapper, context).await
+        let result = self.gated(wrapper, context).await;
+        if result.is_ok()
+            && let Some(checkpoint) = changed.lock().ok().and_then(|mut slot| slot.take())
+        {
+            telemetry.add_event(
+                "pi.durable.checkpoint",
+                serde_json::json!({ "phase": checkpoint })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        result
     }
 
     async fn memo(&self, name: &str, context: &Context) -> SessionResult<Option<JsonValue>> {

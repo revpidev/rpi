@@ -324,6 +324,9 @@ async fn phase_spans_use_the_stored_trace_and_links() {
         "phase events: {:?}",
         span.events
     );
+    let last = recorder.last_span("pi.durable.phase");
+    assert_eq!(last.end_attributes["outcome"], "done");
+    assert_eq!(last.status, "ok");
     assert!(
         recorder
             .0
@@ -636,4 +639,58 @@ async fn phase_spans_carry_faulted_and_aborted_status() {
         "no phase span carried the entry event"
     );
     opened.harness.close(&context()).await.expect("close");
+}
+
+struct CancellableTask(Arc<tokio::sync::Notify>);
+
+#[async_trait::async_trait]
+impl rpi_durable::harness::TaskDefinition for CancellableTask {
+    fn name(&self) -> &str {
+        "test.cancel-span"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> JsonValue {
+        serde_json::json!({ "phase": "step" })
+    }
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: rpi_durable::harness::RunningTask,
+        runtime: &dyn rpi_durable::harness::TaskRuntime,
+        _context: &rpi_durable::chord::context::Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        self.0.notify_one();
+        runtime.signal().cancelled().await;
+        Err(rpi_durable::session::SessionError::Aborted)
+    }
+}
+
+/// R-D9: a phase ended by Harness close is `aborted` and keeps status ok.
+#[tokio::test]
+async fn a_phase_ended_by_close_is_aborted_and_ok() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let recorder = Recorder::default();
+    let telemetry = TelemetryContext::new(Arc::new(recorder.root()) as Arc<dyn TelemetrySink>);
+    let opened = open_with_telemetry(
+        Arc::new(MemoryStorage::new()),
+        vec![Arc::new(CancellableTask(Arc::clone(&started))) as rpi_durable::harness::AnyTask],
+        telemetry,
+    )
+    .await;
+    let conversation = root(&opened.harness).await;
+    let _ = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.cancel-span", serde_json::json!({})),
+    )
+    .await;
+    opened.harness.resume().expect("resume");
+    started.notified().await;
+    opened.harness.close(&context()).await.expect("close");
+    let span = recorder.last_span("pi.durable.phase");
+    assert_eq!(span.end_attributes["outcome"], "aborted");
+    assert_eq!(span.status, "ok");
+    assert!(span.message.is_none(), "message: {:?}", span.message);
 }
