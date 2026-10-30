@@ -490,10 +490,11 @@ impl CodemodeJournal {
         Ok(())
     }
 
-    /// Record the acknowledged issued-call count of `key`.
+    /// Record the authoritative issued-call count of `key`, replacing a
+    /// fallback recorded before the sandbox reported idle.
     pub fn record_issued_after(&mut self, key: &str, issued: u64) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key == key) {
-            entry.issued_after = Some(entry.issued_after.unwrap_or(0).max(issued));
+            entry.issued_after = Some(issued);
         }
     }
 }
@@ -612,7 +613,10 @@ pub trait CodemodeHost: Send + Sync {
     /// `issued` calls. `seq` `0` means that the first batch of calls has been
     /// issued and the VM waits before any result is delivered; do not report
     /// `idle(0, 0)` at script start when the first batch is issued afterwards.
-    /// Replay validates and persists the acknowledged count here, then
+    /// Every call future in that batch must have been driven at least once
+    /// before reporting idle, so `issued` matches the host's count. The sandbox
+    /// reports idle at every point where it has drained the delivered results;
+    /// replay validates and persists the acknowledged count here, then
     /// releases calls not present in the journal.
     async fn idle(&self, seq: u64, issued: u64) -> Result<(), String>;
 
@@ -1101,10 +1105,15 @@ impl<'a> DurableHost<'a> {
     async fn acknowledge_delivered(&self) -> Result<(), String> {
         let issued = self.issued();
         self.record_journal(|journal| {
-            if let Some(last) = journal.entries.last_mut() {
-                last.issued_after = Some(last.issued_after.unwrap_or(0).max(issued));
-            } else {
+            if journal.entries.is_empty() {
+                // Before the first result, every issued call belongs to the
+                // initial batch. An idle report later replaces this fallback.
                 journal.first_issued = Some(journal.first_issued.unwrap_or(0).max(issued));
+            } else if let Some(last) = journal.entries.last_mut()
+                && last.issued_after.is_none()
+            {
+                // Backfill only: a sandbox idle report is authoritative.
+                last.issued_after = Some(issued);
             }
             Ok::<(), String>(())
         })
@@ -1174,12 +1183,21 @@ impl<'a> DurableHost<'a> {
                 }
             }
             let acknowledge = if seq == 0 {
-                journal.first_issued.is_none()
-            } else {
+                if self.rerun {
+                    journal.first_issued.is_none()
+                } else {
+                    journal.first_issued != Some(issued)
+                }
+            } else if self.rerun {
                 journal
                     .entries
                     .get(seq - 1)
                     .is_some_and(|entry| entry.issued_after.is_none())
+            } else {
+                journal
+                    .entries
+                    .get(seq - 1)
+                    .is_some_and(|entry| entry.issued_after != Some(issued))
             };
             let release = self.rerun && replay.next == self.replay_len && seq == self.replay_len;
             Ok((acknowledge, release))
@@ -1191,13 +1209,11 @@ impl<'a> DurableHost<'a> {
         if acknowledge {
             self.record_journal(|journal| {
                 if seq == 0 {
-                    if journal.first_issued.is_none() {
-                        journal.first_issued = Some(issued);
-                    }
-                } else if let Some(entry) = journal.entries.get_mut(seq - 1)
-                    && entry.issued_after.is_none()
+                    journal.first_issued = Some(issued);
+                } else if let Some(key) =
+                    journal.entries.get(seq - 1).map(|entry| entry.key.clone())
                 {
-                    entry.issued_after = Some(issued);
+                    journal.record_issued_after(&key, issued);
                 }
                 Ok::<(), String>(())
             })

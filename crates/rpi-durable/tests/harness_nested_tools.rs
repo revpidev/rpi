@@ -1699,7 +1699,7 @@ async fn assert_crash_window_replay(underway: bool, replay_empty_calls: bool) {
         serde_json::from_value(JsonValue::Object(journal)).expect("journal json");
     if underway {
         assert_eq!(journal.entries.len(), 1);
-        assert_eq!(journal.entries[0].issued_after, Some(3));
+        assert_eq!(journal.entries[0].issued_after, Some(1));
     } else {
         assert!(journal.entries.is_empty());
         assert_eq!(
@@ -1739,7 +1739,7 @@ async fn assert_crash_window_replay(underway: bool, replay_empty_calls: bool) {
         let journal: CodemodeJournal =
             serde_json::from_value(JsonValue::Object(journal)).expect("journal json");
         assert_eq!(journal.entries[0].key, "a");
-        assert_eq!(journal.entries[0].issued_after, Some(3));
+        assert_eq!(journal.entries[0].issued_after, Some(1));
         replay_hold.notify_one();
     }
     tokio::time::timeout(

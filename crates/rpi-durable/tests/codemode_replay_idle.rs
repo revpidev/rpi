@@ -259,7 +259,7 @@ async fn calls_issued_after_an_earlier_result_replay_without_false_divergence() 
     let journal = journal(&opened.harness, parent).await;
     assert_eq!(journal.entries.len(), 2);
     assert_eq!(journal.entries[0].key, "c1");
-    assert_eq!(journal.entries[0].issued_after, Some(3));
+    assert_eq!(journal.entries[0].issued_after, Some(1));
     assert_eq!(journal.entries[1].key, "c2");
 
     let reopened = open_with_storage(
@@ -642,4 +642,157 @@ async fn a_divergence_releases_concurrent_waiters() {
         "{results:?}"
     );
     assert_eq!(runs.load(Ordering::SeqCst), 1, "no nested call ran twice");
+}
+
+struct FirstRunHoldTool {
+    runs: Arc<AtomicUsize>,
+    hold: Arc<tokio::sync::Notify>,
+    first_run: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl ToolExecute for FirstRunHoldTool {
+    async fn execute(
+        &self,
+        _args: JsonObject,
+        api: &dyn ToolExecutionApi,
+        _context: &Context,
+    ) -> Result<ToolExecutionResult, ToolExecuteError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        if self.first_run.load(Ordering::SeqCst)
+            && (api.call_id().ends_with("/c2") || api.call_id().ends_with("/c3"))
+        {
+            self.hold.notified().await;
+        }
+        Ok(ToolExecutionResult {
+            structured_output: Some(serde_json::json!({ "ok": true })),
+            ..Default::default()
+        })
+    }
+}
+
+struct IdleBoundarySandbox {
+    attempts: AtomicUsize,
+    journaled: Arc<tokio::sync::Notify>,
+    crash: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl CodemodeSandbox for IdleBoundarySandbox {
+    fn fingerprint(&self) -> String {
+        "idle-boundary-1".to_string()
+    }
+
+    async fn run(
+        &self,
+        _start: CodemodeStart,
+        host: &dyn CodemodeHost,
+        _context: &Context,
+    ) -> Result<CodemodeOutcome, String> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            host.call_tool("inner", JsonObject::new(), "c1").await?;
+            let c2 = host.call_tool("inner", JsonObject::new(), "c2");
+            tokio::pin!(c2);
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(20), &mut c2).await;
+            host.idle(1, 2).await?;
+            let c3 = host.call_tool("inner", JsonObject::new(), "c3");
+            tokio::pin!(c3);
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(20), &mut c3).await;
+            self.journaled.notify_one();
+            self.crash.notified().await;
+            return Ok(CodemodeOutcome::output("unreachable"));
+        }
+        host.call_tool("inner", JsonObject::new(), "c1").await?;
+        let c2 = host.call_tool("inner", JsonObject::new(), "c2");
+        tokio::pin!(c2);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(20), &mut c2).await;
+        host.idle(1, 2).await?;
+        c2.await?;
+        host.call_tool("inner", JsonObject::new(), "c3").await?;
+        Ok(CodemodeOutcome::output("done"))
+    }
+}
+
+/// An idle report is the authoritative count for its boundary; later
+/// acknowledgements from newly issued calls must not overwrite it and create a
+/// false replay divergence.
+#[tokio::test]
+async fn idle_counts_are_authoritative_for_their_boundary() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let first_run = Arc::new(AtomicBool::new(true));
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let journaled = Arc::new(tokio::sync::Notify::new());
+    let crash = Arc::new(tokio::sync::Notify::new());
+    let sandbox = Arc::new(IdleBoundarySandbox {
+        attempts: AtomicUsize::new(0),
+        journaled: Arc::clone(&journaled),
+        crash,
+    });
+    let extensions = || {
+        vec![extension(vec![
+            create_codemode_tool(CodemodeToolOptions {
+                sandbox: Arc::clone(&sandbox) as Arc<dyn CodemodeSandbox>,
+                ..Default::default()
+            }),
+            tool(
+                "inner",
+                Arc::new(FirstRunHoldTool {
+                    runs: Arc::clone(&runs),
+                    hold: Arc::clone(&hold),
+                    first_run: Arc::clone(&first_run),
+                }),
+            ),
+        ])]
+    };
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage(Arc::clone(&storage), extensions(), None, models()).await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    journaled.notified().await;
+
+    let parent = parent_task(&opened.harness).await;
+    let journal = journal(&opened.harness, parent).await;
+    assert_eq!(journal.entries.len(), 1);
+    assert_eq!(journal.entries[0].key, "c1");
+    assert_eq!(journal.entries[0].issued_after, Some(2));
+    first_run.store(false, Ordering::SeqCst);
+
+    let reopened = open_with_storage(
+        Arc::clone(&storage),
+        extensions(),
+        None,
+        test_models(vec![Script::Message(text_message(
+            "done",
+            rpi_ai::types::StopReason::Stop,
+        ))]),
+    )
+    .await;
+    reopened.harness.resume().expect("resume");
+    let recovered = reopened
+        .harness
+        .submission(submission.id(), &context())
+        .await
+        .expect("submission")
+        .expect("present");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        recovered.wait(&context()),
+    )
+    .await
+    .expect("replay did not settle")
+    .expect("replay settled");
+
+    let results = tool_result_texts(&entries(&root_ready(&reopened.harness).await).await);
+    assert!(
+        results.iter().any(|text| text.contains("done")),
+        "{results:?}"
+    );
+    assert!(
+        !results.iter().any(|text| text.contains("different path")),
+        "{results:?}"
+    );
+    assert!(
+        runs.load(Ordering::SeqCst) >= 3,
+        "c1 and the replayed unrecorded calls must run"
+    );
 }
