@@ -663,7 +663,9 @@ async fn parked_tasks_report_task_parked() {
         info.kind == ReportKind::TaskParked
             && info.task_id == Some(id)
             && info.task_kind.as_deref() == Some("test.count")
-            && info.reason.as_deref() == Some("restart_limit")
+            // Upstream's `task_parked` carries no fixed `reason`; the restart
+            // limit is the definition of parked.
+            && info.reason.is_none()
     }));
     reopened.harness.close(&context()).await.unwrap();
 }
@@ -847,4 +849,289 @@ async fn a_scheduler_commit_failure_fails_the_session() {
         "got {:?}",
         opened.harness.session().failure()
     );
+}
+
+// ─── V18-06 eleventh review: abort marks, inspect, and failed waits ─────────
+
+/// Upstream `harness-blocked.test.ts`: "still runs the abort handler of a parked
+/// task". Writing the abort mark starts the count over, so the handler is not
+/// cut off by the crashes that parked the task.
+#[tokio::test]
+async fn abort_handler_of_a_parked_task_runs() {
+    use rpi_durable::harness::{HarnessSettings, RestartLimit};
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let settings = HarnessSettings {
+        restart_limit: Some(RestartLimit::Limited(1)),
+        ..Default::default()
+    };
+    let opened = open_with_storage_settings_and_report(
+        Arc::clone(&storage),
+        all_tasks(),
+        Some(settings.clone()),
+        None,
+    )
+    .await;
+    let conversation = root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned(
+            "test.abort",
+            serde_json::json!({ "phase": "step", "count": 0 }),
+        ),
+    )
+    .await;
+    // A crash: the record stays `running` on disk.
+    let mut record = opened
+        .harness
+        .get_task(id, &context())
+        .await
+        .unwrap()
+        .expect("task");
+    record.state = TaskState::Running {
+        checkpoint: scheduler_support::checkpoint(&record),
+    };
+    stamp_task(&opened.harness, record).await;
+    // Reopen: one restart with limit 1 parks it.
+    let reopened = open_with_storage_settings_and_report(
+        Arc::clone(&storage),
+        all_tasks(),
+        Some(settings),
+        None,
+    )
+    .await;
+    let record = reopened
+        .harness
+        .get_task(id, &context())
+        .await
+        .unwrap()
+        .expect("live");
+    assert_eq!(record.restarts, Some(1));
+    reopened.harness.abort_task(id, &context()).await.unwrap();
+    let settled = reopened
+        .harness
+        .wait_for_task(id, &context())
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal_status(&settled.record),
+        Some("aborted"),
+        "a parked task's abort handler must run"
+    );
+    reopened.harness.close(&context()).await.unwrap();
+}
+
+/// Upstream `harness-blocked.test.ts`: an abandoned task whose definition is
+/// missing waits for one instead of being orphaned, so its handler can clean up.
+#[tokio::test]
+async fn abandoned_task_without_a_definition_waits_as_blocked() {
+    use rpi_durable::session::{TaskCreate, TaskOwnership, commit_fn};
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
+    let conversation = root(&opened.harness).await;
+    let id = opened
+        .harness
+        .session()
+        .commit(
+            commit_fn(move |tx| {
+                Box::pin(async move {
+                    tx.create_task(TaskCreate {
+                        kind: "test.abort".to_string(),
+                        version: 1,
+                        input: serde_json::Value::Null,
+                        checkpoint: serde_json::json!({ "phase": "step", "count": 0 }),
+                        ownership: TaskOwnership::Conversation(conversation),
+                        conversation_id: Some(conversation),
+                        background: false,
+                        abandon_on_restart: true,
+                        trace: Default::default(),
+                        links: Vec::new(),
+                    })
+                    .await
+                })
+            }),
+            &context(),
+        )
+        .await
+        .expect("create");
+    let mut record = opened
+        .harness
+        .get_task(id, &context())
+        .await
+        .unwrap()
+        .expect("task");
+    record.state = TaskState::Running {
+        checkpoint: scheduler_support::checkpoint(&record),
+    };
+    stamp_task(&opened.harness, record).await;
+    let reopened =
+        open_with_storage_settings_and_report(Arc::clone(&storage), Vec::new(), None, None).await;
+    reopened.harness.resume().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let record = reopened
+        .harness
+        .get_task(id, &context())
+        .await
+        .unwrap()
+        .expect("record");
+    assert!(
+        !matches!(record.state, TaskState::Terminal { .. }),
+        "an abandoned task whose definition is missing stays live, got {:?}",
+        record.state
+    );
+    assert_eq!(record.abort_reason.as_deref(), Some("restart"));
+    // The mark starts the count over: the crash that abandoned it does not eat
+    // the abort handler's budget (upstream `withAbortMark`).
+    assert_eq!(record.restarts, None, "the mark resets the restart count");
+    reopened.harness.close(&context()).await.unwrap();
+}
+
+/// With `restartLimit = 1`, the crash that abandons a running task must not use
+/// up the handler's one try: it still runs and ends the task `aborted`.
+#[tokio::test]
+async fn an_abandoned_running_task_still_runs_its_abort_handler() {
+    use rpi_durable::harness::{HarnessSettings, RestartLimit};
+    use rpi_durable::session::{TaskCreate, TaskOwnership, commit_fn};
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let settings = HarnessSettings {
+        restart_limit: Some(RestartLimit::Limited(1)),
+        ..Default::default()
+    };
+    let opened = open_with_storage_settings_and_report(
+        Arc::clone(&storage),
+        all_tasks(),
+        Some(settings.clone()),
+        None,
+    )
+    .await;
+    let conversation = root(&opened.harness).await;
+    let id = opened
+        .harness
+        .session()
+        .commit(
+            commit_fn(move |tx| {
+                Box::pin(async move {
+                    tx.create_task(TaskCreate {
+                        kind: "test.abort".to_string(),
+                        version: 1,
+                        input: serde_json::Value::Null,
+                        checkpoint: serde_json::json!({ "phase": "step", "count": 0 }),
+                        ownership: TaskOwnership::Conversation(conversation),
+                        conversation_id: Some(conversation),
+                        background: false,
+                        abandon_on_restart: true,
+                        trace: Default::default(),
+                        links: Vec::new(),
+                    })
+                    .await
+                })
+            }),
+            &context(),
+        )
+        .await
+        .expect("create");
+    let mut record = opened
+        .harness
+        .get_task(id, &context())
+        .await
+        .unwrap()
+        .expect("task");
+    record.state = TaskState::Running {
+        checkpoint: scheduler_support::checkpoint(&record),
+    };
+    stamp_task(&opened.harness, record).await;
+    let reopened = open_with_storage_settings_and_report(
+        Arc::clone(&storage),
+        all_tasks(),
+        Some(settings),
+        None,
+    )
+    .await;
+    reopened.harness.resume().unwrap();
+    let settled = reopened
+        .harness
+        .wait_for_task(id, &context())
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal_status(&settled.record),
+        Some("aborted"),
+        "the abandoned task's handler runs instead of faulting at the limit"
+    );
+    assert_eq!(settled.record.restarts, None);
+    reopened.harness.close(&context()).await.unwrap();
+}
+
+/// A due sleep (or an abort-marked one) is not `Sleeping` in `inspect()`
+/// (upstream `#notDue` also requires `until > now` and no abort mark).
+#[tokio::test]
+async fn a_due_sleep_without_a_definition_inspects_as_blocked() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
+    let conversation = root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.count", serde_json::json!({ "phases": 1 })),
+    )
+    .await;
+    let mut record = opened
+        .harness
+        .get_task(id, &context())
+        .await
+        .unwrap()
+        .expect("task");
+    record.state = TaskState::Sleeping {
+        checkpoint: scheduler_support::checkpoint(&record),
+        until: 0.0,
+    };
+    stamp_task(&opened.harness, record).await;
+    let reopened =
+        open_with_storage_settings_and_report(Arc::clone(&storage), Vec::new(), None, None).await;
+    reopened.harness.resume().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let inspection = reopened.harness.inspect(&context()).await.unwrap();
+    let entry = inspection
+        .tasks
+        .iter()
+        .find(|task| task.record.id == id)
+        .expect("live");
+    assert!(
+        matches!(
+            entry.state,
+            TaskInspectionState::Blocked {
+                reason: BlockedReason::MissingTask,
+                ..
+            }
+        ),
+        "a due sleep is not sleeping, got {:?}",
+        entry.state
+    );
+    reopened.harness.close(&context()).await.unwrap();
+}
+
+/// R-D11: a wait after the Session failed reports the cause, not "closed".
+#[tokio::test]
+async fn a_wait_after_a_session_failure_reports_the_cause() {
+    let opened = open_with(all_tasks()).await;
+    let conversation = root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.count", serde_json::json!({ "phases": 3 })),
+    )
+    .await;
+    opened.harness.session().fail("storage exploded");
+    match opened.harness.wait_for_task(id, &context()).await {
+        Err(rpi_durable::session::SessionError::Failed { cause }) => {
+            assert!(cause.contains("storage exploded"), "got {cause}")
+        }
+        other => panic!(
+            "expected Failed, got {}",
+            match other {
+                Ok(_) => "ok".to_string(),
+                Err(error) => error.to_string(),
+            }
+        ),
+    }
 }

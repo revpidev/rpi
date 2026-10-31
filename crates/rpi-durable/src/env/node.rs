@@ -1678,7 +1678,8 @@ pub fn default_watch_mode() -> NodeWatchMode {
 
 const DEFAULT_LIST_MAX_ENTRIES: usize = 50_000;
 const DEFAULT_LIST_MAX_BYTES: usize = 4 * 1024 * 1024;
-const MAX_LIST_MAX_BYTES: usize = 15_900_000;
+/// Upstream's `MAX_PAYLOAD` (`16 MiB` minus the `64 KiB` frame reserve).
+const MAX_LIST_MAX_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
 const DEFAULT_LIST_TIMEOUT_MS: u64 = 10_000;
 
 /// The ignore matchers that apply to one path, shallowest first. Replaying
@@ -1771,14 +1772,39 @@ async fn git_exclude_file(root: &Path) -> Option<PathBuf> {
     Some(common.join("info").join("exclude"))
 }
 
+/// A dot file, and on Windows a file with the hidden attribute (`ignore`'s
+/// `WalkBuilder::hidden(false)` semantics, which the option documents).
+fn is_hidden_entry(name: &str, metadata: &std::fs::Metadata) -> bool {
+    if name.starts_with('.') {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
+            return true;
+        }
+    }
+    let _ = metadata;
+    false
+}
+
 async fn initial_ignore_chain(root: &Path, listed: &Path) -> IgnoreChain {
     let mut chain = IgnoreChain::default();
     // Git precedence: global excludes, then `$GIT_DIR/info/exclude`, then the
     // root `.gitignore`, then each deeper `.gitignore` as it is entered.
-    if let Some(global) = ignore::gitignore::gitconfig_excludes_path()
-        && let Some(matcher) = load_gitignore(root, &global).await
-    {
-        chain = chain.push(matcher);
+    if let Some(global) = ignore::gitignore::gitconfig_excludes_path() {
+        // A relative `core.excludesFile` resolves against the listed directory,
+        // as Git is run there (upstream `WalkBuilder::current_dir(root_path)`).
+        let global = if global.is_relative() {
+            listed.join(global)
+        } else {
+            global
+        };
+        if let Some(matcher) = load_gitignore(root, &global).await {
+            chain = chain.push(matcher);
+        }
     }
     if let Some(exclude) = git_exclude_file(root).await
         && let Some(matcher) = load_gitignore(root, &exclude).await
@@ -1875,9 +1901,6 @@ async fn read_children(
         if name == ".git" || scan.exclude.iter().any(|excluded| excluded == &name) {
             continue;
         }
-        if !scan.show_hidden && name.starts_with('.') {
-            continue;
-        }
         let path = entry.path();
         let relative = if parent.relative.is_empty() {
             name.clone()
@@ -1895,6 +1918,9 @@ async fn read_children(
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
+        if !scan.show_hidden && is_hidden_entry(&name, &metadata) {
+            continue;
+        }
         let kind = if metadata.file_type().is_symlink() {
             FileKind::Symlink
         } else if metadata.is_dir() {

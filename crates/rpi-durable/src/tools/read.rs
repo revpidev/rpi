@@ -189,19 +189,26 @@ async fn read_stable_text_inner(
             context,
             size: before.size,
         };
-        let result = match detect_supported_image_mime_type_of(&source)
+        // A concurrent writer can change the file between the scan and the
+        // reads: appending (a growing log) leaves the scanned text as it was,
+        // and an image must be whole, so a grown image is read again
+        // (upstream `read.ts`).
+        let (result, image) = match detect_supported_image_mime_type_of(&source)
             .await
             .map_err(|error| tool_error(error.to_string()))?
         {
-            Some(mime_type) => {
-                read_image(reader, &before, path, &mime_type, processor, model, context).await?
-            }
-            None => read_text(reader, path, offset, limit, context).await?,
+            Some(mime_type) => (
+                read_image(reader, &before, path, &mime_type, processor, model, context).await?,
+                true,
+            ),
+            None => (
+                read_text(reader, path, offset, limit, context).await?,
+                false,
+            ),
         };
         let after = reader.info(context).await?;
-        if after.size > before.size
-            || (after.size == before.size && after.mtime_ms == before.mtime_ms)
-        {
+        let unchanged = after.size == before.size && after.mtime_ms == before.mtime_ms;
+        if unchanged || (!image && after.size > before.size) {
             return Ok(result);
         }
         if attempt == 1 {
@@ -743,6 +750,7 @@ mod tests {
     use crate::env::line_scan::LineScanner;
     use crate::env::types::{FileKind, LineScan, ScanLinesOptions};
     use crate::errors::FileErrorCode;
+    use base64::Engine as _;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -752,15 +760,21 @@ mod tests {
         content: Mutex<Vec<u8>>,
         infos: Vec<(u64, f64)>,
         call: AtomicUsize,
+        reads: AtomicUsize,
         path: String,
     }
 
     impl ScheduledReader {
         fn new(content: &str, infos: Vec<(u64, f64)>) -> Self {
+            Self::bytes(content.as_bytes().to_vec(), infos)
+        }
+
+        fn bytes(content: Vec<u8>, infos: Vec<(u64, f64)>) -> Self {
             Self {
-                content: Mutex::new(content.as_bytes().to_vec()),
+                content: Mutex::new(content),
                 infos,
                 call: AtomicUsize::new(0),
+                reads: AtomicUsize::new(0),
                 path: "f.txt".to_string(),
             }
         }
@@ -790,6 +804,7 @@ mod tests {
             length: u64,
             _context: &Context,
         ) -> Result<Vec<u8>, crate::errors::FileError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             let content = self.content.lock().expect("content");
             let from = (offset as usize).min(content.len());
             let to = ((offset + length) as usize).min(content.len());
@@ -821,12 +836,81 @@ mod tests {
         crate::chord::context::BACKGROUND_CONTEXT.clone()
     }
 
+    /// 1x1 PNG.
+    const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    /// Upstream: "An image must be read whole: unlike text, one that grows while
+    /// it is read is read again." (spec §"read"); a text log that grows keeps
+    /// the scanned text (see the test below).
+    #[tokio::test]
+    async fn rereads_an_image_that_grew_while_it_was_read() {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(PNG_1X1)
+            .expect("png");
+        let size = bytes.len() as u64;
+        let reader = ScheduledReader::bytes(
+            bytes,
+            vec![
+                (size, 1.0),
+                (size + 10, 1.0),
+                (size + 10, 1.0),
+                (size + 10, 1.0),
+            ],
+        );
+        let result = read_stable_text(&reader, "f.png", None, None, &context())
+            .await
+            .expect("read");
+        assert_eq!(
+            reader.call.load(Ordering::SeqCst),
+            4,
+            "one before/after pair per attempt: the image is read again"
+        );
+        assert!(
+            result
+                .output
+                .as_ref()
+                .map(|content| content
+                    .iter()
+                    .any(|part| matches!(part, ToolResultContent::Image(_))))
+                .unwrap_or(false),
+            "a whole image comes back"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_that_keeps_growing_fails_the_read() {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(PNG_1X1)
+            .expect("png");
+        let size = bytes.len() as u64;
+        let reader = ScheduledReader::bytes(
+            bytes,
+            vec![
+                (size, 1.0),
+                (size + 10, 1.0),
+                (size + 10, 1.0),
+                (size + 20, 1.0),
+            ],
+        );
+        let error = read_stable_text(&reader, "f.png", None, None, &context())
+            .await
+            .expect_err("a growing image fails");
+        assert!(
+            error.to_string().contains("changed while it was read"),
+            "got {error}"
+        );
+        assert_eq!(reader.call.load(Ordering::SeqCst), 4);
+    }
+
     #[tokio::test]
     async fn accepts_a_log_that_grew_while_it_was_read() {
         let reader = ScheduledReader::new("one\ntwo\n", vec![(8, 1.0), (12, 1.0)]);
         let result = read_stable_text(&reader, "f.txt", None, Some(2.0), &context())
             .await
             .expect("read");
+        // One before/after pair: text that grew is accepted as it was scanned
+        // (an image would be read again).
+        assert_eq!(reader.call.load(Ordering::SeqCst), 2);
         assert_eq!(
             result
                 .output

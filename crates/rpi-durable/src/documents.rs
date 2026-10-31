@@ -60,8 +60,10 @@ pub struct DocDefinition {
     pub initial: DocInitializer,
     /// Migrate a stored value from an older definition version.
     pub migrate: Option<DocMigration>,
-    /// Whether a nonempty delta batch must be stored as a fresh base.
-    pub checkpoint_when: Option<DocCheckpoint>,
+    /// Whether a nonempty delta batch must be stored as a fresh base. Required:
+    /// a plain delta declares `|_, _, _| false` explicitly (upstream
+    /// `checkpointWhen`).
+    pub checkpoint_when: DocCheckpoint,
 }
 
 impl std::fmt::Debug for DocDefinition {
@@ -93,7 +95,9 @@ impl std::fmt::Debug for DocToken {
 }
 
 /// Validate a definition and wrap it in a singleton token.
-pub fn define_doc(definition: DocDefinition) -> DocToken {
+pub fn define_doc(mut definition: DocDefinition) -> DocToken {
+    // A singleton never takes a family key, whatever the struct literal says.
+    definition.family = false;
     validate_definition(&definition);
     DocToken {
         definition: Arc::new(definition),
@@ -110,11 +114,6 @@ pub fn define_doc_family(mut definition: DocDefinition) -> DocToken {
 }
 
 fn validate_definition(definition: &DocDefinition) {
-    assert!(
-        definition.checkpoint_when.is_some(),
-        "Document {} must declare checkpointWhen",
-        definition.kind
-    );
     assert!(
         definition.version >= 1,
         "Document {} version must be a positive integer",
@@ -446,7 +445,7 @@ mod tests {
                 _ => JsonObject::new(),
             }),
             migrate: None,
-            checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
+            checkpoint_when: Arc::new(|_value, _ops, _revision| false),
         }
     }
 
@@ -569,22 +568,31 @@ mod tests {
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    #[test]
-    fn a_definition_without_checkpoint_when_fails_at_registration() {
-        let definition = DocDefinition {
-            kind: "test.missing-checkpoint".to_string(),
+    fn definition(family: bool) -> DocDefinition {
+        DocDefinition {
+            kind: "test.checkpoint".to_string(),
             version: 1,
             scope: DocScope::Session,
             history: None,
             fork: None,
-            family: false,
+            family,
             initial: Arc::new(|_seed| JsonObject::new()),
             migrate: None,
-            checkpoint_when: None,
-        };
-        let result = catch_unwind(AssertUnwindSafe(|| define_doc(definition)));
-        assert!(result.is_err(), "checkpointWhen must be required");
+            // Required by the type: a plain delta says so explicitly.
+            checkpoint_when: Arc::new(|_value, _ops, _revision| false),
+        }
+    }
+
+    /// `checkpointWhen` is a required field, so a definition cannot omit it
+    /// (upstream's `AnyDocDefinition`), and `defineDocFamily` marks a family.
+    #[test]
+    fn checkpoint_when_is_required_and_family_is_marked() {
+        let singleton = define_doc(definition(false));
+        assert!(!singleton.definition.family);
+        let family = define_doc_family(definition(false));
+        assert!(family.definition.family);
+        let predicate = &family.definition.checkpoint_when;
+        assert!(!predicate(&JsonValue::Object(JsonObject::new()), &[], 0));
     }
 }

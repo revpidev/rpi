@@ -533,6 +533,9 @@ impl ConversationImpl {
         submission: SubmissionDraft,
         context: &Context,
     ) -> SessionResult<Arc<dyn Submission>> {
+        // A close in progress stops admission first, so nothing starts a run
+        // `close` will not join (upstream closes the Session before joining).
+        self.harness.assert_open()?;
         self.harness
             .submissions
             .submit(self.id, submission, context)
@@ -541,6 +544,7 @@ impl ConversationImpl {
 
     /// Admit a `pi.reset` write that starts a new context.
     pub async fn reset(&self, handoff: Option<String>, context: &Context) -> SessionResult<()> {
+        self.harness.assert_open()?;
         let mut entry = EntryDraft::new(RESET_ENTRY);
         entry.head = Some(EntryHead::This);
         if let Some(text) = handoff {
@@ -568,6 +572,7 @@ impl ConversationImpl {
         instructions: Option<String>,
         context: &Context,
     ) -> SessionResult<TaskId> {
+        self.harness.assert_open()?;
         self.harness.tasks.resume();
         let tasks = Arc::clone(&self.harness.tasks);
         let id = self.id;
@@ -772,6 +777,14 @@ impl Conversation for ConversationImpl {
 
     async fn wait_for_idle(&self, context: &Context) -> SessionResult<()> {
         ConversationImpl::wait_for_idle(self, context).await
+    }
+
+    async fn compact(
+        &self,
+        instructions: Option<String>,
+        context: &Context,
+    ) -> SessionResult<TaskId> {
+        ConversationImpl::compact(self, instructions, context).await
     }
 }
 
@@ -1008,10 +1021,31 @@ pub async fn open_harness(
 /// publications.
 pub async fn open_harness_with_scheduler(
     storage: Arc<dyn Storage>,
-    options: HarnessOptions,
+    mut options: HarnessOptions,
     scheduler_factory: SchedulerFactory,
     context: &Context,
 ) -> SessionResult<Arc<HarnessImpl>> {
+    // A throwing `onReport` callback is contained, and the reports that bypass
+    // the scheduler's context-aware path (session, listener, extension) emit
+    // their fixed telemetry here (upstream `safeReport`).
+    {
+        let host = options.on_report_info.clone();
+        let telemetry = options.telemetry.clone().unwrap_or_default();
+        options.on_report_info = Some(Arc::new(move |info: crate::harness::types::ReportInfo| {
+            if matches!(
+                info.kind,
+                crate::harness::types::ReportKind::SessionFailed
+                    | crate::harness::types::ReportKind::ListenerError
+                    | crate::harness::types::ReportKind::ExtensionError
+            ) {
+                crate::harness::scheduler::emit_report_telemetry(&telemetry, &info);
+            }
+            let Some(host) = host.as_ref() else {
+                return;
+            };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host(info)));
+        }));
+    }
     if context
         .abort_signal()
         .is_some_and(|signal| signal.is_cancelled())
@@ -1041,10 +1075,17 @@ pub async fn open_harness_with_scheduler(
             .unwrap_or(crate::harness::types::SettingsSource::Fixed(
                 crate::harness::types::HarnessSettings::default(),
             ));
-    let report = options
-        .on_report
-        .clone()
-        .unwrap_or_else(|| Arc::new(|_| {}));
+    // A host report callback that throws is contained (upstream `contained` in
+    // `safeReport`): the failure surface never propagates into a commit line.
+    let report: crate::harness::types::ReportFn = {
+        let host = options.on_report.clone();
+        Arc::new(move |message: String| {
+            let Some(host) = host.as_ref() else {
+                return;
+            };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host(message)));
+        })
+    };
     let session = SessionImpl::new(Arc::clone(&storage), Some(Arc::clone(&now)));
     session.set_conversation_created_hook(conversation_created_hook(
         options.conversation_created.clone(),
@@ -1093,12 +1134,9 @@ pub async fn open_harness_with_scheduler(
         move |message| {
             report(message);
             if let Some(report) = &report_info {
-                report(
-                    crate::harness::types::ReportInfo::new(
-                        crate::harness::types::ReportKind::ListenerError,
-                    )
-                    .with_reason("listener"),
-                );
+                report(crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::ListenerError,
+                ));
             }
         }
     }));

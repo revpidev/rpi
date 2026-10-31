@@ -218,24 +218,37 @@ fn tail_chars(text: &str, max: usize) -> String {
     text.chars().skip(count.saturating_sub(max)).collect()
 }
 
-/// Lay out the script's text items so the model can tell them apart.
+/// Lay out the script's text items so the model can tell them apart: number
+/// them first (upstream `formatItems`), then join adjacent text of one stream
+/// into one block (`joinAdjacentText`).
 fn text_blocks(outcome: &CodemodeOutcome) -> Vec<String> {
     let items = display_items(outcome);
     let total = items.iter().filter(|item| !item.console).count();
-    let mut blocks: Vec<String> = Vec::new();
-    let mut console_lines: Vec<String> = Vec::new();
+    let mut numbered: Vec<CodemodeTextItem> = Vec::new();
     let mut index = 0;
-    for item in &items {
+    for item in items {
         if item.console {
-            console_lines.push(item.text.clone());
+            numbered.push(item);
             continue;
         }
         index += 1;
-        blocks.push(if total > 1 {
-            format!("==> text {index}/{total} <==\n{}", item.text)
-        } else {
-            item.text.clone()
+        numbered.push(CodemodeTextItem {
+            text: if total > 1 {
+                format!("==> text {index}/{total} <==\n{}", item.text)
+            } else {
+                item.text
+            },
+            console: false,
         });
+    }
+    let mut blocks: Vec<String> = Vec::new();
+    let mut console_lines: Vec<String> = Vec::new();
+    for item in join_adjacent_text(&numbered) {
+        if item.console {
+            console_lines.push(item.text);
+            continue;
+        }
+        blocks.push(item.text);
     }
     if !console_lines.is_empty() {
         blocks.push(format!(
@@ -253,7 +266,7 @@ fn structured_text(value: &Value) -> String {
     }
 }
 
-fn error_text(outcome: &CodemodeOutcome) -> Option<String> {
+fn error_text(outcome: &CodemodeOutcome, calls: &[CodemodeNestedCall]) -> Option<String> {
     if !outcome.is_error {
         return None;
     }
@@ -268,11 +281,54 @@ fn error_text(outcome: &CodemodeOutcome) -> Option<String> {
         })
         .map(|diagnostic| diagnostic.message.as_str())
         .collect();
-    if diagnostics.is_empty() {
-        Some("Script error".to_string())
+    let head = if diagnostics.is_empty() {
+        "Script error".to_string()
     } else {
-        Some(format!("Script error:\n{}", diagnostics.join("\n")))
+        format!("Script error:\n{}", diagnostics.join("\n"))
+    };
+    // Upstream `formatError`: a failed script tells the model which side effects
+    // already happened, so they are not repeated blindly.
+    let summary = if calls.is_empty() {
+        "No tool calls were made.".to_string()
+    } else {
+        format!(
+            "Tool calls made before the failure (they are not undone): {}",
+            calls
+                .iter()
+                .map(|call| format!(
+                    "{} ({})",
+                    call.name,
+                    match call.status {
+                        CodemodeCallStatus::Running => "running",
+                        CodemodeCallStatus::Ok => "ok",
+                        CodemodeCallStatus::Error => "error",
+                        CodemodeCallStatus::Cancelled => "cancelled",
+                    }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Some(format!("{head}\n\n{summary}"))
+}
+
+/// Join adjacent text items of the same stream, each part starting on its own
+/// line (upstream `joinAdjacentText`).
+fn join_adjacent_text(items: &[CodemodeTextItem]) -> Vec<CodemodeTextItem> {
+    let mut joined: Vec<CodemodeTextItem> = Vec::new();
+    for item in items {
+        if let Some(last) = joined.last_mut()
+            && last.console == item.console
+        {
+            if !last.text.is_empty() && !last.text.ends_with('\n') {
+                last.text.push('\n');
+            }
+            last.text.push_str(&item.text);
+            continue;
+        }
+        joined.push(item.clone());
     }
+    joined
 }
 
 /// Format a script result for the model.
@@ -281,6 +337,7 @@ pub async fn format_outcome(
     wall_ms: f64,
     max_output_tokens: u64,
     writer: Option<&dyn OutputFileWriter>,
+    calls: &[CodemodeNestedCall],
 ) -> FormattedOutput {
     format_with_limits(
         outcome,
@@ -288,6 +345,7 @@ pub async fn format_outcome(
         max_output_tokens,
         OutputLimits::default(),
         writer,
+        calls,
     )
     .await
 }
@@ -299,6 +357,7 @@ pub async fn format_with_limits(
     max_output_tokens: u64,
     limits: OutputLimits,
     writer: Option<&dyn OutputFileWriter>,
+    calls: &[CodemodeNestedCall],
 ) -> FormattedOutput {
     let header = format!(
         "{}\nWall time {:.1} seconds\nOutput:\n",
@@ -312,11 +371,10 @@ pub async fn format_with_limits(
     let mut blocks: Vec<String> = text_blocks(outcome);
     if !outcome.is_error
         && let Some(value) = &outcome.structured_output
-        && !value.is_null()
     {
         blocks.push(structured_text(value));
     }
-    if let Some(error) = error_text(outcome) {
+    if let Some(error) = error_text(outcome, calls) {
         blocks.push(error);
     }
 
@@ -422,7 +480,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let formatted = format_outcome(&outcome, 1500.0, 10_000, None).await;
+        let formatted = format_outcome(&outcome, 1500.0, 10_000, None, &[]).await;
         let rendered = formatted
             .content
             .iter()
@@ -455,7 +513,7 @@ mod tests {
         }
         let writer = Writer(Mutex::new(Vec::new()));
         let outcome = CodemodeOutcome::output("x".repeat(500));
-        let formatted = format_outcome(&outcome, 0.0, 10, Some(&writer)).await;
+        let formatted = format_outcome(&outcome, 0.0, 10, Some(&writer), &[]).await;
         assert!(formatted.truncated);
         assert_eq!(
             formatted.full_output_path.as_deref(),
@@ -468,5 +526,105 @@ mod tests {
                 .map(|value| String::from_utf8_lossy(&value).contains(&"x".repeat(500)))
                 .unwrap_or(false)
         );
+    }
+
+    fn rendered(formatted: &FormattedOutput) -> String {
+        formatted
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                ToolResultContent::Text(text) => Some(text.text.clone()),
+                ToolResultContent::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Upstream `formatError`: a failed script names the calls it already made so
+    /// the model does not repeat their side effects.
+    #[tokio::test]
+    async fn a_failed_script_lists_the_calls_it_made() {
+        let calls = vec![
+            CodemodeNestedCall {
+                id: 1,
+                name: "write".to_string(),
+                args: "{}".to_string(),
+                status: CodemodeCallStatus::Ok,
+                duration_ms: Some(3),
+                error: None,
+            },
+            CodemodeNestedCall {
+                id: 2,
+                name: "bash".to_string(),
+                args: "{}".to_string(),
+                status: CodemodeCallStatus::Error,
+                duration_ms: Some(4),
+                error: Some("exit 1".to_string()),
+            },
+        ];
+        let mut outcome = CodemodeOutcome::error("boom");
+        outcome.diagnostics = vec![crate::harness::types::ToolDiagnostic {
+            severity: crate::harness::types::DiagnosticSeverity::Error,
+            message: "boom".to_string(),
+            code: None,
+        }];
+        let formatted = format_outcome(&outcome, 10.0, 10_000, None, &calls).await;
+        let text = rendered(&formatted);
+        assert!(
+            text.contains(
+                "Tool calls made before the failure (they are not undone): write (ok), bash (error)"
+            ),
+            "{text}"
+        );
+        let empty = format_outcome(&outcome, 10.0, 10_000, None, &[]).await;
+        assert!(rendered(&empty).contains("No tool calls were made."));
+    }
+
+    /// Upstream `formatItems` then `joinAdjacentText`: each text item keeps its
+    /// `==> text N/M <==` marker, and adjacent ones become one block.
+    #[tokio::test]
+    async fn adjacent_text_items_keep_their_markers_and_join() {
+        let outcome = CodemodeOutcome {
+            text_items: vec![
+                CodemodeTextItem {
+                    text: "first".to_string(),
+                    console: false,
+                },
+                CodemodeTextItem {
+                    text: "second".to_string(),
+                    console: false,
+                },
+                CodemodeTextItem {
+                    text: "third".to_string(),
+                    console: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let formatted = format_outcome(&outcome, 0.0, 10_000, None, &[]).await;
+        let text = rendered(&formatted);
+        assert!(
+            text.contains(
+                "==> text 1/3 <==\nfirst\n==> text 2/3 <==\nsecond\n==> text 3/3 <==\nthird"
+            ),
+            "{text}"
+        );
+        let blocks: Vec<&ToolResultContent> = formatted
+            .content
+            .iter()
+            .filter(|content| matches!(content, ToolResultContent::Text(_)))
+            .collect();
+        assert_eq!(blocks.len(), 2, "the header and one joined block: {text}");
+    }
+
+    /// A script that returns `null` shows `null` (upstream `result.value !== undefined`).
+    #[tokio::test]
+    async fn a_returned_null_is_shown() {
+        let outcome = CodemodeOutcome {
+            structured_output: Some(Value::Null),
+            ..Default::default()
+        };
+        let formatted = format_outcome(&outcome, 0.0, 10_000, None, &[]).await;
+        assert!(rendered(&formatted).contains("null"));
     }
 }

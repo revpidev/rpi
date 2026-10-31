@@ -1309,29 +1309,26 @@ impl Transaction {
                     && let Some(change) = &plan.change
                     && let Some(loaded) = &change.loaded
                     && let Some(definition) = &change.definition
-                    && let Some(predicate) = &definition.checkpoint_when
-                {
-                    let deltas_since_base = loaded.deltas_since_base();
-                    if predicate(
+                    && (definition.checkpoint_when)(
                         change.prepared.value(),
                         change.prepared.ops(),
-                        deltas_since_base,
-                    ) {
-                        // Replace the delta with a full base of the prepared value.
-                        if let Some(StorageWrite::DocumentChange { id, .. }) = plan.content.take() {
-                            plan.content = Some(StorageWrite::DocumentChange {
-                                id,
-                                content: crate::types::DocumentContent::Base {
-                                    version: change.version,
-                                    value: change
-                                        .prepared
-                                        .value()
-                                        .as_object()
-                                        .cloned()
-                                        .unwrap_or_default(),
-                                },
-                            });
-                        }
+                        loaded.deltas_since_base(),
+                    )
+                {
+                    // Replace the delta with a full base of the prepared value.
+                    if let Some(StorageWrite::DocumentChange { id, .. }) = plan.content.take() {
+                        plan.content = Some(StorageWrite::DocumentChange {
+                            id,
+                            content: crate::types::DocumentContent::Base {
+                                version: change.version,
+                                value: change
+                                    .prepared
+                                    .value()
+                                    .as_object()
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            },
+                        });
                     }
                 }
             }

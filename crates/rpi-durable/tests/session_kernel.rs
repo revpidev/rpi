@@ -45,7 +45,7 @@ fn conversation_doc(
         family: false,
         initial: Arc::new(initial),
         migrate: None,
-        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
+        checkpoint_when: Arc::new(|_value, _ops, _revision| false),
     })
 }
 
@@ -65,7 +65,7 @@ fn conversation_family(
         family: true,
         initial: Arc::new(initial),
         migrate: None,
-        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
+        checkpoint_when: Arc::new(|_value, _ops, _revision| false),
     })
 }
 
@@ -83,7 +83,7 @@ fn session_doc(
         family: false,
         initial: Arc::new(initial),
         migrate: None,
-        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
+        checkpoint_when: Arc::new(|_value, _ops, _revision| false),
     })
 }
 
@@ -101,7 +101,7 @@ fn task_doc(
         family: false,
         initial: Arc::new(initial),
         migrate: None,
-        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
+        checkpoint_when: Arc::new(|_value, _ops, _revision| false),
     })
 }
 
@@ -571,7 +571,7 @@ async fn migration_writes_base_then_delta() {
             family: false,
             initial: Arc::new(|_| object(serde_json::json!({"count": 0}))),
             migrate: None,
-            checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
+            checkpoint_when: Arc::new(|_value, _ops, _revision| false),
         };
         definition.migrate = Some(Arc::new(|value, from| {
             let count = value.get("count").and_then(JsonValue::as_u64).unwrap_or(0);
@@ -654,9 +654,9 @@ async fn checkpoint_predicate_upgrades_delta_to_base() {
             family: false,
             initial: Arc::new(|_| object(serde_json::json!({"count": 0}))),
             migrate: None,
-            checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
+            checkpoint_when: Arc::new(|_value, _ops, _revision| false),
         };
-        definition.checkpoint_when = Some(Arc::new(|_value, _ops, _deltas_since_base| true));
+        definition.checkpoint_when = Arc::new(|_value, _ops, _deltas_since_base| true);
         define_doc(definition)
     });
     let harness = open_test_session();
@@ -1312,7 +1312,7 @@ async fn terminal_task_retires_task_documents() {
             family: true,
             initial: Arc::new(|_| object(serde_json::json!({"lines": []}))),
             migrate: None,
-            checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
+            checkpoint_when: Arc::new(|_value, _ops, _revision| false),
         })
     });
     let harness = open_test_session();
@@ -1422,7 +1422,7 @@ async fn family_first_seed_wins() {
                 }))
             }),
             migrate: None,
-            checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
+            checkpoint_when: Arc::new(|_value, _ops, _revision| false),
         })
     });
     let harness = open_test_session();
@@ -2082,7 +2082,9 @@ async fn document_retention_reloads_an_unobserved_document() {
         })
     })
     .await;
-    harness.session.set_document_retention(Arc::new(|| Some(0)));
+    harness
+        .session
+        .set_document_retention(Arc::new(|| Some(0.0)));
     let before = harness.storage.document_read_count.load(Ordering::SeqCst);
     harness
         .session
@@ -2109,6 +2111,57 @@ async fn document_retention_reloads_an_unobserved_document() {
     );
 }
 
+/// Upstream `documentRetention`: `Infinity` keeps documents, so repeated access
+/// never reloads an unobserved one.
+#[tokio::test]
+async fn document_retention_infinity_keeps_an_unobserved_document() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft
+                .write()?
+                .as_object_mut()
+                .unwrap()
+                .insert("message".into(), serde_json::json!("kept"));
+            Ok(())
+        })
+    })
+    .await;
+    harness
+        .session
+        .set_document_retention(Arc::new(|| Some(f64::INFINITY)));
+    harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("first");
+    let loaded = harness.storage.document_read_count.load(Ordering::SeqCst);
+    for _ in 0..3 {
+        harness
+            .session
+            .snapshot(
+                live(),
+                DocOwner::Conversation(conversation),
+                &BACKGROUND_CONTEXT,
+            )
+            .await
+            .expect("again");
+    }
+    assert_eq!(
+        harness.storage.document_read_count.load(Ordering::SeqCst),
+        loaded,
+        "Infinity keeps the document cached"
+    );
+}
+
 /// R-D10: a watch keeps its document cached.
 #[tokio::test]
 async fn document_retention_keeps_an_observed_document() {
@@ -2128,7 +2181,9 @@ async fn document_retention_keeps_an_observed_document() {
         })
     })
     .await;
-    harness.session.set_document_retention(Arc::new(|| Some(0)));
+    harness
+        .session
+        .set_document_retention(Arc::new(|| Some(0.0)));
     let watch = harness
         .session
         .watch_doc(
@@ -2155,4 +2210,80 @@ async fn document_retention_keeps_an_observed_document() {
         "an observed document stays cached"
     );
     watch.stop().await;
+}
+
+/// A document with two observers stays cached when the first one detaches:
+/// only the last release unpins the address (upstream counts attaches).
+#[tokio::test]
+async fn document_retention_counts_each_observer() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft
+                .write()?
+                .as_object_mut()
+                .unwrap()
+                .insert("message".into(), serde_json::json!("kept"));
+            Ok(())
+        })
+    })
+    .await;
+    harness
+        .session
+        .set_document_retention(Arc::new(|| Some(0.0)));
+    let first = harness
+        .session
+        .watch_doc(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("watch")
+        .expect("document");
+    let second = harness
+        .session
+        .watch_doc(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("watch")
+        .expect("document");
+    first.stop().await;
+    let before = harness.storage.document_read_count.load(Ordering::SeqCst);
+    harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        harness.storage.document_read_count.load(Ordering::SeqCst),
+        before,
+        "the second observer still pins the document"
+    );
+    second.stop().await;
+    // The last release unpins it, so retention 0 reloads on the next access.
+    harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("snapshot");
+    assert!(
+        harness.storage.document_read_count.load(Ordering::SeqCst) > before,
+        "the last detach releases the address"
+    );
 }

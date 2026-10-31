@@ -24,6 +24,7 @@ use scheduler_support::{Spec, add_task, all_tasks, context, open_with_telemetry,
 struct State {
     spans: Mutex<Vec<Span>>,
     metrics: Mutex<Vec<(String, f64, JsonObject)>>,
+    root_events: Mutex<Vec<(String, JsonObject)>>,
     next: AtomicU64,
 }
 
@@ -34,6 +35,7 @@ struct Span {
     attributes: JsonObject,
     links: Vec<TelemetryCarrier>,
     events: Vec<String>,
+    event_attributes: Vec<JsonObject>,
     end_attributes: JsonObject,
     status: String,
     message: Option<String>,
@@ -141,8 +143,19 @@ impl TelemetrySink for RecordingSink {
         self.with_span(|span| span.attributes.extend(attributes));
     }
 
-    fn add_event(&self, name: &str, _attributes: JsonObject) {
-        self.with_span(|span| span.events.push(name.to_string()));
+    fn add_event(&self, name: &str, attributes: JsonObject) {
+        if self.span.is_none() {
+            self.state
+                .root_events
+                .lock()
+                .expect("events")
+                .push((name.to_string(), attributes));
+            return;
+        }
+        self.with_span(|span| {
+            span.events.push(name.to_string());
+            span.event_attributes.push(attributes);
+        });
     }
 
     fn add_link(&self, carrier: JsonValue) {
@@ -173,6 +186,7 @@ impl TelemetrySink for RecordingSink {
             attributes,
             links,
             events: Vec::new(),
+            event_attributes: Vec::new(),
             end_attributes: JsonObject::new(),
             status: "ok".to_string(),
             message: None,
@@ -701,4 +715,205 @@ async fn a_phase_ended_by_close_is_aborted_and_ok() {
     assert_eq!(span.end_attributes["outcome"], "aborted");
     assert_eq!(span.status, "ok");
     assert!(span.message.is_none(), "message: {:?}", span.message);
+}
+
+// ─── V18-06 eleventh review: report attributes, abort duration, span end ────
+
+/// R-D9: `pi.durable.report` carries only the fixed attributes of its kind
+/// (upstream `safeReport`): `reason` is a fixed enum value and only
+/// `task_faulted`/`task_outdated` have it.
+#[tokio::test]
+async fn report_events_carry_only_their_kind_attributes() {
+    let recorder = Recorder::default();
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let telemetry = || TelemetryContext::new(Arc::new(recorder.root()) as Arc<dyn TelemetrySink>);
+    let mut opened = open_with_telemetry(Arc::clone(&storage), all_tasks(), telemetry()).await;
+    let conversation = root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.count", serde_json::json!({ "phases": 3 })),
+    )
+    .await;
+    // Five crash-loops park it, and the park reports `task_parked`.
+    for _ in 0..6 {
+        let mut record = opened
+            .harness
+            .get_task(id, &context())
+            .await
+            .expect("task")
+            .expect("record");
+        record.state = rpi_durable::types::TaskState::Running {
+            checkpoint: scheduler_support::checkpoint(&record),
+        };
+        scheduler_support::stamp_task(&opened.harness, record).await;
+        opened = open_with_telemetry(Arc::clone(&storage), all_tasks(), telemetry()).await;
+    }
+    let mut events: Vec<JsonObject> = recorder
+        .0
+        .spans
+        .lock()
+        .expect("spans")
+        .iter()
+        .flat_map(|span| span.event_attributes.clone())
+        .collect();
+    events.extend(
+        recorder
+            .0
+            .root_events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter(|(name, _)| name == "pi.durable.report")
+            .map(|(_, attributes)| attributes.clone()),
+    );
+    let parked = events
+        .iter()
+        .find(|event| event.get("type").and_then(JsonValue::as_str) == Some("task_parked"))
+        .unwrap_or_else(|| panic!("no task_parked event: {events:?}"));
+    assert!(
+        parked.get("reason").is_none(),
+        "task_parked has no fixed reason: {parked:?}"
+    );
+    assert_eq!(parked["task.id"], JsonValue::from(id.get()));
+    assert_eq!(
+        parked.keys().cloned().collect::<Vec<_>>(),
+        vec!["type".to_string(), "task.id".to_string()],
+        "only the kind's fixed attributes: {parked:?}"
+    );
+    // A faulted task carries the fixed reason; a host error carries none.
+    assert!(events.iter().all(|event| {
+        event.get("type").and_then(JsonValue::as_str) != Some("task_faulted")
+            || matches!(
+                event.get("reason").and_then(JsonValue::as_str),
+                Some("threw") | Some("restart_limit")
+            )
+    }));
+    assert!(events.iter().all(|event| {
+        event.get("type").and_then(JsonValue::as_str) != Some("host_error")
+            || event.get("reason").is_none()
+    }));
+    opened.harness.close(&context()).await.expect("close");
+}
+
+/// R-D9: an abort phase records its duration like a run phase (upstream `#phase`
+/// wraps both).
+#[tokio::test]
+async fn an_abort_phase_records_its_duration() {
+    let recorder = Recorder::default();
+    let telemetry = TelemetryContext::new(Arc::new(recorder.root()) as Arc<dyn TelemetrySink>);
+    let opened = open_with_telemetry(Arc::clone(&recorder_storage()), all_tasks(), telemetry).await;
+    let conversation = root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned(
+            "test.abort",
+            serde_json::json!({ "phase": "step", "count": 0 }),
+        ),
+    )
+    .await;
+    opened.harness.resume().expect("resume");
+    opened
+        .harness
+        .abort_task(id, &context())
+        .await
+        .expect("abort");
+    wait_terminal(&opened.harness, id).await;
+    let metrics = recorder.0.metrics.lock().expect("metrics").clone();
+    assert!(
+        metrics.iter().any(|(name, _, attributes)| {
+            name == "pi.durable.phase.duration"
+                && attributes["task"] == "test.abort"
+                && attributes["outcome"] == "aborted"
+        }),
+        "missing abort duration: {metrics:?}"
+    );
+    opened.harness.close(&context()).await.expect("close");
+}
+
+/// R-D9: a phase that ends in a sleep still ends its span with that outcome,
+/// and a later Session failure does not leave it unfinished. (`step` normalizes
+/// a failed commit into an ended invocation, so the span-end-on-error branch in
+/// `run`/`run_abort` is defensive.)
+#[tokio::test]
+async fn a_phase_that_commits_a_sleep_ends_its_span_before_the_session_fails() {
+    let recorder = Recorder::default();
+    let telemetry = TelemetryContext::new(Arc::new(recorder.root()) as Arc<dyn TelemetrySink>);
+    let opened = open_with_telemetry(Arc::clone(&recorder_storage()), all_tasks(), telemetry).await;
+    let conversation = root(&opened.harness).await;
+    add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned(
+            "test.abort",
+            serde_json::json!({ "phase": "step", "count": 0 }),
+        ),
+    )
+    .await;
+    opened.harness.resume().expect("resume");
+    for _ in 0..200 {
+        if recorder.span_count("pi.durable.phase") > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(recorder.span_count("pi.durable.phase"), 1);
+    opened.harness.session().fail("storage exploded");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let span = recorder.last_span("pi.durable.phase");
+    assert!(span.ended, "the failed phase span must end");
+    assert_eq!(
+        span.end_attributes["outcome"], "sleeping",
+        "the phase's own outcome: {:?}",
+        span.end_attributes
+    );
+    let metrics = recorder.0.metrics.lock().expect("metrics").clone();
+    assert!(
+        metrics.iter().any(|(name, _, attributes)| {
+            name == "pi.durable.phase.duration" && attributes["task"] == "test.abort"
+        }),
+        "the failed phase still records its duration"
+    );
+}
+
+fn recorder_storage() -> Arc<dyn Storage> {
+    Arc::new(MemoryStorage::new())
+}
+
+/// R-D9: a host `onReport` info callback that throws is contained, and a report
+/// outside the scheduler's context path still emits its fixed telemetry
+/// (upstream `safeReport`).
+#[tokio::test]
+async fn a_panicking_report_callback_is_contained_and_still_reported() {
+    let recorder = Recorder::default();
+    let telemetry = TelemetryContext::new(Arc::new(recorder.root()) as Arc<dyn TelemetrySink>);
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = scheduler_support::open_with_telemetry_and_report(
+        Arc::clone(&storage),
+        all_tasks(),
+        telemetry,
+        Some(Arc::new(|_info: rpi_durable::harness::ReportInfo| {
+            panic!("host report callback");
+        })),
+    )
+    .await;
+    // Failing the Session runs the failure reporter, which reports
+    // `session_failed` through the throwing callback.
+    opened.harness.session().fail("storage exploded");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let events: Vec<(String, JsonObject)> = recorder.0.root_events.lock().expect("events").clone();
+    let report = events
+        .iter()
+        .find(|(name, attributes)| {
+            name == "pi.durable.report"
+                && attributes.get("type").and_then(JsonValue::as_str) == Some("session_failed")
+        })
+        .unwrap_or_else(|| panic!("no session_failed report event: {events:?}"));
+    assert_eq!(
+        report.1.keys().cloned().collect::<Vec<_>>(),
+        vec!["type".to_string()],
+        "session_failed carries no extra attribute: {:?}",
+        report.1
+    );
 }

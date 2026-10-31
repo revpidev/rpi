@@ -139,7 +139,11 @@ impl ToolExecute for ToolSearchTool {
                         .find(|tool| tool.name() == name)
                         .map(|tool| tool.tool.description.as_str())
                         .unwrap_or_default();
-                    let first = description.lines().next().unwrap_or_default();
+                    // The first non-empty line (upstream `.trim().split(/\r?\n/)[0]`).
+                    let first = description
+                        .lines()
+                        .find(|line| !line.trim().is_empty())
+                        .unwrap_or_default();
                     format!("- {name}: {}", first.trim())
                 })
                 .collect::<Vec<_>>()

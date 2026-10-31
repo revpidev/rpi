@@ -682,14 +682,10 @@ impl SchedulerInner {
                     resumed.insert(record.id);
                 }
                 // A task its creator awaited only in memory is abandoned after a
-                // restart: mark it `restart` so its abort handler runs instead of
-                // a phase, and let the cascade reach its owned work.
-                if record.abandon_on_restart && !record.abort_requested {
-                    record.abort_requested = true;
-                    record.abort_reason = Some("restart".to_string());
-                    tx.set_task(record.clone())?;
-                    self.cascade_pending.store(true, Ordering::SeqCst);
-                }
+                // restart: it is marked below, after the crash count, so that the
+                // mark's fresh count is the one the record ends with (upstream
+                // counts first and marks in the first reservation pass).
+                let abandoned = record.abandon_on_restart && !record.abort_requested;
                 if let TaskState::Running { checkpoint } = &record.state {
                     // A crash, eviction, or reset cut the phase off: count it and
                     // write the task back as pending. A normal close writes the
@@ -710,6 +706,14 @@ impl SchedulerInner {
                     }
                     tx.set_task(pending.clone())?;
                     record = pending;
+                }
+                // Mark it `restart` so its abort handler runs instead of a phase,
+                // and let the cascade reach its owned work. The mark starts the
+                // restart count over: it now counts cut-offs of the handler.
+                if abandoned {
+                    record = with_abort_mark(&record, Some("restart"));
+                    tx.set_task(record.clone())?;
+                    self.cascade_pending.store(true, Ordering::SeqCst);
                 }
                 if let Ok(mut live) = self.live.lock() {
                     live.insert(record.id, record.clone());
@@ -742,11 +746,15 @@ impl SchedulerInner {
                 crate::harness::types::ReportInfo::new(
                     crate::harness::types::ReportKind::TaskParked,
                 )
-                .with_task(record.id, record.kind.clone())
-                .with_reason("restart_limit"),
+                .with_task(record.id, record.kind.clone()),
             );
         }
         Ok(())
+    }
+
+    /// The Session's failure cause, when it failed.
+    fn failure(&self) -> Option<String> {
+        self.session.failure()
     }
 
     /// The resolved restart limit.
@@ -793,7 +801,7 @@ impl SchedulerInner {
                         crate::harness::types::ReportInfo::new(
                             crate::harness::types::ReportKind::HostError,
                         )
-                        .with_reason("registry"),
+                        .with_callback("registry"),
                     );
                 }
                 return None;
@@ -820,7 +828,15 @@ impl SchedulerInner {
             .map(|listeners| listeners.values().cloned().collect())
             .unwrap_or_default();
         for listener in listeners {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener()));
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener()))
+            {
+                let message = crate::session::session::panic_message(payload);
+                (self.report)(format!("A blocked listener failed: {message}"));
+                self.report_fixed(crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::ListenerError,
+                ));
+            }
         }
     }
 
@@ -836,31 +852,10 @@ impl SchedulerInner {
         let telemetry = context
             .map(Context::telemetry)
             .unwrap_or_else(|| self.telemetry.clone());
-        let mut attributes = JsonObject::new();
-        attributes.insert(
-            "type".to_string(),
-            serde_json::to_value(info.kind).unwrap_or(JsonValue::Null),
-        );
-        if let Some(reason) = &info.reason {
-            attributes.insert("reason".to_string(), JsonValue::from(reason.clone()));
-        }
-        if let Some(extension) = &info.extension {
-            attributes.insert("extension".to_string(), JsonValue::from(extension.clone()));
-        }
-        if let Some(task) = info.task_id {
-            attributes.insert("task.id".to_string(), JsonValue::from(task.get()));
-        }
-        telemetry.add_event("pi.durable.report", attributes);
-        telemetry.record_metric(
-            "pi.durable.reports",
-            1.0,
-            serde_json::json!({ "type": info.kind })
-                .as_object()
-                .cloned()
-                .unwrap_or_default(),
-        );
+        emit_report_telemetry(&telemetry, &info);
         if let Some(report) = &self.report_info {
-            report(info);
+            // A host callback that throws is contained (upstream `contained`).
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(info)));
         }
     }
 
@@ -937,7 +932,7 @@ impl SchedulerInner {
             {
                 continue;
             }
-            if !record.abort_requested {
+            if !record.abort_requested || record.abort_reason.is_some() {
                 if snapshot.is_none() && !snapshot_failed {
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         self.registry.snapshot()
@@ -951,7 +946,7 @@ impl SchedulerInner {
                                     crate::harness::types::ReportInfo::new(
                                         crate::harness::types::ReportKind::HostError,
                                     )
-                                    .with_reason("registry"),
+                                    .with_callback("registry"),
                                 );
                             }
                         }
@@ -1175,13 +1170,18 @@ impl SchedulerInner {
             )
             .await?;
         if let Some(run) = &outcome.run {
-            // The commit listener signalled the run; join it.
+            // The commit listener signalled the run; join it, unless the Session
+            // fails first: a run that ignores its signal must not outlive it
+            // (upstream races the join against the Session failure).
             let invocation = Arc::clone(run);
-            if await_with_context(wait_invocation(&invocation), context)
-                .await
-                .is_err()
-            {
-                return Err(SessionError::Aborted);
+            let joined = await_with_context(wait_invocation(&invocation), context);
+            tokio::select! {
+                result = joined => {
+                    if result.is_err() {
+                        return Err(SessionError::Aborted);
+                    }
+                }
+                _ = self.session.closed() => {}
             }
         }
         Ok(outcome.result)
@@ -1207,6 +1207,14 @@ impl SchedulerInner {
             .lock()
             .ok()
             .and_then(|map| map.get(&id).cloned());
+        // An owner's own cleanup keeps a restart mark: the task waits for its
+        // definition and is not orphaned (upstream `keepRestart`).
+        if keep_restart && current.abort_reason.as_deref() == Some("restart") {
+            return Ok(AbortCommit {
+                result: TaskAbort::Marked,
+                run: None,
+            });
+        }
         if invocation.is_none() && !matches!(current.state, TaskState::Completing { .. }) {
             self.load_scopes(false).await?;
             if !self.owned_live(None).contains_key(&id) {
@@ -1227,14 +1235,10 @@ impl SchedulerInner {
                 }
             }
         }
-        if !current.abort_requested {
-            let mut marked = current.clone();
-            marked.abort_requested = true;
-            if !keep_restart {
-                // An abort request replaces a restart mark.
-                marked.abort_reason = None;
-            }
-            tx.set_task(marked)?;
+        // A request replaces a restart mark; a plain request already written is
+        // left alone, and so is a terminal or completing task's own cleanup.
+        if !current.abort_requested || current.abort_reason.is_some() {
+            tx.set_task(with_abort_mark(&current, None))?;
         }
         let run = invocation.filter(|invocation| invocation.mode == InvocationMode::Run);
         Ok(AbortCommit {
@@ -1256,6 +1260,9 @@ impl SchedulerInner {
                 let this = Arc::clone(&this);
                 let read_context = read_context.clone();
                 Box::pin(async move {
+                    if let Some(cause) = this.failure() {
+                        return Err(SessionError::Failed { cause });
+                    }
                     if this.closing.load(Ordering::SeqCst) {
                         return Err(SessionError::Closed);
                     }
@@ -1284,6 +1291,9 @@ impl SchedulerInner {
         conversation_id: Option<ConversationId>,
         context: &Context,
     ) -> SessionResult<()> {
+        if let Some(cause) = self.failure() {
+            return Err(SessionError::Failed { cause });
+        }
         if self.closing.load(Ordering::SeqCst) {
             return Err(SessionError::Closed);
         }
@@ -1326,10 +1336,8 @@ impl SchedulerInner {
                                 continue;
                             }
                             reached.push(record.id);
-                            if !record.abort_requested {
-                                let mut marked = record.clone();
-                                marked.abort_requested = true;
-                                tx.set_task(marked)?;
+                            if !record.abort_requested || record.abort_reason.is_some() {
+                                tx.set_task(with_abort_mark(&record, None))?;
                             }
                         }
                         for id in queued {
@@ -1383,8 +1391,14 @@ impl SchedulerInner {
         {
             subscription.unsubscribe();
         }
-        self.task_waiters.reject_all(closed_error());
-        self.idle_waiters.reject_all(closed_error());
+        // A failed Session rejects its remaining waits with the cause; only a
+        // normal close rejects as closed (upstream `closedError(session)`).
+        let error = match self.failure() {
+            Some(cause) => crate::harness::util::WaitError::Failed(cause),
+            None => closed_error(),
+        };
+        self.task_waiters.reject_all(error.clone());
+        self.idle_waiters.reject_all(error);
         if let Ok(mut contexts) = self.contexts.lock() {
             contexts.clear();
         }
@@ -1511,6 +1525,15 @@ impl SchedulerInner {
                 {
                     invocation.controller.cancel();
                 }
+            }
+            // A request replacing a `restart` mark upgrades the marks of the work
+            // below it (upstream `#apply`).
+            let upgraded = previous
+                .as_ref()
+                .is_some_and(|previous| previous.abort_reason.is_some())
+                && record.abort_reason.is_none();
+            if upgraded {
+                self.cascade_pending.store(true, Ordering::SeqCst);
             }
             let was_completing = previous
                 .as_ref()
@@ -1741,21 +1764,28 @@ impl SchedulerInner {
             return Ok(());
         }
         let queued = self.load_scopes(cascade).await?;
-        let mut marked: BTreeSet<TaskId> = BTreeSet::new();
-        let mut marks: Vec<TaskRecord> = Vec::new();
+        // A cascade from an abandoned owner passes its `restart` reason on; any
+        // other intent marks, or upgrades a `restart` mark, as a request.
+        // Staged first, so a request wins over a `restart` mark of the same pass
+        // (upstream `#reconcile` `mark()`).
+        let mut marks: BTreeMap<TaskId, (TaskRecord, Option<String>)> = BTreeMap::new();
         let records: Vec<TaskRecord> = self
             .live
             .lock()
             .map(|live| live.values().cloned().collect())
             .unwrap_or_default();
         for record in records {
-            if !record.background
-                && self.below_cancelled(parent_of(&record))
-                && !record.abort_requested
-                && marked.insert(record.id)
-            {
-                marks.push(record);
+            if record.background {
+                continue;
             }
+            // The nearest live owner with cancellation intent passes its reason
+            // down: only one abandoned after a restart, and nothing else.
+            let Some(owner) = self.below_cancelled_owner(parent_of(&record)) else {
+                continue;
+            };
+            let restart =
+                owner.abort_reason.as_deref() == Some("restart") && !failed_outcome(&owner);
+            stage_mark(&mut marks, &record, restart.then_some("restart"));
         }
         for id in checks {
             let waiter = self
@@ -1782,17 +1812,13 @@ impl SchedulerInner {
                     .and_then(|live| live.get(&member).cloned());
                 if let Some(record) = member
                     && !failed_outcome(&record)
-                    && !record.abort_requested
-                    && marked.insert(record.id)
                 {
-                    marks.push(record);
+                    stage_mark(&mut marks, &record, None);
                 }
             }
         }
-        for record in marks {
-            let mut next = record.clone();
-            next.abort_requested = true;
-            tx.set_task(next)?;
+        for (_, (record, reason)) in marks {
+            tx.set_task(with_abort_mark(&record, reason.as_deref()))?;
         }
         for id in queued {
             if self.below_cancelled(Up::Conversation(id)) {
@@ -2104,10 +2130,12 @@ impl SchedulerInner {
         Some(matches!(scope, Scope::Roots))
     }
 
-    fn below_cancelled(self: &Arc<Self>, start: Up) -> bool {
+    /// The nearest live owner above `start` with cancellation intent, if any
+    /// (upstream `#belowCancelled`). Its `restart` mark is what a cascade passes on.
+    fn below_cancelled_owner(self: &Arc<Self>, start: Up) -> Option<TaskRecord> {
         for step in self.above(start, None) {
             match step {
-                Step::Unknown => return false,
+                Step::Unknown => return None,
                 Step::Conversation(_) => continue,
                 Step::Task(id, node) => {
                     let live = self
@@ -2115,19 +2143,20 @@ impl SchedulerInner {
                         .lock()
                         .ok()
                         .and_then(|live| live.get(&id).cloned());
-                    if live
-                        .map(|record| cancellation_intent(&record))
-                        .unwrap_or(false)
-                    {
-                        return true;
+                    if live.as_ref().map(cancellation_intent).unwrap_or(false) {
+                        return live;
                     }
                     if node.background {
-                        return false;
+                        return None;
                     }
                 }
             }
         }
-        false
+        None
+    }
+
+    fn below_cancelled(self: &Arc<Self>, start: Up) -> bool {
+        self.below_cancelled_owner(start).is_some()
     }
 
     fn idle(self: &Arc<Self>, conversation_id: Option<ConversationId>) -> bool {
@@ -2379,7 +2408,9 @@ impl SchedulerInner {
             let resolution = self.resolve(&record, &snap);
             match resolution {
                 Resolution::Blocked { reason, .. } => {
-                    if mode == InvocationMode::Abort {
+                    // An abandoned task waits for its definition, so its abort
+                    // handler can clean up; only a plain request orphans it.
+                    if mode == InvocationMode::Abort && record.abort_reason.is_none() {
                         self.terminate(
                             tx,
                             &record,
@@ -2478,8 +2509,7 @@ impl SchedulerInner {
                             crate::harness::types::ReportInfo::new(
                                 crate::harness::types::ReportKind::MigrationFailed,
                             )
-                            .with_task(record.id, record.kind.clone())
-                            .with_reason("migration_failed"),
+                            .with_task(record.id, record.kind.clone()),
                         );
                         // Blocked now without a commit: the graph and the host's
                         // wake must hear it after this line releases.
@@ -2643,8 +2673,11 @@ impl SchedulerInner {
                 snapshot: Arc::clone(&snapshot_cell),
                 reported: Arc::clone(&reported),
             };
-            let next = self.step(&invocation, decider, &phase_context).await?;
-            let terminal = self.phase_outcome(&invocation, next.as_ref());
+            let next = self.step(&invocation, decider, &phase_context).await;
+            let terminal = self.phase_outcome(
+                &invocation,
+                next.as_ref().ok().and_then(|next| next.as_ref()),
+            );
             span.context().record_metric(
                 "pi.durable.phase.duration",
                 ((self.now)() - started).max(0.0),
@@ -2666,7 +2699,9 @@ impl SchedulerInner {
                     .cloned()
                     .unwrap_or_default(),
             );
-            current = next;
+            // A failed commit or a failed Session also ends the phase: the span
+            // and its metric carry the outcome before the error returns.
+            current = next?;
         }
         Ok(())
     }
@@ -2722,18 +2757,28 @@ impl SchedulerInner {
         if let Some(next) = next {
             return format!("next={}", next.phase().unwrap_or(""));
         }
-        let state = self
+        let record = self
             .live
             .lock()
             .ok()
-            .and_then(|live| live.get(&invocation.task_id).map(|record| record.status()));
-        match state {
+            .and_then(|live| live.get(&invocation.task_id).cloned());
+        match record.as_ref().map(|record| record.status()) {
             Some(TaskStatus::Waiting) => "waiting".to_string(),
             Some(TaskStatus::Sleeping) => "sleeping".to_string(),
             _ if invocation.ended.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) => {
                 "aborted".to_string()
             }
-            _ => "done".to_string(),
+            // Upstream's `next=${checkpoint.phase}`: the phase the record would
+            // run next, which a failed commit leaves in place.
+            Some(_) => match record
+                .as_ref()
+                .and_then(|record| record_checkpoint(record).get("phase").cloned())
+                .and_then(|phase| phase.as_str().map(str::to_string))
+            {
+                Some(phase) => format!("next={phase}"),
+                None => "done".to_string(),
+            },
+            None => "done".to_string(),
         }
     }
 
@@ -2790,9 +2835,10 @@ impl SchedulerInner {
             snapshot: Arc::new(Mutex::new(Arc::clone(&reservation.snapshot))),
             agent: Arc::new(tokio::sync::OnceCell::new()),
         };
+        let started = (self.now)();
         let failure = reservation
             .task
-            .abort(current, &runtime, &phase_context)
+            .abort(current.clone(), &runtime, &phase_context)
             .await
             .err()
             .map(|error| error.to_string());
@@ -2804,8 +2850,25 @@ impl SchedulerInner {
                 },
                 &phase_context,
             )
-            .await?;
-        let outcome = self.phase_outcome(invocation, next.as_ref());
+            .await;
+        let outcome = self.phase_outcome(
+            invocation,
+            next.as_ref().ok().and_then(|next| next.as_ref()),
+        );
+        // An abort phase counts like a run phase: the histogram must not lose
+        // cancels and restarts (upstream `#phase` wraps both).
+        span.context().record_metric(
+            "pi.durable.phase.duration",
+            ((self.now)() - started).max(0.0),
+            serde_json::json!({
+                "task": reservation.task.name(),
+                "phase": current.phase().unwrap_or(""),
+                "outcome": outcome,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
         if let Some(failure) = self.phase_status_error(invocation, None) {
             span.set_status("error", Some(&failure));
         }
@@ -2815,6 +2878,7 @@ impl SchedulerInner {
                 .cloned()
                 .unwrap_or_default(),
         );
+        next?;
         Ok(())
     }
 
@@ -3229,18 +3293,18 @@ impl SchedulerInner {
         if matches!(record.state, TaskState::Completing { .. }) {
             return TaskInspectionState::Completing;
         }
-        if let TaskState::Sleeping { until, .. } = &record.state {
-            return TaskInspectionState::Sleeping { until: *until };
+        let on = self.waiting_on(record, owned);
+        if !on.is_empty() {
+            return TaskInspectionState::Waiting { on };
+        }
+        if let Some(until) = not_due(record, (self.now)()) {
+            return TaskInspectionState::Sleeping { until };
         }
         if self.parked(record) {
             return TaskInspectionState::Blocked {
                 reason: BlockedReason::RestartLimit,
                 error: None,
             };
-        }
-        let on = self.waiting_on(record, owned);
-        if !on.is_empty() {
-            return TaskInspectionState::Waiting { on };
         }
         match self.fit(record, snapshot.task(&record.kind)) {
             Fit::Blocked { reason, error } => TaskInspectionState::Blocked { reason, error },
@@ -3650,8 +3714,14 @@ impl TaskRuntime for InvocationRuntime {
         self.inner.wait_for_task(id, &bound).await
     }
 
-    async fn owned_tasks(&self, _context: &Context) -> SessionResult<Vec<TaskRecord>> {
+    async fn owned_tasks(&self, context: &Context) -> SessionResult<Vec<TaskRecord>> {
         self.ensure_open()?;
+        // A cancelled caller does not get a list (upstream `throwIfAborted`).
+        if let Some(signal) = context.abort_signal()
+            && signal.is_cancelled()
+        {
+            return Err(SessionError::Aborted);
+        }
         let task_id = self.invocation.task_id;
         let mut owned: Vec<TaskRecord> = self
             .inner
@@ -3920,7 +3990,10 @@ impl TaskRuntime for InvocationRuntime {
     }
 
     fn report_info(&self, info: crate::harness::types::ReportInfo) {
-        self.inner.report_fixed(info);
+        // Task-level reports land on the invocation's span context
+        // (upstream passes `invocation.context`).
+        self.inner
+            .report_fixed_with(info, Some(&self.invocation.context));
     }
 
     fn set_timer(
@@ -3988,9 +4061,14 @@ impl TaskScheduler {
         let scheduler = Arc::new(Self {
             inner: Arc::new(SchedulerInner::new(deps)),
         });
-        let inner = Arc::clone(&scheduler.inner);
-        let session = Arc::clone(&inner.session);
+        // A weak capture: the Session keeps the hook, and the inner keeps the
+        // Session, so a strong hook would keep both alive forever.
+        let weak = Arc::downgrade(&scheduler.inner);
+        let session = Arc::clone(&scheduler.inner.session);
         session.on_failure(Arc::new(move |cause| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
             let cause = cause.to_string();
             inner
                 .task_waiters
@@ -4228,6 +4306,36 @@ fn cancellation_intent(record: &TaskRecord) -> bool {
     record.status() != TaskStatus::Terminal && (record.abort_requested || failed_outcome(record))
 }
 
+/// Stage one cascade mark (upstream `#reconcile` `mark()`): a request staged in
+/// this pass wins over a `restart` mark, an already requested task is not
+/// marked again, and a `restart` mark is upgraded by a request.
+fn stage_mark(
+    marks: &mut BTreeMap<TaskId, (TaskRecord, Option<String>)>,
+    record: &TaskRecord,
+    reason: Option<&str>,
+) {
+    if let Some((_, staged)) = marks.get(&record.id)
+        && staged.is_none()
+    {
+        return;
+    }
+    if record.abort_requested && (record.abort_reason.is_none() || reason.is_some()) {
+        return;
+    }
+    marks.insert(record.id, (record.clone(), reason.map(str::to_string)));
+}
+
+/// A sleep whose `until` the clock has not reached; an abort mark ends a sleep
+/// (upstream `#notDue`).
+fn not_due(record: &TaskRecord, now: f64) -> Option<f64> {
+    match &record.state {
+        TaskState::Sleeping { until, .. } if !record.abort_requested && *until > now => {
+            Some(*until)
+        }
+        _ => None,
+    }
+}
+
 /// Whether the record holds or ends with an outcome other than `completed`.
 fn failed_outcome(record: &TaskRecord) -> bool {
     match &record.state {
@@ -4322,6 +4430,75 @@ fn overlay_of(tx: &Transaction) -> Overlay {
 }
 
 /// Replace a live record's state; memos disappear once an outcome is decided.
+/// Emit one report's fixed telemetry: the event carries only its kind's
+/// attributes, and the counter only its type (upstream `safeReport`).
+pub(crate) fn emit_report_telemetry(
+    telemetry: &crate::chord::telemetry::TelemetryContext,
+    info: &crate::harness::types::ReportInfo,
+) {
+    let mut attributes = JsonObject::new();
+    attributes.insert(
+        "type".to_string(),
+        serde_json::to_value(info.kind).unwrap_or(JsonValue::Null),
+    );
+    // Fixed attributes per report kind (upstream `safeReport`): `reason` is one
+    // of the schema's fixed values and only `task_faulted`/`task_outdated` carry
+    // it; `host_error` carries only the task id, and
+    // `session_failed`/`listener_error` carry no extra attribute.
+    match info.kind {
+        crate::harness::types::ReportKind::TaskFaulted
+        | crate::harness::types::ReportKind::TaskOutdated => {
+            if let Some(reason) = &info.reason {
+                attributes.insert("reason".to_string(), JsonValue::from(reason.clone()));
+            }
+            if let Some(extension) = &info.extension {
+                attributes.insert("extension".to_string(), JsonValue::from(extension.clone()));
+            }
+            if let Some(task) = info.task_id {
+                attributes.insert("task.id".to_string(), JsonValue::from(task.get()));
+            }
+        }
+        crate::harness::types::ReportKind::TaskParked
+        | crate::harness::types::ReportKind::MigrationFailed
+        | crate::harness::types::ReportKind::TaskError
+        | crate::harness::types::ReportKind::ExtensionError => {
+            if let Some(extension) = &info.extension {
+                attributes.insert("extension".to_string(), JsonValue::from(extension.clone()));
+            }
+            if let Some(task) = info.task_id {
+                attributes.insert("task.id".to_string(), JsonValue::from(task.get()));
+            }
+        }
+        crate::harness::types::ReportKind::HostError => {
+            if let Some(task) = info.task_id {
+                attributes.insert("task.id".to_string(), JsonValue::from(task.get()));
+            }
+        }
+        crate::harness::types::ReportKind::SessionFailed
+        | crate::harness::types::ReportKind::ListenerError => {}
+    }
+    telemetry.add_event("pi.durable.report", attributes);
+    telemetry.record_metric(
+        "pi.durable.reports",
+        1.0,
+        serde_json::json!({ "type": info.kind })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    );
+}
+
+/// The record with an abort mark: `restart` for an abandonment; without a
+/// reason, a request, which replaces `restart`. The restart count starts over:
+/// it now counts cut-offs of the abort handler (upstream `withAbortMark`).
+fn with_abort_mark(record: &TaskRecord, reason: Option<&str>) -> TaskRecord {
+    let mut next = record.clone();
+    next.abort_requested = true;
+    next.abort_reason = reason.map(str::to_string);
+    next.restarts = None;
+    next
+}
+
 fn with_state(record: &TaskRecord, state: TaskState) -> TaskRecord {
     let mut next = record.clone();
     let terminal_like = matches!(

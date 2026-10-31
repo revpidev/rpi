@@ -116,13 +116,13 @@ pub static INBOX_DOC: LazyLock<DocToken> = LazyLock::new(|| {
         family: false,
         initial: Arc::new(|_seed| initial()),
         migrate: None,
-        checkpoint_when: Some(Arc::new(|value, _ops, _revision| {
+        checkpoint_when: Arc::new(|value, _ops, _revision| {
             value
                 .get("items")
                 .and_then(JsonValue::as_array)
                 .map(|items| items.is_empty())
                 .unwrap_or(true)
-        })),
+        }),
     })
 });
 

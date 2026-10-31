@@ -130,14 +130,15 @@ pub struct SessionImpl {
     failure_hooks: Mutex<Vec<FailureHook>>,
     /// Last use of each cached document, by address, for retention.
     idle_since: Mutex<HashMap<String, f64>>,
-    /// Addresses with a watch or state attached; never evicted.
-    attached: Mutex<std::collections::HashSet<String>>,
+    /// Addresses with attached watches/states and how many; never evicted while
+    /// the count is positive (upstream `#attachedDocuments`).
+    attached: Mutex<std::collections::HashMap<String, usize>>,
     /// `settings.documentRetentionMs`, read at each use.
     document_retention_ms: Mutex<Option<DocumentRetentionReader>>,
 }
 
 /// Reads `settings.documentRetentionMs` at each use.
-pub type DocumentRetentionReader = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+pub type DocumentRetentionReader = Arc<dyn Fn() -> Option<f64> + Send + Sync>;
 
 /// Host reporter for the error that failed the Session.
 pub type FailureReporter = Arc<dyn Fn(String) + Send + Sync>;
@@ -173,7 +174,7 @@ impl SessionImpl {
             listener_reporter: Mutex::new(None),
             failure_hooks: Mutex::new(Vec::new()),
             idle_since: Mutex::new(HashMap::new()),
-            attached: Mutex::new(std::collections::HashSet::new()),
+            attached: Mutex::new(std::collections::HashMap::new()),
             document_retention_ms: Mutex::new(None),
         });
         session.guarded_typed.attach(&session);
@@ -344,9 +345,11 @@ impl SessionImpl {
             .lock()
             .ok()
             .and_then(|slot| slot.clone());
+        // A non-negative number, `Infinity` to keep documents; anything else is
+        // the default (upstream `documentRetention`).
         let retention = match retention_reader.as_ref().and_then(|reader| reader()) {
-            Some(ms) => ms as f64,
-            None => 600_000.0,
+            Some(ms) if ms == f64::INFINITY || (ms.is_finite() && ms >= 0.0) => ms,
+            _ => 600_000.0,
         };
         let now = (self.now)();
         let attached = self
@@ -361,7 +364,9 @@ impl SessionImpl {
         };
         let expired: Vec<String> = idle
             .iter()
-            .filter(|(address, since)| !attached.contains(*address) && now - **since >= retention)
+            .filter(|(address, since)| {
+                !attached.contains_key(*address) && now - **since >= retention
+            })
             .map(|(address, _)| address.clone())
             .collect();
         drop(idle);
@@ -382,13 +387,20 @@ impl SessionImpl {
 
     pub(crate) fn attach_document(&self, address_id: &str) {
         if let Ok(mut attached) = self.attached.lock() {
-            attached.insert(address_id.to_string());
+            *attached.entry(address_id.to_string()).or_insert(0) += 1;
         }
     }
 
     pub(crate) fn detach_document(&self, address_id: &str) {
-        if let Ok(mut attached) = self.attached.lock() {
-            attached.remove(address_id);
+        if let Ok(mut attached) = self.attached.lock()
+            && let Some(count) = attached.get_mut(address_id)
+        {
+            *count = count.saturating_sub(1);
+            // Only the last observer releases the address: another watch or
+            // state still keeps the document cached.
+            if *count == 0 {
+                attached.remove(address_id);
+            }
         }
         self.touch(address_id);
     }
@@ -576,6 +588,10 @@ impl SessionImpl {
         documents: &[CommitChange],
         context: &Context,
     ) {
+        // A commit is also when documents past their retention leave the cache,
+        // so an idle Session frees them instead of waiting for the next access
+        // (upstream sweeps on a timer; the observable reload is the same).
+        self.evict_idle();
         let listeners: Vec<(CommitListener, bool)> = match self.commit_listeners.lock() {
             Ok(listeners) => listeners
                 .iter()
@@ -600,7 +616,11 @@ impl SessionImpl {
         }
         changes.extend(documents.iter().cloned());
         let publication = CommitPublication { seq, changes };
-        for (listener, internal) in listeners {
+        // Component listeners run before host listeners (upstream keeps two
+        // sets and publishes to the internal one first).
+        let mut ordered = listeners;
+        ordered.sort_by_key(|(_, internal)| !*internal);
+        for (listener, internal) in ordered {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 listener(&publication, context);
             }));
@@ -1006,6 +1026,12 @@ impl SessionImpl {
             if let Ok(mut documents) = this.documents.lock() {
                 documents.clear();
             }
+            if let Ok(mut idle) = this.idle_since.lock() {
+                idle.clear();
+            }
+            if let Ok(mut attached) = this.attached.lock() {
+                attached.clear();
+            }
             if let Ok(mut listeners) = this.commit_listeners.lock() {
                 listeners.clear();
             }
@@ -1091,7 +1117,7 @@ impl SessionImpl {
 }
 
 /// The message of a caught panic payload.
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
     } else if let Some(message) = payload.downcast_ref::<String>() {

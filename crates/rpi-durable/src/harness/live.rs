@@ -245,7 +245,7 @@ pub static LIVE_DOC: LazyLock<DocToken> = LazyLock::new(|| {
         migrate: None,
         // A complete base whenever nothing runs (spec §8.2): no generation and no
         // running tool slot.
-        checkpoint_when: Some(Arc::new(|value, _ops, _revision| {
+        checkpoint_when: Arc::new(|value, _ops, _revision| {
             let no_generation = value.get("generation").is_none();
             let no_running = ["tools", "nestedTools"].iter().all(|field| {
                 value
@@ -259,7 +259,7 @@ pub static LIVE_DOC: LazyLock<DocToken> = LazyLock::new(|| {
                     .unwrap_or(true)
             });
             no_generation && no_running
-        })),
+        }),
     })
 });
 

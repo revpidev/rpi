@@ -59,7 +59,7 @@ pub static USAGE_DOC: LazyLock<DocToken> = LazyLock::new(|| {
         family: false,
         initial: Arc::new(|_seed| initial()),
         migrate: None,
-        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| true)),
+        checkpoint_when: Arc::new(|_value, _ops, _revision| true),
     })
 });
 

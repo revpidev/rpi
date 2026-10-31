@@ -103,9 +103,14 @@ pub struct ReportInfo {
     /// Fixed report kind.
     #[serde(rename = "type")]
     pub kind: ReportKind,
-    /// Fixed reason, when present.
+    /// Fixed reason, when present: `threw`/`restart_limit` for a faulted task,
+    /// `missing_task`/`incompatible_task` for an outdated one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Host callback that failed (`setTimer`/`now`/`registry`/`settings`/
+    /// `onWake`/`env`/`models`), for a `host_error` report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback: Option<String>,
     /// Task the report is about.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
@@ -123,6 +128,7 @@ impl ReportInfo {
         Self {
             kind,
             reason: None,
+            callback: None,
             task_id: None,
             task_kind: None,
             extension: None,
@@ -132,6 +138,12 @@ impl ReportInfo {
     /// Attach a fixed reason.
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
+        self
+    }
+
+    /// Attach the host callback that failed.
+    pub fn with_callback(mut self, callback: impl Into<String>) -> Self {
+        self.callback = Some(callback.into());
         self
     }
 
@@ -1491,8 +1503,9 @@ pub struct HarnessSettings {
     pub follow_up_mode: Option<QueueMode>,
     /// Idle context retention in milliseconds.
     pub context_retention_ms: Option<u64>,
-    /// How long an unobserved document stays cached, in milliseconds.
-    pub document_retention_ms: Option<u64>,
+    /// How long an unobserved document stays cached, in milliseconds;
+    /// `f64::INFINITY` keeps documents (upstream `documentRetentionMs`).
+    pub document_retention_ms: Option<f64>,
     /// What a failed run does with the inputs queued behind it.
     pub after_failed_run: Option<AfterFailedRun>,
     /// How many consecutive restarts park a task.
@@ -1523,7 +1536,7 @@ pub struct Settings {
     /// Idle context retention in milliseconds.
     pub context_retention_ms: u64,
     /// How long an unobserved document stays cached, in milliseconds.
-    pub document_retention_ms: u64,
+    pub document_retention_ms: f64,
     /// What a failed run does with the inputs queued behind it.
     pub after_failed_run: AfterFailedRun,
     /// How many consecutive restarts park a task.
@@ -1844,6 +1857,12 @@ pub trait Conversation: Send + Sync {
     ) -> Result<(), SessionError>;
     /// Resolve when the ordinary ownership scope is idle.
     async fn wait_for_idle(&self, context: &Context) -> Result<(), SessionError>;
+    /// Start a manual compaction and return its task (upstream `compact`).
+    async fn compact(
+        &self,
+        instructions: Option<String>,
+        context: &Context,
+    ) -> Result<TaskId, SessionError>;
 }
 
 /// Durable agent harness over one Session.

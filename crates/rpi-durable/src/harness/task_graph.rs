@@ -164,7 +164,7 @@ impl TaskGraphView {
             next_observer: AtomicU64::new(1),
         });
         let advancing = Arc::clone(&view);
-        session.subscribe_commits(Arc::new(move |publication, context| {
+        session.subscribe_internal_commits(Arc::new(move |publication, context| {
             advancing.on_publication(publication, context);
         }));
         let closing = Arc::clone(&view);

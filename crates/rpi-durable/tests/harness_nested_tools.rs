@@ -1576,6 +1576,9 @@ async fn assert_crash_window_replay(underway: bool, replay_empty_calls: bool) {
                 let next = host.call_tool("inner", JsonObject::new(), "a");
                 tokio::pin!(next);
                 let _ = tokio::time::timeout(std::time::Duration::from_millis(20), &mut next).await;
+                // The sandbox's own count at this boundary, as upstream records
+                // it from `idle()` alone.
+                host.idle(0, 1).await?;
                 self.tool_started.notified().await;
                 self.journaled.notify_one();
                 self.hold.notified().await;
@@ -1601,6 +1604,10 @@ async fn assert_crash_window_replay(underway: bool, replay_empty_calls: bool) {
             )
             .await
             .expect("nested tools started");
+            if self.replay_empty_calls {
+                // Two concurrent calls were issued: the sandbox reports them.
+                host.idle(0, 2).await?;
+            }
             self.journaled.notify_one();
             self.hold.notified().await;
             let (next, last) = tokio::join!(next, last);
@@ -1702,6 +1709,7 @@ async fn assert_crash_window_replay(underway: bool, replay_empty_calls: bool) {
         assert_eq!(journal.entries[0].issued_after, None);
     } else {
         assert!(journal.entries.is_empty());
+        // The count is the sandbox's own `idle()` report at that boundary.
         assert_eq!(
             journal.first_issued,
             Some(if replay_empty_calls { 2 } else { 1 })
@@ -2083,4 +2091,110 @@ async fn deeply_nested_slots_keep_the_direct_parent_call_id() {
     assert_eq!(leaf.parent_task_id, middle.task_id);
     finish.notify_one();
     submission.wait(&context()).await.expect("wait");
+}
+
+// ─── V18-06 eleventh review: no-schema output mapping branches ───────────────
+
+/// A single image without a schema resolves as the image block itself.
+struct ImageResultTool;
+#[async_trait]
+impl ToolExecute for ImageResultTool {
+    async fn execute(
+        &self,
+        _args: JsonObject,
+        _api: &dyn ToolExecutionApi,
+        _context: &Context,
+    ) -> Result<ToolExecutionResult, ToolExecuteError> {
+        Ok(ToolExecutionResult {
+            output: Some(vec![rpi_ai::types::ToolResultContent::Image(
+                rpi_ai::types::ImageContent {
+                    data: "aW1n".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+            )]),
+            ..Default::default()
+        })
+    }
+}
+
+/// Several content blocks resolve as the content list.
+struct MultiResultTool;
+#[async_trait]
+impl ToolExecute for MultiResultTool {
+    async fn execute(
+        &self,
+        _args: JsonObject,
+        _api: &dyn ToolExecutionApi,
+        _context: &Context,
+    ) -> Result<ToolExecutionResult, ToolExecuteError> {
+        Ok(ToolExecutionResult {
+            output: Some(vec![
+                rpi_ai::types::ToolResultContent::Text(rpi_ai::types::TextContent {
+                    text: "first".to_string(),
+                    text_signature: None,
+                }),
+                rpi_ai::types::ToolResultContent::Text(rpi_ai::types::TextContent {
+                    text: "second".to_string(),
+                    text_signature: None,
+                }),
+            ]),
+            ..Default::default()
+        })
+    }
+}
+
+/// No output at all resolves as `""`.
+struct EmptyResultTool;
+#[async_trait]
+impl ToolExecute for EmptyResultTool {
+    async fn execute(
+        &self,
+        _args: JsonObject,
+        _api: &dyn ToolExecutionApi,
+        _context: &Context,
+    ) -> Result<ToolExecutionResult, ToolExecuteError> {
+        Ok(ToolExecutionResult {
+            output: Some(Vec::new()),
+            ..Default::default()
+        })
+    }
+}
+
+async fn nested_output_for(inner: Arc<dyn ToolExecute>) -> String {
+    let opened = open(
+        vec![extension(vec![
+            tool("outer", None, None, Arc::new(OuterTool)),
+            tool("inner", Some(vec![ToolCaller::Tools]), None, inner),
+        ])],
+        None,
+        test_models(vec![
+            Script::Message(tool_use_message("outer", "c1", serde_json::json!({}))),
+            Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
+        ]),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    submission.wait(&context()).await.expect("wait");
+    let results = tool_result_texts(&entries(&conversation).await);
+    assert_eq!(results.len(), 1);
+    results[0].clone()
+}
+
+/// Upstream `outputValue`: one image is itself, several blocks are the list,
+/// and nothing is `""`.
+#[tokio::test]
+async fn nested_no_schema_output_maps_images_multi_and_empty() {
+    let image = nested_output_for(Arc::new(ImageResultTool)).await;
+    assert!(
+        image.contains(r#"value={"type":"image","data":"aW1n","mimeType":"image/png"}"#),
+        "one image is itself, as an upstream image block: {image}"
+    );
+    let multi = nested_output_for(Arc::new(MultiResultTool)).await;
+    assert!(
+        multi.contains(r#"value=[{"type":"text","text":"first"},{"type":"text","text":"second"}]"#),
+        "several blocks are the list: {multi}"
+    );
+    let empty = nested_output_for(Arc::new(EmptyResultTool)).await;
+    assert!(empty.contains("value=\"\""), "got {empty}");
 }

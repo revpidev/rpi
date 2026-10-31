@@ -79,7 +79,7 @@ pub const INSTRUCTIONS_KEY: &str = "instructions";
 pub const DEFAULT_CONTEXT_RETENTION_MS: u64 = 600_000;
 
 /// Default `settings.documentRetentionMs`: ten minutes.
-pub const DEFAULT_DOCUMENT_RETENTION_MS: u64 = 600_000;
+pub const DEFAULT_DOCUMENT_RETENTION_MS: f64 = 600_000.0;
 
 /// Default `settings.restartLimit`.
 pub const DEFAULT_RESTART_LIMIT: crate::harness::types::RestartLimit =
@@ -100,7 +100,7 @@ pub static AGENT_DOC: LazyLock<DocToken> = LazyLock::new(|| {
         family: false,
         initial: Arc::new(|_seed| initial()),
         migrate: None,
-        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| true)),
+        checkpoint_when: Arc::new(|_value, _ops, _revision| true),
     })
 });
 
@@ -172,8 +172,11 @@ pub fn resolve_settings(settings: Option<&crate::harness::types::HarnessSettings
         context_retention_ms: settings
             .and_then(|settings| settings.context_retention_ms)
             .unwrap_or(DEFAULT_CONTEXT_RETENTION_MS),
+        // Upstream `documentRetention`: a non-negative number (Infinity keeps
+        // documents); anything else is the default.
         document_retention_ms: settings
             .and_then(|settings| settings.document_retention_ms)
+            .filter(|ms| ms.is_finite() && *ms >= 0.0 || *ms == f64::INFINITY)
             .unwrap_or(DEFAULT_DOCUMENT_RETENTION_MS),
         after_failed_run: settings
             .and_then(|settings| settings.after_failed_run)
@@ -639,7 +642,6 @@ fn apply_wrap_tool(
                 crate::harness::types::ReportInfo::new(
                     crate::harness::types::ReportKind::ExtensionError,
                 )
-                .with_reason("wrapper_renamed")
                 .with_extension(extension),
             );
         }
@@ -669,7 +671,6 @@ fn apply_wrap_section(
                 crate::harness::types::ReportInfo::new(
                     crate::harness::types::ReportKind::ExtensionError,
                 )
-                .with_reason("wrapper_renamed")
                 .with_extension(extension),
             );
         }

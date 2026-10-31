@@ -397,7 +397,7 @@ async fn prepare(
                     crate::harness::types::ReportKind::HostError,
                 )
                 .with_task(runtime.task_id(), GENERATION_TASK_NAME)
-                .with_reason("env"),
+                .with_callback("env"),
             );
             None
         }

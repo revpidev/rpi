@@ -559,7 +559,7 @@ pub static CODEMODE_RUN_DOC: LazyLock<DocToken> = LazyLock::new(|| {
         family: false,
         initial: Arc::new(empty_object),
         migrate: None,
-        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
+        checkpoint_when: Arc::new(|_value, _ops, _revision| false),
     })
 });
 
@@ -574,7 +574,7 @@ pub static CODEMODE_JOURNAL_DOC: LazyLock<DocToken> = LazyLock::new(|| {
         family: false,
         initial: Arc::new(empty_object),
         migrate: None,
-        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
+        checkpoint_when: Arc::new(|_value, _ops, _revision| false),
     })
 });
 
@@ -589,7 +589,7 @@ pub static CODEMODE_STORE_DOC: LazyLock<DocToken> = LazyLock::new(|| {
         family: false,
         initial: Arc::new(store_initial),
         migrate: None,
-        checkpoint_when: Some(Arc::new(|_value, _ops, revision| revision >= 64)),
+        checkpoint_when: Arc::new(|_value, _ops, revision| revision >= 64),
     })
 });
 
@@ -1026,10 +1026,6 @@ impl<'a> DurableHost<'a> {
             .unwrap_or_default()
     }
 
-    fn issued(&self) -> u64 {
-        self.replay.lock().map(|replay| replay.issued).unwrap_or(0)
-    }
-
     fn replay_divergence(&self, message: String) -> String {
         if let Ok(mut replay) = self.replay.lock()
             && replay.divergence.is_none()
@@ -1114,23 +1110,10 @@ impl<'a> DurableHost<'a> {
         }
     }
 
-    async fn acknowledge_first_batch(&self) -> Result<(), String> {
-        let issued = self.issued();
-        self.record_journal(|journal| {
-            if journal.entries.is_empty() {
-                // Before the first result, every issued call belongs to the
-                // initial batch. A later idle report replaces this fallback.
-                journal.first_issued = Some(journal.first_issued.unwrap_or(0).max(issued));
-            }
-            // Do not backfill `issued_after` here: a result may have been
-            // delivered but not processed yet, and the count it will report at
-            // idle can be larger. Upstream records that count only from
-            // `idle()`, so an unacknowledged boundary stays unknown and a
-            // crash there replays without a false divergence.
-            Ok::<(), String>(())
-        })
-        .await
-    }
+    // Journal counts (`first_issued`/`issued_after`) are written only from the
+    // sandbox's `idle()` report, as upstream does: the host's own count is a
+    // lower bound that a crash can leave behind a boundary the sandbox never
+    // reported, and persisting it would fake a divergence on replay.
 
     async fn idle(&self, seq: u64, issued: u64) -> Result<(), String> {
         let seq = usize::try_from(seq)
@@ -1148,12 +1131,6 @@ impl<'a> DurableHost<'a> {
             if let Some(message) = &replay.divergence {
                 return Err(message.clone());
             }
-            if issued != replay.issued {
-                return Err(format!(
-                    "The script took a different path when resumed after a restart: the sandbox reported {issued} issued calls, but the host observed {}",
-                    replay.issued
-                ));
-            }
             if self.rerun && seq < replay.next {
                 return Ok((false, false));
             }
@@ -1163,6 +1140,9 @@ impl<'a> DurableHost<'a> {
                         .to_string(),
                 );
             }
+            // A recorded boundary is compared before any ordering shortcut: a
+            // late or repeated report with a different count is divergent
+            // (upstream `onIdle` compares first).
             if self.rerun && seq <= self.replay_len {
                 let recorded = if seq == 0 {
                     journal.first_issued
@@ -1184,15 +1164,26 @@ impl<'a> DurableHost<'a> {
                     };
                     return Err(message);
                 }
-                if let Some(next) = journal.entries.get(replay.next)
-                    && replay.next < self.replay_len
-                    && !replay.pending.contains(&next.key)
-                {
-                    return Err(format!(
-                        "The script took a different path when resumed after a restart: it waits without making call {}, which it made before",
-                        next.key
-                    ));
-                }
+            }
+            if self.rerun && seq < replay.next {
+                return Ok((false, false));
+            }
+            if self.rerun && seq != replay.next && seq <= self.replay_len {
+                return Err(
+                    "The script took a different path when resumed after a restart: the sandbox reported idle at an unexpected result"
+                        .to_string(),
+                );
+            }
+            if self.rerun
+                && seq <= self.replay_len
+                && let Some(next) = journal.entries.get(replay.next)
+                && replay.next < self.replay_len
+                && !replay.pending.contains(&next.key)
+            {
+                return Err(format!(
+                    "The script took a different path when resumed after a restart: it waits without making call {}, which it made before",
+                    next.key
+                ));
             }
             let acknowledge = if seq == 0 {
                 if self.rerun {
@@ -1218,6 +1209,13 @@ impl<'a> DurableHost<'a> {
             Ok(prepared) => prepared,
             Err(message) => return Err(self.replay_divergence(message)),
         };
+        // The sandbox's report is authoritative for its own issue count; the
+        // host's count only gates what it has delivered.
+        if let Ok(mut replay) = self.replay.lock()
+            && issued > replay.issued
+        {
+            replay.issued = issued;
+        }
         if acknowledge {
             self.record_journal(|journal| {
                 if seq == 0 {
@@ -1290,11 +1288,6 @@ impl<'a> DurableHost<'a> {
                         entry.issued_after.unwrap_or(0)
                     ));
                 }
-            }
-            if let Some(last) = journal.entries.last_mut()
-                && last.issued_after.is_none()
-            {
-                last.issued_after = Some(issued);
             }
             Ok::<(), String>(())
         })
@@ -1386,17 +1379,12 @@ impl<'a> DurableHost<'a> {
         E: std::fmt::Display,
     {
         let _guard = self.journal_commit.lock().await;
-        let issued = self.issued();
         let state = {
             let mut journal = self
                 .journal
                 .lock()
                 .map_err(|_| "codemode journal lock poisoned".to_string())?;
             record(&mut journal).map_err(|error| error.to_string())?;
-            let len = journal.entries.len();
-            if len > 1 && journal.entries[len - 2].issued_after.is_none() {
-                journal.entries[len - 2].issued_after = Some(issued);
-            }
             journal.clone()
         };
         self.persist_journal(&state).await
@@ -1505,7 +1493,6 @@ impl CodemodeHost for DurableHost<'_> {
             );
             return Ok(stored);
         }
-        self.acknowledge_first_batch().await?;
         let result = self
             .api
             .execute_tool(
@@ -1623,15 +1610,24 @@ impl CodemodeHost for DurableHost<'_> {
         if let Some(tool) = model_tool_for(name) {
             let nested = model_call_arguments(args);
             let result = self.call_tool(tool, nested, key).await?;
-            if result.is_error {
+            // Upstream `outcomeOf`: an error result that carries a structured
+            // value resolves with it (`bash`'s nonzero exit has the same shape);
+            // only an error without a value rejects, with its diagnostics.
+            if result.is_error && result.structured_output.is_none() {
                 let message = result
                     .diagnostics
                     .iter()
+                    .filter(|diagnostic| {
+                        matches!(
+                            diagnostic.severity,
+                            crate::harness::types::DiagnosticSeverity::Error
+                        )
+                    })
                     .map(|diagnostic| diagnostic.message.as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
                 return Err(if message.is_empty() {
-                    format!("{name} failed")
+                    format!("Tool {name} failed")
                 } else {
                     message
                 });
@@ -1675,7 +1671,6 @@ impl CodemodeHost for DurableHost<'_> {
             };
             return Ok(outcome);
         }
-        self.acknowledge_first_batch().await?;
         let outcome = if DISCOVERY_GLOBALS.contains(&name) {
             self.discover(name, args).await?
         } else if CATALOG_GLOBALS.contains(&name) {
@@ -1940,6 +1935,7 @@ impl ToolExecute for CodemodeTool {
         let writer = api
             .env()
             .map(|env| EnvOutputFile::new(env, context.clone()));
+        let calls = host.calls();
         let formatted = format_outcome(
             &outcome,
             wall_ms,
@@ -1947,10 +1943,11 @@ impl ToolExecute for CodemodeTool {
             writer
                 .as_ref()
                 .map(|writer| writer as &dyn OutputFileWriter),
+            &calls,
         )
         .await;
         let details = CodemodeToolDetails {
-            calls: host.calls(),
+            calls,
             full_output_path: formatted.full_output_path.clone(),
             structured_output: outcome.structured_output.clone(),
         };

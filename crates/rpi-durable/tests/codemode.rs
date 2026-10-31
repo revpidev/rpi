@@ -356,7 +356,7 @@ async fn structured_output_and_images_format_into_the_result() {
         }],
         ..Default::default()
     };
-    let formatted = format_outcome(&outcome, 500.0, 10_000, None).await;
+    let formatted = format_outcome(&outcome, 500.0, 10_000, None, &[]).await;
     let text = formatted
         .content
         .iter()

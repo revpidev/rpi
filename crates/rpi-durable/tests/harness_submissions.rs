@@ -388,3 +388,26 @@ async fn a_queued_reset_holds_display_only_writes() {
         "a display-only write behind a reset waits for the reset"
     );
 }
+
+/// `Conversation::compact` is part of the object-safe trait, so a
+/// `Arc<dyn Conversation>` can start a manual compaction (upstream `compact`).
+#[tokio::test]
+async fn compact_is_reachable_through_the_conversation_trait() {
+    let (harness, _scheduler) = open_recording().await;
+    let context = context();
+    let conversation = root_conversation(&harness).await;
+    let handle: Arc<dyn rpi_durable::harness::Conversation> = conversation;
+    let task = handle
+        .compact(Some("summarize".to_string()), &context)
+        .await
+        .expect("compact");
+    let record = harness
+        .get_task(task, &context)
+        .await
+        .expect("task")
+        .expect("record");
+    assert_eq!(
+        record.kind,
+        rpi_durable::harness::registry::COMPACTION_TASK_NAME
+    );
+}

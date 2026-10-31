@@ -70,9 +70,11 @@ impl Submissions {
             closed: Arc::new(AtomicBool::new(false)),
         });
         let observe = Arc::clone(&submissions);
+        // A component listener: a panic in it fails the Session, as upstream's
+        // `observeCommits` does, instead of only being reported.
         submissions
             .session
-            .subscribe_commits(Arc::new(move |publication, _context| {
+            .subscribe_internal_commits(Arc::new(move |publication, _context| {
                 observe.observe(publication);
             }));
         let closing = Arc::clone(&submissions);

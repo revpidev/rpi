@@ -672,3 +672,170 @@ async fn an_outdated_definition_reports_once_per_invocation() {
     assert_eq!(outdated, 1, "got {:?}", reports.lock().expect("reports"));
     opened.harness.close(&context()).await.unwrap();
 }
+
+// ─── V18-06 eleventh review: restart marks cascade and upgrade ──────────────
+
+/// Upstream `harness-cancellation-barrier.test.ts`: an abandoned owner's
+/// `restart` reason cascades to its owned work.
+#[tokio::test]
+async fn restart_reason_cascades_to_owned_work() {
+    use rpi_durable::session::{TaskCreate, TaskOwnership, commit_fn};
+    use rpi_durable::types::{TaskState, TaskStatus};
+
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
+    let conversation = root(&opened.harness).await;
+    let create = |ownership: TaskOwnership, abandon: bool| {
+        let harness = Arc::clone(&opened.harness);
+        async move {
+            harness
+                .session()
+                .commit(
+                    commit_fn(move |tx| {
+                        Box::pin(async move {
+                            tx.create_task(TaskCreate {
+                                kind: "test.abort".to_string(),
+                                version: 1,
+                                input: serde_json::Value::Null,
+                                checkpoint: serde_json::json!({ "phase": "step", "count": 0 }),
+                                ownership,
+                                conversation_id: Some(conversation),
+                                background: false,
+                                abandon_on_restart: abandon,
+                                trace: Default::default(),
+                                links: Vec::new(),
+                            })
+                            .await
+                        })
+                    }),
+                    &context(),
+                )
+                .await
+                .expect("create")
+        }
+    };
+    let parent = create(TaskOwnership::Conversation(conversation), true).await;
+    let child = create(TaskOwnership::Task(parent), false).await;
+    let mut record = opened
+        .harness
+        .get_task(parent, &context())
+        .await
+        .unwrap()
+        .expect("task");
+    record.state = TaskState::Running {
+        checkpoint: scheduler_support::checkpoint(&record),
+    };
+    record.restarts = None;
+    scheduler_support::stamp_task(&opened.harness, record).await;
+
+    let reopened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
+    reopened.harness.resume().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let child = reopened
+        .harness
+        .get_task(child, &context())
+        .await
+        .unwrap()
+        .expect("child");
+    assert_eq!(
+        child.abort_reason.as_deref(),
+        Some("restart"),
+        "an abandoned owner's restart reason must cascade to its owned work"
+    );
+    assert_eq!(child.status(), TaskStatus::Terminal);
+    reopened.harness.close(&context()).await.unwrap();
+}
+
+/// Upstream `harness-cancellation-barrier.test.ts`: "upgrades restart marks down
+/// the tree when an abort is requested above them". A host request replaces a
+/// `restart` mark, so the leaf blocked by a missing definition is orphaned.
+#[tokio::test]
+async fn abort_request_upgrades_a_restart_mark_down_the_tree() {
+    use rpi_durable::session::{TaskCreate, TaskOwnership, commit_fn};
+    use rpi_durable::types::{TaskOutcome, TaskState, TaskStatus};
+
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
+    let conversation = root(&opened.harness).await;
+    let create = |kind: &'static str, ownership: TaskOwnership, abandon: bool| {
+        let harness = Arc::clone(&opened.harness);
+        async move {
+            harness
+                .session()
+                .commit(
+                    commit_fn(move |tx| {
+                        Box::pin(async move {
+                            tx.create_task(TaskCreate {
+                                kind: kind.to_string(),
+                                version: 1,
+                                input: serde_json::Value::Null,
+                                checkpoint: serde_json::json!({ "phase": "step", "count": 0 }),
+                                ownership,
+                                conversation_id: Some(conversation),
+                                background: false,
+                                abandon_on_restart: abandon,
+                                trace: Default::default(),
+                                links: Vec::new(),
+                            })
+                            .await
+                        })
+                    }),
+                    &context(),
+                )
+                .await
+                .expect("create")
+        }
+    };
+    let top = create(
+        "test.abort",
+        TaskOwnership::Conversation(conversation),
+        true,
+    )
+    .await;
+    let middle = create("test.abort", TaskOwnership::Task(top), true).await;
+    // Only `test.abort` is registered under a name the registry knows; the leaf's
+    // name is not registered, so it waits for a definition.
+    let leaf = create("test.absent", TaskOwnership::Task(middle), false).await;
+    let mut record = opened
+        .harness
+        .get_task(top, &context())
+        .await
+        .unwrap()
+        .expect("task");
+    record.state = TaskState::Running {
+        checkpoint: scheduler_support::checkpoint(&record),
+    };
+    scheduler_support::stamp_task(&opened.harness, record).await;
+
+    let reopened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
+    reopened.harness.resume().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let leaf_record = reopened
+        .harness
+        .get_task(leaf, &context())
+        .await
+        .unwrap()
+        .expect("leaf");
+    assert_eq!(leaf_record.abort_reason.as_deref(), Some("restart"));
+    assert_ne!(leaf_record.status(), TaskStatus::Terminal);
+
+    // A request on the top task reaches the leaf and replaces its restart mark.
+    reopened.harness.abort_task(top, &context()).await.unwrap();
+    for (id, expected) in [(leaf, "orphaned"), (middle, "aborted"), (top, "aborted")] {
+        let settled = reopened
+            .harness
+            .wait_for_task(id, &context())
+            .await
+            .unwrap();
+        let actual = match settled.record.state {
+            TaskState::Terminal { outcome } => match outcome {
+                TaskOutcome::Orphaned { .. } => "orphaned",
+                TaskOutcome::Aborted { .. } => "aborted",
+                _ => "other",
+            },
+            _ => "live",
+        };
+        assert_eq!(actual, expected, "task {id}");
+    }
+    reopened.harness.close(&context()).await.unwrap();
+}

@@ -203,7 +203,7 @@ pub static NESTED_CALL_DOC: LazyLock<DocToken> = LazyLock::new(|| {
         initial: Arc::new(nested_call_initial),
         migrate: None,
         // The document retires with its task.
-        checkpoint_when: Some(Arc::new(|_value, _ops, _revision| false)),
+        checkpoint_when: Arc::new(|_value, _ops, _revision| false),
     })
 });
 
@@ -744,8 +744,7 @@ async fn run(
                     crate::harness::types::ReportInfo::new(
                         crate::harness::types::ReportKind::TaskError,
                     )
-                    .with_task(runtime.task_id(), TOOL_TASK_NAME)
-                    .with_reason("threw"),
+                    .with_task(runtime.task_id(), TOOL_TASK_NAME),
                 );
                 error_result(&error.to_string())
             }
@@ -1071,8 +1070,15 @@ async fn final_result(
             harness.push(tool_diagnostic("invalid_structured_output", &broken));
         } else {
             // The model never sees structured output, so its call stands; the
-            // host learns of the broken tool.
+            // host learns of the broken tool (upstream reports an extension
+            // error for the tool's own contract).
             let _ = runtime.report(broken);
+            runtime.report_info(
+                crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::ExtensionError,
+                )
+                .with_task(runtime.task_id(), TOOL_TASK_NAME),
+            );
         }
     }
     // Programs get the tool's own value: without a schema, its output.
@@ -1110,6 +1116,30 @@ async fn final_result(
     Ok(final_result)
 }
 
+/// Compiled `structuredOutputSchema` validators, keyed by the schema text: a
+/// script settles many results against the same tool schema (upstream caches
+/// them in a WeakMap, `tool.ts` `structuredValidators`).
+static SCHEMA_VALIDATORS: LazyLock<
+    Mutex<std::collections::HashMap<String, Arc<jsonschema::Validator>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn schema_validator(schema: &JsonValue) -> Result<Arc<jsonschema::Validator>, String> {
+    let key = serde_json::to_string(schema).unwrap_or_default();
+    if let Ok(cache) = SCHEMA_VALIDATORS.lock()
+        && let Some(validator) = cache.get(&key)
+    {
+        return Ok(Arc::clone(validator));
+    }
+    let validator = Arc::new(jsonschema::draft7::new(schema).map_err(|error| error.to_string())?);
+    if let Ok(mut cache) = SCHEMA_VALIDATORS.lock() {
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, Arc::clone(&validator));
+    }
+    Ok(validator)
+}
+
 /// Why a result's `structured_output` breaks the tool's contract, or `None`
 /// when it keeps it.
 fn structured_output_error(
@@ -1132,7 +1162,7 @@ fn structured_output_error(
             }
         }
         (Some(schema), Some(value)) => {
-            let validator = match jsonschema::draft7::new(schema) {
+            let validator = match schema_validator(schema) {
                 Ok(validator) => validator,
                 Err(error) => {
                     return Some(format!(
@@ -1174,11 +1204,28 @@ fn output_value(output: &[ToolResultContent]) -> JsonValue {
         return JsonValue::String(String::new());
     }
     if output.len() > 1 {
-        return serde_json::to_value(output).unwrap_or(JsonValue::Array(Vec::new()));
+        return JsonValue::Array(output.iter().map(content_json).collect());
     }
     match &output[0] {
         ToolResultContent::Text(text) => JsonValue::String(text.text.clone()),
-        ToolResultContent::Image(image) => serde_json::to_value(image).unwrap_or(JsonValue::Null),
+        ToolResultContent::Image(_) => content_json(&output[0]),
+    }
+}
+
+/// One content block as programs see it: upstream's tagged blocks
+/// (`{type:"text",text}` / `{type:"image",data,mimeType}`). `rpi-ai`'s image
+/// struct carries no tag of its own, so the envelope adds it.
+fn content_json(content: &ToolResultContent) -> JsonValue {
+    match content {
+        ToolResultContent::Text(text) => serde_json::json!({
+            "type": "text",
+            "text": text.text,
+        }),
+        ToolResultContent::Image(image) => serde_json::json!({
+            "type": "image",
+            "data": image.data,
+            "mimeType": image.mime_type,
+        }),
     }
 }
 
