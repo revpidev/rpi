@@ -73,6 +73,9 @@ struct FixtureOptions {
     auth_json: Option<String>,
     /// Written verbatim to `<agentDir>/models.json`.
     models_json: Option<String>,
+    /// Use a real built-in model (with any models.json overlay) instead of a
+    /// faux provider; required for per-model/provider origin tests.
+    use_builtin_model: bool,
 }
 
 /// Build the host/session pipeline. `pre_register` entries are registered by
@@ -120,15 +123,10 @@ async fn fixture_with(
         std::fs::write(agent_dir.join("models.json"), models).expect("models.json");
     }
 
-    let provider = FauxProvider::new(FauxProviderOptions {
-        provider: Some(
-            options
-                .model_provider
-                .unwrap_or_else(|| "deepseek".to_owned()),
-        ),
-        ..Default::default()
-    });
-    let model = provider.get_model(None).expect("faux model");
+    let model_provider = options
+        .model_provider
+        .clone()
+        .unwrap_or_else(|| "deepseek".to_owned());
     let model_runtime = rpi::core::model_runtime::ModelRuntime::create(
         rpi::core::model_runtime::CreateModelRuntimeOptions {
             credentials: None,
@@ -140,10 +138,24 @@ async fn fixture_with(
         },
     )
     .await;
-    model_runtime
-        .register_native_provider(Arc::new(FauxAiProvider::new(provider)))
-        .await
-        .expect("register faux provider");
+    let model = if options.use_builtin_model {
+        model_runtime
+            .get_models(Some(&model_provider))
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("no built-in model for {model_provider}"))
+    } else {
+        let provider = FauxProvider::new(FauxProviderOptions {
+            provider: Some(model_provider),
+            ..Default::default()
+        });
+        let model = provider.get_model(None).expect("faux model");
+        model_runtime
+            .register_native_provider(Arc::new(FauxAiProvider::new(provider)))
+            .await
+            .expect("register faux provider");
+        model
+    };
 
     let services = rpi::core::agent_session_services::create_agent_session_services(
         rpi::core::agent_session_services::CreateAgentSessionServicesOptions {
@@ -756,5 +768,277 @@ async fn stored_api_key_and_env_before_store_ordering() {
         std::fs::read_to_string(&glm_key).expect("glm key"),
         "sk-cn-env",
         "a conventional env key wins over any stored api_key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_alias_region_wins_for_glm_and_never_falls_through() {
+    let tmp = TempDir::new();
+    let script = tmp.path().join("glm.py");
+    let stdin_path = tmp.path().join("glm-stdin.json");
+    let runs = tmp.path().join("glm-runs");
+    write_script(
+        &script,
+        &format!(
+            "#!/bin/sh\ncat > {stdin}\necho run >> {runs}\nprintf '%s' '{{\"schemaVersion\":1,\"provider\":\"glm-coding-plan\",\"displayText\":\"ok\"}}'\n",
+            stdin = stdin_path.display(),
+            runs = runs.display()
+        ),
+    );
+    let settings = usage_settings(&[("glm-coding-plan", &script)]);
+    let fixture = fixture_with(
+        Vec::new(),
+        Some(&settings),
+        FixtureOptions {
+            model_provider: Some("zai-coding-cn".to_owned()),
+            ..FixtureOptions::default()
+        },
+    )
+    .await;
+    let _env = EnvVars::set(&[
+        ("ZAI_API_KEY", Some("sk-zai-env")),
+        ("GLM_API_KEY", None),
+        ("ZAI_CODING_CN_API_KEY", Some("sk-cn-env")),
+    ]);
+
+    let result = fetch_result(
+        fixture
+            .api
+            .usage_fetch_detailed("glm-coding-plan", true)
+            .await
+            .expect("glm"),
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    let stdin: Value = serde_json::from_str(&std::fs::read_to_string(&stdin_path).expect("stdin"))
+        .expect("stdin json");
+    assert_eq!(
+        stdin["apiKeyEnv"], "ZAI_CODING_CN_API_KEY",
+        "the current model's region owns the account"
+    );
+    drop(_env);
+    drop(fixture);
+
+    // Same current region but only the other region's key exists: fail
+    // closed instead of showing zai's account.
+    let script = tmp.path().join("glm-fallback.py");
+    let runs_fallback = tmp.path().join("glm-fallback-runs");
+    write_script(
+        &script,
+        &format!(
+            "#!/bin/sh\necho run >> {}\nprintf '%s' '{{\"schemaVersion\":1,\"provider\":\"glm-coding-plan\",\"displayText\":\"ok\"}}'\n",
+            runs_fallback.display()
+        ),
+    );
+    let settings = usage_settings(&[("glm-coding-plan", &script)]);
+    let fixture = fixture_with(
+        Vec::new(),
+        Some(&settings),
+        FixtureOptions {
+            model_provider: Some("zai-coding-cn".to_owned()),
+            ..FixtureOptions::default()
+        },
+    )
+    .await;
+    let _env = EnvVars::set(&[
+        ("ZAI_API_KEY", Some("sk-zai-env")),
+        ("GLM_API_KEY", None),
+        ("ZAI_CODING_CN_API_KEY", None),
+    ]);
+    let result = fetch_result(
+        fixture
+            .api
+            .usage_fetch_detailed("glm-coding-plan", true)
+            .await
+            .expect("glm"),
+    );
+    assert_eq!(
+        result.error.map(|error| error.kind),
+        Some(rpi_ext_host::usage::UsageErrorKind::AuthUnavailable)
+    );
+    assert!(
+        !runs_fallback.exists(),
+        "a missing current-region credential must not run the script"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_alias_region_wins_for_minimax() {
+    let tmp = TempDir::new();
+    let script = tmp.path().join("minimax.py");
+    let stdin_path = tmp.path().join("minimax-stdin.json");
+    write_script(
+        &script,
+        &format!(
+            "#!/bin/sh\ncat > {stdin}\nprintf '%s' '{{\"schemaVersion\":1,\"provider\":\"minimax-token-plan\",\"displayText\":\"ok\"}}'\n",
+            stdin = stdin_path.display()
+        ),
+    );
+    let settings = usage_settings(&[("minimax-token-plan", &script)]);
+    let fixture = fixture_with(
+        Vec::new(),
+        Some(&settings),
+        FixtureOptions {
+            model_provider: Some("minimax-cn".to_owned()),
+            ..FixtureOptions::default()
+        },
+    )
+    .await;
+    let _env = EnvVars::set(&[
+        ("MINIMAX_API_KEY", Some("sk-minimax-env")),
+        ("MINIMAX_CN_API_KEY", Some("sk-minimax-cn-env")),
+    ]);
+    let result = fetch_result(
+        fixture
+            .api
+            .usage_fetch_detailed("minimax-token-plan", true)
+            .await
+            .expect("minimax"),
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    let stdin: Value = serde_json::from_str(&std::fs::read_to_string(&stdin_path).expect("stdin"))
+        .expect("stdin json");
+    assert_eq!(stdin["apiKeyEnv"], "MINIMAX_CN_API_KEY");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_model_proxy_origin_fails_before_the_script() {
+    let tmp = TempDir::new();
+    let script = tmp.path().join("kimi.py");
+    let runs = tmp.path().join("kimi-runs");
+    write_script(
+        &script,
+        &format!(
+            "#!/bin/sh\necho run >> {}\nprintf '%s' '{{\"schemaVersion\":1,\"provider\":\"kimi-code\",\"displayText\":\"ok\"}}'\n",
+            runs.display()
+        ),
+    );
+    let settings = usage_settings(&[("kimi-code", &script)]);
+    let fixture = fixture_with(
+        Vec::new(),
+        Some(&settings),
+        FixtureOptions {
+            model_provider: Some("kimi-coding".to_owned()),
+            models_json: Some(
+                json!({"providers": {"kimi-coding": {"baseUrl": "https://proxy.example.com/v1"}}})
+                    .to_string(),
+            ),
+            use_builtin_model: true,
+            ..FixtureOptions::default()
+        },
+    )
+    .await;
+    let _env = EnvVars::set(&[("KIMI_API_KEY", Some("sk-kimi-env"))]);
+    let result = fetch_result(
+        fixture
+            .api
+            .usage_fetch_detailed("kimi-code", true)
+            .await
+            .expect("kimi"),
+    );
+    assert_eq!(
+        result.error.map(|error| error.kind),
+        Some(rpi_ext_host::usage::UsageErrorKind::OriginMismatch)
+    );
+    assert!(
+        !runs.exists(),
+        "a per-model proxy origin must fail before the script"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_first_party_api_key_env_wins() {
+    let tmp = TempDir::new();
+    let script = tmp.path().join("deepseek-explicit.py");
+    let stdin_path = tmp.path().join("deepseek-explicit-stdin.json");
+    let key_path = tmp.path().join("deepseek-explicit-key.txt");
+    write_script(
+        &script,
+        &format!(
+            "#!/bin/sh\ncat > {stdin}\nprintf '%s' \"$MY_DEEPSEEK_KEY\" > {key}\nprintf '%s' '{{\"schemaVersion\":1,\"provider\":\"deepseek\",\"displayText\":\"ok\"}}'\n",
+            stdin = stdin_path.display(),
+            key = key_path.display()
+        ),
+    );
+    let settings = json!({
+        "usage": {
+            "providers": {
+                "deepseek": {
+                    "script": script.display().to_string(),
+                    "apiKeyEnv": "MY_DEEPSEEK_KEY",
+                }
+            }
+        }
+    })
+    .to_string();
+    let fixture = fixture_with(Vec::new(), Some(&settings), FixtureOptions::default()).await;
+    let _env = EnvVars::set(&[
+        ("MY_DEEPSEEK_KEY", Some("sk-explicit")),
+        ("DEEPSEEK_API_KEY", Some("sk-default")),
+    ]);
+    let result = fetch_result(
+        fixture
+            .api
+            .usage_fetch_detailed("deepseek", true)
+            .await
+            .expect("deepseek"),
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    let stdin: Value = serde_json::from_str(&std::fs::read_to_string(&stdin_path).expect("stdin"))
+        .expect("stdin json");
+    assert_eq!(stdin["apiKeyEnv"], "MY_DEEPSEEK_KEY");
+    assert_eq!(
+        std::fs::read_to_string(&key_path).expect("key"),
+        "sk-explicit",
+        "the explicit usage apiKeyEnv wins over the conventional variable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn codex_oauth_without_account_id_fails_closed() {
+    let future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    let tmp = TempDir::new();
+    let script = tmp.path().join("codex.py");
+    let runs = tmp.path().join("codex-runs");
+    write_script(
+        &script,
+        &format!(
+            "#!/bin/sh\necho run >> {}\nprintf '%s' '{{\"schemaVersion\":1,\"provider\":\"openai-codex\",\"displayText\":\"ok\"}}'\n",
+            runs.display()
+        ),
+    );
+    let settings = usage_settings(&[("openai-codex", &script)]);
+    let fixture = fixture_with(
+        Vec::new(),
+        Some(&settings),
+        FixtureOptions {
+            auth_json: Some(
+                json!({
+                    "openai-codex": {
+                        "type": "oauth",
+                        "refresh": "refresh",
+                        "access": "access-without-account",
+                        "expires": future,
+                    }
+                })
+                .to_string(),
+            ),
+            ..FixtureOptions::default()
+        },
+    )
+    .await;
+    let result = fetch_result(
+        fixture
+            .api
+            .usage_fetch_detailed("openai-codex", true)
+            .await
+            .expect("codex"),
+    );
+    assert_eq!(
+        result.error.map(|error| error.kind),
+        Some(rpi_ext_host::usage::UsageErrorKind::AuthUnavailable)
+    );
+    assert!(
+        !runs.exists(),
+        "Codex without an account id must fail before the script"
     );
 }

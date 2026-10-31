@@ -123,12 +123,22 @@ impl UsageCredentialResolver for SessionUsageCredentialResolver {
         };
         let runtime = session.model_runtime().clone();
         let current_model = session.model();
+        // The current model's provider owns the account. Alias usage ids
+        // (glm-coding-plan / minimax-token-plan / kimi-code) do not match a
+        // model provider id, so select the candidate that does and never
+        // silently fall through to another region's account.
+        let current_candidate = current_model.as_ref().and_then(|model| {
+            auth_spec
+                .candidates
+                .iter()
+                .find(|candidate| candidate.provider == model.provider)
+        });
 
         match auth_spec.kind {
             UsageCredentialKind::ApiKey => {
                 // Resolution order (03 §5.3): explicit usage apiKeyEnv, then
                 // conventional environment variables, then auth.json's
-                // api_key — all candidates before the next credential store.
+                // api_key.
                 if let Some(name) = api_key_env
                     && let Some(key) = env_value(name)
                 {
@@ -136,6 +146,7 @@ impl UsageCredentialResolver for SessionUsageCredentialResolver {
                         .candidates
                         .iter()
                         .find(|candidate| candidate.env.contains(&name))
+                        .or(current_candidate)
                         .unwrap_or(&auth_spec.candidates[0]);
                     return api_key_identity(
                         &runtime,
@@ -146,6 +157,14 @@ impl UsageCredentialResolver for SessionUsageCredentialResolver {
                     )
                     .map(Some);
                 }
+                if let Some(candidate) = current_candidate {
+                    return resolve_api_key_candidate(&runtime, current_model.as_ref(), candidate)
+                        .await
+                        .map(Some);
+                }
+                // Explicitly querying a non-current provider: conventional
+                // environment variables across candidates first, then the
+                // stored api_key across candidates.
                 for candidate in auth_spec.candidates {
                     for name in candidate.env {
                         if let Some(key) = env_value(name) {
@@ -161,106 +180,116 @@ impl UsageCredentialResolver for SessionUsageCredentialResolver {
                     }
                 }
                 for candidate in auth_spec.candidates {
-                    let credential = match runtime
-                        .credential_store()
-                        .read(candidate.provider, None)
-                        .await
+                    if let Ok(credentials) =
+                        resolve_api_key_candidate(&runtime, current_model.as_ref(), candidate).await
                     {
-                        Ok(credential) => credential,
-                        Err(_) => return Err(UsageErrorKind::AuthUnavailable),
-                    };
-                    let Some(Credential::ApiKey(credential)) = credential else {
-                        continue;
-                    };
-                    let Some(key) = credential.key.filter(|key| !key.is_empty()) else {
-                        continue;
-                    };
-                    let name = candidate
-                        .env
-                        .first()
-                        .map(|name| (*name).to_owned())
-                        .or_else(|| api_key_env.map(str::to_owned))
-                        .unwrap_or_else(|| USAGE_API_KEY_ENV.to_owned());
-                    return api_key_identity(
-                        &runtime,
-                        current_model.as_ref(),
-                        candidate,
-                        &name,
-                        &key,
-                    )
-                    .map(Some);
+                        return Ok(Some(credentials));
+                    }
                 }
                 Err(UsageErrorKind::AuthUnavailable)
             }
             UsageCredentialKind::Oauth => {
+                if let Some(candidate) = current_candidate {
+                    return resolve_oauth_candidate(&runtime, current_model.as_ref(), candidate)
+                        .await
+                        .map(Some);
+                }
                 let mut last_error = UsageErrorKind::AuthUnavailable;
                 for candidate in auth_spec.candidates {
-                    let credential = match runtime
-                        .credential_store()
-                        .read(candidate.provider, None)
-                        .await
+                    match resolve_oauth_candidate(&runtime, current_model.as_ref(), candidate).await
                     {
-                        Ok(Some(Credential::OAuth(credential))) => credential,
-                        Ok(_) => continue,
-                        Err(_) => return Err(UsageErrorKind::AuthUnavailable),
-                    };
-                    let Some(provider_config) = runtime.get_provider(candidate.provider) else {
-                        continue;
-                    };
-                    let Some((configured_base_url, configured_origin, official_origin)) =
-                        provider_origins(
-                            provider_config.as_ref(),
-                            current_model.as_ref(),
-                            candidate.provider,
-                        )
-                    else {
-                        last_error = UsageErrorKind::AuthUnavailable;
-                        continue;
-                    };
-                    if configured_origin != official_origin {
-                        last_error = UsageErrorKind::OriginMismatch;
-                        continue;
+                        Ok(credentials) => return Ok(Some(credentials)),
+                        Err(kind) => last_error = kind,
                     }
-                    let identity = match ResolvedRequestAuth::resolve_oauth_read_only(
-                        candidate.provider,
-                        provider_config.auth(),
-                        provider_config.native_base_url(),
-                        &configured_base_url,
-                        &credential,
-                    )
-                    .await
-                    {
-                        Ok(identity) => identity,
-                        Err(_) => {
-                            last_error = UsageErrorKind::AuthUnavailable;
-                            continue;
-                        }
-                    };
-                    let mut script_env =
-                        vec![(USAGE_OAUTH_ACCESS_ENV.to_owned(), credential.access.clone())];
-                    if candidate.provider == "openai-codex" {
-                        match oauth_account_id(&credential) {
-                            Ok(Some(account_id)) => {
-                                script_env.push((USAGE_OAUTH_ACCOUNT_ID_ENV.to_owned(), account_id))
-                            }
-                            Ok(None) | Err(_) => {
-                                last_error = UsageErrorKind::AuthUnavailable;
-                                continue;
-                            }
-                        }
-                    }
-                    return Ok(Some(UsageCredentials {
-                        credential_kind: UsageCredentialKind::Oauth,
-                        generation: identity.generation.as_str().to_owned(),
-                        effective_origin: identity.effective_origin,
-                        script_env,
-                        api_key_env: None,
-                    }));
                 }
                 Err(last_error)
             }
         }
     }
+}
+
+async fn resolve_api_key_candidate(
+    runtime: &crate::core::model_runtime::ModelRuntime,
+    current_model: Option<&rpi_ai::types::Model>,
+    candidate: &UsageAuthCandidate,
+) -> Result<UsageCredentials, UsageErrorKind> {
+    for name in candidate.env {
+        if let Some(key) = env_value(name) {
+            return api_key_identity(runtime, current_model, candidate, name, &key);
+        }
+    }
+    let credential = match runtime
+        .credential_store()
+        .read(candidate.provider, None)
+        .await
+    {
+        Ok(credential) => credential,
+        Err(_) => return Err(UsageErrorKind::AuthUnavailable),
+    };
+    let Some(Credential::ApiKey(credential)) = credential else {
+        return Err(UsageErrorKind::AuthUnavailable);
+    };
+    let Some(key) = credential.key.filter(|key| !key.is_empty()) else {
+        return Err(UsageErrorKind::AuthUnavailable);
+    };
+    let name = candidate
+        .env
+        .first()
+        .map(|name| (*name).to_owned())
+        .unwrap_or_else(|| USAGE_API_KEY_ENV.to_owned());
+    api_key_identity(runtime, current_model, candidate, &name, &key)
+}
+
+async fn resolve_oauth_candidate(
+    runtime: &crate::core::model_runtime::ModelRuntime,
+    current_model: Option<&rpi_ai::types::Model>,
+    candidate: &UsageAuthCandidate,
+) -> Result<UsageCredentials, UsageErrorKind> {
+    let credential = match runtime
+        .credential_store()
+        .read(candidate.provider, None)
+        .await
+    {
+        Ok(Some(Credential::OAuth(credential))) => credential,
+        Ok(_) => return Err(UsageErrorKind::AuthUnavailable),
+        Err(_) => return Err(UsageErrorKind::AuthUnavailable),
+    };
+    let Some(provider_config) = runtime.get_provider(candidate.provider) else {
+        return Err(UsageErrorKind::AuthUnavailable);
+    };
+    let Some((configured_base_url, configured_origin, official_origin)) =
+        provider_origins(provider_config.as_ref(), current_model, candidate.provider)
+    else {
+        return Err(UsageErrorKind::AuthUnavailable);
+    };
+    if configured_origin != official_origin {
+        return Err(UsageErrorKind::OriginMismatch);
+    }
+    let identity = ResolvedRequestAuth::resolve_oauth_read_only(
+        candidate.provider,
+        provider_config.auth(),
+        provider_config.native_base_url(),
+        &configured_base_url,
+        &credential,
+    )
+    .await
+    .map_err(|_| UsageErrorKind::AuthUnavailable)?;
+    let mut script_env = vec![(USAGE_OAUTH_ACCESS_ENV.to_owned(), credential.access.clone())];
+    if candidate.provider == "openai-codex" {
+        let account_id =
+            oauth_account_id(&credential).map_err(|_| UsageErrorKind::AuthUnavailable)?;
+        let Some(account_id) = account_id else {
+            return Err(UsageErrorKind::AuthUnavailable);
+        };
+        script_env.push((USAGE_OAUTH_ACCOUNT_ID_ENV.to_owned(), account_id));
+    }
+    Ok(UsageCredentials {
+        credential_kind: UsageCredentialKind::Oauth,
+        generation: identity.generation.as_str().to_owned(),
+        effective_origin: identity.effective_origin,
+        script_env,
+        api_key_env: None,
+    })
 }
 
 fn api_key_identity(
