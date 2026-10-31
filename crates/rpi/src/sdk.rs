@@ -338,7 +338,7 @@ pub async fn create_agent_session(
         }
     }
 
-    // Thinking level (sdk.ts:253-277): CLI > resumed entry > per-model >
+    // Thinking level (sdk.ts:253-278): CLI > resumed entry > per-model >
     // global > medium. A resumed branch without a thinking entry goes
     // straight to the global default; the per-model override is only
     // consulted for a fresh session (upstream special case, issue #72).

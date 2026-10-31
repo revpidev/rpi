@@ -2177,7 +2177,7 @@ mod session_scoped_mutations {
 
 // ---------------------------------------------------------------------------
 // V18-07 / issue #72: per-model thinking override at session startup
-// (upstream `sdk.ts:253-269`, `model-resolver.ts:543-610`).
+// (upstream `sdk.ts:253-278`, `model-resolver.ts:543-610`).
 // ---------------------------------------------------------------------------
 
 mod initial_thinking_level {

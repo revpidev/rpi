@@ -907,7 +907,7 @@ pub struct InitialModelResult {
     pub fallback_message: Option<String>,
 }
 
-/// Session-restore state for the initial thinking decision (sdk.ts:253-269).
+/// Session-restore state for the initial thinking decision (sdk.ts:253-278).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumedThinking {
     /// No session data to restore (`hasExistingSession` false): a fresh
@@ -1004,7 +1004,7 @@ pub async fn find_initial_model(
 
     // 2. Use first model from scoped models (skip if continuing/resuming).
     // Upstream prefers the pattern's own thinking suffix, then the per-model
-    // override, then the global default (model-resolver.ts:566-575).
+    // override, then the global default (model-resolver.ts:566-574).
     if !scoped_models.is_empty() && !is_continuing {
         let first = &scoped_models[0];
         let per_model = model_thinking_levels.and_then(|levels| {
@@ -1028,7 +1028,7 @@ pub async fn find_initial_model(
 
     // 3. Try saved default from settings if auth is configured.
     // The per-model override is keyed by the saved default and wins over the
-    // global default (model-resolver.ts:578-590).
+    // global default (model-resolver.ts:576-589).
     if let (Some(default_provider), Some(default_model_id)) = (default_provider, default_model_id)
         && let Some(found) = model_runtime.get_model(default_provider, default_model_id)
         && model_runtime.has_configured_auth(&found.provider)
@@ -1872,7 +1872,7 @@ mod tests {
     // ------------------------------------------------------------------
     // Initial thinking level (issue #72 / V18-07)
     //
-    // Upstream anchors: `sdk.ts:253-269` (CLI > resumed entry > per-model >
+    // Upstream anchors: `sdk.ts:253-278` (CLI > resumed entry > per-model >
     // global > medium; a resumed branch without a thinking entry goes
     // straight to global) and `model-resolver.ts:543-610` (scoped and
     // saved-default prefer the per-model entry; provider defaults and the
