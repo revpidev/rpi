@@ -645,6 +645,49 @@ async fn prompt_history_update_byte_exact() {
     );
 }
 
+/// `if (customInstructions)` (compaction.ts:715) is truthiness, not
+/// presence: an empty string from `/compact    ` must not append an empty
+/// "Additional focus:" suffix to either split-turn prompt.
+#[tokio::test]
+async fn empty_custom_instructions_append_no_focus_suffix() {
+    let mut b = EntryBuilder::new();
+    b.user(&big());
+    b.assistant(vec![text_block(&big())]);
+    b.user(&big());
+    b.assistant(vec![text_block(&big())]);
+    b.tool_result(&big());
+    b.assistant(vec![text_block(&big())]);
+    b.tool_result(&small());
+    let entries = b.finish();
+
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 16384,
+        keep_recent_tokens: 150,
+    };
+    let preparation = prepare_compaction(&entries, &settings).expect("preparation");
+    assert!(preparation.is_split_turn, "split-turn preparation");
+
+    let capture = capture_stream_fn(&["HISTORY SUMMARY TEXT", "TURN PREFIX SUMMARY TEXT"]);
+    compact(
+        &preparation,
+        &test_model(),
+        Some(""),
+        &capture.stream_fn,
+        &SummarizationArgs::default(),
+        None,
+    )
+    .await
+    .expect("compact");
+
+    for index in 0..2 {
+        assert!(
+            !captured_prompt(&capture, index).contains("Additional focus:"),
+            "prompt {index} must not carry an empty focus suffix"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // V14-01 FR-F/FR-I: summarization failure contract + request shape
 // (97fa14e39 #7048, 90305d90a, 6b36eb592)

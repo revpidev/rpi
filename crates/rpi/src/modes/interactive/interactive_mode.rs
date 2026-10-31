@@ -6783,11 +6783,15 @@ impl InteractiveMode {
                 Some(())
             }
             "export" => {
-                ui.handle_export_command(args);
+                // `handleExportCommand(text)` (interactive-mode.ts:3184-3187):
+                // the handler parses the full command text, so dispatch must
+                // not pre-split it.
+                ui.handle_export_command(text);
                 Some(())
             }
             "import" => {
-                self.handle_import_command(args).await;
+                // `handleImportCommand(text)` (interactive-mode.ts:3189-3192).
+                self.handle_import_command(text).await;
                 Some(())
             }
             "share" => {
@@ -6852,13 +6856,13 @@ impl InteractiveMode {
                 Some(())
             }
             "compact" => {
-                let custom_instructions = if args.is_empty() {
-                    None
-                } else {
-                    Some(args.to_string())
-                };
-                ui.handle_compact_command(custom_instructions.as_deref().unwrap_or(""))
-                    .await;
+                // `const customInstructions = text.startsWith("/compact ")
+                // ? text.slice(9).trim() : undefined`
+                // (interactive-mode.ts:3266-3270). `/compact` alone passes
+                // None; a whitespace-only suffix keeps the upstream empty
+                // string.
+                let custom_instructions = text.strip_prefix("/compact ").map(str::trim);
+                ui.handle_compact_command(custom_instructions).await;
                 Some(())
             }
             "resume" => {
@@ -7573,7 +7577,8 @@ mod tests {
 
     use super::*;
     use crate::modes::interactive::test_support::{
-        TempDir, TestSession, TestTerminal, build_test_session, build_test_session_with,
+        TempDir, TestSession, TestTerminal, build_switchable_test_session, build_test_session,
+        build_test_session_with, build_test_session_with_manager,
         build_test_session_with_model_runtime, build_test_session_with_settings,
         install_noop_product_transports,
     };
@@ -14439,6 +14444,411 @@ mod tests {
         assert!(
             !restored.contains("custom editor"),
             "editor restored: {restored}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // V18-08 / issue #73: real slash dispatch argument contracts
+    // ---------------------------------------------------------------------
+
+    fn rendered_chat(ui: &InteractiveUi) -> String {
+        lock(&ui.chat_container).render(60).join("\n")
+    }
+
+    fn seed_session_message(session: &AgentSession, text: &str) {
+        let manager_handle = session.session_manager();
+        lock(&manager_handle)
+            .append_message(user_message(text))
+            .expect("append user message");
+    }
+
+    /// [`mode_harness`] over a working runtime factory, so `/import` can
+    /// replace the current session.
+    async fn mode_harness_switchable() -> (InteractiveMode, Arc<TestTerminal>, AgentSession, TempDir)
+    {
+        let TestSession {
+            _tmp,
+            runtime,
+            session,
+            cwd: _,
+        } = build_switchable_test_session().await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        install_noop_product_transports(&mode);
+        (mode, terminal, session, _tmp)
+    }
+
+    /// A file-backed session so the HTML export branch has a real session
+    /// file (the in-memory harness can only exercise the error arm).
+    async fn mode_harness_file_backed()
+    -> (InteractiveMode, Arc<TestTerminal>, AgentSession, TempDir) {
+        let tmp = TempDir::new();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions dir");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).expect("cwd dir");
+        let manager = crate::core::session_manager::SessionManager::create(
+            &cwd,
+            Some(&sessions),
+            crate::core::session_manager::NewSessionOptions::default(),
+        )
+        .expect("file-backed session manager");
+        let harness = build_test_session_with_manager(Some(manager)).await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        install_noop_product_transports(&mode);
+        (mode, terminal, harness.session, tmp)
+    }
+
+    fn write_import_file(path: &std::path::Path, cwd: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("import parent dir");
+        }
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 3,
+            "id": "imported-by-dispatch",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "cwd": cwd.to_string_lossy(),
+        });
+        let message = serde_json::json!({
+            "type": "message",
+            "id": "m-imported",
+            "parentId": null,
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "message": {"role": "user", "content": "imported by dispatch", "timestamp": 1},
+        });
+        std::fs::write(path, format!("{header}\n{message}\n")).expect("write import file");
+    }
+
+    /// Wait for the mounted dialog carrying `needle`, then feed `keys` one
+    /// per tick.
+    async fn answer_mounted_dialog(
+        ui: &Arc<InteractiveUi>,
+        terminal: &Arc<TestTerminal>,
+        needle: &str,
+        keys: &[&str],
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mounted = lock(&ui.editor_container).render(120).join("\n");
+            if mounted.contains(needle) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dialog {needle:?} never mounted; content: {mounted}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        for key in keys {
+            terminal.feed(key);
+            ui.ui.tick(std::time::Instant::now());
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_export_bare_uses_default_html_path() {
+        let (mut mode, _terminal, session) = mode_harness().await;
+        seed_session_message(&session, "export me");
+
+        assert!(mode.dispatch_slash_command("/export").await);
+
+        // The in-memory harness reaches the default HTML branch; the branch
+        // itself is the assertion here (a file-backed bare export would write
+        // to the process cwd).
+        let rendered = rendered_chat(&mode.ui_state);
+        assert!(
+            rendered.contains("Failed to export session: Cannot export in-memory"),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_export_jsonl_path_writes_file() {
+        let (mut mode, _terminal, session) = mode_harness().await;
+        seed_session_message(&session, "export by dispatch");
+        let tmp = TempDir::new();
+        let output = tmp.path().join("dispatch-session.jsonl");
+
+        assert!(
+            mode.dispatch_slash_command(&format!("/export {}", output.display()))
+                .await
+        );
+
+        assert!(output.exists(), "jsonl file written at the requested path");
+        let contents = std::fs::read_to_string(&output).expect("read jsonl");
+        assert!(
+            contents.contains("export by dispatch"),
+            "message in jsonl: {contents}"
+        );
+        assert!(
+            rendered_chat(&mode.ui_state).contains("Session exported to:"),
+            "status: {}",
+            rendered_chat(&mode.ui_state)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_export_quoted_path_with_spaces_writes_html() {
+        use base64::Engine as _;
+
+        let (mut mode, _terminal, session, _tmp) = mode_harness_file_backed().await;
+        seed_session_message(&session, "html export by dispatch");
+        let tmp = TempDir::new();
+        let output = tmp.path().join("a b.html");
+
+        assert!(
+            mode.dispatch_slash_command(&format!("/export \"{}\"", output.display()))
+                .await
+        );
+
+        assert!(output.exists(), "html file written at the quoted path");
+        let html = std::fs::read_to_string(&output).expect("read html");
+        let marker = r#"<script id="session-data" type="application/json">"#;
+        let start = html.find(marker).expect("session-data script") + marker.len();
+        let end = html[start..].find("</script>").expect("script close") + start;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&html[start..end])
+            .expect("session data base64");
+        let session_data: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("session data json");
+        assert!(
+            session_data.to_string().contains("html export by dispatch"),
+            "exported session data carries the seeded message"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_import_bare_shows_usage() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        assert!(mode.dispatch_slash_command("/import").await);
+        assert!(
+            rendered_chat(&mode.ui_state).contains("Usage: /import <path.jsonl>"),
+            "rendered: {}",
+            rendered_chat(&mode.ui_state)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_import_confirm_replaces_session() {
+        install_global_keybindings();
+        let (mut mode, terminal, _session, tmp) = mode_harness_switchable().await;
+        mode.init().await;
+        let source = tmp.path().join("outside").join("imported.jsonl");
+        write_import_file(&source, &tmp.path().join("cwd"));
+
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(&ui, &terminal, "Import session", &["\r"]).await;
+        };
+        let command = format!("/import {}", source.display());
+        let (_, ()) = tokio::join!(mode.dispatch_slash_command(&command), feeder);
+
+        let rendered = rendered_chat(&mode.ui_state);
+        assert!(
+            rendered.contains("Session imported from:"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            mode.ui_state
+                .session()
+                .messages()
+                .iter()
+                .any(|message| format!("{message:?}").contains("imported by dispatch")),
+            "imported message visible in the replacement session"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_import_decline_keeps_current_session() {
+        install_global_keybindings();
+        let (mut mode, terminal, _session, tmp) = mode_harness_switchable().await;
+        mode.init().await;
+        let source = tmp.path().join("outside").join("imported.jsonl");
+        write_import_file(&source, &tmp.path().join("cwd"));
+        let session_id_before = mode.ui_state.session().session_id();
+
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(&ui, &terminal, "Import session", &["\x1b[B", "\r"]).await;
+        };
+        let command = format!("/import {}", source.display());
+        let (_, ()) = tokio::join!(mode.dispatch_slash_command(&command), feeder);
+
+        let rendered = rendered_chat(&mode.ui_state);
+        assert!(
+            rendered.contains("Import cancelled"),
+            "rendered: {rendered}"
+        );
+        assert_eq!(
+            mode.ui_state.session().session_id(),
+            session_id_before,
+            "declining keeps the current session"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_import_missing_cwd_prompts_and_retries() {
+        install_global_keybindings();
+        let (mut mode, terminal, _session, tmp) = mode_harness_switchable().await;
+        mode.init().await;
+        let source = tmp.path().join("outside").join("imported.jsonl");
+        write_import_file(&source, &tmp.path().join("gone-cwd"));
+        let expected_cwd = tmp.path().join("cwd");
+
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(&ui, &terminal, "Import session", &["\r"]).await;
+            answer_mounted_dialog(&ui, &terminal, "Session cwd not found", &["\r"]).await;
+        };
+        let command = format!("/import {}", source.display());
+        let (_, ()) = tokio::join!(mode.dispatch_slash_command(&command), feeder);
+
+        let rendered = rendered_chat(&mode.ui_state);
+        assert!(
+            rendered.contains("Session imported from:"),
+            "rendered: {rendered}"
+        );
+        assert_eq!(
+            lock(&mode.ui_state.session().session_manager())
+                .get_cwd()
+                .to_path_buf(),
+            expected_cwd,
+            "imported under the fallback cwd"
+        );
+    }
+
+    fn seed_compaction_turns(session: &AgentSession) {
+        let manager_handle = session.session_manager();
+        let mut manager = lock(&manager_handle);
+        manager
+            .append_message(user_message("older question"))
+            .expect("append older user");
+        manager
+            .append_message(assistant_message(
+                vec![text_content("older answer")],
+                StopReason::Stop,
+            ))
+            .expect("append older assistant");
+        manager
+            .append_message(user_message("recent question"))
+            .expect("append recent user");
+        manager
+            .append_message(assistant_message(
+                // Exceeds the default 20k keepRecentTokens budget, so the cut
+                // lands in this turn and older content is summarized.
+                vec![text_content(&"x".repeat(90_000))],
+                StopReason::Stop,
+            ))
+            .expect("append recent assistant");
+    }
+
+    async fn compact_harness(
+        captured: Arc<Mutex<serde_json::Value>>,
+    ) -> (InteractiveMode, Arc<TestTerminal>, AgentSession, TempDir) {
+        use rpi_ext_host::api::ExtensionApi;
+        use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
+
+        let factory: ExtensionFactory = Arc::new(move |api: ExtensionApi| {
+            let captured = Arc::clone(&captured);
+            api.on(
+                "session_before_compact",
+                Arc::new(move |event, _ctx| {
+                    *lock(&captured) = event.clone();
+                    let last_id = event["branchEntries"]
+                        .as_array()
+                        .and_then(|entries| entries.last())
+                        .and_then(|entry| entry["id"].as_str())
+                        .expect("last branch entry id")
+                        .to_owned();
+                    Box::pin(async move {
+                        Ok(serde_json::json!({
+                            "compaction": {
+                                "summary": "dispatch compact summary",
+                                "firstKeptEntryId": last_id,
+                                "tokensBefore": 42,
+                            }
+                        }))
+                    })
+                }),
+            )
+            .expect("register session_before_compact");
+            Box::pin(async { Ok(()) })
+        });
+        let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new("/v18-08-cwd"));
+        let errors = host
+            .load_inline(&[InlineExtension::Anonymous(factory)])
+            .await;
+        assert!(errors.is_empty(), "load errors: {errors:?}");
+        mode_harness_with_host(host).await
+    }
+
+    #[tokio::test]
+    async fn dispatch_compact_passes_trimmed_instructions_to_hook() {
+        let captured = Arc::new(Mutex::new(serde_json::Value::Null));
+        let (mut mode, _terminal, session, _tmp) = compact_harness(Arc::clone(&captured)).await;
+        seed_compaction_turns(&session);
+
+        assert!(
+            mode.dispatch_slash_command("/compact   focus on the API changes only   ")
+                .await
+        );
+
+        let event = lock(&captured).clone();
+        assert_eq!(
+            event["customInstructions"],
+            serde_json::json!("focus on the API changes only"),
+            "dispatch trims the `/compact ` suffix"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_compact_bare_passes_none_to_hook() {
+        let captured = Arc::new(Mutex::new(serde_json::Value::Null));
+        let (mut mode, _terminal, session, _tmp) = compact_harness(Arc::clone(&captured)).await;
+        seed_compaction_turns(&session);
+
+        assert!(mode.dispatch_slash_command("/compact").await);
+
+        let event = lock(&captured).clone();
+        assert!(
+            event["customInstructions"].is_null(),
+            "bare /compact passes none: {event}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_compact_whitespace_suffix_keeps_upstream_empty_string() {
+        let captured = Arc::new(Mutex::new(serde_json::Value::Null));
+        let (mut mode, _terminal, session, _tmp) = compact_harness(Arc::clone(&captured)).await;
+        seed_compaction_turns(&session);
+
+        assert!(mode.dispatch_slash_command("/compact    ").await);
+
+        let event = lock(&captured).clone();
+        assert_eq!(
+            event["customInstructions"],
+            serde_json::json!(""),
+            "`text.slice(9).trim()` normalizes a whitespace-only suffix to an empty string"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_neighbor_name_keeps_full_text_argument() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        assert!(mode.dispatch_slash_command("/name  my session  ").await);
+        assert_eq!(
+            mode.ui_state.session().session_name().as_deref(),
+            Some("my session")
         );
     }
 }

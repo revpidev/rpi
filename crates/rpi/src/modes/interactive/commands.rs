@@ -82,10 +82,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// `getPathCommandArgument` (interactive-mode.ts:5438-5465): extract the
-/// path argument of `/export` / `/import` — the quoted string when the first
-/// char is a quote, otherwise the first whitespace-delimited token; `None`
-/// when the text is the bare command or has no argument.
+/// `getPathCommandArgument` (interactive-mode.ts:6511-6538 @ 4a080252f):
+/// extract the path argument of `/export` / `/import` — the quoted string
+/// when the first char is a quote, otherwise the first whitespace-delimited
+/// token; `None` when the text is the bare command or has no argument.
 fn get_path_command_argument(text: &str, command: &str) -> Option<String> {
     let args_string = text.strip_prefix(&format!("{command} "))?.trim_start();
     if args_string.is_empty() {
@@ -418,10 +418,12 @@ impl InteractiveUi {
         })
     }
 
-    /// `handleExportCommand` (interactive-mode.ts:5422-5436): `.jsonl`
-    /// suffix → JSONL branch export, anything else (or no path) → HTML.
-    pub(crate) fn handle_export_command(&self, args: &str) {
-        let output_path = get_path_command_argument(args, "/export");
+    /// `handleExportCommand` (interactive-mode.ts:6493-6509): `.jsonl`
+    /// suffix → JSONL branch export, anything else (or no path) → HTML. The
+    /// argument is the full command text; `getPathCommandArgument` (:6511)
+    /// strips the command prefix.
+    pub(crate) fn handle_export_command(&self, text: &str) {
+        let output_path = get_path_command_argument(text, "/export");
         if let Some(jsonl_path) = output_path
             .as_deref()
             .filter(|path| path.ends_with(".jsonl"))
@@ -788,15 +790,11 @@ impl InteractiveUi {
         self.render_handle.request_render();
     }
 
-    /// `handleCompactCommand` (interactive-mode.ts:6018-6026). Errors are
+    /// `handleCompactCommand` (interactive-mode.ts:7053-7061). The dispatch
+    /// already sliced and trimmed the `/compact ` suffix (interactive-mode.ts
+    /// :3266-3270); this forwards the instructions unchanged. Errors are
     /// ignored — compaction failures surface through the event stream.
-    pub(crate) async fn handle_compact_command(&self, args: &str) {
-        // `/compact ` prefix is 9 chars (`text.slice(9).trim()`,
-        // interactive-mode.ts:2753); `/compact` alone passes None.
-        let custom_instructions = args
-            .strip_prefix("/compact ")
-            .map(str::trim)
-            .filter(|instructions| !instructions.is_empty());
+    pub(crate) async fn handle_compact_command(&self, custom_instructions: Option<&str>) {
         let _ = self.session().compact(custom_instructions).await;
     }
 
@@ -808,11 +806,13 @@ impl InteractiveUi {
 }
 
 impl InteractiveMode {
-    /// `handleImportCommand` (interactive-mode.ts:6567-6609): confirm, replace
-    /// the current session with the one in the JSONL file, and recover from a
-    /// missing stored cwd by prompting for the fallback directory.
-    pub(crate) async fn handle_import_command(&mut self, args: &str) {
-        let Some(input_path) = get_path_command_argument(args, "/import") else {
+    /// `handleImportCommand` (interactive-mode.ts:6540-6582): the argument is
+    /// the full command text; `getPathCommandArgument` (:6511) strips the
+    /// command prefix. Confirm, replace the current session with the one in
+    /// the JSONL file, and recover from a missing stored cwd by prompting for
+    /// the fallback directory.
+    pub(crate) async fn handle_import_command(&mut self, text: &str) {
+        let Some(input_path) = get_path_command_argument(text, "/import") else {
             self.ui_state.show_error("Usage: /import <path.jsonl>");
             return;
         };

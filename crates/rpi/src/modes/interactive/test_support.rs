@@ -17,7 +17,9 @@ use rpi_tui::terminal::{InputHandler, ResizeHandler, Terminal};
 use tokio::time::Duration;
 
 use crate::core::agent_session::AgentSession;
-use crate::core::agent_session_runtime::AgentSessionRuntime;
+use crate::core::agent_session_runtime::{
+    AgentSessionRuntime, CreateAgentSessionRuntimeResult, CreateRuntimeOptions,
+};
 use crate::core::agent_session_services::{
     CreateAgentSessionServicesOptions, create_agent_session_services,
 };
@@ -287,7 +289,7 @@ pub(crate) async fn build_test_session() -> TestSession {
 pub(crate) async fn build_test_session_with_manager(
     manager: Option<SessionManager>,
 ) -> TestSession {
-    build_test_session_inner(manager, None, None, None).await
+    build_test_session_inner(manager, None, None, None, false).await
 }
 
 /// [`build_test_session_with_manager`] plus an optional extension host,
@@ -297,7 +299,13 @@ pub(crate) async fn build_test_session_with(
     manager: Option<SessionManager>,
     extension_host: Option<Arc<rpi_ext_host::host::NativeExtensionHost>>,
 ) -> TestSession {
-    build_test_session_inner(manager, extension_host, None, None).await
+    build_test_session_inner(manager, extension_host, None, None, false).await
+}
+
+/// [`build_test_session`] with a working session factory, so runtime-level
+/// commands (`/import`, `/new`, `/resume`, `/clone`) can switch sessions.
+pub(crate) async fn build_switchable_test_session() -> TestSession {
+    build_test_session_inner(None, None, None, None, true).await
 }
 
 /// [`build_test_session_with`] with a caller-provided model runtime and
@@ -307,7 +315,7 @@ pub(crate) async fn build_test_session_with_model_runtime(
     model_runtime: Arc<crate::core::model_runtime::ModelRuntime>,
     model: rpi_ai::types::Model,
 ) -> TestSession {
-    build_test_session_inner(None, None, Some((model_runtime, model)), None).await
+    build_test_session_inner(None, None, Some((model_runtime, model)), None, false).await
 }
 
 /// [`build_test_session_with`] with a caller-provided settings manager
@@ -315,7 +323,7 @@ pub(crate) async fn build_test_session_with_model_runtime(
 pub(crate) async fn build_test_session_with_settings(
     settings_manager: crate::core::settings_manager::SettingsManager,
 ) -> TestSession {
-    build_test_session_inner(None, None, None, Some(settings_manager)).await
+    build_test_session_inner(None, None, None, Some(settings_manager), false).await
 }
 
 #[allow(clippy::too_many_lines)] // single fixture builder; the options are one-line pass-throughs
@@ -327,6 +335,7 @@ async fn build_test_session_inner(
         rpi_ai::types::Model,
     )>,
     settings_manager: Option<crate::core::settings_manager::SettingsManager>,
+    switchable: bool,
 ) -> TestSession {
     let tmp = TempDir::new();
     let agent_dir = tmp.path().join("agent");
@@ -370,11 +379,18 @@ async fn build_test_session_inner(
 
     let session_manager = match manager {
         Some(manager) => manager,
+        None if switchable => {
+            let sessions = tmp.path().join("sessions");
+            std::fs::create_dir_all(&sessions).expect("sessions dir");
+            SessionManager::create(&cwd, Some(&sessions), NewSessionOptions::default())
+                .expect("file-backed session manager")
+        }
         None => SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
             .expect("in-memory session manager"),
     };
     let session_manager = Arc::new(Mutex::new(session_manager));
 
+    let factory_agent_dir = agent_dir.clone();
     let created = create_agent_session(CreateAgentSessionOptions {
         cwd: Some(cwd.clone()),
         agent_dir: Some(agent_dir),
@@ -388,19 +404,57 @@ async fn build_test_session_inner(
     .await
     .expect("create test session");
 
-    // The mode tests exercise the skeleton only; the runtime's session
-    // factory (session switching) is never invoked.
-    let runtime = AgentSessionRuntime::new(
-        created.session.clone(),
-        services,
-        Arc::new(|_options| {
-            Box::pin(async {
-                unreachable!("session creation is not exercised by interactive tests")
-            })
-        }),
-        Vec::new(),
-        None,
-    );
+    // Most mode tests exercise the skeleton only; a real factory is opt-in
+    // for the runtime-level commands that replace the session.
+    let runtime = if switchable {
+        let factory_services = services.clone();
+        let factory_cwd = cwd.clone();
+        AgentSessionRuntime::new(
+            created.session.clone(),
+            services,
+            Arc::new(move |options: CreateRuntimeOptions| {
+                let services = factory_services.clone();
+                let cwd = factory_cwd.clone();
+                let agent_dir = factory_agent_dir.clone();
+                Box::pin(async move {
+                    let created = create_agent_session(CreateAgentSessionOptions {
+                        cwd: Some(cwd),
+                        agent_dir: Some(agent_dir),
+                        model: None,
+                        no_tools: Some(NoTools::All),
+                        services: Some(services),
+                        session_manager: Some(options.session_manager),
+                        ..Default::default()
+                    })
+                    .await?;
+                    Ok(CreateAgentSessionRuntimeResult {
+                        session: created.session,
+                        services: created.services.expect("services round-trip"),
+                        diagnostics: Vec::new(),
+                        model_fallback_message: created.model_fallback_message,
+                    })
+                })
+                    as futures::future::BoxFuture<
+                        'static,
+                        Result<CreateAgentSessionRuntimeResult, crate::RpiError>,
+                    >
+            }),
+            Vec::new(),
+            None,
+        )
+    } else {
+        AgentSessionRuntime::new(
+            created.session.clone(),
+            services,
+            Arc::new(|_options| {
+                Box::pin(async {
+                    unreachable!("session creation is not exercised by interactive tests")
+                })
+            }),
+            Vec::new(),
+            None,
+        )
+    };
 
     TestSession {
         _tmp: tmp,

@@ -797,7 +797,8 @@ pub async fn generate_summary_with_usage(
         Some(_) => UPDATE_SUMMARIZATION_PROMPT.to_owned(),
         None => SUMMARIZATION_PROMPT.to_owned(),
     };
-    if let Some(instructions) = custom_instructions {
+    if let Some(instructions) = custom_instructions.filter(|instructions| !instructions.is_empty())
+    {
         base_prompt = format!("{base_prompt}\n\nAdditional focus: {instructions}");
     }
 
@@ -1341,7 +1342,8 @@ async fn generate_turn_prefix_summary(
     let mut prompt_text = format!(
         "# Conversation\n{conversation_text}\n\n# Instructions\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
     );
-    if let Some(instructions) = custom_instructions {
+    if let Some(instructions) = custom_instructions.filter(|instructions| !instructions.is_empty())
+    {
         prompt_text = format!("{prompt_text}\n\nAdditional focus: {instructions}");
     }
     let summarization_messages = vec![rpi_ai::types::Message::User(UserMessage {
