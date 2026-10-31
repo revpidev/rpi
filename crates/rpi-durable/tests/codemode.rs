@@ -19,8 +19,8 @@ use rpi_durable::codemode::{
     CODEMODE_RUN_DOC, CODEMODE_STORE_DOC, CODEMODE_TOOL_NAME, CodemodeCatalog, CodemodeHost,
     CodemodeImage, CodemodeJournal, CodemodeJournalEntry, CodemodeNamespaceInfo, CodemodeOutcome,
     CodemodeRunState, CodemodeSandbox, CodemodeStart, CodemodeStoreState, CodemodeTextItem,
-    CodemodeToolDetails, CodemodeToolInfo, CodemodeToolOptions, create_codemode_tool,
-    format_outcome,
+    CodemodeToolDetails, CodemodeToolInfo, CodemodeToolOptions, GENERATE_IMAGES_TOOL,
+    create_codemode_tool, format_outcome,
 };
 use rpi_durable::harness::types::{DiagnosticSeverity, OutputSkip, OutputWindow};
 use rpi_durable::harness::{
@@ -225,6 +225,22 @@ fn codemode_section_lists_tools_and_the_extension_exposes_the_section() {
     assert_eq!(extension.sections[0].key, "codemode");
 }
 
+/// Upstream `createCodemodeTool` declares `OUTPUT_LIMITS`: the formatter keeps
+/// the result inside them, so the Harness must not cut the formatted head and
+/// tail again.
+#[test]
+fn the_codemode_tool_declares_its_own_output_limits() {
+    let tool = create_codemode_tool(CodemodeToolOptions {
+        sandbox: Arc::new(UnusedSandbox),
+        models: false,
+        ..Default::default()
+    });
+    let limits = tool.output_limits.expect("declared output limits");
+    assert_eq!(limits.max_bytes, Some(4 * 1024 * 1024));
+    assert_eq!(limits.max_lines, Some(100_000));
+    assert_eq!(limits.retain, None);
+}
+
 #[test]
 fn structured_results_live_in_the_details_channel() {
     let details = CodemodeToolDetails {
@@ -356,7 +372,7 @@ async fn structured_output_and_images_format_into_the_result() {
         }],
         ..Default::default()
     };
-    let formatted = format_outcome(&outcome, 500.0, 10_000, None, &[]).await;
+    let formatted = format_outcome(&outcome, 500.0, 10_000, None, &[], 0).await;
     let text = formatted
         .content
         .iter()
@@ -742,6 +758,201 @@ async fn an_image_result_flows_through_a_nested_call() {
     );
     let texts = tool_result_texts(&entries(&conversation).await);
     assert!(texts[0].contains("rendered"));
+}
+
+struct GeneratedImageTool;
+
+#[async_trait]
+impl ToolExecute for GeneratedImageTool {
+    async fn execute(
+        &self,
+        _args: JsonObject,
+        _api: &dyn ToolExecutionApi,
+        _context: &Context,
+    ) -> Result<ToolExecutionResult, ToolExecuteError> {
+        Ok(ToolExecutionResult {
+            structured_output: Some(serde_json::json!({
+                "output": [{
+                    "type": "image",
+                    "data": base64::engine::general_purpose::STANDARD.encode([1_u8, 2, 3]),
+                    "mimeType": "image/png"
+                }]
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+fn generated_images(result: &NestedToolExecutionResult) -> Vec<CodemodeImage> {
+    result
+        .structured_output
+        .as_ref()
+        .and_then(|value| value.get("output"))
+        .and_then(JsonValue::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    if item.get("type").and_then(JsonValue::as_str) != Some("image") {
+                        return None;
+                    }
+                    Some(CodemodeImage {
+                        data: item.get("data")?.as_str()?.to_string(),
+                        mime_type: item.get("mimeType")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+struct HiddenGeneratedImagesSandbox;
+
+#[async_trait]
+impl CodemodeSandbox for HiddenGeneratedImagesSandbox {
+    fn fingerprint(&self) -> String {
+        "generated-images-hidden".to_string()
+    }
+    async fn run(
+        &self,
+        _start: CodemodeStart,
+        host: &dyn CodemodeHost,
+        _context: &Context,
+    ) -> Result<CodemodeOutcome, String> {
+        let result = host
+            .call_tool(GENERATE_IMAGES_TOOL, JsonObject::new(), "c1")
+            .await?;
+        assert_eq!(generated_images(&result).len(), 1);
+        Ok(CodemodeOutcome::output("done"))
+    }
+}
+
+struct ShownGeneratedImagesSandbox;
+
+#[async_trait]
+impl CodemodeSandbox for ShownGeneratedImagesSandbox {
+    fn fingerprint(&self) -> String {
+        "generated-images-shown".to_string()
+    }
+    async fn run(
+        &self,
+        _start: CodemodeStart,
+        host: &dyn CodemodeHost,
+        _context: &Context,
+    ) -> Result<CodemodeOutcome, String> {
+        let result = host
+            .call_tool(GENERATE_IMAGES_TOOL, JsonObject::new(), "c1")
+            .await?;
+        Ok(CodemodeOutcome::output("done").with_images(generated_images(&result)))
+    }
+}
+
+async fn open_codemode_case(sandbox: Arc<dyn CodemodeSandbox>) -> generation_support::Opened {
+    open(
+        vec![extension(vec![
+            create_codemode_tool(CodemodeToolOptions {
+                sandbox,
+                ..Default::default()
+            }),
+            inner_tool(
+                GENERATE_IMAGES_TOOL,
+                Some(serde_json::json!({ "type": "object" })),
+                Arc::new(GeneratedImageTool),
+            ),
+        ])],
+        None,
+        test_models(vec![
+            Script::Message(tool_use_message(
+                CODEMODE_TOOL_NAME,
+                "c1",
+                serde_json::json!({ "code": "return 1" }),
+            )),
+            Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
+        ]),
+    )
+    .await
+}
+
+/// Upstream `codemode-models.test.ts`: generated images the script did not show
+/// are named; shown images are returned without the note.
+#[tokio::test]
+async fn generated_images_the_script_did_not_show_are_noted() {
+    let opened = open_codemode_case(Arc::new(HiddenGeneratedImagesSandbox)).await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    submission.wait(&context()).await.expect("wait");
+    let texts = tool_result_texts(&entries(&conversation).await);
+    assert!(
+        texts.iter().any(|text| text.contains(
+            "Note: models.generateImages() returned 1 image that the script did not show"
+        )),
+        "got {texts:?}"
+    );
+
+    let opened = open_codemode_case(Arc::new(ShownGeneratedImagesSandbox)).await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    submission.wait(&context()).await.expect("wait");
+    let entries = entries(&conversation).await;
+    let texts = tool_result_texts(&entries);
+    assert!(
+        !texts.iter().any(|text| text.contains("Note:")),
+        "shown images need no note: {texts:?}"
+    );
+    assert!(
+        tool_result_contents(&entries)
+            .iter()
+            .flatten()
+            .any(|content| matches!(content, ToolResultContent::Image(_))),
+        "the shown image is returned"
+    );
+}
+
+struct LongOutputSandbox;
+
+#[async_trait]
+impl CodemodeSandbox for LongOutputSandbox {
+    fn fingerprint(&self) -> String {
+        "long-output-1".to_string()
+    }
+    async fn run(
+        &self,
+        _start: CodemodeStart,
+        _host: &dyn CodemodeHost,
+        _context: &Context,
+    ) -> Result<CodemodeOutcome, String> {
+        let text = (0..200_000)
+            .map(|index| match index {
+                0 => "BEGIN".to_string(),
+                199_999 => "END".to_string(),
+                _ => "a".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(CodemodeOutcome::output(text))
+    }
+}
+
+/// Upstream `codemode.test.ts` 200,000-line case: both ends survive, the line
+/// limit applies, and the Harness does not cut the formatted result again.
+#[tokio::test]
+async fn a_long_result_keeps_both_ends_within_the_line_limit() {
+    let opened = open_codemode_case(Arc::new(LongOutputSandbox)).await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    submission.wait(&context()).await.expect("wait");
+    let texts = tool_result_texts(&entries(&conversation).await);
+    let text = texts
+        .iter()
+        .find(|text| text.contains("Warning: truncated output"))
+        .unwrap_or_else(|| panic!("no truncated result: {texts:?}"));
+    assert!(text.contains("BEGIN"), "the head is kept");
+    assert!(text.contains("END"), "the tail is kept");
+    assert!(
+        text.split('\n').count() < 100_000,
+        "the result is bounded by the line limit"
+    );
+    assert!(!text.contains("0 tokens truncated"), "{text}");
 }
 
 // ---------------------------------------------------------------------------

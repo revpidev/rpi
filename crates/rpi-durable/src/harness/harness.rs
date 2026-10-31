@@ -1025,9 +1025,12 @@ pub async fn open_harness_with_scheduler(
     scheduler_factory: SchedulerFactory,
     context: &Context,
 ) -> SessionResult<Arc<HarnessImpl>> {
-    // A throwing `onReport` callback is contained, and the reports that bypass
-    // the scheduler's context-aware path (session, listener, extension) emit
-    // their fixed telemetry here (upstream `safeReport`).
+    // The scheduler emits telemetry for every report it makes itself, so its
+    // callback must only reach the host. Reports that bypass the scheduler
+    // (session failure, listener errors, direct extension errors) emit their
+    // fixed telemetry here (upstream `safeReport`). Split the two callbacks so
+    // each report is emitted exactly once.
+    let scheduler_report_info = options.on_report_info.clone();
     {
         let host = options.on_report_info.clone();
         let telemetry = options.telemetry.clone().unwrap_or_default();
@@ -1151,7 +1154,7 @@ pub async fn open_harness_with_scheduler(
         settings: settings_source.clone(),
         env: options.env.clone(),
         report: Arc::clone(&report),
-        report_info: options.on_report_info.clone(),
+        report_info: scheduler_report_info,
         now: Arc::clone(&now),
         context: without_abort_signal(context),
     });

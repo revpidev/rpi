@@ -9,6 +9,7 @@
 //! environment. Images are saved next to a path label when possible and always
 //! returned as image blocks.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -218,11 +219,43 @@ fn tail_chars(text: &str, max: usize) -> String {
     text.chars().skip(count.saturating_sub(max)).collect()
 }
 
+/// The first `max_lines` lines of the first `max_chars` characters, as
+/// upstream `combined.slice(0, headChars).split("\n").slice(0, lineBudget)`.
+fn head_lines(text: &str, max_chars: usize, max_lines: usize) -> String {
+    head_chars(text, max_chars)
+        .split('\n')
+        .take(max_lines)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The last `max_lines` lines of the last `max_chars` characters, as upstream
+/// `combined.slice(-tailChars).split("\n").slice(-lineBudget)`.
+fn tail_lines(text: &str, max_chars: usize, max_lines: usize) -> String {
+    if max_lines == 0 {
+        return String::new();
+    }
+    let sliced = tail_chars(text, max_chars);
+    let lines: Vec<&str> = sliced.split('\n').collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
 /// Lay out the script's text items so the model can tell them apart: number
 /// them first (upstream `formatItems`), then join adjacent text of one stream
 /// into one block (`joinAdjacentText`).
 fn text_blocks(outcome: &CodemodeOutcome) -> Vec<String> {
-    let items = display_items(outcome);
+    let mut items = display_items(outcome);
+    if !outcome.is_error
+        && let Some(value) = &outcome.structured_output
+    {
+        // Upstream `formatResult` appends the returned value before
+        // `formatItems`, so it is one of the numbered text items.
+        items.push(CodemodeTextItem {
+            text: structured_text(value),
+            console: false,
+        });
+    }
     let total = items.iter().filter(|item| !item.console).count();
     let mut numbered: Vec<CodemodeTextItem> = Vec::new();
     let mut index = 0;
@@ -338,6 +371,7 @@ pub async fn format_outcome(
     max_output_tokens: u64,
     writer: Option<&dyn OutputFileWriter>,
     calls: &[CodemodeNestedCall],
+    generated_images: usize,
 ) -> FormattedOutput {
     format_with_limits(
         outcome,
@@ -346,6 +380,7 @@ pub async fn format_outcome(
         OutputLimits::default(),
         writer,
         calls,
+        generated_images,
     )
     .await
 }
@@ -358,6 +393,7 @@ pub async fn format_with_limits(
     limits: OutputLimits,
     writer: Option<&dyn OutputFileWriter>,
     calls: &[CodemodeNestedCall],
+    generated_images: usize,
 ) -> FormattedOutput {
     let header = format!(
         "{}\nWall time {:.1} seconds\nOutput:\n",
@@ -369,13 +405,14 @@ pub async fn format_with_limits(
         wall_ms / 1000.0
     );
     let mut blocks: Vec<String> = text_blocks(outcome);
-    if !outcome.is_error
-        && let Some(value) = &outcome.structured_output
-    {
-        blocks.push(structured_text(value));
-    }
     if let Some(error) = error_text(outcome, calls) {
         blocks.push(error);
+    }
+    if generated_images > 0 && outcome.images.is_empty() {
+        blocks.push(format!(
+            "Note: models.generateImages() returned {generated_images} image{} that the script did not show. Show each image block of result.output with image(block).",
+            if generated_images == 1 { "" } else { "s" }
+        ));
     }
 
     let combined = blocks.join("\n");
@@ -383,14 +420,14 @@ pub async fn format_with_limits(
         .saturating_mul(CHARS_PER_TOKEN)
         .min((limits.max_bytes / 4) as usize);
     let line_budget = (limits.max_lines as usize).saturating_sub(LINE_MARGIN) / 2;
-    let line_count = combined.lines().count();
+    let line_count = combined.split('\n').count();
     let truncated = count_chars(&combined) > budget || line_count > 2 * line_budget;
     let mut full_output_path = None;
     let blocks: Vec<String> = if truncated {
         let head_chars_budget = budget / 2;
         let tail_chars_budget = budget.saturating_sub(head_chars_budget);
-        let head = head_chars(&combined, head_chars_budget);
-        let tail = tail_chars(&combined, tail_chars_budget);
+        let head = head_lines(&combined, head_chars_budget, line_budget);
+        let tail = tail_lines(&combined, tail_chars_budget, line_budget);
         let removed = count_chars(&combined)
             .saturating_sub(count_chars(&head))
             .saturating_sub(count_chars(&tail));
@@ -422,23 +459,32 @@ pub async fn format_with_limits(
         content.push(text(block));
     }
 
-    for (index, image) in outcome.images.iter().enumerate() {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(image.data.as_bytes())
-            .unwrap_or_default();
-        let kind = format!("{}, {} bytes", image.mime_type, bytes.len());
-        if let Some(writer) = writer {
-            let name = format!("image-{}{}", index + 1, image_extension(&image.mime_type));
-            let label = match writer.write(&name, &bytes).await {
-                Ok(path) => format!("[Image saved to {path} ({kind})]"),
-                Err(error) => format!("[Image ({kind}) could not be saved: {error}]"),
-            };
-            content.push(text(label));
+    // Upstream `saveImages`: one file and one label per distinct image data,
+    // reused before every occurrence of that image.
+    let mut labels: HashMap<String, String> = HashMap::new();
+    let mut saved = 0;
+    for image in &outcome.images {
+        let label = if let Some(label) = labels.get(&image.data) {
+            label.clone()
         } else {
-            content.push(text(format!(
-                "[Image ({kind}) not saved: no execution environment]"
-            )));
-        }
+            saved += 1;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(image.data.as_bytes())
+                .unwrap_or_default();
+            let kind = format!("{}, {} bytes", image.mime_type, bytes.len());
+            let label = if let Some(writer) = writer {
+                let name = format!("image-{}{}", saved, image_extension(&image.mime_type));
+                match writer.write(&name, &bytes).await {
+                    Ok(path) => format!("[Image saved to {path} ({kind})]"),
+                    Err(error) => format!("[Image ({kind}) could not be saved: {error}]"),
+                }
+            } else {
+                format!("[Image ({kind}) not saved: no execution environment]")
+            };
+            labels.insert(image.data.clone(), label.clone());
+            label
+        };
+        content.push(text(label));
         content.push(ToolResultContent::Image(ImageContent {
             data: image.data.clone(),
             mime_type: image.mime_type.clone(),
@@ -480,7 +526,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let formatted = format_outcome(&outcome, 1500.0, 10_000, None, &[]).await;
+        let formatted = format_outcome(&outcome, 1500.0, 10_000, None, &[], 0).await;
         let rendered = formatted
             .content
             .iter()
@@ -501,6 +547,40 @@ mod tests {
         );
     }
 
+    /// Upstream `saveImages`: an image shown twice is saved and labeled once.
+    #[tokio::test]
+    async fn repeated_images_share_one_file_and_label() {
+        struct Writer(Mutex<Vec<String>>);
+        #[async_trait]
+        impl OutputFileWriter for Writer {
+            async fn write(&self, name: &str, _data: &[u8]) -> Result<String, String> {
+                self.0.lock().expect("names").push(name.to_string());
+                Ok(format!("/tmp/{name}"))
+            }
+        }
+        let writer = Writer(Mutex::new(Vec::new()));
+        let image = CodemodeImage {
+            data: base64::engine::general_purpose::STANDARD.encode([1_u8, 2, 3]),
+            mime_type: "image/png".to_string(),
+        };
+        let outcome = CodemodeOutcome::output("x").with_images(vec![image.clone(), image]);
+        let formatted = format_outcome(&outcome, 0.0, 10_000, Some(&writer), &[], 0).await;
+        assert_eq!(writer.0.lock().expect("names").len(), 1, "one file");
+        let labels: Vec<String> = formatted
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                ToolResultContent::Text(text) if text.text.starts_with("[Image saved") => {
+                    Some(text.text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 2, "a label before each occurrence");
+        assert_eq!(labels[0], labels[1]);
+        assert!(labels[0].contains("/tmp/image-1.png"), "{}", labels[0]);
+    }
+
     #[tokio::test]
     async fn truncates_and_spills_the_complete_text() {
         struct Writer(Mutex<Vec<u8>>);
@@ -513,7 +593,7 @@ mod tests {
         }
         let writer = Writer(Mutex::new(Vec::new()));
         let outcome = CodemodeOutcome::output("x".repeat(500));
-        let formatted = format_outcome(&outcome, 0.0, 10, Some(&writer), &[]).await;
+        let formatted = format_outcome(&outcome, 0.0, 10, Some(&writer), &[], 0).await;
         assert!(formatted.truncated);
         assert_eq!(
             formatted.full_output_path.as_deref(),
@@ -538,6 +618,70 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Upstream `codemode.test.ts` "keeps a result inside the tool's output
+    /// limits": 200,000 short lines are cut by the line limit on both sides,
+    /// not only by the character budget.
+    #[tokio::test]
+    async fn truncates_by_lines_and_keeps_both_ends() {
+        let text = (0..200_000)
+            .map(|index| match index {
+                0 => "BEGIN".to_string(),
+                199_999 => "END".to_string(),
+                _ => "a".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let formatted =
+            format_outcome(&CodemodeOutcome::output(text), 0.0, 2_000_000, None, &[], 0).await;
+        let text = rendered(&formatted);
+        assert!(formatted.truncated);
+        assert!(text.contains("Warning: truncated output"), "{text}");
+        assert!(text.contains("BEGIN"), "the head is kept");
+        assert!(text.contains("END"), "the tail is kept");
+        assert!(
+            text.split('\n').count() < 100_000,
+            "the line limit applies to head and tail"
+        );
+        assert!(!text.contains("0 tokens truncated"), "{text}");
+    }
+
+    /// Upstream `formatResult`: generated images the script did not show are
+    /// named, so the model knows they exist; shown images are not noted.
+    #[tokio::test]
+    async fn notes_generated_images_the_script_did_not_show() {
+        let hidden = CodemodeOutcome::output("done");
+        let formatted = format_outcome(&hidden, 0.0, 10_000, None, &[], 1).await;
+        let text = rendered(&formatted);
+        assert!(
+            text.contains(
+                "Note: models.generateImages() returned 1 image that the script did not show"
+            ),
+            "{text}"
+        );
+
+        let shown = hidden.with_images(vec![CodemodeImage {
+            data: base64::engine::general_purpose::STANDARD.encode([1_u8, 2, 3]),
+            mime_type: "image/png".to_string(),
+        }]);
+        let formatted = format_outcome(&shown, 0.0, 10_000, None, &[], 1).await;
+        assert!(!rendered(&formatted).contains("Note:"));
+    }
+
+    /// Upstream `formatResult` then `formatItems`: a returned value is one of
+    /// the numbered text items, not an unnumbered block after them.
+    #[tokio::test]
+    async fn a_returned_value_is_a_numbered_text_item() {
+        let outcome = CodemodeOutcome {
+            output: "hello".to_string(),
+            structured_output: Some(serde_json::json!({ "answer": 42 })),
+            ..Default::default()
+        };
+        let formatted = format_outcome(&outcome, 0.0, 10_000, None, &[], 0).await;
+        let text = rendered(&formatted);
+        assert!(text.contains("==> text 1/2 <==\nhello"), "{text}");
+        assert!(text.contains("==> text 2/2 <==\n{\"answer\":42}"), "{text}");
     }
 
     /// Upstream `formatError`: a failed script names the calls it already made so
@@ -568,7 +712,7 @@ mod tests {
             message: "boom".to_string(),
             code: None,
         }];
-        let formatted = format_outcome(&outcome, 10.0, 10_000, None, &calls).await;
+        let formatted = format_outcome(&outcome, 10.0, 10_000, None, &calls, 0).await;
         let text = rendered(&formatted);
         assert!(
             text.contains(
@@ -576,7 +720,7 @@ mod tests {
             ),
             "{text}"
         );
-        let empty = format_outcome(&outcome, 10.0, 10_000, None, &[]).await;
+        let empty = format_outcome(&outcome, 10.0, 10_000, None, &[], 0).await;
         assert!(rendered(&empty).contains("No tool calls were made."));
     }
 
@@ -601,7 +745,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let formatted = format_outcome(&outcome, 0.0, 10_000, None, &[]).await;
+        let formatted = format_outcome(&outcome, 0.0, 10_000, None, &[], 0).await;
         let text = rendered(&formatted);
         assert!(
             text.contains(
@@ -624,7 +768,7 @@ mod tests {
             structured_output: Some(Value::Null),
             ..Default::default()
         };
-        let formatted = format_outcome(&outcome, 0.0, 10_000, None, &[]).await;
+        let formatted = format_outcome(&outcome, 0.0, 10_000, None, &[], 0).await;
         assert!(rendered(&formatted).contains("null"));
     }
 }

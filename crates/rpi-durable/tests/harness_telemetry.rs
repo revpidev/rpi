@@ -9,16 +9,25 @@ mod scheduler_support;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rpi_durable::chord::context::{TELEMETRY_CONTEXT_KEY, with_context_value};
+use async_trait::async_trait;
+use rpi_ai::types::Tool as AiTool;
+use rpi_durable::chord::context::{Context, TELEMETRY_CONTEXT_KEY, with_context_value};
 use rpi_durable::chord::json::{JsonObject, JsonValue};
 use rpi_durable::chord::telemetry::{
     TelemetryCarrier, TelemetryContext, TelemetrySink, TelemetrySpanSink,
 };
+use rpi_durable::harness::{
+    AgentChange, Extension, ExtensionsChange, LIVE_DOC, RootOptions, ToolExecute, ToolExecuteError,
+    ToolExecutionApi, ToolExecutionResult, ToolRegistration, ToolReplay, Wrap,
+};
 use rpi_durable::ids::{ConversationId, TaskId};
-use rpi_durable::session::{TaskCreate, TaskOwnership, TaskTrace, commit_fn};
+use rpi_durable::session::{DocOwner, TaskCreate, TaskOwnership, TaskTrace, commit_fn};
 use rpi_durable::storage::MemoryStorage;
 use rpi_durable::types::{Storage, TaskStatus};
-use scheduler_support::{Spec, add_task, all_tasks, context, open_with_telemetry, root};
+use scheduler_support::{
+    Spec, add_task, all_tasks, context, open_with_telemetry, open_with_telemetry_and_extensions,
+    root,
+};
 
 #[derive(Default)]
 struct State {
@@ -717,7 +726,221 @@ async fn a_phase_ended_by_close_is_aborted_and_ok() {
     assert!(span.message.is_none(), "message: {:?}", span.message);
 }
 
+struct UnusedTool;
+
+#[async_trait]
+impl ToolExecute for UnusedTool {
+    async fn execute(
+        &self,
+        _args: JsonObject,
+        _api: &dyn ToolExecutionApi,
+        _context: &Context,
+    ) -> Result<ToolExecutionResult, ToolExecuteError> {
+        Ok(ToolExecutionResult::default())
+    }
+}
+
+fn wrap_extension() -> Extension {
+    Extension {
+        name: "wrap-test".to_string(),
+        tools: vec![ToolRegistration {
+            tool: AiTool {
+                name: "x".to_string(),
+                description: "x".to_string(),
+                parameters: serde_json::json!({ "type": "object", "properties": {} }),
+                constrained_sampling: None,
+            },
+            replay: ToolReplay::Unsafe,
+            execution_mode: None,
+            prepare_arguments: None,
+            output_limits: None,
+            structured_output_schema: None,
+            callers: None,
+            deferred: false,
+            execute: Arc::new(UnusedTool),
+        }],
+        wraps: vec![Wrap::Tool {
+            tool: "x".to_string(),
+            wrap: Arc::new(|mut tool: ToolRegistration| {
+                tool.tool.name = "z".to_string();
+                tool
+            }),
+        }],
+        ..Extension::default()
+    }
+}
+
 // ─── V18-06 eleventh review: report attributes, abort duration, span end ────
+
+/// R-D9: a task-level report emits exactly one event and one metric. The
+/// scheduler emits its own telemetry; the Harness callback must not emit it a
+/// second time for reports that already took that path.
+#[tokio::test]
+async fn a_task_report_emits_one_event_and_one_metric() {
+    let recorder = Recorder::default();
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let telemetry = TelemetryContext::new(Arc::new(recorder.root()) as Arc<dyn TelemetrySink>);
+    let opened = open_with_telemetry(Arc::clone(&storage), all_tasks(), telemetry).await;
+    let conversation = root(&opened.harness).await;
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.report-extension-error", serde_json::json!({})),
+    )
+    .await;
+    opened
+        .harness
+        .wait_for_task(id, &context())
+        .await
+        .expect("wait");
+    let events = recorder
+        .0
+        .root_events
+        .lock()
+        .expect("events")
+        .iter()
+        .filter(|(name, attributes)| {
+            name == "pi.durable.report"
+                && attributes.get("type").and_then(JsonValue::as_str) == Some("extension_error")
+        })
+        .count();
+    let metrics = recorder
+        .0
+        .metrics
+        .lock()
+        .expect("metrics")
+        .iter()
+        .filter(|(name, _, attributes)| {
+            name == "pi.durable.reports"
+                && attributes.get("type").and_then(JsonValue::as_str) == Some("extension_error")
+        })
+        .count();
+    assert_eq!(events, 1, "one report event per report");
+    assert_eq!(metrics, 1, "one report metric per report");
+}
+
+#[tokio::test]
+async fn a_listener_panic_emits_one_listener_error() {
+    let recorder = Recorder::default();
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let telemetry = TelemetryContext::new(Arc::new(recorder.root()) as Arc<dyn TelemetrySink>);
+    let opened = open_with_telemetry(Arc::clone(&storage), all_tasks(), telemetry).await;
+    let _subscription = opened
+        .harness
+        .session()
+        .subscribe_commits(Arc::new(|_, _| panic!("host listener")));
+    let conversation = root(&opened.harness).await;
+    opened
+        .harness
+        .session()
+        .commit(
+            commit_fn(move |tx| {
+                Box::pin(async move {
+                    tx.doc(&LIVE_DOC, DocOwner::Conversation(conversation), None)
+                        .await?;
+                    Ok(())
+                })
+            }),
+            &context(),
+        )
+        .await
+        .ok();
+    let events = recorder
+        .0
+        .root_events
+        .lock()
+        .expect("events")
+        .iter()
+        .filter(|(name, attributes)| {
+            name == "pi.durable.report"
+                && attributes.get("type").and_then(JsonValue::as_str) == Some("listener_error")
+        })
+        .count();
+    let metrics = recorder
+        .0
+        .metrics
+        .lock()
+        .expect("metrics")
+        .iter()
+        .filter(|(name, _, attributes)| {
+            name == "pi.durable.reports"
+                && attributes.get("type").and_then(JsonValue::as_str) == Some("listener_error")
+        })
+        .count();
+    assert_eq!(events, 1, "one listener_error event");
+    assert_eq!(metrics, 1, "one listener_error metric");
+}
+
+#[tokio::test]
+async fn a_wrapper_rename_from_a_task_emits_one_extension_error() {
+    let recorder = Recorder::default();
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let telemetry = TelemetryContext::new(Arc::new(recorder.root()) as Arc<dyn TelemetrySink>);
+    let extension = Arc::new(wrap_extension());
+    let opened = open_with_telemetry_and_extensions(
+        Arc::clone(&storage),
+        all_tasks(),
+        telemetry,
+        None,
+        vec![extension.as_ref().clone()],
+    )
+    .await;
+    let conversation = opened
+        .harness
+        .root(
+            &context(),
+            RootOptions {
+                agent: Some(AgentChange {
+                    extensions: Some(Some(ExtensionsChange::List(vec![Arc::clone(&extension)]))),
+                    ..Default::default()
+                }),
+                init: None,
+            },
+        )
+        .await
+        .expect("root")
+        .id();
+    let id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.resolve-agent", serde_json::json!({})),
+    )
+    .await;
+    opened
+        .harness
+        .wait_for_task(id, &context())
+        .await
+        .expect("wait");
+    let events: Vec<(String, JsonObject)> = recorder
+        .0
+        .root_events
+        .lock()
+        .expect("events")
+        .iter()
+        .filter(|(name, attributes)| {
+            name == "pi.durable.report"
+                && attributes.get("type").and_then(JsonValue::as_str) == Some("extension_error")
+        })
+        .cloned()
+        .collect();
+    let metrics = recorder
+        .0
+        .metrics
+        .lock()
+        .expect("metrics")
+        .iter()
+        .filter(|(name, _, attributes)| {
+            name == "pi.durable.reports"
+                && attributes.get("type").and_then(JsonValue::as_str) == Some("extension_error")
+        })
+        .count();
+    assert_eq!(events.len(), 1, "wrapper renames emit one event");
+    assert_eq!(
+        events[0].1.get("extension").and_then(JsonValue::as_str),
+        Some("wrap-test")
+    );
+    assert_eq!(metrics, 1, "wrapper renames emit one metric");
+}
 
 /// R-D9: `pi.durable.report` carries only the fixed attributes of its kind
 /// (upstream `safeReport`): `reason` is a fixed enum value and only

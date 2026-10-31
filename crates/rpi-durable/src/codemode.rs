@@ -21,6 +21,7 @@ pub mod models;
 pub mod output;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
@@ -64,6 +65,15 @@ pub use output::{
 pub const CODEMODE_MODULE_VERSION: u64 = 2;
 /// Name of the tool.
 pub const CODEMODE_TOOL_NAME: &str = "codemode";
+/// The code mode tool's own output bounds (upstream `OUTPUT_LIMITS`): the
+/// formatter keeps the result inside them, so the Harness must not cut the
+/// formatted head and tail again.
+const CODEMODE_OUTPUT_LIMITS: crate::harness::types::OutputLimits =
+    crate::harness::types::OutputLimits {
+        max_bytes: Some(4 * 1024 * 1024),
+        max_lines: Some(100_000),
+        retain: None,
+    };
 /// Globals for finding tools, answered from start data.
 pub const DISCOVERY_GLOBALS: [&str; 3] = ["searchTools", "describeTool", "describeNamespace"];
 
@@ -802,6 +812,21 @@ fn is_internal(name: &str) -> bool {
     name.starts_with(CODEMODE_INTERNAL_PREFIX)
 }
 
+/// Images in an image-generation result's `structuredOutput` (upstream
+/// `countImages`).
+fn count_generated_images(value: Option<&JsonValue>) -> usize {
+    value
+        .and_then(|value| value.get("output"))
+        .and_then(JsonValue::as_array)
+        .map(|output| {
+            output
+                .iter()
+                .filter(|item| item.get("type").and_then(JsonValue::as_str) == Some("image"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 fn agent_tools(agent: &Agent) -> Vec<ToolRegistration> {
     let mut seen = BTreeSet::new();
     let mut tools = Vec::new();
@@ -977,6 +1002,7 @@ struct DurableHost<'a> {
     start_reply: Mutex<JsonValue>,
     rows: Mutex<Vec<(String, CodemodeNestedCall)>>,
     catalog: CodemodeCatalog,
+    generated_images: AtomicUsize,
 }
 
 impl<'a> DurableHost<'a> {
@@ -1010,6 +1036,23 @@ impl<'a> DurableHost<'a> {
             start_reply: Mutex::new(start_reply.unwrap_or(JsonValue::Null)),
             rows: Mutex::new(Vec::new()),
             catalog: CodemodeCatalog::new(start.tools.clone(), start.namespaces.clone()),
+            generated_images: AtomicUsize::new(0),
+        }
+    }
+
+    /// Images `models.generateImages()` returned in this run, shown or not.
+    fn generated_images(&self) -> usize {
+        self.generated_images.load(Ordering::SeqCst)
+    }
+
+    /// Count an image-generation result, also when it is replayed from the
+    /// journal (upstream `callTool`).
+    fn observe_generated_images(&self, name: &str, result: &NestedToolExecutionResult) {
+        if name == GENERATE_IMAGES_TOOL {
+            self.generated_images.fetch_add(
+                count_generated_images(result.structured_output.as_ref()),
+                Ordering::SeqCst,
+            );
         }
     }
 
@@ -1484,6 +1527,7 @@ impl CodemodeHost for DurableHost<'_> {
                 )));
             };
             self.finish_row(key, &stored);
+            self.observe_generated_images(name, &stored);
             self.context.telemetry().add_event(
                 "pi.durable.replay",
                 json!({ "tool.name": name })
@@ -1507,6 +1551,7 @@ impl CodemodeHost for DurableHost<'_> {
             .await
             .map_err(|error| self.replay_divergence(error.to_string()))?;
         self.finish_row(key, &result);
+        self.observe_generated_images(name, &result);
         let at = self.now()?;
         let stored = result.clone();
         self.record_journal(|journal| journal.record(key, name, &args, at, stored))
@@ -1944,6 +1989,7 @@ impl ToolExecute for CodemodeTool {
                 .as_ref()
                 .map(|writer| writer as &dyn OutputFileWriter),
             &calls,
+            host.generated_images(),
         )
         .await;
         let details = CodemodeToolDetails {
@@ -2060,7 +2106,7 @@ pub fn create_codemode_tool(options: CodemodeToolOptions) -> ToolRegistration {
         replay: ToolReplay::Safe,
         execution_mode: None,
         prepare_arguments: None,
-        output_limits: None,
+        output_limits: Some(CODEMODE_OUTPUT_LIMITS),
         structured_output_schema: None,
         callers: Some(vec![ToolCaller::Model]),
         deferred: false,

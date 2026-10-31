@@ -17,7 +17,8 @@ use rpi_durable::chord::context::{BACKGROUND_CONTEXT, Context};
 use rpi_durable::chord::json::JsonValue;
 use rpi_durable::harness::{
     AnyTask, Extension, HarnessImpl, HarnessOptions, Migration, NextTaskState, Registry,
-    RegistryImpl, RunningTask, TaskCommitFn, TaskDefinition, TaskRuntime, open_harness,
+    RegistryImpl, ReportInfo, ReportKind, RunningTask, TaskCommitFn, TaskDefinition, TaskRuntime,
+    open_harness,
 };
 use rpi_durable::ids::{Conversation, ConversationId, Task, TaskId, id_from_number};
 use rpi_durable::session::{
@@ -101,6 +102,80 @@ impl TaskDefinition for CountTask {
             }
         };
         runtime.commit(commit_next(next), context).await
+    }
+}
+
+/// Reports one fixed `extension_error`, then completes.
+pub struct ReportExtensionErrorTask;
+
+#[async_trait]
+impl TaskDefinition for ReportExtensionErrorTask {
+    fn name(&self) -> &str {
+        "test.report-extension-error"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> JsonValue {
+        serde_json::json!({ "phase": "step" })
+    }
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: RunningTask,
+        runtime: &dyn TaskRuntime,
+        context: &Context,
+    ) -> SessionResult<()> {
+        runtime.report_info(
+            ReportInfo::new(ReportKind::ExtensionError)
+                .with_task(runtime.task_id(), TOOL)
+                .with_extension("test"),
+        );
+        runtime
+            .commit(
+                commit_next(NextTaskState::Terminal {
+                    outcome: TaskOutcome::Completed {
+                        result: serde_json::json!({}),
+                    },
+                }),
+                context,
+            )
+            .await
+    }
+}
+
+/// Resolves the conversation's agent (so a wrapper rename reports) and completes.
+pub struct ResolveAgentTask;
+
+#[async_trait]
+impl TaskDefinition for ResolveAgentTask {
+    fn name(&self) -> &str {
+        "test.resolve-agent"
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn initial(&self) -> JsonValue {
+        serde_json::json!({ "phase": "step" })
+    }
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: RunningTask,
+        runtime: &dyn TaskRuntime,
+        context: &Context,
+    ) -> SessionResult<()> {
+        let _ = runtime.agent(context).await?;
+        runtime
+            .commit(
+                commit_next(NextTaskState::Terminal {
+                    outcome: TaskOutcome::Completed {
+                        result: serde_json::json!({}),
+                    },
+                }),
+                context,
+            )
+            .await
     }
 }
 
@@ -724,6 +799,18 @@ pub async fn open_with_telemetry_and_report(
     telemetry: rpi_durable::harness::TelemetryContext,
     report_info: Option<rpi_durable::harness::ReportInfoFn>,
 ) -> Opened {
+    open_with_telemetry_and_extensions(storage, tasks, telemetry, report_info, Vec::new()).await
+}
+
+/// Open a Harness with telemetry, an optional report callback, and extra
+/// extensions installed beside the `test` task extension.
+pub async fn open_with_telemetry_and_extensions(
+    storage: Arc<dyn Storage>,
+    tasks: Vec<AnyTask>,
+    telemetry: rpi_durable::harness::TelemetryContext,
+    report_info: Option<rpi_durable::harness::ReportInfoFn>,
+    extensions: Vec<Extension>,
+) -> Opened {
     let registry = Arc::new(RegistryImpl::with_builtins(builtins()));
     if !tasks.is_empty() {
         let extension = Extension {
@@ -732,6 +819,9 @@ pub async fn open_with_telemetry_and_report(
             ..Extension::default()
         };
         registry.install(extension).expect("install test extension");
+    }
+    for extension in extensions {
+        registry.install(extension).expect("install extension");
     }
     let options = HarnessOptions {
         telemetry: Some(telemetry),
@@ -761,6 +851,8 @@ pub async fn open_with_telemetry_and_report(
 pub fn all_tasks() -> Vec<AnyTask> {
     vec![
         Arc::new(CountTask) as AnyTask,
+        Arc::new(ReportExtensionErrorTask),
+        Arc::new(ResolveAgentTask),
         Arc::new(ThrowingTask),
         Arc::new(NoProgressTask),
         Arc::new(TerminalThenThrowTask),

@@ -243,7 +243,8 @@ pub struct SchedulerDeps {
     pub env: Option<EnvFactory>,
     /// Receives extension failures.
     pub report: ReportFn,
-    /// Fixed-field report callback.
+    /// Fixed-field report callback for the host. The scheduler emits the
+    /// report's telemetry itself before calling it.
     pub report_info: Option<crate::harness::types::ReportInfoFn>,
     /// Wall clock.
     pub now: NowFn,
@@ -563,12 +564,19 @@ impl SchedulerInner {
             ),
             None => None,
         };
+        // Wrapper renames report `extension_error`; route them through the
+        // scheduler's telemetry path like every other scheduler report.
+        let report_info: crate::harness::types::ReportInfoFn = {
+            let inner = Arc::clone(self);
+            let context = context.clone();
+            Arc::new(move |info| inner.report_fixed_with(info, Some(&context)))
+        };
         Ok(resolve_agent(
             state.as_ref(),
             snapshot.as_ref(),
             &self.settings(),
             &self.report,
-            self.report_info.as_ref(),
+            Some(&report_info),
         ))
     }
 
