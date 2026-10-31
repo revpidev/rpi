@@ -2177,7 +2177,7 @@ mod session_scoped_mutations {
 
 // ---------------------------------------------------------------------------
 // V18-07 / issue #72: per-model thinking override at session startup
-// (upstream `sdk.ts:253-269`, `model-resolver.ts:558-610`).
+// (upstream `sdk.ts:253-269`, `model-resolver.ts:543-610`).
 // ---------------------------------------------------------------------------
 
 mod initial_thinking_level {
@@ -2274,12 +2274,19 @@ mod initial_thinking_level {
     // the per-model override.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sdk_cli_thinking_wins_over_per_model() {
+        // Global `medium` and per-model `low` both differ from the CLI
+        // `high`, so this discriminates CLI-over-per-model and CLI-over-global.
         let fixture = session_fixture_full(FixtureConfig {
             thinking_level: Some(ThinkingLevel::High),
             ..FixtureConfig::new(
                 Vec::new(),
                 FauxProviderOptions::default(),
-                Some(PER_MODEL_SETTINGS),
+                Some(
+                    r#"{
+                        "defaultThinkingLevel": "medium",
+                        "modelThinkingLevels": {"faux/faux-1": "low"}
+                    }"#,
+                ),
             )
         })
         .await;

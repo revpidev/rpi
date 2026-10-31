@@ -963,7 +963,7 @@ pub struct FindInitialModelOptions<'a> {
     pub model_runtime: &'a ModelRuntime,
 }
 
-/// `findInitialModel` (model-resolver.ts:537-610). The CLI-resolution error
+/// `findInitialModel` (model-resolver.ts:543-610). The CLI-resolution error
 /// path (`process.exit(1)` upstream `main.ts`) returns `Err(display_message)`.
 /// The port folds `main.ts:buildSessionOptions`' CLI model selection in as
 /// step 1; the scoped/saved-default steps keep upstream's thinking priority.
@@ -1874,7 +1874,7 @@ mod tests {
     //
     // Upstream anchors: `sdk.ts:253-269` (CLI > resumed entry > per-model >
     // global > medium; a resumed branch without a thinking entry goes
-    // straight to global) and `model-resolver.ts:558-610` (scoped and
+    // straight to global) and `model-resolver.ts:543-610` (scoped and
     // saved-default prefer the per-model entry; provider defaults and the
     // first available model stay at `DEFAULT_THINKING_LEVEL`).
     // ------------------------------------------------------------------
