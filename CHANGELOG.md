@@ -2,10 +2,11 @@
 
 ## [Unreleased]
 
-### v0.1.8 draft — V18-00/V18-01/V18-02/V18-03/V18-04/V18-05/V18-06/V18-07/V18-08
+### v0.1.8 draft — V18-00/V18-01/V18-02/V18-03/V18-04/V18-05/V18-06/V18-07/V18-08/V18-09
 
-This section currently covers the completed V18-00 through V18-08 work; the other v0.1.8 tasks and final release review are pending.
+This section currently covers the completed V18-00 through V18-09 work; the other v0.1.8 tasks and final release review are pending.
 
+- **Model selector query and default order** (#76): typing in the `/model` search highlights the best match on the top row again, so Enter selects it; clearing the search keeps that position clamped to the restored list instead of restoring the row the cursor had before the query, and a completed background catalog refresh re-applies the active query to row 0. The persisted default model (the `· default` badge) now sorts immediately after the current model and before the provider order, matching upstream; with no current model it leads the list. The default-search pin, the badge itself and the scoped order are unchanged.
 - **Slash command arguments** (#73): `/export <path>`, `/import <path>` and `/compact <instructions>` keep their arguments. Dispatch now passes the full command text to export/import and computes the compact `Option<&str>` once with the upstream `slice(9).trim()` rule, so paths and focus text reach their handlers; `/import` was a v0.1.7 regression that always ended in the usage error, while `/export` silently used the default HTML path (the `.jsonl` branch was unreachable) and `/compact` ran without the focus text. Empty instructions no longer add an empty "Additional focus:" suffix to summary prompts. Dispatch-level coverage includes JSONL/HTML/quoted paths, import confirmation/cancel/missing-cwd recovery and the `session_before_compact` payload.
 - **Per-model thinking override at session startup** (#72): `modelThinkingLevels` now applies when the initial model is resolved, covering process startup, `/new` and SDK-created sessions instead of silently using the global `defaultThinkingLevel`. `--thinking` (or `--model <pattern>:<level>`) and a resumed session's thinking entry still win, a resumed session without an entry still goes straight to the global default, and provider-default/first-available selections still use `medium`; the model capability clamp is unchanged.
 

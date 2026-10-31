@@ -24,9 +24,12 @@
 //!   (model-selector.ts:197-200); the port reports
 //!   `ModelRuntime::get_error()` instead (the local `refresh` returns no
 //!   error map).
-//! - `sortModels` uses plain `provider.cmp` where upstream uses
-//!   `localeCompare` (model-selector.ts:208); identical for ASCII provider
-//!   ids.
+//! - Provider ordering uses `str::cmp` (code-point order) where upstream
+//!   uses `localeCompare` (model-selector.ts:243 @ 4a080252f). The shipping
+//!   provider ids are lowercase ASCII and sort identically under the
+//!   `en-US`/`zh-CN`/`en`/`de-DE` collations checked for V18-09; a
+//!   mixed-case custom provider id can order differently. Kept as a
+//!   documented difference (V18-09), not part of the rpi#76 fix.
 //! - The `searchInput.onSubmit` handler (model-selector.ts:112-117) is
 //!   unreachable: the component intercepts `tui.select.confirm` before the
 //!   input ever sees Enter, so the port leaves it unset (the confirm branch
@@ -124,13 +127,27 @@ impl Default for SelectorState {
     }
 }
 
-/// `sortModels` (model-selector.ts:200-211): current model first, then by
-/// provider.
-fn sort_models(mut models: Vec<ModelItem>, current_model: &Option<Model>) -> Vec<ModelItem> {
+/// `sortModels` (model-selector.ts:231-246 @ 4a080252f): current model
+/// first, default model second, then by provider. `sort_by` is stable, so
+/// models of the same provider keep the snapshot order (upstream
+/// `Array.prototype.sort` is stable).
+fn sorted_models(
+    mut models: Vec<ModelItem>,
+    current_model: &Option<Model>,
+    default_model: Option<&(String, String)>,
+) -> Vec<ModelItem> {
+    let is_default = |model: &Model| {
+        default_model.is_some_and(|(provider, id)| *provider == model.provider && *id == model.id)
+    };
     models.sort_by(|a, b| {
         let a_is_current = models_are_equal(current_model.as_ref(), Some(&a.model));
         let b_is_current = models_are_equal(current_model.as_ref(), Some(&b.model));
         match (a_is_current, b_is_current) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => {}
+        }
+        match (is_default(&a.model), is_default(&b.model)) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
             _ => a.provider.cmp(&b.provider),
@@ -139,13 +156,14 @@ fn sort_models(mut models: Vec<ModelItem>, current_model: &Option<Model>) -> Vec
     models
 }
 
-/// `loadModelsFromSnapshot` (model-selector.ts:139-160).
+/// `loadModelsFromSnapshot` (model-selector.ts:161-176 @ 4a080252f).
 fn load_models_from_snapshot(
     state: &mut SelectorState,
     runtime: &ModelRuntime,
     current_model: &Option<Model>,
+    default_model: Option<&(String, String)>,
 ) {
-    state.all_models = sort_models(
+    state.all_models = sorted_models(
         runtime
             .get_available_snapshot()
             .into_iter()
@@ -156,9 +174,10 @@ fn load_models_from_snapshot(
             })
             .collect(),
         current_model,
+        default_model,
     );
     // Refresh scoped entries against the catalog; keep the original when the
-    // model is gone (model-selector.ts:146-149).
+    // model is gone (model-selector.ts:168-171 @ 4a080252f).
     state.scoped_models = state
         .scoped_models
         .iter()
@@ -199,7 +218,7 @@ fn load_models_from_snapshot(
     };
 }
 
-/// `setScope` (model-selector.ts:223-233).
+/// `setScope` (model-selector.ts:267-277 @ 4a080252f).
 fn set_scope(
     state: &mut SelectorState,
     scope: ModelScope,
@@ -221,16 +240,20 @@ fn set_scope(
         .position(|item| models_are_equal(current_model.as_ref(), Some(&item.model)));
     state.selected_index = current_index.unwrap_or(0);
     let query = state.search_value.clone();
-    filter_models(state, &query, default_model);
+    apply_model_filter(state, &query, default_model);
 }
 
-/// `filterModels` (model-selector.ts:274-292 @ 9841914, 768184923): the
-/// default entry carries a `" default"` search suffix, and a query that
+/// `filterModels` (model-selector.ts:279-303 @ 4a080252f): the default
+/// entry carries a `" default"` search suffix, and a query that
 /// is a prefix of `"default"` (trim + lowercase, non-empty) pins it to
 /// the top (`isDefaultSearch`, model-selector.ts:262-266). rpi previously
 /// ported the older 1d3503fb9 shape (`" default startup"` suffix +
 /// whole-word `default`/`startup` match) and missed this upstream fix.
-fn filter_models(state: &mut SelectorState, query: &str, default_model: Option<&(String, String)>) {
+fn apply_model_filter(
+    state: &mut SelectorState,
+    query: &str,
+    default_model: Option<&(String, String)>,
+) {
     let is_default = |model: &Model| {
         default_model.is_some_and(|(provider, id)| *provider == model.provider && *id == model.id)
     };
@@ -274,9 +297,17 @@ fn filter_models(state: &mut SelectorState, query: &str, default_model: Option<&
             filtered
         }
     };
-    state.selected_index = state
-        .selected_index
-        .min(state.filtered_models.len().saturating_sub(1));
+    // `filterModels` tail (model-selector.ts:298-301 @ 4a080252f): an
+    // active query highlights the best match on row 0; clearing it keeps
+    // the current numeric position clamped to the restored list instead
+    // of restoring the index from before the query.
+    state.selected_index = if query.is_empty() {
+        state
+            .selected_index
+            .min(state.filtered_models.len().saturating_sub(1))
+    } else {
+        0
+    };
 }
 
 /// `getScopeText` (model-selector.ts:213-217).
@@ -370,9 +401,14 @@ impl ModelSelectorComponent {
         };
         // Render the current snapshot immediately, then refresh in the
         // background (model-selector.ts:131-137).
-        load_models_from_snapshot(&mut state, &model_runtime, &current_model);
+        load_models_from_snapshot(
+            &mut state,
+            &model_runtime,
+            &current_model,
+            default_model.as_ref(),
+        );
         let query = state.search_value.clone();
-        filter_models(&mut state, &query, default_model.as_ref());
+        apply_model_filter(&mut state, &query, default_model.as_ref());
 
         let mut search_input = Input::new();
         if let Some(initial) = &initial_search_input {
@@ -455,9 +491,14 @@ impl ModelSelectorComponent {
                             state.refresh_status_success = true;
                         }
                     }
-                    load_models_from_snapshot(&mut state, &runtime, &current_model);
+                    load_models_from_snapshot(
+                        &mut state,
+                        &runtime,
+                        &current_model,
+                        default_model.as_ref(),
+                    );
                     let query = state.search_value.clone();
-                    filter_models(&mut state, &query, default_model.as_ref());
+                    apply_model_filter(&mut state, &query, default_model.as_ref());
                     drop(state);
                     tui.request_render(false);
                 });
@@ -617,7 +658,7 @@ impl Component for ModelSelectorComponent {
         let query = self.search_input.get_value().to_string();
         let mut state = lock(&self.state);
         state.search_value = query.clone();
-        filter_models(&mut state, &query, self.default_model.as_ref());
+        apply_model_filter(&mut state, &query, self.default_model.as_ref());
     }
 
     fn render(&self, width: usize) -> Vec<String> {
@@ -928,6 +969,23 @@ mod tests {
             .collect()
     }
 
+    /// The catalog snapshot as the selector's list items.
+    fn model_items(runtime: &ModelRuntime) -> Vec<ModelItem> {
+        runtime
+            .get_available_snapshot()
+            .into_iter()
+            .map(|model| ModelItem {
+                provider: model.provider.clone(),
+                id: model.id.clone(),
+                model,
+            })
+            .collect()
+    }
+
+    fn item_ids(items: &[ModelItem]) -> Vec<&str> {
+        items.iter().map(|item| item.id.as_str()).collect()
+    }
+
     #[allow(clippy::too_many_arguments)] // mirrors the upstream constructor
     #[allow(clippy::type_complexity)] // mirrors the upstream callback type
     fn build(
@@ -1035,9 +1093,257 @@ mod tests {
         let (component, _selected, _saved, _) =
             build(None, runtime, Vec::new(), None, None, Some(("beta", "b2")));
         let rows = list_rows(&component.render(80));
-        // ` · default` badge on the persisted default (1d3503fb9).
-        assert!(rows[2].contains("b2 [beta] · default"), "got: {}", rows[2]);
-        assert!(!rows[0].contains("· default"));
+        // ` · default` badge on the persisted default (1d3503fb9), which
+        // sorts first when no model is current (sortModels tiebreak,
+        // model-selector.ts:231-246 @ 4a080252f).
+        assert_eq!(rows[0], "→ b2 [beta] · default");
+        assert!(!rows[1].contains("· default"));
+        assert!(!rows[2].contains("· default"));
+    }
+
+    #[tokio::test]
+    async fn default_model_sorts_after_current() {
+        install_keybindings();
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let current = runtime.get_model("alpha", "a1").expect("a1");
+        let (component, _selected, _saved, _) = build(
+            Some(current),
+            runtime,
+            Vec::new(),
+            None,
+            None,
+            Some(("beta", "b2")),
+        );
+        let rows = list_rows(&component.render(80));
+        // current > default > provider: the default sits right after the
+        // current model even though beta sorts after alpha.
+        assert_eq!(
+            rows,
+            vec!["→ a1 [alpha] ✓", "  b2 [beta] · default", "  b1 [beta]"]
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_list_keeps_the_sorted_order() {
+        install_keybindings();
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let current = runtime.get_model("alpha", "a1").expect("a1");
+        let (mut component, _, _, _) = build(
+            Some(current),
+            runtime,
+            Vec::new(),
+            None,
+            None,
+            Some(("beta", "b2")),
+        );
+        // The filter keeps the sorted active-list order (default first),
+        // it does not re-sort the filtered rows.
+        component.handle_input("b");
+        let rows = list_rows(&component.render(80));
+        assert_eq!(rows, vec!["→ b2 [beta] · default", "  b1 [beta]"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_scope_keeps_definition_order() {
+        install_keybindings();
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        // Upstream does not sort scoped items (they keep the user-defined
+        // order); only the all-models list goes through sortModels.
+        let scoped_b2 = runtime.get_model("beta", "b2").expect("b2");
+        let scoped_a1 = runtime.get_model("alpha", "a1").expect("a1");
+        let (component, _, _, _) = build(
+            None,
+            runtime,
+            vec![
+                (scoped_b2, Some(ModelThinkingLevel::Low)),
+                (scoped_a1, Some(ModelThinkingLevel::High)),
+            ],
+            None,
+            None,
+            Some(("alpha", "a1")),
+        );
+        let rows = list_rows(&component.render(80));
+        assert_eq!(rows, vec!["→ b2 [beta]", "  a1 [alpha] · default"]);
+    }
+
+    /// Gap 1 of rpi#76: while a query is active the highlighted row is the
+    /// best match (row 0), so Enter picks it. Upstream `filterModels` tail
+    /// (model-selector.ts:298-301 @ 4a080252f).
+    #[tokio::test]
+    async fn query_selects_best_match_row_zero_and_enter_selects_it() {
+        install_keybindings();
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let (mut component, selected_calls, _, _) =
+            build(None, runtime, Vec::new(), None, None, None);
+        // Move off the top row first: Down twice → beta/b2 (index 2).
+        component.handle_input("\x1b[B");
+        component.handle_input("\x1b[B");
+        {
+            let state = lock(&component.state);
+            assert_eq!(state.selected_index, 2);
+        }
+        // "b" matches beta/b1 and beta/b2; the highlight moves to row 0.
+        component.handle_input("b");
+        let rows = list_rows(&component.render(80));
+        assert_eq!(rows, vec!["→ b1 [beta]", "  b2 [beta]"]);
+        component.handle_input("\r");
+        assert_eq!(
+            *selected_calls.lock().unwrap(),
+            vec![("beta".to_string(), "b1".to_string())]
+        );
+    }
+
+    /// Clearing the query keeps the current numeric position (0 after the
+    /// query rule) instead of restoring the index from before the query
+    /// (model-selector.ts:298-301 @ 4a080252f).
+    #[tokio::test]
+    async fn clearing_query_keeps_position_not_the_pre_query_index() {
+        install_keybindings();
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let (mut component, _, _, _) = build(None, runtime, Vec::new(), None, None, None);
+        // Down once → beta/b1 (index 1).
+        component.handle_input("\x1b[B");
+        {
+            let state = lock(&component.state);
+            assert_eq!(state.selected_index, 1);
+        }
+        component.handle_input("b");
+        let rows = list_rows(&component.render(80));
+        assert_eq!(rows, vec!["→ b1 [beta]", "  b2 [beta]"]);
+        // Clear the query: the kept position is 0, not the pre-query 1.
+        component.handle_input("\x7f");
+        let rows = list_rows(&component.render(80));
+        assert_eq!(rows, vec!["→ a1 [alpha]", "  b1 [beta]", "  b2 [beta]"]);
+        // The restored three-row list is navigable from that position.
+        component.handle_input("\x1b[B");
+        let rows = list_rows(&component.render(80));
+        assert_eq!(rows[1], "→ b1 [beta]");
+    }
+
+    #[tokio::test]
+    async fn query_cleared_char_by_char_stays_on_row_zero() {
+        install_keybindings();
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let (mut component, _, _, _) = build(None, runtime, Vec::new(), None, None, None);
+        component.handle_input("\x1b[B");
+        for ch in ["b", "2"] {
+            component.handle_input(ch);
+        }
+        assert_eq!(list_rows(&component.render(80)), vec!["→ b2 [beta]"]);
+        for _ in 0..2 {
+            component.handle_input("\x7f");
+        }
+        assert_eq!(
+            list_rows(&component.render(80)),
+            vec!["→ a1 [alpha]", "  b1 [beta]", "  b2 [beta]"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_with_no_match_keeps_row_zero_and_enter_is_a_noop() {
+        install_keybindings();
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let (mut component, selected_calls, _, _) =
+            build(None, runtime, Vec::new(), None, None, None);
+        for ch in "zzzz".chars() {
+            component.handle_input(&ch.to_string());
+        }
+        {
+            let state = lock(&component.state);
+            assert!(state.filtered_models.is_empty());
+            assert_eq!(state.selected_index, 0);
+        }
+        let joined = plain(component.render(80)).join("\n");
+        assert!(joined.contains("No matching models"));
+        component.handle_input("\r");
+        assert!(selected_calls.lock().unwrap().is_empty());
+    }
+
+    /// A cleared query keeps the numeric position and clamps it to the
+    /// restored list length (model-selector.ts:301 @ 4a080252f), including
+    /// the empty-list case.
+    #[tokio::test]
+    async fn cleared_index_clamps_to_the_restored_list() {
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let mut state = SelectorState {
+            active_models: model_items(&runtime),
+            selected_index: 5,
+            ..SelectorState::default()
+        };
+        apply_model_filter(&mut state, "", None);
+        assert_eq!(state.filtered_models.len(), 3);
+        assert_eq!(state.selected_index, 2);
+
+        let mut empty = SelectorState {
+            selected_index: 4,
+            ..SelectorState::default()
+        };
+        apply_model_filter(&mut empty, "", None);
+        assert!(empty.filtered_models.is_empty());
+        assert_eq!(empty.selected_index, 0);
+    }
+
+    /// FR-A R1: `apply_model_filter` owns both the filter and the cursor;
+    /// the query rule sets row 0 and clearing it keeps the kept position.
+    #[tokio::test]
+    async fn apply_model_filter_owns_the_cursor_rule() {
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let items = model_items(&runtime);
+        let mut state = SelectorState {
+            active_models: items.clone(),
+            filtered_models: items,
+            selected_index: 2,
+            ..SelectorState::default()
+        };
+        apply_model_filter(&mut state, "b", None);
+        assert_eq!(state.filtered_models.len(), 2);
+        assert_eq!(state.selected_index, 0);
+        // Clearing keeps the current numeric position (0), not the
+        // pre-query 2.
+        apply_model_filter(&mut state, "", None);
+        assert_eq!(state.filtered_models.len(), 3);
+        assert_eq!(state.selected_index, 0);
+    }
+
+    /// FR-B R1: current > default > provider, independently testable.
+    #[tokio::test]
+    async fn sorted_models_orders_current_then_default_then_provider() {
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let items = model_items(&runtime);
+        let current = runtime.get_model("alpha", "a1");
+        let default = Some(("beta".to_string(), "b2".to_string()));
+        let sorted = sorted_models(items, &current, default.as_ref());
+        assert_eq!(item_ids(&sorted), vec!["a1", "b2", "b1"]);
+    }
+
+    /// current == default does not duplicate the row; it stays at the top.
+    #[tokio::test]
+    async fn sorted_models_does_not_duplicate_a_current_default() {
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let items = model_items(&runtime);
+        let current = runtime.get_model("beta", "b2");
+        let default = Some(("beta".to_string(), "b2".to_string()));
+        let sorted = sorted_models(items, &current, default.as_ref());
+        assert_eq!(item_ids(&sorted), vec!["b2", "a1", "b1"]);
+        assert_eq!(sorted.len(), 3);
+    }
+
+    /// Missing current/default and same-provider rows keep the stable
+    /// provider order; the empty list stays empty.
+    #[tokio::test]
+    async fn sorted_models_falls_back_to_a_stable_provider_order() {
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let items = model_items(&runtime);
+        // No current, no default: provider order, snapshot order within a
+        // provider (beta/b1 then beta/b2).
+        let sorted = sorted_models(items.clone(), &None, None);
+        assert_eq!(item_ids(&sorted), vec!["a1", "b1", "b2"]);
+        // A default reference to a model outside the list changes nothing.
+        let default = Some(("ghost".to_string(), "g1".to_string()));
+        let sorted = sorted_models(items, &None, default.as_ref());
+        assert_eq!(item_ids(&sorted), vec!["a1", "b1", "b2"]);
+        let sorted = sorted_models(Vec::new(), &None, default.as_ref());
+        assert!(sorted.is_empty());
     }
 
     /// rpi#37 (upstream 768184923, model-selector.ts:262-266/274-292 @
@@ -1244,6 +1550,158 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// A provider whose catalog refresh stays pending until the test
+    /// releases it, so the refresh-completion → re-filter path is
+    /// deterministic.
+    struct GatedCatalogProvider {
+        id: String,
+        auth: rpi_ai::auth::ProviderAuth,
+        model: Model,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl rpi_ai::models::Provider for GatedCatalogProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            &self.id
+        }
+
+        fn base_url(&self) -> Option<&str> {
+            None
+        }
+
+        fn headers(&self) -> Option<&rpi_ai::types::ProviderHeaders> {
+            None
+        }
+
+        fn auth(&self) -> &rpi_ai::auth::ProviderAuth {
+            &self.auth
+        }
+
+        fn get_models(&self) -> Vec<Model> {
+            vec![self.model.clone()]
+        }
+
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: &rpi_ai::types::TranscriptContext,
+            _options: Option<rpi_ai::types::StreamOptions>,
+        ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+            rpi_ai::utils::event_stream::AssistantMessageEventStream::new()
+        }
+
+        fn stream_simple(
+            &self,
+            _model: &Model,
+            _context: &rpi_ai::types::TranscriptContext,
+            _options: Option<rpi_ai::types::SimpleStreamOptions>,
+        ) -> Result<rpi_ai::utils::event_stream::AssistantMessageEventStream, String> {
+            Err("GatedCatalogProvider does not stream".to_owned())
+        }
+
+        fn refresh_models(
+            &self,
+            context: rpi_ai::models::RefreshModelsContext,
+        ) -> Option<futures::future::BoxFuture<'_, Result<(), rpi_ai::auth::ModelsError>>> {
+            let started = Arc::clone(&self.started);
+            let release = Arc::clone(&self.release);
+            Some(Box::pin(async move {
+                // Phase 1 (cached restore) passes `allow_network = false`,
+                // including the fire-and-forget refresh inside
+                // `register_native_provider`; only block the network phase
+                // the selector's refresh runs.
+                if !context.allow_network {
+                    return Ok(());
+                }
+                started.notify_one();
+                release.notified().await;
+                Ok(())
+            }))
+        }
+    }
+
+    /// FR-A R2 refresh path: a query active across a completed background
+    /// catalog refresh re-highlights row 0 instead of keeping the
+    /// pre-refresh numeric position (upstream `refreshModels` →
+    /// `filterModels`, model-selector.ts:208-209/298-301 @ 4a080252f).
+    #[tokio::test]
+    async fn query_stays_on_row_zero_across_catalog_refresh() {
+        install_keybindings();
+        const ENV_KEY: &str = "RPI_TEST_MODEL_SELECTOR_GATED_KEY";
+        rpi_test_env::set_var(ENV_KEY, "test-key");
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {
+                "alpha": {
+                    "baseUrl": "https://api.example.com/v1",
+                    "api": "openai-completions",
+                    "apiKey": "RPI_TEST_MODEL_SELECTOR_KEY",
+                    "models": [{"id": "a1", "name": "Alpha One"}]
+                },
+                "beta": {
+                    "baseUrl": "https://api.example.com/v1",
+                    "api": "openai-completions",
+                    "apiKey": "RPI_TEST_MODEL_SELECTOR_KEY",
+                    "models": [
+                        {"id": "b1", "name": "Beta One"},
+                        {"id": "b2", "name": "Beta Two"},
+                        {"id": "b3", "name": "Beta Three"}
+                    ]
+                }
+            }}"#,
+        )
+        .await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        runtime
+            .register_native_provider(Arc::new(GatedCatalogProvider {
+                id: "gated".to_owned(),
+                auth: rpi_ai::auth::ProviderAuth {
+                    api_key: Some(Arc::new(rpi_ai::auth::helpers::env_api_key_auth(
+                        "Test API key",
+                        &[ENV_KEY],
+                    ))),
+                    oauth: None,
+                },
+                model: slow_provider_model("gated"),
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }))
+            .await
+            .expect("register gated provider");
+        let (mut component, _, _, _) = build(None, runtime, Vec::new(), None, None, None);
+        // The constructor's refresh is now blocked inside the provider.
+        started.notified().await;
+        // Query "b" matches the three beta rows; move to row 1 so a stale
+        // numeric position survives the refresh under the old rule.
+        component.handle_input("b");
+        component.handle_input("\x1b[B");
+        {
+            let state = lock(&component.state);
+            assert_eq!(state.filtered_models.len(), 3);
+            assert_eq!(state.selected_index, 1);
+        }
+        release.notify_one();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let lines = plain(component.render(80));
+            if lines.join("\n").contains("Model catalogs refreshed.") {
+                assert_eq!(list_rows(&lines)[0], "→ b1 [beta]");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "refresh never applied"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        rpi_test_env::remove_var(ENV_KEY);
     }
 
     /// A provider whose catalog refresh parks longer than the selector's
