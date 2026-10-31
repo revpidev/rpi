@@ -36,6 +36,10 @@
 //!   selects the same item).
 //! - List rows are truncated to the render width with `...` (same idiom as
 //!   config-selector.rs); upstream `Text` children wrap instead.
+//! - The current-model marker is a suffix (`id [provider] ✓`) where upstream
+//!   prefixes it next to the cursor (`→ ✓ id [provider]`, model-selector.ts:325-329
+//!   @ 4a080252f); the selection cursor and the ` · default` badge text match
+//!   upstream.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
