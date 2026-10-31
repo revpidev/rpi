@@ -28,7 +28,8 @@ use crate::core::extensions::{
     new_extension_runner_ref,
 };
 use crate::core::model_resolver::{
-    DEFAULT_THINKING_LEVEL, FindInitialModelOptions, ScopedModel, find_initial_model,
+    DEFAULT_THINKING_LEVEL, FindInitialModelOptions, ResumedThinking, ScopedModel, ThinkingInputs,
+    find_initial_model, resolve_initial_thinking,
 };
 use crate::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput};
 use crate::core::session_manager::{NewSessionOptions, SessionManager};
@@ -301,13 +302,14 @@ pub async fn create_agent_session(
 
     // If still no model, use findInitialModel (sdk.ts:207-222).
     if model.is_none() {
-        let (default_provider, default_model_id, default_thinking) = {
+        let (default_provider, default_model_id, default_thinking, default_thinking_levels) = {
             let loader = resource_loader.lock().unwrap_or_else(|e| e.into_inner());
             let settings = loader.settings_manager();
             (
                 settings.get_default_provider(),
                 settings.get_default_model(),
                 settings.get_default_thinking_level(),
+                settings.get_all_model_thinking_levels(),
             )
         };
         let result = find_initial_model(FindInitialModelOptions {
@@ -318,6 +320,7 @@ pub async fn create_agent_session(
             default_provider: default_provider.as_deref(),
             default_model_id: default_model_id.as_deref(),
             default_thinking_level: default_thinking,
+            model_thinking_levels: Some(&default_thinking_levels),
             model_runtime: &model_runtime,
         })
         .await
@@ -335,31 +338,38 @@ pub async fn create_agent_session(
         }
     }
 
-    // Thinking level (sdk.ts:224-243).
-    let mut thinking_level = options.thinking_level;
-    if thinking_level.is_none() && has_existing_session {
-        thinking_level = if has_thinking_entry {
-            Some(parse_thinking_level_str(&existing_thinking_level))
+    // Thinking level (sdk.ts:253-277): CLI > resumed entry > per-model >
+    // global > medium. A resumed branch without a thinking entry goes
+    // straight to the global default; the per-model override is only
+    // consulted for a fresh session (upstream special case, issue #72).
+    let resumed = if has_existing_session {
+        if has_thinking_entry {
+            ResumedThinking::Present(parse_thinking_level_str(&existing_thinking_level))
         } else {
-            let default_level = {
-                let loader = resource_loader.lock().unwrap_or_else(|e| e.into_inner());
-                loader.settings_manager().get_default_thinking_level()
-            };
-            Some(default_level.unwrap_or(DEFAULT_THINKING_LEVEL))
-        };
-    }
-    if thinking_level.is_none() {
-        let default_level = {
-            let loader = resource_loader.lock().unwrap_or_else(|e| e.into_inner());
-            loader.settings_manager().get_default_thinking_level()
-        };
-        thinking_level = Some(default_level.unwrap_or(DEFAULT_THINKING_LEVEL));
-    }
+            ResumedThinking::Missing
+        }
+    } else {
+        ResumedThinking::NotResumed
+    };
+    let (per_model_thinking, default_thinking) = {
+        let loader = resource_loader.lock().unwrap_or_else(|e| e.into_inner());
+        let settings = loader.settings_manager();
+        (
+            model
+                .as_ref()
+                .and_then(|model| settings.get_model_thinking_level(&model.provider, &model.id)),
+            settings.get_default_thinking_level(),
+        )
+    };
+    let thinking_level = resolve_initial_thinking(ThinkingInputs {
+        cli: options.thinking_level,
+        resumed,
+        per_model: per_model_thinking,
+        global: default_thinking,
+    });
     let thinking_level = match &model {
         None => ThinkingLevel::Off,
-        Some(model) => {
-            rpi_ai::models::clamp_thinking_level(model, thinking_level.expect("set above"))
-        }
+        Some(model) => rpi_ai::models::clamp_thinking_level(model, thinking_level),
     };
 
     // Tool set (sdk.ts:281-294 @ 04b97ef00 + 541045ae0):

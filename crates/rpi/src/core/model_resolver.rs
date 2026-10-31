@@ -899,12 +899,54 @@ pub fn resolve_cli_model(options: ResolveCliModelOptions) -> ResolveCliModelResu
 // Initial model selection
 // ============================================================================
 
-/// `InitialModelResult` (model-resolver.ts:558-562).
+/// `InitialModelResult` (model-resolver.ts:531-535).
 #[derive(Debug)]
 pub struct InitialModelResult {
     pub model: Option<Model>,
     pub thinking_level: ThinkingLevel,
     pub fallback_message: Option<String>,
+}
+
+/// Session-restore state for the initial thinking decision (sdk.ts:253-269).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumedThinking {
+    /// No session data to restore (`hasExistingSession` false): a fresh
+    /// session, including `/new`.
+    NotResumed,
+    /// The resumed branch carries a `thinking_level_change` entry.
+    Present(ThinkingLevel),
+    /// The resumed branch has no thinking entry. Upstream goes straight to
+    /// the global default here and does **not** consult the per-model
+    /// override; that branch is deliberately not a plain fallback.
+    Missing,
+}
+
+/// Inputs of the shared initial thinking decision (02-design §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThinkingInputs {
+    /// `options.thinkingLevel` / `--thinking` (or `--model <pattern>:<level>`).
+    pub cli: Option<ThinkingLevel>,
+    pub resumed: ResumedThinking,
+    /// `modelThinkingLevels["provider/id"]` for the resolved model.
+    pub per_model: Option<ThinkingLevel>,
+    pub global: Option<ThinkingLevel>,
+}
+
+/// Unclamped initial thinking level:
+/// CLI > resumed entry present > per-model > global > `medium`.
+/// A resumed session without a thinking entry goes straight to global.
+pub(crate) fn resolve_initial_thinking(inputs: ThinkingInputs) -> ThinkingLevel {
+    if let Some(level) = inputs.cli {
+        return level;
+    }
+    match inputs.resumed {
+        ResumedThinking::Present(level) => level,
+        ResumedThinking::Missing => inputs.global.unwrap_or(DEFAULT_THINKING_LEVEL),
+        ResumedThinking::NotResumed => inputs
+            .per_model
+            .or(inputs.global)
+            .unwrap_or(DEFAULT_THINKING_LEVEL),
+    }
 }
 
 pub struct FindInitialModelOptions<'a> {
@@ -915,11 +957,16 @@ pub struct FindInitialModelOptions<'a> {
     pub default_provider: Option<&'a str>,
     pub default_model_id: Option<&'a str>,
     pub default_thinking_level: Option<ThinkingLevel>,
+    /// `modelThinkingLevels` (settings-manager.ts `getAllModelThinkingLevels`),
+    /// keyed `"provider/modelId"` (model-resolver.ts:549/568/581).
+    pub model_thinking_levels: Option<&'a std::collections::BTreeMap<String, ThinkingLevel>>,
     pub model_runtime: &'a ModelRuntime,
 }
 
-/// `findInitialModel` (model-resolver.ts:572-652). The CLI-resolution error
-/// path (`process.exit(1)` upstream) returns `Err(display_message)`.
+/// `findInitialModel` (model-resolver.ts:537-610). The CLI-resolution error
+/// path (`process.exit(1)` upstream `main.ts`) returns `Err(display_message)`.
+/// The port folds `main.ts:buildSessionOptions`' CLI model selection in as
+/// step 1; the scoped/saved-default steps keep upstream's thinking priority.
 pub async fn find_initial_model(
     options: FindInitialModelOptions<'_>,
 ) -> Result<InitialModelResult, String> {
@@ -931,6 +978,7 @@ pub async fn find_initial_model(
         default_provider,
         default_model_id,
         default_thinking_level,
+        model_thinking_levels,
         model_runtime,
     } = options;
 
@@ -955,26 +1003,49 @@ pub async fn find_initial_model(
     }
 
     // 2. Use first model from scoped models (skip if continuing/resuming).
+    // Upstream prefers the pattern's own thinking suffix, then the per-model
+    // override, then the global default (model-resolver.ts:566-575).
     if !scoped_models.is_empty() && !is_continuing {
         let first = &scoped_models[0];
+        let per_model = model_thinking_levels.and_then(|levels| {
+            levels
+                .get(&format!("{}/{}", first.model.provider, first.model.id))
+                .copied()
+        });
         return Ok(InitialModelResult {
             model: Some(first.model.clone()),
-            thinking_level: first
-                .thinking_level
-                .or(default_thinking_level)
-                .unwrap_or(DEFAULT_THINKING_LEVEL),
+            thinking_level: first.thinking_level.unwrap_or_else(|| {
+                resolve_initial_thinking(ThinkingInputs {
+                    cli: None,
+                    resumed: ResumedThinking::NotResumed,
+                    per_model,
+                    global: default_thinking_level,
+                })
+            }),
             fallback_message: None,
         });
     }
 
     // 3. Try saved default from settings if auth is configured.
+    // The per-model override is keyed by the saved default and wins over the
+    // global default (model-resolver.ts:578-590).
     if let (Some(default_provider), Some(default_model_id)) = (default_provider, default_model_id)
         && let Some(found) = model_runtime.get_model(default_provider, default_model_id)
         && model_runtime.has_configured_auth(&found.provider)
     {
+        let per_model = model_thinking_levels.and_then(|levels| {
+            levels
+                .get(&format!("{default_provider}/{default_model_id}"))
+                .copied()
+        });
         return Ok(InitialModelResult {
             model: Some(found),
-            thinking_level: default_thinking_level.unwrap_or(DEFAULT_THINKING_LEVEL),
+            thinking_level: resolve_initial_thinking(ThinkingInputs {
+                cli: None,
+                resumed: ResumedThinking::NotResumed,
+                per_model,
+                global: default_thinking_level,
+            }),
             fallback_message: None,
         });
     }
@@ -1093,6 +1164,7 @@ mod tests {
     //! `packages/coding-agent/test/model-resolver.test.ts` (fixture models
     //! replicated locally; the upstream catalog fixtures are T13).
 
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use rpi_ai::auth::credential_store::InMemoryCredentialStore;
@@ -1446,6 +1518,10 @@ mod tests {
     const TEST_ENV_KEY: &str = "RPI_TEST_MODEL_RESOLVER_KEY";
 
     async fn runtime_with_models(models: Vec<Model>) -> Arc<ModelRuntime> {
+        runtime_with_provider("test-provider", models).await
+    }
+
+    async fn runtime_with_provider(provider_id: &str, models: Vec<Model>) -> Arc<ModelRuntime> {
         rpi_test_env::set_var(TEST_ENV_KEY, "test-key");
         let credentials: Arc<dyn rpi_ai::auth::types::CredentialStore> =
             Arc::new(InMemoryCredentialStore::new());
@@ -1458,7 +1534,7 @@ mod tests {
         .await;
         runtime
             .register_native_provider(create_provider(CreateProviderOptions {
-                id: "test-provider".to_owned(),
+                id: provider_id.to_owned(),
                 name: None,
                 base_url: None,
                 headers: None,
@@ -1475,6 +1551,13 @@ mod tests {
             .await
             .expect("register provider");
         runtime
+    }
+
+    fn thinking_levels(pairs: &[(&str, ThinkingLevel)]) -> BTreeMap<String, ThinkingLevel> {
+        pairs
+            .iter()
+            .map(|(key, level)| ((*key).to_owned(), *level))
+            .collect()
     }
 
     fn test_model(id: &str) -> Model {
@@ -1654,6 +1737,11 @@ mod tests {
     #[tokio::test]
     async fn test_find_initial_model_cli_priority() {
         let runtime = runtime_with_models(vec![test_model("alpha-1"), test_model("beta-1")]).await;
+        // `--model`/`--provider` resolution is upstream `main.ts`'s seam: the
+        // resolver returns `medium` for this rpi-only step and does not
+        // consult `modelThinkingLevels` (the real CLI thinking travels
+        // through `createAgentSessionOptions`).
+        let per_model = thinking_levels(&[("test-provider/beta-1", ThinkingLevel::Low)]);
         let result = find_initial_model(FindInitialModelOptions {
             cli_provider: Some("test-provider"),
             cli_model: Some("beta-1"),
@@ -1661,7 +1749,8 @@ mod tests {
             is_continuing: false,
             default_provider: None,
             default_model_id: None,
-            default_thinking_level: None,
+            default_thinking_level: Some(ThinkingLevel::High),
+            model_thinking_levels: Some(&per_model),
             model_runtime: &runtime,
         })
         .await
@@ -1685,6 +1774,7 @@ mod tests {
             default_provider: None,
             default_model_id: None,
             default_thinking_level: None,
+            model_thinking_levels: None,
             model_runtime: &runtime,
         })
         .await
@@ -1705,6 +1795,7 @@ mod tests {
             default_provider: Some("test-provider"),
             default_model_id: Some("beta-1"),
             default_thinking_level: Some(ThinkingLevel::Low),
+            model_thinking_levels: None,
             model_runtime: &runtime,
         })
         .await
@@ -1721,6 +1812,7 @@ mod tests {
             default_provider: Some("test-provider"),
             default_model_id: Some("nonexistent"),
             default_thinking_level: None,
+            model_thinking_levels: None,
             model_runtime: &runtime,
         })
         .await
@@ -1769,11 +1861,285 @@ mod tests {
             default_provider: Some("test-provider"),
             default_model_id: Some("alpha-1"),
             default_thinking_level: None,
+            model_thinking_levels: None,
             model_runtime: &runtime,
         })
         .await
         .expect("no error");
         assert!(result.model.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Initial thinking level (issue #72 / V18-07)
+    //
+    // Upstream anchors: `sdk.ts:253-269` (CLI > resumed entry > per-model >
+    // global > medium; a resumed branch without a thinking entry goes
+    // straight to global) and `model-resolver.ts:558-610` (scoped and
+    // saved-default prefer the per-model entry; provider defaults and the
+    // first available model stay at `DEFAULT_THINKING_LEVEL`).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_initial_thinking_precedence_matrix() {
+        // CLI wins over a resumed entry, the per-model override and global.
+        for resumed in [
+            ResumedThinking::NotResumed,
+            ResumedThinking::Missing,
+            ResumedThinking::Present(ThinkingLevel::Low),
+        ] {
+            assert_eq!(
+                resolve_initial_thinking(ThinkingInputs {
+                    cli: Some(ThinkingLevel::High),
+                    resumed,
+                    per_model: Some(ThinkingLevel::Minimal),
+                    global: Some(ThinkingLevel::Max),
+                }),
+                ThinkingLevel::High,
+                "CLI must win for {resumed:?}"
+            );
+        }
+
+        // A resumed entry present wins over per-model and global.
+        assert_eq!(
+            resolve_initial_thinking(ThinkingInputs {
+                cli: None,
+                resumed: ResumedThinking::Present(ThinkingLevel::Minimal),
+                per_model: Some(ThinkingLevel::Low),
+                global: Some(ThinkingLevel::Max),
+            }),
+            ThinkingLevel::Minimal
+        );
+
+        // No resumed session (fresh start / `/new`): per-model then global.
+        assert_eq!(
+            resolve_initial_thinking(ThinkingInputs {
+                cli: None,
+                resumed: ResumedThinking::NotResumed,
+                per_model: Some(ThinkingLevel::Low),
+                global: Some(ThinkingLevel::High),
+            }),
+            ThinkingLevel::Low
+        );
+        assert_eq!(
+            resolve_initial_thinking(ThinkingInputs {
+                cli: None,
+                resumed: ResumedThinking::NotResumed,
+                per_model: None,
+                global: Some(ThinkingLevel::High),
+            }),
+            ThinkingLevel::High
+        );
+
+        // A resumed session without a thinking entry goes straight to the
+        // global default: the per-model override is deliberately skipped.
+        assert_eq!(
+            resolve_initial_thinking(ThinkingInputs {
+                cli: None,
+                resumed: ResumedThinking::Missing,
+                per_model: Some(ThinkingLevel::Low),
+                global: Some(ThinkingLevel::High),
+            }),
+            ThinkingLevel::High
+        );
+
+        // Nothing configured anywhere → `medium`.
+        for resumed in [ResumedThinking::NotResumed, ResumedThinking::Missing] {
+            assert_eq!(
+                resolve_initial_thinking(ThinkingInputs {
+                    cli: None,
+                    resumed,
+                    per_model: None,
+                    global: None,
+                }),
+                DEFAULT_THINKING_LEVEL
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_find_initial_model_scoped_per_model_and_explicit_precedence() {
+        let runtime = runtime_with_models(vec![test_model("alpha-1")]).await;
+        let per_model = thinking_levels(&[("test-provider/alpha-1", ThinkingLevel::Low)]);
+
+        // Scoped model without an explicit level: per-model beats global.
+        let scoped = vec![ScopedModel {
+            model: test_model("alpha-1"),
+            thinking_level: None,
+        }];
+        let result = find_initial_model(FindInitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &scoped,
+            is_continuing: false,
+            default_provider: None,
+            default_model_id: None,
+            default_thinking_level: Some(ThinkingLevel::High),
+            model_thinking_levels: Some(&per_model),
+            model_runtime: &runtime,
+        })
+        .await
+        .expect("no error");
+        assert_eq!(result.thinking_level, ThinkingLevel::Low);
+
+        // An explicit scoped level (pattern suffix) still wins.
+        let scoped = vec![ScopedModel {
+            model: test_model("alpha-1"),
+            thinking_level: Some(ThinkingLevel::Medium),
+        }];
+        let result = find_initial_model(FindInitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &scoped,
+            is_continuing: false,
+            default_provider: None,
+            default_model_id: None,
+            default_thinking_level: Some(ThinkingLevel::High),
+            model_thinking_levels: Some(&per_model),
+            model_runtime: &runtime,
+        })
+        .await
+        .expect("no error");
+        assert_eq!(result.thinking_level, ThinkingLevel::Medium);
+
+        // No per-model entry → global, then medium.
+        let empty = thinking_levels(&[]);
+        let scoped = vec![ScopedModel {
+            model: test_model("alpha-1"),
+            thinking_level: None,
+        }];
+        let result = find_initial_model(FindInitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &scoped,
+            is_continuing: false,
+            default_provider: None,
+            default_model_id: None,
+            default_thinking_level: Some(ThinkingLevel::High),
+            model_thinking_levels: Some(&empty),
+            model_runtime: &runtime,
+        })
+        .await
+        .expect("no error");
+        assert_eq!(result.thinking_level, ThinkingLevel::High);
+        let result = find_initial_model(FindInitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &scoped,
+            is_continuing: false,
+            default_provider: None,
+            default_model_id: None,
+            default_thinking_level: None,
+            model_thinking_levels: None,
+            model_runtime: &runtime,
+        })
+        .await
+        .expect("no error");
+        assert_eq!(result.thinking_level, DEFAULT_THINKING_LEVEL);
+    }
+
+    #[tokio::test]
+    async fn test_find_initial_model_saved_default_per_model_then_global() {
+        let runtime = runtime_with_models(vec![test_model("alpha-1"), test_model("beta-1")]).await;
+        let per_model = thinking_levels(&[("test-provider/beta-1", ThinkingLevel::Low)]);
+
+        // Saved default: per-model beats global.
+        let result = find_initial_model(FindInitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &[],
+            is_continuing: true,
+            default_provider: Some("test-provider"),
+            default_model_id: Some("beta-1"),
+            default_thinking_level: Some(ThinkingLevel::High),
+            model_thinking_levels: Some(&per_model),
+            model_runtime: &runtime,
+        })
+        .await
+        .expect("no error");
+        assert_eq!(result.model.map(|m| m.id).as_deref(), Some("beta-1"));
+        assert_eq!(result.thinking_level, ThinkingLevel::Low);
+
+        // The per-model entry is keyed by the saved default: another model's
+        // entry must not leak into this selection.
+        let other_model = thinking_levels(&[("test-provider/alpha-1", ThinkingLevel::Minimal)]);
+        let result = find_initial_model(FindInitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &[],
+            is_continuing: true,
+            default_provider: Some("test-provider"),
+            default_model_id: Some("beta-1"),
+            default_thinking_level: Some(ThinkingLevel::High),
+            model_thinking_levels: Some(&other_model),
+            model_runtime: &runtime,
+        })
+        .await
+        .expect("no error");
+        assert_eq!(result.thinking_level, ThinkingLevel::High);
+
+        // No global either → medium.
+        let result = find_initial_model(FindInitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &[],
+            is_continuing: true,
+            default_provider: Some("test-provider"),
+            default_model_id: Some("beta-1"),
+            default_thinking_level: None,
+            model_thinking_levels: Some(&other_model),
+            model_runtime: &runtime,
+        })
+        .await
+        .expect("no error");
+        assert_eq!(result.thinking_level, DEFAULT_THINKING_LEVEL);
+    }
+
+    #[tokio::test]
+    async fn test_find_initial_model_provider_default_and_first_available_stay_medium() {
+        // Negative parity: the provider-default and first-available branches
+        // do not consult `modelThinkingLevels` upstream.
+        let runtime = runtime_with_provider(
+            "deepseek",
+            vec![model("deepseek", "deepseek-v4-pro", "DeepSeek", false)],
+        )
+        .await;
+        let per_model = thinking_levels(&[("deepseek/deepseek-v4-pro", ThinkingLevel::Low)]);
+        let result = find_initial_model(FindInitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &[],
+            is_continuing: false,
+            default_provider: None,
+            default_model_id: None,
+            default_thinking_level: Some(ThinkingLevel::High),
+            model_thinking_levels: Some(&per_model),
+            model_runtime: &runtime,
+        })
+        .await
+        .expect("no error");
+        assert_eq!(
+            result.model.map(|m| m.id).as_deref(),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(result.thinking_level, DEFAULT_THINKING_LEVEL);
+
+        let runtime = runtime_with_models(vec![test_model("alpha-1")]).await;
+        let per_model = thinking_levels(&[("test-provider/alpha-1", ThinkingLevel::Low)]);
+        let result = find_initial_model(FindInitialModelOptions {
+            cli_provider: None,
+            cli_model: None,
+            scoped_models: &[],
+            is_continuing: false,
+            default_provider: None,
+            default_model_id: None,
+            default_thinking_level: Some(ThinkingLevel::High),
+            model_thinking_levels: Some(&per_model),
+            model_runtime: &runtime,
+        })
+        .await
+        .expect("no error");
+        assert_eq!(result.model.map(|m| m.id).as_deref(), Some("alpha-1"));
+        assert_eq!(result.thinking_level, DEFAULT_THINKING_LEVEL);
     }
 
     #[tokio::test]

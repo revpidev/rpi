@@ -2,9 +2,11 @@
 
 ## [Unreleased]
 
-### v0.1.8 draft — V18-00/V18-01/V18-02/V18-03/V18-04/V18-05/V18-06
+### v0.1.8 draft — V18-00/V18-01/V18-02/V18-03/V18-04/V18-05/V18-06/V18-07
 
-This section currently covers the completed V18-00 through V18-06 work; the other v0.1.8 tasks and final release review are pending.
+This section currently covers the completed V18-00 through V18-07 work; the other v0.1.8 tasks and final release review are pending.
+
+- **Per-model thinking override at session startup** (#72): `modelThinkingLevels` now applies when the initial model is resolved, covering process startup, `/new` and SDK-created sessions instead of silently using the global `defaultThinkingLevel`. `--thinking` (or `--model <pattern>:<level>`) and a resumed session's thinking entry still win, a resumed session without an entry still goes straight to the global default, and provider-default/first-available selections still use `medium`; the model capability clamp is unchanged.
 
 - **CJK-friendly Markdown in HTML export** (V18-00): the Pi v1.4.0 viewer assets include the CJK-friendly Markdown parser; a deterministic synchronizer vendors the six embedded assets and the export loads the parser between the base Markdown and highlight scripts.
 - **Configuration schemas, share destination and coordinated settings writes**: revpi.dev-branded settings/models/keybindings/theme schemas are vendored by a pinned sync script; built-in themes use the revpi.dev theme schema; `/share` honors `sessionShareDestination` (`auto`/`gist`; `radius` fails explicitly) and all first-party settings writers share the host `fs2` → `<target>.write-lock` lock order with in-lock re-read, preserved keys/newline/mode and atomic replacement.

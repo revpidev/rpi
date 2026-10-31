@@ -81,6 +81,7 @@ struct SessionFixture {
     ai_provider: Arc<FauxAiProvider>,
     events: Arc<Mutex<Vec<AgentSessionEvent>>>,
     agent_dir: std::path::PathBuf,
+    services: Option<rpi::core::agent_session_services::AgentSessionServices>,
     _tmp: TempDir,
 }
 
@@ -118,12 +119,57 @@ impl SessionFixture {
     }
 }
 
+/// Which `CreateAgentSessionOptions.model` a fixture passes.
+enum FixtureModel {
+    /// The faux provider's default model (most existing fixtures).
+    ProviderDefault,
+    /// No model: resolve from settings / first available (`sdk.rs:295-328`).
+    Resolved,
+    /// An exact model instance (for example one carrying a `thinkingLevelMap`).
+    Explicit(Box<rpi_ai::types::Model>),
+}
+
+struct FixtureConfig<'a> {
+    responses: Vec<FauxResponseStep>,
+    provider_options: FauxProviderOptions,
+    settings_json: Option<&'a str>,
+    tools: Option<Vec<String>>,
+    no_tools: Option<rpi::sdk::NoTools>,
+    model: FixtureModel,
+    thinking_level: Option<rpi_agent::types::ThinkingLevel>,
+    session_manager: Option<Arc<Mutex<SessionManager>>>,
+}
+
+impl<'a> FixtureConfig<'a> {
+    fn new(
+        responses: Vec<FauxResponseStep>,
+        provider_options: FauxProviderOptions,
+        settings_json: Option<&'a str>,
+    ) -> Self {
+        FixtureConfig {
+            responses,
+            provider_options,
+            settings_json,
+            tools: None,
+            no_tools: None,
+            model: FixtureModel::ProviderDefault,
+            thinking_level: None,
+            session_manager: None,
+        }
+    }
+}
+
 async fn session_fixture(
     responses: Vec<FauxResponseStep>,
     provider_options: FauxProviderOptions,
     settings_json: Option<&str>,
 ) -> SessionFixture {
-    session_fixture_cli(responses, provider_options, settings_json, None, None).await
+    session_fixture_full(FixtureConfig::new(
+        responses,
+        provider_options,
+        settings_json,
+    ))
+    .await
 }
 
 /// [`session_fixture`] plus the `--tools` / `--no-tools` CLI override inputs
@@ -135,6 +181,25 @@ async fn session_fixture_cli(
     tools: Option<Vec<String>>,
     no_tools: Option<rpi::sdk::NoTools>,
 ) -> SessionFixture {
+    session_fixture_full(FixtureConfig {
+        tools,
+        no_tools,
+        ..FixtureConfig::new(responses, provider_options, settings_json)
+    })
+    .await
+}
+
+async fn session_fixture_full(config: FixtureConfig<'_>) -> SessionFixture {
+    let FixtureConfig {
+        responses,
+        provider_options,
+        settings_json,
+        tools,
+        no_tools,
+        model,
+        thinking_level,
+        session_manager,
+    } = config;
     let tmp = TempDir::new();
     let cwd = tmp.path().join("cwd");
     let agent_dir = tmp.path().join("agent");
@@ -159,7 +224,11 @@ async fn session_fixture_cli(
     }
     let provider = FauxProvider::new(options);
     provider.set_responses(responses);
-    let model = provider.get_model(None).expect("faux model");
+    let model = match model {
+        FixtureModel::ProviderDefault => Some(provider.get_model(None).expect("faux model")),
+        FixtureModel::Resolved => None,
+        FixtureModel::Explicit(model) => Some(*model),
+    };
 
     let model_runtime = rpi::core::model_runtime::ModelRuntime::create(CreateModelRuntimeOptions {
         credentials: None,
@@ -185,15 +254,18 @@ async fn session_fixture_cli(
     .await
     .expect("services");
 
-    let session_manager = Arc::new(Mutex::new(
-        SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
-            .expect("in-memory session"),
-    ));
+    let session_manager = session_manager.unwrap_or_else(|| {
+        Arc::new(Mutex::new(
+            SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
+                .expect("in-memory session"),
+        ))
+    });
     let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
         cwd: Some(cwd),
         agent_dir: Some(agent_dir.clone()),
         model_runtime: Some(model_runtime),
-        model: Some(model),
+        model,
+        thinking_level,
         services: Some(services),
         session_manager: Some(session_manager),
         tools,
@@ -221,6 +293,7 @@ async fn session_fixture_cli(
         ai_provider,
         events,
         agent_dir,
+        services: created.services,
         _tmp: tmp,
     }
 }
@@ -2099,6 +2172,307 @@ mod session_scoped_mutations {
             enabled.iter().any(|pattern| pattern == &reference),
             "persisted default must join enabledModels, got {enabled:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// V18-07 / issue #72: per-model thinking override at session startup
+// (upstream `sdk.ts:253-269`, `model-resolver.ts:558-610`).
+// ---------------------------------------------------------------------------
+
+mod initial_thinking_level {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    use futures::future::BoxFuture;
+    use rpi::core::agent_session_runtime::{
+        AgentSessionRuntime, CreateAgentSessionRuntimeResult, CreateRuntimeOptions,
+    };
+    use rpi_agent::types::ThinkingLevel;
+    use rpi_ai::types::Model;
+
+    /// Global `high` plus a `low` per-model override for `faux/faux-1`.
+    const PER_MODEL_SETTINGS: &str = r#"{
+        "defaultProvider": "faux",
+        "defaultModel": "faux-1",
+        "defaultThinkingLevel": "high",
+        "modelThinkingLevels": {"faux/faux-1": "low"}
+    }"#;
+
+    fn seeded_session_manager(thinking_entry: Option<&str>) -> Arc<Mutex<SessionManager>> {
+        let mut manager = SessionManager::in_memory(None, NewSessionOptions::default())
+            .expect("in-memory session");
+        if let Some(level) = thinking_entry {
+            manager
+                .append_thinking_level_change(level)
+                .expect("append thinking level");
+        }
+        manager
+            .append_message(AgentMessage::User(rpi_ai::types::UserMessage {
+                role: rpi_ai::types::UserRole::User,
+                content: rpi_ai::types::UserContent::Text("existing".to_owned()),
+                timestamp: 1,
+            }))
+            .expect("append user message");
+        Arc::new(Mutex::new(manager))
+    }
+
+    fn with_thinking_level_map(model: &Model, entries: &[(ThinkingLevel, Option<&str>)]) -> Model {
+        let mut model = model.clone();
+        model.thinking_level_map = Some(
+            entries
+                .iter()
+                .map(|(level, value)| (*level, value.map(str::to_owned)))
+                .collect::<BTreeMap<_, _>>(),
+        );
+        model
+    }
+
+    // Issue #72 acceptance: via `create_agent_session` (model passed,
+    // `thinking_level: None`, empty session) the per-model override must win
+    // over the global default. Before the fix this was `high` (global).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sdk_startup_uses_per_model_thinking_override() {
+        let fixture = session_fixture_full(FixtureConfig {
+            model: FixtureModel::Resolved,
+            ..FixtureConfig::new(
+                Vec::new(),
+                FauxProviderOptions::default(),
+                Some(PER_MODEL_SETTINGS),
+            )
+        })
+        .await;
+        assert_eq!(
+            fixture.session.model().map(|model| model.id),
+            Some("faux-1".to_owned())
+        );
+        assert_eq!(fixture.session.thinking_level(), ThinkingLevel::Low);
+    }
+
+    // The per-model lookup is keyed by the resolved model: an entry for a
+    // different model does not apply, so the global default still wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sdk_startup_global_default_wins_without_matching_override() {
+        let fixture = session_fixture_full(FixtureConfig {
+            model: FixtureModel::Resolved,
+            ..FixtureConfig::new(
+                Vec::new(),
+                FauxProviderOptions::default(),
+                Some(
+                    r#"{
+                        "defaultThinkingLevel": "high",
+                        "modelThinkingLevels": {"faux/other": "low"}
+                    }"#,
+                ),
+            )
+        })
+        .await;
+        assert_eq!(fixture.session.thinking_level(), ThinkingLevel::High);
+    }
+
+    // CLI `--thinking` (here `create_agent_session.thinking_level`) wins over
+    // the per-model override.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sdk_cli_thinking_wins_over_per_model() {
+        let fixture = session_fixture_full(FixtureConfig {
+            thinking_level: Some(ThinkingLevel::High),
+            ..FixtureConfig::new(
+                Vec::new(),
+                FauxProviderOptions::default(),
+                Some(PER_MODEL_SETTINGS),
+            )
+        })
+        .await;
+        assert_eq!(fixture.session.thinking_level(), ThinkingLevel::High);
+    }
+
+    // A resumed session with a thinking entry keeps it over the per-model
+    // override.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sdk_resumed_thinking_entry_wins_over_per_model() {
+        let fixture = session_fixture_full(FixtureConfig {
+            session_manager: Some(seeded_session_manager(Some("minimal"))),
+            ..FixtureConfig::new(
+                Vec::new(),
+                FauxProviderOptions::default(),
+                Some(PER_MODEL_SETTINGS),
+            )
+        })
+        .await;
+        assert_eq!(fixture.session.thinking_level(), ThinkingLevel::Minimal);
+    }
+
+    // Upstream special case: a resumed session without a thinking entry goes
+    // straight to the global default and must NOT consult the per-model
+    // override.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sdk_resumed_without_thinking_entry_goes_global() {
+        let fixture = session_fixture_full(FixtureConfig {
+            session_manager: Some(seeded_session_manager(None)),
+            ..FixtureConfig::new(
+                Vec::new(),
+                FauxProviderOptions::default(),
+                Some(PER_MODEL_SETTINGS),
+            )
+        })
+        .await;
+        assert_eq!(fixture.session.thinking_level(), ThinkingLevel::High);
+    }
+
+    // Capability clamp still applies after the per-model decision: `high` is
+    // unsupported by this model, so it clamps down to `medium`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sdk_per_model_level_is_clamped_to_model_capabilities() {
+        let seed = session_fixture(Vec::new(), FauxProviderOptions::default(), None).await;
+        let model = seed.session.model().expect("faux model");
+        let clamped_model = with_thinking_level_map(&model, &[(ThinkingLevel::High, None)]);
+        let fixture = session_fixture_full(FixtureConfig {
+            model: FixtureModel::Explicit(Box::new(clamped_model)),
+            ..FixtureConfig::new(
+                Vec::new(),
+                FauxProviderOptions::default(),
+                Some(
+                    r#"{
+                        "defaultThinkingLevel": "low",
+                        "modelThinkingLevels": {"faux/faux-1": "high"}
+                    }"#,
+                ),
+            )
+        })
+        .await;
+        // The per-model `high` reaches the clamp and becomes `medium`; the
+        // pre-fix global `low` would have stayed `low`.
+        assert_eq!(fixture.session.thinking_level(), ThinkingLevel::Medium);
+    }
+
+    // No resolved model still forces `off`, even with an explicit CLI
+    // thinking level (upstream `if (!model) thinkingLevel = "off"`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sdk_no_model_forces_off_thinking() {
+        let tmp = TempDir::new();
+        let cwd = tmp.path().join("cwd");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let model_runtime =
+            rpi::core::model_runtime::ModelRuntime::create(CreateModelRuntimeOptions {
+                credentials: None,
+                auth_path: Some(agent_dir.join("auth.json")),
+                models_path: ModelsPathInput::Disabled,
+                ..Default::default()
+            })
+            .await;
+        let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+            cwd: cwd.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            settings_manager: None,
+            model_runtime: Some(model_runtime.clone()),
+            extension_flag_values: Vec::new(),
+            resource_loader_options: None,
+        })
+        .await
+        .expect("services");
+        let session_manager = Arc::new(Mutex::new(
+            SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
+                .expect("in-memory session"),
+        ));
+        let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
+            cwd: Some(cwd),
+            agent_dir: Some(agent_dir),
+            model_runtime: Some(model_runtime),
+            model: None,
+            thinking_level: Some(ThinkingLevel::High),
+            no_tools: Some(rpi::sdk::NoTools::All),
+            services: Some(services),
+            session_manager: Some(session_manager),
+            ..Default::default()
+        })
+        .await
+        .expect("create session");
+        assert!(created.session.model().is_none());
+        assert_eq!(created.session.thinking_level(), ThinkingLevel::Off);
+    }
+
+    fn runtime_factory(
+        services: rpi::core::agent_session_services::AgentSessionServices,
+        agent_dir: std::path::PathBuf,
+        model: Option<Model>,
+    ) -> rpi::core::agent_session_runtime::CreateAgentSessionRuntimeFactory {
+        Arc::new(move |options: CreateRuntimeOptions| {
+            let services = services.clone();
+            let agent_dir = agent_dir.clone();
+            let model = model.clone();
+            Box::pin(async move {
+                let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
+                    cwd: Some(options.cwd.clone()),
+                    agent_dir: Some(agent_dir),
+                    model,
+                    thinking_level: None,
+                    no_tools: Some(rpi::sdk::NoTools::All),
+                    services: Some(services),
+                    session_manager: Some(options.session_manager),
+                    ..Default::default()
+                })
+                .await?;
+                Ok(CreateAgentSessionRuntimeResult {
+                    session: created.session,
+                    services: created.services.expect("services round-trip"),
+                    diagnostics: Vec::new(),
+                    model_fallback_message: created.model_fallback_message,
+                })
+            })
+                as BoxFuture<'static, Result<CreateAgentSessionRuntimeResult, rpi::RpiError>>
+        })
+    }
+
+    // `/new` starts a fresh (non-resumed) session, so the same per-model
+    // fallback applies when the model is resolved from settings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn new_session_uses_per_model_thinking_override() {
+        let fixture = session_fixture(
+            Vec::new(),
+            FauxProviderOptions::default(),
+            Some(PER_MODEL_SETTINGS),
+        )
+        .await;
+        let services = fixture.services.clone().expect("services");
+        let factory = runtime_factory(services.clone(), fixture.agent_dir.clone(), None);
+        let mut runtime =
+            AgentSessionRuntime::new(fixture.session.clone(), services, factory, Vec::new(), None);
+        let cancelled = runtime
+            .new_session(None, None, None)
+            .await
+            .expect("new session");
+        assert!(!cancelled);
+        assert_eq!(
+            runtime.session().model().map(|model| model.id),
+            Some("faux-1".to_owned())
+        );
+        assert_eq!(runtime.session().thinking_level(), ThinkingLevel::Low);
+    }
+
+    // `/new` with an explicit scoped model (the app passes the scoped model
+    // but no thinking level unless the pattern had a suffix) also keeps the
+    // per-model fallback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn new_session_scoped_model_uses_per_model_thinking_override() {
+        const SETTINGS: &str = r#"{
+            "defaultThinkingLevel": "high",
+            "enabledModels": ["faux/faux-1"],
+            "modelThinkingLevels": {"faux/faux-1": "low"}
+        }"#;
+        let fixture =
+            session_fixture(Vec::new(), FauxProviderOptions::default(), Some(SETTINGS)).await;
+        let model = fixture.session.model().expect("faux model");
+        let services = fixture.services.clone().expect("services");
+        let factory = runtime_factory(services.clone(), fixture.agent_dir.clone(), Some(model));
+        let mut runtime =
+            AgentSessionRuntime::new(fixture.session.clone(), services, factory, Vec::new(), None);
+        runtime
+            .new_session(None, None, None)
+            .await
+            .expect("new session");
+        assert_eq!(runtime.session().thinking_level(), ThinkingLevel::Low);
     }
 }
 
