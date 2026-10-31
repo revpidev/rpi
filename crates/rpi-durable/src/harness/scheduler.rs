@@ -2663,6 +2663,7 @@ impl SchedulerInner {
             let runtime = InvocationRuntime {
                 inner: Arc::clone(self),
                 invocation: Arc::clone(&invocation),
+                context: phase_context.clone(),
                 snapshot: Arc::clone(&snapshot_cell),
                 agent: Arc::new(tokio::sync::OnceCell::new()),
             };
@@ -2840,6 +2841,7 @@ impl SchedulerInner {
         let runtime = InvocationRuntime {
             inner: Arc::clone(self),
             invocation: Arc::clone(invocation),
+            context: phase_context.clone(),
             snapshot: Arc::new(Mutex::new(Arc::clone(&reservation.snapshot))),
             agent: Arc::new(tokio::sync::OnceCell::new()),
         };
@@ -3427,6 +3429,10 @@ impl DocumentReader for SchedulerDocumentReader {
 struct InvocationRuntime {
     inner: Arc<SchedulerInner>,
     invocation: Arc<Invocation>,
+    /// Context of the phase this runtime runs: task-level reports and agent
+    /// resolution land on its telemetry span (upstream replaces
+    /// `invocation.context` for the phase).
+    context: Context,
     snapshot: Arc<Mutex<Arc<dyn RegistrySnapshot>>>,
     /// Shared so a clone (the owned handle for spawned progress commits)
     /// resolves the agent once per invocation.
@@ -3549,7 +3555,7 @@ impl TaskRuntime for InvocationRuntime {
     async fn agent(&self, context: &Context) -> SessionResult<Agent> {
         self.ensure_open()?;
         let conversation_id = self.invocation.conversation_id;
-        let invocation_context = self.invocation.context.clone();
+        let invocation_context = self.context.clone();
         let snapshot = self.current_snapshot();
         let inner = Arc::clone(&self.inner);
         let cell = Arc::clone(&self.agent);
@@ -3998,10 +4004,9 @@ impl TaskRuntime for InvocationRuntime {
     }
 
     fn report_info(&self, info: crate::harness::types::ReportInfo) {
-        // Task-level reports land on the invocation's span context
-        // (upstream passes `invocation.context`).
-        self.inner
-            .report_fixed_with(info, Some(&self.invocation.context));
+        // Task-level reports land on the phase span (upstream replaces
+        // `invocation.context` with the phase's telemetry for the phase).
+        self.inner.report_fixed_with(info, Some(&self.context));
     }
 
     fn set_timer(

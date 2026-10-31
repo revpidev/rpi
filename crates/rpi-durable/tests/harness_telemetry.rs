@@ -56,6 +56,7 @@ struct SpanSnapshot {
     attributes: JsonObject,
     links: Vec<TelemetryCarrier>,
     events: Vec<String>,
+    event_attributes: Vec<JsonObject>,
     end_attributes: JsonObject,
     status: String,
     message: Option<String>,
@@ -111,6 +112,7 @@ impl Recorder {
             attributes: span.attributes.clone(),
             links: span.links.clone(),
             events: span.events.clone(),
+            event_attributes: span.event_attributes.clone(),
             end_attributes: span.end_attributes.clone(),
             status: span.status.clone(),
             message: span.message.clone(),
@@ -126,6 +128,7 @@ impl Recorder {
             attributes: span.attributes.clone(),
             links: span.links.clone(),
             events: span.events.clone(),
+            event_attributes: span.event_attributes.clone(),
             end_attributes: span.end_attributes.clone(),
             status: span.status.clone(),
             message: span.message.clone(),
@@ -772,9 +775,10 @@ fn wrap_extension() -> Extension {
 
 // ─── V18-06 eleventh review: report attributes, abort duration, span end ────
 
-/// R-D9: a task-level report emits exactly one event and one metric. The
-/// scheduler emits its own telemetry; the Harness callback must not emit it a
-/// second time for reports that already took that path.
+/// R-D9: a task-level report lands on the phase span exactly once, and the
+/// metric is counted once. The scheduler emits its own telemetry; the Harness
+/// callback must not emit it a second time for reports that already took that
+/// path.
 #[tokio::test]
 async fn a_task_report_emits_one_event_and_one_metric() {
     let recorder = Recorder::default();
@@ -793,15 +797,12 @@ async fn a_task_report_emits_one_event_and_one_metric() {
         .wait_for_task(id, &context())
         .await
         .expect("wait");
-    let events = recorder
-        .0
-        .root_events
-        .lock()
-        .expect("events")
+    let span = recorder.last_span("pi.durable.phase");
+    let events = span
+        .event_attributes
         .iter()
-        .filter(|(name, attributes)| {
-            name == "pi.durable.report"
-                && attributes.get("type").and_then(JsonValue::as_str) == Some("extension_error")
+        .filter(|attributes| {
+            attributes.get("type").and_then(JsonValue::as_str) == Some("extension_error")
         })
         .count();
     let metrics = recorder
@@ -815,8 +816,21 @@ async fn a_task_report_emits_one_event_and_one_metric() {
                 && attributes.get("type").and_then(JsonValue::as_str) == Some("extension_error")
         })
         .count();
-    assert_eq!(events, 1, "one report event per report");
+    assert_eq!(events, 1, "one phase-span report event per report");
     assert_eq!(metrics, 1, "one report metric per report");
+    assert!(
+        !recorder
+            .0
+            .root_events
+            .lock()
+            .expect("events")
+            .iter()
+            .any(|(name, attributes)| {
+                name == "pi.durable.report"
+                    && attributes.get("type").and_then(JsonValue::as_str) == Some("extension_error")
+            }),
+        "the task report must not also land on root"
+    );
 }
 
 #[tokio::test]
@@ -911,15 +925,12 @@ async fn a_wrapper_rename_from_a_task_emits_one_extension_error() {
         .wait_for_task(id, &context())
         .await
         .expect("wait");
-    let events: Vec<(String, JsonObject)> = recorder
-        .0
-        .root_events
-        .lock()
-        .expect("events")
+    let span = recorder.last_span("pi.durable.phase");
+    let events: Vec<JsonObject> = span
+        .event_attributes
         .iter()
-        .filter(|(name, attributes)| {
-            name == "pi.durable.report"
-                && attributes.get("type").and_then(JsonValue::as_str) == Some("extension_error")
+        .filter(|attributes| {
+            attributes.get("type").and_then(JsonValue::as_str) == Some("extension_error")
         })
         .cloned()
         .collect();
@@ -934,12 +945,25 @@ async fn a_wrapper_rename_from_a_task_emits_one_extension_error() {
                 && attributes.get("type").and_then(JsonValue::as_str) == Some("extension_error")
         })
         .count();
-    assert_eq!(events.len(), 1, "wrapper renames emit one event");
+    assert_eq!(events.len(), 1, "wrapper renames emit one phase event");
     assert_eq!(
-        events[0].1.get("extension").and_then(JsonValue::as_str),
+        events[0].get("extension").and_then(JsonValue::as_str),
         Some("wrap-test")
     );
     assert_eq!(metrics, 1, "wrapper renames emit one metric");
+    assert!(
+        !recorder
+            .0
+            .root_events
+            .lock()
+            .expect("events")
+            .iter()
+            .any(|(name, attributes)| {
+                name == "pi.durable.report"
+                    && attributes.get("type").and_then(JsonValue::as_str) == Some("extension_error")
+            }),
+        "the wrapper report must not also land on root"
+    );
 }
 
 /// R-D9: `pi.durable.report` carries only the fixed attributes of its kind
