@@ -391,6 +391,102 @@ mod tests {
         assert!(frame["id"].as_str().is_some_and(|id| !id.is_empty()));
     }
 
+    #[test]
+    fn text_bridge_emits_usage_text_and_compact_report() {
+        let (bridge, buffer) = bridge(PrintOutputMode::Text, Value::Null);
+        bridge
+            .emit_structured("usageText", &Value::String("usage: ok".to_owned()), true)
+            .expect("validate");
+        assert_eq!(buffer.text(), "", "validateOnly writes nothing");
+        bridge
+            .emit_structured("usageText", &Value::String("usage: ok".to_owned()), false)
+            .expect("text");
+        assert_eq!(buffer.text(), "usage: ok\n");
+        let report = serde_json::json!({
+            "schemaVersion": 1,
+            "provider": "x",
+            "stale": false,
+            "source": "network",
+        });
+        bridge
+            .emit_structured("usageReport", &report, false)
+            .expect("report");
+        let text = buffer.text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one compact report line, no wrapper");
+        let parsed: Value = serde_json::from_str(lines[1]).expect("compact json");
+        assert_eq!(parsed, report);
+        assert_eq!(
+            bridge
+                .emit_structured("usageText", &report, false)
+                .expect_err("usageText needs a string"),
+            UiOutputError::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn json_bridge_emits_the_usage_report_frame() {
+        let (bridge, buffer) = bridge(PrintOutputMode::Json, Value::Null);
+        let report = serde_json::json!([
+            {"schemaVersion": 1, "provider": "x", "stale": true}
+        ]);
+        bridge
+            .emit_structured("usageReport", &report, false)
+            .expect("report");
+        let frame: Value = serde_json::from_str(buffer.text().trim()).expect("frame json");
+        assert_eq!(frame["type"], "extension_ui_request");
+        assert_eq!(frame["method"], "usageReport");
+        assert_eq!(frame["data"], report);
+        assert!(frame.get("message").is_none());
+        assert!(frame["id"].as_str().is_some_and(|id| !id.is_empty()));
+
+        bridge
+            .emit_structured("usageText", &Value::String("usage: ok".to_owned()), false)
+            .expect("text");
+        let frames: Vec<Value> = buffer
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("line json"))
+            .collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1]["method"], "notify");
+        assert_eq!(frames[1]["message"], "usage: ok");
+    }
+
+    #[test]
+    fn emit_structured_write_failure_is_recorded_for_the_mode_exit_code() {
+        struct Failing(Arc<AtomicUsize>);
+        impl std::io::Write for Failing {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed pipe",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        let out = RawStdout::new(Box::new(Failing(writes.clone())));
+        let bridge = output_ui_bridge(PrintOutputMode::Text, out.clone(), Value::Null);
+        bridge
+            .emit_structured("usageText", &Value::String("usage".to_owned()), false)
+            .expect("emit");
+        assert!(out.has_error());
+        bridge
+            .emit_structured("usageReport", &serde_json::json!({"provider": "x"}), false)
+            .expect("later writes dropped");
+        assert!(out.has_error());
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "the output guard drops writes after the first error"
+        );
+    }
+
     #[tokio::test]
     async fn dialogs_stay_noops_on_the_output_bridge() {
         let (bridge, _buffer) = bridge(PrintOutputMode::Text, Value::Null);
@@ -502,5 +598,14 @@ mod tests {
         let error: UiOutputError = NoOutput.emit_text("x", true).expect_err("default");
         assert_eq!(error, UiOutputError::UnsupportedOutput);
         assert_eq!(error.to_string(), "unsupported-output");
+        let error: UiOutputError = NoOutput
+            .emit_structured("usageReport", &Value::Null, true)
+            .expect_err("default");
+        assert_eq!(error, UiOutputError::UnsupportedOutput);
+        assert_eq!(error.to_string(), "unsupported-output");
+        let error: UiOutputError = NoOutput
+            .emit_structured("usageText", &Value::String("x".to_owned()), false)
+            .expect_err("default");
+        assert_eq!(error, UiOutputError::UnsupportedOutput);
     }
 }

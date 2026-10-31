@@ -484,6 +484,17 @@ impl HostActions for SessionHostActions {
         self.usage.fetch(provider, force).await
     }
 
+    /// `ctx.usage.fetchDetailed(provider, force?)`: the detailed
+    /// source/stale/error combination; no implicit second request.
+    async fn usage_fetch_detailed(&self, provider: &str, force: bool) -> Value {
+        self.usage.fetch_detailed(provider, force).await.to_json()
+    }
+
+    /// `ctx.usage.cached(provider)`: cache-only, zero scripts and no network.
+    async fn usage_cached(&self, provider: &str) -> Value {
+        self.usage.cached_result(provider).await.to_json()
+    }
+
     /// `ctx.usage.register(provider, scriptPath)`: plugin registrations are
     /// the lowest resolution priority.
     fn usage_register(&self, provider: &str, script_path: &str) -> Result<(), String> {
@@ -939,14 +950,27 @@ pub(crate) async fn exec_script(request: ScriptExecRequest<'_>) -> ScriptExecOut
     for (name, value) in request.env {
         command.env(name, value);
     }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => {
-            return ScriptExecOutcome {
-                code: 1,
-                spawn_failed: true,
-                ..ScriptExecOutcome::default()
-            };
+    // Linux reports ETXTBSY when another thread's just-written executable
+    // still has an inherited write descriptor across a concurrent fork. The
+    // condition clears once that descriptor closes, so retry briefly instead
+    // of surfacing a spurious runtime-unavailable error (and test flake).
+    let mut attempts = 0u32;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 20 =>
+            {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Err(_) => {
+                return ScriptExecOutcome {
+                    code: 1,
+                    spawn_failed: true,
+                    ..ScriptExecOutcome::default()
+                };
+            }
         }
     };
 

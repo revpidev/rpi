@@ -283,6 +283,41 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .map_err(|error| ("call", error.to_string()))?;
             Ok(Value::Null)
         }
+        "ui.emitStructured" => {
+            // rpi additive (ADR-0039 / V18-10):
+            // `{method:"usageText"|"usageReport", data, validateOnly?}`.
+            // The method/data pair is validated before the bridge sees it;
+            // NullUi then answers `unsupported-output` before any fetch.
+            let Some(method) = str_arg(&args, "method") else {
+                return err(
+                    "invalidRequest",
+                    "ui.emitStructured: required string arg `method`",
+                );
+            };
+            let Some(data) = args.get("data") else {
+                return err("invalidRequest", "ui.emitStructured: missing `data`");
+            };
+            match method {
+                "usageText" if data.is_string() => {}
+                "usageReport" if data.is_object() || data.is_array() => {}
+                "usageText" | "usageReport" => {
+                    return err(
+                        "invalidRequest",
+                        "ui.emitStructured: usageText requires a string and usageReport an object or array",
+                    );
+                }
+                _ => {
+                    return err(
+                        "invalidRequest",
+                        "ui.emitStructured: unsupported method (usageText|usageReport)",
+                    );
+                }
+            }
+            let validate_only = bool_arg(&args, "validateOnly").unwrap_or(false);
+            ui.emit_structured(method, data, validate_only)
+                .map_err(|error| ("call", error.to_string()))?;
+            Ok(Value::Null)
+        }
         "ui.setStatus" => {
             ui.set_status(
                 str_arg(&args, "key").unwrap_or_default(),
@@ -984,6 +1019,103 @@ mod tests {
         assert_eq!(frame["method"], "notify");
         assert_eq!(frame["message"], "statusline: help");
         assert_eq!(frame["notifyType"], "info");
+        assert!(frame["id"].as_str().is_some_and(|id| !id.is_empty()));
+    }
+
+    #[test]
+    fn ui_emit_structured_validates_method_and_data() {
+        let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"method": "usageText"}),
+            serde_json::json!({"method": "usageReport", "data": "text"}),
+            serde_json::json!({"method": "usageText", "data": {}}),
+            serde_json::json!({"method": "nope", "data": "x"}),
+        ] {
+            let (kind, _) =
+                dispatch(&mut state, "ui.emitStructured", args.clone()).expect_err("invalid args");
+            assert_eq!(kind, "invalidRequest", "{args}");
+        }
+    }
+
+    #[test]
+    fn ui_emit_structured_null_bridge_is_unsupported_for_validate_and_actual() {
+        let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
+        for args in [
+            serde_json::json!({"method": "usageText", "data": "x", "validateOnly": true}),
+            serde_json::json!({"method": "usageReport", "data": []}),
+        ] {
+            let (kind, message) =
+                dispatch(&mut state, "ui.emitStructured", args).expect_err("NullUi");
+            assert_eq!(kind, "call");
+            assert_eq!(message, "unsupported-output");
+        }
+    }
+
+    #[test]
+    fn ui_emit_structured_text_bridge_writes_text_and_compact_json() {
+        let chunks = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink_chunks = Arc::clone(&chunks);
+        let sink: crate::bridges::UiOutputSink =
+            Arc::new(move |chunk: &str| sink_chunks.lock().unwrap().push(chunk.to_owned()));
+        let bridge = crate::bridges::OutputUiBridge::text(Value::Null, sink);
+        let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
+        state
+            .api
+            .runtime()
+            .set_ui_bridge(Some(Arc::new(bridge)), ExtensionMode::Print);
+
+        dispatch(
+            &mut state,
+            "ui.emitStructured",
+            serde_json::json!({"method": "usageText", "data": "ignored", "validateOnly": true}),
+        )
+        .expect("validate");
+        assert!(chunks.lock().unwrap().is_empty());
+
+        dispatch(
+            &mut state,
+            "ui.emitStructured",
+            serde_json::json!({"method": "usageText", "data": "usage: ok"}),
+        )
+        .expect("text");
+        dispatch(
+            &mut state,
+            "ui.emitStructured",
+            serde_json::json!({"method": "usageReport", "data": {"provider": "x"}}),
+        )
+        .expect("report");
+        let chunks = chunks.lock().unwrap();
+        assert_eq!(chunks[0], "usage: ok\n");
+        let report: Value = serde_json::from_str(chunks[1].trim()).expect("compact json");
+        assert_eq!(report["provider"], "x");
+        assert_eq!(chunks[1].lines().count(), 1);
+    }
+
+    #[test]
+    fn ui_emit_structured_json_bridge_uses_the_usage_report_frame() {
+        let chunks = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink_chunks = Arc::clone(&chunks);
+        let sink: crate::bridges::UiOutputSink =
+            Arc::new(move |chunk: &str| sink_chunks.lock().unwrap().push(chunk.to_owned()));
+        let bridge = crate::bridges::OutputUiBridge::json_notify(Value::Null, sink);
+        let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
+        state
+            .api
+            .runtime()
+            .set_ui_bridge(Some(Arc::new(bridge)), ExtensionMode::Json);
+        dispatch(
+            &mut state,
+            "ui.emitStructured",
+            serde_json::json!({"method": "usageReport", "data": [{"provider": "x"}]}),
+        )
+        .expect("report");
+        let chunks = chunks.lock().unwrap();
+        let frame: Value = serde_json::from_str(chunks[0].trim()).expect("frame json");
+        assert_eq!(frame["type"], "extension_ui_request");
+        assert_eq!(frame["method"], "usageReport");
+        assert_eq!(frame["data"][0]["provider"], "x");
+        assert!(frame.get("message").is_none());
         assert!(frame["id"].as_str().is_some_and(|id| !id.is_empty()));
     }
 }

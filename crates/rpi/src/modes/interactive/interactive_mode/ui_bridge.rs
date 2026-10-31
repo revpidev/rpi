@@ -557,6 +557,35 @@ impl UiBridge for InteractiveUiBridge {
         Ok(())
     }
 
+    /// `ui.emitStructured` (rpi additive, ADR-0039 / V18-10): TUI command
+    /// output stays on the notification surface. `usageText` is shown as is;
+    /// `usageReport` is pretty-printed into the notification body. The
+    /// notification is not a machine channel; RPC/json/print carry the
+    /// structured frame.
+    fn emit_structured(
+        &self,
+        method: &str,
+        data: &Value,
+        validate_only: bool,
+    ) -> Result<(), UiOutputError> {
+        if validate_only {
+            return Ok(());
+        }
+        match method {
+            "usageText" => {
+                let text = data.as_str().ok_or(UiOutputError::InvalidRequest)?;
+                self.notify(text, NotifyType::Info);
+            }
+            "usageReport" => {
+                let text = serde_json::to_string_pretty(data)
+                    .map_err(|_| UiOutputError::InvalidRequest)?;
+                self.notify(&text, NotifyType::Info);
+            }
+            _ => return Err(UiOutputError::InvalidRequest),
+        }
+        Ok(())
+    }
+
     /// `ui.hasOverlay` (ADR-0041 / V18-02): the real session overlay stack.
     fn has_overlay(&self) -> rpi_ext_host::api::HasOverlayState {
         self.ui()

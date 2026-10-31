@@ -12849,6 +12849,41 @@ mod tests {
             "emitText renders through notify"
         );
 
+        // ui.emitStructured → notification body (usageText as is, usageReport
+        // pretty JSON); validateOnly only checks the channel. Status
+        // notifications coalesce into the same row, so assert the message.
+        let status_message = || {
+            lock(&ui.last_status_text)
+                .as_ref()
+                .map(|track| lock(&track.message).clone())
+                .unwrap_or_default()
+        };
+        let before_structured = status_message();
+        bridge
+            .emit_structured("usageText", &serde_json::json!("USAGE-TEXT"), true)
+            .expect("validate structured channel");
+        assert_eq!(
+            status_message(),
+            before_structured,
+            "structured validateOnly must not write"
+        );
+        bridge
+            .emit_structured(
+                "usageReport",
+                &serde_json::json!({"provider": "x", "stale": false}),
+                false,
+            )
+            .expect("emit structured report");
+        let report = status_message();
+        assert!(
+            report.contains("\"provider\": \"x\""),
+            "usageReport renders as pretty JSON: {report:?}"
+        );
+        bridge
+            .emit_structured("usageText", &serde_json::json!("USAGE-TEXT"), false)
+            .expect("emit structured text");
+        assert_eq!(status_message(), "USAGE-TEXT");
+
         // editor text read/write + paste path.
         bridge.set_editor_text("hello");
         assert_eq!(bridge.get_editor_text(), "hello");

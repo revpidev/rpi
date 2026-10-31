@@ -23,7 +23,7 @@ pub mod request;
 pub mod resolve;
 pub mod types;
 
-pub use request::{CredentialGeneration, ResolvedRequestAuth};
+pub use request::{CredentialGeneration, ResolvedRequestAuth, oauth_account_id};
 
 pub use anthropic_auth::{AnthropicApiKeyAuth, anthropic_api_key_auth};
 pub use anthropic_federation::{

@@ -118,6 +118,13 @@ pub(crate) fn validate_subscription_origin(
     Ok(())
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn generation(parts: &[&[u8]]) -> Result<CredentialGeneration, ModelsError> {
     let salt = PROCESS_SALT.as_ref().map_err(|error| error.clone())?;
     let mut hash = Sha256::new();
@@ -168,6 +175,15 @@ fn account_id(credential: &super::OAuthCredential) -> Result<Option<String>, Mod
     Ok(account_id.or(jwt_account_id))
 }
 
+/// The validated account id of an OAuth credential (top-level `accountId` /
+/// `account_id`, cross-checked with the Codex JWT). `openai-codex` requires
+/// one; other providers may omit it.
+pub fn oauth_account_id(
+    credential: &super::OAuthCredential,
+) -> Result<Option<String>, ModelsError> {
+    account_id(credential)
+}
+
 fn ensure_oauth_snapshot_matches(auth: &ModelAuth, access: &str) -> Result<(), ModelsError> {
     if auth.api_key.as_deref().is_some_and(|key| key == access) {
         return Ok(());
@@ -187,6 +203,77 @@ fn ensure_oauth_snapshot_matches(auth: &ModelAuth, access: &str) -> Result<(), M
 }
 
 impl ResolvedRequestAuth {
+    /// Resolve the identity of an API key without reading the credential
+    /// store or refreshing anything. Non-inference consumers (usage) use this
+    /// to keep the cache key on the same key+origin the request would use.
+    pub fn resolve_api_key_read_only(
+        provider_id: &str,
+        official_base_url: Option<&str>,
+        configured_base_url: &str,
+        key: &str,
+    ) -> Result<Self, ModelsError> {
+        let result = AuthResult {
+            auth: ModelAuth {
+                api_key: Some(key.to_owned()),
+                ..Default::default()
+            },
+            env: None,
+            source: Some("api key".to_owned()),
+        };
+        Self::resolve(
+            provider_id,
+            &ProviderAuth::default(),
+            official_base_url,
+            configured_base_url,
+            result,
+            None,
+        )
+    }
+
+    /// Resolve the identity of a stored OAuth credential **without** any
+    /// refresh: an expired credential is an error. Subscription usage must
+    /// never rotate tokens or write auth state (ADR-0039).
+    pub async fn resolve_oauth_read_only(
+        provider_id: &str,
+        provider_auth: &ProviderAuth,
+        official_base_url: Option<&str>,
+        configured_base_url: &str,
+        credential: &super::OAuthCredential,
+    ) -> Result<Self, ModelsError> {
+        if credential.expires <= now_ms() {
+            return Err(ModelsError::new(
+                ModelsErrorCode::Oauth,
+                format!("OAuth credential for {provider_id} is expired; sign in again"),
+            ));
+        }
+        let oauth = provider_auth.oauth.as_ref().ok_or_else(|| {
+            ModelsError::new(
+                ModelsErrorCode::Auth,
+                format!("Provider {provider_id} has no OAuth auth method"),
+            )
+        })?;
+        let auth = oauth.to_auth(credential).await.map_err(|error| {
+            ModelsError::with_cause(
+                ModelsErrorCode::Oauth,
+                format!("OAuth auth derivation failed for {provider_id}"),
+                &error.message,
+            )
+        })?;
+        let result = AuthResult {
+            auth,
+            env: None,
+            source: Some("OAuth".to_owned()),
+        };
+        Self::resolve(
+            provider_id,
+            provider_auth,
+            official_base_url,
+            configured_base_url,
+            result,
+            Some(Credential::OAuth(credential.clone())),
+        )
+    }
+
     pub(crate) fn resolve(
         provider_id: &str,
         provider_auth: &ProviderAuth,
@@ -438,5 +525,100 @@ mod tests {
         .expect_err("credential kind transition must fail");
         assert!(error.message.contains("Credential kind changed"));
         assert!(!error.message.contains("stored-secret"));
+    }
+
+    #[test]
+    fn api_key_read_only_identity_uses_key_and_origin() {
+        let one = ResolvedRequestAuth::resolve_api_key_read_only(
+            "deepseek",
+            Some("https://api.deepseek.com"),
+            "https://api.deepseek.com/v1",
+            "first-key",
+        )
+        .expect("first");
+        let two = ResolvedRequestAuth::resolve_api_key_read_only(
+            "deepseek",
+            Some("https://api.deepseek.com"),
+            "https://api.deepseek.com/v1",
+            "second-key",
+        )
+        .expect("second");
+        assert_eq!(one.credential_kind, CredentialType::ApiKey);
+        assert_eq!(one.effective_origin, "https://api.deepseek.com");
+        assert_ne!(one.generation, two.generation);
+        let debug = format!("{one:?} {two:?}");
+        assert!(!debug.contains("first-key"));
+        assert!(!debug.contains("second-key"));
+    }
+
+    #[tokio::test]
+    async fn oauth_read_only_rejects_expired_and_never_refreshes() {
+        let oauth = crate::auth::oauth::anthropic::AnthropicOAuth::new();
+        let provider_auth = ProviderAuth {
+            api_key: None,
+            oauth: Some(std::sync::Arc::new(oauth)),
+        };
+        let expired = OAuthCredential {
+            refresh: "refresh-secret".to_owned(),
+            access: "access-secret".to_owned(),
+            expires: 0,
+            extra: Map::new(),
+        };
+        let error = ResolvedRequestAuth::resolve_oauth_read_only(
+            "anthropic",
+            &provider_auth,
+            Some("https://api.anthropic.com"),
+            "https://api.anthropic.com",
+            &expired,
+        )
+        .await
+        .expect_err("expired");
+        assert!(error.message.contains("expired"));
+        assert!(!error.message.contains("access-secret"));
+        assert!(!error.message.contains("refresh-secret"));
+
+        let valid = OAuthCredential {
+            refresh: "refresh-secret".to_owned(),
+            access: "access-secret".to_owned(),
+            expires: now_ms() + 3_600_000,
+            extra: Map::new(),
+        };
+        let identity = ResolvedRequestAuth::resolve_oauth_read_only(
+            "anthropic",
+            &provider_auth,
+            Some("https://api.anthropic.com"),
+            "https://api.anthropic.com",
+            &valid,
+        )
+        .await
+        .expect("valid");
+        assert_eq!(identity.credential_kind, CredentialType::Oauth);
+        assert_eq!(identity.auth.api_key.as_deref(), Some("access-secret"));
+        assert_eq!(identity.effective_origin, "https://api.anthropic.com");
+        let debug = format!("{identity:?}");
+        assert!(!debug.contains("access-secret"));
+        assert!(!debug.contains("refresh-secret"));
+    }
+
+    #[test]
+    fn oauth_account_id_reads_the_flattened_top_level_field() {
+        let mut credential = OAuthCredential {
+            refresh: "r".to_owned(),
+            access: "a".to_owned(),
+            expires: 1,
+            extra: Map::new(),
+        };
+        assert_eq!(oauth_account_id(&credential).expect("none"), None);
+        credential
+            .extra
+            .insert("accountId".to_owned(), serde_json::json!("acc-1"));
+        assert_eq!(
+            oauth_account_id(&credential).expect("account").as_deref(),
+            Some("acc-1")
+        );
+        credential
+            .extra
+            .insert("account_id".to_owned(), serde_json::json!("acc-2"));
+        assert!(oauth_account_id(&credential).is_err());
     }
 }

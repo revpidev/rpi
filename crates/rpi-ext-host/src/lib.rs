@@ -26,6 +26,7 @@ pub mod native;
 pub mod runner;
 pub mod system_prompt_bridge;
 pub mod types;
+pub mod usage;
 pub mod wasm;
 
 #[cfg(test)]

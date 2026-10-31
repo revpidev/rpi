@@ -114,7 +114,7 @@ Common options:
 | `--export <file> [output.html]` | Export a session file to HTML |
 | `--tools` / `--exclude-tools` / `--no-tools` | Tool allowlist/denylist with `*` patterns and `+name` / `-name` adjustments; `--tools` keeps MCP tools unless an entry starts with `mcp__` |
 | `--no-mcp` | Disable the built-in MCP client for this run |
-| `--offline` | Disable all network endpoints for this run |
+| `--offline` | Disable all network endpoints for this run; `/usage` then only serves the session cache and never runs a provider script |
 | `--use-theme <name[/name]>` | Initial interactive theme for this run |
 | `@<file>` | Attach a file (text or image) to the initial message |
 

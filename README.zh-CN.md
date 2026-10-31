@@ -114,7 +114,7 @@ rpi self-uninstall --purge   # 连同 ~/.rpi（会话、认证、设置）一起
 | `--export <file> [output.html]` | 将会话文件导出为 HTML |
 | `--tools` / `--exclude-tools` / `--no-tools` | 工具 allowlist/denylist，支持 `*` 模式与 `+name` / `-name` 调整；`--tools` 默认保留 MCP 工具，除非条目以 `mcp__` 开头 |
 | `--no-mcp` | 本次运行关闭内建 MCP 客户端 |
-| `--offline` | 本次运行关闭所有网络端点 |
+| `--offline` | 本次运行关闭所有网络端点；`/usage` 只读取会话缓存，不执行任何 provider 脚本 |
 | `--use-theme <name[/name]>` | 本次运行使用的初始交互主题 |
 | `@<file>` | 将文件（文本或图片）附加到初始消息 |
 

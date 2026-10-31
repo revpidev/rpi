@@ -5501,10 +5501,17 @@ impl AgentSession {
                         })
                         .unwrap_or_default()
                 });
+                let credentials: Arc<dyn crate::core::usage_providers::UsageCredentialResolver> =
+                    Arc::new(
+                        crate::core::usage_providers::SessionUsageCredentialResolver::new(
+                            self.downgrade(),
+                        ),
+                    );
                 Arc::new(crate::core::usage_providers::UsageProviderRegistry::new(
                     agent_dir,
                     self.inner.cwd.clone(),
                     settings,
+                    credentials,
                 ))
             })
             .clone()

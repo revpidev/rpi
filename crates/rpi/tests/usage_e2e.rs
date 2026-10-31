@@ -60,8 +60,13 @@ impl EnvGuard {
             "RPI_CODING_AGENT_DIR",
             Some(agent_dir.to_string_lossy().into_owned()),
         );
-        set("RPI_OFFLINE", Some("1".to_owned()));
+        // Usage scripts stay offline-only; V18-10 gates RPI_OFFLINE before
+        // every script, so these fixtures use fake keys and no network.
+        set("RPI_OFFLINE", None);
         set("RPI_SKIP_VERSION_CHECK", Some("1".to_owned()));
+        set("DEEPSEEK_API_KEY", Some("sk-deepseek-fixture".to_owned()));
+        set("ZAI_API_KEY", Some("sk-zai-fixture".to_owned()));
+        set("KIMI_API_KEY", Some("sk-kimi-fixture".to_owned()));
         set("XDG_CONFIG_HOME", None);
         set("LANG", None);
         set("LC_ALL", None);

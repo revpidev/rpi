@@ -664,6 +664,27 @@ pub trait HostActions: Send + Sync {
         None
     }
 
+    /// `ctx.usage.cached(provider)` (V18-10 / ADR-0039): the same-identity
+    /// cached envelope with `source:"cache"` and `stale` per TTL, or a
+    /// classified `cache-miss` / `auth-unavailable` / `origin-mismatch`.
+    /// This path never runs a script or touches the network.
+    async fn usage_cached(&self, _provider: &str) -> Value {
+        crate::usage::UsageFetchResult::failure(crate::usage::UsageError::new(
+            crate::usage::UsageErrorKind::AuthUnavailable,
+        ))
+        .to_json()
+    }
+
+    /// `ctx.usage.fetchDetailed(provider, force?)` (V18-10 / ADR-0039):
+    /// `{envelope?, source?, stale, error?}` with the full network/cache,
+    /// stale-fallback and offline combinations.
+    async fn usage_fetch_detailed(&self, _provider: &str, _force: bool) -> Value {
+        crate::usage::UsageFetchResult::failure(crate::usage::UsageError::new(
+            crate::usage::UsageErrorKind::AuthUnavailable,
+        ))
+        .to_json()
+    }
+
     /// `ctx.usage.register(provider, scriptPath)`: register (or replace) a
     /// provider's script path. Pre-bind calls queue in the extension API
     /// and flush on `bindCore`.
@@ -846,7 +867,8 @@ pub struct HasOverlayState {
     pub capturing: bool,
 }
 
-/// Failure reason of the additive `ui.emitText` output channel
+/// Failure reason of the additive `ui.emitText` / `ui.emitStructured` output
+/// channels
 /// (ADR-0040 / V18-02). `UnsupportedOutput` is answered by
 /// [`crate::bridges::NullUiBridge`] and any other bridge that has no
 /// machine-readable output path (NullUi / subagent). Its wire string is
@@ -856,12 +878,16 @@ pub struct HasOverlayState {
 pub enum UiOutputError {
     /// This bridge/mode has no output channel for command text.
     UnsupportedOutput,
+    /// The structured-output method/data pair is not part of the frozen
+    /// `ui.emitStructured` contract.
+    InvalidRequest,
 }
 
 impl std::fmt::Display for UiOutputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedOutput => f.write_str("unsupported-output"),
+            Self::InvalidRequest => f.write_str("invalid-request"),
         }
     }
 }
@@ -977,6 +1003,24 @@ pub trait UiBridge: Send + Sync {
     /// channel and produces no output. The default stays unsupported so a
     /// bridge must opt in explicitly.
     fn emit_text(&self, _text: &str, _validate_only: bool) -> Result<(), UiOutputError> {
+        Err(UiOutputError::UnsupportedOutput)
+    }
+
+    /// `ui.emitStructured {method, data, validateOnly?}` (rpi additive,
+    /// ADR-0039 / V18-10): machine-readable usage reports. `method` is
+    /// `usageText` (data is a string) or `usageReport` (data is an object or
+    /// array). TUI converts both to a notification body (pretty JSON for
+    /// reports); RPC and `--mode json` emit `usageReport` as its own
+    /// `extension_ui_request` frame; print writes the text or one compact
+    /// JSON line to controlled RawStdout. NullUi/subagents answer
+    /// [`UiOutputError::UnsupportedOutput`] for `validate_only` and actual
+    /// output alike. The default stays unsupported so a bridge must opt in.
+    fn emit_structured(
+        &self,
+        _method: &str,
+        _data: &Value,
+        _validate_only: bool,
+    ) -> Result<(), UiOutputError> {
         Err(UiOutputError::UnsupportedOutput)
     }
 
@@ -3466,6 +3510,28 @@ impl ExtensionApi {
             .runtime
             .require_actions()?
             .usage_fetch(provider, force)
+            .await)
+    }
+
+    /// `ctx.usage.cached(provider)` (V18-10 / ADR-0039): the same-identity
+    /// cache-only view. Zero scripts, zero network.
+    pub async fn usage_cached(&self, provider: &str) -> Result<Value, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self.runtime.require_actions()?.usage_cached(provider).await)
+    }
+
+    /// `ctx.usage.fetchDetailed(provider, force?)` (V18-10 / ADR-0039): the
+    /// detailed network/cache result with `stale` and a classified error.
+    pub async fn usage_fetch_detailed(
+        &self,
+        provider: &str,
+        force: bool,
+    ) -> Result<Value, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self
+            .runtime
+            .require_actions()?
+            .usage_fetch_detailed(provider, force)
             .await)
     }
 

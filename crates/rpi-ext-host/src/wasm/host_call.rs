@@ -102,6 +102,8 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         // (the script execution itself stays host-internal).
         | "ctx.usage.listProviders"
         | "ctx.usage.fetch"
+        | "ctx.usage.cached"
+        | "ctx.usage.fetchDetailed"
         | "ctx.usage.register"
         | "ctx.isIdle"
         | "ctx.isProjectTrusted"
@@ -1095,6 +1097,32 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .usage_register(&provider, &script_path)
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(Value::Null)
+        }
+        "ctx.usage.cached" => {
+            let provider = str_arg(&args, "provider").unwrap_or_default().to_owned();
+            if provider.is_empty() {
+                return err("invalidRequest", "ctx.usage.cached: missing provider");
+            }
+            let api = state.api.clone();
+            let handle = state.async_handle.clone();
+            block_on(&handle, async move { api.usage_cached(&provider).await })?
+                .map_err(|e| (error_kind(&e), e.to_string()))
+        }
+        "ctx.usage.fetchDetailed" => {
+            let provider = str_arg(&args, "provider").unwrap_or_default().to_owned();
+            if provider.is_empty() {
+                return err(
+                    "invalidRequest",
+                    "ctx.usage.fetchDetailed: missing provider",
+                );
+            }
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let api = state.api.clone();
+            let handle = state.async_handle.clone();
+            block_on(&handle, async move {
+                api.usage_fetch_detailed(&provider, force).await
+            })?
+            .map_err(|e| (error_kind(&e), e.to_string()))
         }
         "registerProvider" => {
             let name = str_arg(&args, "name").unwrap_or_default().to_owned();
@@ -3178,6 +3206,8 @@ mod v16_05_wire_tests {
             "setMode",
             "ctx.usage.listProviders",
             "ctx.usage.fetch",
+            "ctx.usage.cached",
+            "ctx.usage.fetchDetailed",
             "ctx.usage.register",
         ];
         for method in methods {
@@ -3215,6 +3245,18 @@ mod v16_05_wire_tests {
         )
         .expect_err("unbound actions");
         assert_eq!(value.0, "unbound");
+        let mut state = unbound_state(HashSet::from([Capability::Session]));
+        let value = dispatch(&mut state, "ctx.usage.cached", json!({"provider": "p"}))
+            .expect_err("unbound actions");
+        assert_eq!(value.0, "unbound");
+        let mut state = unbound_state(HashSet::from([Capability::Session]));
+        let value = dispatch(
+            &mut state,
+            "ctx.usage.fetchDetailed",
+            json!({"provider": "p", "force": true}),
+        )
+        .expect_err("unbound actions");
+        assert_eq!(value.0, "unbound");
     }
 
     /// Pre-bind `ctx.usage.register` queues in the runtime (the flush is
@@ -3247,6 +3289,12 @@ mod v16_05_wire_tests {
         assert_eq!(value.0, "invalidRequest");
         let value =
             dispatch(&mut state, "ctx.usage.fetch", json!({})).expect_err("missing provider");
+        assert_eq!(value.0, "invalidRequest");
+        let value =
+            dispatch(&mut state, "ctx.usage.cached", json!({})).expect_err("missing provider");
+        assert_eq!(value.0, "invalidRequest");
+        let value = dispatch(&mut state, "ctx.usage.fetchDetailed", json!({}))
+            .expect_err("missing provider");
         assert_eq!(value.0, "invalidRequest");
     }
 }

@@ -75,6 +75,55 @@ pub fn supports_emit_text<H: HostCall + ?Sized>(host: &H) -> Result<bool, Intera
     }
 }
 
+/// `ui.emitStructured` — the additive host-call of ADR-0039 / V18-10.
+pub const METHOD_UI_EMIT_STRUCTURED: &str = "ui.emitStructured";
+
+/// Emit a structured usage report through the current mode's output channel.
+///
+/// `method` is `usageText` (a string payload) or `usageReport` (an object or
+/// array payload). TUI shows it as a notification body; RPC/`--mode json`
+/// emit the `usageReport` frame; print writes one compact JSON line. NullUi
+/// answers `unsupported-output`; call [`validate_structured`] before fetching
+/// so the command never runs a script/network request without a channel.
+pub fn emit_structured<H: HostCall + ?Sized>(
+    host: &H,
+    method: &str,
+    data: &Value,
+    validate_only: bool,
+) -> Result<(), InteractiveUiError> {
+    let mut args = serde_json::Map::new();
+    args.insert("method".to_owned(), Value::String(method.to_owned()));
+    args.insert("data".to_owned(), data.clone());
+    if validate_only {
+        args.insert("validateOnly".to_owned(), Value::Bool(true));
+    }
+    host.call(METHOD_UI_EMIT_STRUCTURED, Value::Object(args))?;
+    Ok(())
+}
+
+/// Validate the structured-output channel without producing output.
+pub fn validate_structured<H: HostCall + ?Sized>(host: &H) -> Result<(), InteractiveUiError> {
+    emit_structured(host, "usageText", &Value::String(String::new()), true)
+}
+
+/// Whether `error` is the host's `unsupported-output` refusal.
+pub fn is_unsupported_structured_output(error: &InteractiveUiError) -> bool {
+    is_unsupported_output(error)
+}
+
+/// Probe whether the host implements `ui.emitStructured`.
+pub fn supports_emit_structured<H: HostCall + ?Sized>(
+    host: &H,
+) -> Result<bool, InteractiveUiError> {
+    match validate_structured(host) {
+        Ok(()) => Ok(true),
+        Err(error) => match error.kind {
+            crate::interactive_ui::InteractiveUiErrorKind::UnknownMethod => Ok(false),
+            _ => Err(error),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +191,46 @@ mod tests {
             host.calls.borrow()[0].1,
             json!({"text": "", "validateOnly": true})
         );
+    }
+
+    #[test]
+    fn sends_structured_text_and_report() {
+        let host = host(Ok(Value::Null));
+        emit_structured(&host, "usageText", &json!("report"), false).expect("text");
+        emit_structured(
+            &host,
+            "usageReport",
+            &json!([{"provider": "x", "stale": false}]),
+            false,
+        )
+        .expect("report");
+        validate_structured(&host).expect("validate");
+        let calls = host.calls.borrow();
+        assert_eq!(calls[0].0, METHOD_UI_EMIT_STRUCTURED);
+        assert_eq!(calls[0].1, json!({"method": "usageText", "data": "report"}));
+        assert_eq!(calls[1].1["method"], json!("usageReport"));
+        assert_eq!(calls[1].1["data"][0]["provider"], json!("x"));
+        assert_eq!(
+            calls[2].1,
+            json!({"method": "usageText", "data": "", "validateOnly": true})
+        );
+    }
+
+    #[test]
+    fn structured_output_probe_and_unsupported_error() {
+        let unsupported = host(Err(InteractiveUiError::new(
+            InteractiveUiErrorKind::Call,
+            UNSUPPORTED_OUTPUT,
+        )));
+        let error = validate_structured(&unsupported).expect_err("no channel");
+        assert!(is_unsupported_structured_output(&error));
+
+        let old = host(Err(InteractiveUiError::new(
+            InteractiveUiErrorKind::UnknownMethod,
+            "unknown host call: ui.emitStructured",
+        )));
+        assert!(!supports_emit_structured(&old).expect("probe"));
+        let current = host(Ok(Value::Null));
+        assert!(supports_emit_structured(&current).expect("probe"));
     }
 }

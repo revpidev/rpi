@@ -132,6 +132,31 @@ Response:
 
 `hasUI` keeps its existing meaning: print/json bridges are output-capable but report `hasUI = false` (`is_noop`); only the interactive/RPC bridges report `hasUI = true`.
 
+## Extension structured output (`ui.emitStructured`, v0.1.8 / ADR-0039)
+
+`ui.emitStructured {method, data, validateOnly?}` is the machine-readable output channel for usage reports (V18-10). `method` is fixed:
+
+- `usageText`: `data` is a string (multi-line report text).
+- `usageReport`: `data` is a JSON object (single provider) or array (`all`). It is never encoded as a string.
+
+Other methods, or a mismatched `data` type, answer a structured `invalidRequest` error before any output. The output matrix:
+
+| Mode | `usageText` | `usageReport` |
+|---|---|---|
+| TUI | notification text | notification body is pretty-printed JSON |
+| RPC | `extension_ui_request{method:"notify",message}` | `extension_ui_request{id,method:"usageReport",data}` |
+| `--mode json` | same notify frame on raw stdout | same `usageReport` frame |
+| `--mode text` | text plus one trailing newline | one compact JSON line, no wrapper |
+| NullUi / subagent | `call` error `unsupported-output` | same |
+
+Report objects always contain `schemaVersion:1`, `provider` and `stale`; `current`, `source`, `envelope` and `error` are optional. `source` is `network`, `cache` or (for the current-session token-only fallback) `local`; a cache miss keeps the three required fields and only omits `source`/`envelope`. Errors carry a fixed `kind` and an actionable `action`; no raw provider body, stderr, token or account id is included.
+
+`validateOnly:true` checks the output channel without producing anything. Commands call it **before** fetching usage data, so a NullUi/subagent session fails with `unsupported-output` before running a script or touching the network. Command output is not gated on `hasUI`.
+
+```json
+{"type":"extension_ui_request","id":"<uuid>","method":"usageReport","data":{"schemaVersion":1,"provider":"deepseek","stale":false,"source":"network","envelope":{"schemaVersion":1,"provider":"deepseek","displayText":"CNY 9.99"}}}
+```
+
 ## Backpressure and write errors
 
 - Event writes in print/rpc mode go through a unified backpressure write path (`crates/rpi/src/core/output_guard.rs::RawStdout`): when the pipe peer consumes slowly, event sources are throttled naturally — events are never dropped, merged, or buffered unboundedly.
@@ -145,6 +170,7 @@ Response:
 | quadratic-output regression (#7290) | `crates/rpi/tests/regression_7290_json_stream_linear.rs` |
 | backpressure against a slow consumer | `crates/rpi/tests/json_rpc_backpressure_test.rs` |
 | `ui.emitText` RPC/JSON frame + print newline + `validateOnly` + `unsupported-output` | `crates/rpi/src/modes/rpc/ui_bridge.rs` tests, `crates/rpi/src/modes/print_mode.rs` tests, `crates/rpi-ext-host/src/wasm/ui_dispatch.rs` tests |
+| `ui.emitStructured` usageText/usageReport RPC/JSON/print/TUI/NullUi routing, `validateOnly`, one compact stdout line | `crates/rpi/src/modes/rpc/ui_bridge.rs` tests, `crates/rpi/src/modes/print_mode.rs` tests, `crates/rpi/src/modes/interactive/interactive_mode.rs` tests, `crates/rpi-ext-host/src/wasm/ui_dispatch.rs` tests |
 | 33-command contract | `crates/rpi` `rpc_mode_test.rs` (20 contract tests) |
 | `clear_queue` retrieve/drain + Esc combination (idle after clear_queue + abort; drained steering not consumed) | `rpc_mode_test.rs` `clear_queue_returns_and_purges_queues` |
 | `prompt` disposition (`handled`/`queued`/`started`) + `streamingBehavior`; `steer`/`follow_up` two-state disposition; this document's field names/shapes | `rpc_mode_test.rs` `prompt_lifecycle_messages_state_stats`, `steer_follow_up_abort_during_streaming`, `prompt_extension_command_reports_handled_without_agent_settled`, `json_rpc_doc_pins_prompt_dispositions` |

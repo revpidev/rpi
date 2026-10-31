@@ -158,6 +158,43 @@ pub enum UiOutputFlavor {
 /// the bridge only formats the chunk.
 pub type UiOutputSink = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Validate and format one `ui.emitStructured` payload for a line-oriented
+/// sink: `usageText` is the string itself, `usageReport` is compact JSON.
+fn structured_single_line(method: &str, data: &Value) -> Result<String, UiOutputError> {
+    match method {
+        "usageText" => data
+            .as_str()
+            .map(str::to_owned)
+            .ok_or(UiOutputError::InvalidRequest),
+        "usageReport" => serde_json::to_string(data).map_err(|_| UiOutputError::InvalidRequest),
+        _ => Err(UiOutputError::InvalidRequest),
+    }
+}
+
+/// Validate and build the RPC/JSON-mode frame for `ui.emitStructured`.
+fn structured_json_frame(method: &str, data: &Value) -> Result<Value, UiOutputError> {
+    let id = rpi_ai::utils::uuid::random_uuid();
+    match method {
+        "usageText" => {
+            let text = data.as_str().ok_or(UiOutputError::InvalidRequest)?;
+            Ok(serde_json::json!({
+                "type": "extension_ui_request",
+                "id": id,
+                "method": "notify",
+                "message": text,
+                "notifyType": "info",
+            }))
+        }
+        "usageReport" => Ok(serde_json::json!({
+            "type": "extension_ui_request",
+            "id": id,
+            "method": "usageReport",
+            "data": data,
+        })),
+        _ => Err(UiOutputError::InvalidRequest),
+    }
+}
+
 /// Output-capable, non-interactive bridge for plain print and `--mode json`
 /// (ADR-0040 / 04 §7.4). `hasUI` stays false (`is_noop = true`) so an
 /// extension cannot mistake it for an interactive TUI, but `ui.emitText`
@@ -240,6 +277,39 @@ impl UiBridge for OutputUiBridge {
                     "message": text,
                     "notifyType": "info",
                 });
+                if let Ok(mut line) = serde_json::to_string(&frame) {
+                    line.push('\n');
+                    (self.sink)(&line);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `ui.emitStructured` (rpi additive, ADR-0039 / V18-10):
+    /// `usageText` is a string, `usageReport` compact JSON; both take one
+    /// trailing newline. JSON mode emits the notify/usageReport frame. The
+    /// sink records a broken stdout for the mode exit code; `validate_only`
+    /// only checks the channel.
+    fn emit_structured(
+        &self,
+        method: &str,
+        data: &Value,
+        validate_only: bool,
+    ) -> Result<(), UiOutputError> {
+        if validate_only {
+            return Ok(());
+        }
+        match self.flavor {
+            UiOutputFlavor::Text => {
+                let mut out = structured_single_line(method, data)?;
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                (self.sink)(&out);
+            }
+            UiOutputFlavor::JsonNotify => {
+                let frame = structured_json_frame(method, data)?;
                 if let Ok(mut line) = serde_json::to_string(&frame) {
                     line.push('\n');
                     (self.sink)(&line);
@@ -416,6 +486,14 @@ impl UiBridge for NamespacedUiBridge {
 
     fn emit_text(&self, text: &str, validate_only: bool) -> Result<(), UiOutputError> {
         self.inner.emit_text(text, validate_only)
+    }
+    fn emit_structured(
+        &self,
+        method: &str,
+        data: &Value,
+        validate_only: bool,
+    ) -> Result<(), UiOutputError> {
+        self.inner.emit_structured(method, data, validate_only)
     }
 
     fn has_overlay(&self) -> HasOverlayState {
@@ -837,6 +915,14 @@ impl UiBridge for UiPromptBridge {
 
     fn emit_text(&self, text: &str, validate_only: bool) -> Result<(), UiOutputError> {
         self.inner.emit_text(text, validate_only)
+    }
+    fn emit_structured(
+        &self,
+        method: &str,
+        data: &Value,
+        validate_only: bool,
+    ) -> Result<(), UiOutputError> {
+        self.inner.emit_structured(method, data, validate_only)
     }
 
     fn has_overlay(&self) -> HasOverlayState {

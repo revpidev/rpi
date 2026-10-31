@@ -556,6 +556,35 @@ impl Extension {
         .map(|value| if value.is_null() { None } else { Some(value) })
     }
 
+    /// `ctx.usage.fetchDetailed(provider, force?)` (V18-10 / ADR-0039): the
+    /// detailed result `{envelope?, source?, stale, error?}`. Parse it with
+    /// `rpi_ext_host::usage::UsageFetchResult` in a native plugin.
+    pub fn usage_fetch_detailed(&self, provider: &str, force: bool) -> Result<Value, String> {
+        host_call(
+            "ctx.usage.fetchDetailed",
+            json!({ "provider": provider, "force": force }),
+        )
+    }
+
+    /// `ctx.usage.cached(provider)` (V18-10 / ADR-0039): cache-only result;
+    /// zero scripts and zero network.
+    pub fn usage_cached(&self, provider: &str) -> Result<Value, String> {
+        host_call("ctx.usage.cached", json!({ "provider": provider }))
+    }
+
+    /// Whether the host implements the V18-10 detailed usage surface
+    /// (`ctx.usage.cached` / `ctx.usage.fetchDetailed`). Probes the cache-only
+    /// method with a provider id that cannot exist.
+    pub fn supports_usage_detail(&self) -> Result<bool, String> {
+        match host_call_typed("ctx.usage.cached", json!({ "provider": "__rpi_probe__" })) {
+            Ok(_) => Ok(true),
+            Err(error) => match error.kind {
+                crate::interactive_ui::InteractiveUiErrorKind::UnknownMethod => Ok(false),
+                _ => Err(error.to_string()),
+            },
+        }
+    }
+
     /// `ctx.usage.register(provider, scriptPath)`: register (or replace) a
     /// provider's script path. Pre-bind calls queue in the extension API
     /// and flush on `bindCore`.

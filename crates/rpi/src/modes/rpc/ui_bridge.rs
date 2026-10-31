@@ -200,6 +200,35 @@ impl UiBridge for RpcUiBridge {
         Ok(())
     }
 
+    /// `ui.emitStructured` (rpi additive, ADR-0039 / V18-10): `usageText`
+    /// reuses the notify frame; `usageReport` is its own
+    /// `extension_ui_request{method:"usageReport",data}` frame so the JSON
+    /// object/array is never embedded in a message string.
+    fn emit_structured(
+        &self,
+        method: &str,
+        data: &Value,
+        validate_only: bool,
+    ) -> Result<(), UiOutputError> {
+        if validate_only {
+            return Ok(());
+        }
+        match method {
+            "usageText" => {
+                let text = data.as_str().ok_or(UiOutputError::InvalidRequest)?;
+                self.notify(text, NotifyType::Info);
+            }
+            "usageReport" => self.emit(json!({
+                "type": "extension_ui_request",
+                "id": rpi_ai::utils::uuid::random_uuid(),
+                "method": "usageReport",
+                "data": data,
+            })),
+            _ => return Err(UiOutputError::InvalidRequest),
+        }
+        Ok(())
+    }
+
     /// Degraded: raw terminal input is not supported (rpc-mode.ts:165-167).
     fn on_terminal_input(&self, _handler: TerminalInputHandler) -> Unsubscribe {
         Box::new(|| {})
@@ -383,5 +412,41 @@ mod tests {
         assert_eq!(frame["message"], "statusline: help");
         assert_eq!(frame["notifyType"], "info");
         assert!(frame["id"].as_str().is_some_and(|id| !id.is_empty()));
+    }
+
+    #[test]
+    fn emit_structured_routes_text_and_report_frames() {
+        let (bridge, buffer) = bridge();
+        bridge
+            .emit_structured("usageReport", &serde_json::json!([{"provider": "x"}]), true)
+            .expect("validate");
+        assert_eq!(buffer.text(), "");
+        let report = serde_json::json!({
+            "schemaVersion": 1,
+            "provider": "x",
+            "stale": false,
+            "source": "cache",
+        });
+        bridge
+            .emit_structured("usageReport", &report, false)
+            .expect("report");
+        let frame: Value = serde_json::from_str(buffer.text().trim()).expect("frame json");
+        assert_eq!(frame["type"], "extension_ui_request");
+        assert_eq!(frame["method"], "usageReport");
+        assert_eq!(frame["data"], report);
+        assert!(frame.get("message").is_none());
+        assert!(frame["id"].as_str().is_some_and(|id| !id.is_empty()));
+
+        bridge
+            .emit_structured("usageText", &Value::String("usage: ok".to_owned()), false)
+            .expect("text");
+        let frames: Vec<Value> = buffer
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("line json"))
+            .collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1]["method"], "notify");
+        assert_eq!(frames[1]["message"], "usage: ok");
     }
 }
