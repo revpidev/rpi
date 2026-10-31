@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rpi_agent::compaction::branch_summarization::{
-    GenerateBranchSummaryOptions, generate_branch_summary, prepare_branch_entries,
+    BRANCH_SUMMARY_PROMPT, GenerateBranchSummaryOptions, generate_branch_summary,
+    prepare_branch_entries,
 };
 use rpi_agent::compaction::utils::{
     FileOperations, SUMMARIZATION_SYSTEM_PROMPT, compute_file_lists, create_file_ops,
@@ -1322,6 +1323,42 @@ async fn prompt_branch_custom_instructions_byte_exact() {
         captured_prompt(&capture, 0),
         prompt_text("branch_custom_instructions.txt")
     );
+}
+
+/// `if (replaceInstructions && customInstructions)` / `else if
+/// (customInstructions)` (branch-summarization.ts:328-331) is truthiness:
+/// an empty custom prompt uses the default branch prompt in both modes.
+#[tokio::test]
+async fn branch_empty_custom_instructions_use_default_prompt() {
+    let mut b = EntryBuilder::new();
+    b.user("short branch");
+    b.assistant(vec![text_block("work")]);
+    let entries = b.finish();
+
+    for replace_instructions in [false, true] {
+        let capture = capture_stream_fn(&["BRANCH SUMMARY TEXT"]);
+        let args = SummarizationArgs::default();
+        let options = GenerateBranchSummaryOptions {
+            model: &test_model(),
+            stream_fn: &capture.stream_fn,
+            args: &args,
+            custom_instructions: Some(""),
+            replace_instructions,
+            reserve_tokens: 16384,
+            callbacks: None,
+        };
+        generate_branch_summary(&entries, &options).await;
+
+        let prompt = captured_prompt(&capture, 0);
+        assert!(
+            prompt.ends_with(BRANCH_SUMMARY_PROMPT),
+            "replace_instructions={replace_instructions}: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Additional focus:"),
+            "replace_instructions={replace_instructions}: {prompt}"
+        );
+    }
 }
 
 /// #11036 (6fcb48670): branch summaries no longer cap output at

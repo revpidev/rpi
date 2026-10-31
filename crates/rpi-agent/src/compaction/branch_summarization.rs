@@ -371,8 +371,14 @@ pub async fn generate_branch_summary(
     let llm_messages = convert_to_llm(&messages);
     let conversation_text = serialize_conversation(&llm_messages);
 
-    // Build prompt.
-    let instructions = match (options.replace_instructions, options.custom_instructions) {
+    // Build prompt. Upstream checks truthiness (`if (replaceInstructions &&
+    // customInstructions)` / `else if (customInstructions)`), so an empty
+    // string falls back to the default prompt instead of replacing it or
+    // appending an empty focus suffix.
+    let custom_instructions = options
+        .custom_instructions
+        .filter(|instructions| !instructions.is_empty());
+    let instructions = match (options.replace_instructions, custom_instructions) {
         (true, Some(custom)) => custom.to_owned(),
         (_, Some(custom)) => format!("{BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: {custom}"),
         (_, None) => BRANCH_SUMMARY_PROMPT.to_owned(),
