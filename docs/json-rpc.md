@@ -149,7 +149,7 @@ Other methods, or a mismatched `data` type, answer a structured `invalidRequest`
 | `--mode text` | text plus one trailing newline | one compact JSON line, no wrapper |
 | NullUi / subagent | `call` error `unsupported-output` | same |
 
-Report objects always contain `schemaVersion:1`, `provider` and `stale`; `current`, `source`, `envelope` and `error` are optional. `source` is `network`, `cache` or (for the current-session token-only fallback) `local`; a cache miss keeps the three required fields and only omits `source`/`envelope`. Errors carry a fixed `kind` and an actionable `action`; no raw provider body, stderr, token or account id is included.
+Report objects always contain `schemaVersion:1`, `provider` and `stale`; `current`, `source`, `envelope` and `error` are optional. `source` is `network`, `cache` or (for the current-session token-only fallback) `local`; a cache miss keeps the three required fields and only omits `source`/`envelope`. Errors carry a fixed `kind` and an actionable `action`; no raw provider body, stderr, token or account id is included. `displayText`/`label`/`plan`/`unit` are script-authored display text: the host drops unknown envelope fields but does not content-filter script-chosen text, so provider scripts must not write credentials there.
 
 `validateOnly:true` checks the output channel without producing anything. Commands call it **before** fetching usage data, so a NullUi/subagent session fails with `unsupported-output` before running a script or touching the network. Command output is not gated on `hasUI`.
 

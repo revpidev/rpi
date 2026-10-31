@@ -723,6 +723,61 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn cached_stale_is_reported_and_a_non_forced_fetch_refreshes() {
+        let temp = TempDir::new();
+        let script = temp.path().join("stale.py");
+        let marker = temp.path().join("runs");
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\necho run >> {}\nprintf '%s' '{{\"schemaVersion\":1,\"provider\":\"p\",\"displayText\":\"p: ok\"}}'\n",
+                marker.display()
+            ),
+        );
+        let (mut registry, _agent) = registry(&temp, settings_for("p", &script));
+        let first = registry.fetch_detailed("p", true).await;
+        assert_eq!(first.source, Some(super::super::UsageSource::Network));
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1
+        );
+
+        // Expire the TTL without changing the identity: cached() marks the
+        // same-identity value stale and still runs no script; a non-forced
+        // fetch sees the expired entry and refreshes it.
+        registry.cache.set_ttl(Duration::from_millis(0));
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let cached = registry.cached_result("p").await;
+        assert_eq!(cached.source, Some(super::super::UsageSource::Cache));
+        assert!(cached.stale);
+        assert!(cached.error.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1,
+            "cached stale must not run a script"
+        );
+
+        let refreshed = registry.fetch_detailed("p", false).await;
+        assert_eq!(refreshed.source, Some(super::super::UsageSource::Network));
+        assert!(!refreshed.stale);
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            2,
+            "an expired non-forced cache refreshes exactly once"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn failure_matrix_keeps_last_success() {
         let temp = TempDir::new();
         let script = temp.path().join("flaky.py");

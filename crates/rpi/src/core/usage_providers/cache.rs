@@ -108,6 +108,13 @@ impl UsageCache {
         }
     }
 
+    /// Test-only TTL override (the registry's stale-branch tests need to
+    /// expire an existing entry without dropping its identity).
+    #[cfg(test)]
+    pub(crate) fn set_ttl(&mut self, ttl: Duration) {
+        self.ttl = ttl;
+    }
+
     /// A TTL-fresh entry for `key`, if any.
     pub fn get_fresh(&self, key: &UsageCacheKey) -> Option<UsageEnvelope> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());

@@ -135,6 +135,21 @@ pub fn host_call_typed(
     ))
 }
 
+/// Classify a feature-probe reply: `Ok(value)` proves support, an
+/// `unknownMethod` error is the old-host signal (`Ok(None)`), and every other
+/// error is a real failure.
+fn classify_feature_probe<T>(
+    result: Result<T, interactive_ui::InteractiveUiError>,
+) -> Result<Option<T>, String> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => match error.kind {
+            interactive_ui::InteractiveUiErrorKind::UnknownMethod => Ok(None),
+            _ => Err(error.to_string()),
+        },
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 fn next_seq() -> u64 {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -576,13 +591,11 @@ impl Extension {
     /// (`ctx.usage.cached` / `ctx.usage.fetchDetailed`). Probes the cache-only
     /// method with a provider id that cannot exist.
     pub fn supports_usage_detail(&self) -> Result<bool, String> {
-        match host_call_typed("ctx.usage.cached", json!({ "provider": "__rpi_probe__" })) {
-            Ok(_) => Ok(true),
-            Err(error) => match error.kind {
-                crate::interactive_ui::InteractiveUiErrorKind::UnknownMethod => Ok(false),
-                _ => Err(error.to_string()),
-            },
-        }
+        classify_feature_probe(host_call_typed(
+            "ctx.usage.cached",
+            json!({ "provider": "__rpi_probe__" }),
+        ))
+        .map(|value| value.is_some())
     }
 
     /// `ctx.usage.register(provider, scriptPath)`: register (or replace) a
@@ -600,26 +613,15 @@ impl Extension {
     /// (`getMode` / `setMode` / `mode_change`). Probes the read-only
     /// `getMode`; an older host answers `unknownMethod` (`Ok(false)`).
     pub fn supports_permission_mode(&self) -> Result<bool, String> {
-        match host_call_typed("getMode", json!({})) {
-            Ok(_) => Ok(true),
-            Err(error) => match error.kind {
-                crate::interactive_ui::InteractiveUiErrorKind::UnknownMethod => Ok(false),
-                _ => Err(error.to_string()),
-            },
-        }
+        classify_feature_probe(host_call_typed("getMode", json!({}))).map(|value| value.is_some())
     }
 
     /// Whether the host implements the V16-05 usage-provider surface
     /// (`ctx.usage.*`). Probes the read-only `ctx.usage.listProviders`; an
     /// older host answers `unknownMethod` (`Ok(false)`).
     pub fn supports_usage_providers(&self) -> Result<bool, String> {
-        match host_call_typed("ctx.usage.listProviders", json!({})) {
-            Ok(_) => Ok(true),
-            Err(error) => match error.kind {
-                crate::interactive_ui::InteractiveUiErrorKind::UnknownMethod => Ok(false),
-                _ => Err(error.to_string()),
-            },
-        }
+        classify_feature_probe(host_call_typed("ctx.usage.listProviders", json!({})))
+            .map(|value| value.is_some())
     }
 
     /// Host call escape hatch for the rest of the capability surface
@@ -1042,5 +1044,27 @@ mod tests {
             "request": {"model": {"provider": "router", "id": "other"}},
         }));
         assert!(missing.is_null());
+    }
+    #[test]
+    fn feature_probe_classifies_support_and_old_hosts() {
+        use crate::interactive_ui::{InteractiveUiError, InteractiveUiErrorKind};
+
+        assert_eq!(
+            classify_feature_probe(Ok(Value::Null)),
+            Ok(Some(Value::Null))
+        );
+        assert_eq!(
+            classify_feature_probe::<Value>(Err(InteractiveUiError::new(
+                InteractiveUiErrorKind::UnknownMethod,
+                "unknown host call: ctx.usage.cached",
+            ))),
+            Ok(None)
+        );
+        let error = classify_feature_probe::<Value>(Err(InteractiveUiError::new(
+            InteractiveUiErrorKind::Call,
+            "unsupported-output",
+        )))
+        .expect_err("real failure");
+        assert_eq!(error, "unsupported-output");
     }
 }
