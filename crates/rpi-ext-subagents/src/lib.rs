@@ -38,6 +38,7 @@ mod prompts;
 mod render;
 mod runner;
 mod runtime;
+mod scalars;
 mod session_fork;
 mod settings_lease;
 mod tool;
@@ -976,6 +977,13 @@ fn dispatch_message(message: &Value) -> Value {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let params = message.get("params").cloned().unwrap_or(Value::Null);
+            // FR-J R3 (#3060): providers may send declared booleans/integers as
+            // strings; convert them before any parser reads the params.
+            let params = if tool_name == "subagent" {
+                scalars::normalize_subagent_params(&params)
+            } else {
+                params
+            };
             // Child-safe mode blocks mutating management actions before
             // execution (fanout-child.ts allowlist, L174-189).
             if state.mode == PluginMode::ChildFanout

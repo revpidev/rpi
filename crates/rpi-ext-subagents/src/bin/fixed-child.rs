@@ -136,6 +136,34 @@ fn main() {
             );
             emit(&mut out, r#"{"type":"agent_settled"}"#);
         }
+        // TE51 FR-J R2 (#3051/#3075): the child ends on a terminal
+        // `agent_end` after a clean final reply and never reports
+        // `agent_settled` — the runner must still return the reply.
+        "terminal-agent-end" => {
+            emit(
+                &mut out,
+                r#"{"type":"session","version":3,"id":"fixed","timestamp":"2026-08-14T00:00:00.000Z","cwd":"/tmp"}"#,
+            );
+            emit(
+                &mut out,
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"terminal end reply"}],"usage":{"input":10,"output":4,"cost":{"total":0.01}},"model":"faux/fixed-1","stopReason":"stop"}}"#,
+            );
+            emit(&mut out, r#"{"type":"agent_end","willRetry":false}"#);
+        }
+        // TE51 FR-J R2: a compaction starts after that terminal `agent_end`
+        // and finishes before the process exits — the reply must survive it.
+        "terminal-agent-end-compaction" => {
+            emit(
+                &mut out,
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"reply before compaction"}],"usage":{"input":10,"output":4,"cost":{"total":0.01}},"model":"faux/fixed-1","stopReason":"stop"}}"#,
+            );
+            emit(&mut out, r#"{"type":"agent_end","willRetry":false}"#);
+            emit(&mut out, r#"{"type":"compaction_start","reason":"auto"}"#);
+            emit(
+                &mut out,
+                r#"{"type":"compaction_end","reason":"auto","willRetry":false}"#,
+            );
+        }
         // TE09: a run with real tool activity — tool_execution_start/end
         // pairs, a tool result and the final assistant message, so the
         // streaming snapshots carry currentTool/recentTools/toolCalls.

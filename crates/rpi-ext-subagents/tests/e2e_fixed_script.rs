@@ -448,6 +448,50 @@ fn e2e_fixed_child_full_pipeline() {
     assert_eq!(meta["usage"]["cost"], 0.42);
     assert_eq!(meta["model"], "faux/fixed-1");
 
+    // ---- Scenario 1a (TE51 FR-J R2): terminal agent_end without settle ---
+    // The child's last event is a non-retrying `agent_end` after a clean
+    // final reply and it exits without `agent_settled`; the foreground call
+    // must still return that reply instead of hanging.
+    rpi_test_env::set_var("RPI_E2E_MODE", "terminal-agent-end");
+    let started = std::time::Instant::now();
+    let result = execute(json!({ "agent": "scout", "task": "end on agent_end" }));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "terminal agent_end must settle promptly"
+    );
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    assert_eq!(result["content"][0]["text"], json!("terminal end reply"));
+
+    // A compaction that starts after that terminal event and finishes before
+    // exit must not drop or delay the reply.
+    rpi_test_env::set_var("RPI_E2E_MODE", "terminal-agent-end-compaction");
+    let started = std::time::Instant::now();
+    let result = execute(json!({ "agent": "scout", "task": "compact after final reply" }));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "post-final compaction must settle promptly"
+    );
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    assert_eq!(
+        result["content"][0]["text"],
+        json!("reply before compaction")
+    );
+
+    // Same shape in the background: the run still reaches a terminal state
+    // with the reply (no "exited before writing a result").
+    rpi_test_env::set_var("RPI_E2E_MODE", "terminal-agent-end");
+    let receipt = execute(json!({
+        "agent": "scout", "task": "background terminal end", "async": true
+    }));
+    assert_eq!(receipt["isError"], Value::Bool(false), "{receipt}");
+    // The wait returns instead of blocking forever on a child that never
+    // reports `agent_settled`.
+    let wait = rpi_ext_subagents::execute_tool_for_test(
+        "subagent_wait",
+        &json!({ "all": true, "timeoutMs": 30000 }),
+    );
+    assert_eq!(wait["isError"], Value::Bool(false), "{wait}");
+
     // ---- Scenario 1b: Git routing env is stripped, trust flows to argv ---
     // #2440: GIT_DIR/GIT_WORK_TREE/GIT_CONFIG_KEY_0 set in the parent must
     // not reach the child (the fixed-child dump now includes GIT_*).
