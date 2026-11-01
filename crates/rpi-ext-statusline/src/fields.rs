@@ -196,8 +196,9 @@ impl Palette {
     ///
     /// Theme color values may be hex, a variable name (`accent: "violet"`),
     /// a 256-color index, `oklch(...)`/`okhsl(...)` (host ThemeJson), or a
-    /// named base color. Hex/index/OKLCH/OKHSL resolve to truecolor through
-    /// the host color model; named base colors map to their ANSI family;
+    /// named base color. Hex/OKLCH/OKHSL resolve to truecolor through the
+    /// host color model, a 256-color index to its palette entry, and named
+    /// base colors map to their ANSI family;
     /// genuinely unknown values fall back to plain text — the contract says
     /// invalid/missing colors must not be guessed.
     pub fn from_theme(theme: &serde_json::Value) -> Self {

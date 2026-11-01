@@ -454,7 +454,10 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         "type": "items",
         "items": ["model"],
         "placement": "widget",
-        "useColors": true
+        "useColors": true,
+        // Long interval: the theme repaint must come from the fingerprint,
+        // not the periodic interval tick.
+        "refreshInterval": 60
     }}));
     set_canned(
         "ui.theme",
@@ -464,6 +467,8 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
     poll_until("red accent theme", |records| {
         last_widget_contains(records, "\u{1b}[38;2;255;0;0mTest Model")
     });
+    // Let the next poll settle on the red fingerprint before switching.
+    std::thread::sleep(Duration::from_millis(1500));
     set_canned(
         "ui.theme",
         json!({"appearance": "dark", "colors": {"accent": "#00ff00"}}),
