@@ -360,7 +360,7 @@ pub async fn refresh_loop(
                         if last_items_fingerprint.as_ref() != Some(&fingerprint) {
                             last_items_fingerprint = Some(fingerprint);
                             maybe_start_git(&calls, items, &ctx);
-                            let data = refresh_items(&calls, items, Some(ctx));
+                            let data = refresh_items(&calls, items, Some(ctx), true);
                             if data.is_some() {
                                 last_items_data = data;
                             }
@@ -436,7 +436,16 @@ pub async fn refresh_loop(
                         }
                         let ctx = fetch_items_ctx(&calls, items);
                         maybe_start_git(&calls, items, &ctx);
-                        let data = refresh_items(&calls, items, Some(ctx));
+                        let read_stats = matches!(
+                            reason,
+                            "session_start"
+                                | "session_compact"
+                                | "turn_end"
+                                | "agent_settled"
+                                | "interval"
+                                | "config_saved"
+                        );
+                        let data = refresh_items(&calls, items, Some(ctx), read_stats);
                         if data.is_some() {
                             last_items_data = data;
                         }
@@ -719,7 +728,7 @@ fn items_fingerprint(items: &ItemsConfig, ctx: &CtxData) -> String {
     });
     let git = with_engine(|engine| format!("{:?}", engine.git.info()));
     format!(
-        "{items:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{stats}|{git}|{live:?}",
+        "{items:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{stats}|{git}|{live:?}",
         ctx.cwd,
         ctx.model.as_ref().map(|model| model.get("id")),
         ctx.thinking_level,
@@ -727,6 +736,7 @@ fn items_fingerprint(items: &ItemsConfig, ctx: &CtxData) -> String {
         ctx.context_usage,
         ctx.mode,
         ctx.idle,
+        ctx.theme,
     )
 }
 
@@ -758,12 +768,11 @@ fn refresh_items(
     calls: &AsyncHostCalls,
     items: &ItemsConfig,
     ctx_override: Option<CtxData>,
+    read_stats: bool,
 ) -> Option<FieldData> {
-    if items.needs_session_stats() {
+    if items.needs_session_stats() && read_stats {
         let token = with_engine(|engine| engine.session_stats.begin_request());
-        let stats = host_ok(calls, "ctx.sessionStats", json!({}))
-            .and_then(|value| serde_json::from_value::<SessionStats>(value).ok());
-        match stats {
+        match fetch_session_stats(calls) {
             Some(stats) => {
                 with_engine(|engine| engine.session_stats.apply(token, stats));
             }
@@ -774,6 +783,18 @@ fn refresh_items(
     let data = build_field_data(items, &ctx);
     publish_items_from_data(calls, items, &data);
     Some(data)
+}
+
+/// Read `ctx.sessionStats` without the generic per-call warning (`host_ok`):
+/// a host that predates the method would otherwise log on every poll.
+fn fetch_session_stats(calls: &AsyncHostCalls) -> Option<SessionStats> {
+    let response = crate::host_call_static(calls, "ctx.sessionStats", json!({}));
+    if let Some(error) = response.get("error") {
+        tracing::debug!(?error, "rpi-statusline: ctx.sessionStats failed");
+        return None;
+    }
+    let value = response.get("ok")?.clone();
+    serde_json::from_value(value).ok()
 }
 
 /// One diagnostic per process: an old host without `ctx.sessionStats` omits

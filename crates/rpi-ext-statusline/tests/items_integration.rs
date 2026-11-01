@@ -347,8 +347,20 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         "message_end",
         json!({
             "type": "message_end",
-            "message": {"role": "assistant", "usage": {"output": 25}},
+            "message": {"role": "assistant", "usage": {"output": 40}},
         }),
+    );
+    // After the stream settles the exact provider count wins over the last
+    // streaming running total (R20 §4.3: 结束后 exact).
+    poll_until("post-stream exact live tokens", |records| {
+        last_widget_contains(records, "40")
+    });
+    assert!(
+        !widget_texts(&records())
+            .last()
+            .is_some_and(|text| text.contains("25")),
+        "the settled frame uses usage.output from message_end: {:?}",
+        widget_texts(&records()).last()
     );
 
     // ── 5. Turning live off stops the events and clears the measurement.

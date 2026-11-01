@@ -253,6 +253,19 @@ fn resolve_color(
             if let Some(variable) = vars.and_then(|vars| vars.get(text)) {
                 return resolve_color(variable, vars, depth + 1);
             }
+            // Host theme colors are ThemeJson literals: `oklch(...)` /
+            // `okhsl(...)` are first-class, so reuse the host's parser
+            // instead of treating them as invalid. The converted RGB gets a
+            // truecolor SGR parameter.
+            if let Ok(color) = rpi_tui::colors::parse_color(text) {
+                let rgb = rpi_tui::colors::color_to_rgb(&color);
+                return Some(format!(
+                    "38;2;{};{};{}",
+                    rgb.r.round() as u8,
+                    rgb.g.round() as u8,
+                    rgb.b.round() as u8
+                ));
+            }
             named_sgr(text).map(str::to_owned)
         }
         _ => None,
@@ -317,9 +330,15 @@ pub struct LiveView {
 }
 
 impl LiveView {
-    /// The provider-reported output count for the current message.
+    /// The provider-reported output count for the current message: the
+    /// streaming running total while in flight, the exact `message_end`
+    /// value once the stream settles (R20 §4.3).
     pub fn reported_output(self) -> Option<u64> {
-        self.output_tokens.or(self.output_tokens_exact)
+        if self.streaming {
+            self.output_tokens.or(self.output_tokens_exact)
+        } else {
+            self.output_tokens_exact.or(self.output_tokens)
+        }
     }
 }
 
@@ -530,7 +549,7 @@ fn raw_value(id: FieldId, data: &FieldData) -> Option<FieldValue> {
             let output = if live.streaming {
                 live.output_tokens
             } else {
-                live.output_tokens.or(live.output_tokens_exact)
+                live.output_tokens_exact.or(live.output_tokens)
             }?;
             Some(FieldValue::new(
                 format_tokens(output, data.number_format),
@@ -993,7 +1012,12 @@ mod tests {
         assert_eq!(value(FieldId::Streaming, &stopped), None);
         assert_eq!(
             value(FieldId::LiveOutputTokens, &stopped).unwrap().text,
-            "123"
+            "500"
+        );
+        // 500 output over 4 s = 125.0 tok/s.
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &stopped).unwrap().text,
+            "125.0 tok/s"
         );
         // liveTokens disabled → all live fields omitted.
         let disabled = FieldData {
@@ -1111,8 +1135,9 @@ mod tests {
         assert_eq!(palette.sgr(Tone::Accent), Some("38;2;170;187;204"));
         assert_eq!(palette.sgr(Tone::Muted), Some("38;2;17;34;51"));
         assert_eq!(palette.sgr(Tone::Success), Some("38;5;42"));
-        // Unsupported color function → plain text fallback.
-        assert_eq!(palette.sgr(Tone::Warning), None);
+        // 03 §4.1: `okhsl()` is a legal host theme color; it resolves through
+        // the host color model to truecolor.
+        assert_eq!(palette.sgr(Tone::Warning), Some("38;2;205;154;34"));
         assert_eq!(palette.sgr(Tone::Error), Some("31"));
         // Background variables resolve through one hop and named base colors.
         let built_in = json!({
@@ -1121,7 +1146,56 @@ mod tests {
         });
         let palette = Palette::from_theme(&built_in);
         assert_eq!(palette.sgr(Tone::Accent), Some("35"));
-        assert_eq!(palette.sgr(Tone::Muted), None);
+        assert_eq!(palette.sgr(Tone::Muted), Some("38;2;4;3;3"));
+    }
+
+    #[test]
+    fn built_in_dark_theme_palette_is_fully_resolved() {
+        // The built-in dark theme's semantic colors all pass through `vars`
+        // to `okhsl(...)` literals (core/themes.rs DARK_THEME_JSON). The
+        // default `useColors:true` path must produce truecolor SGR, not the
+        // plain-text fallback.
+        let theme = json!({
+            "appearance": "dark",
+            "vars": {
+                "text": "okhsl(234 3% 89%)",
+                "muted": "okhsl(229 6% 67%)",
+                "violet": "okhsl(295 50% 67%)",
+                "blue": "okhsl(232 54% 67%)",
+                "green": "okhsl(159 59% 67%)",
+                "red": "okhsl(20 72% 67%)",
+                "yellow": "okhsl(83 88% 67%)"
+            },
+            "colors": {
+                "accent": "violet",
+                "border": "okhsl(231 57% 65%)",
+                "success": "green",
+                "error": "red",
+                "warning": "yellow",
+                "muted": "muted",
+                "dim": "okhsl(229 8% 56%)",
+                "text": "text"
+            }
+        });
+        let palette = Palette::from_theme(&theme);
+        for tone in [
+            Tone::Accent,
+            Tone::Muted,
+            Tone::Success,
+            Tone::Warning,
+            Tone::Error,
+            Tone::Info,
+        ] {
+            let sgr = palette.sgr(tone).expect("built-in theme color resolves");
+            assert!(
+                sgr.starts_with("38;2;"),
+                "{tone:?} must be truecolor, got {sgr}"
+            );
+        }
+        // Spot-check the actual conversions (host colors.rs math).
+        assert_eq!(palette.sgr(Tone::Accent), Some("38;2;167;152;215"));
+        assert_eq!(palette.sgr(Tone::Muted), Some("38;2;157;165;169"));
+        assert_eq!(palette.sgr(Tone::Success), Some("38;2;104;183;141"));
     }
 
     #[test]

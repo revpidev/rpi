@@ -242,11 +242,13 @@ fn statusline_and_usage_compose_on_the_host_status_row() {
     // ── usage side: the legacy footer face (TE53 replaces this literal with
     //        the typed `windows[]`/`ledgers[]` formatter and request-count
     //        assertions on the same fixture).
-    let usage = "Kimi 12% · 3h 12m";
+    // TE50 compact footer shape: `<label> <pct>%(~<reset-in>)`, windows
+    // joined by " / " (TE53 replaces this with the typed footer).
+    let usage = "5h 12%(~3h) / 7d 45%(~2d)";
 
     let row = compose_status_row(&statusline, usage);
     assert_eq!(
-        row, "Test Model · Context 6% used · 70 Kimi 12% · 3h 12m",
+        row, "Test Model · Context 6% used · 70 5h 12%(~3h) / 7d 45%(~2d)",
         "sorted keys: rpi-statusline before rpi-usage, one space"
     );
 

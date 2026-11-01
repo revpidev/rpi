@@ -1,18 +1,22 @@
-//! `/resume` 会话替换回归（独立二进制：statusline 的状态是进程级
-//! OnceLock；本测试在其上验证第二宿主的 rebind 路径）。
+//! `/resume` session-replacement regression (a separate binary: the
+//! statusline state is a process-global `OnceLock`; this test exercises the
+//! second-host rebind path on top of it).
 //!
-//! 复现（修复前）：会话替换（`/resume` 等）重建 NativeExtensionHost 并
-//! 重载同一 dlopen 记忆化的 cdylib——install 早退 `{"ok": true}`：
-//! 1. 新宿主上**零事件订阅**（早退在 `on` 注册之前）→ /resume 后所有
-//!    statusline 事件（message_end / model_select …）不再触发刷新，
-//!    footer 冻结在旧帧；
-//! 2. refresh_loop 持有宿主 1 的通道，poll 定时器每 tick 仍通过旧
-//!    cookie 推送——旧宿主随 apply() 丢弃后为悬垂指针（UAF）；
-//! 3. 旧循环已在 session_shutdown 上退出，且无人重启。
+//! Before the fix: a session replacement (`/resume` etc.) rebuilds the
+//! `NativeExtensionHost` and reloads the same dlopen-memoized cdylib — install
+//! returned `{"ok": true}` early:
+//! 1. the fresh host had **zero event subscriptions** (the early return ran
+//!    before `on`), so every statusline event (message_end / model_select …)
+//!    stopped refreshing the footer after `/resume`;
+//! 2. the refresh loop held host 1's channel and its poll timer kept pushing
+//!    through the old cookie — a dangling pointer once that host was dropped;
+//! 3. the old loop had already exited on `session_shutdown` and nothing
+//!    restarted it.
 //!
-//! 修复后：第二宿主 install 走 rebind——重订阅事件、换绑 CHANNEL、
-//! 重启 refresh_loop；本测试断言：B 宿主重新拿到完整订阅、事件驱动
-//! 的 footer 刷新在 B 上恢复、A 宿主在 rebind 后零推送。
+//! After the fix: the second install takes the rebind path — re-subscribes the
+//! events, swaps the CHANNEL and restarts the refresh loop. This test asserts
+//! that B receives the full subscription set, event-driven footer refreshes
+//! resume on B, and A pushes nothing after the rebind.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
