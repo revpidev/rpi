@@ -294,59 +294,14 @@ pub fn assistant_message_error(message: &serde_json::Value) -> Option<String> {
     ))
 }
 
-/// `resolveCurrentPath` (long-running-guard.ts:55-69): first non-empty
-/// string among `path/file/filename/target/cwd`; `bash` additionally
-/// extracts the redirect target (`>`, `>>` or `tee `) from the command.
+/// `resolveCurrentPath` (v0.83 `long-running-guard.ts:55-69`): first
+/// non-empty string among `path/file/filename/target/cwd`; `bash` uses the
+/// quote/escape-aware first-written-file extractor (`runner/guard.rs`).
 pub fn resolve_current_path(
     tool_name: Option<&str>,
     args: Option<&serde_json::Value>,
 ) -> Option<String> {
-    let tool_name = tool_name?;
-    let args = args?;
-    let direct = ["path", "file", "filename", "target", "cwd"];
-    for key in direct {
-        if let Some(value) = args.get(key).and_then(|v| v.as_str())
-            && !value.trim().is_empty()
-        {
-            return Some(value.trim().to_string());
-        }
-    }
-    if tool_name == "bash" {
-        let command = args.get("command").and_then(|v| v.as_str())?;
-        // `/(?:>|>>|tee\s+)(\S+)/` — first match by scan position. The
-        // single-char `>` alternative always shadows `>>` (regex alternation
-        // order), so a `>` captures the non-space run immediately after it
-        // and a `> ` (trailing space) fails the whole position; `tee\s+`
-        // only participates at a `tee` position. Bug-for-bug with upstream.
-        let chars: Vec<char> = command.chars().collect();
-        let mut index = 0usize;
-        while index < chars.len() {
-            let captured = if chars[index] == '>' {
-                Some(index + 1)
-            } else if chars[index..].starts_with(&['t', 'e', 'e']) {
-                // `tee` must be followed by at least one whitespace, which
-                // is consumed before the capture.
-                let mut end = index + 3;
-                while end < chars.len() && chars[end].is_whitespace() {
-                    end += 1;
-                }
-                (end > index + 3).then_some(end)
-            } else {
-                None
-            };
-            if let Some(start) = captured {
-                let target: String = chars[start..]
-                    .iter()
-                    .take_while(|c| !c.is_whitespace())
-                    .collect();
-                if !target.is_empty() {
-                    return Some(target);
-                }
-            }
-            index += 1;
-        }
-    }
-    None
+    super::guard::resolve_current_path(tool_name, args)
 }
 
 /// `formatToolCall` (formatters.ts:100-120): the `text`/`expandedText`
@@ -522,12 +477,13 @@ mod tests {
             resolve_current_path(Some("read"), Some(&args)),
             Some("/tmp/x.rs".to_string())
         );
-        // `(?:>|>>|tee\s+)(\S+)` bug-for-bug: a space after `>` fails the
-        // whole position (verified against upstream regex semantics), the
-        // single-char `>` alternative shadows `>>` and captures the second
-        // `>` itself.
+        // v0.83 `firstWrittenFile`: a space after `>` is fine, `>>` writes
+        // the actual target, and quoted targets keep their spaces.
         let args = json!({ "command": "echo hi > /tmp/out.txt" });
-        assert_eq!(resolve_current_path(Some("bash"), Some(&args)), None);
+        assert_eq!(
+            resolve_current_path(Some("bash"), Some(&args)),
+            Some("/tmp/out.txt".to_string())
+        );
         let args = json!({ "command": "echo hi >/tmp/out.txt" });
         assert_eq!(
             resolve_current_path(Some("bash"), Some(&args)),
@@ -536,7 +492,7 @@ mod tests {
         let args = json!({ "command": "echo a >> log.txt" });
         assert_eq!(
             resolve_current_path(Some("bash"), Some(&args)),
-            Some(">".to_string())
+            Some("log.txt".to_string())
         );
         let args = json!({ "command": "tee log.txt" });
         assert_eq!(

@@ -16,6 +16,16 @@ use crate::tool::types::{AnswerKind, QuestionAnswer, QuestionData, Questionnaire
 /// One failed attempt's machine-readable code + human reason.
 pub type Reject = (String, String);
 
+/// Frame-safety bound for inbound free text. Upstream has no explicit cap;
+/// the rpi guest settles by rendering a `done` frame (1 MiB / 32 KiB-line
+/// host limit), so an unbounded answer could be accepted (`ok`) and then fail
+/// to render. 8 KiB leaves ample room for notes/global notes.
+pub const MAX_EXTERNAL_TEXT_BYTES: usize = 8 * 1024;
+
+fn text_too_long(text: &str) -> bool {
+    text.len() > MAX_EXTERNAL_TEXT_BYTES
+}
+
 fn reject(code: &str, reason: impl Into<String>) -> Reject {
     (code.to_owned(), reason.into())
 }
@@ -39,7 +49,7 @@ fn resolve_entry(
     entry: &Map<String, Value>,
 ) -> Result<QuestionAnswer, Reject> {
     let option_indexes = match entry.get("optionIndexes") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::Array(items)) => {
             let mut indexes = Vec::with_capacity(items.len());
             for item in items {
@@ -61,7 +71,7 @@ fn resolve_entry(
         }
     };
     let text = match entry.get("text") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(text)) => Some(text.clone()),
         Some(_) => {
             return Err(reject(
@@ -71,7 +81,7 @@ fn resolve_entry(
         }
     };
     let notes = match entry.get("notes") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(notes)) => Some(notes.clone()),
         Some(_) => {
             return Err(reject(
@@ -80,6 +90,19 @@ fn resolve_entry(
             ));
         }
     };
+
+    if text.as_deref().is_some_and(text_too_long) {
+        return Err(reject(
+            "invalid_payload",
+            format!("question {index}: text exceeds {MAX_EXTERNAL_TEXT_BYTES} bytes"),
+        ));
+    }
+    if notes.as_deref().is_some_and(text_too_long) {
+        return Err(reject(
+            "invalid_payload",
+            format!("question {index}: notes exceed {MAX_EXTERNAL_TEXT_BYTES} bytes"),
+        ));
+    }
 
     let invalid = |reason: String| reject("invalid_answer", format!("question {index}: {reason}"));
     let picked: Vec<i64> = option_indexes.unwrap_or_default();
@@ -172,17 +195,23 @@ pub fn resolve_external_answer(
         return Err(reject("invalid_payload", "payload must be an object"));
     };
     let cancel = match payload.get("cancel") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::Bool(value)) => Some(*value),
         Some(_) => return Err(reject("invalid_payload", "cancel must be a boolean")),
     };
     let global_note_raw = match payload.get("globalNote") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(note)) => Some(note.clone()),
         Some(_) => {
             return Err(reject("invalid_payload", "globalNote must be a string"));
         }
     };
+    if global_note_raw.as_deref().is_some_and(text_too_long) {
+        return Err(reject(
+            "invalid_payload",
+            format!("globalNote exceeds {MAX_EXTERNAL_TEXT_BYTES} bytes"),
+        ));
+    }
     let global_note = note_of(global_note_raw.as_deref());
 
     if cancel == Some(true) {
@@ -330,6 +359,15 @@ mod tests {
         for (payload, code) in [
             (json!(null), "invalid_payload"),
             (json!({"cancel": "yes"}), "invalid_payload"),
+            (json!({"cancel": null}), "invalid_payload"),
+            (json!({"globalNote": null}), "invalid_payload"),
+            (
+                json!({"answers": [
+                    {"questionIndex": 0, "text": null},
+                    {"questionIndex": 1, "text": "x"}
+                ]}),
+                "invalid_payload",
+            ),
             (json!({"globalNote": 3}), "invalid_payload"),
             (json!({}), "invalid_payload"),
             (json!({"answers": [{"questionIndex": 0}]}), "invalid_answer"),
@@ -365,6 +403,13 @@ mod tests {
                     {"questionIndex": 1, "text": "x"}
                 ]}),
                 "invalid_answer",
+            ),
+            (
+                json!({"answers": [
+                    {"questionIndex": 0, "text": "x".repeat(MAX_EXTERNAL_TEXT_BYTES + 1)},
+                    {"questionIndex": 1, "text": "x"}
+                ]}),
+                "invalid_payload",
             ),
         ] {
             let (actual, _) =

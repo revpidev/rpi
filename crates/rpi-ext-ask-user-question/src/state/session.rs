@@ -593,10 +593,10 @@ pub fn inline_row_budget(rows: usize) -> usize {
 ///
 /// v2.13.0 (#253): the questionnaire opens **inline** in the editor slot by
 /// default — overlays hide the message the question refers to and swallow
-/// transcript scrolling. Upstream falls back to an overlay when another
-/// overlay is already open (`mustYieldInlineSlot` reads `tui.hasOverlay()`);
-/// the rpi interactive-UI ABI exposes no overlay query, so the inline mount
-/// is unconditional (documented divergence, TE48 §7.3).
+/// transcript scrolling. v2.15.0 (#313): `ui.hasOverlay` `{visible,capturing}`
+/// (ADR-0041) selects the stacked overlay only when a capturing overlay is
+/// visible; a non-capturing HUD keeps the inline slot. `answerable` carries
+/// the dispatch's `toolCallId` (ADR-0043).
 pub fn mount_options(
     collapse_key: &str,
     capturing_overlay: bool,
@@ -700,6 +700,20 @@ pub fn run(
     i18n: &I18n,
     config: &AskUserQuestionConfig,
 ) -> Result<QuestionnaireResult, InteractiveUiError> {
+    run_with_prompt(host, params, i18n, config, || {})
+}
+
+/// [`run`] plus a `mounted` callback invoked after `ui.mountComponent`
+/// succeeds and before the first poll. The tool layer uses it to emit the
+/// prompt/blocked events only once the answerable mount exists (ADR-0043 /
+/// FR-G R1: open before prompt); direct test callers keep the no-op wrapper.
+pub fn run_with_prompt(
+    host: &dyn HostCall,
+    params: &QuestionParams,
+    i18n: &I18n,
+    config: &AskUserQuestionConfig,
+    mounted: impl FnOnce(),
+) -> Result<QuestionnaireResult, InteractiveUiError> {
     let collapse_key = resolve_collapse_key(config);
     let notes_key = resolve_notes_key(config);
     let mut component =
@@ -718,8 +732,9 @@ pub fn run(
     );
     let adapter = AbiHostAdapter { host };
     let handle = mount_component(&adapter, &options)?;
+    mounted();
 
-    let mut width = 0usize;
+    let mut width = 80usize;
     let mut announced_hide = false;
     loop {
         let event = poll_component(&adapter, handle)?;

@@ -85,6 +85,8 @@ pub struct FleetRow {
     pub duration_ms: u64,
     /// The live child activity (`⎿ grep …`) while running, if any.
     pub current_tool: Option<String>,
+    /// Long-running guard activity (`needs_attention`/`active_long_running`).
+    pub activity_state: Option<String>,
 }
 
 /// Everything one push renders from.
@@ -228,6 +230,17 @@ fn fleet_row(run_id: &str, status: &Value, started_ms: u64, now_ms: u64) -> Flee
             .and_then(Value::as_str)
             .map(str::to_owned)
     });
+    let activity_state = status
+        .get("activityState")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            steps.iter().find_map(|step| {
+                step.get("activityState")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        });
     FleetRow {
         run_id: run_id.to_string(),
         mode,
@@ -236,6 +249,7 @@ fn fleet_row(run_id: &str, status: &Value, started_ms: u64, now_ms: u64) -> Flee
         state,
         duration_ms: now_ms.saturating_sub(started_ms),
         current_tool,
+        activity_state,
     }
 }
 
@@ -296,8 +310,20 @@ pub fn fleet_tree(snapshot: &FleetSnapshot, expanded: bool) -> Value {
             .map(|row| row.agents)
             .sum::<usize>()
             .max(snapshot.run_count());
+        let needs_attention = snapshot
+            .active
+            .iter()
+            .filter(|row| row.activity_state.as_deref() == Some("needs_attention"))
+            .count();
         let line = if snapshot.active.is_empty() {
             format!("{} agents · {}", agent_count, capacity_text(snapshot))
+        } else if needs_attention > 0 {
+            format!(
+                "{} agents · {} needing attention · {} running",
+                agent_count,
+                needs_attention,
+                capacity_text(snapshot)
+            )
         } else {
             format!(
                 "{} agents · {} · {} running",
@@ -323,13 +349,26 @@ pub fn fleet_tree(snapshot: &FleetSnapshot, expanded: bool) -> Value {
         .take(MAX_TREE_ROWS)
         .collect();
     for row in &rows {
-        let (glyph, fg) = row_glyph(&row.state, row.duration_ms);
+        let (glyph, mut fg) = row_glyph(&row.state, row.duration_ms);
         let mut text = format!(
             "{glyph} {} · {} · {}",
             row.agent_label,
             row.state,
             crate::render::format_duration(row.duration_ms)
         );
+        if let Some(activity) = &row.activity_state {
+            match activity.as_str() {
+                "needs_attention" => {
+                    fg = "error";
+                    text.push_str(" · needs attention");
+                }
+                "active_long_running" => {
+                    fg = "warning";
+                    text.push_str(" · active long-running");
+                }
+                _ => {}
+            }
+        }
         if let Some(tool) = &row.current_tool {
             text.push_str(&format!(" · ⎿ {tool}"));
         }
@@ -520,6 +559,7 @@ mod tests {
             state: state.to_string(),
             duration_ms,
             current_tool: None,
+            activity_state: None,
         }
     }
 

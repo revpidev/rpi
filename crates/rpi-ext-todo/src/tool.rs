@@ -2,7 +2,7 @@
 //!
 //! Port of upstream `packages/rpiv-todo/todo.ts` @ `0fdf4f8` for the P0
 //! surface: the registration payload (schema/description/promptSnippet/
-//! promptGuidelines — the eight built-in guidelines; config overrides land
+//! promptGuidelines — the nine built-in guidelines; config overrides land
 //! with TE35/config.rs) and the fixed `execute` order
 //! (state → reducer → commit → envelope).
 //!
@@ -561,7 +561,7 @@ mod tests {
     fn guidance_overrides_the_prompt_snippet() {
         let definition = definition_with(json!({"promptSnippet": "Custom todo snippet"}));
         assert_eq!(definition["promptSnippet"], json!("Custom todo snippet"));
-        // Guidelines stay at the built-in eight.
+        // Guidelines stay at the built-in nine.
         assert_eq!(
             definition["promptGuidelines"].as_array().map(Vec::len),
             Some(9)

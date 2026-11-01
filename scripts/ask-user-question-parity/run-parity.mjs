@@ -2,9 +2,10 @@
 //
 //   node scripts/ask-user-question-parity/run-parity.mjs
 //
-// 1. Verifies the pinned submodule HEAD (external/rpiv-mono @ afc21bc2) and
-//    materializes a read-only snapshot of the six upstream pure-function
-//    modules into the deps dir (external/ is never written).
+// 1. Verifies the submodule HEAD is one of the two track pins (target
+//    ce6d3530 / regression afc21bc2) and materializes a read-only snapshot of
+//    the twelve upstream pure-function modules into the deps dir (external/
+//    is never written).
 // 2. Builds this crate's `ask_user_question_parity_runner` example. All
 //    workspace parity examples are uniquely named (P2-9), so cargo's shared
 //    target/debug/examples directory has no same-name collision; building
@@ -419,7 +420,6 @@ function main() {
 	const report = [
 		`# ask-user-question parity report (${TRACK} track: rpiv-mono ${TRACK_LABEL} @ ${PIN.slice(0, 10)} — TE28/TE29/TE30/TE31 G3/G12, dual-track TE51)`,
 		"",
-		`generated: ${new Date().toISOString()}`,
 		`upstream submodule: external/rpiv-mono (${ASKQ_PKG})`,
 		`submodule HEAD: ${head} (track pin ${PIN})`,
 		`typebox: ${typeboxPin()}`,

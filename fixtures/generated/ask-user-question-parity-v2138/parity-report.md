@@ -1,6 +1,5 @@
 # ask-user-question parity report (regression track: rpiv-mono v2138 @ afc21bc25f — TE28/TE29/TE30/TE31 G3/G12, dual-track TE51)
 
-generated: 2026-11-01T07:56:57.542Z
 upstream submodule: external/rpiv-mono (packages/rpiv-ask-user-question)
 submodule HEAD: afc21bc25f7d07cae9fb3103dc309240a16b9f49 (track pin afc21bc25f7d07cae9fb3103dc309240a16b9f49)
 typebox: 1.3.6

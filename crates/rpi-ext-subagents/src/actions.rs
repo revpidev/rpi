@@ -152,6 +152,12 @@ pub fn format_agent_detail(agent: &AgentConfig) -> String {
             }
         ));
     }
+    if !agent.mutation_tools.is_empty() {
+        lines.push(format!(
+            "Mutation tools: {}",
+            agent.mutation_tools.join(", ")
+        ));
+    }
     if let crate::agents::discover::ThinkingSpec::Level(level) = &agent.thinking {
         lines.push(format!("Thinking: {level}"));
     }
@@ -407,7 +413,7 @@ pub fn handle_management_action_with(
 /// Re-register the `subagent` tool so the advertised catalog (if any)
 /// rebuilds; registration failure is logged and non-fatal (the action
 /// itself already succeeded).
-fn refresh_advertised_catalog(
+pub(crate) fn refresh_advertised_catalog(
     host: Option<&dyn crate::HostContext>,
     cwd: &Path,
     config: &crate::config::ExtensionConfig,
@@ -418,7 +424,22 @@ fn refresh_advertised_catalog(
     let Some(calls) = host.async_calls() else {
         return;
     };
-    let description = crate::description::build_subagent_tool_description(config, cwd);
+    let project_trusted = host.project_trusted() != Some(false);
+    let provider = host.parent_model();
+    let description = match crate::description::build_subagent_tool_description(
+        config,
+        cwd,
+        project_trusted,
+        provider
+            .as_deref()
+            .and_then(|model| model.split('/').next()),
+    ) {
+        Ok(description) => description,
+        Err(error) => {
+            tracing::warn!(%error, "advertised-catalog refresh: invalid settings");
+            return;
+        }
+    };
     let response = crate::host_call_static(
         &calls,
         "registerTool",
@@ -828,7 +849,19 @@ fn handle_management_action_inner(
                 "async": true,
             });
             let host_cwd = host.cwd();
-            let settings = crate::config::read_settings_pair(&host_cwd);
+            let settings = match crate::config::read_settings_pair_trusted(
+                &host_cwd,
+                host.project_trusted() != Some(false),
+            ) {
+                Ok(settings) => settings.with_provider(
+                    host.parent_model()
+                        .as_deref()
+                        .and_then(|model| model.split('/').next()),
+                ),
+                Err(error) => {
+                    return ToolOutcome::error(format!("Subagent settings error: {error}"));
+                }
+            };
             let config = crate::config::load_config();
             let result = crate::tool::execute_subagent_tool(
                 &params, host, &settings, &config, runtime, None,
@@ -928,7 +961,7 @@ fn handle_management_action_inner(
             };
             manage_refine(action, name, &raw_params, cwd, settings, trusted)
         }
-        "doctor" => ToolOutcome::text(doctor_report(cwd, settings, config)),
+        "doctor" => ToolOutcome::text(doctor_report(cwd, settings, config, trusted)),
         other => ToolOutcome::error(format!(
             "Unknown subagent action \"{other}\". Supported actions: list, get, status, interrupt, stop, steer, resume, refine, refine.show, refine.rollback, grant-spawn-budget, debug.run, doctor."
         )),
@@ -1156,7 +1189,7 @@ fn stringify_json_preview(value: &Value) -> String {
         other => serde_json::to_string(other).unwrap_or_default(),
     };
     if raw.chars().count() > TRANSCRIPT_PREVIEW_MAX_CHARS {
-        let mut cut: String = raw.chars().take(TRANSCRIPT_PREVIEW_MAX_CHARS - 1).collect();
+        let mut cut: String = raw.chars().take(TRANSCRIPT_PREVIEW_MAX_CHARS).collect();
         cut.push('…');
         cut
     } else {
@@ -1196,7 +1229,6 @@ fn render_session_message(record: &Value) -> Option<String> {
                     .unwrap_or("tool");
                 let preview = block
                     .get("arguments")
-                    .filter(|value| !value.is_null())
                     .map(|value| format!(" {}", stringify_json_preview(value)))
                     .unwrap_or_default();
                 parts.push(format!("[tool: {name}{preview}]"));
@@ -1205,7 +1237,6 @@ fn render_session_message(record: &Value) -> Option<String> {
             if matches!(block_type, Some("toolResult") | Some("tool_result")) {
                 let preview = block
                     .get("result")
-                    .filter(|value| !value.is_null())
                     .map(|value| format!(": {}", stringify_json_preview(value)))
                     .unwrap_or_default();
                 parts.push(format!("[tool result{preview}]"));
@@ -1239,10 +1270,6 @@ fn read_session_transcript_tail(path: &str, line_limit: usize) -> Result<Vec<Str
             continue;
         };
         if entry["type"].as_str() != Some("message") {
-            continue;
-        }
-        let role = entry["message"]["role"].as_str().unwrap_or("message");
-        if !matches!(role, "user" | "assistant") {
             continue;
         }
         if let Some(rendered) = render_session_message(&entry) {
@@ -1357,6 +1384,7 @@ fn doctor_report(
     cwd: &Path,
     settings: &SettingsPair,
     config: &crate::config::ExtensionConfig,
+    project_trusted: bool,
 ) -> String {
     let mut sections = Vec::new();
 
@@ -1387,8 +1415,13 @@ fn doctor_report(
     }
     sections.push(filesystem);
 
-    let (agents, diagnostics) =
-        discover::discover_agents_with_diagnostics(cwd, "both", settings, None);
+    let (agents, diagnostics) = discover::discover_agents_with_diagnostics_trusted(
+        cwd,
+        "both",
+        settings,
+        None,
+        project_trusted,
+    );
     let by_source = |source: discover::AgentSource| {
         agents.iter().filter(|agent| agent.source == source).count()
     };
@@ -1509,40 +1542,106 @@ fn write_agent_config(config: &Value, target: &Path) -> Result<(), String> {
                 body = prompt.to_string();
             }
             "thinking" => {
-                // #3074: reject unknown levels when managing agents; #3077: an
-                // explicit `off` (trimmed) round-trips as `thinking: off`.
-                let Some(level) = value.as_str() else {
-                    return Err("config.thinking must be a string.".to_string());
-                };
-                let level = level.trim();
-                if level == "false" {
-                    lines.push("thinking: false".to_string());
-                } else if crate::launch::model::THINKING_LEVELS.contains(&level) {
-                    lines.push(format!("thinking: {level}"));
-                } else {
-                    return Err(format!(
-                        "config.thinking must be one of {}, or false.",
-                        crate::launch::model::THINKING_LEVELS.join(", ")
-                    ));
+                // #3074/#3077 + agent-management.ts:521-533: `false` or an
+                // empty string clears the field, a known level (trimmed)
+                // round-trips, anything else is rejected before writing.
+                match value {
+                    Value::Bool(false) => {}
+                    Value::String(level) => {
+                        let level = level.trim();
+                        if level.is_empty() {
+                            continue;
+                        }
+                        if crate::launch::model::THINKING_LEVELS.contains(&level) {
+                            lines.push(format!("thinking: {level}"));
+                        } else {
+                            return Err(format!(
+                                "config.thinking must be one of {}, or false when provided.",
+                                crate::launch::model::THINKING_LEVELS.join(", ")
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "config.thinking must be a string or false when provided.".to_string()
+                        );
+                    }
                 }
             }
-            "model" | "systemPromptMode" | "defaultContext" | "output" | "tools" | "skills"
-            | "aliases" | "allowedAgents" | "extensions" => {
+            "mutationTools" => {
+                // agent-management.ts:521-525: false deletes, "" clears to
+                // an empty list, a comma-separated string/array is parsed.
+                match value {
+                    Value::Bool(false) => {}
+                    Value::String(text) => {
+                        let names: Vec<&str> = text
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                            .collect();
+                        if !names.is_empty() {
+                            lines.push(format!("mutationTools: {}", names.join(", ")));
+                        }
+                    }
+                    Value::Array(items) => {
+                        let names: Vec<&str> = items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::trim)
+                            .collect();
+                        if names.iter().any(|name| name.is_empty()) {
+                            return Err(
+                                "config.mutationTools must be a comma-separated string, empty string, string array, or false when provided.".to_string(),
+                            );
+                        }
+                        if !names.is_empty() {
+                            lines.push(format!("mutationTools: {}", names.join(", ")));
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "config.mutationTools must be a comma-separated string, empty string, string array, or false when provided.".to_string(),
+                        );
+                    }
+                }
+            }
+            "model"
+            | "systemPromptMode"
+            | "defaultContext"
+            | "output"
+            | "outputMode"
+            | "tools"
+            | "skills"
+            | "aliases"
+            | "allowedAgents"
+            | "extensions"
+            | "excludeTools"
+            | "acceptanceRole"
+            | "inheritProjectContext"
+            | "inheritSkills"
+            | "advertise"
+            | "allowNestedSubagents"
+            | "subagentOnlyExtensions"
+            | "defaultAsync"
+            | "timeoutMs"
+            | "memory" => {
                 let rendered = match value {
                     Value::String(s) => s.clone(),
                     Value::Bool(b) => b.to_string(),
-                    Value::Array(items) => items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    Value::Array(items) => {
+                        let names: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+                        if names.is_empty() {
+                            continue;
+                        }
+                        names.join(", ")
+                    }
                     other => other.to_string(),
                 };
                 lines.push(format!("{key}: {rendered}"));
             }
             other => {
                 return Err(format!(
-                    "config.{other} is not a supported agent field (supported: description, systemPrompt, model, thinking, systemPromptMode, defaultContext, output, tools, skills, aliases, allowedAgents, extensions)."
+                    "config.{other} is not a supported agent field (supported: description, systemPrompt, model, thinking, systemPromptMode, defaultContext, output, outputMode, tools, skills, aliases, allowedAgents, extensions, excludeTools, acceptanceRole, inheritProjectContext, inheritSkills, advertise, allowNestedSubagents, subagentOnlyExtensions, defaultAsync, timeoutMs, memory, mutationTools)."
                 ));
             }
         }
@@ -1559,6 +1658,96 @@ fn write_agent_config(config: &Value, target: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(target, content).map_err(|e| e.to_string())
+}
+
+/// Merge an `update` request over the existing agent definition so fields
+/// the caller did not mention (model/thinking/tools/mutationTools/body, …)
+/// are preserved (upstream `editableAgentConfig` + diff application).
+fn merge_update_config(
+    existing: &discover::AgentConfig,
+    requested: &Value,
+) -> Result<Value, String> {
+    let mut out = requested
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "config must be an object.".to_string())?;
+    let parsed = crate::agents::frontmatter::parse_frontmatter(
+        &std::fs::read_to_string(&existing.file_path).map_err(|error| error.to_string())?,
+    );
+    let mut set = |key: &str, value: Value| {
+        out.entry(key.to_string()).or_insert(value);
+    };
+    set("description", json!(existing.description));
+    if let Some(model) = &existing.model {
+        set("model", json!(model));
+    }
+    match &existing.thinking {
+        discover::ThinkingSpec::Level(level) => set("thinking", json!(level)),
+        discover::ThinkingSpec::Disabled => set("thinking", json!(false)),
+        discover::ThinkingSpec::Unset => {}
+    }
+    if let Some(tools) = &existing.tools {
+        set("tools", json!(tools));
+    }
+    if let Some(mode) = &existing.output_mode {
+        set("outputMode", json!(mode));
+    }
+    if let Some(context) = &existing.default_context {
+        set("defaultContext", json!(context.as_str()));
+    }
+    if let Some(output) = &existing.output {
+        set("output", json!(output));
+    }
+    if let Some(role) = &existing.acceptance_role {
+        set("acceptanceRole", json!(role));
+    }
+    set(
+        "inheritProjectContext",
+        json!(existing.inherit_project_context),
+    );
+    set("inheritSkills", json!(existing.inherit_skills));
+    if let Some(advertise) = existing.advertise {
+        set("advertise", json!(advertise));
+    }
+    if let Some(allow_nested) = existing.allow_nested_subagents {
+        set("allowNestedSubagents", json!(allow_nested));
+    }
+    if let Some(subagent_only) = &existing.subagent_only_extensions {
+        set("subagentOnlyExtensions", json!(subagent_only));
+    }
+    if let Some(default_async) = existing.default_async {
+        set("defaultAsync", json!(default_async));
+    }
+    if let Some(timeout) = existing.default_timeout_ms {
+        set("timeoutMs", json!(timeout));
+    }
+    if !existing.exclude_tools.is_empty() {
+        set("excludeTools", json!(existing.exclude_tools));
+    }
+    if let Some(memory) = &existing.memory {
+        set(
+            "memory",
+            json!({ "scope": memory.scope, "path": memory.path }),
+        );
+    }
+    if !existing.skills.is_empty() {
+        set("skills", json!(existing.skills));
+    }
+    if let Some(aliases) = &existing.aliases {
+        set("aliases", json!(aliases));
+    }
+    if let Some(allowed) = &existing.allowed_agents {
+        set("allowedAgents", json!(allowed));
+    }
+    if let Some(extensions) = &existing.extensions {
+        set("extensions", json!(extensions));
+    }
+    if !existing.mutation_tools.is_empty() {
+        set("mutationTools", json!(existing.mutation_tools));
+    }
+    set("systemPromptMode", json!(existing.system_prompt_mode));
+    set("systemPrompt", json!(parsed.body));
+    Ok(Value::Object(out))
 }
 
 fn manage_create_update(
@@ -1590,7 +1779,21 @@ fn manage_create_update(
         ));
     }
     let target = scope_agent_dir(cwd, scope).join(format!("{name}.md"));
-    if let Err(message) = write_agent_config(config, &target) {
+    let config = if action == "update" {
+        let existing = existing.expect("update existence checked");
+        if existing.source == discover::AgentSource::Builtin {
+            return ToolOutcome::error(format!(
+                "Cannot update builtin agent '{name}'; eject it first."
+            ));
+        }
+        match merge_update_config(existing, config) {
+            Ok(merged) => merged,
+            Err(message) => return ToolOutcome::error(message),
+        }
+    } else {
+        config.clone()
+    };
+    if let Err(message) = write_agent_config(&config, &target) {
         return ToolOutcome::error(message);
     }
     ToolOutcome::text(format!(
@@ -2103,6 +2306,32 @@ mod tests {
     }
 
     #[test]
+    fn update_merges_requested_fields_over_the_existing_definition() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-update-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("worker.md");
+        std::fs::write(
+            &target,
+            "---\nname: worker\ndescription: old\nmodel: prov/model\nmutationTools: edit, write\n---\nkeep this body\n",
+        )
+        .unwrap();
+        let existing = crate::agents::discover::agent_from_content(
+            &std::fs::read_to_string(&target).unwrap(),
+            &target,
+            crate::agents::discover::AgentSource::User,
+        )
+        .unwrap()
+        .expect("agent");
+        let merged = merge_update_config(&existing, &json!({"description": "new"})).unwrap();
+        assert_eq!(merged["description"], json!("new"));
+        assert_eq!(merged["model"], json!("prov/model"));
+        assert_eq!(merged["mutationTools"], json!(["edit", "write"]));
+        assert_eq!(merged["systemPrompt"], json!("keep this body"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn agent_config_round_trips_explicit_thinking_off_and_rejects_typos() {
         let dir = std::env::temp_dir().join(format!("rpi-sub-thinking-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2125,7 +2354,30 @@ mod tests {
                 .unwrap()
                 .contains("thinking: max")
         );
-        for bad in ["hgih", "OFF", "none"] {
+        write_agent_config(
+            &serde_json::json!({
+                "description": "Writes",
+                "mutationTools": ["edit", "write"]
+            }),
+            &target,
+        )
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("mutationTools: edit, write")
+        );
+        write_agent_config(
+            &serde_json::json!({"description": "Writes", "mutationTools": false}),
+            &target,
+        )
+        .unwrap();
+        assert!(
+            !std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("mutationTools:")
+        );
+        for bad in ["hgih", "OFF", "none", "false"] {
             let error = write_agent_config(
                 &serde_json::json!({"description": "Writes", "thinking": bad}),
                 &target,
@@ -2484,13 +2736,36 @@ mod tests {
             .split_once("[tool: bash ")
             .and_then(|(_, rest)| rest.strip_suffix(']'))
             .expect("preview");
-        assert_eq!(preview.chars().count(), TRANSCRIPT_PREVIEW_MAX_CHARS);
+        assert_eq!(preview.chars().count(), TRANSCRIPT_PREVIEW_MAX_CHARS + 1);
         // A record without renderable parts yields nothing.
         assert!(
             render_session_message(
                 &json!({"type":"message","message":{"role":"assistant","content":[]}})
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn transcript_renders_real_tool_result_messages_and_null_arguments() {
+        let record = json!({
+            "type": "message",
+            "message": {"role": "toolResult", "content": [{"type": "text", "text": "exit 0"}]}
+        });
+        assert_eq!(
+            render_session_message(&record).as_deref(),
+            Some("toolResult: exit 0")
+        );
+        let record = json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "toolCall", "name": "bash", "arguments": null}]
+            }
+        });
+        assert_eq!(
+            render_session_message(&record).as_deref(),
+            Some("assistant: [tool: bash null]")
         );
     }
 

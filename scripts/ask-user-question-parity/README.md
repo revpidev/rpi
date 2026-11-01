@@ -31,13 +31,14 @@ Report: `fixtures/generated/ask-user-question-parity-v2150/parity-report.md`
 (regression), plus the `upstream-<group>.jsonl` / `rust-<group>.jsonl` raw
 legs. The target track attributes pending differences through
 `expected-diffs-v2150.json` (`{key: "group/case", section, r, owner}`); the
-regression track's manifest stays empty by design.
+regression track attributes its eight `upstream-semantics` cases
+(`#281/#163/#301/#294/#287`) through `expected-diffs-v2138.json` (TE51 FR-G).
 
 ## What runs
 
 | File | Role |
 |------|------|
-| `fixtures.json` | Shared cases, grouped `schema` / `normalize` / `validate` / `envelope` / `row-intent` / `rpc` / `state` / `keys` |
+| `fixtures.json` | Shared cases, grouped `schema` / `normalize` / `validate` / `envelope` / `row-intent` / `rpc` / `state` / `keys` / `preview` |
 | `upstream-runner.mjs` | Imports the upstream TS modules via `tsx` and prints one JSON line per case |
 | `run-parity.mjs` | Verifies the submodule HEAD is one of the two track pins, materializes the track snapshot (+ the `@earendil-works/pi-tui` keys stub), runs both legs, normalizes, diffs, attributes pending target diffs, checks the golden-frame baseline (target only), writes the report |
 | `gen-golden-frames.mjs` | Re-records `golden-frames/*.jsonl` from the native fixture component (run deliberately; the files are committed) |
@@ -52,18 +53,20 @@ modules from the tracked pin into `$RPI_ASKQ_PARITY_DEPS/snapshot-<track>/`
 (fresh every run, `git show` only) and records each file's sha256 in the
 report. The deps dir carries `tsx` + the
 `typebox` version from the upstream `package-lock.json` (1.3.6). The submodule
-HEAD is asserted against `afc21bc25f7d07cae9fb3103dc309240a16b9f49`.
+HEAD must be one of the two track pins (`ce6d353041…` target / `afc21bc25f…`
+regression); snapshots come from the git object database.
 
 Driven modules: `tool/{types,normalize-params,validate-questionnaire,response-envelope,format-answer}.ts`,
-`state/{row-intent,i18n-bridge,state-reducer,key-router}.ts` + `rpc-fallback.ts` (type-only imports into
+`state/{row-intent,i18n-bridge,state-reducer,key-router}.ts` + `rpc-fallback.ts` +
+`view/components/preview/{preview-layout-decider,preview-box-renderer}.ts` (type-only imports into
 `view/` are erased by tsx; the i18n bridge falls back to its identity `t` when the `rpiv-i18n` SDK is
 absent — the harness deps do not install it — so every leg runs on canonical English, and the Rust
 leg pins `I18n::for_locale("en")` to match).
 
 `state/key-router.ts` imports `@earendil-works/pi-tui` (`Key`, `matchesKey`). The harness writes a stub
 package into `$RPI_ASKQ_PARITY_DEPS/node_modules/@earendil-works/pi-tui/` whose entry is a **verbatim
-copy** of `external/pi/packages/tui/src/keys.ts` @ `9841914c` (self-contained; the hash is recorded in
-the report). The Rust leg matches through `rpi_tui::keys::matches_key`, the port of the same source.
+copy** of `external/pi/packages/tui/src/keys.ts` @ `9841914c`, and a `utils.ts` copy for the preview
+layout (both self-contained; their hashes are recorded in the report). The Rust leg matches through `rpi_tui::keys::matches_key`, the port of the same source.
 
 ## Normalization whitelist
 
@@ -88,6 +91,16 @@ the report). The Rust leg matches through `rpi_tui::keys::matches_key`, the port
   out-of-order answers.
 - `row-intent` — sentinel append matrix + the full `ROW_INTENT_META` /
   `LABELS_BY_KIND` / reserved-set constants.
+- `rpc` (TE29) — `hasDialogUI` judgment table (`{select, input}` flags + `undefined` ui) and the
+  sequential dialog walker: each case drives a scripted `DialogUI` (`{reply}` / `{cancel}` entries,
+  exhausted script = dismiss) and compares the recorded calls (method/title/options/placeholder) and
+  the final `QuestionnaireResult` verbatim — titles (header prefix, preview folding, ≤600 UTF-16-unit
+  truncation incl. a clean astral boundary), option lines + sentinel row, multi-select token parsing
+  (indices/dedup/space/period/out-of-range/empty commit/custom), cancels and mid-walk partial answers.
+  The astral fixture pins a *clean* boundary on purpose — a cut that would split a surrogate pair
+  cannot be byte-pinned (JS `slice` keeps a lone surrogate, which is invalid UTF-8 in Rust; the
+  walker stops at the previous char instead, see `rpc_fallback.rs::truncate_utf16`).
+
 - `state` (TE30) — dialog state machine vectors: each case runs an action
   sequence through the upstream `state/state-reducer.ts` (`reduce`) and the
   Rust `reducer::apply`, comparing the canonical per-step state snapshot
@@ -102,6 +115,8 @@ the report). The Rust leg matches through `rpi_tui::keys::matches_key`, the port
   the group-level `keyMatrix` (Enter/Space/`n`/Esc/CSI+SS3 arrows/Tab/Shift+Tab/
   Left/Right/`Ctrl+]`/newline/`Ctrl+U`/`Ctrl+G`/plain text/Kitty sequences) and
   compared action-by-action against the upstream `state/key-router.ts`.
+- `preview` — preview layout gates: width/height/focus/notes-affordance
+  matrix and the bordered-box/fence-marker renderer vectors.
 
 ## Golden frames (TE30)
 
@@ -114,12 +129,3 @@ compares byte-for-byte; `run-parity.mjs` does the same as part of the harness.
 Re-record deliberately with `node scripts/ask-user-question-parity/gen-golden-frames.mjs`
 and review the diff (TE31 re-records this baseline for the rich-interaction
 pass).
-- `rpc` (TE29) — `hasDialogUI` judgment table (`{select, input}` flags + `undefined` ui) and the
-  sequential dialog walker: each case drives a scripted `DialogUI` (`{reply}` / `{cancel}` entries,
-  exhausted script = dismiss) and compares the recorded calls (method/title/options/placeholder) and
-  the final `QuestionnaireResult` verbatim — titles (header prefix, preview folding, ≤600 UTF-16-unit
-  truncation incl. a clean astral boundary), option lines + sentinel row, multi-select token parsing
-  (indices/dedup/space/period/out-of-range/empty commit/custom), cancels and mid-walk partial answers.
-  The astral fixture pins a *clean* boundary on purpose — a cut that would split a surrogate pair
-  cannot be byte-pinned (JS `slice` keeps a lone surrogate, which is invalid UTF-8 in Rust; the
-  walker stops at the previous char instead, see `rpc_fallback.rs::truncate_utf16`).

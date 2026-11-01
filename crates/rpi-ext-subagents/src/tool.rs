@@ -82,7 +82,7 @@ impl ToolOutcome {
 /// Parameter schema (schemas.ts:257-378 P0 subset; all optional, no
 /// additionalProperties restriction — upstream TypeBox behavior).
 pub fn tool_parameters_schema() -> Value {
-    json!({
+    let mut schema = json!({
         "type": "object",
         "properties": {
             "agent": {
@@ -225,7 +225,77 @@ pub fn tool_parameters_schema() -> Value {
                 "description": "With action list (#1717): compact capability lines plus structured details.agentCapabilities records (prompt-free agent selection)."
             }
         }
-    })
+    });
+    schema["properties"]["control"] = control_schema();
+    schema
+}
+
+/// `control` per-call override schema (kept out of the large `json!` macro to
+/// avoid the compiler recursion limit; byte-identical JSON shape).
+fn control_schema() -> Value {
+    serde_json::from_str(
+        r#"{
+            "type": "object",
+            "description": "Per-run control/attention overrides (enabled, needsAttentionAfterMs, activeNoticeAfterMs/Turns/Tokens, failedToolAttemptsBeforeAttention, notifyOn, notifyChannels).",
+            "additionalProperties": false,
+            "properties": {
+                "enabled": { "type": "boolean" },
+                "needsAttentionAfterMs": { "type": "integer", "minimum": 1 },
+                "activeNoticeAfterMs": { "type": "integer", "minimum": 1 },
+                "activeNoticeAfterTurns": { "type": "integer", "minimum": 1 },
+                "activeNoticeAfterTokens": { "type": "integer", "minimum": 1 },
+                "failedToolAttemptsBeforeAttention": { "type": "integer", "minimum": 1 },
+                "notifyOn": { "type": "array", "items": { "type": "string", "enum": ["active_long_running", "needs_attention"] } },
+                "notifyChannels": { "type": "array", "items": { "type": "string", "enum": ["event", "async", "intercom"] } }
+            }
+        }"#,
+    )
+    .expect("control schema")
+}
+
+/// Foreground control notices: the host session gets the same
+/// `subagent_control_notice` message and `subagent:control-event` bus event
+/// as a background run. `notifyChannels` gates each sink; intercom is N/A.
+fn foreground_control_sink(
+    host: &dyn HostContext,
+    config: &crate::runner::control::ResolvedControlConfig,
+) -> Option<crate::runner::foreground::ControlEventSink> {
+    use crate::runner::control::ControlNotificationChannel;
+    let calls = host.async_calls()?;
+    let config = config.clone();
+    Some(std::sync::Arc::new(
+        move |event: &crate::runner::control::ControlEvent| {
+            if config
+                .notify_channels
+                .contains(&ControlNotificationChannel::Async)
+            {
+                let notice = crate::runner::control::format_control_notice(event);
+                let _ = crate::host_call_static(
+                    &calls,
+                    "sendMessage",
+                    json!({
+                        "message": {
+                            "customType": "subagent_control_notice",
+                            "content": notice,
+                            "display": true,
+                        },
+                        "options": { "triggerTurn": true },
+                    }),
+                );
+            }
+            if config
+                .notify_channels
+                .contains(&ControlNotificationChannel::Event)
+            {
+                let data = serde_json::to_value(event).unwrap_or(Value::Null);
+                let _ = crate::host_call_static(
+                    &calls,
+                    "events.emit",
+                    json!({ "channel": "subagent:control-event", "data": data }),
+                );
+            }
+        },
+    ))
 }
 
 /// The whole tool entry point. Returns the AgentToolResult JSON.
@@ -377,7 +447,18 @@ fn execute_subagent_tool_inner(
         .unwrap_or("both");
 
     // Shared per-call context (cwd, session root, artifacts, model registry).
-    let mut ctx = crate::p1::launch_child::RunCtx::from_host(host, &object, config.clone());
+    let mut ctx = match crate::p1::launch_child::RunCtx::from_host(host, &object, config.clone()) {
+        Ok(ctx) => ctx,
+        Err(error) => return ToolOutcome::mode_error(requested_mode, error),
+    };
+    // #2805 / R18.4: an untrusted project must not silently fall back to a
+    // same-named builtin when the caller explicitly asked for project scope.
+    if scope == "project" && ctx.project_trusted == Some(false) {
+        return ToolOutcome::mode_error(
+            requested_mode,
+            "Project scope requires a trusted project; retry in a trusted session or use agentScope \"user\" or \"both\".".to_string(),
+        );
+    }
     // TE09 FR-A: install the streaming seam under a real dispatch id. The
     // composite paths decide per shape below (single/chain stream, parallel
     // does not — upstream wraps only those).
@@ -387,6 +468,7 @@ fn execute_subagent_tool_inner(
     // Async paths clear it (clone_ctx_for_async) — background runs outlive
     // the dispatch that spawned them and must not die with its turn.
     ctx.abort_probe = tool_call_id.and_then(|id| host.abort_probe(id));
+    ctx.control_sink = foreground_control_sink(host, &ctx.control);
     // #55: the sync single delegation is the blocking face — arm the
     // intercom detach so a child's blocking `contact_supervisor` ask
     // detaches the run instead of deadlocking the dispatch (async paths
@@ -532,6 +614,48 @@ fn check_timeout_aliases(object: &serde_json::Map<String, Value>) -> Result<(), 
     Ok(())
 }
 
+/// Aggregate child control events/states for composite details: any
+/// `needs_attention` wins over `active_long_running` (subagent-runner.ts
+/// aggregate rule).
+fn aggregate_control(results: &[Value]) -> (Option<&'static str>, Vec<Value>) {
+    let mut events = Vec::new();
+    let mut needs = false;
+    let mut long = false;
+    for result in results {
+        if let Some(list) = result.get("controlEvents").and_then(Value::as_array) {
+            for event in list {
+                match event.get("type").and_then(Value::as_str) {
+                    Some("needs_attention") => needs = true,
+                    Some("active_long_running") => long = true,
+                    _ => {}
+                }
+                events.push(event.clone());
+            }
+        }
+        if let Some(state) = result
+            .get("results")
+            .and_then(Value::as_array)
+            .and_then(|results| results.first())
+            .and_then(|single| single.get("activityState"))
+            .and_then(Value::as_str)
+        {
+            match state {
+                "needs_attention" => needs = true,
+                "active_long_running" => long = true,
+                _ => {}
+            }
+        }
+    }
+    let activity = if needs {
+        Some("needs_attention")
+    } else if long {
+        Some("active_long_running")
+    } else {
+        None
+    };
+    (activity, events)
+}
+
 /// Single-run `details` assembly (types.ts:1014-1115 + compactForegroundResult).
 fn assemble_single_details(
     ctx: &crate::p1::launch_child::RunCtx,
@@ -584,6 +708,12 @@ fn assemble_single_details(
     if let Some(truncation) = &result.truncation {
         single["truncation"] = truncation.clone();
     }
+    if let Some(activity) = result.activity_state {
+        single["activityState"] = json!(activity.as_str());
+    }
+    if let Some(last_activity) = result.last_activity_at {
+        single["lastActivityAt"] = json!(last_activity);
+    }
     single["finalOutput"] = json!(result.final_output);
     if let Some(saved) = &outcome.saved_output_path {
         single["savedOutputPath"] = json!(saved.to_string_lossy());
@@ -598,6 +728,7 @@ fn assemble_single_details(
         "mode": "single",
         "runId": run_id,
         "results": [single],
+        "controlEvents": result.control_events,
     });
     let timeout = spec
         .timeout_ms
@@ -792,13 +923,21 @@ fn dispatch_tasks(
     let any_failed = outcomes.iter().any(|o| o.exit_code != 0);
     let text = crate::p1::parallel::aggregate_parallel_outputs(&outcomes);
     let total_usage = sum_usage(&outcomes);
-    let details = json!({
+    let result_details: Vec<Value> = outcomes.iter().map(|o| o.details.clone()).collect();
+    let (activity, control_events) = aggregate_control(&result_details);
+    let mut details = json!({
         "mode": "parallel",
         "runId": ctx.run_id,
-        "results": outcomes.iter().map(|o| o.details.clone()).collect::<Vec<_>>(),
+        "results": result_details,
         "totalChildUsage": total_usage.clone(),
         "totalCost": total_usage["cost"].as_f64().unwrap_or(0.0),
     });
+    if let Some(activity) = activity {
+        details["activityState"] = json!(activity);
+    }
+    if !control_events.is_empty() {
+        details["controlEvents"] = json!(control_events);
+    }
     ToolOutcome {
         text,
         details,
@@ -876,12 +1015,19 @@ fn dispatch_steps(
     if let Some(failure) = &failed {
         results.push(failure.details.clone());
     }
-    let details = json!({
+    let (activity, control_events) = aggregate_control(&results);
+    let mut details = json!({
         "mode": "chain",
         "runId": ctx.run_id,
         "results": results,
         "chainStepCount": steps.len(),
     });
+    if let Some(activity) = activity {
+        details["activityState"] = json!(activity);
+    }
+    if !control_events.is_empty() {
+        details["controlEvents"] = json!(control_events);
+    }
     ToolOutcome {
         text,
         details,
@@ -1202,6 +1348,8 @@ mod tests {
             session_root: dir.join("sessions"),
             frame_sink: None,
             step_status: None,
+            control: crate::runner::control::ResolvedControlConfig::default(),
+            control_sink: None,
             abort_probe: None,
         };
         let entries = vec![crate::p1::parallel::TaskEntry {

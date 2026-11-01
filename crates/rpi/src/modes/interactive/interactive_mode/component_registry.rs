@@ -158,6 +158,8 @@ pub(crate) struct MountState {
     mount: Arc<dyn ComponentMountPoint>,
     diagnostics: Arc<Mutex<VecDeque<ComponentDiagnostic>>>,
     dispose_grace: Duration,
+    /// ADR-0043: verdict sink for answers still queued when this mount closes.
+    answer_verdict_sink: Mutex<Option<AnswerVerdictSink>>,
 }
 
 impl MountState {
@@ -198,6 +200,7 @@ impl MountState {
             mount,
             diagnostics,
             dispose_grace,
+            answer_verdict_sink: Mutex::new(None),
         }
     }
 
@@ -232,13 +235,48 @@ impl MountState {
     }
 
     /// Push an event, merging pending status-class events (R-U1.2 / §2.1).
-    fn push_event(&self, event: ComponentEvent) {
+    fn set_answer_verdict_sink(&self, sink: AnswerVerdictSink) {
+        *self
+            .answer_verdict_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sink);
+    }
+
+    fn emit_answer_verdict(&self, payload: &Value, code: &str, reason: &str) {
+        let sink = self
+            .answer_verdict_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(sink) = sink {
+            sink(payload, Some(code), Some(reason));
+        }
+    }
+
+    fn drain_external_answers(&self) -> Vec<Value> {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut drained = Vec::new();
+        queue.retain(|event| {
+            if let ComponentEvent::ExternalAnswer { payload } = event {
+                drained.push(payload.clone());
+                false
+            } else {
+                true
+            }
+        });
+        drained
+    }
+
+    fn push_event(&self, event: ComponentEvent) -> bool {
         if self.is_closed() {
-            return;
+            return false;
         }
         if self.disposing.load(Ordering::SeqCst) && !matches!(event, ComponentEvent::Dispose { .. })
         {
-            return;
+            return false;
         }
         let status_class = matches!(
             event,
@@ -250,6 +288,16 @@ impl MountState {
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Re-check after taking the queue lock: `close()` sets `closed`
+        // before draining under this lock, so a delivery that raced the drain
+        // must not push into a closed queue (otherwise it would get neither
+        // processing nor a verdict).
+        if self.is_closed()
+            || (self.disposing.load(Ordering::SeqCst)
+                && !matches!(event, ComponentEvent::Dispose { .. }))
+        {
+            return false;
+        }
         if status_class
             && let Some(pending) = queue
                 .iter_mut()
@@ -258,14 +306,14 @@ impl MountState {
             *pending = event;
             drop(queue);
             self.notify.notify_one();
-            return;
+            return true;
         }
         if queue.len() >= EVENT_QUEUE_CAPACITY {
             drop(queue);
             if matches!(event, ComponentEvent::Tick) {
                 // `tick` is a time signal, not a state transition; dropping it
                 // under pressure cannot hide a bug (R-U1.2 / design §3.7).
-                return;
+                return false;
             }
             self.fail(
                 InteractiveUiError::invalid_request(format!(
@@ -274,11 +322,12 @@ impl MountState {
                 )),
                 "overflow",
             );
-            return;
+            return false;
         }
         queue.push_back(event);
         drop(queue);
         self.notify.notify_one();
+        true
     }
 
     /// Fail-visible unmount: record the structured error for a blocked
@@ -631,6 +680,13 @@ impl MountState {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        for payload in self.drain_external_answers() {
+            self.emit_answer_verdict(
+                &payload,
+                "not_found",
+                "the questionnaire closed before the answer was processed",
+            );
+        }
         self.stop_tick_task();
         if let Some(id) = self
             .input_listener
@@ -904,6 +960,9 @@ fn to_tui_size(value: WireSize) -> SizeValue {
     }
 }
 
+/// ADR-0043: host verdict callback for an inbound answer attempt.
+type AnswerVerdictSink = Arc<dyn Fn(&Value, Option<&str>, Option<&str>) + Send + Sync>;
+
 /// The registry: one active component at a time (the per-extension slot is
 /// subsumed — see the V14-21 §7 note), globally unique handles, fail-visible
 /// diagnostics.
@@ -917,6 +976,9 @@ pub(crate) struct ComponentRegistry {
     dispose_grace: Duration,
     /// Optional per-component lifecycle limit (R-U8.3; default off).
     lifecycle_limit: LifecycleLimit,
+    /// ADR-0043: host verdict callback for unprocessed external answers
+    /// (delivered but never polled before the mount closes).
+    answer_verdict_sink: Mutex<Option<AnswerVerdictSink>>,
 }
 
 impl Default for ComponentRegistry {
@@ -939,6 +1001,7 @@ impl ComponentRegistry {
             diagnostics: Arc::new(Mutex::new(VecDeque::new())),
             dispose_grace,
             lifecycle_limit: None,
+            answer_verdict_sink: Mutex::new(None),
         }
     }
 
@@ -966,6 +1029,29 @@ impl ComponentRegistry {
         closed.push_back(handle.0);
     }
 
+    /// ADR-0043: install the host verdict callback for answers that were
+    /// delivered but never consumed (mount closed before the guest polled).
+    pub(crate) fn set_answer_verdict_sink(&self, sink: AnswerVerdictSink) {
+        if let Some(state) = self.active_state() {
+            state.set_answer_verdict_sink(Arc::clone(&sink));
+        }
+        *self
+            .answer_verdict_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sink);
+    }
+
+    fn emit_answer_verdict(&self, payload: &Value, code: &str, reason: &str) {
+        let sink = self
+            .answer_verdict_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(sink) = sink {
+            sink(payload, Some(code), Some(reason));
+        }
+    }
+
     /// ADR-0043: deliver an inbound `rpi:ask-user:answer` payload to the
     /// active answerable component. The payload's `toolCallId` must name the
     /// mount's `answerable.toolCallId`; the guest validates the rest.
@@ -986,9 +1072,24 @@ impl ComponentRegistry {
         if answerable.tool_call_id != tool_call_id {
             return Delivery::NotFound;
         }
-        state.push_event(ComponentEvent::ExternalAnswer {
+        if let Some(sink) = self
+            .answer_verdict_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            state.set_answer_verdict_sink(sink);
+        }
+        if state.is_closed() || state.disposing.load(Ordering::SeqCst) {
+            self.emit_answer_verdict(payload, "not_found", "the questionnaire is already settled");
+            return Delivery::Settled;
+        }
+        if !state.push_event(ComponentEvent::ExternalAnswer {
             payload: payload.clone(),
-        });
+        }) {
+            self.emit_answer_verdict(payload, "not_found", "the questionnaire is already settled");
+            return Delivery::Settled;
+        }
         Delivery::Delivered
     }
 
@@ -1118,6 +1219,14 @@ impl ComponentRegistry {
             }
         } else {
             mount.show_editor_region(Arc::clone(&entry));
+        }
+        if let Some(sink) = self
+            .answer_verdict_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            state.set_answer_verdict_sink(sink);
         }
         state.mounted.store(true, Ordering::SeqCst);
         state.focused.store(
@@ -1664,6 +1773,65 @@ mod interactive_component {
             Delivery::NotFound
         );
         let _ = unmounted;
+    }
+
+    #[test]
+    fn component_registry_answers_queued_and_closed_with_not_found() {
+        use crate::modes::interactive::interactive_mode::answer_channel::Delivery;
+        use rpi_ext_host::interactive_ui::AnswerableOptions;
+        use std::sync::Mutex as StdMutex;
+        let registry = ComponentRegistry::new();
+        #[allow(clippy::type_complexity)]
+        let seen: Arc<StdMutex<Vec<(Value, Option<String>)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        registry.set_answer_verdict_sink(Arc::new(move |payload, code, _reason| {
+            sink_seen
+                .lock()
+                .unwrap()
+                .push((payload.clone(), code.map(str::to_string)));
+        }));
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let handle = registry
+            .mount(
+                "ext",
+                MountOptions {
+                    answerable: Some(AnswerableOptions {
+                        tool_call_id: "call-1".to_owned(),
+                    }),
+                    ..MountOptions::default()
+                },
+                Arc::clone(&mount) as Arc<dyn ComponentMountPoint>,
+            )
+            .expect("mount");
+        let first = serde_json::json!({"toolCallId": "call-1", "answers": []});
+        let second = serde_json::json!({"toolCallId": "call-1", "cancel": true});
+        assert_eq!(
+            registry.deliver_external_answer(&first),
+            Delivery::Delivered
+        );
+        assert_eq!(
+            registry.deliver_external_answer(&second),
+            Delivery::Delivered
+        );
+        // Neither answer was polled; closing the mount must verdict both.
+        registry
+            .render(
+                "ext",
+                handle,
+                ComponentFrame::lines(vec!["done".to_owned()]).with_done(Value::Null),
+            )
+            .expect("done");
+        let verdicts = seen.lock().unwrap().clone();
+        assert_eq!(verdicts.len(), 2, "{verdicts:?}");
+        assert!(
+            verdicts
+                .iter()
+                .all(|(_, code)| code.as_deref() == Some("not_found"))
+        );
+        // A further answer after close is rejected with a verdict too.
+        let third = serde_json::json!({"toolCallId": "call-1", "cancel": true});
+        assert_eq!(registry.deliver_external_answer(&third), Delivery::Settled);
+        assert_eq!(seen.lock().unwrap().len(), 3);
     }
 
     // -- §4.1 registry lifecycle -------------------------------------------

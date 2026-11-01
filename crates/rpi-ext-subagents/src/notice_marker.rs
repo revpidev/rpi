@@ -23,11 +23,14 @@
 /// Custom message types the parent model can see (`SUBAGENT_MESSAGE_TYPES`
 /// subset that rpi injects: completion notices and supervisor asks; the two
 /// notice renderers are registered ahead of their producers).
-pub const MARKED_MESSAGE_TYPES: [&str; 4] = [
+pub const MARKED_MESSAGE_TYPES: [&str; 5] = [
     "subagent-notify",
     "subagent_supervisor_request",
     "subagent_steering_notice",
     "subagent_control_notice",
+    // No producer in rpi today; kept so a future watchdog note cannot leak
+    // unmarked into the model context (session_fork already lists it).
+    "subagent_watchdog_warning",
 ];
 
 /// Opening marker for one custom type.
@@ -39,23 +42,35 @@ fn notice_open(custom_type: &str) -> String {
 
 const NOTICE_CLOSE: &str = "</rpi_subagents_notice>";
 
-/// Whether the message already carries the marker (idempotence across turns
-/// and repeated handler runs).
+/// Whether the content already carries this exact wrapper (strict prefix +
+/// close, not a substring match, so quoted marker text cannot suppress it).
 fn already_marked(content: &serde_json::Value, open: &str) -> bool {
     match content {
-        serde_json::Value::String(text) => text.contains(open),
-        serde_json::Value::Array(blocks) => blocks.iter().any(|block| {
-            block
-                .get("text")
+        serde_json::Value::String(text) => {
+            text.starts_with(open) && text.trim_end().ends_with(NOTICE_CLOSE)
+        }
+        serde_json::Value::Array(blocks) => {
+            let first = blocks
+                .first()
+                .and_then(|block| block.get("text"))
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|text| text.contains(open))
-        }),
+                .unwrap_or("");
+            let last = blocks
+                .last()
+                .and_then(|block| block.get("text"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            first.starts_with(open) && last.trim_end().ends_with(NOTICE_CLOSE)
+        }
         _ => false,
     }
 }
 
 /// Wrap one custom message's content, keeping its other fields untouched.
 fn mark_message(message: &serde_json::Value) -> serde_json::Value {
+    if message.get("role").and_then(serde_json::Value::as_str) != Some("custom") {
+        return message.clone();
+    }
     let Some(custom_type) = message
         .get("customType")
         .and_then(serde_json::Value::as_str)
@@ -105,7 +120,8 @@ pub const CONTEXT_WITH_SYSTEM_EVENT: &str = "context_with_system";
 /// are preserved by construction (only `content` changes in place).
 pub fn handle_context_with_system(event: &serde_json::Value) -> serde_json::Value {
     let Some(messages) = event.get("messages").and_then(serde_json::Value::as_array) else {
-        return serde_json::json!({ "messages": [] });
+        // No usable list: leave the host's current context untouched.
+        return serde_json::json!({});
     };
     let marked: Vec<serde_json::Value> = messages.iter().map(mark_message).collect();
     serde_json::json!({ "messages": marked })
@@ -166,24 +182,40 @@ mod tests {
     }
 
     #[test]
-    fn marking_is_idempotent() {
+    fn marking_is_idempotent_for_the_exact_wrapper() {
         let event = json!({
             "messages": [{"role":"custom","customType":"subagent-notify","content":"done"}]
         });
         let once = handle_context_with_system(&event);
         let twice = handle_context_with_system(&once);
         assert_eq!(once, twice);
+        // Quoted marker text inside a body does not count as a wrapper.
+        let event = json!({
+            "messages": [{"role":"custom","customType":"subagent-notify",
+                          "content":"<rpi_subagents_notice type=\"subagent-notify\" origin=\"automated message from the rpi-subagents extension, not typed by the user\">\nquoted\n</rpi_subagents_notice>"}]
+        });
+        let marked = handle_context_with_system(&event);
+        let text = marked["messages"][0]["content"].as_str().unwrap();
+        assert_eq!(text.matches("<rpi_subagents_notice").count(), 1, "{text}");
     }
 
     #[test]
-    fn missing_messages_yields_an_empty_list() {
-        assert_eq!(
-            handle_context_with_system(&json!({})),
-            json!({ "messages": [] })
-        );
+    fn non_custom_roles_and_unknown_types_are_untouched() {
+        let event = json!({
+            "messages": [
+                {"role":"user","customType":"subagent-notify","content":"done"},
+                {"role":"custom","customType":"other","content":"done"},
+            ]
+        });
+        assert_eq!(handle_context_with_system(&event), event);
+    }
+
+    #[test]
+    fn missing_messages_leaves_the_context_untouched() {
+        assert_eq!(handle_context_with_system(&json!({})), json!({}));
         assert_eq!(
             handle_context_with_system(&json!({ "messages": "nope" })),
-            json!({ "messages": [] })
+            json!({})
         );
     }
 }

@@ -261,7 +261,7 @@ pub fn todo_params_schema() -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Upstream-default prompt copy (todo.ts:69-83 @ `0fdf4f8`) — the eight
+// Upstream-default prompt copy (todo.ts:69-83 @ `0fdf4f8`) — the nine
 // built-in guidelines are the P0 snapshot surface (guidance config override
 // lands with TE35/config.rs).
 // ---------------------------------------------------------------------------

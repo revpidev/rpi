@@ -89,6 +89,9 @@ pub struct AgentConfig {
     pub skills: Vec<String>,
     pub extensions: Option<Vec<String>>,
     pub subagent_only_extensions: Option<Vec<String>>,
+    /// `mutationTools` (`agents.ts:2281`): extra extension tool names treated
+    /// as mutating for the long-running guard. Empty = none.
+    pub mutation_tools: Vec<String>,
     pub output: Option<String>,
     /// `outputMode` (#1305): "inline" (default) | "file-only" — agent
     /// frontmatter / builtin override; call-level output mode outranks it.
@@ -653,6 +656,15 @@ pub fn agent_from_content(
     };
 
     let raw_tools = super::frontmatter::parse_tools_field(fm.get("tools").map(String::as_str));
+    if let Some(tools) = &raw_tools
+        && let Some(bad) = tools
+            .iter()
+            .find(|tool| tool.starts_with('+') || tool.starts_with('-'))
+    {
+        return Err(format!(
+            "Agent '{local_name}' has invalid tools entry '{bad}'; v0.82 rejects '+name'/'-name' modifiers (use tools/excludeTools without modifiers)."
+        ));
+    }
     let (tools, mcp_direct_tools) = split_tool_list(raw_tools);
     // #1776: frontmatter excludeTools is a plain list (agents.ts:1995/2118
     // @ 0fc0eebb); empty block lists carry no effect.
@@ -723,6 +735,9 @@ pub fn agent_from_content(
     let subagent_only_extensions = super::frontmatter::parse_unquoted_list(
         fm.get("subagentOnlyExtensions").map(String::as_str),
     );
+    let mutation_tools =
+        super::frontmatter::parse_unquoted_list(fm.get("mutationTools").map(String::as_str))
+            .unwrap_or_default();
 
     Ok(Some(AgentConfig {
         name: runtime_name,
@@ -747,6 +762,7 @@ pub fn agent_from_content(
         skills,
         extensions,
         subagent_only_extensions,
+        mutation_tools,
         output: fm.get("output").cloned(),
         output_mode: match fm.get("outputMode").map(String::as_str) {
             // agents.ts:979-983: inline | file-only; anything else is a
@@ -1188,6 +1204,12 @@ pub fn discover_agents_trusted(
     builtin_dir: Option<&Path>,
     project_trusted: bool,
 ) -> Result<Vec<AgentConfig>, String> {
+    if scope == "project" && !project_trusted {
+        return Err(
+            "Project scope requires a trusted project; retry in a trusted session or use scope \"user\" or \"both\"."
+                .to_string(),
+        );
+    }
     Ok(discover_agents_with_user_dirs_with_diagnostics_trusted(
         cwd,
         scope,
@@ -1203,6 +1225,9 @@ pub fn discover_agents_trusted(
 /// [`discover_agents`] plus one [`DiscoverDiagnostic`] per skipped definition
 /// or unreadable directory, in discovery order (builtin → user dirs → project
 /// dirs). Per-file failures never abort the batch.
+/// Trust-blind compatibility/test entry point. Production callers MUST use
+/// [`discover_agents_with_diagnostics_trusted`] with the session's project
+/// trust decision.
 pub fn discover_agents_with_diagnostics(
     cwd: &Path,
     scope: &str,
@@ -1257,6 +1282,8 @@ pub fn discover_agents_with_user_dirs(
 }
 
 /// Diagnostics-aware variant of [`discover_agents_with_user_dirs`].
+/// Trust-blind compatibility/test entry point; see
+/// [`discover_agents_with_user_dirs_with_diagnostics_trusted`].
 pub fn discover_agents_with_user_dirs_with_diagnostics(
     cwd: &Path,
     scope: &str,
@@ -1589,6 +1616,9 @@ fn apply_override_entry(agent: &mut AgentConfig, entry: &crate::config::AgentOve
     if let Some(exclude) = &entry.exclude_tools {
         agent.exclude_tools = exclude.clone().unwrap_or_default();
     }
+    if let Some(mutation) = &entry.mutation_tools {
+        agent.mutation_tools = mutation.clone().unwrap_or_default();
+    }
     if let Some(thinking) = &entry.thinking {
         agent.thinking = match thinking {
             Some(level) => ThinkingSpec::Level(level.clone()),
@@ -1668,6 +1698,11 @@ fn apply_custom_override_entry(agent: &mut AgentConfig, entry: &crate::config::A
         && !agent.has_frontmatter_field(&["excludeTools"])
     {
         agent.exclude_tools = exclude.clone().unwrap_or_default();
+    }
+    if let Some(mutation) = &entry.mutation_tools
+        && !agent.has_frontmatter_field(&["mutationTools"])
+    {
+        agent.mutation_tools = mutation.clone().unwrap_or_default();
     }
     if let Some(allowed) = &entry.allowed_agents
         && !agent.has_frontmatter_field(&["allowedAgents"])
@@ -2257,6 +2292,69 @@ mod tests {
         assert_eq!(researcher.mcp_direct_tools.len(), 0);
         // Builtins without an explicit model inherit subagents.defaultModel.
         assert_eq!(researcher.model.as_deref(), Some("model-x"));
+    }
+
+    #[test]
+    fn untrusted_project_scope_errors_instead_of_builtin_fallback() {
+        let root = temp_root("untrusted-scope");
+        let project = root.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let settings = crate::config::SettingsPair::default();
+        let error = discover_agents_trusted(&project, "project", &settings, None, false)
+            .expect_err("project scope must fail closed");
+        assert!(error.contains("requires a trusted project"), "{error}");
+        let both = discover_agents_trusted(&project, "both", &settings, None, false)
+            .expect("both scope still works");
+        assert!(
+            both.iter()
+                .all(|agent| agent.source != AgentSource::Project)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tool_modifier_entries_are_rejected_not_silently_accepted() {
+        let error = agent_from_content(
+            "---\nname: mod\ndescription: M\ntools: \"+read\"\n---\nbody",
+            Path::new("/x/mod.md"),
+            AgentSource::User,
+        )
+        .expect_err("+read must be rejected");
+        assert!(error.contains("invalid tools entry '+read'"), "{error}");
+    }
+
+    #[test]
+    fn mutation_tools_frontmatter_and_builtin_override() {
+        let agent = agent_from_content(
+            "---\nname: mutant\ndescription: M\nmutationTools: \"a\", b\n---\nbody",
+            Path::new("/x/mutant.md"),
+            AgentSource::User,
+        )
+        .expect("agent parses")
+        .expect("agent");
+        assert_eq!(agent.mutation_tools, vec!["a".to_string(), "b".to_string()]);
+        let mut user_settings = crate::config::SubagentSettings::default();
+        user_settings.overrides.insert(
+            "researcher".to_string(),
+            crate::config::AgentOverride {
+                mutation_tools: Some(Some(vec!["custom_tool".to_string()])),
+                ..Default::default()
+            },
+        );
+        let settings = crate::config::SettingsPair {
+            user: user_settings,
+            ..Default::default()
+        };
+        let found = discover_agents_with_user_dirs(
+            Path::new("/nonexistent"),
+            "both",
+            &settings,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let researcher = found.iter().find(|a| a.name == "researcher").unwrap();
+        assert_eq!(researcher.mutation_tools, vec!["custom_tool".to_string()]);
     }
 
     #[test]

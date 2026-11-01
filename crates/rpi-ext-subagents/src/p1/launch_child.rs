@@ -223,6 +223,11 @@ pub struct RunCtx {
     /// Step activity projection (TE09 FR-C): async runs install a sink that
     /// mirrors currentTool/currentPath into the run status document.
     pub step_status: Option<crate::runner::foreground::StepStatusSink>,
+    /// Resolved control config (global `config.control` + per-call override).
+    pub control: crate::runner::control::ResolvedControlConfig,
+    /// Control-event sink (async status/notices); foreground single runs use
+    /// the stream frame's `controlEvents` instead.
+    pub control_sink: Option<crate::runner::foreground::ControlEventSink>,
     /// Abort probe for the dispatch this context serves (see
     /// [`crate::runner::foreground::AbortProbe`]); `None` when there is no
     /// host channel or the context outlives its dispatch (async runs).
@@ -241,10 +246,16 @@ impl RunCtx {
         host: &dyn crate::HostContext,
         object: &serde_json::Map<String, Value>,
         config: ExtensionConfig,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        let parent_model = host.parent_model();
         let settings = crate::config::read_settings_pair_trusted(
             &host.cwd(),
             host.project_trusted() != Some(false),
+        )?
+        .with_provider(
+            parent_model
+                .as_deref()
+                .and_then(|model| model.split('/').next()),
         );
         let parent_session = host.parent_session(&settings);
         let parent_session_file = parent_session
@@ -288,7 +299,9 @@ impl RunCtx {
                 preference,
             )
         });
-        Self {
+        let control =
+            crate::runner::control::resolve(config.control.as_ref(), object.get("control"));
+        Ok(Self {
             top_model: object
                 .get("model")
                 .and_then(Value::as_str)
@@ -315,7 +328,7 @@ impl RunCtx {
             parent_session,
             parent_session_file,
             parent_session_id,
-            parent_model: host.parent_model(),
+            parent_model,
             project_trusted: host.project_trusted(),
             registry: host.scoped_models(),
             host_builtin_tool_names: host.host_tool_names(),
@@ -327,9 +340,11 @@ impl RunCtx {
             // non-streaming default for every other constructor caller).
             frame_sink: None,
             step_status: None,
+            control,
+            control_sink: None,
             abort_probe: None,
             detach_ctx: None,
-        }
+        })
     }
 
     /// Discover agents in both scopes for the effective cwd.
@@ -957,6 +972,9 @@ pub async fn run_child_async(
         intercom_detach: ctx.detach_ctx.clone().filter(|_| bridge_active),
         stream_sink: ctx.frame_sink.clone(),
         step_status: ctx.step_status.clone(),
+        mutation_tools: agent.mutation_tools.clone(),
+        control: ctx.control.clone(),
+        control_sink: ctx.control_sink.clone(),
         abort_probe: ctx.abort_probe.clone(),
     };
 
@@ -1212,6 +1230,8 @@ mod te18_fork_tests {
             session_root: std::env::temp_dir(),
             frame_sink: None,
             step_status: None,
+            control: crate::runner::control::ResolvedControlConfig::default(),
+            control_sink: None,
             abort_probe: None,
             detach_ctx: None,
         }
@@ -1386,6 +1406,8 @@ mod te18_gate_budget_tests {
             session_root: std::env::temp_dir(),
             frame_sink: None,
             step_status: None,
+            control: crate::runner::control::ResolvedControlConfig::default(),
+            control_sink: None,
             abort_probe: None,
             detach_ctx: None,
         };
@@ -1398,6 +1420,7 @@ mod te18_gate_budget_tests {
             tools: Some(vec!["web_search".to_string()]),
             exclude_tools: Vec::new(),
             mcp_direct_tools: Vec::new(),
+            mutation_tools: Vec::new(),
             model: None,
             allowed_agents: None,
             thinking: crate::agents::discover::ThinkingSpec::Unset,

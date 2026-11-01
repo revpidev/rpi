@@ -414,14 +414,19 @@ type BusTimeline = Arc<Mutex<Vec<(&'static str, Value)>>>;
 
 fn record_bus(host: &NativeExtensionHost) -> BusTimeline {
     let timeline: BusTimeline = Arc::new(Mutex::new(Vec::new()));
-    for channel in ["rpi:ask-user:prompt", "rpi:ask-user:blocked"] {
+    for channel in [
+        "rpi:ask-user:prompt",
+        "rpi:ask-user:blocked",
+        "rpi:ask-user:answer-result",
+    ] {
         let sink = timeline.clone();
         let unsubscribe = host.event_bus().on(
             channel,
             Arc::new(move |data| {
                 let name = match channel {
                     "rpi:ask-user:prompt" => "prompt",
-                    _ => "blocked",
+                    "rpi:ask-user:blocked" => "blocked",
+                    _ => "answer-result",
                 };
                 sink.lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -534,6 +539,7 @@ async fn build_session(
 struct TuiFixture {
     term: Term,
     session: rpi::core::agent_session::AgentSession,
+    host: Arc<NativeExtensionHost>,
     bus: BusTimeline,
     _sandbox: Sandbox,
     _env: EnvGuard,
@@ -641,6 +647,7 @@ impl TuiFixture {
         let fixture = TuiFixture {
             term,
             session,
+            host,
             bus,
             _sandbox: sandbox,
             _env: env,
@@ -804,6 +811,35 @@ fn find_jsonl(dir: &Path) -> Option<PathBuf> {
 /// FR-A/R-Q5.1/Q5.4/Q5.6: two questions — a multi-select (Space + Next
 /// row) then a single-select — auto-advance onto q2, explicit `Tab`/
 /// `Shift+Tab` tab hopping through the real pipeline, the global note
+/// ADR-0043: an inbound `rpi:ask-user:answer` on the real host bus settles
+/// the open TUI questionnaire, and exactly one answer-result verdict is
+/// emitted (no synthetic keys).
+#[tokio::test]
+async fn tui_external_answer_settles_the_open_questionnaire() {
+    let Some(mut fixture) = TuiFixture::boot("external-answer", &pick_one_params()).await else {
+        return;
+    };
+    await_screen(&fixture.term, "Alpha", Duration::from_secs(10)).await;
+    fixture.host.event_bus().emit(
+        "rpi:ask-user:answer",
+        json!({
+            "toolCallId": "tool:1",
+            "answers": [{"questionIndex": 0, "optionIndexes": [0]}],
+        }),
+    );
+    let (result, bus) = fixture.finish().await;
+    assert_eq!(result["content"][0]["text"], ALPHA_ENVELOPE);
+    assert_eq!(result["details"]["answers"][0]["answer"], json!("Alpha"));
+    let verdicts: Vec<&Value> = bus
+        .iter()
+        .filter(|(name, _)| *name == "answer-result")
+        .map(|(_, data)| data)
+        .collect();
+    assert_eq!(verdicts.len(), 1, "{bus:?}");
+    assert_eq!(verdicts[0]["ok"], json!(true));
+    assert_eq!(verdicts[0]["toolCallId"], json!("tool:1"));
+}
+
 /// (`n` on Submit) and Submit; the envelope carries the multi answer, the
 /// option answer and the global note. (`↑` and the per-question notes
 /// editor stay covered by the TE30/TE31 key matrix + golden frames; every

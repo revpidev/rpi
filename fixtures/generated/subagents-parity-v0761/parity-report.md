@@ -1,6 +1,5 @@
 # subagents parity report (regression track: pi-subagents v0.76.1 @ 7d072b91d snapshot, ADR-0036)
 
-generated: 2026-11-01T06:17:33.679Z
 
 ## args
 

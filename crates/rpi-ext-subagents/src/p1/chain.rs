@@ -847,6 +847,8 @@ mod tests {
             session_root: base.join("sessions"),
             frame_sink: None,
             step_status: None,
+            control: crate::runner::control::ResolvedControlConfig::default(),
+            control_sink: None,
             abort_probe: None,
             detach_ctx: None,
         };

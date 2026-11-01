@@ -9,11 +9,12 @@
 //! to `rpi:` (declared [BREAKING] in `changes/v0.1.6.md`); it is the single
 //! intentional break of the immutability policy above.
 //!
-//! `prompt` is emitted after validation and before the questionnaire opens;
-//! `blocked {active:true}` brackets the wait and `{active:false}` runs in the
-//! `finally` path. Q0 lands the payload builders + emit helpers; the wait
-//! bracket is wired by TE29 (RPC walker) / TE30 (component), which is why
-//! `tool::execute` does not emit `blocked` yet.
+//! `prompt` is emitted after the answerable component mount succeeds and
+//! before the first poll (ADR-0043 / FR-G R1: open before prompt). The
+//! component path emits `blocked {active:true}` in the same mounted callback
+//! and `{active:false}` on every exit; the RPC walker emits the same bracket
+//! around its dialogs. Physical/inline fallbacks emit the pair around the
+//! walker.
 
 use serde_json::{Value, json};
 

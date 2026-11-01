@@ -47,6 +47,10 @@ pub type StreamFrameSink = Arc<dyn Fn(&str, &Value) + Send + Sync>;
 /// `subagent_wait` can show live tool lines.
 pub type StepStatusSink = Arc<dyn Fn(u32, &Value) + Send + Sync>;
 
+/// Control-event sink (long-running guard): parent/background consumers that
+/// need every `needs_attention` / `active_long_running` transition.
+pub type ControlEventSink = Arc<dyn Fn(&crate::runner::control::ControlEvent) + Send + Sync>;
+
 /// Cooperative abort probe (extension-ABI abort-channel gap): polls the
 /// host's `ctx.aborted` for the dispatch's toolCallId. The native dispatch
 /// is a synchronous FFI call the runtime cannot cancel — a foreground run
@@ -229,6 +233,8 @@ pub struct ForegroundRunInput {
     pub agent_tools: Option<Vec<String>>,
     /// #1776 (R7.1.4.2): agent deny-list → `--exclude-tools`.
     pub agent_exclude_tools: Vec<String>,
+    /// Agent `mutationTools` (long-running guard classification).
+    pub mutation_tools: Vec<String>,
     pub agent_extensions: Option<Vec<String>>,
     pub agent_subagent_only_extensions: Option<Vec<String>>,
     /// The agent's declared `allowedAgents` (#2338): the child's own
@@ -297,6 +303,9 @@ pub struct ForegroundRunInput {
     /// currentPath into their status document so `subagent_wait` shows live
     /// tool lines. None for plain foreground runs.
     pub step_status: Option<StepStatusSink>,
+    /// Resolved control config + event sink (long-running guard).
+    pub control: crate::runner::control::ResolvedControlConfig,
+    pub control_sink: Option<ControlEventSink>,
     /// Cooperative abort probe (see [`AbortProbe`]): checked on every
     /// activity tick and between stdout events while waiting for the child.
     /// None = no abort channel (test fakes, detached async runs).
@@ -321,6 +330,9 @@ pub struct ForegroundRunResult {
     pub tool_count: u64,
     /// Assistant turns (`AgentProgress.turnCount` terminal projection).
     pub turns: u64,
+    pub activity_state: Option<crate::runner::control::ActivityState>,
+    pub control_events: Vec<crate::runner::control::ControlEvent>,
+    pub last_activity_at: Option<u64>,
     pub duration_ms: u64,
     pub artifact_paths: Option<ArtifactPaths>,
     pub session_file: Option<PathBuf>,
@@ -338,6 +350,241 @@ pub struct ForegroundRunResult {
 }
 
 const PROMPT_REDACTED: &str = "[prompt redacted]";
+
+/// Per-run metadata for control events (the state itself stays lock-protected).
+#[derive(Clone)]
+struct GuardContext {
+    control: crate::runner::control::ResolvedControlConfig,
+    run_id: String,
+    agent: String,
+    index: u32,
+    thinking: Option<String>,
+}
+
+const MUTATING_FAILURE_WINDOW_MS: u64 = 5 * 60 * 1000;
+
+fn is_budget_blocked(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("tool budget") || lower.contains("budget exceeded")
+}
+
+fn control_event_for(
+    state: &crate::runner::events::ChildRunState,
+    guard: &GuardContext,
+    now: u64,
+    to: crate::runner::control::ActivityState,
+    reason: &str,
+    message: Option<String>,
+    recent_failure_summary: Option<String>,
+) -> crate::runner::control::ControlEvent {
+    crate::runner::control::build_control_event(crate::runner::control::ControlEventInput {
+        to: Some(to),
+        from: state.activity_state,
+        run_id: guard.run_id.clone(),
+        agent: guard.agent.clone(),
+        index: Some(guard.index),
+        ts: now,
+        last_activity_at: state.last_activity_at,
+        message,
+        reason: Some(reason.to_string()),
+        turns: Some(state.turns),
+        tokens: Some(state.usage_input + state.usage_output),
+        tool_count: Some(state.tool_count),
+        current_tool: state.current_tool.clone(),
+        tool_call_id: state.current_tool_call_id.clone(),
+        current_tool_duration_ms: state
+            .current_tool_started_at
+            .map(|started| now.saturating_sub(started)),
+        current_path: state.current_path.clone(),
+        recent_failure_summary,
+        ..crate::runner::control::ControlEventInput::default()
+    })
+}
+
+fn record_control_event(
+    state: &mut crate::runner::events::ChildRunState,
+    event: crate::runner::control::ControlEvent,
+    events: &mut Vec<crate::runner::control::ControlEvent>,
+) {
+    state.control_events.push(event.clone());
+    state.pending_control_events.push(event.clone());
+    let overflow = state.control_events.len().saturating_sub(64);
+    if overflow > 0 {
+        state.control_events.drain(..overflow);
+    }
+    let pending_overflow = state.pending_control_events.len().saturating_sub(64);
+    if pending_overflow > 0 {
+        state.pending_control_events.drain(..pending_overflow);
+    }
+    if event.to == crate::runner::control::ActivityState::NeedsAttention {
+        state.attention_sticky = true;
+        state.attention_activity_at = state.last_activity_at;
+    }
+    events.push(event);
+}
+
+fn evaluate_control(
+    state: &mut crate::runner::events::ChildRunState,
+    guard: &GuardContext,
+    now: u64,
+) -> Vec<crate::runner::control::ControlEvent> {
+    let mut events = Vec::new();
+    if !guard.control.enabled {
+        state.activity_state = None;
+        state.attention_sticky = false;
+        return events;
+    }
+    if state.attention_sticky && state.last_activity_at == state.attention_activity_at {
+        // A failure/idle notice stays visible until the child produces new
+        // activity (upstream keeps `progress.activityState` across ticks).
+        state.activity_state = Some(crate::runner::control::ActivityState::NeedsAttention);
+        return events;
+    }
+    state.attention_sticky = false;
+    state.activity_state = None;
+    if crate::runner::control::should_emit_open_tool_attention(
+        &guard.control,
+        state.current_tool.as_deref(),
+        state.current_tool_started_at,
+        now,
+    ) {
+        let event = control_event_for(
+            state,
+            guard,
+            now,
+            crate::runner::control::ActivityState::NeedsAttention,
+            "tool_open_threshold",
+            Some(format!(
+                "{} has an open tool past the active-notice threshold",
+                guard.agent
+            )),
+            None,
+        );
+        state.activity_state = Some(crate::runner::control::ActivityState::NeedsAttention);
+        if crate::runner::control::claim_notification(
+            &guard.control,
+            &event,
+            &mut state.seen_control_keys,
+        ) {
+            record_control_event(state, event, &mut events);
+        }
+    } else if crate::runner::control::derive_activity_state(
+        &guard.control,
+        state.started_at_ms.unwrap_or(now),
+        state.last_activity_at,
+        state.turns,
+        state.current_tool.as_deref(),
+        guard.thinking.as_deref(),
+        now,
+    )
+    .is_some()
+    {
+        let event = control_event_for(
+            state,
+            guard,
+            now,
+            crate::runner::control::ActivityState::NeedsAttention,
+            "idle",
+            None,
+            None,
+        );
+        state.activity_state = Some(crate::runner::control::ActivityState::NeedsAttention);
+        if crate::runner::control::claim_notification(
+            &guard.control,
+            &event,
+            &mut state.seen_control_keys,
+        ) {
+            record_control_event(state, event, &mut events);
+        }
+    } else if !state.active_long_running_notified
+        && let Some(trigger) = crate::runner::guard::next_long_running_trigger(
+            &guard.control,
+            &crate::runner::guard::LongRunningMetrics {
+                started_at: state.started_at_ms.unwrap_or(now),
+                now,
+                turns: state.turns,
+                tokens: state.usage_input + state.usage_output,
+            },
+        )
+    {
+        let event = control_event_for(
+            state,
+            guard,
+            now,
+            crate::runner::control::ActivityState::ActiveLongRunning,
+            trigger.as_str(),
+            None,
+            None,
+        );
+        state.active_long_running_notified = true;
+        state.activity_state = Some(crate::runner::control::ActivityState::ActiveLongRunning);
+        if crate::runner::control::claim_notification(
+            &guard.control,
+            &event,
+            &mut state.seen_control_keys,
+        ) {
+            record_control_event(state, event, &mut events);
+        }
+    } else if state.active_long_running_notified {
+        state.activity_state = Some(crate::runner::control::ActivityState::ActiveLongRunning);
+    }
+    events
+}
+
+fn process_tool_end(
+    state: &mut crate::runner::events::ChildRunState,
+    guard: &GuardContext,
+    signal: &crate::runner::events::ToolEndSignal,
+) -> Vec<crate::runner::control::ControlEvent> {
+    let mut events = Vec::new();
+    if !guard.control.enabled || !signal.mutates {
+        return events;
+    }
+    if !crate::runner::guard::did_mutating_tool_fail(signal.is_error)
+        || is_budget_blocked(&signal.error)
+    {
+        crate::runner::guard::reset_mutating_failure_state(&mut state.mutating_failures);
+        return events;
+    }
+    crate::runner::guard::record_mutating_failure(
+        &mut state.mutating_failures,
+        crate::runner::guard::FailedMutatingAttempt {
+            tool: signal.tool.clone(),
+            path: signal.path.clone(),
+            error: signal.error.clone(),
+            ts: signal.ts,
+        },
+        MUTATING_FAILURE_WINDOW_MS,
+    );
+    if crate::runner::guard::should_escalate_mutating_failures(
+        &state.mutating_failures,
+        guard.control.failed_tool_attempts_before_attention,
+    ) {
+        let summary =
+            crate::runner::guard::summarize_recent_mutating_failures(&state.mutating_failures);
+        let event = control_event_for(
+            state,
+            guard,
+            signal.ts,
+            crate::runner::control::ActivityState::NeedsAttention,
+            "tool_failures",
+            Some(format!(
+                "{} needs attention after repeated mutating tool failures",
+                guard.agent
+            )),
+            Some(summary),
+        );
+        state.activity_state = Some(crate::runner::control::ActivityState::NeedsAttention);
+        if crate::runner::control::claim_notification(
+            &guard.control,
+            &event,
+            &mut state.seen_control_keys,
+        ) {
+            record_control_event(state, event, &mut events);
+        }
+    }
+    events
+}
 
 /// Run one child to completion (blocking the caller's async context — the
 /// plugin runs it on its private runtime while the host dispatch thread
@@ -474,7 +721,13 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         (guard.stdout.take(), guard.stderr.take())
     };
 
+    let run_started = artifacts::now_millis();
     let state = Arc::new(Mutex::new(ChildRunState::default()));
+    {
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        state.mutation_tools = input.mutation_tools.clone();
+        state.started_at_ms = Some(run_started);
+    }
     let raw_tail = Arc::new(Mutex::new(BoundedByteTail::new(MAX_CHILD_STDERR_BYTES)));
     // V13-01 (FR-A/FR-B): one persistent write handle per child run instead
     // of per-line open/close — events.jsonl from stdout, the transcript
@@ -556,10 +809,19 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         skills: input.resolved_skill_names.clone(),
         model: input.model.clone(),
         thinking: input.thinking.clone(),
-        started_at_ms: artifacts::now_millis(),
+        started_at_ms: run_started,
+    };
+    let guard = GuardContext {
+        control: input.control.clone(),
+        run_id: input.run_id.clone(),
+        agent: input.agent_name.clone(),
+        index: input.child_index,
+        thinking: input.thinking.clone(),
     };
     let frame_sink = input.stream_sink.clone();
     let step_status = input.step_status.clone();
+    let control_sink = input.control_sink.clone();
+    let stdout_guard = guard.clone();
     let child_index = input.child_index;
     let context_label = input.context_label.clone();
     // Ticker-side copies (the stdout task above owns the originals).
@@ -645,11 +907,16 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                 // reference; cloning `messages` per event is an O(n²) face
                 // it does not have). `messages` never leaves the lock: the
                 // frame builder walks it for the bounded summaries only.
-                let (outcome, status_fields, frame) = {
+                let (outcome, status_fields, frame, control_events) = {
                     let mut state = stdout_state.lock().unwrap_or_else(|e| e.into_inner());
                     let outcome = state.process_line(trimmed, now_ms);
+                    let control_events = outcome
+                        .tool_end
+                        .as_ref()
+                        .map(|signal| process_tool_end(&mut state, &stdout_guard, signal))
+                        .unwrap_or_default();
                     if !outcome.progress_event {
-                        (outcome, None, None)
+                        (outcome, None, None, control_events)
                     } else {
                         let status_fields = step_status.as_ref().map(|_| {
                             json!({
@@ -659,19 +926,28 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                                 "currentPath": state.current_path.clone(),
                                 "turnCount": state.turns,
                                 "toolCount": state.tool_count,
+                                "activityState": state.activity_state.map(|state| state.as_str()),
+                                "lastActivityAt": state.last_activity_at,
                             })
                         });
                         let frame = frame_sink.as_ref().map(|_| {
-                            streaming::single_update_details(
+                            let frame = streaming::single_update_details(
                                 &state,
                                 &stream_meta,
                                 &context_label,
                                 now_ms,
-                            )
+                            );
+                            state.pending_control_events.clear();
+                            frame
                         });
-                        (outcome, status_fields, frame)
+                        (outcome, status_fields, frame, control_events)
                     }
                 };
+                for event in &control_events {
+                    if let Some(sink) = &control_sink {
+                        sink(event);
+                    }
+                }
                 match outcome.lifecycle {
                     ChildLifecycleAction::StartDrain => terminal = true,
                     ChildLifecycleAction::CancelDrain => terminal = false,
@@ -778,8 +1054,9 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     // (execution.ts:1075 idleMs 2s/hardMs 8s) approximated by the hard cap.
     // With a streaming sink the wait races the 1s activity tick
     // (execution.ts:1009-1019: the interval fires updateActivityState +
-    // fireUpdate while onUpdate is attached; the derivation engine feeding
-    // activityState is out of scope, the tick itself stays).
+    // fireUpdate while onUpdate is attached. TE51 runs the ported guard's
+    // idle/open-tool/active-long-running derivation on this tick; it also
+    // runs for async status/control sinks, not only streaming frames.)
     //
     // Abort probe (extension-ABI abort-channel gap): on a user abort the
     // child gets an immediate SIGKILL — upstream user-level aborts surface
@@ -810,8 +1087,16 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         Exited(std::io::Result<std::process::ExitStatus>),
         Detached(Value),
     }
-    let wait_outcome = if input.stream_sink.is_some() {
+    let needs_ticker = input.stream_sink.is_some()
+        || input.step_status.is_some()
+        || input.control.enabled
+        || input.control_sink.is_some();
+    let wait_outcome = if needs_ticker {
         let ticker_state = state.clone();
+        let ticker_step_status = input.step_status.clone();
+        let ticker_guard = guard.clone();
+        let ticker_control_sink = input.control_sink.clone();
+        let ticker_has_frame = input.stream_sink.is_some();
         let ticker_sink = input
             .stream_sink
             .clone()
@@ -842,17 +1127,47 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                     let now_ms = artifacts::now_millis();
                     // Build under the lock, push outside it (same discipline
                     // as the per-event path — no full-state clone).
-                    let (text, details) = {
-                        let state =
+                    let (frame, control_events, status_fields) = {
+                        let mut state =
                             ticker_state.lock().unwrap_or_else(|e| e.into_inner());
-                        streaming::single_update_details(
-                            &state,
-                            &ticker_meta,
-                            &ticker_context,
-                            now_ms,
-                        )
+                        let control_events = evaluate_control(&mut state, &ticker_guard, now_ms);
+                        let status_fields = ticker_step_status.as_ref().map(|_| {
+                            json!({
+                                "currentTool": state.current_tool.clone(),
+                                "currentToolArgs": state.current_tool_args.clone(),
+                                "currentToolStartedAt": state.current_tool_started_at,
+                                "currentPath": state.current_path.clone(),
+                                "turnCount": state.turns,
+                                "toolCount": state.tool_count,
+                                "activityState": state.activity_state.map(|state| state.as_str()),
+                                "lastActivityAt": state.last_activity_at,
+                            })
+                        });
+                        let frame = ticker_has_frame.then(|| {
+                            let frame = streaming::single_update_details(
+                                &state,
+                                &ticker_meta,
+                                &ticker_context,
+                                now_ms,
+                            );
+                            state.pending_control_events.clear();
+                            frame
+                        });
+                        (frame, control_events, status_fields)
                     };
-                    ticker_sink(&text, &details);
+                    for event in &control_events {
+                        if let Some(sink) = &ticker_control_sink {
+                            sink(event);
+                        }
+                    }
+                    if let Some(fields) = &status_fields
+                        && let Some(status) = &ticker_step_status
+                    {
+                        status(input.child_index, fields);
+                    }
+                    if let Some((text, details)) = frame {
+                        ticker_sink(&text, &details);
+                    }
                 }
             }
         }
@@ -1425,6 +1740,9 @@ fn synthesize_exit_from_parts(
         output_partial,
         tool_count: state.tool_count,
         turns: state.turns,
+        activity_state: state.activity_state,
+        control_events: state.control_events.clone(),
+        last_activity_at: state.last_activity_at,
         duration_ms,
         artifact_paths: None,
         session_file: None,
@@ -1453,6 +1771,9 @@ fn failed_result(
         output_partial: false,
         tool_count: 0,
         turns: 0,
+        activity_state: None,
+        control_events: Vec::new(),
+        last_activity_at: None,
         duration_ms: start.elapsed().as_millis() as u64,
         artifact_paths,
         session_file: None,
@@ -1535,9 +1856,79 @@ mod frame_signature_tests {
 mod terminal_classification_tests {
     use super::*;
 
+    fn guard_config() -> crate::runner::control::ResolvedControlConfig {
+        crate::runner::control::ResolvedControlConfig {
+            needs_attention_after_ms: 100,
+            needs_attention_after_ms_is_explicit: true,
+            failed_tool_attempts_before_attention: 2,
+            ..crate::runner::control::ResolvedControlConfig::default()
+        }
+    }
+
+    fn guard() -> GuardContext {
+        GuardContext {
+            control: guard_config(),
+            run_id: "run-control".to_string(),
+            agent: "worker".to_string(),
+            index: 0,
+            thinking: None,
+        }
+    }
+
+    #[test]
+    fn control_guard_emits_idle_and_mutating_failure_attention_once() {
+        let mut state = crate::runner::events::ChildRunState {
+            started_at_ms: Some(0),
+            last_activity_at: Some(0),
+            turns: 1,
+            ..crate::runner::events::ChildRunState::default()
+        };
+        let events = evaluate_control(&mut state, &guard(), 150);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            events[0].event_type,
+            crate::runner::control::ControlEventType::NeedsAttention
+        );
+        assert_eq!(events[0].reason.as_deref(), Some("idle"));
+        assert_eq!(
+            state.activity_state,
+            Some(crate::runner::control::ActivityState::NeedsAttention)
+        );
+        // Same state: the dedupe key suppresses a second notice.
+        assert!(evaluate_control(&mut state, &guard(), 160).is_empty());
+        // Activity resumes.
+        state.last_activity_at = Some(200);
+        let events = evaluate_control(&mut state, &guard(), 210);
+        assert!(events.is_empty());
+        assert_eq!(state.activity_state, None);
+        // Mutating failures escalate at the configured threshold.
+        let signal = crate::runner::events::ToolEndSignal {
+            tool: "edit".to_string(),
+            path: Some("src/a.ts".to_string()),
+            mutates: true,
+            is_error: true,
+            error: "boom".to_string(),
+            ts: 220,
+            ..crate::runner::events::ToolEndSignal::default()
+        };
+        assert!(process_tool_end(&mut state, &guard(), &signal).is_empty());
+        let events = process_tool_end(&mut state, &guard(), &signal);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].reason.as_deref(), Some("tool_failures"));
+        assert!(
+            events[0]
+                .recent_failure_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("edit(src/a.ts)"))
+        );
+    }
+
     fn test_input() -> ForegroundRunInput {
         ForegroundRunInput {
             intercom_detach: None,
+            control: crate::runner::control::ResolvedControlConfig::default(),
+            control_sink: None,
+            mutation_tools: Vec::new(),
             agent_name: "scout".to_string(),
             agent_system_prompt: String::new(),
             agent_system_prompt_mode: "replace",

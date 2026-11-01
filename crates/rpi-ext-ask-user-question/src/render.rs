@@ -160,7 +160,6 @@ fn parse_questions(args: &Value) -> Option<Vec<ParsedQuestion>> {
                         .filter(|text| !text.is_empty())
                         .map(sanitize_inline)
                 };
-                let _ = object.and_then(|object| object.get("options"));
                 ParsedQuestion {
                     header: string_field("header"),
                     question: string_field("question"),
@@ -261,7 +260,21 @@ fn answer_text(answer: Option<&Value>, theme: &dyn RenderTheme, i18n: &I18n) -> 
             picks.extend(typed);
             picks
         }
-        _ => Vec::new(),
+        _ => {
+            let mut picks: Vec<String> = answer
+                .get("selected")
+                .and_then(Value::as_array)
+                .map(|selected| {
+                    selected
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(strip_recommended)
+                        .collect()
+                })
+                .unwrap_or_default();
+            picks.extend(typed);
+            picks
+        }
     };
     let text = picks
         .into_iter()
@@ -299,7 +312,8 @@ fn detail_lines(
             .and_then(Value::as_str)
             .filter(|preview| !preview.is_empty())
     {
-        for line in preview.split('\n') {
+        let preview_lines: Vec<String> = preview.split('\n').map(str::to_string).collect();
+        for line in crate::view::preview::strip_fence_markers(&preview_lines) {
             lines.push(truncate_line(
                 &format!("{indent}{}", theme.fg("dim", &format!("│ {line}"))),
                 width,
@@ -347,18 +361,18 @@ fn questionnaire_details(result: &Value) -> Option<&Value> {
         .filter(|details| details.get("cancelled").is_some_and(Value::is_boolean))
 }
 
-/// The first non-empty text block of a tool result, unsanitized.
+/// The first `type:"text"` content block of a tool result, unsanitized
+/// (`firstTextLine`: an empty first text block yields an empty reason).
 fn raw_result_text(result: &Value) -> String {
     result
         .get("content")
         .and_then(Value::as_array)
         .and_then(|blocks| {
-            blocks.iter().find_map(|block| {
-                block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-            })
+            blocks
+                .iter()
+                .find(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
         })
         .unwrap_or("")
         .to_string()
@@ -418,13 +432,14 @@ fn single_lines(
     details: &Value,
     question_text: Option<&str>,
     theme: &dyn RenderTheme,
+    i18n: &I18n,
     expanded: bool,
     width: usize,
 ) -> Vec<String> {
     let list = answers(details);
     let answer = answer_for(list, 0);
     let prefix = format!("{} ", theme.fg("success", "✓"));
-    let mut lines = hanging(&prefix, &answer_text(answer, theme, &I18n::detect()), width);
+    let mut lines = hanging(&prefix, &answer_text(answer, theme, i18n), width);
     let question = expanded.then_some(question_text).flatten();
     lines.extend(detail_lines(answer, question, "  ", theme, width));
     lines.extend(global_note_lines(details, theme, width));
@@ -436,6 +451,7 @@ fn table_lines(
     details: &Value,
     questions: &[ParsedQuestion],
     theme: &dyn RenderTheme,
+    i18n: &I18n,
     expanded: bool,
     width: usize,
 ) -> Vec<String> {
@@ -456,11 +472,7 @@ fn table_lines(
         let header = headers.get(index).cloned().unwrap_or_default();
         let pad = header_width.saturating_sub(rpi_tui::utils::visible_width(&header));
         let prefix = format!("  {}{}  ", theme.fg("muted", &header), " ".repeat(pad));
-        lines.extend(hanging(
-            &prefix,
-            &answer_text(answer, theme, &I18n::detect()),
-            width,
-        ));
+        lines.extend(hanging(&prefix, &answer_text(answer, theme, i18n), width));
         let question_text = expanded.then_some(question.question.as_deref()).flatten();
         lines.extend(detail_lines(
             answer,
@@ -522,7 +534,7 @@ pub fn render_result(
         let args = context.get("args").cloned().unwrap_or(Value::Null);
         let questions = parse_questions(&args).unwrap_or_default();
         if questions.len() > 1 {
-            table_lines(details, &questions, theme, expanded, width)
+            table_lines(details, &questions, theme, i18n, expanded, width)
         } else {
             single_lines(
                 details,
@@ -530,6 +542,7 @@ pub fn render_result(
                     .first()
                     .and_then(|question| question.question.as_deref()),
                 theme,
+                i18n,
                 expanded,
                 width,
             )
@@ -819,6 +832,30 @@ mod tests {
             );
             assert_eq!(text_of(&tree), expected);
         }
+    }
+
+    #[test]
+    fn preview_fence_markers_are_stripped_from_the_receipt() {
+        let questions = json!({"questions": [{"question": "Q", "header": "H", "options": []}]});
+        let tree = render_result(
+            &result(
+                details(json!([{
+                    "questionIndex": 0,
+                    "question": "Q",
+                    "kind": "option",
+                    "answer": "A",
+                    "preview": "```rust\nlet x = 1;\n```"
+                }])),
+                "",
+            ),
+            &json!({}),
+            &json!({ "args": questions, "expanded": true, "terminalWidth": 80, "isError": false }),
+            &IdentityRenderTheme,
+            &en(),
+        );
+        let text = text_of(&tree);
+        assert!(!text.contains("```"), "{text}");
+        assert!(text.contains("let x = 1;"), "{text}");
     }
 
     #[test]

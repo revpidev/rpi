@@ -13,16 +13,19 @@
 //!   and `artifactConfig.cleanupDays` must be non-negative integers — invalid
 //!   values invalidate the whole config (config.ts:49-68). P2 keys with object
 //!   shapes (missions/authorityPolicy/…) are accepted only as JSON objects.
-//! - Settings `subagents.*` are fail-fast on wrong types (agents.ts
-//!   `readSubagentSettings`); the whole file degrades to warn + empty (TE-D15).
+//! - Settings `subagents.*` are fail-fast on parse/validation errors
+//!   (agents.ts `readSubagentSettings`; R18.9.4 BREAKING). Both user and
+//!   trusted-project files abort the extension load; an untrusted project is
+//!   never read (`read_settings_pair_trusted`).
 //! - TE05 adds the P1 field set: settings keys `defaultThinking`,
 //!   `disableThinking`, `defaultExtensions`, `modelScope` and the full
 //!   agentOverrides entries; config keys `forceTopLevelAsync`,
 //!   `globalConcurrencyLimit`, `maxSubagentSpawnsPerSession`,
 //!   `maxActiveAsyncRunsPerSession`, `singleRunOutputBaseDir`, `parallel`,
 //!   `waitTool`, `worktreeBaseDir`, `worktreeSetupHook`, `intercomBridge`.
-//!   Override fields beyond the documented set (extensions/
-//!   subagentOnlyExtensions/completionGuard/toolBudget) warn and are ignored.
+//!   `mutationTools` and `agentOverridesByProvider` are fully parsed; fields
+//!   beyond the documented set (extensions/subagentOnlyExtensions/…) warn
+//!   and are ignored.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -92,6 +95,10 @@ pub struct ExtensionConfig {
     /// `RPI_SUBAGENT_WAIT_TOOL_DEFAULT_TIMEOUT_MS` overrides). None = the
     /// built-in 30-minute default.
     pub wait_tool_default_timeout_ms: Option<u64>,
+    /// `control` (subagent-control.ts): global attention/active-long-running
+    /// thresholds. Raw JSON because `resolveControlConfig` is lenient and
+    /// ignores invalid positive integers/lists.
+    pub control: Option<Value>,
 }
 
 impl Default for ExtensionConfig {
@@ -125,6 +132,7 @@ impl ExtensionConfig {
             worktree_setup_hook: None,
             intercom_bridge: None,
             wait_tool_default_timeout_ms: None,
+            control: None,
         }
     }
 
@@ -565,6 +573,12 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
             return Err(format!("config.{key} must be a JSON object"));
         }
     }
+    if let Some(control) = object.get("control") {
+        if !control.is_object() && !control.is_null() {
+            return Err("config.control must be a JSON object".into());
+        }
+        config.control = control.as_object().map(|_| control.clone());
+    }
     Ok(config)
 }
 
@@ -645,6 +659,93 @@ pub struct AgentOverride {
     /// `outputMode` override (#1305, agents.ts:979-983): inline | file-only.
     pub output_mode: Option<String>,
     pub skills: Option<Option<Vec<String>>>,
+    /// `mutationTools` (agents.ts:1232): string[] or false (clear).
+    pub mutation_tools: Option<Option<Vec<String>>>,
+}
+
+impl AgentOverride {
+    /// Shallow field merge used by `selectProviderOverrides` (agents.ts:1370-1378):
+    /// every field present in `other` wins over `self`.
+    pub fn merge_from(&mut self, other: &AgentOverride) {
+        if other.description.is_some() {
+            self.description = other.description.clone();
+        }
+        if other.model.is_some() {
+            self.model = other.model.clone();
+        }
+        if other.disabled.is_some() {
+            self.disabled = other.disabled;
+        }
+        if other.tools.is_some() {
+            self.tools = other.tools.clone();
+        }
+        if other.exclude_tools.is_some() {
+            self.exclude_tools = other.exclude_tools.clone();
+        }
+        if other.thinking.is_some() {
+            self.thinking = other.thinking.clone();
+        }
+        if other.system_prompt_mode.is_some() {
+            self.system_prompt_mode = other.system_prompt_mode.clone();
+        }
+        if other.inherit_project_context.is_some() {
+            self.inherit_project_context = other.inherit_project_context;
+        }
+        if other.inherit_skills.is_some() {
+            self.inherit_skills = other.inherit_skills;
+        }
+        if other.default_context.is_some() {
+            self.default_context = other.default_context.clone();
+        }
+        if other.acceptance_role.is_some() {
+            self.acceptance_role = other.acceptance_role.clone();
+        }
+        if other.system_prompt.is_some() {
+            self.system_prompt = other.system_prompt.clone();
+        }
+        if other.advertise.is_some() {
+            self.advertise = other.advertise;
+        }
+        if other.default_provider.is_some() {
+            self.default_provider = other.default_provider.clone();
+        }
+        if other.allow_nested_subagents.is_some() {
+            self.allow_nested_subagents = other.allow_nested_subagents;
+        }
+        if other.allowed_agents.is_some() {
+            self.allowed_agents = other.allowed_agents.clone();
+        }
+        if other.output_mode.is_some() {
+            self.output_mode = other.output_mode.clone();
+        }
+        if other.skills.is_some() {
+            self.skills = other.skills.clone();
+        }
+        if other.mutation_tools.is_some() {
+            self.mutation_tools = other.mutation_tools.clone();
+        }
+    }
+}
+
+impl SubagentSettings {
+    /// Upstream `selectProviderOverrides` (agents.ts:1370-1378): a provider's
+    /// per-agent entries merge over the base `agentOverrides` for that provider.
+    pub fn with_provider_overrides(&self, provider: Option<&str>) -> SubagentSettings {
+        let Some(provider) = provider else {
+            return self.clone();
+        };
+        let Some(selected) = self.provider_overrides.get(provider) else {
+            return self.clone();
+        };
+        let mut out = self.clone();
+        for (name, entry) in selected {
+            out.overrides
+                .entry(name.clone())
+                .or_default()
+                .merge_from(entry);
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -656,6 +757,8 @@ pub struct SubagentSettings {
     pub default_thinking: Option<String>,
     pub disable_thinking: Option<bool>,
     pub default_extensions: Option<Vec<String>>,
+    /// `agentOverridesByProvider.<provider>.<agent>` entries (agents.ts:1326-1365).
+    pub provider_overrides: BTreeMap<String, BTreeMap<String, AgentOverride>>,
     /// `defaultSubagentOnlyExtensions` (#2322): child-only extension paths
     /// for agents without their own `subagentOnlyExtensions` field; unlike
     /// `defaultExtensions: []` this never disables ambient discovery. An
@@ -684,9 +787,24 @@ pub struct SubagentSettings {
 /// description, model, disabled, tools}`. Unknown override fields warn and are
 /// ignored (TE-D15); invalid types are errors like upstream.
 pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings, String> {
-    let Some(raw) = read_json_file(path) else {
-        return Ok(SubagentSettings::default());
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SubagentSettings::default());
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to read settings file '{}': {error}",
+                path.to_string_lossy()
+            ));
+        }
     };
+    let raw: Value = serde_json::from_str(&content).map_err(|error| {
+        format!(
+            "Failed to parse settings file '{}': {error}",
+            path.to_string_lossy()
+        )
+    })?;
     let Some(object) = raw.as_object() else {
         return Err(format!(
             "Failed to read settings file '{}': must be a JSON object",
@@ -697,7 +815,10 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
         return Ok(SubagentSettings::default());
     };
     let Some(subagents) = subagents.as_object() else {
-        return Ok(SubagentSettings::default());
+        return Err(format!(
+            "Subagent settings in '{}' must be a JSON object.",
+            path.to_string_lossy()
+        ));
     };
     let mut parsed = SubagentSettings::default();
     if let Some(value) = subagents.get("disableBuiltins") {
@@ -913,7 +1034,10 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
     }
     if let Some(overrides) = subagents.get("agentOverrides") {
         let Some(overrides) = overrides.as_object() else {
-            return Ok(parsed);
+            return Err(format!(
+                "Subagent settings in '{}' have invalid agentOverrides; expected an object keyed by agent.",
+                path.to_string_lossy()
+            ));
         };
         for (name, value) in overrides {
             let Some(entry) = value.as_object() else {
@@ -922,264 +1046,310 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                     path.to_string_lossy()
                 ));
             };
-            let mut parsed_entry = AgentOverride::default();
-            let mut ignored = Vec::new();
-            for (key, field) in entry {
-                if !BUILTIN_OVERRIDE_FIELDS.contains(&key.as_str()) {
-                    let suggestion =
-                        crate::agents::edit_distance::closest_match(key, BUILTIN_OVERRIDE_FIELDS);
+            let parsed_entry =
+                parse_override_entry(path, &format!("agentOverrides.{name}"), entry)?;
+            if parsed_entry != AgentOverride::default() {
+                parsed.overrides.insert(name.clone(), parsed_entry);
+            }
+        }
+    }
+    if let Some(by_provider) = subagents.get("agentOverridesByProvider") {
+        let Some(by_provider) = by_provider.as_object() else {
+            return Err(format!(
+                "Subagent settings in '{}' have invalid agentOverridesByProvider; expected an object keyed by provider.",
+                path.to_string_lossy()
+            ));
+        };
+        for (provider, value) in by_provider {
+            let Some(entries) = value.as_object() else {
+                return Err(format!(
+                    "Subagent settings in '{}' have invalid agentOverridesByProvider.{provider}; expected an object keyed by agent.",
+                    path.to_string_lossy()
+                ));
+            };
+            let mut parsed_entries = BTreeMap::new();
+            for (agent_name, value) in entries {
+                let Some(entry) = value.as_object() else {
                     return Err(format!(
-                        "Subagent settings in '{}' have invalid agentOverrides.{name}: unknown field '{key}'.{}",
-                        path.to_string_lossy(),
-                        suggestion
-                            .map(|suggestion| format!(" Did you mean '{suggestion}'?"))
-                            .unwrap_or_default()
+                        "Subagent settings in '{}' have invalid agentOverridesByProvider.{provider}.{agent_name}; expected a JSON object.",
+                        path.to_string_lossy()
                     ));
+                };
+                let parsed_entry = parse_override_entry(
+                    path,
+                    &format!("agentOverridesByProvider.{provider}.{agent_name}"),
+                    entry,
+                )?;
+                if parsed_entry != AgentOverride::default() {
+                    parsed_entries.insert(agent_name.clone(), parsed_entry);
                 }
-                match key.as_str() {
-                    "description" => {
-                        parsed_entry.description = Some(
-                            field
-                                .as_str()
-                                .ok_or_else(|| {
-                                    invalid_override_field(path, name, "description", "a string")
-                                })?
-                                .to_string(),
-                        )
+            }
+            parsed
+                .provider_overrides
+                .insert(provider.clone(), parsed_entries);
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_override_entry(
+    path: &std::path::Path,
+    name: &str,
+    entry: &serde_json::Map<String, Value>,
+) -> Result<AgentOverride, String> {
+    let mut parsed_entry = AgentOverride::default();
+    let mut ignored = Vec::new();
+    for (key, field) in entry {
+        if !BUILTIN_OVERRIDE_FIELDS.contains(&key.as_str()) {
+            let suggestion =
+                crate::agents::edit_distance::closest_match(key, BUILTIN_OVERRIDE_FIELDS);
+            return Err(format!(
+                "Subagent settings in '{}' have invalid {name}: unknown field '{key}'.{}",
+                path.to_string_lossy(),
+                suggestion
+                    .map(|suggestion| format!(" Did you mean '{suggestion}'?"))
+                    .unwrap_or_default()
+            ));
+        }
+        match key.as_str() {
+            "description" => {
+                parsed_entry.description = Some(
+                    field
+                        .as_str()
+                        .ok_or_else(|| {
+                            invalid_override_field(path, name, "description", "a string")
+                        })?
+                        .to_string(),
+                )
+            }
+            "model" => {
+                parsed_entry.model = Some(match field {
+                    Value::Bool(false) => None,
+                    Value::String(s) => Some(s.clone()),
+                    _ => {
+                        return Err(invalid_override_field(
+                            path,
+                            name,
+                            "model",
+                            "a string or false",
+                        ));
                     }
-                    "model" => {
-                        parsed_entry.model = Some(match field {
-                            Value::Bool(false) => None,
-                            Value::String(s) => Some(s.clone()),
-                            _ => {
-                                return Err(invalid_override_field(
-                                    path,
-                                    name,
-                                    "model",
-                                    "a string or false",
-                                ));
-                            }
-                        });
-                    }
-                    "disabled" => {
-                        parsed_entry.disabled = Some(field.as_bool().ok_or_else(|| {
-                            invalid_override_field(path, name, "disabled", "a boolean")
-                        })?);
-                    }
-                    // #2534: `advertise` accepts only booleans (agents.ts:1014).
-                    "advertise" => {
-                        parsed_entry.advertise = Some(field.as_bool().ok_or_else(|| {
-                            invalid_override_field(path, name, "advertise", "a boolean")
-                        })?);
-                    }
-                    "tools" => {
-                        // `parseToolsOverride` (agents.ts:946-951 @ 0fc0eebb):
-                        // string "inherit" (after trim), boolean false, or a
-                        // string array; anything else is a settings error.
-                        parsed_entry.tools = Some(match field {
-                            Value::String(value) if value.trim() == "inherit" => {
-                                ToolsOverride::Inherit
-                            }
-                            Value::Bool(false) => ToolsOverride::Disable,
-                            Value::Array(items) => {
-                                let mut names = Vec::new();
-                                for item in items {
-                                    names.push(
-                                        item.as_str()
-                                            .ok_or_else(|| {
-                                                invalid_override_field(
-                                                    path,
-                                                    name,
-                                                    "tools",
-                                                    "an array of strings, \"inherit\", or false",
-                                                )
-                                            })?
-                                            .to_string(),
-                                    );
-                                }
-                                ToolsOverride::List(names)
-                            }
-                            _ => {
-                                return Err(invalid_override_field(
+                });
+            }
+            "disabled" => {
+                parsed_entry.disabled =
+                    Some(field.as_bool().ok_or_else(|| {
+                        invalid_override_field(path, name, "disabled", "a boolean")
+                    })?);
+            }
+            // #2534: `advertise` accepts only booleans (agents.ts:1014).
+            "advertise" => {
+                parsed_entry.advertise =
+                    Some(field.as_bool().ok_or_else(|| {
+                        invalid_override_field(path, name, "advertise", "a boolean")
+                    })?);
+            }
+            "tools" => {
+                // `parseToolsOverride` (agents.ts:946-951 @ 0fc0eebb):
+                // string "inherit" (after trim), boolean false, or a
+                // string array; anything else is a settings error.
+                parsed_entry.tools = Some(match field {
+                    Value::String(value) if value.trim() == "inherit" => ToolsOverride::Inherit,
+                    Value::Bool(false) => ToolsOverride::Disable,
+                    Value::Array(items) => {
+                        let mut names = Vec::new();
+                        for item in items {
+                            let tool = item.as_str().ok_or_else(|| {
+                                invalid_override_field(
                                     path,
                                     name,
                                     "tools",
                                     "an array of strings, \"inherit\", or false",
-                                ));
-                            }
-                        });
-                    }
-                    "excludeTools" => {
-                        // #1776: same shape family as other list overrides
-                        // (`parseOverrideStringArrayOrFalse`, agents.ts:1098).
-                        parsed_entry.exclude_tools = Some(parse_override_string_array_or_false(
-                            field,
-                            path,
-                            name,
-                            "excludeTools",
-                        )?);
-                    }
-                    "allowedAgents" => {
-                        parsed_entry.allowed_agents = Some(parse_override_string_array_or_false(
-                            field,
-                            path,
-                            name,
-                            "allowedAgents",
-                        )?);
-                    }
-                    "thinking" => {
-                        // #3064: a known level (off..max) or false; a typo used
-                        // to be appended to the child's model id.
-                        parsed_entry.thinking = Some(match field {
-                            Value::Bool(false) => None,
-                            Value::String(level)
-                                if crate::launch::model::THINKING_LEVELS
-                                    .contains(&level.as_str()) =>
-                            {
-                                Some(level.clone())
-                            }
-                            _ => {
-                                return Err(invalid_override_field(
-                                    path,
-                                    name,
-                                    "thinking",
-                                    "a known level (off, minimal, low, medium, high, xhigh, max) or false",
-                                ));
-                            }
-                        });
-                    }
-                    "systemPromptMode" => {
-                        parsed_entry.system_prompt_mode = Some(match field.as_str() {
-                            Some("append") | Some("replace") => field.as_str().unwrap().to_string(),
-                            _ => {
-                                return Err(invalid_override_field(
-                                    path,
-                                    name,
-                                    "systemPromptMode",
-                                    "'append' or 'replace'",
-                                ));
-                            }
-                        });
-                    }
-                    "inheritProjectContext" => {
-                        parsed_entry.inherit_project_context =
-                            Some(field.as_bool().ok_or_else(|| {
-                                invalid_override_field(
-                                    path,
-                                    name,
-                                    "inheritProjectContext",
-                                    "a boolean",
                                 )
-                            })?);
-                    }
-                    "inheritSkills" => {
-                        parsed_entry.inherit_skills = Some(field.as_bool().ok_or_else(|| {
-                            invalid_override_field(path, name, "inheritSkills", "a boolean")
-                        })?);
-                    }
-                    "defaultContext" => {
-                        parsed_entry.default_context = Some(match field {
-                            Value::Bool(false) => None,
-                            Value::String(s) if s == "fresh" || s == "fork" => Some(s.clone()),
-                            _ => {
+                            })?;
+                            if tool.starts_with('+') || tool.starts_with('-') {
                                 return Err(invalid_override_field(
                                     path,
                                     name,
-                                    "defaultContext",
-                                    "'fresh', 'fork', or false",
+                                    "tools",
+                                    "tool names without '+name'/'-name' modifiers (use tools/excludeTools)",
                                 ));
                             }
-                        });
-                    }
-                    "acceptanceRole" => {
-                        parsed_entry.acceptance_role = Some(match field {
-                            Value::Bool(false) => None,
-                            Value::String(s) if s == "read-only" || s == "writer" => {
-                                Some(s.clone())
-                            }
-                            _ => {
-                                return Err(invalid_override_field(
-                                    path,
-                                    name,
-                                    "acceptanceRole",
-                                    "'read-only', 'writer', or false",
-                                ));
-                            }
-                        });
-                    }
-                    "systemPrompt" => {
-                        parsed_entry.system_prompt = Some(
-                            field
-                                .as_str()
-                                .ok_or_else(|| {
-                                    invalid_override_field(path, name, "systemPrompt", "a string")
-                                })?
-                                .to_string(),
-                        );
-                    }
-                    "defaultProvider" => {
-                        // #1393 (agents.ts:1087-1090): non-empty string or false.
-                        parsed_entry.default_provider = Some(match field {
-                            Value::Bool(false) => None,
-                            Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
-                            _ => {
-                                return Err(invalid_override_field(
-                                    path,
-                                    name,
-                                    "defaultProvider",
-                                    "a non-empty string or false",
-                                ));
-                            }
-                        });
-                    }
-                    "allowNestedSubagents" => {
-                        // #1587 (agents.ts:1100-1102).
-                        parsed_entry.allow_nested_subagents =
-                            Some(field.as_bool().ok_or_else(|| {
-                                invalid_override_field(
-                                    path,
-                                    name,
-                                    "allowNestedSubagents",
-                                    "a boolean",
-                                )
-                            })?);
-                    }
-                    "outputMode" => {
-                        // #1305 (agents.ts:979-983): inline | file-only.
-                        match field.as_str() {
-                            Some("inline") | Some("file-only") => {
-                                parsed_entry.output_mode =
-                                    Some(field.as_str().unwrap_or("inline").to_string());
-                            }
-                            _ => {
-                                return Err(invalid_override_field(
-                                    path,
-                                    name,
-                                    "outputMode",
-                                    "'inline' or 'file-only'",
-                                ));
-                            }
+                            names.push(tool.to_string());
                         }
+                        ToolsOverride::List(names)
                     }
-                    "skills" => {
-                        parsed_entry.skills = Some(parse_override_string_array_or_false(
-                            field, path, name, "skills",
-                        )?);
+                    _ => {
+                        return Err(invalid_override_field(
+                            path,
+                            name,
+                            "tools",
+                            "an array of strings, \"inherit\", or false",
+                        ));
                     }
-                    _ => ignored.push(key.clone()),
-                }
+                });
             }
-            if !ignored.is_empty() {
-                tracing::warn!(
-                    agent = %name,
-                    fields = ?ignored,
-                    "agentOverrides fields beyond the documented set are ignored (extensions/subagentOnlyExtensions/completionGuard/toolBudget stay unsupported)"
+            "excludeTools" => {
+                // #1776: same shape family as other list overrides
+                // (`parseOverrideStringArrayOrFalse`, agents.ts:1098).
+                parsed_entry.exclude_tools = Some(parse_override_string_array_or_false(
+                    field,
+                    path,
+                    name,
+                    "excludeTools",
+                )?);
+            }
+            "allowedAgents" => {
+                parsed_entry.allowed_agents = Some(parse_override_string_array_or_false(
+                    field,
+                    path,
+                    name,
+                    "allowedAgents",
+                )?);
+            }
+            "thinking" => {
+                // #3064: a known level (off..max) or false; a typo used
+                // to be appended to the child's model id.
+                parsed_entry.thinking = Some(match field {
+                    Value::Bool(false) => None,
+                    Value::String(level)
+                        if crate::launch::model::THINKING_LEVELS.contains(&level.as_str()) =>
+                    {
+                        Some(level.clone())
+                    }
+                    _ => {
+                        return Err(invalid_override_field(
+                            path,
+                            name,
+                            "thinking",
+                            "a known level (off, minimal, low, medium, high, xhigh, max) or false",
+                        ));
+                    }
+                });
+            }
+            "systemPromptMode" => {
+                parsed_entry.system_prompt_mode = Some(match field.as_str() {
+                    Some("append") | Some("replace") => field.as_str().unwrap().to_string(),
+                    _ => {
+                        return Err(invalid_override_field(
+                            path,
+                            name,
+                            "systemPromptMode",
+                            "'append' or 'replace'",
+                        ));
+                    }
+                });
+            }
+            "inheritProjectContext" => {
+                parsed_entry.inherit_project_context = Some(field.as_bool().ok_or_else(|| {
+                    invalid_override_field(path, name, "inheritProjectContext", "a boolean")
+                })?);
+            }
+            "inheritSkills" => {
+                parsed_entry.inherit_skills = Some(field.as_bool().ok_or_else(|| {
+                    invalid_override_field(path, name, "inheritSkills", "a boolean")
+                })?);
+            }
+            "defaultContext" => {
+                parsed_entry.default_context = Some(match field {
+                    Value::Bool(false) => None,
+                    Value::String(s) if s == "fresh" || s == "fork" => Some(s.clone()),
+                    _ => {
+                        return Err(invalid_override_field(
+                            path,
+                            name,
+                            "defaultContext",
+                            "'fresh', 'fork', or false",
+                        ));
+                    }
+                });
+            }
+            "acceptanceRole" => {
+                parsed_entry.acceptance_role = Some(match field {
+                    Value::Bool(false) => None,
+                    Value::String(s) if s == "read-only" || s == "writer" => Some(s.clone()),
+                    _ => {
+                        return Err(invalid_override_field(
+                            path,
+                            name,
+                            "acceptanceRole",
+                            "'read-only', 'writer', or false",
+                        ));
+                    }
+                });
+            }
+            "systemPrompt" => {
+                parsed_entry.system_prompt = Some(
+                    field
+                        .as_str()
+                        .ok_or_else(|| {
+                            invalid_override_field(path, name, "systemPrompt", "a string")
+                        })?
+                        .to_string(),
                 );
             }
-            parsed.overrides.insert(name.clone(), parsed_entry);
+            "defaultProvider" => {
+                // #1393 (agents.ts:1087-1090): non-empty string or false.
+                parsed_entry.default_provider = Some(match field {
+                    Value::Bool(false) => None,
+                    Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                    _ => {
+                        return Err(invalid_override_field(
+                            path,
+                            name,
+                            "defaultProvider",
+                            "a non-empty string or false",
+                        ));
+                    }
+                });
+            }
+            "allowNestedSubagents" => {
+                // #1587 (agents.ts:1100-1102).
+                parsed_entry.allow_nested_subagents = Some(field.as_bool().ok_or_else(|| {
+                    invalid_override_field(path, name, "allowNestedSubagents", "a boolean")
+                })?);
+            }
+            "outputMode" => {
+                // #1305 (agents.ts:979-983): inline | file-only.
+                match field.as_str() {
+                    Some("inline") | Some("file-only") => {
+                        parsed_entry.output_mode =
+                            Some(field.as_str().unwrap_or("inline").to_string());
+                    }
+                    _ => {
+                        return Err(invalid_override_field(
+                            path,
+                            name,
+                            "outputMode",
+                            "'inline' or 'file-only'",
+                        ));
+                    }
+                }
+            }
+            "skills" => {
+                parsed_entry.skills = Some(parse_override_string_array_or_false(
+                    field, path, name, "skills",
+                )?);
+            }
+            "mutationTools" => {
+                parsed_entry.mutation_tools = Some(parse_override_string_array_or_false(
+                    field,
+                    path,
+                    name,
+                    "mutationTools",
+                )?);
+            }
+            _ => ignored.push(key.clone()),
         }
     }
-    Ok(parsed)
+    if !ignored.is_empty() {
+        tracing::warn!(
+            agent = %name,
+            fields = ?ignored,
+            "agentOverrides fields beyond the documented set are ignored (extensions/subagentOnlyExtensions/completionGuard/toolBudget stay unsupported)"
+        );
+    }
+    Ok(parsed_entry)
 }
 
 fn invalid_override_field(
@@ -1189,7 +1359,7 @@ fn invalid_override_field(
     expected: &str,
 ) -> String {
     format!(
-        "Subagent settings in '{}' have invalid agentOverrides.{name}.{field}; expected {expected}.",
+        "Subagent settings in '{}' have invalid {name}.{field}; expected {expected}.",
         path.to_string_lossy()
     )
 }
@@ -1265,9 +1435,9 @@ fn parse_override_string_array_or_false(
 /// The two settings scopes the plugin reads (`<agentDir>/settings.json` user,
 /// `<projectRoot>/.rpi/settings.json` project) plus the merged P0 values.
 /// Upstream is fail-fast on invalid values (agents.ts `readSubagentSettings`
-/// throws); the plugin downgrades that to warn + empty settings so a bad file
-/// cannot brick the whole extension load (deviation TE-D15: same relaxation
-/// `loadConfig` applies to its own file).
+/// throws); rpi matches that for `subagents.*` (R18.9.4 BREAKING). The
+/// extension's own `config.json` keeps the upstream config.ts warn+empty
+/// relaxation (TE-D15), which is a different file.
 #[derive(Debug, Clone, Default)]
 pub struct SettingsPair {
     pub user: SubagentSettings,
@@ -1311,33 +1481,37 @@ pub struct SettingsPair {
     pub default_provider: Option<String>,
 }
 
-/// Read both settings files. Invalid files warn and contribute nothing.
-pub fn read_settings_pair(cwd: &std::path::Path) -> SettingsPair {
-    read_settings_pair_trusted(cwd, true)
+impl SettingsPair {
+    /// Apply the selected provider's `agentOverridesByProvider` entries to the
+    /// base overrides at both scopes (agents.ts `selectProviderOverrides`).
+    pub fn with_provider(&self, provider: Option<&str>) -> SettingsPair {
+        let Some(provider) = provider else {
+            return self.clone();
+        };
+        let mut out = self.clone();
+        out.user = self.user.with_provider_overrides(Some(provider));
+        out.project = self.project.with_provider_overrides(Some(provider));
+        out
+    }
 }
 
 /// Trust-aware settings pair (#2805): an untrusted project contributes no
 /// settings, session dir or exclusion roots, so a malformed or hostile
 /// project file cannot change discovery or launches. The user level is
 /// unchanged.
-pub fn read_settings_pair_trusted(cwd: &std::path::Path, project_trusted: bool) -> SettingsPair {
+pub fn read_settings_pair_trusted(
+    cwd: &std::path::Path,
+    project_trusted: bool,
+) -> Result<SettingsPair, String> {
     let user_path = paths::get_agent_dir().join("settings.json");
-    let user = read_subagent_settings(&user_path).unwrap_or_else(|message| {
-        tracing::warn!(path = %user_path.to_string_lossy(), %message, "invalid subagents settings");
-        SubagentSettings::default()
-    });
+    let user = read_subagent_settings(&user_path)?;
     let project_path = project_trusted
         .then(|| crate::agents::project_settings_path(cwd))
         .flatten();
-    let project = project_path
-        .as_ref()
-        .and_then(|p| {
-            read_subagent_settings(p).map_err(|message| {
-                tracing::warn!(path = %p.to_string_lossy(), %message, "invalid subagents settings");
-            })
-            .ok()
-        })
-        .unwrap_or_default();
+    let project = match &project_path {
+        Some(path) => read_subagent_settings(path)?,
+        None => SubagentSettings::default(),
+    };
     let project_bulk_disabled = project.disable_builtins == Some(true) && project_path.is_some();
     let user_bulk_disabled =
         project.disable_builtins.is_none() && user.disable_builtins == Some(true);
@@ -1421,7 +1595,7 @@ pub fn read_settings_pair_trusted(cwd: &std::path::Path, project_trusted: bool) 
             }
         }
     }
-    SettingsPair {
+    Ok(SettingsPair {
         default_model: project
             .default_model
             .clone()
@@ -1440,7 +1614,7 @@ pub fn read_settings_pair_trusted(cwd: &std::path::Path, project_trusted: bool) 
         default_provider,
         user,
         project,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1612,6 +1786,33 @@ mod tests {
     /// #1591: waitTool.defaultTimeoutMs parses with validation, and
     /// resolves through env overrides.
     #[test]
+    fn control_config_parses_and_resolves() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-cfg-control-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"control":{"enabled":false,"needsAttentionAfterMs":1000,"activeNoticeAfterTurns":2,"notifyChannels":["event"]}}"#,
+        )
+        .unwrap();
+        let raw = read_json_file(&path).unwrap();
+        let config = parse_config(&raw, "config.json").unwrap();
+        let resolved = crate::runner::control::resolve(config.control.as_ref(), None);
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.needs_attention_after_ms, 1_000);
+        assert!(resolved.needs_attention_after_ms_is_explicit);
+        assert_eq!(resolved.active_notice_after_turns, Some(2));
+        assert_eq!(
+            resolved.notify_channels,
+            vec![crate::runner::control::ControlNotificationChannel::Event]
+        );
+        std::fs::write(&path, r#"{"control":"nope"}"#).unwrap();
+        assert!(parse_config(&read_json_file(&path).unwrap(), "config.json").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn wait_window_config() {
         fn load_config_at(path: &std::path::Path) -> ExtensionConfig {
             let raw = read_json_file(path).expect("config file");
@@ -1633,6 +1834,133 @@ mod tests {
         std::fs::write(&bad, r#"{"waitTool":{"defaultTimeoutMs":0}}"#).unwrap();
         assert!(parse_config(&read_json_file(&bad).unwrap(), "bad.json").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_provider_overrides_and_mutation_tools() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-cfg-provider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"subagents":{
+                "agentOverrides":{"researcher":{"model":"base/model","thinking":"low"}},
+                "agentOverridesByProvider":{
+                    "anthropic":{"researcher":{"model":"anthropic/model","tools":["read","bash"],"mutationTools":["custom"]}},
+                    "openai":{"researcher":{"disabled":true}}
+                }
+            }}"#,
+        )
+        .unwrap();
+        let settings = read_subagent_settings(&path).unwrap();
+        let base = settings.with_provider_overrides(None);
+        assert_eq!(
+            base.overrides
+                .get("researcher")
+                .unwrap()
+                .model
+                .as_ref()
+                .and_then(Option::as_deref),
+            Some("base/model")
+        );
+        let anthropic = settings.with_provider_overrides(Some("anthropic"));
+        let entry = anthropic.overrides.get("researcher").unwrap();
+        assert_eq!(
+            entry.model.as_ref().and_then(Option::as_deref),
+            Some("anthropic/model")
+        );
+        assert_eq!(
+            entry.thinking,
+            Some(Some("low".to_string())),
+            "provider merge is field-wise"
+        );
+        assert_eq!(entry.mutation_tools, Some(Some(vec!["custom".to_string()])));
+        assert_eq!(
+            entry.tools,
+            Some(ToolsOverride::List(vec![
+                "read".to_string(),
+                "bash".to_string()
+            ]))
+        );
+        let openai = settings.with_provider_overrides(Some("openai"));
+        assert_eq!(
+            openai.overrides.get("researcher").unwrap().disabled,
+            Some(true)
+        );
+        // Provider-level validation uses the same unknown-field/thinking rules.
+        std::fs::write(
+            &path,
+            r#"{"subagents":{"agentOverridesByProvider":{"anthropic":{"x":{"modle":"m"}}}}}"#,
+        )
+        .unwrap();
+        let error = read_subagent_settings(&path).unwrap_err();
+        assert!(
+            error.contains("agentOverridesByProvider.anthropic.x")
+                && error.contains("Did you mean 'model'?"),
+            "{error}"
+        );
+        std::fs::write(
+            &path,
+            r#"{"subagents":{"agentOverrides":{"x":{"tools":["+read"]}}}}"#,
+        )
+        .unwrap();
+        let error = read_subagent_settings(&path).unwrap_err();
+        assert!(error.contains("+name'/'-name"), "{error}");
+        std::fs::write(
+            &path,
+            r#"{"subagents":{"agentOverrides":{"empty":{"output":"x"}}}}"#,
+        )
+        .unwrap();
+        let settings = read_subagent_settings(&path).unwrap();
+        assert!(
+            !settings.overrides.contains_key("empty"),
+            "an entry with no implemented field must not mask the other scope"
+        );
+        std::fs::write(
+            &path,
+            r#"{"subagents":{"agentOverridesByProvider":{"anthropic":{"x":{"thinking":"hgih"}}}}}"#,
+        )
+        .unwrap();
+        assert!(read_subagent_settings(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_settings_file_fails_fast() {
+        let dir =
+            std::env::temp_dir().join(format!("rpi-sub-cfg-malformed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{not json").unwrap();
+        let error = read_subagent_settings(&path).expect_err("malformed JSON must fail");
+        assert!(error.contains("Failed to parse settings file"), "{error}");
+        std::fs::write(&path, r#"{"subagents":"nope"}"#).unwrap();
+        assert!(read_subagent_settings(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_pair_fails_fast_but_ignores_untrusted_project() {
+        let root = std::env::temp_dir().join(format!("rpi-sub-cfg-pair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join(".rpi")).unwrap();
+        std::fs::write(
+            project.join(".rpi").join("settings.json"),
+            r#"{"subagents":{"agentOverrides":{"x":{"modle":"m"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            read_settings_pair_trusted(&project, true).is_err(),
+            "trusted project parse errors fail the load"
+        );
+        assert!(
+            read_settings_pair_trusted(&project, false).is_ok(),
+            "an untrusted project is not read"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1689,15 +2017,9 @@ mod tests {
         assert_eq!(worker.skills, Some(Some(vec!["s1".to_string()])));
         assert_eq!(worker.system_prompt.as_deref(), Some("custom"));
         assert_eq!(worker.inherit_skills, Some(false));
-        // toolBudget is a known upstream field rpi does not implement → ignored, not fatal.
-        assert!(
-            settings
-                .overrides
-                .get("reviewer")
-                .unwrap()
-                .disabled
-                .is_none()
-        );
+        // toolBudget is a known upstream field rpi does not implement →
+        // ignored; an entry with no implemented field is not inserted.
+        assert!(!settings.overrides.contains_key("reviewer"));
         std::fs::write(&path, r#"{"subagents":{"disableBuiltins":"yes"}}"#).unwrap();
         assert!(read_subagent_settings(&path).is_err());
         std::fs::write(&path, r#"{"subagents":{"defaultThinking":""}}"#).unwrap();
@@ -1819,10 +2141,10 @@ mod tests {
             r#"{"subagents":{"defaultModel":"project/model","defaultThinking":"high"}}"#,
         )
         .unwrap();
-        let trusted = read_settings_pair_trusted(&project, true);
+        let trusted = read_settings_pair_trusted(&project, true).unwrap();
         assert_eq!(trusted.default_model.as_deref(), Some("project/model"));
         assert_eq!(trusted.default_thinking.as_deref(), Some("high"));
-        let untrusted = read_settings_pair_trusted(&project, false);
+        let untrusted = read_settings_pair_trusted(&project, false).unwrap();
         assert_eq!(untrusted.default_model, None);
         assert_eq!(untrusted.default_thinking, None);
         assert_eq!(untrusted.project, SubagentSettings::default());

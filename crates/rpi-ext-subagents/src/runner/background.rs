@@ -919,8 +919,128 @@ pub async fn drive_run(
                 if let Some(tools) = activity["toolCount"].as_u64() {
                     step["toolCount"] = json!(tools);
                 }
+                if let Some(activity_state) = activity["activityState"].as_str() {
+                    step["activityState"] = json!(activity_state);
+                } else if let Some(object) = step.as_object_mut() {
+                    object.remove("activityState");
+                }
+                if let Some(last_activity) = activity["lastActivityAt"].as_u64() {
+                    step["lastActivityAt"] = json!(last_activity);
+                } else if let Some(object) = step.as_object_mut() {
+                    object.remove("lastActivityAt");
+                }
+            });
+            // The run-level state is an aggregate of the live steps; a clear
+            // tick (child resumed) must clear it too, not only an event.
+            update_status(&status_handle, |status| {
+                let mut needs = false;
+                let mut long = false;
+                if let Some(steps) = status["steps"].as_array() {
+                    for step in steps {
+                        match step["activityState"].as_str() {
+                            Some("needs_attention") => needs = true,
+                            Some("active_long_running") => long = true,
+                            _ => {}
+                        }
+                    }
+                }
+                if needs {
+                    status["activityState"] = json!("needs_attention");
+                } else if long {
+                    status["activityState"] = json!("active_long_running");
+                } else if let Some(object) = status.as_object_mut() {
+                    object.remove("activityState");
+                }
             });
         }));
+        // Long-running-guard notices: status + JSONL + session message +
+        // event bus. The foreground guard has already deduped/claimed them.
+        let control_handle = handle.clone();
+        let control_calls = notify.calls;
+        let control_config = ctx.control.clone();
+        ctx.control_sink = Some(std::sync::Arc::new(
+            move |event: &crate::runner::control::ControlEvent| {
+                let event_json = serde_json::to_value(event).unwrap_or(Value::Null);
+                update_status(&control_handle, |status| {
+                    let mut needs =
+                        event.to == crate::runner::control::ActivityState::NeedsAttention;
+                    let mut long =
+                        event.to == crate::runner::control::ActivityState::ActiveLongRunning;
+                    if let Some(steps) = status["steps"].as_array() {
+                        for step in steps {
+                            match step["activityState"].as_str() {
+                                Some("needs_attention") => needs = true,
+                                Some("active_long_running") => long = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                    status["activityState"] = json!(if needs {
+                        "needs_attention"
+                    } else if long {
+                        "active_long_running"
+                    } else {
+                        event.to.as_str()
+                    });
+                    status["lastActivityAt"] = json!(event.ts);
+                    let events = status["controlEvents"].as_array_mut();
+                    if let Some(events) = events {
+                        events.push(event_json.clone());
+                        if events.len() > 16 {
+                            let overflow = events.len() - 16;
+                            events.drain(..overflow);
+                        }
+                    } else {
+                        status["controlEvents"] = json!([event_json.clone()]);
+                    }
+                });
+                if let Some(index) = event.index {
+                    set_step_field(&control_handle, index as usize, |step| {
+                        step["activityState"] = json!(event.to.as_str());
+                        step["lastActivityAt"] = json!(event.ts);
+                    });
+                }
+                append_event(
+                    control_handle.run_dir.as_path(),
+                    "subagent.control",
+                    event_json.clone(),
+                );
+                if let Some(calls) = &control_calls {
+                    use crate::runner::control::ControlNotificationChannel;
+                    if control_config
+                        .notify_channels
+                        .contains(&ControlNotificationChannel::Async)
+                    {
+                        let notice = crate::runner::control::format_control_notice(event);
+                        let _ = crate::host_call_static(
+                            calls,
+                            "sendMessage",
+                            json!({
+                                "message": {
+                                    "customType": "subagent_control_notice",
+                                    "content": notice,
+                                    "display": true,
+                                },
+                                "options": { "triggerTurn": true },
+                            }),
+                        );
+                    }
+                    if control_config
+                        .notify_channels
+                        .contains(&ControlNotificationChannel::Event)
+                    {
+                        let _ = crate::host_call_static(
+                            calls,
+                            "events.emit",
+                            json!({
+                                "channel": "subagent:control-event",
+                                "data": event_json,
+                            }),
+                        );
+                    }
+                }
+            },
+        ));
     }
     let agents = match ctx.discover("both") {
         Ok(agents) => agents,
@@ -1067,6 +1187,8 @@ pub async fn drive_run(
                                         "currentToolArgs",
                                         "currentToolStartedAt",
                                         "currentPath",
+                                        "activityState",
+                                        "lastActivityAt",
                                     ] {
                                         object.remove(key);
                                     }
@@ -1267,6 +1389,8 @@ fn record_step_result(
                 "currentToolArgs",
                 "currentToolStartedAt",
                 "currentPath",
+                "activityState",
+                "lastActivityAt",
             ] {
                 object.remove(key);
             }
@@ -1530,6 +1654,18 @@ async fn finish_with_handoff(
             status["stopped"] = json!(true);
             status["stoppedReason"] = json!("stop-request");
         }
+        if let Some(object) = status.as_object_mut() {
+            object.remove("activityState");
+            object.remove("lastActivityAt");
+        }
+        if let Some(steps) = status["steps"].as_array_mut() {
+            for step in steps {
+                if let Some(object) = step.as_object_mut() {
+                    object.remove("activityState");
+                    object.remove("lastActivityAt");
+                }
+            }
+        }
     });
     append_event(
         handle.run_dir.as_path(),
@@ -1549,6 +1685,10 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
     update_status(handle, |status| {
         status["state"] = json!(STATE_FAILED);
         status["error"] = json!(error);
+        if let Some(object) = status.as_object_mut() {
+            object.remove("activityState");
+            object.remove("lastActivityAt");
+        }
     });
     append_event(
         handle.run_dir.as_path(),
@@ -1914,7 +2054,7 @@ pub async fn wait_for_runs(
     on_update: Option<&(dyn Fn(&str) + Send + Sync)>,
     is_aborted: Option<&(dyn Fn() -> bool + Send + Sync)>,
 ) -> Result<Value, String> {
-    wait_for_runs_with_session_asks(id, all, timeout_ms, on_update, is_aborted, None).await
+    wait_for_runs_with_session_asks(id, all, timeout_ms, on_update, is_aborted, None, true).await
 }
 
 /// `subagent_wait` with the #2345 session-wide supervisor barrier: besides
@@ -1930,6 +2070,7 @@ pub async fn wait_for_runs_with_session_asks(
     on_update: Option<&(dyn Fn(&str) + Send + Sync)>,
     is_aborted: Option<&(dyn Fn() -> bool + Send + Sync)>,
     orchestrator_session_id: Option<&str>,
+    stop_on_attention: bool,
 ) -> Result<Value, String> {
     let started = std::time::Instant::now();
     let deadline = started + Duration::from_millis(timeout_ms.max(1));
@@ -2025,6 +2166,53 @@ pub async fn wait_for_runs_with_session_asks(
                     },
                     "runs": snapshots,
                 }));
+            }
+        }
+        // Long-running guard: a waited run/step that transitioned to
+        // needs_attention stops the wait only when the call opted in
+        // (`stopOnAttention`, default true). Supervisor asks above always
+        // stop, preserving the existing #1315 contract.
+        if stop_on_attention {
+            let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            for run_id in &initial_ids {
+                let Some(handle) = runs.get(run_id.as_str()) else {
+                    continue;
+                };
+                let status = handle.status.read().unwrap_or_else(|e| e.into_inner());
+                let step_attention = status["steps"].as_array().and_then(|steps| {
+                    steps.iter().find_map(|step| {
+                        (step["activityState"].as_str() == Some("needs_attention")).then(|| {
+                            json!({
+                                "index": step.get("index").and_then(Value::as_u64).unwrap_or(0),
+                                "agent": step.get("agent").and_then(Value::as_str).unwrap_or(""),
+                            })
+                        })
+                    })
+                });
+                let run_attention = status["activityState"].as_str() == Some("needs_attention");
+                if run_attention || step_attention.is_some() {
+                    let snapshots: Vec<Value> = initial_ids
+                        .iter()
+                        .filter_map(|id| runs.get(id.as_str()).map(|h| status_snapshot(h)))
+                        .collect();
+                    let mut attention = json!({
+                        "runId": run_id,
+                        "reason": "needs_attention",
+                        "activityState": "needs_attention",
+                    });
+                    if let Some(step) = step_attention {
+                        attention["childIndex"] = step["index"].clone();
+                        attention["agent"] = step["agent"].clone();
+                    }
+                    drop(status);
+                    drop(runs);
+                    return Ok(json!({
+                        "waited": 0,
+                        "all": all,
+                        "attention": attention,
+                        "runs": snapshots,
+                    }));
+                }
             }
         }
         // #2345 session-wide supervisor barrier: yield for pending blocking
@@ -2180,10 +2368,14 @@ pub fn async_wait_update(runs: &[Value], provider_count: usize, elapsed_ms: u64)
             continue;
         }
         for step in active {
-            let current = match step["currentTool"].as_str() {
-                Some(tool) => tool.to_string(),
-                None if step["status"].as_str() == Some("pending") => "queued".to_string(),
-                None => "thinking…".to_string(),
+            let current = match step["activityState"].as_str() {
+                Some("needs_attention") => "needs attention".to_string(),
+                Some("active_long_running") => "active long-running".to_string(),
+                _ => match step["currentTool"].as_str() {
+                    Some(tool) => tool.to_string(),
+                    None if step["status"].as_str() == Some("pending") => "queued".to_string(),
+                    None => "thinking…".to_string(),
+                },
             };
             let mut line = format!("{}: {current}", step["agent"].as_str().unwrap_or_default());
             if let Some(path) = step["currentPath"].as_str() {
@@ -2210,6 +2402,13 @@ pub fn async_wait_update(runs: &[Value], provider_count: usize, elapsed_ms: u64)
 /// fields drop (upstream filters undefined).
 fn format_step_activity(step: &Value, now_ms: u64) -> Option<String> {
     let mut facts: Vec<String> = Vec::new();
+    if let Some(activity) = step["activityState"].as_str() {
+        facts.push(match activity {
+            "needs_attention" => "needs attention".to_string(),
+            "active_long_running" => "active long-running".to_string(),
+            other => other.to_string(),
+        });
+    }
     if let Some(tool) = step["currentTool"].as_str() {
         let duration = step["currentToolStartedAt"]
             .as_u64()
@@ -2321,6 +2520,83 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn wait_stops_on_guard_attention_only_when_requested() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let spec = crate::p1::launch_child::ChildSpec::from_params(
+            json!({"agent": "scout", "task": "wait attention"})
+                .as_object()
+                .unwrap(),
+        );
+        let handle = start_run(
+            "te51-wait-attention",
+            None,
+            &AsyncBody::Single {
+                spec: Box::new(spec),
+            },
+        );
+        update_status(&handle, |status| {
+            status["steps"][0]["status"] = json!("running");
+            status["steps"][0]["activityState"] = json!("needs_attention");
+            status["steps"][0]["lastActivityAt"] = json!(1);
+            status["activityState"] = json!("needs_attention");
+        });
+        let stopped = wait_for_runs_with_session_asks(
+            Some("te51-wait-attention"),
+            false,
+            5_000,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("attention wait");
+        assert_eq!(stopped["attention"]["reason"], json!("needs_attention"));
+        assert_eq!(stopped["attention"]["runId"], json!("te51-wait-attention"));
+        let not_stopped = wait_for_runs_with_session_asks(
+            Some("te51-wait-attention"),
+            false,
+            20,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("bounded wait");
+        assert!(not_stopped.get("attention").is_none(), "{not_stopped}");
+        // A resumed child clears both step and run activity; the wait must
+        // stop reporting stale attention.
+        update_status(&handle, |status| {
+            status["steps"][0]["status"] = json!("running");
+            if let Some(step) = status["steps"][0].as_object_mut() {
+                step.remove("activityState");
+                step.remove("lastActivityAt");
+            }
+            if let Some(object) = status.as_object_mut() {
+                object.remove("activityState");
+                object.remove("lastActivityAt");
+            }
+        });
+        let cleared = wait_for_runs_with_session_asks(
+            Some("te51-wait-attention"),
+            false,
+            20,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("cleared wait");
+        assert!(cleared.get("attention").is_none(), "{cleared}");
+        unregister_run("te51-wait-attention");
+    }
+
+    #[tokio::test]
     // The registry guard serializes tests against the process-global run
     // registry and must span the awaits below; every test here runs on the
     // current-thread runtime, so the std guard cannot deadlock.
@@ -2378,6 +2654,7 @@ pub(crate) mod tests {
             None,
             None,
             Some(&session),
+            true,
         )
         .await
         .expect("wait yields, not errors");
@@ -2403,6 +2680,7 @@ pub(crate) mod tests {
             None,
             None,
             Some(&session),
+            true,
         )
         .await
         .expect("bounded wait returns");
@@ -3124,6 +3402,9 @@ pub(crate) mod tests {
             output_partial: false,
             tool_count: 0,
             turns: 1,
+            activity_state: None,
+            control_events: Vec::new(),
+            last_activity_at: None,
             duration_ms: 1,
             artifact_paths: None,
             session_file: None,

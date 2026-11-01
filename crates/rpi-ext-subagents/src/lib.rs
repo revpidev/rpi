@@ -743,12 +743,47 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         PluginMode::Parent => {
             let config = config::load_config();
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            // #2803/#2805: description discovery must not read project
+            // settings/agents/custom text when trust is declined. Old hosts
+            // without `ctx.isProjectTrusted` keep the trusted default; a
+            // failed trust call on a trust-aware host fails closed.
+            let trust_response = host_call(&calls, cookie, "ctx.isProjectTrusted", json!({}));
+            let project_trusted = match trust_response
+                .get("error")
+                .and_then(|error| error.get("kind"))
+                .and_then(Value::as_str)
+            {
+                Some("unknownMethod") => true,
+                _ => trust_response
+                    .get("ok")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
+            let provider = host_call_ok(&calls, cookie, "ctx.model", json!({})).and_then(|model| {
+                model
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            let description = match description::build_subagent_tool_description(
+                &config,
+                &cwd,
+                project_trusted,
+                provider.as_deref(),
+            ) {
+                Ok(description) => description,
+                Err(error) => {
+                    return json!({"error": {"kind": "init", "message": format!(
+                        "invalid subagents settings: {error}"
+                    )}});
+                }
+            };
             if let Err(error) = register(
                 "registerTool",
                 json!({
                     "name": "subagent",
                     "label": "Subagent",
-                    "description": description::build_subagent_tool_description(&config, &cwd),
+                    "description": description,
                     "promptSnippet": "Delegate focused subtasks to child agent sessions (scout/researcher/worker/reviewer/oracle/delegate) or manage them via action.",
                     "parameters": tool::tool_parameters_schema(),
                     // TE11 FR-A/FR-B render hooks (see the ChildFanout
@@ -1026,15 +1061,26 @@ fn dispatch_message(message: &Value) -> Value {
                 // coordinator: its own child session — the inherited env
                 // value names the ROOT orchestrator and must NOT filter a
                 // nested coordinator's own children, #2087).
-                let mut session_id = HostCallsContext {
+                let host = HostCallsContext {
                     calls: &state.calls,
                     cookie: state.cookie,
-                }
-                .parent_session(&config::read_settings_pair(
-                    &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                ))
-                .map(|session| session.id)
-                .unwrap_or_default();
+                };
+                let settings = match config::read_settings_pair_trusted(
+                    &host.cwd(),
+                    host.project_trusted() != Some(false),
+                ) {
+                    Ok(settings) => settings,
+                    Err(error) => {
+                        return crate::tool::ToolOutcome::error(format!(
+                            "Subagent settings error: {error}"
+                        ))
+                        .to_tool_result();
+                    }
+                };
+                let mut session_id = host
+                    .parent_session(&settings)
+                    .map(|session| session.id)
+                    .unwrap_or_default();
                 if session_id.is_empty() && state.mode == PluginMode::Parent {
                     // Root fallback only: the env var is unset in a root
                     // process, so this stays empty in practice.
@@ -1053,10 +1099,25 @@ fn dispatch_message(message: &Value) -> Value {
                 calls: &state.calls,
                 cookie: state.cookie,
             };
-            let settings = config::read_settings_pair_trusted(
+            let settings = match config::read_settings_pair_trusted(
                 &host.cwd(),
                 host.project_trusted() != Some(false),
-            );
+            )
+            .map(|settings| {
+                settings.with_provider(
+                    host.parent_model()
+                        .as_deref()
+                        .and_then(|model| model.split('/').next()),
+                )
+            }) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    return crate::tool::ToolOutcome::error(format!(
+                        "Subagent settings error: {error}"
+                    ))
+                    .to_tool_result();
+                }
+            };
             let config = config::load_config();
             // ADR-0015: the host forwards the toolCallId so `toolUpdate`
             // frames can address the in-flight execution (test seams may
@@ -1125,10 +1186,24 @@ fn dispatch_message(message: &Value) -> Value {
                 calls: &state.calls,
                 cookie: state.cookie,
             };
-            let settings = config::read_settings_pair_trusted(
+            let settings = match config::read_settings_pair_trusted(
                 &host.cwd(),
                 host.project_trusted() != Some(false),
-            );
+            )
+            .map(|settings| {
+                settings.with_provider(
+                    host.parent_model()
+                        .as_deref()
+                        .and_then(|model| model.split('/').next()),
+                )
+            }) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    return json!({
+                        "error": { "kind": "invalidSettings", "message": error }
+                    });
+                }
+            };
             let config = config::load_config();
             if let Some(outcome) = prompts::handle_prompt_command(
                 name,
@@ -1173,6 +1248,16 @@ fn dispatch_message(message: &Value) -> Value {
                 (PluginMode::Parent, "session_start") => {
                     let config = config::load_config();
                     artifacts::cleanup_all_artifact_dirs(config.cleanup_days_or_default());
+                    // Session start is the first point where the host's
+                    // project-trust decision is authoritative. Rebuild the
+                    // tool description against the trusted view so an
+                    // install-time pre-trust catalog never leaks project
+                    // agents/custom text.
+                    let host = HostCallsContext {
+                        calls: &state.calls,
+                        cookie: state.cookie,
+                    };
+                    actions::refresh_advertised_catalog(Some(&host), &host.cwd(), &config);
                     Value::Null
                 }
                 (PluginMode::Parent, "session_shutdown") => {
@@ -1236,13 +1321,20 @@ async fn async_move_drain(session_id: Option<&str>) {
 /// authoritative session (V13-02 `ctx.sessionFile`, ADR-0022); the env value
 /// names the ROOT orchestrator and is only a root-mode fallback.
 fn orchestrator_session_id(state: &PluginState) -> Option<String> {
-    let session = HostCallsContext {
+    let host = HostCallsContext {
         calls: &state.calls,
         cookie: state.cookie,
-    }
-    .parent_session(&config::read_settings_pair(
-        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-    ))
+    };
+    let session = config::read_settings_pair_trusted(
+        &host.cwd(),
+        host.project_trusted() != Some(false),
+    )
+    .map_err(|error| {
+        tracing::warn!(%error, "invalid subagents settings; orchestrator session falls back to env");
+        error
+    })
+    .ok()
+    .and_then(|settings| host.parent_session(&settings))
     .map(|session| session.id);
     match session {
         Some(id) if !id.is_empty() => Some(id),
@@ -1298,11 +1390,13 @@ fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Opti
         // the built-in 30 minutes.
         .or_else(|| config.wait_tool_default_timeout_ms())
         .unwrap_or(30 * 60 * 1000);
-    // #1315 `stopOnAttention`: accepted for call-shape parity. rpi's only
-    // attention source is a pending supervisor ask, and upstream stops the
-    // wait on supervisor asks in BOTH modes — so the value has no
-    // distinguishing effect here (documented in TE19 §7).
-    let _stop_on_attention = params.get("stopOnAttention").and_then(Value::as_bool);
+    // Supervisor asks always stop the wait (#1315). Since TE51,
+    // `stopOnAttention` also gates the long-running guard's
+    // `needs_attention` state; `false` keeps waiting through guard attention.
+    let stop_on_attention = params
+        .get("stopOnAttention")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     // The live-activity stream rides the same toolUpdate seam as the
     // foreground snapshots (upstream deps.onUpdate, subagent-wait.ts:578).
     let (update_sink, abort_probe) = {
@@ -1352,6 +1446,7 @@ fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Opti
             // nested coordinator = its own session; the inherited env value
             // names the ROOT and must not own a child's barrier).
             orchestrator_session_id(state).as_deref(),
+            stop_on_attention,
         )
         .await
     });
@@ -1365,6 +1460,22 @@ fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Opti
                      Completion still arrives as a session message; inspect with \
                      subagent({{action:\"status\"}}) or wait again with subagent_wait.",
                     waited["runs"].as_array().map(Vec::len).unwrap_or(0)
+                )
+            }
+            // Long-running guard attention (stopOnAttention): inspect/steer
+            // the run; unlike a supervisor ask there is no request to reply.
+            else if waited["attention"]["reason"].as_str() == Some("needs_attention") {
+                let attention = &waited["attention"];
+                format!(
+                    "Wait stopped: background run {} needs attention. Inspect with subagent({{action:\"status\", id:\"{}\"}}) and steer, resume or stop it; pass stopOnAttention:false to keep waiting through guard attention.",
+                    attention
+                        .get("runId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
+                    attention
+                        .get("runId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
                 )
             }
             // #1315: a run needs a decision — answer it, then wait again.

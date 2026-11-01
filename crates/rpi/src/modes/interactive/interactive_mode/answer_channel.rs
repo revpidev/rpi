@@ -23,6 +23,9 @@ pub const ANSWER_RESULT_EVENT: &str = "rpi:ask-user:answer-result";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Delivery {
     Delivered,
+    /// The registry already emitted the verdict (closed/disposing/queue
+    /// rejection); the bus handler must not emit a second one.
+    Settled,
     NotFound,
     InvalidPayload,
 }
@@ -34,30 +37,58 @@ pub(crate) fn emit_verdict(
     code: Option<&str>,
     reason: Option<&str>,
 ) {
-    let request_id = payload.get("requestId").and_then(Value::as_str);
-    let tool_call_id = payload.get("toolCallId").and_then(Value::as_str);
-    let verdict = json!({
-        "ok": code.is_none(),
-        "code": code,
-        "reason": reason,
-        "requestId": request_id,
-        "toolCallId": tool_call_id,
-    });
-    bus.emit(ANSWER_RESULT_EVENT, verdict);
+    let mut verdict = serde_json::Map::new();
+    verdict.insert("ok".to_owned(), json!(code.is_none()));
+    if let Some(code) = code {
+        verdict.insert("code".to_owned(), json!(code));
+    }
+    if let Some(reason) = reason {
+        verdict.insert("reason".to_owned(), json!(reason));
+    }
+    for field in ["requestId", "toolCallId"] {
+        if let Some(value) = payload.get(field).and_then(Value::as_str) {
+            verdict.insert(field.to_owned(), json!(value));
+        }
+    }
+    bus.emit(ANSWER_RESULT_EVENT, Value::Object(verdict));
 }
 
 /// Install the TUI routing handler on `bus`; the weak UI keeps the handler
 /// inert after teardown.
 pub(crate) fn install_tui(bus: &EventBus, ui: Weak<InteractiveUi>) {
     let bus_for_handler = bus.clone();
+    // ADR-0043: unprocessed answers drained when a mount closes still get a
+    // verdict; the registry owns the sink so close/dispose paths can call it
+    // without knowing the bus.
+    if let Some(ui) = ui.upgrade() {
+        let verdict_bus = bus.clone();
+        ui.component_registry
+            .set_answer_verdict_sink(std::sync::Arc::new(
+                move |payload: &Value, code: Option<&str>, reason: Option<&str>| {
+                    emit_verdict(&verdict_bus, payload, code, reason);
+                },
+            ));
+    }
     let unsubscribe = bus.on(
         ANSWER_EVENT,
         std::sync::Arc::new(move |payload: Value| {
             let Some(ui) = ui.upgrade() else {
                 return;
             };
+            if payload
+                .get("requestId")
+                .is_some_and(|value| !value.is_string())
+            {
+                emit_verdict(
+                    &bus_for_handler,
+                    &payload,
+                    Some("invalid_payload"),
+                    Some("requestId must be a string"),
+                );
+                return;
+            }
             match ui.component_registry.deliver_external_answer(&payload) {
-                Delivery::Delivered => {}
+                Delivery::Delivered | Delivery::Settled => {}
                 Delivery::NotFound => emit_verdict(
                     &bus_for_handler,
                     &payload,
@@ -134,7 +165,7 @@ mod tests {
         emit_verdict(&bus, &serde_json::json!({"requestId": 3}), None, None);
         let verdicts = seen.lock().unwrap();
         assert_eq!(verdicts[0]["ok"], serde_json::json!(true));
-        assert_eq!(verdicts[0]["code"], Value::Null);
-        assert_eq!(verdicts[0]["requestId"], Value::Null);
+        assert!(verdicts[0].get("code").is_none());
+        assert!(verdicts[0].get("requestId").is_none());
     }
 }

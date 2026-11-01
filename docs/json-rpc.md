@@ -176,3 +176,7 @@ TE53 consumers (`rpi-usage`): the plain `/usage` report is one `usageText` paylo
 | 33-command contract | `crates/rpi` `rpc_mode_test.rs` (20 contract tests) |
 | `clear_queue` retrieve/drain + Esc combination (idle after clear_queue + abort; drained steering not consumed) | `rpc_mode_test.rs` `clear_queue_returns_and_purges_queues` |
 | `prompt` disposition (`handled`/`queued`/`started`) + `streamingBehavior`; `steer`/`follow_up` two-state disposition; this document's field names/shapes | `rpc_mode_test.rs` `prompt_lifecycle_messages_state_stats`, `steer_follow_up_abort_during_streaming`, `prompt_extension_command_reports_handled_without_agent_settled`, `json_rpc_doc_pins_prompt_dispositions` |
+
+## Ask-user-question inbound answer channel (TUI only)
+
+The `rpi:ask-user:answer` extension-bus event is accepted only by the TUI host, which routes it to the open questionnaire by `toolCallId` and emits one `rpi:ask-user:answer-result` verdict (`ok`/`not_found`/`invalid_payload`/`invalid_answer`). RPC and print hosts answer every attempt with `unsupported_host`; they never synthesize dialog input. The channel is additive and does not change the JSON/RPC frame shapes above.

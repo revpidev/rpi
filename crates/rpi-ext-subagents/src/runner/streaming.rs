@@ -8,11 +8,10 @@
 //! (`boundStreamedRecentTools` / `boundStreamedRecentOutput` /
 //! `boundStreamedToolCalls` + `extractToolCallSummaries` :370-387).
 //!
-//! Upstream pushes every event plus a 1s activity-timer tick; the
-//! `deriveActivityState` engine behind the timer is out of TE09 scope, so
-//! `activityState` stays unset and `controlEvents` is always empty (it only
-//! ever carries `active_long_running`/`needs_attention`, both products of
-//! that engine).
+//! Upstream pushes every event plus a 1s activity-timer tick. The
+//! `deriveActivityState` engine is ported in TE51 (`runner/control.rs` +
+//! `runner/guard.rs`): `activityState`/`lastActivityAt` and `controlEvents`
+//! now carry `active_long_running`/`needs_attention` transitions.
 
 use serde_json::{Map, Value, json};
 
@@ -184,6 +183,12 @@ pub fn snapshot_progress(state: &ChildRunState, meta: &StreamMeta, now_ms: u64) 
     );
     map.insert("toolCount".to_string(), json!(state.tool_count));
     map.insert("turnCount".to_string(), json!(state.turns));
+    if let Some(activity) = state.activity_state {
+        map.insert("activityState".to_string(), json!(activity.as_str()));
+    }
+    if let Some(last_activity) = state.last_activity_at {
+        map.insert("lastActivityAt".to_string(), json!(last_activity));
+    }
     map.insert(
         "tokens".to_string(),
         json!(state.usage_input + state.usage_output),
@@ -200,9 +205,6 @@ pub fn snapshot_progress(state: &ChildRunState, meta: &StreamMeta, now_ms: u64) 
         "durationMs".to_string(),
         json!(now_ms.saturating_sub(meta.started_at_ms)),
     );
-    if let Some(last_activity) = state.last_activity_at {
-        map.insert("lastActivityAt".to_string(), json!(last_activity));
-    }
     Value::Object(map)
 }
 
@@ -252,8 +254,7 @@ pub fn streaming_update_text(state: &ChildRunState) -> String {
 
 /// One full `emitUpdateSnapshot` details payload (execution.ts:824-836):
 /// `{mode:"single", results:[stream result], progress:[snapshot],
-/// controlEvents}` — `controlEvents` is always empty here (the derivation
-/// engine that fills it is out of scope; see the module docs).
+/// controlEvents}` — the guard fills `controlEvents` (see module docs).
 pub fn single_update_details(
     state: &ChildRunState,
     meta: &StreamMeta,
@@ -266,7 +267,7 @@ pub fn single_update_details(
         "mode": "single",
         "results": [result],
         "progress": [progress],
-        "controlEvents": [],
+        "controlEvents": state.pending_control_events,
     });
     (streaming_update_text(state), details)
 }

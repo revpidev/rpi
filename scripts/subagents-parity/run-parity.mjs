@@ -420,7 +420,6 @@ const report = [
 		? "# subagents parity report (target track: pi-subagents v0.83.0 @ 3a63e0ad snapshot, ADR-0038)"
 		: "# subagents parity report (regression track: pi-subagents v0.76.1 @ 7d072b91d snapshot, ADR-0036)",
 	"",
-	`generated: ${new Date().toISOString()}`,
 	"",
 ];
 for (const mode of MODES) {

@@ -842,7 +842,7 @@ fn aggregate_projector_accepts(prefix: &str) -> Option<AggregateProjection> {
 /// Accumulated child facts extracted from the JSONL stream (the `processLine`
 /// subset, execution.ts:848-1007) plus the streaming-progress projection
 /// (TE09 FR-A: the `AgentProgress` fields execution.ts:891-1006 maintains).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ChildRunState {
     pub messages: Vec<Value>,
     pub usage_input: u64,
@@ -875,6 +875,51 @@ pub struct ChildRunState {
     /// Bounded in memory to the last 50 lines (`appendRecentOutput`).
     pub recent_output: Vec<String>,
     pub last_activity_at: Option<u64>,
+    /// #3059/long-running guard: per-call snapshot for mutating-failure
+    /// accounting (parallel calls can interleave).
+    pub pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
+    pub current_tool_call_id: Option<String>,
+    pub current_tool_mutates: bool,
+    /// Agent `mutationTools` (set once by the runner before reading).
+    pub mutation_tools: Vec<String>,
+    pub mutating_failures: super::guard::MutatingFailureState,
+    pub active_long_running_notified: bool,
+    /// Control events accumulated for the streaming snapshot.
+    pub control_events: Vec<super::control::ControlEvent>,
+    /// Events not yet delivered in a streaming frame (upstream drains
+    /// `controlEvents` per snapshot; `control_events` keeps the terminal
+    /// history for the final result).
+    pub pending_control_events: Vec<super::control::ControlEvent>,
+    pub activity_state: Option<super::control::ActivityState>,
+    /// `needs_attention` stays visible until the next child activity; the
+    /// timestamp is the `last_activity_at` observed when it was raised.
+    pub attention_sticky: bool,
+    pub attention_activity_at: Option<u64>,
+    pub seen_control_keys: std::collections::BTreeSet<String>,
+    /// Run start (set by the runner from StreamMeta; used by the idle rule).
+    pub started_at_ms: Option<u64>,
+}
+
+/// One in-flight tool call (`pendingToolResultsByCallId`).
+#[derive(Debug, Clone, Default)]
+pub struct PendingToolCall {
+    pub tool: String,
+    pub path: Option<String>,
+    pub mutates: bool,
+    pub started_at: u64,
+}
+
+/// Tool-end facts a runner needs for the mutating failure machine.
+#[derive(Debug, Clone, Default)]
+pub struct ToolEndSignal {
+    pub tool_call_id: String,
+    pub tool: String,
+    pub path: Option<String>,
+    pub mutates: bool,
+    pub is_error: bool,
+    pub error: String,
+    pub ts: u64,
+    pub duration_ms: Option<u64>,
 }
 
 /// One `recentTools` entry (`tool_execution_end` push, execution.ts:916-922).
@@ -889,6 +934,8 @@ pub struct RecentToolEntry {
 #[derive(Debug, Default, Clone)]
 pub struct LineOutcome {
     pub lifecycle: ChildLifecycleAction,
+    /// Mutating-tool end facts for the guard (tool_execution_end only).
+    pub tool_end: Option<ToolEndSignal>,
     /// Whether the line was a progress-bearing event (drives the streaming
     /// frame push — upstream fires the update per event, execution.ts:914/
     /// 929/972/1005).
@@ -898,6 +945,45 @@ pub struct LineOutcome {
     /// dispatch — unknown event types included; the lifecycle arms return
     /// early above it and do not).
     pub activity_event: bool,
+}
+
+impl Default for ChildRunState {
+    fn default() -> Self {
+        Self {
+            messages: Vec::new(),
+            usage_input: 0,
+            usage_output: 0,
+            usage_cache_read: 0,
+            usage_cache_write: 0,
+            usage_cost_total: 0.0,
+            model: None,
+            tool_count: 0,
+            turns: 0,
+            agent_settled_received: false,
+            assistant_error: None,
+            partial_text: String::new(),
+            current_tool: None,
+            current_tool_args: None,
+            current_tool_started_at: None,
+            current_path: None,
+            recent_tools: Vec::new(),
+            recent_output: Vec::new(),
+            last_activity_at: None,
+            pending_tool_calls: std::collections::HashMap::new(),
+            current_tool_call_id: None,
+            current_tool_mutates: false,
+            mutation_tools: Vec::new(),
+            mutating_failures: super::guard::MutatingFailureState::default(),
+            active_long_running_notified: false,
+            control_events: Vec::new(),
+            pending_control_events: Vec::new(),
+            activity_state: None,
+            attention_sticky: false,
+            attention_activity_at: None,
+            seen_control_keys: std::collections::BTreeSet::new(),
+            started_at_ms: None,
+        }
+    }
 }
 
 impl ChildRunState {
@@ -933,29 +1019,116 @@ impl ChildRunState {
                 );
             }
             "tool_execution_start" => {
-                // execution.ts:891-914: currentTool projection.
+                // execution.ts:891-914: currentTool projection + the guard
+                // snapshot (`pendingToolResultsByCallId`).
                 self.tool_count += 1;
                 let tool_args = match value.get("args") {
                     Some(args) if args.as_object().is_some() => args.clone(),
                     _ => json!({}),
                 };
-                self.current_tool = value
+                let tool_name = value
                     .get("toolName")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                let path =
+                    super::display::resolve_current_path(tool_name.as_deref(), Some(&tool_args));
+                let mutates = super::guard::is_mutating_tool(
+                    tool_name.as_deref(),
+                    Some(&tool_args),
+                    &self.mutation_tools,
+                );
+                let tool_call_id = value
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}:{now_ms}:{}",
+                            tool_name.as_deref().unwrap_or("tool"),
+                            self.tool_count
+                        )
+                    });
+                self.pending_tool_calls.insert(
+                    tool_call_id.clone(),
+                    PendingToolCall {
+                        tool: tool_name.clone().unwrap_or_else(|| "tool".to_string()),
+                        path: path.clone(),
+                        mutates,
+                        started_at: now_ms,
+                    },
+                );
+                self.current_tool_call_id = Some(tool_call_id);
+                self.current_tool_mutates = mutates;
+                self.current_tool = tool_name;
                 self.current_tool_args = self
                     .current_tool
                     .as_ref()
                     .map(|_| super::display::extract_tool_args_preview(&tool_args));
                 self.current_tool_started_at = Some(now_ms);
-                self.current_path = super::display::resolve_current_path(
-                    value.get("toolName").and_then(Value::as_str),
-                    Some(&tool_args),
-                );
+                self.current_path = path;
                 outcome.progress_event = true;
             }
             "tool_execution_end" => {
-                // execution.ts:916-929: recentTools push + current* clear.
+                // execution.ts:916-929: recentTools push + current* clear;
+                // the mutating failure machine reads the same end event.
+                let ended_name = value
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let requested_id = value
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
+                let id = requested_id
+                    .map(str::to_string)
+                    .or_else(|| self.current_tool_call_id.clone())
+                    .or_else(|| {
+                        self.pending_tool_calls
+                            .iter()
+                            .find(|(_, pending)| {
+                                ended_name.as_deref() == Some(pending.tool.as_str())
+                            })
+                            .map(|(id, _)| id.clone())
+                    });
+                let pending = id
+                    .as_ref()
+                    .and_then(|id| self.pending_tool_calls.remove(id))
+                    .or_else(|| {
+                        let key = self
+                            .pending_tool_calls
+                            .iter()
+                            .find(|(_, pending)| {
+                                ended_name.as_deref() == Some(pending.tool.as_str())
+                            })
+                            .map(|(id, _)| id.clone());
+                        key.and_then(|key| self.pending_tool_calls.remove(&key))
+                    });
+                if let Some(pending) = pending {
+                    let result_text = value
+                        .get("result")
+                        .map(super::display::extract_text_from_content)
+                        .or_else(|| {
+                            value
+                                .get("message")
+                                .map(super::display::extract_text_from_content)
+                        })
+                        .unwrap_or_default();
+                    outcome.tool_end = Some(ToolEndSignal {
+                        tool_call_id: id.unwrap_or_default(),
+                        tool: pending.tool,
+                        path: pending.path,
+                        mutates: pending.mutates,
+                        is_error: value.get("isError") == Some(&Value::Bool(true)),
+                        error: result_text
+                            .lines()
+                            .find(|line| !line.trim().is_empty())
+                            .map(|line| line.trim().chars().take(180).collect())
+                            .unwrap_or_else(|| "mutating tool failed".to_string()),
+                        ts: now_ms,
+                        duration_ms: value.get("durationMs").and_then(Value::as_u64),
+                    });
+                }
                 if let Some(tool) = self.current_tool.take() {
                     self.recent_tools.push(RecentToolEntry {
                         tool,
@@ -963,6 +1136,8 @@ impl ChildRunState {
                         end_ms: now_ms,
                     });
                 }
+                self.current_tool_call_id = None;
+                self.current_tool_mutates = false;
                 self.current_tool_started_at = None;
                 self.current_path = None;
                 outcome.progress_event = true;

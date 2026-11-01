@@ -169,19 +169,6 @@ pub fn execute(host: &dyn HostCall, params: &Value) -> Value {
         return failure_result(error, &message);
     }
 
-    // Emit the prompt event for external listeners (notification plugins
-    // etc.) before the questionnaire opens. Upstream would propagate a
-    // listener throw; in rpi `events.emit` is fire-and-forget and a host
-    // failure is logged, never fatal to the tool call.
-    if let Err(error) = events::emit_prompt(host, &typed, crate::current_tool_call_id().as_deref())
-    {
-        tracing::warn!(
-            kind = %error.kind,
-            message = %error.message,
-            "rpi-ask-user-question: prompt event emit failed"
-        );
-    }
-
     // RPC hosts (VSCode pendant, ACP clients like Zed/Paseo — upstream issue
     // #78): `ui.custom` cannot render there, but the select/input dialog
     // sub-protocol works; hosts advertising `ctx.mode` (rpi always does)
@@ -223,6 +210,9 @@ fn run_rpc_path_with(
     i18n: &I18n,
     emit_bel: impl FnOnce(),
 ) -> Value {
+    if let Err(error) = events::emit_prompt(host, typed, crate::current_tool_call_id().as_deref()) {
+        tracing::warn!(kind = %error.kind, message = %error.message, "rpi-ask-user-question: prompt event emit failed");
+    }
     emit_blocked_or_warn(host, true);
     let outcome = {
         emit_bel();
@@ -259,17 +249,57 @@ fn resolve_undefined_result_with(
     i18n: &I18n,
     emit_bel: impl FnOnce(),
 ) -> Value {
-    emit_blocked_or_warn(host, true);
+    let blocked_announced = std::cell::Cell::new(false);
     let component = {
         emit_bel();
-        crate::state::session::run(host, typed, i18n, &crate::config::load_config())
+        crate::state::session::run_with_prompt(
+            host,
+            typed,
+            i18n,
+            &crate::config::load_config(),
+            || {
+                if let Err(error) =
+                    events::emit_prompt(host, typed, crate::current_tool_call_id().as_deref())
+                {
+                    tracing::warn!(kind = %error.kind, message = %error.message, "rpi-ask-user-question: prompt event emit failed");
+                }
+                emit_blocked_or_warn(host, true);
+                blocked_announced.set(true);
+            },
+        )
     };
-    emit_blocked_or_warn(host, false);
 
     match component {
-        Ok(result) => crate::tool::envelope::build_questionnaire_response(Some(&result), typed),
-        Err(error) if error.is_unknown_method() => resolve_without_component(host, typed, i18n),
+        Ok(result) => {
+            emit_blocked_or_warn(host, false);
+            crate::tool::envelope::build_questionnaire_response(Some(&result), typed)
+        }
+        Err(error) if error.is_unknown_method() => {
+            if blocked_announced.get() {
+                // Mount succeeded, but a later interactive-UI call was
+                // unknown: close the bracket already opened by the callback.
+                emit_blocked_or_warn(host, false);
+                resolve_without_component(host, typed, i18n)
+            } else {
+                // No component ABI: emit the prompt and blocked bracket
+                // before the dialog walker fallback (there is no answerable
+                // mount, so external answers correctly get
+                // `not_found`/`unsupported`).
+                if let Err(error) =
+                    events::emit_prompt(host, typed, crate::current_tool_call_id().as_deref())
+                {
+                    tracing::warn!(kind = %error.kind, message = %error.message, "rpi-ask-user-question: prompt event emit failed");
+                }
+                emit_blocked_or_warn(host, true);
+                let outcome = resolve_without_component(host, typed, i18n);
+                emit_blocked_or_warn(host, false);
+                outcome
+            }
+        }
         Err(error) => {
+            if blocked_announced.get() {
+                emit_blocked_or_warn(host, false);
+            }
             tracing::warn!(
                 kind = %error.kind,
                 message = %error.message,
@@ -516,12 +546,16 @@ mod tests {
         // the `no_custom_ui` envelope with the byte-identical literal.
         let host = host_script(vec![
             ("ctx.hasUI", Ok(json!(true))),
-            ("events.emit", Ok(json!(null))), // prompt
             ("ctx.mode", Ok(json!("tui"))),
-            ("events.emit", Ok(json!(null))), // blocked:true
+            (
+                "ui.hasOverlay",
+                Ok(json!({"visible": false, "capturing": false})),
+            ),
             ("ui.mountComponent", Err(unknown_method())),
-            ("events.emit", Ok(json!(null))), // blocked:false
+            ("events.emit", Ok(json!(null))), // prompt
+            ("events.emit", Ok(json!(null))), // blocked:true
             ("ctx.hasUI", Ok(json!(false))),  // dialog-primitive probe
+            ("events.emit", Ok(json!(null))), // blocked:false
         ]);
         let result = execute(&host, &valid_params());
         assert_eq!(result["content"][0]["text"], ERROR_NO_CUSTOM_UI);
@@ -533,22 +567,22 @@ mod tests {
             methods,
             vec![
                 "ctx.hasUI",
-                "events.emit",
                 "ctx.mode",
-                "events.emit",
                 "ui.hasOverlay",
                 "ui.mountComponent",
                 "events.emit",
-                "ctx.hasUI"
+                "events.emit",
+                "ctx.hasUI",
+                "events.emit"
             ]
         );
-        assert_eq!(calls[1].1["channel"], "rpi:ask-user:prompt");
+        assert_eq!(calls[4].1["channel"], "rpi:ask-user:prompt");
         assert_eq!(
-            calls[1].1["data"]["questions"][0]["options"][0]["hasPreview"],
+            calls[4].1["data"]["questions"][0]["options"][0]["hasPreview"],
             json!(false)
         );
-        assert_eq!(calls[3].1["data"], json!({ "active": true }));
-        assert_eq!(calls[6].1["data"], json!({ "active": false }));
+        assert_eq!(calls[5].1["data"], json!({ "active": true }));
+        assert_eq!(calls[7].1["data"], json!({ "active": false }));
     }
 
     /// RPC hosts route to the dialog walker: `ctx.mode == "rpc"` + both
@@ -558,12 +592,12 @@ mod tests {
     fn rpc_mode_uses_walker() {
         let host = FakeHost::new(&[
             ("ctx.hasUI", json!(true)),
-            ("events.emit", json!(null)),
             ("ctx.mode", json!("rpc")),
             ("ctx.hasUI", json!(true)),
-            ("events.emit", json!(null)),
+            ("events.emit", json!(null)), // prompt
+            ("events.emit", json!(null)), // blocked:true
             ("ui.select", json!("1. A — a")),
-            ("events.emit", json!(null)),
+            ("events.emit", json!(null)), // blocked:false
         ]);
         let result = execute(&host, &valid_params());
         assert_eq!(
@@ -579,9 +613,9 @@ mod tests {
             methods,
             vec![
                 "ctx.hasUI",
-                "events.emit",
                 "ctx.mode",
                 "ctx.hasUI",
+                "events.emit",
                 "events.emit",
                 "ui.select",
                 "events.emit"
@@ -632,6 +666,7 @@ mod tests {
         assert_eq!(
             timeline,
             vec![
+                "events.emit:rpi:ask-user:prompt:null",
                 "events.emit:rpi:ask-user:blocked:true",
                 "BEL",
                 "ui.select",
@@ -647,7 +682,8 @@ mod tests {
         let host = FakeHost::default();
         {
             let mut queue = host.replies.lock().expect("queue");
-            queue.push(("events.emit".to_owned(), Ok(json!(null))));
+            queue.push(("events.emit".to_owned(), Ok(json!(null)))); // prompt
+            queue.push(("events.emit".to_owned(), Ok(json!(null)))); // blocked:true
             queue.push((
                 "ui.select".to_owned(),
                 Err(HostError {
@@ -655,7 +691,7 @@ mod tests {
                     message: "ui.select requires capability ui".to_owned(),
                 }),
             ));
-            queue.push(("events.emit".to_owned(), Ok(json!(null))));
+            queue.push(("events.emit".to_owned(), Ok(json!(null)))); // blocked:false
         }
         let params: QuestionParams = serde_json::from_value(valid_params()).expect("params");
         let result = run_rpc_path_with(&host, &params, &I18n::for_locale("en"), || {});
@@ -667,8 +703,8 @@ mod tests {
                 .contains("host dialog failed")
         );
         let calls = host.calls();
-        assert_eq!(calls[0].1["data"], json!({ "active": true }));
-        assert_eq!(calls[2].1["data"], json!({ "active": false }));
+        assert_eq!(calls[1].1["data"], json!({ "active": true }));
+        assert_eq!(calls[3].1["data"], json!({ "active": false }));
     }
 
     /// Non-RPC host whose component mount answers `unknownMethod` falls to
@@ -679,13 +715,17 @@ mod tests {
     fn component_unknown_method_falls_back_to_walker_bare() {
         let host = host_script(vec![
             ("ctx.hasUI", Ok(json!(true))),
-            ("events.emit", Ok(json!(null))), // prompt
             ("ctx.mode", Ok(json!("tui"))),
-            ("events.emit", Ok(json!(null))), // blocked:true
+            (
+                "ui.hasOverlay",
+                Ok(json!({"visible": false, "capturing": false})),
+            ),
             ("ui.mountComponent", Err(unknown_method())),
-            ("events.emit", Ok(json!(null))), // blocked:false
+            ("events.emit", Ok(json!(null))), // prompt
+            ("events.emit", Ok(json!(null))), // blocked:true
             ("ctx.hasUI", Ok(json!(true))),   // dialog-primitive probe
             ("ui.select", Ok(json!(null))),
+            ("events.emit", Ok(json!(null))), // blocked:false
         ]);
         let result = execute(&host, &valid_params());
         assert_eq!(
@@ -702,10 +742,7 @@ mod tests {
             emit_count, 3,
             "prompt + the component attempt's blocked pair"
         );
-        assert_eq!(
-            calls.last().map(|(method, _)| method.as_str()),
-            Some("ui.select")
-        );
+        assert!(calls.iter().any(|(method, _)| method == "ui.select"));
     }
 
     /// TE30 component path: a TUI host answers mount/poll/render; the user
@@ -900,13 +937,22 @@ mod tests {
 
     #[test]
     fn tool_execute_normalizes_before_validation_and_event() {
-        let host = FakeHost::new(&[("ctx.hasUI", json!(true))]);
+        let host = host_script(vec![
+            ("ctx.hasUI", Ok(json!(true))),
+            ("ui.mountComponent", Err(unknown_method())),
+        ]);
         let mut params = valid_params();
         params["questions"][0]["question"] = json!("Pick\r\none?");
         params["questions"][0]["options"][0]["label"] = json!("A\r");
         let _ = execute(&host, &params);
         let calls = host.calls();
-        let payload = &calls[1].1["data"];
+        let payload = calls
+            .iter()
+            .find(|(method, args)| {
+                method == "events.emit" && args["channel"] == "rpi:ask-user:prompt"
+            })
+            .map(|(_, args)| &args["data"])
+            .expect("prompt payload");
         assert_eq!(payload["questions"][0]["question"], "Pick\none?");
         assert_eq!(payload["questions"][0]["options"][0]["label"], "A");
     }
@@ -932,7 +978,6 @@ mod tests {
         let host = FakeHost::default();
         {
             let mut queue = host.replies.lock().expect("queue");
-            queue.push(("events.emit".to_owned(), Ok(json!(null)))); // blocked:true
             queue.push((
                 "ui.mountComponent".to_owned(),
                 Err(HostError {
@@ -940,8 +985,10 @@ mod tests {
                     message: "unknown host call: ui.mountComponent".to_owned(),
                 }),
             ));
-            queue.push(("events.emit".to_owned(), Ok(json!(null)))); // blocked:false
+            queue.push(("events.emit".to_owned(), Ok(json!(null)))); // prompt
+            queue.push(("events.emit".to_owned(), Ok(json!(null)))); // blocked:true
             queue.push(("ctx.hasUI".to_owned(), Ok(json!(false)))); // dialog probe
+            queue.push(("events.emit".to_owned(), Ok(json!(null)))); // blocked:false
         }
         let timeline: Mutex<Vec<String>> = Mutex::new(Vec::new());
         let recording = RecordingHost {
@@ -964,12 +1011,13 @@ mod tests {
         assert_eq!(
             timeline.lock().expect("timeline").clone(),
             vec![
-                "events.emit:rpi:ask-user:blocked:true",
                 "BEL",
                 "ui.hasOverlay",
                 "ui.mountComponent",
-                "events.emit:rpi:ask-user:blocked:false",
+                "events.emit:rpi:ask-user:prompt:null",
+                "events.emit:rpi:ask-user:blocked:true",
                 "ctx.hasUI", // the no_custom_ui probe
+                "events.emit:rpi:ask-user:blocked:false",
             ]
         );
     }

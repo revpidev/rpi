@@ -478,7 +478,7 @@ impl<'de> Deserialize<'de> for SizeValue {
 // ComponentEvent (design §2.2, R-U1.2 / R-U2 / R-U5)
 // ============================================================================
 
-/// `ui.pollComponent` result: the host→guest event enumeration (9 types).
+/// `ui.pollComponent` result: the host→guest event enumeration (10 types).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ComponentEvent {

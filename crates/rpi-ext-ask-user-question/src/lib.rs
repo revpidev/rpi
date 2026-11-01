@@ -478,18 +478,18 @@ mod tests {
         let _ = install_for_test(RpiHostCalls { call: fake_call }, std::ptr::null());
         reset_fake();
 
-        // toolExecute -> execute path (ctx.hasUI + prompt event).
+        // toolExecute -> execute path (mount first, then prompt/blocked).
         queue_reply(Ok(json!(true))); // ctx.hasUI
-        queue_reply(Ok(Value::Null)); // events.emit (prompt)
         queue_reply(Ok(Value::Null)); // ctx.mode
-        queue_reply(Ok(Value::Null)); // events.emit (blocked:true)
         queue_reply(Ok(json!({"visible": false, "capturing": false}))); // ui.hasOverlay
         queue_reply(Err((
             "unknownMethod",
             "unknown host call: ui.mountComponent",
         )));
-        queue_reply(Ok(Value::Null)); // events.emit (blocked:false)
+        queue_reply(Ok(Value::Null)); // events.emit (prompt)
+        queue_reply(Ok(Value::Null)); // events.emit (blocked:true)
         queue_reply(Ok(json!(false))); // ctx.hasUI (dialog-primitive probe)
+        queue_reply(Ok(Value::Null)); // events.emit (blocked:false)
         let result = dispatch_for_test(&json!({
             "kind": "toolExecute",
             "toolName": "ask_user_question",
@@ -506,7 +506,15 @@ mod tests {
         assert_eq!(result["details"]["error"], "no_custom_ui");
         let calls = requests();
         assert_eq!(calls[0].0, "ctx.hasUI");
-        assert_eq!(calls[1].0, "events.emit");
+        assert_eq!(calls[1].0, "ctx.mode");
+        assert_eq!(
+            calls
+                .iter()
+                .find(|(method, args)| method == "events.emit"
+                    && args["channel"] == "rpi:ask-user:prompt")
+                .map(|(_, args)| args["data"]["questions"][0]["question"].clone()),
+            Some(json!("Pick?"))
+        );
 
         // A different tool name is not ours.
         reset_fake();

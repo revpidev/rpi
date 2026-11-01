@@ -81,11 +81,13 @@ pub fn resolve_tool_description_mode(config: &ExtensionConfig) -> ToolDescriptio
     }
 }
 
-fn custom_description_paths(cwd: &Path) -> Vec<PathBuf> {
-    vec![
-        paths::get_project_config_dir(cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE),
-        paths::get_agent_dir().join(CUSTOM_TOOL_DESCRIPTION_FILE),
-    ]
+fn custom_description_paths(cwd: &Path, project_trusted: bool) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if project_trusted {
+        paths.push(paths::get_project_config_dir(cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE));
+    }
+    paths.push(paths::get_agent_dir().join(CUSTOM_TOOL_DESCRIPTION_FILE));
+    paths
 }
 
 /// `renderCustomTemplate` (tool-description.ts:86-106).
@@ -134,8 +136,8 @@ fn render_custom_template(template: &str, cwd: &Path) -> String {
 }
 
 /// `loadCustomToolDescription` (tool-description.ts:108-143).
-fn load_custom_tool_description(cwd: &Path) -> Option<String> {
-    for path in custom_description_paths(cwd) {
+fn load_custom_tool_description(cwd: &Path, project_trusted: bool) -> Option<String> {
+    for path in custom_description_paths(cwd, project_trusted) {
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
@@ -196,12 +198,17 @@ fn with_mandatory_safety_guidance(description: &str) -> String {
 /// `buildSubagentToolDescription` (tool-description.ts:169-182). The
 /// legacy-chain-control line stripping is moot for the rewritten texts (they
 /// contain no legacy chain guidance).
-pub fn build_subagent_tool_description(config: &ExtensionConfig, cwd: &Path) -> String {
+pub fn build_subagent_tool_description(
+    config: &ExtensionConfig,
+    cwd: &Path,
+    project_trusted: bool,
+    provider: Option<&str>,
+) -> Result<String, String> {
     let base = match resolve_tool_description_mode(config) {
         ToolDescriptionMode::Compact => {
             format!("{COMPACT_SUBAGENT_TOOL_DESCRIPTION}\n\n{SUBAGENT_SAFETY_GUIDANCE}")
         }
-        ToolDescriptionMode::Custom => match load_custom_tool_description(cwd) {
+        ToolDescriptionMode::Custom => match load_custom_tool_description(cwd, project_trusted) {
             Some(custom) => with_mandatory_safety_guidance(&custom),
             None => {
                 tracing::warn!(
@@ -220,13 +227,19 @@ pub fn build_subagent_tool_description(config: &ExtensionConfig, cwd: &Path) -> 
     // (≤16 agents, ≤12 KiB catalog, ≤512-byte descriptions, name-sorted,
     // same guidance line), re-pushed via `registerTool` + host
     // `refreshTools` after mutating management actions.
-    let settings = crate::config::read_settings_pair(cwd);
-    let (agents, _) =
-        crate::agents::discover::discover_agents_with_diagnostics(cwd, "both", &settings, None);
+    let settings =
+        crate::config::read_settings_pair_trusted(cwd, project_trusted)?.with_provider(provider);
+    let (agents, _) = crate::agents::discover::discover_agents_with_diagnostics_trusted(
+        cwd,
+        "both",
+        &settings,
+        None,
+        project_trusted,
+    );
     if let Some(catalog) = advertised_agent_catalog(&agents.iter().collect::<Vec<_>>()) {
-        format!("{base}\n\n{catalog}")
+        Ok(format!("{base}\n\n{catalog}"))
     } else {
-        base
+        Ok(base)
     }
 }
 
@@ -372,6 +385,7 @@ mod tests {
             tools: None,
             exclude_tools: Vec::new(),
             mcp_direct_tools: Vec::new(),
+            mutation_tools: Vec::new(),
             model: None,
             allowed_agents: None,
             thinking: crate::agents::discover::ThinkingSpec::Unset,
@@ -405,7 +419,8 @@ mod tests {
     #[test]
     fn full_contains_safety_once_and_structure() {
         let config = ExtensionConfig::new();
-        let description = build_subagent_tool_description(&config, Path::new("/repo"));
+        let description =
+            build_subagent_tool_description(&config, Path::new("/repo"), true, None).unwrap();
         assert!(description.contains("SINGLE RUN"));
         assert!(description.contains("PARALLEL WAVE"));
         assert!(description.contains("CHAIN"));
@@ -438,6 +453,37 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_project_description_hides_project_agents_and_custom_text() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-desc-trust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".rpi").join("agents")).unwrap();
+        std::fs::write(
+            project.join(".rpi").join("agents").join("proj.md"),
+            "---\nname: proj\ndescription: Project-only agent\nadvertise: true\n---\nBody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".rpi").join(CUSTOM_TOOL_DESCRIPTION_FILE),
+            "PROJECT CUSTOM DESCRIPTION",
+        )
+        .unwrap();
+        let mut config = ExtensionConfig::new();
+        config.tool_description_mode = Some("custom".into());
+        let untrusted = build_subagent_tool_description(&config, &project, false, None).unwrap();
+        assert!(!untrusted.contains("Project-only agent"), "{untrusted}");
+        assert!(
+            !untrusted.contains("PROJECT CUSTOM DESCRIPTION"),
+            "{untrusted}"
+        );
+        assert!(untrusted.contains("SAFETY-CRITICAL SUBAGENT GUIDANCE"));
+        let trusted = build_subagent_tool_description(&config, &project, true, None).unwrap();
+        assert!(trusted.contains("Project-only agent"), "{trusted}");
+        assert!(trusted.contains("PROJECT CUSTOM DESCRIPTION"), "{trusted}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn custom_template_dedupes_safety_and_keeps_unknown_placeholders() {
         let dir = std::env::temp_dir().join(format!("rpi-sub-desc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -450,7 +496,7 @@ mod tests {
         .unwrap();
         let mut config = ExtensionConfig::new();
         config.tool_description_mode = Some("custom".into());
-        let description = build_subagent_tool_description(&config, &dir);
+        let description = build_subagent_tool_description(&config, &dir, true, None).unwrap();
         assert!(description.starts_with("My custom text"));
         assert!(
             description.contains("{{unknownVar}}"),
