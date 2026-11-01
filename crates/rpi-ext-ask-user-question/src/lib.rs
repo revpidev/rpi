@@ -457,6 +457,7 @@ mod tests {
         queue_reply(Ok(Value::Null)); // events.emit (prompt)
         queue_reply(Ok(Value::Null)); // ctx.mode
         queue_reply(Ok(Value::Null)); // events.emit (blocked:true)
+        queue_reply(Ok(json!({"visible": false, "capturing": false}))); // ui.hasOverlay
         queue_reply(Err((
             "unknownMethod",
             "unknown host call: ui.mountComponent",

@@ -388,9 +388,12 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
         }
         if model.state.notes_visible {
             let (range, notes_cursor) = push_notes_editor(model, &mut lines, true);
-            if let Some(range) = range {
-                focused_range = Some(range);
-            }
+            let available = model
+                .height
+                .map(|height| height.saturating_sub(picker_start + 1))
+                .unwrap_or(usize::MAX);
+            focused_range = notes_focus_range(range, notes_cursor.map(|(row, _)| row), available)
+                .or(focused_range);
             cursor = cursor.or(notes_cursor);
         }
         lines.push(truncate_line(
@@ -479,9 +482,16 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
     lines.extend(body.lines);
     if model.state.notes_visible {
         let (range, notes_cursor) = push_notes_editor(model, &mut lines, false);
-        if let Some(range) = range {
-            focused_range = Some(range);
-        }
+        // #317: while the notes editor is open it is the keyboard target. A
+        // block that fits the window is followed whole (header included); a
+        // taller one is followed by its cursor row so typed text and an IME
+        // composition window stay on screen.
+        let available = model
+            .height
+            .map(|height| height.saturating_sub(body_start + 1))
+            .unwrap_or(usize::MAX);
+        focused_range =
+            notes_focus_range(range, notes_cursor.map(|(row, _)| row), available).or(focused_range);
         cursor = cursor.or(notes_cursor);
     } else if let Some(note) = saved_note(model.state) {
         // v2.13.7 (#197): a saved note stays visible once its editor closes —
@@ -582,6 +592,23 @@ fn push_notes_editor(
 
 /// Apply the scroll window (when configured and needed) and produce the
 /// final frame.
+/// `notesFocusRange` (dialog-builder.ts:234-262 @ 2.15.0, #317): the notes
+/// editor is the keyboard target while open. A block that fits the window is
+/// followed whole (header included); a taller one is followed by the row
+/// carrying the editor's cursor, so typed text and an IME composition window
+/// stay on screen. Without a cursor row the whole block is kept.
+fn notes_focus_range(
+    block: Option<(usize, usize)>,
+    cursor_row: Option<usize>,
+    available: usize,
+) -> Option<(usize, usize)> {
+    let (start, end) = block?;
+    if end.saturating_sub(start) <= available {
+        return Some((start, end));
+    }
+    cursor_row.map(|row| (row, row + 1)).or(Some((start, end)))
+}
+
 fn finish(
     model: &DialogModel<'_>,
     lines: Vec<String>,
@@ -1043,6 +1070,20 @@ mod tests {
         // "off" falls back to the cancel-only line (upstream parity).
         let off = collapsed_row("off", &i18n, &theme);
         assert_eq!(strip_ansi(&off), " Esc to cancel ");
+    }
+
+    #[test]
+    fn notes_focus_range_follows_the_cursor_only_when_the_block_overflows() {
+        // The whole block fits: header included.
+        assert_eq!(notes_focus_range(Some((6, 10)), Some(8), 10), Some((6, 10)));
+        // Taller than the window: the cursor row is the target.
+        assert_eq!(
+            notes_focus_range(Some((6, 30)), Some(20), 10),
+            Some((20, 21))
+        );
+        // No cursor row: keep the block.
+        assert_eq!(notes_focus_range(Some((6, 30)), None, 10), Some((6, 30)));
+        assert_eq!(notes_focus_range(None, Some(3), 10), None);
     }
 
     #[test]

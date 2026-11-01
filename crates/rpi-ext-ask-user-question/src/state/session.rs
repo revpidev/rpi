@@ -592,9 +592,11 @@ pub fn inline_row_budget(rows: usize) -> usize {
 /// overlay is already open (`mustYieldInlineSlot` reads `tui.hasOverlay()`);
 /// the rpi interactive-UI ABI exposes no overlay query, so the inline mount
 /// is unconditional (documented divergence, TE48 §7.3).
-pub fn mount_options(collapse_key: &str) -> MountOptions {
+pub fn mount_options(collapse_key: &str, capturing_overlay: bool) -> MountOptions {
     MountOptions {
-        overlay: false,
+        // #313: only an overlay that takes the keys (e.g. /btw) forces the
+        // stacked overlay fallback; a non-capturing HUD keeps the inline slot.
+        overlay: capturing_overlay,
         overlay_options: None,
         // The questionnaire has no animation; it never subscribes to ticks.
         tick_ms: 0,
@@ -688,7 +690,14 @@ pub fn run(
     let notes_key = resolve_notes_key(config);
     let mut component =
         QuestionnaireComponent::new(params, i18n.clone(), collapse_key.clone(), notes_key);
-    let options = mount_options(&collapse_key);
+    // #313: `ui.hasOverlay` returns `{visible, capturing}` (ADR-0041); an old
+    // host or a failed call keeps the inline presentation.
+    let capturing_overlay = host
+        .call("ui.hasOverlay", serde_json::json!({}))
+        .ok()
+        .and_then(|value| value.get("capturing").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false);
+    let options = mount_options(&collapse_key, capturing_overlay);
     let adapter = AbiHostAdapter { host };
     let handle = mount_component(&adapter, &options)?;
 
@@ -1011,7 +1020,7 @@ mod tests {
         assert!(component.state.collapsed);
         let _ = component.take_host_effects();
         // The only key the host routes while hidden is the collapse key.
-        let options = mount_options("ctrl+]");
+        let options = mount_options("ctrl+]", false);
         assert_eq!(options.keys_when_hidden, vec!["ctrl+]"]);
         assert!(!options.keys_when_hidden.iter().any(|key| key == "escape"));
         // Esc on the visible collapsed fallback row cancels (upstream parity).
@@ -1289,14 +1298,18 @@ mod tests {
 
     #[test]
     fn mount_options_carry_inline_presentation_and_collapse_channel() {
-        let options = mount_options("ctrl+]");
+        let options = mount_options("ctrl+]", false);
         assert!(!options.overlay, "v2.13.0: inline editor-slot mount");
         assert!(options.overlay_options.is_none());
         assert_eq!(options.tick_ms, 0);
         assert_eq!(options.keys_when_hidden, vec!["ctrl+]".to_owned()]);
         assert!(options.cursor);
         assert_eq!(options.label.as_deref(), Some("ask_user_question"));
-        assert!(mount_options("off").keys_when_hidden.is_empty());
+        // #313: a capturing overlay switches to the stacked overlay mount.
+        let stacked = mount_options("ctrl+]", true);
+        assert!(stacked.overlay);
+        assert!(stacked.overlay_options.is_none());
+        assert!(mount_options("off", false).keys_when_hidden.is_empty());
         // Row budget: 70% with a 12-row floor, never above the terminal.
         assert_eq!(inline_row_budget(30), 21);
         assert_eq!(inline_row_budget(10), 10);

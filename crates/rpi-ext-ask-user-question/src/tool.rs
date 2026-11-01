@@ -65,6 +65,10 @@ pub fn tool_definition(config: &AskUserQuestionConfig) -> Value {
         "promptSnippet": guidance.prompt_snippet.clone().unwrap_or_else(default_prompt_snippet),
         "promptGuidelines": guidance.prompt_guidelines.clone().unwrap_or_else(default_prompt_guidelines),
         "parameters": question_params_schema(),
+        // #310: codemode "only" hides direct tools behind scripts; a question
+        // needs the user, so the model must keep calling it directly and a
+        // script must never call it.
+        "exposure": "model-only",
         "renderCall": true,
         "renderResult": true,
     })
@@ -445,6 +449,7 @@ mod tests {
         );
         assert_eq!(definition["parameters"]["type"], "object");
         // TE41 (rpi#52): the render capability flags ride the registration.
+        assert_eq!(definition["exposure"], json!("model-only"));
         assert_eq!(definition["renderCall"], json!(true));
         assert_eq!(definition["renderResult"], json!(true));
 
@@ -529,6 +534,7 @@ mod tests {
                 "events.emit",
                 "ctx.mode",
                 "events.emit",
+                "ui.hasOverlay",
                 "ui.mountComponent",
                 "events.emit",
                 "ctx.hasUI"
@@ -540,7 +546,7 @@ mod tests {
             json!(false)
         );
         assert_eq!(calls[3].1["data"], json!({ "active": true }));
-        assert_eq!(calls[5].1["data"], json!({ "active": false }));
+        assert_eq!(calls[6].1["data"], json!({ "active": false }));
     }
 
     /// RPC hosts route to the dialog walker: `ctx.mode == "rpc"` + both
@@ -694,7 +700,10 @@ mod tests {
             emit_count, 3,
             "prompt + the component attempt's blocked pair"
         );
-        assert_eq!(calls[7].0, "ui.select");
+        assert_eq!(
+            calls.last().map(|(method, _)| method.as_str()),
+            Some("ui.select")
+        );
     }
 
     /// TE30 component path: a TUI host answers mount/poll/render; the user
@@ -715,8 +724,7 @@ mod tests {
             ("ui.renderComponent", Ok(json!({"ok": true}))),
             (
                 "ui.pollComponent",
-                Ok(json!({"event": {"type": "input", "data": "
-"}})),
+                Ok(json!({"event": {"type": "input", "data": "\r"}})),
             ),
             ("ui.renderComponent", Ok(json!({"ok": true}))),
             ("events.emit", Ok(json!(null))), // blocked:false
@@ -737,11 +745,15 @@ mod tests {
         assert!(!methods.contains(&"ui.custom"));
         // Mount options: inline editor-slot presentation (v2.13.0, #253),
         // tickMs 0, cursor on.
-        assert_eq!(calls[4].1["options"]["overlay"], json!(false));
-        assert!(calls[4].1["options"].get("overlayOptions").is_none());
-        assert_eq!(calls[4].1["options"]["tickMs"], json!(0));
-        assert_eq!(calls[4].1["options"]["cursor"], json!(true));
-        assert_eq!(calls[4].1["options"]["keysWhenHidden"], json!(["ctrl+]"]));
+        let mount = calls
+            .iter()
+            .find(|(method, _)| method == "ui.mountComponent")
+            .expect("component mount");
+        assert_eq!(mount.1["options"]["overlay"], json!(false));
+        assert!(mount.1["options"].get("overlayOptions").is_none());
+        assert_eq!(mount.1["options"]["tickMs"], json!(0));
+        assert_eq!(mount.1["options"]["cursor"], json!(true));
+        assert_eq!(mount.1["options"]["keysWhenHidden"], json!(["ctrl+]"]));
         // Two frames: the first contains the question, the second carries
         // `done` with the answer.
         let renders: Vec<&Value> = calls
@@ -757,6 +769,58 @@ mod tests {
                 .any(|line| line.as_str().is_some_and(|line| line.contains("Pick one?")))
         );
         assert_eq!(renders[1]["done"]["answers"][0]["answer"], json!("A"));
+    }
+
+    /// #313: only a capturing overlay forces the stacked overlay mount; a
+    /// non-capturing HUD keeps the inline editor slot.
+    #[test]
+    fn component_mount_yields_only_to_a_capturing_overlay() {
+        let host = FakeHost::new(&[
+            ("ctx.hasUI", json!(true)),
+            ("events.emit", json!(null)), // prompt
+            ("ctx.mode", json!("tui")),
+            ("events.emit", json!(null)), // blocked:true
+            ("ui.hasOverlay", json!({"visible": true, "capturing": true})),
+            ("ui.mountComponent", json!({"handle": 7})),
+            (
+                "ui.pollComponent",
+                json!({"event": {"type": "input", "data": "\r"}}),
+            ),
+            ("ui.renderComponent", json!({"ok": true})),
+            ("events.emit", json!(null)), // blocked:false
+        ]);
+        let _ = execute(&host, &valid_params());
+        let calls = host.calls();
+        let mount = calls
+            .iter()
+            .find(|(method, _)| method == "ui.mountComponent")
+            .expect("component mount");
+        assert_eq!(mount.1["options"]["overlay"], json!(true));
+
+        let hud = FakeHost::new(&[
+            ("ctx.hasUI", json!(true)),
+            ("events.emit", json!(null)),
+            ("ctx.mode", json!("tui")),
+            ("events.emit", json!(null)),
+            (
+                "ui.hasOverlay",
+                json!({"visible": true, "capturing": false}),
+            ),
+            ("ui.mountComponent", json!({"handle": 8})),
+            (
+                "ui.pollComponent",
+                json!({"event": {"type": "input", "data": "\r"}}),
+            ),
+            ("ui.renderComponent", json!({"ok": true})),
+            ("events.emit", json!(null)),
+        ]);
+        let _ = execute(&hud, &valid_params());
+        let calls = hud.calls();
+        let mount = calls
+            .iter()
+            .find(|(method, _)| method == "ui.mountComponent")
+            .expect("component mount");
+        assert_eq!(mount.1["options"]["overlay"], json!(false));
     }
 
     /// A component transport failure that is not `unknownMethod` surfaces as
@@ -900,6 +964,7 @@ mod tests {
             vec![
                 "events.emit:rpi:ask-user:blocked:true",
                 "BEL",
+                "ui.hasOverlay",
                 "ui.mountComponent",
                 "events.emit:rpi:ask-user:blocked:false",
                 "ctx.hasUI", // the no_custom_ui probe
