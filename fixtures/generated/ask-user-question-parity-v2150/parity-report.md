@@ -1,6 +1,6 @@
 # ask-user-question parity report (target track: rpiv-mono v2150 @ ce6d353041 — TE28/TE29/TE30/TE31 G3/G12, dual-track TE51)
 
-generated: 2026-11-01T06:02:10.850Z
+generated: 2026-11-01T06:17:35.611Z
 upstream submodule: external/rpiv-mono (packages/rpiv-ask-user-question)
 submodule HEAD: afc21bc25f7d07cae9fb3103dc309240a16b9f49 (track pin ce6d3530410812ca504ec294995581a52170f9e1)
 typebox: 1.3.6
