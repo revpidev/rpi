@@ -1,8 +1,13 @@
 {
   "name": "rpi-statusline",
   "version": "0.1.0",
-  "description": "Claude Code-compatible script statusline: run a configured command, feed it session JSON, render its stdout as the footer",
+  "description": "Claude Code-compatible statusline: a script command (CC stdin JSON contract) or declarative items (21 fields, /statusline editor), rendered as footer/widget/status with event-driven and live refresh",
   "native": "librpi_ext_statusline.so",
-  "capabilities": ["ui", "session"],
+  "capabilities": [
+    "commands",
+    "ui",
+    "session",
+    "events"
+  ],
   "rpiAbi": 1
 }

@@ -18,13 +18,20 @@
 //! `ui.setWidget`.
 
 pub mod config;
+pub mod editor;
+pub mod fields;
+pub mod git;
+pub mod items;
 pub mod paths;
 pub mod payload;
 pub mod refresh;
 pub mod render;
 pub mod runner;
 pub mod runtime;
+pub mod session_stats;
+pub mod settings_write;
 pub mod state;
+pub mod subscriptions;
 
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -37,26 +44,12 @@ use crate::refresh::Trigger;
 use crate::runtime::PluginRuntime;
 use crate::state::EngineState;
 
-/// Events subscribed at install (TE12 事件映射表; everything else is
-/// deliberately not subscribed — other high-frequency events carry no
-/// data this plugin consumes).
-const SUBSCRIBED_EVENTS: &[&str] = &[
-    "message_end",
-    "session_start",
-    "session_compact",
-    "session_info_changed",
-    "model_select",
-    "thinking_level_select",
-    "tool_execution_end",
-    "session_shutdown",
-];
-
-/// Live-token subscriptions (03-realtime-token-count §1.4/§1.5): only
-/// armed at install when `statusLine.liveTokens` is configured — the
-/// subscription set is the zero-cost off switch (unsubscribed users pay
-/// no per-delta host payload serialization). Both dispatch as
-/// bookkeeping-only `Trigger::Live` (never the 300ms-debounce path).
-const LIVE_EVENTS: &[&str] = &["message_start", "message_update"];
+/// Live-token dispatch events (03-realtime-token-count §1.4/§1.5): the
+/// event SET is reconciled from the configuration (`subscriptions`), while
+/// these two bookkeeping events map to `Trigger::Live` (never the 300ms
+/// debounce path).
+#[allow(dead_code)] // documented dispatch table; the match below is the live path
+const LIVE_DISPATCH_EVENTS: &[&str] = &["message_start", "message_update"];
 
 /// Host-call handle + plugin-owned runtime, established once by
 /// `rpi_extension_init`. The cookie is stored as `usize` to keep the state
@@ -88,6 +81,10 @@ pub(crate) static ENGINE: OnceLock<Mutex<EngineState>> = OnceLock::new();
 /// together with the restarted loop (the previous loop broke on
 /// `session_shutdown`).
 static TRIGGERS: OnceLock<Mutex<tokio::sync::mpsc::UnboundedSender<Trigger>>> = OnceLock::new();
+
+/// Dynamic `on`/`off` registrations keyed by event name (items mode) plus the
+/// command-mode table (TE52 R20 §4.4).
+static SUBSCRIPTIONS: OnceLock<Mutex<subscriptions::SubscriptionState>> = OnceLock::new();
 
 /// Clonable host-call channel for background tasks (subagents lib.rs:70-95
 /// precedent, verbatim): the refresh loop outlives the install dispatch
@@ -132,33 +129,37 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         call: calls.call,
         cookie: cookie as usize,
     };
-    for event in SUBSCRIBED_EVENTS {
-        let response = host_call_static(&channel, "on", json!({"event": event}));
-        if response.get("error").is_some() {
-            return response;
-        }
-    }
-    // §1.5 启用时机注记: the live subscription set is fixed at load — a
-    // runtime `liveTokens` key edit changes nothing until restart.
-    let live_tokens_enabled = config::live_tokens_configured_in_global_settings();
-    if live_tokens_enabled {
-        for event in LIVE_EVENTS {
-            let response = host_call_static(&channel, "on", json!({"event": event}));
-            if response.get("error").is_some() {
-                return response;
-            }
-        }
+    // `/statusline` editor/config command (manifest capability `commands`).
+    let response = host_call_static(
+        &channel,
+        "registerCommand",
+        json!({
+            "name": "statusline",
+            "description": "Configure the status line: /statusline | help | reset",
+        }),
+    );
+    if response.get("error").is_some() {
+        return response;
     }
 
-    // Rebind: newest host wins (see CHANNEL). The loop restart shares the
-    // engine state — the new session's `session_start` event resets the
-    // per-session fields.
-    if let Some(state) = STATE.get() {
+    let first_install = STATE.get().is_none();
+    // Rebind: newest host wins (see CHANNEL). The new host's registry is
+    // empty, so drop the old subscription ids and re-register below; the
+    // loop restart shares the engine state.
+    if !first_install {
         *CHANNEL
             .get()
             .expect("channel cell installed with the first state")
             .write()
             .unwrap_or_else(|error| error.into_inner()) = channel;
+        if let Some(subscriptions) = SUBSCRIPTIONS.get() {
+            *subscriptions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                subscriptions::SubscriptionState::default();
+        }
+        reconcile_subscriptions(&channel, &config::load_settings_snapshot());
+        let state = STATE.get().expect("state installed");
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         *TRIGGERS
             .get()
@@ -182,12 +183,21 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         }
     };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let initial = config::load_settings_snapshot();
+    let command_live_fixed = matches!(
+        initial.status_line,
+        Some(config::StatusLine::Command(ref config)) if config.live_tokens.enabled
+    );
     let _ = TRIGGERS.set(Mutex::new(tx));
-    let _ = ENGINE.set(Mutex::new(EngineState::default()));
+    let mut engine = EngineState::default();
+    engine.command_live_fixed = command_live_fixed;
+    let _ = ENGINE.set(Mutex::new(engine));
+    let _ = SUBSCRIPTIONS.set(Mutex::new(subscriptions::SubscriptionState::default()));
     let _ = CHANNEL.set(Arc::new(RwLock::new(channel)));
-    if live_tokens_enabled {
+    if command_live_fixed {
         with_engine(|engine| engine.arm_live_measure());
     }
+    reconcile_subscriptions(&channel, &initial);
     runtime.spawn(refresh::refresh_loop(
         Arc::clone(CHANNEL.get().expect("channel cell just set")),
         rx,
@@ -196,10 +206,46 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     json!({"ok": true})
 }
 
+/// Reconcile the dynamic subscription set (and the items live measure) with
+/// the current configuration. Called at install, after a rebind and on every
+/// refresh poll.
+pub(crate) fn reconcile_subscriptions(
+    channel: &AsyncHostCalls,
+    settings: &config::SettingsSnapshot,
+) {
+    let desired = {
+        let command_live_fixed = with_engine(|engine| engine.command_live_fixed);
+        subscriptions::desired_events(settings.status_line.as_ref(), command_live_fixed)
+    };
+    if let Some(state) = SUBSCRIPTIONS.get() {
+        state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .reconcile(channel, &desired);
+    }
+    if let Some(config::StatusLine::Items(items)) = settings.status_line.as_ref() {
+        // Items live membership is dynamic: disabled → off + clear.
+        with_engine(|engine| engine.set_live_measure(items.live_enabled()));
+    }
+}
+
 /// Event dispatch: light state updates + a channel send, nothing more.
 fn handle_dispatch(message: &Value) -> Value {
-    if message.get("kind").and_then(Value::as_str) != Some("event") {
-        return Value::Null;
+    match message.get("kind").and_then(Value::as_str) {
+        Some("event") => {}
+        Some("command") => {
+            if message.get("name").and_then(Value::as_str) != Some("statusline") {
+                return Value::Null;
+            }
+            let args = message.get("args").and_then(Value::as_str).unwrap_or("");
+            let calls = *CHANNEL
+                .get()
+                .expect("channel cell installed before commands")
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            return editor::handle_command(&calls, args);
+        }
+        _ => return Value::Null,
     }
     let event = message.get("event").and_then(Value::as_str).unwrap_or("");
     tracing::info!(event, "statusline dispatch");
@@ -247,6 +293,12 @@ fn handle_dispatch(message: &Value) -> Value {
         "model_select" => Trigger::Event("model_select"),
         "thinking_level_select" => Trigger::Event("thinking_level_select"),
         "tool_execution_end" => Trigger::Event("tool_execution_end"),
+        // TE52 items triggers (subscribed only when a selected field needs
+        // them; a stray event is still cheap bookkeeping).
+        "turn_end" => Trigger::Event("turn_end"),
+        "agent_start" => Trigger::Event("agent_start"),
+        "agent_settled" => Trigger::Event("agent_settled"),
+        "mode_change" => Trigger::Event("mode_change"),
         _ => return Value::Null,
     };
     if let Some(cell) = TRIGGERS.get() {
@@ -258,12 +310,28 @@ fn handle_dispatch(message: &Value) -> Value {
     Value::Null
 }
 
-fn with_engine<T>(update: impl FnOnce(&mut EngineState) -> T) -> T {
+pub(crate) fn with_engine<T>(update: impl FnOnce(&mut EngineState) -> T) -> T {
     let engine = ENGINE
         .get()
         .expect("engine state installed before dispatch");
     let mut engine = engine.lock().unwrap_or_else(|error| error.into_inner());
     update(&mut engine)
+}
+
+/// Wake the refresh loop after a configuration save (dynamic subscriptions
+/// and the first re-render happen on the next tick).
+pub(crate) fn request_refresh(reason: &'static str) {
+    request_trigger(Trigger::Event(reason));
+}
+
+/// Push an arbitrary trigger (background Git probes).
+pub(crate) fn request_trigger(trigger: Trigger) {
+    if let Some(cell) = TRIGGERS.get() {
+        let _ = cell
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .send(trigger);
+    }
 }
 
 fn pack(value: Value) -> RVec<u8> {
@@ -317,16 +385,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subscribed_events_are_unique_and_sorted_for_documentation() {
-        let mut events = SUBSCRIBED_EVENTS.to_vec();
-        events.sort_unstable();
-        let count = events.len();
-        events.dedup();
-        assert_eq!(events.len(), count, "no duplicate subscriptions");
-        assert_eq!(count, 8, "the TE12 event table");
-        let mut live = LIVE_EVENTS.to_vec();
+    fn live_dispatch_events_are_unique() {
+        let mut live = LIVE_DISPATCH_EVENTS.to_vec();
         live.sort_unstable();
+        let count = live.len();
         live.dedup();
-        assert_eq!(live.len(), 2, "message_start + message_update only");
+        assert_eq!(live.len(), count);
+        assert_eq!(count, 2, "message_start + message_update only");
+    }
+
+    #[test]
+    fn subscription_tables_are_disjoint_and_unique() {
+        let mut base = subscriptions::BASE_EVENTS.to_vec();
+        base.sort_unstable();
+        let count = base.len();
+        base.dedup();
+        assert_eq!(base.len(), count);
+        let mut all = subscriptions::BASE_EVENTS
+            .iter()
+            .chain(subscriptions::COMMAND_EVENTS.iter())
+            .chain(subscriptions::LIVE_EVENTS.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        all.sort_unstable();
+        all.dedup();
+        for event in subscriptions::COMMAND_EVENTS
+            .iter()
+            .chain(subscriptions::LIVE_EVENTS.iter())
+        {
+            assert!(
+                !subscriptions::BASE_EVENTS.contains(event),
+                "{event} must not be duplicated in the base set"
+            );
+        }
     }
 }

@@ -13,7 +13,16 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 # Native ABI types (RpiNativeModule / RpiHostCalls) for the cdylib thin shell.
 rpi-ext-host.workspace = true
+# Guest-side protocol shapes (interactive-UI component loop, sessionStats,
+# emitText) shared with the wasm carrier; the native plugin drives them over
+# the same JSON host-call trampoline.
+rpi-ext-sdk.workspace = true
 abi_stable = "0.11"
+# Timestamp parsing for ctx.sessionStats' RFC3339 startedAt.
+chrono.workspace = true
+# A+B settings coordination for the /statusline editor (same protocol as the
+# host and subagents writers; ADR-0040).
+fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Plugin-owned tokio runtime + script
@@ -23,3 +32,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 rpi-test-env.workspace = true
+# TE52 joint frames: the host's exact status-line wrap helper (the same
+# function the built-in footer uses). TE53 replaces the usage-side literal
+# with the real typed footer (linking both abi_stable root modules into one
+# test binary conflicts on the exported module-loader symbol).
+rpi-tui.workspace = true

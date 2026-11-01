@@ -144,7 +144,9 @@ fn statusline_lifecycle_over_the_carrier_seam() {
     let receipt = rpi_ext_statusline::install_for_test(calls, COOKIE);
     assert!(receipt.get("error").is_none(), "install: {receipt:#?}");
 
-    // ── 1. Subscription set (the TE12 event table). ────────────────────
+    // ── 1. Subscription set: with no statusLine only the base lifecycle
+    //        events are registered (TE52 field-driven subscriptions); the
+    //        command table is added when a command config appears. ─────
     let subscribed: Vec<String> = records()
         .iter()
         .filter(|(method, _)| method == "on")
@@ -156,13 +158,10 @@ fn statusline_lifecycle_over_the_carrier_seam() {
         })
         .collect();
     for event in [
-        "message_end",
         "session_start",
-        "session_compact",
         "session_info_changed",
         "model_select",
         "thinking_level_select",
-        "tool_execution_end",
         "session_shutdown",
     ] {
         assert!(
@@ -170,6 +169,26 @@ fn statusline_lifecycle_over_the_carrier_seam() {
             "missing subscription: {event}"
         );
     }
+    for event in [
+        "message_end",
+        "tool_execution_end",
+        "message_start",
+        "message_update",
+    ] {
+        assert!(
+            !subscribed.iter().any(|s| s == event),
+            "unconfigured plugin must not subscribe {event}"
+        );
+    }
+    // No `/statusline` command when the config is empty? The command is
+    // always registered (it opens the editor); assert the registration.
+    assert!(
+        records()
+            .iter()
+            .any(|(method, args)| method == "registerCommand"
+                && args.get("name").and_then(Value::as_str) == Some("statusline")),
+        "the /statusline editor command is registered"
+    );
 
     // ── 2. No statusLine key → no UI traffic, no script. ───────────────
     send_event(
@@ -218,9 +237,14 @@ fn statusline_lifecycle_over_the_carrier_seam() {
             .and_then(Value::as_str),
         Some("column")
     );
-    assert_eq!(
-        footer_args.pointer("/component/children/0/props/truncate"),
-        Some(&json!(true))
+    // TE52 registered rendering change: no truncate, no 8-line cap; the
+    // host wraps over-wide lines at the terminal width.
+    assert!(
+        footer_args
+            .pointer("/component/children/0/props")
+            .expect("props")
+            .get("truncate")
+            .is_none()
     );
     assert!(
         footer_args
@@ -247,6 +271,54 @@ fn statusline_lifecycle_over_the_carrier_seam() {
         "last message usage"
     );
     assert_eq!(stdin["rpi"]["session_totals"]["input"], 300);
+    // The command config reconciled the TE12 event table in.
+    let subscribed_now: Vec<String> = records()
+        .iter()
+        .filter(|(method, _)| method == "on")
+        .map(|(_, args)| {
+            args.get("event")
+                .and_then(Value::as_str)
+                .expect("event name")
+                .to_owned()
+        })
+        .collect();
+    for event in ["message_end", "tool_execution_end", "session_compact"] {
+        assert!(
+            subscribed_now.iter().any(|s| s == event),
+            "command mode must subscribe {event}"
+        );
+    }
+
+    // ── 3b. Explicit newlines are preserved with no line cap (the one
+    //        registered command rendering change). ─────────────────────
+    write_settings(json!({"statusLine": {
+        "type": "command",
+        "command": "for i in 1 2 3 4 5 6 7 8 9 10; do echo line-$i; done",
+        "placement": "widget",
+    }}));
+    send_event("message_end", json!({"type": "message_end"}));
+    let now = poll_until("ten-line widget tree", |records| {
+        calls_of(records, "ui.setWidget").iter().any(|args| {
+            args.get("key").and_then(Value::as_str) == Some("rpi-statusline")
+                && args
+                    .pointer("/content/children/9/props/text")
+                    .and_then(Value::as_str)
+                    == Some("line-10")
+        })
+    });
+    let widget_calls = calls_of(&now, "ui.setWidget");
+    let tree = widget_calls.last().expect("widget recorded");
+    assert_eq!(
+        tree.pointer("/content/children")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(10),
+        "all explicit lines survive (no 8-line cap)"
+    );
+    assert!(
+        tree.pointer("/content/children/0/props/truncate").is_none(),
+        "no per-line truncation"
+    );
 
     // ── 4. Switch to status placement: old channel restored first. ────
     write_settings(json!({"statusLine": {

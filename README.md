@@ -143,7 +143,7 @@ Four hidden built-in extensions provide agent-level surfaces:
 | `builtin:mcp` | MCP servers from `~/.rpi/agent/mcp.json` and `<cwd>/.rpi/mcp.json`: `mcp__*` tools, resource tools, `/mcp`, and OAuth. `rpi-mcp-adapter` is retired — the built-in client is the supported path. |
 | `builtin:llama.cpp` | llama.cpp router integration (`/llama`) and native decision-model classifiers. |
 
-Seven first-party extensions ship as `.rpix` archives in lockstep with the host release: `rpi-subagents` (delegation, background runs, worktrees), `rpi-smart-fetch` (fingerprinted web fetch), `rpi-statusline` (script-driven footer), `rpi-ask-user-question` (structured questions), `rpi-todo` (task list), `rpi-plan-mode` (read-only planning and approval), and `rpi-usage` (provider quota footer).
+Seven first-party extensions ship as `.rpix` archives in lockstep with the host release: `rpi-subagents` (delegation, background runs, worktrees), `rpi-smart-fetch` (fingerprinted web fetch), `rpi-statusline` (script or declarative 21-field footer with a `/statusline` editor), `rpi-ask-user-question` (structured questions), `rpi-todo` (task list), `rpi-plan-mode` (read-only planning and approval), and `rpi-usage` (provider quota footer).
 
 ### Permission modes and plan mode
 

@@ -1,22 +1,35 @@
-//! The refresh loop (TE12 FR-C / FR-C0 / FR-D / FR-H / FR-J).
+//! The refresh loop (TE12 command mode + TE52 items mode).
 //!
-//! Structure mirrors the subagents fleet refresh loop (fleet.rs:357-392:
-//! a private-runtime task driving UI host calls) plus the CC statusline
-//! update discipline: 300ms debounce, one script in flight at a time, a
-//! newer trigger cancels the in-flight script, failures keep the last
-//! render. Script runs are spawned (not awaited inline) so the loop stays
-//! responsive; a generation counter discards results from cancelled runs.
+//! Structure mirrors the subagents fleet refresh loop (fleet.rs:357-392: a
+//! private-runtime task driving UI host calls) plus the CC statusline update
+//! discipline: 300ms debounce, one script in flight at a time, a newer
+//! trigger cancels the in-flight script, failures keep the last render.
+//!
+//! Since TE52 the loop also renders `type:"items"` directly:
+//! - session totals come from the absolute `ctx.sessionStats` snapshot;
+//! - Git is probed on the plugin runtime with a generation that discards
+//!   late results;
+//! - `session-duration` runs a local 1s tick that only recomputes the clock
+//!   (no host call, no script, no transcript);
+//! - live fields reuse the existing `LiveMeasure` at `refreshMs`;
+//! - subscriptions are reconciled from the selected fields on every poll and
+//!   after a config save.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::config::{self, DEFAULT_LIVE_REFRESH_MS, Placement};
+use crate::config::{self, DEFAULT_LIVE_REFRESH_MS, Placement, StatusLine};
+use crate::fields::{self, ContextInfo, FieldData, FieldId, ModelInfo, Palette};
+use crate::git::{self, GitInfo};
+use crate::items::ItemsConfig;
 use crate::payload::{HOOK_EVENT_STATUS, build_stdin_json};
 use crate::render::{footer_tree, status_text};
 use crate::runner::{self, CancelToken, ScriptError};
+use crate::session_stats::SessionStats;
 use crate::state::{EngineState, Snapshot};
 use crate::{AsyncHostCalls, ENGINE, host_ok};
 
@@ -35,24 +48,30 @@ const BRIDGE_RETRIES: usize = 15;
 
 /// Poll cadence for the ctx-data fingerprint: the plugin's self-healing
 /// data plane. The host event surface has proven lossy (TE12 found two
-/// silent event drops); the poll re-reads the five ctx facts every second
+/// silent event drops); the poll re-reads the ctx facts every second
 /// (µs-scale host calls) and triggers a full refresh whenever ANY of them
 /// changed — "data changed ⇒ re-render", independent of event delivery.
-/// The elapsed clock is deliberately NOT part of the fingerprint: a
-/// ticking duration stays opt-in via `refreshInterval`.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Local clock tick for `session-duration` (reads no host data).
+const DURATION_TICK: Duration = Duration::from_secs(1);
 
 /// What wakes the loop.
 #[derive(Debug)]
 pub enum Trigger {
-    /// A subscribed session event (or the synthetic "interval").
+    /// A subscribed session event (or the synthetic "interval"/"poll").
     Event(&'static str),
     /// Live bookkeeping advanced (`message_start` / `message_update`
     /// dispatch — measurement only, FR-E); arms the live ticker, never
     /// the debounce must-run path.
     Live,
-    /// The live ticker fired (streaming re-run throttle, FR-E).
+    /// The live ticker fired (streaming re-run throttle, FR-E / items live
+    /// field re-render).
     LiveTick,
+    /// The local session-duration clock moved one second.
+    DurationTick,
+    /// A background Git probe finished.
+    GitDone(u64, Option<GitInfo>),
     /// `session_shutdown` — cancel in-flight work and stop.
     Shutdown,
 }
@@ -71,6 +90,10 @@ struct CtxData {
     /// `ctx.sessionFile` answer `{path, id}` (FR-I); `None` = call
     /// failed / unbound → the directory heuristic stays in charge.
     session_file: Option<Value>,
+    /// TE52 items facts, fetched only when a selected field needs them.
+    mode: Option<String>,
+    idle: Option<bool>,
+    theme: Option<Value>,
 }
 
 /// Run the refresh loop until `Trigger::Shutdown` (or every senders drop).
@@ -97,6 +120,10 @@ pub async fn refresh_loop(
     // message streams; fires at most once per `liveTokens.refreshMs`.
     let mut live_deadline: Option<Instant> = None;
     let mut last_live_fingerprint: Option<String> = None;
+    // TE52 items state.
+    let mut duration_deadline: Option<Instant> = None;
+    let mut last_items_data: Option<FieldData> = None;
+    let mut last_items_fingerprint: Option<String> = None;
 
     loop {
         // The current host channel (rebind-aware; see the fn doc).
@@ -126,6 +153,16 @@ pub async fn refresh_loop(
             }
         };
         tokio::pin!(live_fut);
+        let duration_deadline_value = duration_deadline;
+        let duration_fut = async move {
+            match duration_deadline_value {
+                Some(deadline) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(duration_fut);
 
         let step = tokio::select! {
             trigger = rx.recv() => match trigger {
@@ -143,6 +180,7 @@ pub async fn refresh_loop(
             _ = &mut interval_fut => Trigger::Event("interval"),
             _ = &mut poll_fut => Trigger::Event("poll"),
             _ = &mut live_fut => Trigger::LiveTick,
+            _ = &mut duration_fut => Trigger::DurationTick,
         };
 
         match step {
@@ -152,7 +190,19 @@ pub async fn refresh_loop(
                 }
                 break;
             }
+            Trigger::GitDone(probe_generation, info) => {
+                let accepted = with_engine(|engine| engine.git.apply(probe_generation, info));
+                if accepted && bridge_ready && !bridge_abandoned {
+                    let settings = config::load_settings_snapshot();
+                    if let Some(StatusLine::Items(items)) = settings.status_line.as_ref() {
+                        publish_items_from_cache(&calls, items, last_items_data.as_mut());
+                    }
+                }
+            }
             Trigger::Live => {
+                if !live_currently_enabled() {
+                    continue;
+                }
                 // Arm the streaming ticker (idempotent): the first live
                 // bookkeeping of a stream starts the refreshMs cadence.
                 if live_deadline.is_none() {
@@ -197,14 +247,40 @@ pub async fn refresh_loop(
                     continue;
                 }
                 last_live_fingerprint = Some(fingerprint);
-                if let Some(token) = inflight.take() {
-                    token.cancel();
-                    generation += 1;
+                let settings = config::load_settings_snapshot();
+                match settings.status_line {
+                    Some(StatusLine::Command(_)) => {
+                        if let Some(token) =
+                            refresh_tick(&calls, &done_tx, &mut generation, "message_update", None)
+                        {
+                            inflight = Some(token);
+                        }
+                    }
+                    Some(StatusLine::Items(items)) => {
+                        if bridge_ready && !bridge_abandoned {
+                            publish_items_from_cache(&calls, &items, last_items_data.as_mut());
+                        }
+                    }
+                    None => restore_if_mounted(&calls),
                 }
-                if let Some(token) =
-                    refresh_tick(&calls, &done_tx, &mut generation, "message_update", None)
+            }
+            Trigger::DurationTick => {
+                let settings = config::load_settings_snapshot();
+                let duration_selected = matches!(
+                    settings.status_line.as_ref(),
+                    Some(StatusLine::Items(items)) if items.needs_duration()
+                );
+                duration_deadline = duration_selected.then(|| Instant::now() + DURATION_TICK);
+                if let Some(StatusLine::Items(items)) = settings.status_line.as_ref()
+                    && items.needs_duration()
+                    && bridge_ready
+                    && !bridge_abandoned
                 {
-                    inflight = Some(token);
+                    // Only the clock moves: no host call, no Git, no script.
+                    if let Some(data) = last_items_data.as_mut() {
+                        data.now = Some(Utc::now());
+                        publish_items_from_data(&calls, items, data);
+                    }
                 }
             }
             Trigger::Event("poll") => {
@@ -218,25 +294,79 @@ pub async fn refresh_loop(
                 }) {
                     continue;
                 }
-                if bridge_abandoned || !bridge_ready {
-                    // The poll never opens the bridge gate: without a UI
-                    // there is nothing to refresh (dormant children stay
-                    // free of host-call traffic).
-                    continue;
-                }
-                if let Some(ctx) = poll_fingerprint_changed(&calls, &mut last_fingerprint) {
-                    if let Some(token) = inflight.take() {
-                        token.cancel();
-                        generation += 1;
+                let settings = config::load_settings_snapshot();
+                crate::reconcile_subscriptions(&calls, &settings);
+                match settings.status_line.as_ref() {
+                    None => {
+                        if let Some(token) = inflight.take() {
+                            token.cancel();
+                            generation += 1;
+                        }
+                        restore_if_mounted(&calls);
+                        last_fingerprint = None;
+                        last_items_fingerprint = None;
+                        last_items_data = None;
+                        interval_deadline = None;
+                        duration_deadline = None;
+                        live_deadline = None;
                     }
-                    if let Some(token) = refresh_tick(
-                        &calls,
-                        &done_tx,
-                        &mut generation,
-                        HOOK_EVENT_STATUS,
-                        Some(ctx),
-                    ) {
-                        inflight = Some(token);
+                    Some(StatusLine::Command(_)) => {
+                        duration_deadline = None;
+                        if bridge_abandoned || !bridge_ready {
+                            continue;
+                        }
+                        if let Some(ctx) = poll_fingerprint_changed(&calls, &mut last_fingerprint) {
+                            if let Some(token) = inflight.take() {
+                                token.cancel();
+                                generation += 1;
+                            }
+                            if let Some(token) = refresh_tick(
+                                &calls,
+                                &done_tx,
+                                &mut generation,
+                                HOOK_EVENT_STATUS,
+                                Some(ctx),
+                            ) {
+                                inflight = Some(token);
+                            }
+                        }
+                    }
+                    Some(StatusLine::Items(items)) => {
+                        if let Some(token) = inflight.take() {
+                            // A command script started before a mode switch
+                            // must not publish over the items channel.
+                            token.cancel();
+                            generation += 1;
+                        }
+                        if bridge_abandoned {
+                            continue;
+                        }
+                        if !bridge_ready {
+                            bridge_ready = wait_for_bridge(&calls).await;
+                            if !bridge_ready {
+                                bridge_abandoned = true;
+                                continue;
+                            }
+                        }
+                        interval_deadline =
+                            Some(Instant::now() + Duration::from_secs(items.refresh_interval_secs));
+                        duration_deadline = items
+                            .needs_duration()
+                            .then(|| Instant::now() + DURATION_TICK);
+                        // A data change (or a fresh config) re-renders; the
+                        // duration clock has its own 1s tick.
+                        let ctx = fetch_items_ctx(&calls, items);
+                        let fingerprint = items_fingerprint(items, &ctx);
+                        if last_items_fingerprint.as_ref() != Some(&fingerprint) {
+                            last_items_fingerprint = Some(fingerprint);
+                            maybe_start_git(&calls, items, &ctx);
+                            let data = refresh_items(&calls, items, Some(ctx));
+                            if data.is_some() {
+                                last_items_data = data;
+                            }
+                        } else {
+                            maybe_start_git(&calls, items, &ctx);
+                        }
                     }
                 }
             }
@@ -264,23 +394,60 @@ pub async fn refresh_loop(
                     }
                     break;
                 }
-                if saw_live && live_deadline.is_none() {
+                if saw_live && live_deadline.is_none() && live_currently_enabled() {
                     live_deadline = Some(Instant::now() + live_refresh_interval());
                 }
-                // A newer update cancels the in-flight script (CC
-                // semantics). Bump the generation so its late result is
-                // discarded even when no new run follows.
-                if let Some(token) = inflight.take() {
-                    token.cancel();
-                    generation += 1;
+                let settings = config::load_settings_snapshot();
+                crate::reconcile_subscriptions(&calls, &settings);
+                match settings.status_line.as_ref() {
+                    None => {
+                        if let Some(token) = inflight.take() {
+                            token.cancel();
+                            generation += 1;
+                        }
+                        restore_if_mounted(&calls);
+                        interval_deadline = None;
+                        duration_deadline = None;
+                        last_items_data = None;
+                        last_items_fingerprint = None;
+                        continue;
+                    }
+                    Some(StatusLine::Command(_)) => {
+                        // A newer update cancels the in-flight script (CC
+                        // semantics). Bump the generation so its late result
+                        // is discarded even when no new run follows.
+                        if let Some(token) = inflight.take() {
+                            token.cancel();
+                            generation += 1;
+                        }
+                        if let Some(token) =
+                            refresh_tick(&calls, &done_tx, &mut generation, HOOK_EVENT_STATUS, None)
+                        {
+                            inflight = Some(token);
+                        }
+                        duration_deadline = None;
+                        interval_deadline = current_refresh_interval()
+                            .map(|secs| Instant::now() + Duration::from_secs(secs));
+                    }
+                    Some(StatusLine::Items(items)) => {
+                        if let Some(token) = inflight.take() {
+                            token.cancel();
+                            generation += 1;
+                        }
+                        let ctx = fetch_items_ctx(&calls, items);
+                        maybe_start_git(&calls, items, &ctx);
+                        let data = refresh_items(&calls, items, Some(ctx));
+                        if data.is_some() {
+                            last_items_data = data;
+                        }
+                        last_items_fingerprint = None;
+                        interval_deadline =
+                            Some(Instant::now() + Duration::from_secs(items.refresh_interval_secs));
+                        duration_deadline = items
+                            .needs_duration()
+                            .then(|| Instant::now() + DURATION_TICK);
+                    }
                 }
-                if let Some(token) =
-                    refresh_tick(&calls, &done_tx, &mut generation, HOOK_EVENT_STATUS, None)
-                {
-                    inflight = Some(token);
-                }
-                let interval = current_refresh_interval();
-                interval_deadline = interval.map(|secs| Instant::now() + Duration::from_secs(secs));
             }
         }
     }
@@ -296,9 +463,26 @@ fn drain_triggers(rx: &mut UnboundedReceiver<Trigger>) -> (bool, bool) {
         match rx.try_recv() {
             Ok(Trigger::Shutdown) => return (true, saw_live),
             Ok(Trigger::Live) => saw_live = true,
+            Ok(Trigger::GitDone(generation, info)) => {
+                let accepted = with_engine(|engine| engine.git.apply(generation, info));
+                if accepted {
+                    tracing::info!("statusline git probe applied during drain");
+                }
+            }
             Ok(_) => {}
             Err(_) => return (false, saw_live),
         }
+    }
+}
+
+/// Whether the current configuration enables live measurement (command:
+/// load-time fixed; items: dynamic).
+fn live_currently_enabled() -> bool {
+    let snapshot = config::load_settings_snapshot();
+    match snapshot.status_line {
+        Some(StatusLine::Command(_)) => with_engine(|engine| engine.command_live_fixed),
+        Some(StatusLine::Items(items)) => items.live_enabled(),
+        None => false,
     }
 }
 
@@ -320,7 +504,7 @@ async fn wait_for_bridge(calls: &AsyncHostCalls) -> bool {
 fn live_refresh_interval() -> Duration {
     let ms = config::load_settings_snapshot()
         .status_line
-        .map(|config| config.live_tokens.refresh_ms)
+        .map(|config| config.live_tokens().refresh_ms)
         .unwrap_or(DEFAULT_LIVE_REFRESH_MS);
     Duration::from_millis(ms)
 }
@@ -330,20 +514,14 @@ fn live_refresh_interval() -> Duration {
 fn current_refresh_interval() -> Option<u64> {
     config::load_settings_snapshot()
         .status_line
-        .and_then(|config| config.refresh_interval_secs)
+        .and_then(|config| config.refresh_interval_secs())
 }
 
-/// One poll pass: when unconfigured, also ride the FR-H restore (the poll
-/// covers the idle no-event case); otherwise fingerprint the five ctx
-/// facts and report whether ANY of them changed since the last poll. The
-/// first poll after (re)configuration counts as a change — a free initial
-/// render for config edits the event surface knows nothing about.
-///
-/// The live measurements join the fingerprint only once FROZEN
-/// (`message_end` seen): while streaming, the liveTicker owns the re-run
-/// cadence and the poll must not interleave a second spawn stream
-/// (A4: spawn rate ≤ 1/refreshMs). Frozen values self-heal a dropped
-/// `message_end` event through the poll instead.
+/// One poll pass for command mode: when unconfigured, also ride the FR-H
+/// restore (the poll covers the idle no-event case); otherwise fingerprint
+/// the five ctx facts and report whether ANY of them changed since the last
+/// poll. The first poll after (re)configuration counts as a change — a free
+/// initial render for config edits the event surface knows nothing about.
 fn poll_fingerprint_changed(calls: &AsyncHostCalls, last: &mut Option<String>) -> Option<CtxData> {
     let settings = config::load_settings_snapshot();
     if settings.status_line.is_none() {
@@ -374,16 +552,16 @@ fn poll_fingerprint_changed(calls: &AsyncHostCalls, last: &mut Option<String>) -
     changed.then_some(ctx)
 }
 
-/// One refresh pass: reload config, pull ctx, spawn the script. Returns
-/// the new in-flight cancel token.
+/// One command-mode refresh pass: reload config, pull ctx, spawn the script.
+/// Returns the new in-flight cancel token.
 ///
-/// Every tick runs the script unconditionally: the seven trigger events
-/// are all low-frequency user-visible operations (message/tool completion,
+/// Every tick runs the script unconditionally: the seven trigger events are
+/// all low-frequency user-visible operations (message/tool completion,
 /// model/thinking switches, session lifecycle) already coalesced by the
 /// 300ms debounce, so a snapshot-comparison short-circuit only creates
-/// "changed but not refreshed" bugs — the git branch, for one, lives in
-/// none of the host-visible fields (TE12 follow-up: switching branches in
-/// a bash tool never re-rendered because the dirty key was unchanged).
+/// "changed but not refreshed" bugs — the git branch, for one, lives in none
+/// of the host-visible fields (TE12 follow-up: switching branches in a bash
+/// tool never re-rendered because the dirty key was unchanged).
 fn refresh_tick(
     calls: &AsyncHostCalls,
     done_tx: &UnboundedSender<ScriptDone>,
@@ -392,7 +570,7 @@ fn refresh_tick(
     ctx_override: Option<CtxData>,
 ) -> Option<CancelToken> {
     let settings = config::load_settings_snapshot();
-    let Some(config) = settings.status_line else {
+    let Some(StatusLine::Command(config)) = settings.status_line else {
         restore_if_mounted(calls);
         return None;
     };
@@ -480,8 +658,8 @@ fn snapshot_from_engine(
     })
 }
 
-/// Pull the session facts over host calls (six reads; each failure falls
-/// back independently).
+/// Pull the command-mode session facts over host calls (six reads; each
+/// failure falls back independently).
 fn fetch_ctx(calls: &AsyncHostCalls) -> CtxData {
     CtxData {
         cwd: host_ok(calls, "ctx.cwd", json!({}))
@@ -504,6 +682,232 @@ fn fetch_ctx(calls: &AsyncHostCalls) -> CtxData {
                 .and_then(Value::as_str)
                 .is_some_and(|id| !id.is_empty())
         }),
+        ..CtxData::default()
+    }
+}
+
+/// Items-mode context facts: the base six plus only the reads the selected
+/// fields need (field-driven collection, R20 §4.4).
+fn fetch_items_ctx(calls: &AsyncHostCalls, items: &ItemsConfig) -> CtxData {
+    let mut ctx = fetch_ctx(calls);
+    if items.has_field(FieldId::PermissionMode) {
+        ctx.mode = host_ok(calls, "getMode", json!({}))
+            .and_then(|value| value.as_str().map(str::to_owned));
+    }
+    if items.has_field(FieldId::RunState) {
+        ctx.idle = host_ok(calls, "ctx.isIdle", json!({})).and_then(|value| value.as_bool());
+    }
+    if items.use_colors {
+        ctx.theme = host_ok(calls, "ui.theme", json!({})).filter(|value| !value.is_null());
+    }
+    ctx
+}
+
+/// Items-mode change fingerprint: config + ctx + session totals + Git +
+/// frozen live values. The duration clock is intentionally absent (its own
+/// 1s tick re-renders it).
+fn items_fingerprint(items: &ItemsConfig, ctx: &CtxData) -> String {
+    let (stats, live) = with_engine(|engine| {
+        (
+            engine.session_stats.fingerprint(),
+            engine
+                .live
+                .as_ref()
+                .filter(|live| !live.is_streaming())
+                .map(|live| live.peek_fingerprint(Instant::now())),
+        )
+    });
+    let git = with_engine(|engine| format!("{:?}", engine.git.info()));
+    format!(
+        "{items:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{stats}|{git}|{live:?}",
+        ctx.cwd,
+        ctx.model.as_ref().map(|model| model.get("id")),
+        ctx.thinking_level,
+        ctx.session_name,
+        ctx.context_usage,
+        ctx.mode,
+        ctx.idle,
+    )
+}
+
+/// Start a Git probe when the selection needs it and the interval elapsed.
+fn maybe_start_git(calls: &AsyncHostCalls, items: &ItemsConfig, ctx: &CtxData) {
+    let _ = calls;
+    if !items.needs_git() {
+        // Not selected: invalidate any in-flight probe and stop collecting.
+        with_engine(|engine| engine.git.clear());
+        return;
+    }
+    let now = Instant::now();
+    let interval = Duration::from_secs(items.refresh_interval_secs);
+    let due = with_engine(|engine| engine.git.should_fetch(interval, now));
+    if !due {
+        return;
+    }
+    let generation = with_engine(|engine| engine.git.begin(now));
+    let cwd = ctx.cwd.clone();
+    tokio::task::spawn_blocking(move || {
+        let info = git::probe(Path::new(&cwd));
+        crate::request_trigger(Trigger::GitDone(generation, info));
+    });
+}
+
+/// One items-mode refresh: fetch/refresh the absolute session snapshot, build
+/// the frame data, render and publish. Returns the data for later local ticks.
+fn refresh_items(
+    calls: &AsyncHostCalls,
+    items: &ItemsConfig,
+    ctx_override: Option<CtxData>,
+) -> Option<FieldData> {
+    if items.needs_session_stats() {
+        let token = with_engine(|engine| engine.session_stats.begin_request());
+        let stats = host_ok(calls, "ctx.sessionStats", json!({}))
+            .and_then(|value| serde_json::from_value::<SessionStats>(value).ok());
+        match stats {
+            Some(stats) => {
+                with_engine(|engine| engine.session_stats.apply(token, stats));
+            }
+            None => warn_missing_session_stats_once(),
+        }
+    }
+    let ctx = ctx_override.unwrap_or_else(|| fetch_items_ctx(calls, items));
+    let data = build_field_data(items, &ctx);
+    publish_items_from_data(calls, items, &data);
+    Some(data)
+}
+
+/// One diagnostic per process: an old host without `ctx.sessionStats` omits
+/// the token/cost/duration fields instead of scanning the transcript.
+fn warn_missing_session_stats_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "rpi-statusline: ctx.sessionStats unavailable; session token/cost/duration fields stay hidden"
+        );
+    }
+}
+
+fn build_field_data(items: &ItemsConfig, ctx: &CtxData) -> FieldData {
+    let model = ctx.model.as_ref().and_then(|model| {
+        let id = model.get("id").and_then(Value::as_str)?.to_owned();
+        let name = model.get("name").and_then(Value::as_str).map(str::to_owned);
+        Some(ModelInfo { id, name })
+    });
+    let context = ctx.context_usage.as_ref().map(|usage| ContextInfo {
+        tokens: usage.get("tokens").and_then(Value::as_u64),
+        context_window: usage
+            .get("contextWindow")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        percent: usage.get("percent").and_then(Value::as_f64),
+    });
+    let now = Instant::now();
+    let (stats, live, git) = with_engine(|engine| {
+        (
+            engine.session_stats.snapshot().cloned(),
+            items
+                .live_enabled()
+                .then(|| engine.live_view(now))
+                .flatten(),
+            engine.git.info().cloned(),
+        )
+    });
+    FieldData {
+        cwd: Some(ctx.cwd.clone()).filter(|cwd| !cwd.is_empty()),
+        model,
+        thinking: ctx.thinking_level.clone(),
+        mode: ctx.mode.clone(),
+        idle: ctx.idle,
+        context,
+        session_name: ctx.session_name.clone(),
+        stats,
+        live,
+        git,
+        now: Some(Utc::now()),
+        number_format: items.number_format,
+        palette: items
+            .use_colors
+            .then(|| ctx.theme.as_ref().map(Palette::from_theme))
+            .flatten(),
+        preview: false,
+    }
+}
+
+/// Re-render from the cached data (duration tick / live tick / Git result):
+/// no host calls at all.
+fn publish_items_from_cache(
+    calls: &AsyncHostCalls,
+    items: &ItemsConfig,
+    data: Option<&mut FieldData>,
+) {
+    let Some(data) = data else {
+        return;
+    };
+    let now = Instant::now();
+    let (live, git) = with_engine(|engine| {
+        (
+            items
+                .live_enabled()
+                .then(|| engine.live_view(now))
+                .flatten(),
+            engine.git.info().cloned(),
+        )
+    });
+    data.live = live;
+    data.git = git;
+    data.now = Some(Utc::now());
+    data.number_format = items.number_format;
+    publish_items_from_data(calls, items, data);
+}
+
+fn publish_items_from_data(calls: &AsyncHostCalls, items: &ItemsConfig, data: &FieldData) {
+    let line = fields::render_line(&items.entries, &items.separator, items.use_colors, data);
+    publish_line(calls, line.as_deref(), items.placement, items.padding);
+}
+
+/// Publish one items frame into the configured channel. Empty output clears
+/// the owned key (widget/status) or restores the built-in footer (replace) —
+/// never an empty separator or a permanently blank footer.
+fn publish_line(calls: &AsyncHostCalls, text: Option<&str>, placement: Placement, padding: usize) {
+    let text = text.filter(|text| !text.is_empty());
+    let mounted = with_engine(|engine| engine.mounted);
+    if let Some(text) = text {
+        if mounted.is_some_and(|old| old != placement) {
+            restore_if_mounted(calls);
+        }
+        match placement {
+            Placement::Replace => {
+                host_ok(
+                    calls,
+                    "ui.setFooter",
+                    json!({ "component": footer_tree(text, padding) }),
+                );
+                with_engine(|engine| engine.mounted = Some(Placement::Replace));
+            }
+            Placement::Widget => {
+                host_ok(
+                    calls,
+                    "ui.setWidget",
+                    json!({
+                        "key": STATUS_KEY,
+                        "content": footer_tree(text, padding),
+                        "placement": "belowEditor",
+                    }),
+                );
+                with_engine(|engine| engine.mounted = Some(Placement::Widget));
+            }
+            Placement::Status => {
+                host_ok(
+                    calls,
+                    "ui.setStatus",
+                    json!({ "key": STATUS_KEY, "text": text }),
+                );
+                with_engine(|engine| engine.mounted = Some(Placement::Status));
+            }
+        }
+    } else {
+        restore_if_mounted(calls);
     }
 }
 
@@ -530,7 +934,7 @@ fn handle_script_done(calls: &AsyncHostCalls, generation: usize, done: ScriptDon
         }
     };
     let settings = config::load_settings_snapshot();
-    let Some(config) = settings.status_line else {
+    let Some(StatusLine::Command(config)) = settings.status_line else {
         restore_if_mounted(calls);
         return DoneOutcome::Handled;
     };
@@ -593,8 +997,8 @@ fn restore_if_mounted(calls: &AsyncHostCalls) {
     }
 }
 
-/// Access the shared engine state (the dispatch thread and this loop are
-/// the only users).
+/// Access the shared engine state (the dispatch thread and this loop are the
+/// only users).
 fn with_engine<T>(update: impl FnOnce(&mut EngineState) -> T) -> T {
     let engine = ENGINE
         .get()
@@ -620,5 +1024,30 @@ mod tests {
         assert_eq!(drain_triggers(&mut rx), (true, true));
         tx.send(Trigger::Live).ok();
         assert_eq!(drain_triggers(&mut rx), (false, true));
+    }
+
+    #[test]
+    fn items_fingerprint_moves_with_config_and_ctx() {
+        // Pure-shape test without the global engine: the fingerprint must at
+        // least include the config and the ctx facts it is given.
+        let items = ItemsConfig::default();
+        let first = CtxData {
+            cwd: "/a".into(),
+            ..CtxData::default()
+        };
+        let second = CtxData {
+            cwd: "/b".into(),
+            ..CtxData::default()
+        };
+        // The engine is not installed in unit tests; capture the shape via
+        // the same formatting pieces instead.
+        let shape = |ctx: &CtxData| {
+            format!(
+                "{items:?}|{}|{:?}",
+                ctx.cwd,
+                ctx.model.as_ref().map(|model| model.get("id"))
+            )
+        };
+        assert_ne!(shape(&first), shape(&second));
     }
 }

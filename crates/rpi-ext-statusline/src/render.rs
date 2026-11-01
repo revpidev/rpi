@@ -1,17 +1,14 @@
 //! stdout → ComponentTree / setStatus text (TE12 FR-G).
 //!
-//! Render structure: a `column` of one `text` node per output line with
-//! `truncate: true`. Rationale (TE12 "宽度" verification): the rpi
-//! `TruncatedText` keeps each node single-line (clips to the render width
-//! with an ANSI-safe `...`), so a wide statusline degrades like CC's
-//! per-line clipping instead of word-wrapping into extra rows; the node
-//! sets NO `fg`/`dim`, so the script's own ANSI passes through verbatim
-//! (`component_tree.rs:110-142` only wraps when styling props are set).
+//! Render structure: a `column` of one `text` node per output line. Since
+//! TE52 the nodes do NOT set `truncate`: explicit newlines are preserved and
+//! over-wide lines wrap to the terminal width instead of being clipped, with
+//! no fixed line cap (ADR-0040 decision 1 — the only registered command
+//! rendering change). The nodes set NO `fg`/`dim`, so the script's own ANSI
+//! passes through verbatim (`component_tree.rs:110-142` only wraps when
+//! styling props are set).
 
 use serde_json::{Value, json};
-
-/// Rendering lines cap (defensive; CC documents no cap).
-pub const MAX_LINES: usize = 8;
 
 /// `\x1b[0m` — SGR reset.
 const RESET: &str = "\x1b[0m";
@@ -27,13 +24,11 @@ pub fn footer_tree(stdout: &str, padding: usize) -> Value {
         let prefix = " ".repeat(padding);
         trimmed
             .split('\n')
-            .take(MAX_LINES)
             .map(|line| {
                 json!({
                     "type": "text",
                     "props": {
                         "text": format!("{prefix}{}", normalize_line(line)),
-                        "truncate": true,
                     },
                 })
             })
@@ -100,7 +95,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn two_color_lines_become_truncated_text_nodes() {
+    fn two_color_lines_become_wrapping_text_nodes() {
         let stdout =
             "\x1b[36m\x1b[1m◆ GLM-5.1\x1b[0m · \x1b[90m❖ xhigh\x1b[0m\n\x1b[32m██████░░░░\x1b[0m 43%"
                 .to_owned();
@@ -110,7 +105,8 @@ mod tests {
         assert_eq!(children.len(), 2);
         for child in children {
             assert_eq!(child["type"], "text");
-            assert_eq!(child["props"]["truncate"], true);
+            // TE52: no truncate — the host wraps at the terminal width.
+            assert!(child["props"].get("truncate").is_none());
             // No fg/dim: the script's ANSI must pass through untouched.
             assert!(child["props"].get("fg").is_none());
             assert!(child["props"].get("dim").is_none());
@@ -170,13 +166,16 @@ mod tests {
     }
 
     #[test]
-    fn more_than_max_lines_are_dropped() {
+    fn every_explicit_line_is_preserved_without_a_cap() {
+        // TE52 registered rendering change: no 8-line cap, no truncation.
         let stdout = (1..=20)
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         let tree = footer_tree(&stdout, 0);
-        assert_eq!(tree["children"].as_array().map(Vec::len), Some(MAX_LINES));
+        let children = tree["children"].as_array().expect("children");
+        assert_eq!(children.len(), 20);
+        assert_eq!(children[19]["props"]["text"], "20");
     }
 
     #[test]

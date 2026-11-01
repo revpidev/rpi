@@ -17,6 +17,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::items::{ItemsConfig, parse_items};
 use crate::paths::get_agent_dir;
 
 /// Top-level settings key (CC-compatible spelling).
@@ -84,6 +85,16 @@ impl Placement {
             _ => Placement::Replace,
         }
     }
+
+    /// Items-mode placement parser: `widget` is the frozen default, an
+    /// unknown value falls back to it.
+    pub(crate) fn parse_items(value: &str) -> Self {
+        match value {
+            "replace" => Placement::Replace,
+            "status" => Placement::Status,
+            _ => Placement::Widget,
+        }
+    }
 }
 
 /// Parsed `statusLine` object. Unknown sub-keys are ignored (the file is
@@ -105,12 +116,54 @@ pub struct StatusLineConfig {
     pub live_tokens: LiveTokens,
 }
 
+/// One parsed `statusLine` mode (TE52: the two modes are mutually
+/// exclusive; only the selected `type` runs).
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatusLine {
+    /// TE12 script mode — unchanged stdin/timeout/failure semantics.
+    Command(StatusLineConfig),
+    /// Declarative 21-field mode (TE52 / ADR-0040).
+    Items(ItemsConfig),
+}
+
+impl StatusLine {
+    pub fn placement(&self) -> Placement {
+        match self {
+            Self::Command(config) => config.placement,
+            Self::Items(config) => config.placement,
+        }
+    }
+
+    pub fn padding(&self) -> usize {
+        match self {
+            Self::Command(config) => config.padding,
+            Self::Items(config) => config.padding,
+        }
+    }
+
+    /// Command mode has no default timer (`None` = event-driven only); items
+    /// mode always carries a local refresh interval.
+    pub fn refresh_interval_secs(&self) -> Option<u64> {
+        match self {
+            Self::Command(config) => config.refresh_interval_secs,
+            Self::Items(config) => Some(config.refresh_interval_secs),
+        }
+    }
+
+    pub fn live_tokens(&self) -> LiveTokens {
+        match self {
+            Self::Command(config) => config.live_tokens,
+            Self::Items(config) => config.live_tokens,
+        }
+    }
+}
+
 /// One read of the global settings.json serving both consumers (the
 /// statusLine config and the `sessionDir` setting used by the transcript
 /// latch) so a refresh tick touches the file once.
 #[derive(Debug, Clone, Default)]
 pub struct SettingsSnapshot {
-    pub status_line: Option<StatusLineConfig>,
+    pub status_line: Option<StatusLine>,
     pub session_dir: Option<String>,
 }
 
@@ -138,14 +191,20 @@ pub(crate) fn read_settings_file(path: &Path) -> SettingsSnapshot {
     }
 }
 
-/// FR-A validation: `type` must be exactly `"command"`, `command` a
-/// non-empty string; every other key falls back to its default instead of
-/// failing.
-fn parse_status_line(value: &Value) -> Option<StatusLineConfig> {
+/// FR-A validation: the parsed mode is selected exclusively by `type`;
+/// `command` requires a non-empty command, `items` accepts the declarative
+/// object with per-key fallbacks. Any other type disables the plugin
+/// (missing/invalid config never touches the footer).
+fn parse_status_line(value: &Value) -> Option<StatusLine> {
     let object = value.as_object()?;
-    if object.get("type").and_then(Value::as_str) != Some("command") {
-        return None;
+    match object.get("type").and_then(Value::as_str) {
+        Some("command") => parse_command(object).map(StatusLine::Command),
+        Some("items") => Some(StatusLine::Items(parse_items(object))),
+        _ => None,
     }
+}
+
+fn parse_command(object: &serde_json::Map<String, Value>) -> Option<StatusLineConfig> {
     let command = object.get("command")?.as_str()?.trim();
     if command.is_empty() {
         return None;
@@ -178,8 +237,9 @@ fn parse_status_line(value: &Value) -> Option<StatusLineConfig> {
 
 /// §1.5: `true` = on with defaults; an object may override `refreshMs`
 /// (clamped 300..5000, out-of-range/invalid falls back to the default);
-/// `false` / missing / wrong type = off.
-fn parse_live_tokens(value: Option<&Value>) -> LiveTokens {
+/// `false` / missing / wrong type = off. Command mode evaluates `enabled`
+/// once at load; items mode reconciles it dynamically.
+pub(crate) fn parse_live_tokens(value: Option<&Value>) -> LiveTokens {
     let mut live = LiveTokens {
         enabled: true,
         ..LiveTokens::default()
@@ -196,31 +256,39 @@ fn parse_live_tokens(value: Option<&Value>) -> LiveTokens {
     live
 }
 
-/// Load-time subscription evaluation (§1.5 启用时机注记): whether the
-/// `liveTokens` key is configured in the CURRENT global settings. Called
-/// once at install; runtime key edits do not change the subscription set.
-pub fn live_tokens_configured_in_global_settings() -> bool {
-    load_settings_snapshot()
-        .status_line
-        .is_some_and(|config| config.live_tokens.enabled)
+/// Load-time subscription evaluation for COMMAND mode (§1.5 启用时机注记):
+/// whether `liveTokens` is enabled in the current command configuration.
+/// Items mode reconciles live subscriptions dynamically instead.
+pub fn command_live_tokens_configured_in_global_settings() -> bool {
+    matches!(
+        load_settings_snapshot().status_line,
+        Some(StatusLine::Command(config)) if config.live_tokens.enabled
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fields::FieldId;
     use serde_json::json;
 
-    fn parse(value: Value) -> Option<StatusLineConfig> {
+    fn parse(value: Value) -> Option<StatusLine> {
         parse_status_line(&value)
+    }
+
+    fn command(value: Value) -> StatusLineConfig {
+        match parse(value).expect("valid config") {
+            StatusLine::Command(config) => config,
+            other => panic!("expected command mode, got {other:?}"),
+        }
     }
 
     #[test]
     fn valid_command_config_parses_with_defaults() {
-        let config = parse(json!({
+        let config = command(json!({
             "type": "command",
             "command": "python3 ~/.claude/statusline.py"
-        }))
-        .expect("valid config");
+        }));
         assert_eq!(config.command, "python3 ~/.claude/statusline.py");
         assert_eq!(config.padding, 0);
         assert_eq!(config.refresh_interval_secs, None);
@@ -231,23 +299,20 @@ mod tests {
 
     #[test]
     fn full_config_parses_with_clamps() {
-        let config = parse(json!({
+        let config = command(json!({
             "type": "command",
             "command": "echo hi",
             "padding": 99,
             "refreshInterval": 0,
             "placement": "status",
             "timeoutMs": 10
-        }))
-        .expect("valid config");
+        }));
         assert_eq!(config.padding, MAX_PADDING);
         assert_eq!(config.refresh_interval_secs, Some(1));
         assert_eq!(config.placement, Placement::Status);
         assert_eq!(config.timeout_ms, MIN_TIMEOUT_MS);
         assert_eq!(
-            parse(json!({"type": "command", "command": "x", "timeoutMs": 999_999}))
-                .unwrap()
-                .timeout_ms,
+            command(json!({"type": "command", "command": "x", "timeoutMs": 999_999})).timeout_ms,
             MAX_TIMEOUT_MS
         );
     }
@@ -255,23 +320,42 @@ mod tests {
     #[test]
     fn widget_placement_parses() {
         assert_eq!(
-            parse(json!({"type": "command", "command": "x", "placement": "widget"}))
-                .unwrap()
-                .placement,
+            command(json!({"type": "command", "command": "x", "placement": "widget"})).placement,
             Placement::Widget
         );
     }
 
     #[test]
+    fn items_mode_parses_exclusively_and_keeps_command_ignored() {
+        // `type` selects the mode; a retained command string does not run.
+        let mode = parse(json!({
+            "type": "items",
+            "command": "echo old",
+            "items": ["model", "project"]
+        }))
+        .expect("items config");
+        let StatusLine::Items(config) = mode else {
+            panic!("expected items mode");
+        };
+        let fields: Vec<FieldId> = config.fields().collect();
+        assert_eq!(fields, vec![FieldId::Model, FieldId::ProjectName]);
+        // The default items placement is widget (command keeps replace).
+        assert_eq!(config.placement, Placement::Widget);
+    }
+
+    #[test]
+    fn unknown_type_disables_the_plugin() {
+        assert_eq!(parse(json!({"type": "items-x", "items": []})), None);
+    }
+
+    #[test]
     fn live_tokens_parses_bool_object_and_clamps() {
-        // Missing / false / wrong type → off with default refresh.
         for off in [None, Some(json!(false)), Some(json!("yes")), Some(json!(1))] {
             let value = off.clone();
-            let config = parse(json!({"type": "command", "command": "x"})).unwrap();
+            let config = command(json!({"type": "command", "command": "x"}));
             assert!(!config.live_tokens.enabled);
             assert_eq!(parse_live_tokens(value.as_ref()), LiveTokens::default());
         }
-        // `true` → on, default refreshMs.
         assert_eq!(
             parse_live_tokens(Some(&json!(true))),
             LiveTokens {
@@ -279,7 +363,6 @@ mod tests {
                 refresh_ms: DEFAULT_LIVE_REFRESH_MS,
             }
         );
-        // Object with refreshMs inside bounds.
         assert_eq!(
             parse_live_tokens(Some(&json!({"refreshMs": 500}))),
             LiveTokens {
@@ -287,20 +370,18 @@ mod tests {
                 refresh_ms: 500,
             }
         );
-        // Out-of-range clamps to 300..5000; invalid falls back to default.
         assert_eq!(
             parse_live_tokens(Some(&json!({"refreshMs": 1}))).refresh_ms,
-            300
+            MIN_LIVE_REFRESH_MS
         );
         assert_eq!(
             parse_live_tokens(Some(&json!({"refreshMs": 999_999}))).refresh_ms,
-            5000
+            MAX_LIVE_REFRESH_MS
         );
         assert_eq!(
             parse_live_tokens(Some(&json!({"refreshMs": "soon"}))).refresh_ms,
             DEFAULT_LIVE_REFRESH_MS
         );
-        // Empty object → on with defaults.
         assert_eq!(
             parse_live_tokens(Some(&json!({}))),
             LiveTokens {
@@ -312,19 +393,27 @@ mod tests {
 
     #[test]
     fn invalid_configs_yield_none() {
-        // Missing key / wrong type / empty command / non-object.
         assert_eq!(parse(json!({"command": "x"})), None);
         assert_eq!(parse(json!({"type": "progress", "command": "x"})), None);
         assert_eq!(parse(json!({"type": "command"})), None);
         assert_eq!(parse(json!({"type": "command", "command": "  "})), None);
         assert_eq!(parse(json!("nonsense")), None);
-        // Unknown placement string falls back to Replace, not an error.
         assert_eq!(
-            parse(json!({"type": "command", "command": "x", "placement": "??"}))
-                .unwrap()
-                .placement,
+            command(json!({"type": "command", "command": "x", "placement": "??"})).placement,
             Placement::Replace
         );
+    }
+
+    #[test]
+    fn mode_helpers_project_the_frozen_defaults() {
+        let items = parse(json!({"type": "items"})).expect("items");
+        assert_eq!(items.placement(), Placement::Widget);
+        assert_eq!(items.padding(), 0);
+        assert_eq!(items.refresh_interval_secs(), Some(5));
+        assert!(!items.live_tokens().enabled);
+        let command = parse(json!({"type": "command", "command": "echo x"})).expect("command");
+        assert_eq!(command.placement(), Placement::Replace);
+        assert_eq!(command.refresh_interval_secs(), None);
     }
 
     #[test]
@@ -346,16 +435,31 @@ mod tests {
         let snapshot = read_settings_file(&path);
         assert_eq!(
             snapshot.status_line,
-            Some(StatusLineConfig {
+            Some(StatusLine::Command(StatusLineConfig {
                 command: "echo ok".to_owned(),
                 padding: 2,
                 refresh_interval_secs: None,
                 placement: Placement::Replace,
                 timeout_ms: DEFAULT_TIMEOUT_MS,
                 live_tokens: LiveTokens::default(),
-            })
+            }))
         );
         assert_eq!(snapshot.session_dir.as_deref(), Some("/data/sessions"));
+        // Items mode round-trips through the same snapshot.
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "statusLine": {"type": "items", "items": ["model"], "liveTokens": true}
+            }))
+            .expect("serialize"),
+        )
+        .expect("write");
+        let snapshot = read_settings_file(&path);
+        let Some(StatusLine::Items(config)) = snapshot.status_line else {
+            panic!("expected items mode");
+        };
+        assert_eq!(config.fields().collect::<Vec<_>>(), vec![FieldId::Model]);
+        assert!(config.live_tokens.enabled);
         // Missing file / broken JSON yield empty snapshots.
         assert_eq!(
             read_settings_file(&dir.join("absent.json")).status_line,

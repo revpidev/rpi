@@ -3327,8 +3327,12 @@ name = "rpi-ext-statusline"
 version = "0.1.7"
 dependencies = [
  "abi_stable",
+ "chrono",
+ "fs2",
  "rpi-ext-host",
+ "rpi-ext-sdk",
  "rpi-test-env",
+ "rpi-tui",
  "serde",
  "serde_json",
  "tokio",

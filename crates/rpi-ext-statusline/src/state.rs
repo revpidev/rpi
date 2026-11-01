@@ -15,7 +15,10 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::Placement;
+use crate::fields::LiveView;
+use crate::git::GitCache;
 use crate::paths::{find_latest_session_file, resolve_session_dir, session_id_from_path};
+use crate::session_stats::SessionStatsCache;
 
 /// Live streaming measurements for the CURRENT assistant message
 /// (03-realtime-token-count §1.4/§2.3): native measures, python computes.
@@ -234,6 +237,17 @@ impl LiveMeasure {
         self.streaming
     }
 
+    /// Project the provider-reported live values used by items fields. No
+    /// character estimate is exposed: both counts come from provider usage.
+    pub fn view(&self, now: Instant) -> LiveView {
+        LiveView {
+            streaming: self.streaming,
+            output_tokens: self.streaming_output_tokens,
+            output_tokens_exact: self.output_tokens_exact,
+            decode_ms: self.decode_ms(now),
+        }
+    }
+
     /// Whether any measurement was ever taken (drives block omission:
     /// `liveTokens` unconfigured or nothing streamed → no `live_output`).
     pub fn ever_measured(&self) -> bool {
@@ -405,6 +419,13 @@ pub struct EngineState {
     /// built-in footer is untouched) — needed to restore on config removal
     /// (FR-H).
     pub mounted: Option<Placement>,
+    /// Absolute `ctx.sessionStats` cache (items mode; TE52 R20 §4.2).
+    pub session_stats: SessionStatsCache,
+    /// Local Git probe cache for project-name/git-branch (TE52 R20 §4.4).
+    pub git: GitCache,
+    /// Command-mode `liveTokens.enabled` captured at install (§1.5: runtime
+    /// edits require a restart). Items mode reconciles dynamically instead.
+    pub command_live_fixed: bool,
 }
 
 /// Mtime tolerance below the session-start wall clock: the host creates
@@ -424,6 +445,9 @@ impl Default for EngineState {
             authoritative_session: None,
             live: None,
             mounted: None,
+            session_stats: SessionStatsCache::default(),
+            git: GitCache::default(),
+            command_live_fixed: false,
         }
     }
 }
@@ -433,6 +457,22 @@ impl EngineState {
     /// fixed at install; §1.5 启用时机注记).
     pub fn arm_live_measure(&mut self) {
         self.live.get_or_insert_with(LiveMeasure::default);
+    }
+
+    /// Items mode: dynamic live membership. Disabling clears the measurement
+    /// immediately (R20 §4.4) so a later re-enable cannot show stale tokens.
+    pub fn set_live_measure(&mut self, enabled: bool) {
+        if enabled {
+            self.live.get_or_insert_with(LiveMeasure::default);
+        } else {
+            self.live = None;
+        }
+    }
+
+    /// Project the current live measurement (items fields; `None` when the
+    /// measurement is disarmed).
+    pub fn live_view(&self, now: Instant) -> Option<LiveView> {
+        self.live.as_ref().map(|live| live.view(now))
     }
 
     /// `message_end`: accumulate `message.usage` when present (assistant
@@ -457,6 +497,10 @@ impl EngineState {
     /// FR-D: the live measurements reset with the session (an in-flight
     /// stream belongs to the previous session's run).
     pub fn on_session_start(&mut self, reason: Option<&str>) {
+        // The absolute session snapshot belongs to the previous session in
+        // every case (reload included: identity is re-checked on the next
+        // reply; the snapshot is never re-added).
+        self.session_stats.begin_session(reason);
         match reason {
             Some("reload") => {
                 self.transcript = None;
