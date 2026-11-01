@@ -662,12 +662,16 @@ mod tests {
         assert_eq!(host.fetch_count("xai"), 1);
         assert_eq!(host.cached_calls().len(), cached_before.len() + 1);
 
-        // Offline: every provider reads cached only.
-        let _guard = crate::TEST_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let previous = std::env::var("RPI_OFFLINE").ok();
-        rpi_test_env::set_var("RPI_OFFLINE", "1");
+        // Offline: every provider reads cached only. A thread-local test
+        // seam avoids the process-wide RPI_OFFLINE race with parallel tests.
+        struct OfflineGuard;
+        impl Drop for OfflineGuard {
+            fn drop(&mut self) {
+                host::set_test_offline(None);
+            }
+        }
+        host::set_test_offline(Some(true));
+        let _offline = OfflineGuard;
         let host = host_with("deepseek", typed_envelope("deepseek"));
         let mut state = FooterState::default();
         refresh(
@@ -681,10 +685,6 @@ mod tests {
         );
         assert!(host.called("ctx.usage.cached"));
         assert!(!host.called("ctx.usage.fetchDetailed"));
-        match previous {
-            Some(value) => rpi_test_env::set_var("RPI_OFFLINE", value),
-            None => rpi_test_env::remove_var("RPI_OFFLINE"),
-        }
     }
 
     #[test]

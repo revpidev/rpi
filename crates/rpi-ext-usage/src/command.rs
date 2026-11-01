@@ -456,6 +456,15 @@ mod tests {
             parse("--provider list"),
             query(Target::Provider("list".to_owned()), false, false)
         );
+        // `--provider` never expands aliases; the direct position does.
+        assert_eq!(
+            parse("--provider grok"),
+            query(Target::Provider("grok".to_owned()), false, false)
+        );
+        assert_eq!(
+            parse("grok"),
+            query(Target::Provider("xai".to_owned()), false, false)
+        );
         assert_eq!(parse("list"), ParsedCommand::List);
         assert_eq!(parse("help"), ParsedCommand::Help);
         assert_eq!(parse(""), query(Target::Current, false, false));
@@ -665,6 +674,41 @@ mod tests {
         let outcome = run(&host, "--provider deepseek");
         assert!(text(&outcome).starts_with("deepseek"));
         assert_eq!(host.fetch_calls(), vec![("deepseek".to_owned(), true)]);
+    }
+
+    #[test]
+    fn provider_flag_keeps_the_raw_key_and_direct_aliases_expand() {
+        let host = host_with("xai");
+        host.set_providers(vec!["xai".to_owned()]);
+        host.set_envelope(
+            "xai",
+            json!({
+                "schemaVersion": 1,
+                "provider": "xai",
+                "displayText": "7d 42.5%",
+                "windows": [window("included_allowance", "7d", 42.5, "2027-01-19T06:00:00Z")]
+            }),
+        );
+        // `grok` is not a registry key: --provider keeps it raw and returns
+        // no-data without touching the xai script.
+        let outcome = run(&host, "--provider grok");
+        assert!(
+            text(&outcome).contains("Status: no-data"),
+            "{}",
+            text(&outcome)
+        );
+        assert!(matches!(outcome.footer, FooterAction::None));
+        assert_eq!(host.fetch_calls(), Vec::<(String, bool)>::new());
+        assert!(!host.called("ctx.usage.cached"));
+        // The direct position expands grok -> xai and forces one fetch.
+        let outcome = run(&host, "grok");
+        assert!(
+            text(&outcome).starts_with("xai (current)"),
+            "{}",
+            text(&outcome)
+        );
+        assert_eq!(host.fetch_calls(), vec![("xai".to_owned(), true)]);
+        assert!(matches!(outcome.footer, FooterAction::Publish(_)));
     }
 
     #[test]

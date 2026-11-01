@@ -3,7 +3,7 @@
 //! `ctx.usage.*` consumption helpers (V16-05 FR-A R5; V18-10 / TE53).
 
 use rpi_ext_host::types::SessionStatsSnapshot;
-use rpi_ext_host::usage::{UsageError, UsageErrorKind, UsageFetchResult, UsageReport};
+use rpi_ext_host::usage::{UsageError, UsageErrorKind, UsageFetchResult};
 use serde_json::{Value, json};
 
 use crate::HostCall;
@@ -45,18 +45,6 @@ pub fn usage_list_providers(host: &dyn HostCall) -> Vec<String> {
         .ok()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
-}
-
-/// `ctx.usage.fetch(provider, force?)` → the latest successful envelope JSON
-/// (`None` when nothing succeeded yet). Legacy surface; the command/footer
-/// paths use [`usage_fetch_detailed`] so errors and staleness are visible.
-pub fn usage_fetch(host: &dyn HostCall, provider: &str, force: bool) -> Option<Value> {
-    host.call(
-        "ctx.usage.fetch",
-        json!({ "provider": provider, "force": force }),
-    )
-    .ok()
-    .filter(|value| !value.is_null())
 }
 
 /// `ctx.usage.fetchDetailed(provider, force?)` → the typed result. A
@@ -160,11 +148,6 @@ pub fn emit_output(host: &dyn HostCall, output: &Output) -> Result<(), crate::Ho
     host.call("ui.emitStructured", args).map(|_| ())
 }
 
-/// Emit a typed report through the same structured channel.
-pub fn emit_report(host: &dyn HostCall, report: &UsageReport) -> Result<(), crate::HostError> {
-    emit_output(host, &Output::Json(report.to_json()))
-}
-
 /// `ctx.usage.register(provider, scriptPath)` → registration receipt.
 pub fn usage_register(
     host: &dyn HostCall,
@@ -186,16 +169,5 @@ pub fn set_status(host: &dyn HostCall, key: &str, text: Option<&str>) {
     };
     if let Err(error) = host.call("ui.setStatus", args) {
         tracing::debug!(%error, "rpi-usage: ui.setStatus rejected");
-    }
-}
-
-/// `ui.notify` (info level); failures are debug-only (no user-visible
-/// channel left to report them).
-pub fn notify(host: &dyn HostCall, message: &str) {
-    if let Err(error) = host.call(
-        "ui.notify",
-        json!({ "message": message, "notifyType": "info" }),
-    ) {
-        tracing::debug!(%error, "rpi-usage: ui.notify rejected");
     }
 }

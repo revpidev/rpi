@@ -212,18 +212,21 @@ fn windows_shim_name(file: &str) -> String {
 /// (TE53 FR-A R6), forwarding the exit code and all script arguments.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn windows_shim_body(file: &str) -> String {
+    // Labels (not an `if (...)` block) keep `%errorlevel%` expansion after
+    // the interpreter has run; a block would expand it at parse time and
+    // swallow a non-zero script exit code.
     format!(
         "@echo off\r\n\
          where python3 >nul 2>nul\r\n\
-         if %errorlevel%==0 (\r\n\
-         \x20 python3 \"%~dp0{file}\" %*\r\n\
-         \x20 exit /b %errorlevel%\r\n\
-         )\r\n\
+         if errorlevel 1 goto rpi_usage_py\r\n\
+         python3 \"%~dp0{file}\" %*\r\n\
+         exit /b %errorlevel%\r\n\
+         :rpi_usage_py\r\n\
          where py >nul 2>nul\r\n\
-         if %errorlevel%==0 (\r\n\
-         \x20 py -3 \"%~dp0{file}\" %*\r\n\
-         \x20 exit /b %errorlevel%\r\n\
-         )\r\n\
+         if errorlevel 1 goto rpi_usage_python\r\n\
+         py -3 \"%~dp0{file}\" %*\r\n\
+         exit /b %errorlevel%\r\n\
+         :rpi_usage_python\r\n\
          python \"%~dp0{file}\" %*\r\n"
     )
 }
@@ -342,6 +345,16 @@ mod tests {
         let python = body.find("\r\npython \"%~dp0xai.py\" %*").expect("python");
         assert!(python3 < py3 && py3 < python, "{body}");
         assert_eq!(body.matches("exit /b %errorlevel%").count(), 2, "{body}");
+        // Labels keep the exit code expansion after the interpreter runs;
+        // an `if (...)` block would expand it at parse time.
+        assert!(!body.contains("%errorlevel%==0"), "{body}");
+        assert!(body.contains("if errorlevel 1 goto rpi_usage_py"), "{body}");
+        assert!(body.contains(":rpi_usage_py"), "{body}");
+        assert!(
+            body.contains("if errorlevel 1 goto rpi_usage_python"),
+            "{body}"
+        );
+        assert!(body.contains(":rpi_usage_python"), "{body}");
     }
 
     #[test]

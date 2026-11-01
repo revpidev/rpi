@@ -1051,6 +1051,273 @@ fn kimi_full_window_is_rate_limited() {
     assert_eq!(value["displayText"], "5h 45%(~48m) / 7d 100%(~3d22h)");
 }
 
+#[test]
+fn deepseek_zero_balance_and_field_drift() {
+    let body = fixture_with(
+        "deepseek_balance.json",
+        &[
+            ("/balance_infos/0/total_balance", Value::from("0.00")),
+            ("/balance_infos/0/granted_balance", Value::from("0.00")),
+            ("/balance_infos/0/topped_up_balance", Value::from("0.00")),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("deepseek-zero");
+    let run = run_script("deepseek.py", "deepseek", &agent, &stub, &DEEPSEEK, 5_000);
+    let value = envelope(&run);
+    assert_eq!(value["displayText"], "CNY 0.00 / USD 3.00");
+    assert_eq!(value["balance"][0]["total"], 0.0);
+    assert_eq!(value["balance"][0]["granted"], 0.0);
+    assert_eq!(value["balance"][0]["toppedUp"], 0.0);
+
+    // Field drift: a response without balance_infos is a shape change.
+    let body = fixture_with("deepseek_balance.json", &[("/balance_infos", Value::Null)]);
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("deepseek-drift");
+    let run = run_script("deepseek.py", "deepseek", &agent, &stub, &DEEPSEEK, 5_000);
+    assert_error(&run, "shape-changed");
+    assert_eq!(stub.requests().len(), 1);
+}
+
+#[test]
+fn glm_zero_usage_partial_windows_and_invalid_percentage() {
+    // Zero usage on the weekly window.
+    let body = fixture_with(
+        "glm_quota_weekly.json",
+        &[("/data/limits/0/percentage", Value::from(0))],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("glm-zero");
+    let run = run_script(
+        "glm_coding_plan.py",
+        "glm-coding-plan",
+        &agent,
+        &stub,
+        &with_clock(&GLM),
+        5_000,
+    );
+    let value = envelope(&run);
+    let weekly = value["windows"]
+        .as_array()
+        .expect("windows")
+        .iter()
+        .find(|window| window["id"] == "7d")
+        .expect("7d window");
+    assert_eq!(weekly["usedPercent"], 0.0);
+    assert_eq!(weekly["remainingPercent"], 100.0);
+    assert_eq!(weekly["status"], "ok");
+
+    // Partial windows: only the weekly limit is present.
+    let body = fixture_with(
+        "glm_quota_weekly.json",
+        &[(
+            "/data/limits",
+            serde_json::json!([{
+                "type": "TOKENS_LIMIT",
+                "unit": 6,
+                "number": 1,
+                "percentage": 9
+            }]),
+        )],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("glm-partial");
+    let run = run_script(
+        "glm_coding_plan.py",
+        "glm-coding-plan",
+        &agent,
+        &stub,
+        &with_clock(&GLM),
+        5_000,
+    );
+    let value = envelope(&run);
+    assert_eq!(value["displayText"], "7d 9%");
+    let windows = value["windows"].as_array().expect("windows");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["id"], "7d");
+
+    // An invalid percentage on the only window is a classified shape change.
+    let body = fixture_with(
+        "glm_quota_weekly.json",
+        &[(
+            "/data/limits",
+            serde_json::json!([{
+                "type": "TOKENS_LIMIT",
+                "unit": 3,
+                "number": 5,
+                "percentage": "abc"
+            }]),
+        )],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("glm-invalid-percent");
+    let run = run_script(
+        "glm_coding_plan.py",
+        "glm-coding-plan",
+        &agent,
+        &stub,
+        &with_clock(&GLM),
+        5_000,
+    );
+    assert_error(&run, "shape-changed");
+}
+
+#[test]
+fn minimax_zero_usage_partial_windows_and_invalid_percent() {
+    // Zero usage on both windows.
+    let body = fixture_with(
+        "minimax_remains.json",
+        &[
+            (
+                "/model_remains/0/current_interval_remaining_percent",
+                Value::from(100),
+            ),
+            (
+                "/model_remains/0/current_weekly_remaining_percent",
+                Value::from(100),
+            ),
+            ("/model_remains/0/current_weekly_status", Value::from(1)),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("minimax-zero");
+    let run = run_script(
+        "minimax_token_plan.py",
+        "minimax-token-plan",
+        &agent,
+        &stub,
+        &with_clock(&MINIMAX),
+        5_000,
+    );
+    let value = envelope(&run);
+    for window in value["windows"].as_array().expect("windows") {
+        assert_eq!(window["usedPercent"], 0.0, "{window}");
+    }
+
+    // Partial windows: the weekly bucket has no usable representation.
+    let body = fixture_with(
+        "minimax_remains.json",
+        &[
+            (
+                "/model_remains/0/current_weekly_remaining_percent",
+                Value::Null,
+            ),
+            ("/model_remains/0/current_weekly_status", Value::Null),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("minimax-partial");
+    let run = run_script(
+        "minimax_token_plan.py",
+        "minimax-token-plan",
+        &agent,
+        &stub,
+        &with_clock(&MINIMAX),
+        5_000,
+    );
+    let value = envelope(&run);
+    let windows = value["windows"].as_array().expect("windows");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["id"], "interval");
+
+    // An invalid interval percentage keeps the still-valid weekly window.
+    let body = fixture_with(
+        "minimax_unlimited.json",
+        &[
+            (
+                "/model_remains/0/current_interval_remaining_percent",
+                Value::from("abc"),
+            ),
+            ("/model_remains/0/current_interval_status", Value::from(1)),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("minimax-invalid");
+    let run = run_script(
+        "minimax_token_plan.py",
+        "minimax-token-plan",
+        &agent,
+        &stub,
+        &with_clock(&MINIMAX),
+        5_000,
+    );
+    let value = envelope(&run);
+    let windows = value["windows"].as_array().expect("windows");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["id"], "weekly");
+}
+
+#[test]
+fn kimi_partial_and_invalid_ratio() {
+    // Partial windows: no rolling limit, no 5h ratio -> only the 7d quota.
+    let body = fixture_with(
+        "kimi_usages.json",
+        &[
+            ("/limits", Value::Array(Vec::new())),
+            ("/usages/limit_5h", Value::Null),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("kimi-partial");
+    let run = run_script(
+        "kimi_code.py",
+        "kimi-code",
+        &agent,
+        &stub,
+        &with_clock(&KIMI),
+        5_000,
+    );
+    let value = envelope(&run);
+    let windows = value["windows"].as_array().expect("windows");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["id"], "7d");
+
+    // An invalid 7d ratio keeps the valid 5h window instead of panicking.
+    let body = fixture_with(
+        "kimi_usages_used.json",
+        &[
+            ("/usage", Value::Null),
+            ("/limits", Value::Array(Vec::new())),
+            ("/usages/limit_7d/used_ratio", Value::from("abc")),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("kimi-invalid");
+    let run = run_script(
+        "kimi_code.py",
+        "kimi-code",
+        &agent,
+        &stub,
+        &with_clock(&KIMI),
+        5_000,
+    );
+    let value = envelope(&run);
+    let windows = value["windows"].as_array().expect("windows");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["id"], "5h");
+
+    // No usable windows at all is a classified shape change.
+    let body = fixture_with(
+        "kimi_usages.json",
+        &[
+            ("/usage", Value::Null),
+            ("/limits", Value::Array(Vec::new())),
+            ("/usages", Value::Null),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("kimi-empty");
+    let run = run_script(
+        "kimi_code.py",
+        "kimi-code",
+        &agent,
+        &stub,
+        &with_clock(&KIMI),
+        5_000,
+    );
+    assert_error(&run, "shape-changed");
+}
+
 // ---------------------------------------------------------------------------
 // New providers
 // ---------------------------------------------------------------------------
