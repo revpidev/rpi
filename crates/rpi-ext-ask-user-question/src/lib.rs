@@ -547,7 +547,7 @@ mod tests {
                 .replace("[1m", "")
                 .replace("[22m", "")
                 .replace("[39m", ""),
-            "ask_user_question 1 question (Pick)"
+            "Ask Pick"
         );
         // The theme read went through the stored channel.
         assert_eq!(requests()[0].0, "ui.theme");

@@ -1,54 +1,23 @@
-//! Transcript renderCall/renderResult component trees — the rpi#52
-//! [RPI-OWN] render governance surface (TE41 FR-A…FR-E).
+//! Transcript renderCall/renderResult component trees.
 //!
-//! Upstream registers no render hooks for `ask_user_question` (in pi the
-//! args never land in the transcript — the questionnaire lives in the
-//! interactive overlay only, so the bold-title fallback suffices). rpi's
-//! host renders hook-less extension tools through the generic
-//! pretty-printed-args branch (render-slot inheritance, kept intentionally
-//! — issue #52 "the host behavior stays"), so the plugin provides the
-//! hooks itself: this module has **no upstream counterpart** and is out of
-//! the parity-harness surface by design ([RPI-OWN] plugin-layer
-//! enhancement, task TE41 §5 — no deviation number, rpi-statusline
-//! own-surface precedent).
+//! v0.1.8 (TE51, FR-G): adopted the upstream v2.15.0 receipt
+//! (`packages/rpiv-ask-user-question/view/transcript.ts`, #231/#292). The
+//! call line is bold `Ask` plus the question headers joined with ` · `; the
+//! result is one `✓ answer` line for a single question, an aligned
+//! header/answer table for several, `✗ <first line>` for a failure and a
+//! dimmed `✗ no answer` for a declined questionnaire, with notes, previews
+//! and the global note as detail lines. Layout runs at the render context's
+//! `terminalWidth` (hanging wrap/truncate via `rpi_tui::utils`).
 //!
-//! Shapes (ComponentTree v1, `rpi.component-tree.v1`):
-//! - collapsed call: one `text` node — bold `ask_user_question`
-//!   (`toolTitle`) + muted `N questions (Header1, Header2, …)` summary
-//!   (issue #52 §1), `truncate` so the summary stays a single line;
-//! - expanded call (`context.expanded`, the `Ctrl+O`
-//!   `app.tools.expand` toggle): the summary line, a spacer, then one
-//!   block per question — `  i. Header — question [multi]` plus
-//!   `       j. label — description` option lines (issue #52 §3 example,
-//!   minimized per the 2026-09-20 layout decision: no option preview
-//!   blocks, no preview markers);
-//! - result: one line per state — `✓ N answered` (success, fg
-//!   `success`), `declined`/`declined (N partial)` (cancel, fg `muted`),
-//!   `✗ <error text>` (fg `error`, wraps); expanded adds per-answer lines
-//!   and the global note.
+//! G2: this replaces the TE41 (rpi#52) rpi-own shape — a collapsed
+//! `N questions (headers)` summary and per-answer `question = answer` lines —
+//! with the upstream receipt; the change is registered in the TE51 changes
+//! entry.
 //!
-//! Multi-color single lines are not expressible as declarative v1 props
-//! (one `fg` per text node, no `row`), so the segments are embedded as
-//! ANSI wraps inside the text value — the same channel as the upstream
-//! `Text` component's pre-wrapped strings (the upstream todo plugin's
-//! `view/format.ts` port precedent in `rpi-ext-todo/src/view.rs`).
-//!
-//! Streaming tolerance (FR-A): `renderCall` fires while args are still
-//! streaming (`context.argsComplete === false`), so every parse here is
-//! defensive — missing/partial/malformed `questions` degrade to the bare
-//! title node (never an error, never the JSON dump); a truncated array
-//! counts what is there and appends `…` until complete. Render failures
-//! degrade through the host's per-hook chain to the pi-identical bold
-//! title line (FR-D): this module returns `null` for unknown render
-//! requests, and a panic is converted to `null` at the dispatch entry
-//! (`lib.rs`) — the isError tool-result envelope must never leak into a
-//! render answer.
-//!
-//! All string inputs are model-authored and may arrive mid-stream, so
-//! every rendered string passes through [`sanitize_inline`]: line
-//! terminators and tabs collapse to spaces and the remaining C0 controls
-//! are replaced with a space (single-line integrity for the summary line; the execute
-//! path's full #192 normalization is unrelated and runs later).
+//! Defensive parsing still matters: the call hook fires while args stream
+//! and both hooks may see partial envelopes, so every renderer degrades to
+//! the bare title/check instead of dumping JSON. Render panics answer
+//! `null` at the dispatch entry, never the isError envelope.
 
 use serde_json::{Value, json};
 
@@ -166,8 +135,6 @@ impl RenderTheme for AnsiRenderTheme {
 struct ParsedQuestion {
     header: Option<String>,
     question: Option<String>,
-    options: Vec<Option<(String, String)>>,
-    multi: bool,
 }
 
 /// Parse the render-side view of `args.questions`. `None` = no usable
@@ -193,35 +160,10 @@ fn parse_questions(args: &Value) -> Option<Vec<ParsedQuestion>> {
                         .filter(|text| !text.is_empty())
                         .map(sanitize_inline)
                 };
+                let _ = object.and_then(|object| object.get("options"));
                 ParsedQuestion {
                     header: string_field("header"),
                     question: string_field("question"),
-                    options: object
-                        .and_then(|object| object.get("options"))
-                        .and_then(Value::as_array)
-                        .map(|options| {
-                            options
-                                .iter()
-                                .map(|option| {
-                                    let label = option
-                                        .get("label")
-                                        .and_then(Value::as_str)
-                                        .filter(|label| !label.is_empty())
-                                        .map(sanitize_inline)?;
-                                    let description = option
-                                        .get("description")
-                                        .and_then(Value::as_str)
-                                        .map(sanitize_inline)
-                                        .unwrap_or_default();
-                                    Some((label, description))
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    multi: object
-                        .and_then(|object| object.get("multiSelect"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
                 }
             })
             .collect(),
@@ -242,150 +184,171 @@ fn sanitize_inline(text: &str) -> String {
         .collect()
 }
 
-/// The `N question(s)` count segment (`render.question` / `render.questions`).
-fn count_segment(i18n: &I18n, count: usize) -> String {
-    let key = if count == 1 {
-        "render.question"
-    } else {
-        "render.questions"
-    };
-    i18n.t(key, "{count} questions")
-        .replace("{count}", &count.to_string())
+/// Terminal width for the receipt layout: the render context's viewport
+/// width (rpi extension), falling back to 80 columns.
+fn render_width(context: &Value) -> usize {
+    context
+        .get("terminalWidth")
+        .and_then(Value::as_u64)
+        .map(|width| width as usize)
+        .filter(|width| *width > 0)
+        .unwrap_or(80)
 }
 
-/// The bare title node — the pi-identical fallback shape (`createCallFallback`
-/// renders the same bold tool name; here the plugin's own floor for
-/// unusable args, so the host chain and this floor converge visually).
-fn title_node(theme: &dyn RenderTheme) -> Value {
-    json!({
-        "type": "text",
-        "props": { "text": title_text(theme) }
-    })
+/// One line truncated to the width (`truncateToWidth(text, width, "…")`).
+fn truncate_line(text: &str, width: usize) -> String {
+    rpi_tui::utils::truncate_to_width(text, width, "…", false)
 }
 
-fn title_text(theme: &dyn RenderTheme) -> String {
-    theme.fg("toolTitle", &theme.bold(TOOL_NAME))
-}
-
-/// The collapsed summary line text:
-/// `{bold tool} {muted: N questions (H1, H2, …)}` (issue #52 §1).
-fn summary_text(
-    questions: &[ParsedQuestion],
-    args_complete: bool,
-    theme: &dyn RenderTheme,
-    i18n: &I18n,
-) -> String {
-    let mut headers: Vec<String> = questions
-        .iter()
-        .filter_map(|question| question.header.clone())
-        .collect();
-    if !args_complete {
-        headers.push("…".to_owned());
-    }
-    let summary = if headers.is_empty() {
-        // Complete args always carry headers (schema-required); an empty
-        // header list therefore only occurs mid-stream before the first
-        // header arrives — count only.
-        count_segment(i18n, questions.len())
-    } else {
-        format!(
-            "{} ({})",
-            count_segment(i18n, questions.len()),
-            headers.join(", ")
-        )
-    };
-    format!("{} {}", title_text(theme), theme.fg("muted", &summary))
-}
-
-/// Whether a question has enough shape to render an expanded block
-/// (header + question text; options are optional lines within the block).
-fn expandable(question: &ParsedQuestion) -> bool {
-    question.header.is_some() && question.question.is_some()
-}
-
-// ---------------------------------------------------------------------------
-// renderCall (FR-A collapsed / FR-B expanded)
-// ---------------------------------------------------------------------------
-
-/// The `renderCall` tree. Collapsed (default): the single summary line
-/// (`truncate` keeps it one line at narrow widths, ANSI-preserving).
-/// Expanded (`context.expanded`, the existing `Ctrl+O` toggle): summary +
-/// per-question detail blocks (issue #52 §3 example, minimized).
-pub fn render_call(args: &Value, context: &Value, theme: &dyn RenderTheme, i18n: &I18n) -> Value {
-    let Some(questions) = parse_questions(args) else {
-        return title_node(theme);
-    };
-    let args_complete = context
-        .get("argsComplete")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let expanded = context
-        .get("expanded")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let summary = summary_text(&questions, args_complete, theme, i18n);
-    if !expanded {
-        return json!({
-            "type": "text",
-            "props": { "text": summary, "truncate": true }
-        });
-    }
-
-    let mut children = vec![
-        json!({ "type": "text", "props": { "text": summary, "truncate": true } }),
-        json!({ "type": "spacer", "props": { "lines": 1 } }),
-    ];
-    for (index, question) in questions.iter().enumerate() {
-        if !expandable(question) {
-            // A mid-stream partial question body is skipped; the trailing
-            // `…` line below marks the open tail while args stream.
-            continue;
-        }
-        let header = question.header.clone().unwrap_or_default();
-        let text = question.question.clone().unwrap_or_default();
-        let mut line = format!(
-            "  {}. {} — {}",
-            index + 1,
-            theme.fg("accent", &header),
-            text
-        );
-        if question.multi {
-            line.push(' ');
-            line.push_str(&theme.fg("dim", i18n.t("render.multi", "[multi]")));
-        }
-        children.push(json!({ "type": "text", "props": { "text": line } }));
-        for (option_index, option) in question.options.iter().enumerate() {
-            let Some((label, description)) = option else {
-                continue;
-            };
-            let option_line = if description.is_empty() {
-                format!("       {}. {}", option_index + 1, label)
+/// `prefix` then `text` wrapped to the width left after it; continuation
+/// lines align under the text (`hanging` in transcript.ts).
+fn hanging(prefix: &str, text: &str, width: usize) -> Vec<String> {
+    let indent = rpi_tui::utils::visible_width(prefix);
+    let bound = width.saturating_sub(indent).max(1);
+    rpi_tui::utils::wrap_text_with_ansi(text, bound)
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                format!("{prefix}{line}")
             } else {
-                format!(
-                    "       {}. {} — {}",
-                    option_index + 1,
-                    label,
-                    theme.fg("dim", description)
-                )
-            };
-            children.push(json!({ "type": "text", "props": { "text": option_line } }));
-        }
-    }
-    if !args_complete {
-        children.push(json!({
-            "type": "text",
-            "props": { "text": theme.fg("dim", "…") }
-        }));
-    }
-    json!({ "type": "column", "props": {}, "children": children })
+                format!("{}{line}", " ".repeat(indent))
+            }
+        })
+        .collect()
 }
 
-// ---------------------------------------------------------------------------
-// renderResult (FR-C)
-// ---------------------------------------------------------------------------
+/// `label` (transcript.ts:147): drop the author's `(Recommended)` suffix.
+fn strip_recommended(text: &str) -> String {
+    const SUFFIX: &str = "(Recommended)";
+    let trimmed = text.trim_end();
+    if let Some(head) = trimmed.strip_suffix(SUFFIX) {
+        head.trim_end().to_string()
+    } else {
+        text.to_string()
+    }
+}
 
-/// The first text block of a tool result (`content[0].text` shape).
-fn result_text(result: &Value) -> String {
+/// `answerText` (transcript.ts:129-140): the option labels (or the custom
+/// text, quoted) for one answer; `None`/missing renders the dim
+/// `not answered` marker.
+fn answer_text(answer: Option<&Value>, theme: &dyn RenderTheme, i18n: &I18n) -> String {
+    let Some(answer) = answer else {
+        return theme.fg("dim", i18n.t("transcript.not_answered", "not answered"));
+    };
+    let typed = answer
+        .get("answer")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(|text| format!("\"{}\"", sanitize_inline(text)));
+    let picks: Vec<String> = match answer.get("kind").and_then(Value::as_str) {
+        Some("option") => vec![strip_recommended(
+            answer.get("answer").and_then(Value::as_str).unwrap_or(""),
+        )],
+        Some("custom") => typed.into_iter().collect(),
+        Some("multi") => {
+            let mut picks: Vec<String> = answer
+                .get("selected")
+                .and_then(Value::as_array)
+                .map(|selected| {
+                    selected
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(strip_recommended)
+                        .collect()
+                })
+                .unwrap_or_default();
+            picks.extend(typed);
+            picks
+        }
+        _ => Vec::new(),
+    };
+    let text = picks
+        .into_iter()
+        .filter(|pick| !pick.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = if text.is_empty() {
+        crate::tool::envelope::NO_INPUT_PLACEHOLDER.to_owned()
+    } else {
+        text
+    };
+    theme.fg("toolOutput", &text)
+}
+
+/// `detailLines` (transcript.ts:100-116): the question text and chosen
+/// preview when expanded, then the answer's note.
+fn detail_lines(
+    answer: Option<&Value>,
+    question_text: Option<&str>,
+    indent: &str,
+    theme: &dyn RenderTheme,
+    width: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(question) = question_text.filter(|text| !text.is_empty()) {
+        lines.extend(hanging(
+            indent,
+            &theme.fg("dim", &sanitize_inline(question)),
+            width,
+        ));
+    }
+    if question_text.is_some_and(|text| !text.is_empty())
+        && let Some(preview) = answer
+            .and_then(|answer| answer.get("preview"))
+            .and_then(Value::as_str)
+            .filter(|preview| !preview.is_empty())
+    {
+        for line in preview.split('\n') {
+            lines.push(truncate_line(
+                &format!("{indent}{}", theme.fg("dim", &format!("│ {line}"))),
+                width,
+            ));
+        }
+    }
+    if let Some(note) = answer
+        .and_then(|answer| answer.get("notes"))
+        .and_then(Value::as_str)
+        .filter(|note| !note.is_empty())
+    {
+        lines.extend(hanging(
+            indent,
+            &theme.fg("dim", &format!("✎ {}", sanitize_inline(note))),
+            width,
+        ));
+    }
+    lines
+}
+
+/// `globalNoteLines` (transcript.ts:118-120).
+fn global_note_lines(details: &Value, theme: &dyn RenderTheme, width: usize) -> Vec<String> {
+    details
+        .get("globalNote")
+        .and_then(Value::as_str)
+        .filter(|note| !note.is_empty())
+        .map(|note| {
+            hanging(
+                "  ",
+                &theme.fg("dim", &format!("✎ {}", sanitize_inline(note))),
+                width,
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// The questionnaire result envelope (`isQuestionnaireResult`): an
+/// `answers` array and a boolean `cancelled`.
+fn questionnaire_details(result: &Value) -> Option<&Value> {
+    let details = result.get("details").filter(|details| !details.is_null())?;
+    details
+        .get("answers")
+        .is_some_and(Value::is_array)
+        .then_some(details)
+        .filter(|details| details.get("cancelled").is_some_and(Value::is_boolean))
+}
+
+/// The first non-empty text block of a tool result, unsanitized.
+fn raw_result_text(result: &Value) -> String {
     result
         .get("content")
         .and_then(Value::as_array)
@@ -397,78 +360,122 @@ fn result_text(result: &Value) -> String {
                     .filter(|text| !text.is_empty())
             })
         })
-        .map(sanitize_inline)
-        .unwrap_or_default()
+        .unwrap_or("")
+        .to_string()
 }
 
-/// The answers array of a questionnaire result envelope (`details.answers`).
-fn result_answers(result: &Value) -> &[Value] {
-    result
-        .get("details")
-        .and_then(|details| details.get("answers"))
+/// First line of the model-facing text content (`firstTextLine`).
+fn first_text_line(result: &Value) -> String {
+    raw_result_text(result)
+        .split('\n')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The answers array of a questionnaire result envelope.
+fn answers(details: &Value) -> &[Value] {
+    details
+        .get("answers")
         .and_then(Value::as_array)
-        .map(|answers| answers.as_slice())
+        .map(Vec::as_slice)
         .unwrap_or(&[])
 }
 
-/// `format_answer_scalar`-equivalent over the answer JSON (kind: option →
-/// `answer`; custom → `answer` or `(no input)`; multi → `selected` joined
-/// or `(no input)`).
-fn answer_scalar(answer: &Value) -> String {
-    match answer.get("kind").and_then(Value::as_str) {
-        Some("multi") => answer
-            .get("selected")
-            .and_then(Value::as_array)
-            .filter(|selected| !selected.is_empty())
-            .map(|selected| {
-                // Module invariant: EVERY rendered string passes through
-                // sanitize_inline — the joined selection included (a
-                // replayed/hand-built envelope can carry raw control
-                // characters in any answer field).
-                sanitize_inline(
-                    &selected
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                )
-            })
-            .unwrap_or_else(|| crate::tool::envelope::NO_INPUT_PLACEHOLDER.to_owned()),
-        Some("custom") => answer
-            .get("answer")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .map(sanitize_inline)
-            .unwrap_or_else(|| crate::tool::envelope::NO_INPUT_PLACEHOLDER.to_owned()),
-        // Option answers: `a.answer ?? NO_INPUT_PLACEHOLDER` (an
-        // empty-string option answer stays empty).
-        _ => answer
-            .get("answer")
-            .and_then(Value::as_str)
-            .map(sanitize_inline)
-            .unwrap_or_else(|| crate::tool::envelope::NO_INPUT_PLACEHOLDER.to_owned()),
-    }
+/// The answer for question `index` (`answers.find(a => a.questionIndex === i)`).
+fn answer_for(answers: &[Value], index: usize) -> Option<&Value> {
+    answers
+        .iter()
+        .find(|answer| answer.get("questionIndex").and_then(Value::as_u64) == Some(index as u64))
 }
 
-/// One per-answer line for the expanded result:
-/// `{glyph} {question} = {answer}`.
-fn answer_line(glyph: &str, answer: &Value, color: &str, theme: &dyn RenderTheme) -> Value {
-    let question = answer
-        .get("question")
-        .and_then(Value::as_str)
-        .map(sanitize_inline)
+/// `renderAskCall` (transcript.ts:31-38): bold `Ask` and the question
+/// headers joined with ` · `, truncated to one line.
+pub fn render_call(args: &Value, context: &Value, theme: &dyn RenderTheme, i18n: &I18n) -> Value {
+    let _ = i18n;
+    let headers: Vec<String> = parse_questions(args)
+        .map(|questions| {
+            questions
+                .into_iter()
+                .filter_map(|question| question.header)
+                .collect()
+        })
         .unwrap_or_default();
-    let text = format!("{glyph} {question} = {}", answer_scalar(answer));
+    let title = theme.fg("toolTitle", &theme.bold("Ask"));
+    let text = if headers.is_empty() {
+        title
+    } else {
+        format!("{title} {}", theme.fg("accent", &headers.join(" · ")))
+    };
     json!({
         "type": "text",
-        "props": { "text": theme.fg(color, &text) }
+        "props": { "text": truncate_line(&text, render_width(context)) }
     })
 }
 
-/// The `renderResult` tree — the three states of issue #52 §4 plus the
-/// minimal expanded detail (per-answer lines + global note). Collapsed
-/// states are one short line each; the error line wraps (no truncate) so
-/// the failure text stays readable.
+/// The single-question receipt (`singleLines`, transcript.ts:63-72).
+fn single_lines(
+    details: &Value,
+    question_text: Option<&str>,
+    theme: &dyn RenderTheme,
+    expanded: bool,
+    width: usize,
+) -> Vec<String> {
+    let list = answers(details);
+    let answer = answer_for(list, 0);
+    let prefix = format!("{} ", theme.fg("success", "✓"));
+    let mut lines = hanging(&prefix, &answer_text(answer, theme, &I18n::detect()), width);
+    let question = expanded.then_some(question_text).flatten();
+    lines.extend(detail_lines(answer, question, "  ", theme, width));
+    lines.extend(global_note_lines(details, theme, width));
+    lines
+}
+
+/// The multi-question receipt table (`tableLines`, transcript.ts:74-92).
+fn table_lines(
+    details: &Value,
+    questions: &[ParsedQuestion],
+    theme: &dyn RenderTheme,
+    expanded: bool,
+    width: usize,
+) -> Vec<String> {
+    let list = answers(details);
+    let headers: Vec<String> = questions
+        .iter()
+        .map(|question| question.header.clone().unwrap_or_default())
+        .collect();
+    let header_width = headers
+        .iter()
+        .map(|header| rpi_tui::utils::visible_width(header))
+        .max()
+        .unwrap_or(0);
+    let answer_indent = " ".repeat(2 + header_width + 2);
+    let mut lines = Vec::new();
+    for (index, question) in questions.iter().enumerate() {
+        let answer = answer_for(list, index);
+        let header = headers.get(index).cloned().unwrap_or_default();
+        let pad = header_width.saturating_sub(rpi_tui::utils::visible_width(&header));
+        let prefix = format!("  {}{}  ", theme.fg("muted", &header), " ".repeat(pad));
+        lines.extend(hanging(
+            &prefix,
+            &answer_text(answer, theme, &I18n::detect()),
+            width,
+        ));
+        let question_text = expanded.then_some(question.question.as_deref()).flatten();
+        lines.extend(detail_lines(
+            answer,
+            question_text,
+            &answer_indent,
+            theme,
+            width,
+        ));
+    }
+    lines.extend(global_note_lines(details, theme, width));
+    lines
+}
+
+/// The `renderResult` receipt (`renderAskResult`, transcript.ts:40-61):
+/// success answers, a failure line, or the declined marker.
 pub fn render_result(
     result: &Value,
     options: &Value,
@@ -476,88 +483,62 @@ pub fn render_result(
     theme: &dyn RenderTheme,
     i18n: &I18n,
 ) -> Value {
+    let expanded = options
+        .get("expanded")
+        .and_then(Value::as_bool)
+        .or_else(|| context.get("expanded").and_then(Value::as_bool))
+        .unwrap_or(false);
     let is_error = context
         .get("isError")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if is_error {
-        let text = result_text(result);
-        let line = if text.is_empty() {
-            "✗".to_owned()
-        } else {
-            format!("✗ {text}")
-        };
-        return json!({
-            "type": "text",
-            "props": { "text": theme.fg("error", &line) }
-        });
-    }
-
-    let cancelled = result
-        .get("details")
-        .and_then(|details| details.get("cancelled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let answers = result_answers(result);
-    let expanded = options
-        .get("expanded")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    if cancelled {
-        let headline = if answers.is_empty() {
-            i18n.t("render.declined", "declined").to_owned()
-        } else {
-            i18n.t("render.declined_partial", "declined ({count} partial)")
-                .replace("{count}", &answers.len().to_string())
-        };
-        if !expanded {
+    let width = render_width(context);
+    let details = questionnaire_details(result);
+    let lines: Vec<String> = if is_error
+        || details
+            .and_then(|d| d.get("error"))
+            .is_some_and(|e| !e.is_null())
+    {
+        let reason = first_text_line(result);
+        vec![theme.fg("error", &format!("✗ {reason}"))]
+    } else {
+        let Some(details) = details else {
             return json!({
                 "type": "text",
-                "props": { "text": theme.fg("muted", &headline) }
+                "props": { "text": theme.fg("success", "✓") }
+            });
+        };
+        if details.get("cancelled").and_then(Value::as_bool) == Some(true) {
+            return json!({
+                "type": "text",
+                "props": {
+                    "text": theme.fg(
+                        "dim",
+                        &format!("✗ {}", i18n.t("transcript.no_answer", "no answer"))
+                    )
+                }
             });
         }
-        let mut children = vec![json!({
-            "type": "text",
-            "props": { "text": theme.fg("muted", &headline) }
-        })];
-        for answer in answers {
-            children.push(answer_line("·", answer, "muted", theme));
+        let args = context.get("args").cloned().unwrap_or(Value::Null);
+        let questions = parse_questions(&args).unwrap_or_default();
+        if questions.len() > 1 {
+            table_lines(details, &questions, theme, expanded, width)
+        } else {
+            single_lines(
+                details,
+                questions
+                    .first()
+                    .and_then(|question| question.question.as_deref()),
+                theme,
+                expanded,
+                width,
+            )
         }
-        return json!({ "type": "column", "props": {}, "children": children });
-    }
-
-    let headline = i18n
-        .t("render.answered", "✓ {count} answered")
-        .replace("{count}", &answers.len().to_string());
-    if !expanded {
-        return json!({
-            "type": "text",
-            "props": { "text": theme.fg("success", &headline) }
-        });
-    }
-    let mut children = vec![json!({
+    };
+    json!({
         "type": "text",
-        "props": { "text": theme.fg("success", &headline) }
-    })];
-    for answer in answers {
-        children.push(answer_line("✓", answer, "success", theme));
-    }
-    if let Some(note) = result
-        .get("details")
-        .and_then(|details| details.get("globalNote"))
-        .and_then(Value::as_str)
-        .filter(|note| !note.is_empty())
-    {
-        let note = i18n
-            .t("render.global_note", "global note: {text}")
-            .replace("{text}", &sanitize_inline(note));
-        children.push(json!({
-            "type": "text",
-            "props": { "text": theme.fg("dim", &note) }
-        }));
-    }
-    json!({ "type": "column", "props": {}, "children": children })
+        "props": { "text": lines.join("\n") }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -617,49 +598,38 @@ mod tests {
     }
 
     fn three_questions() -> Value {
-        // The issue #52 §1 example: Scope / Priority / Framework.
         json!({
             "questions": [
                 {
                     "question": "Which storage backend should the CLI default to?",
                     "header": "Scope",
                     "options": [
-                        {"label": "Local SQLite", "description": "zero setup, single machine"},
-                        {"label": "Postgres", "description": "networked, concurrent access"}
+                        {"label": "Local SQLite", "description": "zero setup"},
+                        {"label": "Postgres", "description": "networked"}
                     ]
                 },
                 {
                     "question": "How urgent is the migration?",
                     "header": "Priority",
-                    "options": [
-                        {"label": "Now", "description": "this sprint"},
-                        {"label": "Later", "description": "next quarter"}
-                    ]
+                    "options": [{"label": "Now", "description": "this sprint"}]
                 },
                 {
                     "question": "Which UI framework?",
                     "header": "Framework",
                     "multiSelect": true,
-                    "options": [
-                        {"label": "React", "description": ""},
-                        {"label": "Vue", "description": ""}
-                    ]
+                    "options": [{"label": "React", "description": ""}]
                 }
             ]
         })
     }
 
-    fn complete_context(expanded: bool) -> Value {
+    fn context(expanded: bool, width: u64) -> Value {
         json!({
             "toolCallId": "call-1",
-            "cwd": "/tmp",
-            "executionStarted": true,
             "argsComplete": true,
-            "isPartial": false,
             "expanded": expanded,
-            "showImages": false,
             "isError": false,
-            "terminalWidth": 100
+            "terminalWidth": width
         })
     }
 
@@ -667,478 +637,288 @@ mod tests {
         node["props"]["text"].as_str().unwrap_or("")
     }
 
-    /// Strip the wrapping codes an unstyled `AnsiRenderTheme` still emits
-    /// (`\x1b[1m/22m` bold, bare `\x1b[39m` resets — the host `Theme`
-    /// channel shape, rpi-todo overlay.rs test precedent).
+    /// Strip the wrapping codes an unstyled `AnsiRenderTheme` still emits.
     fn strip_ansi(line: &str) -> String {
         line.replace("\u{1b}[39m", "")
             .replace("\u{1b}[22m", "")
             .replace("\u{1b}[1m", "")
+            .replace("\u{1b}[0m", "")
     }
 
-    // ===== FR-A: collapsed summary snapshots =====
+    fn details(answers: Value) -> Value {
+        json!({ "answers": answers, "cancelled": false })
+    }
+
+    fn result(details: Value, content: &str) -> Value {
+        json!({ "content": [{ "type": "text", "text": content }], "details": details })
+    }
+
+    // ===== renderCall (transcript.ts:31-38) =====
 
     #[test]
-    fn collapsed_summary_matches_issue_example() {
+    fn call_lists_the_question_headers() {
         let tree = render_call(
             &three_questions(),
-            &complete_context(false),
+            &context(false, 100),
             &IdentityRenderTheme,
             &en(),
         );
-        assert_eq!(
-            tree,
-            json!({
-                "type": "text",
-                "props": {
-                    "text": "ask_user_question 3 questions (Scope, Priority, Framework)",
-                    "truncate": true
-                }
-            })
+        assert_eq!(text_of(&tree), "Ask Scope · Priority · Framework");
+        // No questions array → the bare title.
+        let tree = render_call(
+            &json!({}),
+            &context(false, 100),
+            &IdentityRenderTheme,
+            &en(),
         );
+        assert_eq!(text_of(&tree), "Ask");
     }
 
     #[test]
-    fn collapsed_summary_singular_and_tree_is_width_independent() {
-        let args = json!({"questions": [{
-            "question": "Pick?", "header": "Pick",
+    fn call_truncates_to_the_context_width() {
+        let tree = render_call(
+            &three_questions(),
+            &context(false, 12),
+            &IdentityRenderTheme,
+            &en(),
+        );
+        let text = strip_ansi(text_of(&tree));
+        assert!(text.ends_with('…'), "{text}");
+        assert!(rpi_tui::utils::visible_width(&text) <= 12, "{text}");
+    }
+
+    // ===== renderResult failure / declined / empty (transcript.ts:40-61) =====
+
+    #[test]
+    fn result_failure_uses_the_first_content_line() {
+        let tree = render_result(
+            &result(details(json!([])), "Error: nope\nsecond line"),
+            &json!({}),
+            &json!({ "isError": true, "terminalWidth": 80 }),
+            &IdentityRenderTheme,
+            &en(),
+        );
+        assert_eq!(text_of(&tree), "✗ Error: nope");
+        // A reducer error in `details.error` takes the same branch.
+        let tree = render_result(
+            &result(
+                json!({ "answers": [], "cancelled": false, "error": "bad batch" }),
+                "Error: bad batch",
+            ),
+            &json!({}),
+            &context(false, 80),
+            &IdentityRenderTheme,
+            &en(),
+        );
+        assert_eq!(text_of(&tree), "✗ Error: bad batch");
+    }
+
+    #[test]
+    fn result_without_details_is_a_check_and_cancelled_is_no_answer() {
+        let tree = render_result(
+            &json!({ "content": [] }),
+            &json!({}),
+            &context(false, 80),
+            &IdentityRenderTheme,
+            &en(),
+        );
+        assert_eq!(text_of(&tree), "✓");
+        let tree = render_result(
+            &result(json!({ "answers": [], "cancelled": true }), ""),
+            &json!({}),
+            &context(false, 80),
+            &IdentityRenderTheme,
+            &en(),
+        );
+        assert_eq!(text_of(&tree), "✗ no answer");
+    }
+
+    // ===== single-question receipt (transcript.ts:63-72) =====
+
+    #[test]
+    fn single_answer_strips_recommended_and_hides_details_when_collapsed() {
+        let questions = json!({"questions": [{
+            "question": "Pick one",
+            "header": "H",
             "options": [{"label": "A", "description": "a"}, {"label": "B", "description": "b"}]
         }]});
-        let narrow = complete_context(false);
-        let wide = json!({
-            "toolCallId": "call-1", "cwd": "/tmp", "executionStarted": true,
-            "argsComplete": true, "isPartial": false, "expanded": false,
-            "showImages": false, "isError": false, "terminalWidth": 200
-        });
-        let no_width = json!({
-            "toolCallId": "call-1", "cwd": "/tmp", "executionStarted": true,
-            "argsComplete": true, "isPartial": false, "expanded": false,
-            "showImages": false, "isError": false
-        });
-        let tree = render_call(&args, &narrow, &IdentityRenderTheme, &en());
-        assert_eq!(text_of(&tree), "ask_user_question 1 question (Pick)");
-        // The tree is width-independent: truncation is the host's
-        // `truncate` prop clipping at the live render width.
-        assert_eq!(tree, render_call(&args, &wide, &IdentityRenderTheme, &en()));
-        assert_eq!(
-            tree,
-            render_call(&args, &no_width, &IdentityRenderTheme, &en())
-        );
-    }
-
-    #[test]
-    fn collapsed_summary_localizes_count_copy() {
-        let zh = I18n::for_locale("zh");
-        let tree = render_call(
-            &three_questions(),
-            &complete_context(false),
+        let ctx =
+            json!({ "args": questions, "expanded": false, "terminalWidth": 80, "isError": false });
+        let tree = render_result(
+            &result(
+                details(json!([{
+                    "questionIndex": 0,
+                    "question": "Pick one",
+                    "kind": "option",
+                    "answer": "B (Recommended)",
+                    "notes": "keep it",
+                    "preview": "preview line"
+                }])),
+                "",
+            ),
+            &json!({}),
+            &ctx,
             &IdentityRenderTheme,
-            &zh,
+            &en(),
         );
-        assert_eq!(
-            text_of(&tree),
-            "ask_user_question 3 个问题 (Scope, Priority, Framework)"
+        let text = text_of(&tree);
+        // Notes stay visible when collapsed; the question and its preview are
+        // expanded-only (upstream `detailLines`).
+        assert_eq!(text, "✓ B\n  ✎ keep it", "collapsed: {text}");
+
+        let ctx =
+            json!({ "args": questions, "expanded": true, "terminalWidth": 80, "isError": false });
+        let tree = render_result(
+            &result(
+                details(json!([{
+                    "questionIndex": 0,
+                    "question": "Pick one",
+                    "kind": "option",
+                    "answer": "B (Recommended)",
+                    "notes": "keep it",
+                    "preview": "preview line"
+                }])),
+                "",
+            ),
+            &json!({}),
+            &ctx,
+            &IdentityRenderTheme,
+            &en(),
         );
+        let text = text_of(&tree);
+        assert!(text.contains("✓ B"), "{text}");
+        assert!(text.contains("Pick one"), "{text}");
+        assert!(text.contains("│ preview line"), "{text}");
+        assert!(text.contains("✎ keep it"), "{text}");
     }
 
-    // ===== FR-A: streaming tolerance matrix (argsComplete=false) =====
-
     #[test]
-    fn streaming_args_count_what_is_there_and_ellipsis_until_complete() {
-        let mut context = complete_context(false);
-        context["argsComplete"] = json!(false);
-        let tree = render_call(&three_questions(), &context, &IdentityRenderTheme, &en());
-        assert_eq!(
-            text_of(&tree),
-            "ask_user_question 3 questions (Scope, Priority, Framework, …)"
-        );
-
-        // A truncated array simply counts fewer questions.
-        let mut truncated = three_questions();
-        truncated["questions"].as_array_mut().unwrap().pop();
-        let tree = render_call(&truncated, &context, &IdentityRenderTheme, &en());
-        assert_eq!(
-            text_of(&tree),
-            "ask_user_question 2 questions (Scope, Priority, …)"
-        );
-    }
-
-    #[test]
-    fn malformed_or_missing_questions_fall_back_to_bare_title() {
-        for args in [
-            Value::Null,
-            json!({}),
-            json!({"questions": null}),
-            json!({"questions": "not-an-array"}),
-            json!({"questions": []}),
-            json!({"questions": {}}),
+    fn single_answer_custom_and_multi_shapes() {
+        let questions = json!({"questions": [{"question": "Q", "header": "H", "options": []}]});
+        let ctx = |answer: Value| json!({ "args": questions, "expanded": false, "terminalWidth": 80, "isError": false, "answer": answer });
+        for (answer, expected) in [
+            (
+                json!({"questionIndex":0,"question":"Q","kind":"custom","answer":"typed it"}),
+                "✓ \"typed it\"",
+            ),
+            (
+                json!({"questionIndex":0,"question":"Q","kind":"multi","answer":"own","selected":["A","C"]}),
+                "✓ A, C, \"own\"",
+            ),
+            (
+                json!({"questionIndex":0,"question":"Q","kind":"option","answer":null}),
+                "✓ (no input)",
+            ),
         ] {
-            let tree = render_call(&args, &complete_context(false), &IdentityRenderTheme, &en());
-            assert_eq!(
-                tree,
+            let tree = render_result(
+                &result(details(json!([answer])), ""),
+                &json!({}),
+                &ctx(json!({})),
+                &IdentityRenderTheme,
+                &en(),
+            );
+            assert_eq!(text_of(&tree), expected);
+        }
+    }
+
+    #[test]
+    fn missing_answer_renders_not_answered() {
+        let questions = json!({"questions": [{"question": "Q", "header": "H", "options": []}]});
+        let tree = render_result(
+            &result(details(json!([])), ""),
+            &json!({}),
+            &json!({ "args": questions, "expanded": false, "terminalWidth": 80, "isError": false }),
+            &IdentityRenderTheme,
+            &en(),
+        );
+        assert_eq!(text_of(&tree), "✓ not answered");
+    }
+
+    // ===== multi-question table (transcript.ts:74-92) =====
+
+    #[test]
+    fn multi_question_table_aligns_headers_and_appends_the_global_note() {
+        let questions = json!({"questions": [
+            {"question": "Pick one", "header": "Scope", "options": []},
+            {"question": "Pick two", "header": "Priority", "options": []}
+        ]});
+        let tree = render_result(
+            &result(
                 json!({
-                    "type": "text",
-                    "props": {"text": "ask_user_question"}
+                    "answers": [
+                        {"questionIndex":0,"question":"Pick one","kind":"option","answer":"A"},
+                        {"questionIndex":1,"question":"Pick two","kind":"custom","answer":"now"}
+                    ],
+                    "cancelled": false,
+                    "globalNote": "overall"
                 }),
-                "args {args} must degrade to the bare title node"
+                "",
+            ),
+            &json!({}),
+            &json!({ "args": questions, "expanded": false, "terminalWidth": 80, "isError": false }),
+            &IdentityRenderTheme,
+            &en(),
+        );
+        let text = text_of(&tree);
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert_eq!(lines[0], "  Scope     A", "{text}");
+        assert_eq!(lines[1], "  Priority  \"now\"", "{text}");
+        assert_eq!(lines[2], "  ✎ overall", "{text}");
+    }
+
+    #[test]
+    fn expanded_multi_table_includes_each_question() {
+        let questions = json!({"questions": [
+            {"question": "Pick one", "header": "Scope", "options": []},
+            {"question": "Pick two", "header": "Priority", "options": []}
+        ]});
+        let tree = render_result(
+            &result(
+                details(json!([
+                    {"questionIndex":0,"question":"Pick one","kind":"option","answer":"A"}
+                ])),
+                "",
+            ),
+            &json!({"expanded": true}),
+            &json!({ "args": questions, "expanded": false, "terminalWidth": 80, "isError": false }),
+            &IdentityRenderTheme,
+            &en(),
+        );
+        let text = text_of(&tree);
+        assert!(text.contains("Pick one"), "{text}");
+        assert!(text.contains("Pick two"), "{text}");
+    }
+
+    #[test]
+    fn result_lines_wrap_to_the_context_width() {
+        let questions = json!({"questions": [{"question": "Q", "header": "H", "options": []}]});
+        let answer = "x".repeat(120);
+        let tree = render_result(
+            &result(
+                details(json!([{
+                    "questionIndex":0,"question":"Q","kind":"custom","answer":answer
+                }])),
+                "",
+            ),
+            &json!({}),
+            &json!({ "args": questions, "expanded": false, "terminalWidth": 30, "isError": false }),
+            &IdentityRenderTheme,
+            &en(),
+        );
+        let text = text_of(&tree);
+        for line in text.split('\n') {
+            assert!(
+                rpi_tui::utils::visible_width(line) <= 30,
+                "line over width: {line:?}"
             );
         }
-    }
-
-    #[test]
-    fn malformed_items_count_without_headers_and_stream_mid_object() {
-        let mut context = complete_context(false);
-        context["argsComplete"] = json!(false);
-        // One complete question + one half-streamed object (no header yet)
-        // + one non-object item: count 3, headers Scope only, ellipsis
-        // while streaming.
-        let args = json!({
-            "questions": [
-                {"question": "Pick?", "header": "Scope", "options": []},
-                {"question": "partial"},
-                "garbage"
-            ]
-        });
-        let tree = render_call(&args, &context, &IdentityRenderTheme, &en());
-        assert_eq!(text_of(&tree), "ask_user_question 3 questions (Scope, …)");
-
-        // Mid-stream before any header arrives: count + the open tail.
-        let args = json!({"questions": [{"question": "partial"}]});
-        let tree = render_call(&args, &context, &IdentityRenderTheme, &en());
-        assert_eq!(text_of(&tree), "ask_user_question 1 question (…)");
-
-        // The same payload once complete keeps the (schema-invalid)
-        // headerless shape without the ellipsis.
-        let args = json!({"questions": [{"question": "partial"}]});
-        let tree = render_call(&args, &complete_context(false), &IdentityRenderTheme, &en());
-        assert_eq!(text_of(&tree), "ask_user_question 1 question");
-    }
-
-    #[test]
-    fn control_characters_never_fragment_the_summary_line() {
-        let mut args = three_questions();
-        args["questions"][0]["header"] = json!("Sc\r\nop\te");
-        args["questions"][0]["question"] = json!("Which \u{0000}backend?");
-        let tree = render_call(&args, &complete_context(false), &IdentityRenderTheme, &en());
-        // Every control char maps 1:1 to a space (no run collapsing —
-        // the render only guarantees single-line integrity).
-        assert_eq!(
-            text_of(&tree),
-            "ask_user_question 3 questions (Sc  op e, Priority, Framework)"
-        );
-        assert!(!text_of(&tree).contains('\r'));
-        assert!(!text_of(&tree).contains('\n'));
-    }
-
-    // ===== FR-B: expanded detail view =====
-
-    #[test]
-    fn expanded_tree_matches_issue_example_shape() {
-        let tree = render_call(
-            &three_questions(),
-            &complete_context(true),
-            &IdentityRenderTheme,
-            &en(),
-        );
-        // Root is a column: summary + spacer + per-question blocks.
-        assert_eq!(tree["type"], "column");
-        let children = tree["children"].as_array().expect("children");
-        // summary + spacer + (1 line + 2 options) × 3 questions.
-        assert_eq!(children.len(), 2 + 9);
-        assert_eq!(
-            text_of(&children[0]),
-            "ask_user_question 3 questions (Scope, Priority, Framework)"
-        );
-        assert_eq!(children[1]["props"]["lines"], json!(1));
-        assert_eq!(
-            text_of(&children[2]),
-            "  1. Scope — Which storage backend should the CLI default to?"
-        );
-        assert_eq!(
-            text_of(&children[3]),
-            "       1. Local SQLite — zero setup, single machine"
-        );
-        assert_eq!(
-            text_of(&children[4]),
-            "       2. Postgres — networked, concurrent access"
-        );
-        assert_eq!(
-            text_of(&children[5]),
-            "  2. Priority — How urgent is the migration?"
-        );
-        // multiSelect question carries the localized marker at the line end.
-        assert_eq!(
-            text_of(&children[8]),
-            "  3. Framework — Which UI framework? [multi]"
-        );
-        // An empty description renders label only (no dangling dash).
-        assert_eq!(text_of(&children[9]), "       1. React");
-    }
-
-    #[test]
-    fn expanded_tree_multi_marker_localizes() {
-        let tree = render_call(
-            &three_questions(),
-            &complete_context(true),
-            &IdentityRenderTheme,
-            &I18n::for_locale("zh"),
-        );
-        let children = tree["children"].as_array().expect("children");
-        assert_eq!(
-            text_of(&children[8]),
-            "  3. Framework — Which UI framework? [多选]"
+        assert!(
+            text.contains("\n  "),
+            "continuation is hanging-indented: {text}"
         );
     }
 
-    #[test]
-    fn expanded_streaming_skips_partial_bodies_and_marks_the_tail() {
-        let mut context = complete_context(true);
-        context["argsComplete"] = json!(false);
-        let mut args = three_questions();
-        args["questions"].as_array_mut().unwrap().truncate(2);
-        args["questions"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"question": "half"}));
-        let tree = render_call(&args, &context, &IdentityRenderTheme, &en());
-        let children = tree["children"].as_array().expect("children");
-        let last = children.last().expect("tail marker");
-        assert_eq!(text_of(last), "…");
-        // The half-streamed question contributes no body block:
-        // summary + spacer + (1+2) + (1+2) + tail marker.
-        assert_eq!(children.len(), 2 + 6 + 1);
-    }
-
-    #[test]
-    fn expanded_tree_uses_ansi_theme_channels() {
-        let theme = AnsiRenderTheme::from_theme_json(&json!({
-            "colors": {
-                "toolTitle": "#ff0000",
-                "muted": "mutedVar",
-                "accent": "#00ff00",
-                "dim": "dimVar"
-            },
-            "vars": {"mutedVar": "#808080", "dimVar": "#404040"}
-        }));
-        let tree = render_call(&three_questions(), &complete_context(false), &theme, &en());
-        assert_eq!(
-            text_of(&tree),
-            "\u{1b}[38;2;255;0;0m\u{1b}[1mask_user_question\u{1b}[22m\u{1b}[39m \
-             \u{1b}[38;2;128;128;128m3 questions (Scope, Priority, Framework)\u{1b}[39m"
-        );
-        let expanded = render_call(&three_questions(), &complete_context(true), &theme, &en());
-        assert_eq!(
-            text_of(&expanded["children"][2]),
-            "  1. \u{1b}[38;2;0;255;0mScope\u{1b}[39m — Which storage backend should the CLI default to?"
-        );
-        // Unresolvable tokens render unstyled (lenient fallback; the bare
-        // resets the channel always emits are invisible).
-        let bare = AnsiRenderTheme::from_theme_json(&Value::Null);
-        let tree = render_call(&three_questions(), &complete_context(false), &bare, &en());
-        assert_eq!(
-            strip_ansi(text_of(&tree)),
-            "ask_user_question 3 questions (Scope, Priority, Framework)"
-        );
-    }
-
-    #[test]
-    fn multi_selected_control_characters_are_sanitized() {
-        // Regression: the multi arm's joined `selected` used to bypass
-        // `sanitize_inline` (the module invariant) — a replayed/hand-built
-        // envelope could fragment the rendered line with raw `\r`/`\n`.
-        let scalar = answer_scalar(&json!({
-            "questionIndex": 0,
-            "question": "Q?",
-            "kind": "multi",
-            "selected": ["a\rb", "c\nd\te"]
-        }));
-        assert_eq!(scalar, "a b, c d e");
-        assert!(!scalar.contains('\r'));
-        assert!(!scalar.contains('\n'));
-        assert!(!scalar.contains('\t'));
-    }
-
-    // ===== FR-C: renderResult states =====
-
-    fn answered_result(answers: Value, global_note: Option<&str>) -> Value {
-        let mut details = json!({"answers": answers, "cancelled": false});
-        if let Some(note) = global_note {
-            details["globalNote"] = json!(note);
-        }
-        json!({
-            "content": [{
-                "type": "text",
-                "text": "User has answered your questions: \"Q?\"=\"A\". You can now continue with the user's answers in mind."
-            }],
-            "details": details
-        })
-    }
-
-    #[test]
-    fn result_success_single_line_and_expanded_detail() {
-        let answers = json!([
-            {"questionIndex": 0, "question": "Q1?", "kind": "option", "answer": "A"},
-            {"questionIndex": 1, "question": "Q2?", "kind": "custom", "answer": "typed"},
-            {"questionIndex": 2, "question": "Q3?", "kind": "multi", "selected": ["X", "Y"]}
-        ]);
-        let result = answered_result(answers, Some("see note"));
-        let tree = render_result(
-            &result,
-            &json!({"expanded": false, "isPartial": false}),
-            &complete_context(false),
-            &IdentityRenderTheme,
-            &en(),
-        );
-        assert_eq!(
-            tree,
-            json!({"type": "text", "props": {"text": "✓ 3 answered"}})
-        );
-
-        let expanded = render_result(
-            &result,
-            &json!({"expanded": true, "isPartial": false}),
-            &complete_context(false),
-            &IdentityRenderTheme,
-            &en(),
-        );
-        let children = expanded["children"].as_array().expect("children");
-        assert_eq!(text_of(&children[0]), "✓ 3 answered");
-        assert_eq!(text_of(&children[1]), "✓ Q1? = A");
-        assert_eq!(text_of(&children[2]), "✓ Q2? = typed");
-        // The multi answer renders the canonical scalar (joined labels).
-        assert_eq!(text_of(&children[3]), "✓ Q3? = X, Y");
-        assert_eq!(text_of(&children[4]), "global note: see note");
-    }
-
-    #[test]
-    fn result_cancelled_declined_and_partial_shapes() {
-        let declined = json!({
-            "content": [{"type": "text", "text": "User declined to answer questions"}],
-            "details": {"answers": [], "cancelled": true}
-        });
-        let tree = render_result(
-            &declined,
-            &json!({"expanded": false}),
-            &complete_context(false),
-            &IdentityRenderTheme,
-            &en(),
-        );
-        assert_eq!(text_of(&tree), "declined");
-
-        let partial = json!({
-            "content": [{"type": "text", "text": "User declined to answer questions"}],
-            "details": {
-                "answers": [{"questionIndex": 0, "question": "Q1?", "kind": "option", "answer": "A"}],
-                "cancelled": true
-            }
-        });
-        let tree = render_result(
-            &partial,
-            &json!({"expanded": false}),
-            &complete_context(false),
-            &IdentityRenderTheme,
-            &en(),
-        );
-        assert_eq!(text_of(&tree), "declined (1 partial)");
-        let expanded = render_result(
-            &partial,
-            &json!({"expanded": true}),
-            &complete_context(false),
-            &IdentityRenderTheme,
-            &en(),
-        );
-        assert_eq!(text_of(&expanded["children"][1]), "· Q1? = A");
-    }
-
-    #[test]
-    fn result_error_carries_error_text_and_localizes() {
-        let error = json!({
-            "content": [{
-                "type": "text",
-                "text": "Error: UI not available (running in non-interactive mode)"
-            }],
-            "details": {"answers": [], "cancelled": true}
-        });
-        let mut context = complete_context(false);
-        context["isError"] = json!(true);
-        let tree = render_result(
-            &error,
-            &json!({"expanded": false}),
-            &context,
-            &IdentityRenderTheme,
-            &en(),
-        );
-        assert_eq!(
-            text_of(&tree),
-            "✗ Error: UI not available (running in non-interactive mode)"
-        );
-
-        // An error result without text degrades to the bare glyph.
-        let tree = render_result(
-            &json!({"content": [], "details": {}}),
-            &json!({"expanded": false}),
-            &context,
-            &IdentityRenderTheme,
-            &en(),
-        );
-        assert_eq!(text_of(&tree), "✗");
-
-        // Success/declined copy localizes.
-        let zh = I18n::for_locale("zh");
-        let answered = answered_result(
-            json!([{"questionIndex": 0, "question": "Q?", "kind": "option", "answer": "A"}]),
-            None,
-        );
-        let tree = render_result(
-            &answered,
-            &json!({"expanded": false}),
-            &complete_context(false),
-            &IdentityRenderTheme,
-            &zh,
-        );
-        assert_eq!(text_of(&tree), "✓ 已回答 1 题");
-    }
-
-    #[test]
-    fn result_answer_scalars_match_envelope_semantics() {
-        // Empty custom answer and empty multi → the envelope placeholder.
-        let answers = json!([
-            {"questionIndex": 0, "question": "Q1?", "kind": "custom", "answer": ""},
-            {"questionIndex": 1, "question": "Q2?", "kind": "multi", "selected": []}
-        ]);
-        let result = answered_result(answers, None);
-        let expanded = render_result(
-            &result,
-            &json!({"expanded": true}),
-            &complete_context(false),
-            &IdentityRenderTheme,
-            &en(),
-        );
-        let children = expanded["children"].as_array().expect("children");
-        assert_eq!(text_of(&children[1]), "✓ Q1? = (no input)");
-        assert_eq!(text_of(&children[2]), "✓ Q2? = (no input)");
-    }
-
-    #[test]
-    fn theme_wraps_result_lines_in_color() {
-        let theme = AnsiRenderTheme::from_theme_json(&json!({
-            "colors": {"success": "#00ff00", "error": "#ff0000", "muted": "#808080"}
-        }));
-        let result = answered_result(
-            json!([{"questionIndex": 0, "question": "Q?", "kind": "option", "answer": "A"}]),
-            None,
-        );
-        let tree = render_result(
-            &result,
-            &json!({"expanded": false}),
-            &complete_context(false),
-            &theme,
-            &en(),
-        );
-        assert_eq!(text_of(&tree), "\u{1b}[38;2;0;255;0m✓ 1 answered\u{1b}[39m");
-    }
-
-    // ===== FR-D: dispatch nulls (the host chain degrades to the title) =====
+    // ===== dispatch =====
 
     #[test]
     fn dispatch_render_answers_null_for_foreign_tools_and_kinds() {
@@ -1158,9 +938,6 @@ mod tests {
         );
     }
 
-    /// A host whose every call fails (`ui.theme` unreachable): the render
-    /// still succeeds with the unstyled theme — a theme read failure must
-    /// not kill the render (lenient fallback).
     struct FailingHost;
 
     impl crate::HostCall for FailingHost {
@@ -1178,12 +955,12 @@ mod tests {
             &FailingHost,
             &json!({
                 "kind": "render", "what": "toolCall", "toolName": TOOL_NAME,
-                "context": {"args": three_questions(), "argsComplete": true, "expanded": false}
+                "context": {"args": three_questions(), "argsComplete": true, "expanded": false, "terminalWidth": 100}
             }),
         );
         assert_eq!(
             strip_ansi(text_of(&tree)),
-            "ask_user_question 3 questions (Scope, Priority, Framework)"
+            "Ask Scope · Priority · Framework"
         );
     }
 }

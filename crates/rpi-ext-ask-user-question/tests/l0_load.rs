@@ -417,33 +417,26 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
             terminal_width: Some(100),
         };
 
-    // Collapsed summary (the issue #52 §1 example shape).
-    let tree = render_call(call_context(true, false)).expect("collapsed tree");
+    // The v2.15.0 receipt call line: bold `Ask` + the question headers.
+    let tree = render_call(call_context(true, false)).expect("call tree");
     let serialized = serde_json::to_string(&tree).unwrap_or_default();
     assert_eq!(
         strip_ansi(tree["props"]["text"].as_str().unwrap_or("")),
-        "ask_user_question 2 questions (Scope, Priority)"
+        "Ask Scope · Priority"
     );
-    assert_eq!(tree["props"]["truncate"], serde_json::json!(true));
     // The rpi#52 regression floor: no pretty-printed args anywhere in the
     // tree (the dump would carry the raw question/description strings).
     assert!(!serialized.contains("Which storage backend"));
     assert!(!serialized.contains("zero setup, single machine"));
 
-    // Expanded detail (Ctrl+O / app.tools.expand).
-    let tree = render_call(call_context(true, true)).expect("expanded tree");
-    assert_eq!(tree["type"], "column");
-    let children = tree["children"].as_array().expect("children");
+    // The receipt layout does not expand the call (upstream renderAskCall).
+    let tree = render_call(call_context(true, true)).expect("expanded call tree");
     assert_eq!(
-        strip_ansi(children[2]["props"]["text"].as_str().unwrap_or("")),
-        "  1. Scope — Which storage backend should the CLI default to?"
-    );
-    assert_eq!(
-        strip_ansi(children[3]["props"]["text"].as_str().unwrap_or("")),
-        "       1. Local SQLite — zero setup, single machine"
+        strip_ansi(tree["props"]["text"].as_str().unwrap_or("")),
+        "Ask Scope · Priority"
     );
 
-    // Streaming tolerance: a truncated array counts what is there.
+    // Streaming tolerance: only the headers present so far are listed.
     let mut streaming = call_context(false, false);
     streaming.args["questions"]
         .as_array_mut()
@@ -452,7 +445,7 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
     let tree = render_call(streaming).expect("streaming tree");
     assert_eq!(
         strip_ansi(tree["props"]["text"].as_str().unwrap_or("")),
-        "ask_user_question 1 question (Scope, …)"
+        "Ask Scope"
     );
 
     // renderResult over a real answered envelope (from step 7's execute).
@@ -473,11 +466,14 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
         result_context.clone(),
     )
     .expect("result tree");
-    assert_eq!(
-        strip_ansi(tree["props"]["text"].as_str().unwrap_or("")),
-        "✓ 1 answered"
+    let text = strip_ansi(tree["props"]["text"].as_str().unwrap_or(""));
+    // Two questions in the envelope → the aligned receipt table; the second
+    // one was not answered by this envelope.
+    assert!(
+        text.starts_with("  Scope     A\n  Priority  not answered"),
+        "{text}"
     );
-    // Expanded result carries the per-answer detail line.
+    // Expanded result adds each question's text under its answer.
     let tree = render_result(
         answered,
         rpi_ext_host::types::ToolRenderResultOptions {
@@ -487,10 +483,9 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
         result_context,
     )
     .expect("expanded result tree");
-    assert_eq!(
-        strip_ansi(tree["children"][1]["props"]["text"].as_str().unwrap_or("")),
-        "✓ Pick one? = A"
-    );
+    let text = strip_ansi(tree["props"]["text"].as_str().unwrap_or(""));
+    assert!(text.contains("Which storage backend"), "{text}");
+    assert!(text.contains("How urgent is the migration?"), "{text}");
 
     let _ = std::fs::remove_dir_all(full.parent().unwrap());
 }
