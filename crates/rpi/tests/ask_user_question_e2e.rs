@@ -733,12 +733,12 @@ async fn tui_single_question_submit_full_flow() {
         .position(|name| *name == "blocked")
         .expect("blocked event");
     assert!(
-        bus[blocked_true].1 == json!({ "active": true }),
+        bus[blocked_true].1 == json!({ "active": true, "toolCallId": "tool:1" }),
         "first blocked arm is active:true: {bus:?}"
     );
     let last = bus.last().expect("closing blocked arm");
     assert_eq!(last.0, "blocked");
-    assert_eq!(last.1, json!({ "active": false }));
+    assert_eq!(last.1, json!({ "active": false, "toolCallId": "tool:1" }));
 
     // R-Q3.3: the file-backed session JSONL carries the answers detail.
     let sessions_dir = fixture._sandbox.sessions();
@@ -1132,7 +1132,7 @@ async fn tui_esc_cancels_questionnaire() {
     // The blocked bracket still closes (finally path).
     let last = bus.last().expect("closing blocked arm");
     assert_eq!(last.0, "blocked");
-    assert_eq!(last.1, json!({ "active": false }));
+    assert_eq!(last.1, json!({ "active": false, "toolCallId": "tool:1" }));
 }
 
 /// FR-A/R-Q5.9: Ctrl+G in input mode opens the host external editor
@@ -1330,7 +1330,7 @@ async fn rpc_walker_full_round_trip() {
         .collect();
     assert_eq!(
         blocked.last().cloned(),
-        Some(json!({ "active": false })),
+        Some(json!({ "active": false, "toolCallId": "tool:1" })),
         "closing blocked arm"
     );
 
