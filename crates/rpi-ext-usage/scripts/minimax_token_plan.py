@@ -301,16 +301,23 @@ def finite_number(value):
 
 
 def window_percent(bucket, prefix):
-    """(used_percent | None, unlimited) for one window of a bucket (legacy)."""
+    """(used_percent | None, unlimited) for one window of a bucket (legacy).
+
+    Only the documented statuses are interpreted: 1 normal, 2 exhausted,
+    3 unlimited. Any other (or missing) status is `unknown` and produces no
+    percentage; an out-of-range remaining percentage is invalid, not clamped.
+    """
     status = bucket.get(f"current_{prefix}_status")
     if status == STATUS_UNLIMITED:
         return None, True
     if status == STATUS_EXHAUSTED:
         return 100.0, False
-    remaining = bucket.get(f"current_{prefix}_remaining_percent")
-    if not isinstance(remaining, (int, float)):
+    if status != STATUS_NORMAL:
         return None, False
-    return max(0.0, min(100.0, 100.0 - float(remaining))), False
+    remaining = finite_number(bucket.get(f"current_{prefix}_remaining_percent"))
+    if remaining is None or remaining < 0.0 or remaining > 100.0:
+        return None, False
+    return 100.0 - remaining, False
 
 
 def interval_label(bucket):
@@ -326,7 +333,11 @@ def interval_label(bucket):
 
 
 def typed_window(bucket, prefix, window_id, label, time_prefix):
-    """One typed window; None when the bucket carries no usable data."""
+    """One typed window; None when the bucket carries no usable data.
+
+    A missing/undocumented status becomes `unknown` without numbers (the
+    footer skips it); only documented status 1 produces percentages/counts.
+    """
     status_code = bucket.get(f"current_{prefix}_status")
     start = bucket.get(f"{time_prefix}start_time")
     end = bucket.get(f"{time_prefix}end_time")
@@ -339,6 +350,16 @@ def typed_window(bucket, prefix, window_id, label, time_prefix):
             "status": "ok",
             "unlimited": True,
         }
+    elif status_code == STATUS_EXHAUSTED:
+        window = {
+            "id": window_id,
+            "label": label,
+            "status": "rate-limited",
+            "usedPercent": 100.0,
+            "remainingPercent": 0.0,
+        }
+    elif status_code != STATUS_NORMAL:
+        window = {"id": window_id, "label": label, "status": "unknown"}
     else:
         percent = window_percent(bucket, prefix)[0]
         if percent is not None:
@@ -353,7 +374,7 @@ def typed_window(bucket, prefix, window_id, label, time_prefix):
             total = finite_number(bucket.get(f"current_{prefix}_total_count"))
             used = finite_number(bucket.get(f"current_{prefix}_usage_count"))
             # A 0/0 bucket is "no quota configured", not a counted window.
-            if total is None or total <= 0:
+            if total is None or total <= 0 or (used is not None and used > total):
                 return None
             window = {
                 "id": window_id,
@@ -477,8 +498,14 @@ def main():
             f"7d {fmt(weekly_pct)}%"
             + countdown_annotation(epoch_seconds(bucket.get("weekly_end_time")), now)
         )
+    if windows and all(window["status"] == "unknown" for window in windows):
+        return fail("shape-changed", "response carries no usable windows")
     if not parts and windows:
-        parts = [typed_window_text(window) for window in windows]
+        parts = [
+            typed_window_text(window)
+            for window in windows
+            if window["status"] != "unknown"
+        ]
     if not parts:
         return fail("shape-changed", "response carries no recognized windows")
     display = " / ".join(parts)

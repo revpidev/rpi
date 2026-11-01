@@ -22,3 +22,7 @@ examples/wasm-extension/Cargo.lock
 
 # Test artifact rewritten by rpi-ext-subagents e2e runs (detached-run receipt)
 crates/rpi-ext-subagents/context.md
+
+# Python bytecode from provider-script smoke checks
+__pycache__/
+*.pyc

@@ -739,6 +739,19 @@ mod tests {
     }
 
     #[test]
+    fn footer_counted_remaining_only_uses_left() {
+        let mut environment = envelope();
+        let mut window = window("c", "c", UsageWindowStatus::Ok);
+        window.unit = Some("requests".to_owned());
+        window.remaining = Some(18.0);
+        environment.windows = Some(vec![window]);
+        assert_eq!(
+            footer_text(&environment, &config(), NOW_MS).as_deref(),
+            Some("c 18 requests left")
+        );
+    }
+
+    #[test]
     fn static_reset_limited_unknown_and_single_sided_counts() {
         let mut environment = envelope();
         environment.windows = Some(vec![

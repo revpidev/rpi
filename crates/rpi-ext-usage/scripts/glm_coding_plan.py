@@ -300,15 +300,26 @@ def finite_number(value):
     return float(value)
 
 
+def valid_percent(value):
+    """Finite 0..100 percentage, else None (out-of-range is invalid)."""
+    if value is None:
+        return None
+    return value if 0.0 <= value <= 100.0 else None
+
+
 def percent(limit):
-    """Legacy display percent: `percentage`, else current/usage (clamped)."""
-    raw = finite_number(limit.get("percentage"))
+    """Legacy display percent: `percentage`, else current/usage.
+
+    An out-of-range or non-finite value is invalid (no clamping): a provider
+    percentage outside 0..100 is a shape change, not a value to invent.
+    """
+    raw = valid_percent(finite_number(limit.get("percentage")))
     if raw is not None:
-        return max(0.0, min(100.0, raw))
+        return raw
     current = finite_number(limit.get("currentValue"))
     total = finite_number(limit.get("usage"))
     if current is not None and total is not None and total > 0:
-        return max(0.0, min(100.0, current / total * 100.0))
+        return valid_percent(current / total * 100.0)
     return None
 
 
@@ -343,6 +354,10 @@ def countable(limit):
         values["total"] = total
     if remaining is not None and remaining >= 0:
         values["remaining"] = remaining
+    if "used" in values and "total" in values and values["used"] > values["total"]:
+        return None
+    if "remaining" in values and "total" in values and values["remaining"] > values["total"]:
+        return None
     if not values:
         return None
     values["unit"] = unit
@@ -354,7 +369,9 @@ def typed_window(window_id, label, limit, duration):
     raw_percent = finite_number(limit.get("percentage"))
     window = {"id": window_id, "label": label}
     if raw_percent is not None:
-        used = max(0.0, min(100.0, raw_percent))
+        used = valid_percent(raw_percent)
+        if used is None:
+            return None
         window["usedPercent"] = round(used, 4)
         window["remainingPercent"] = round(max(0.0, 100.0 - used), 4)
         limited = used >= 100.0

@@ -712,6 +712,45 @@ mod tests {
     }
 
     #[test]
+    fn current_xai_command_paths_force_once_and_publish() {
+        let host = host_with("xai");
+        host.set_providers(vec!["xai".to_owned()]);
+        host.set_envelope(
+            "xai",
+            json!({
+                "schemaVersion": 1,
+                "provider": "xai",
+                "plan": "SuperGrok",
+                "displayText": "7d 42.5%",
+                "windows": [window("included_allowance", "7d", 42.5, "2027-01-19T06:00:00Z")]
+            }),
+        );
+        // The no-argument command resolves the current xAI model to the xai
+        // provider: one forced read, no cached call, footer from the same
+        // result.
+        let outcome = run(&host, "");
+        assert!(
+            text(&outcome).starts_with("xai (current)"),
+            "{}",
+            text(&outcome)
+        );
+        assert!(matches!(outcome.footer, FooterAction::Publish(_)));
+        assert_eq!(host.fetch_calls(), vec![("xai".to_owned(), true)]);
+        assert_eq!(host.cached_calls(), Vec::<String>::new());
+
+        // `--json` is a second explicit path: again exactly one forced read.
+        let outcome = run(&host, "--json");
+        let report = json(&outcome);
+        assert_eq!(report["provider"], json!("xai"));
+        assert!(matches!(outcome.footer, FooterAction::Publish(_)));
+        assert_eq!(
+            host.fetch_calls(),
+            vec![("xai".to_owned(), true), ("xai".to_owned(), true)]
+        );
+        assert_eq!(host.cached_calls(), Vec::<String>::new());
+    }
+
+    #[test]
     fn current_provider_without_a_quota_script_falls_back_to_local_tokens() {
         let host = host_with("openrouter");
         host.set_providers(vec!["deepseek".to_owned()]);

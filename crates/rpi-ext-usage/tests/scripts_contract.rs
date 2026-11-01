@@ -564,11 +564,22 @@ fn validate_envelope(value: &Value) {
                 || window.get("unit").is_some();
             let representations =
                 usize::from(unlimited) + usize::from(percentage) + usize::from(counted);
-            assert_eq!(
-                representations, 1,
-                "{id}: exactly one window representation is required: {window}"
-            );
-            if unlimited {
+            if status == "unknown" {
+                // `unknown` windows may omit any representation; a value is
+                // allowed but never treated as normal.
+                assert!(
+                    representations <= 1,
+                    "{id}: at most one representation is allowed: {window}"
+                );
+            } else {
+                assert_eq!(
+                    representations, 1,
+                    "{id}: exactly one window representation is required: {window}"
+                );
+            }
+            if representations == 0 {
+                // Unknown window without invented numbers.
+            } else if unlimited {
                 for key in [
                     "usedPercent",
                     "remainingPercent",
@@ -1217,8 +1228,23 @@ fn minimax_zero_usage_partial_windows_and_invalid_percent() {
     );
     let value = envelope(&run);
     let windows = value["windows"].as_array().expect("windows");
-    assert_eq!(windows.len(), 1);
-    assert_eq!(windows[0]["id"], "interval");
+    assert_eq!(windows.len(), 2);
+    let interval = windows
+        .iter()
+        .find(|window| window["id"] == "interval")
+        .expect("interval window");
+    let weekly = windows
+        .iter()
+        .find(|window| window["id"] == "weekly")
+        .expect("weekly window");
+    assert_eq!(interval["status"], "ok");
+    assert_eq!(weekly["status"], "unknown");
+    assert!(
+        value["displayText"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("5h ")),
+        "{value}"
+    );
 
     // An invalid interval percentage keeps the still-valid weekly window.
     let body = fixture_with(
@@ -1296,6 +1322,30 @@ fn kimi_partial_and_invalid_ratio() {
     assert_eq!(windows.len(), 1);
     assert_eq!(windows[0]["id"], "5h");
 
+    // An out-of-range ratio is invalid too (not clamped to 100%).
+    let body = fixture_with(
+        "kimi_usages_used.json",
+        &[
+            ("/usage", Value::Null),
+            ("/limits", Value::Array(Vec::new())),
+            ("/usages/limit_7d/used_ratio", Value::from(150)),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("kimi-out-of-range");
+    let run = run_script(
+        "kimi_code.py",
+        "kimi-code",
+        &agent,
+        &stub,
+        &with_clock(&KIMI),
+        5_000,
+    );
+    let value = envelope(&run);
+    let windows = value["windows"].as_array().expect("windows");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["id"], "5h");
+
     // No usable windows at all is a classified shape change.
     let body = fixture_with(
         "kimi_usages.json",
@@ -1316,6 +1366,330 @@ fn kimi_partial_and_invalid_ratio() {
         5_000,
     );
     assert_error(&run, "shape-changed");
+}
+
+#[test]
+fn minimax_unknown_status_is_not_ok() {
+    let body = fixture_with(
+        "minimax_remains.json",
+        &[("/model_remains/0/current_interval_status", Value::from(4))],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("minimax-unknown");
+    let run = run_script(
+        "minimax_token_plan.py",
+        "minimax-token-plan",
+        &agent,
+        &stub,
+        &with_clock(&MINIMAX),
+        5_000,
+    );
+    let value = envelope(&run);
+    let interval = value["windows"]
+        .as_array()
+        .expect("windows")
+        .iter()
+        .find(|window| window["id"] == "interval")
+        .expect("interval window");
+    assert_eq!(interval["status"], "unknown");
+    assert!(interval.get("usedPercent").is_none());
+    assert!(interval.get("unit").is_none());
+    // The still-valid weekly window is kept; the unknown one is not rendered.
+    assert_eq!(value["displayText"], "7d unlimited");
+}
+
+#[test]
+fn minimax_all_unknown_or_invalid_percent_is_shape_changed() {
+    // Both statuses undocumented -> no usable window.
+    let body = fixture_with(
+        "minimax_remains.json",
+        &[
+            ("/model_remains/0/current_interval_status", Value::from(4)),
+            ("/model_remains/0/current_weekly_status", Value::from(4)),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("minimax-all-unknown");
+    let run = run_script(
+        "minimax_token_plan.py",
+        "minimax-token-plan",
+        &agent,
+        &stub,
+        &with_clock(&MINIMAX),
+        5_000,
+    );
+    assert_error(&run, "shape-changed");
+
+    // An out-of-range remaining percentage is invalid, not clamped.
+    let body = fixture_with(
+        "minimax_unlimited.json",
+        &[
+            (
+                "/model_remains/0/current_interval_remaining_percent",
+                Value::from(150),
+            ),
+            ("/model_remains/0/current_interval_status", Value::from(1)),
+            ("/model_remains/0/current_weekly_status", Value::from(4)),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("minimax-invalid-range");
+    let run = run_script(
+        "minimax_token_plan.py",
+        "minimax-token-plan",
+        &agent,
+        &stub,
+        &with_clock(&MINIMAX),
+        5_000,
+    );
+    assert_error(&run, "shape-changed");
+}
+
+#[test]
+fn opencode_go_all_unknown_and_zero_partial_windows() {
+    let body = fixture_with(
+        "opencode_go_usage.json",
+        &[
+            ("/usage/rolling/status", Value::from("mystery-state")),
+            ("/usage/weekly/status", Value::from("mystery-state")),
+            ("/usage/monthly/status", Value::from("mystery-state")),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("opencode-all-unknown");
+    let run = run_script(
+        "opencode_go.py",
+        "opencode-go",
+        &agent,
+        &stub,
+        &with_clock(&OPENCODE),
+        5_000,
+    );
+    assert_error(&run, "shape-changed");
+
+    // Zero use on a partial response (only rolling is present).
+    let body = fixture_with(
+        "opencode_go_usage.json",
+        &[
+            ("/usage/rolling/percent", Value::from(0)),
+            ("/usage/weekly", Value::Null),
+            ("/usage/monthly", Value::Null),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("opencode-zero");
+    let run = run_script(
+        "opencode_go.py",
+        "opencode-go",
+        &agent,
+        &stub,
+        &with_clock(&OPENCODE),
+        5_000,
+    );
+    let value = envelope(&run);
+    assert!(
+        value["displayText"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("rolling 0%")),
+        "{value}"
+    );
+    let windows = value["windows"].as_array().expect("windows");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["usedPercent"], 0.0);
+}
+
+#[test]
+fn anthropic_zero_partial_and_rate_limited_windows() {
+    let body = fixture_with(
+        "anthropic_usage.json",
+        &[
+            ("/five_hour/utilization", Value::from(0)),
+            ("/seven_day", Value::Null),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("anthropic-zero");
+    let run = run_script(
+        "anthropic.py",
+        "anthropic",
+        &agent,
+        &stub,
+        &with_clock(&ANTHROPIC),
+        5_000,
+    );
+    let value = envelope(&run);
+    assert!(
+        value["displayText"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("5h 0%")),
+        "{value}"
+    );
+    let windows = value["windows"].as_array().expect("windows");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["usedPercent"], 0.0);
+
+    let body = fixture_with(
+        "anthropic_usage.json",
+        &[("/five_hour/utilization", Value::from(100))],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("anthropic-limited");
+    let run = run_script(
+        "anthropic.py",
+        "anthropic",
+        &agent,
+        &stub,
+        &with_clock(&ANTHROPIC),
+        5_000,
+    );
+    let value = envelope(&run);
+    assert_eq!(value["windows"][0]["status"], "rate-limited");
+    assert_eq!(value["windows"][0]["usedPercent"], 100.0);
+}
+
+#[test]
+fn codex_zero_partial_all_unknown_and_invalid_percent() {
+    let body = fixture_with(
+        "openai_codex_usage.json",
+        &[
+            ("/rate_limit/primary_window/used_percent", Value::from(0)),
+            ("/rate_limit/secondary_window", Value::Null),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("codex-zero");
+    let run = run_script(
+        "openai_codex.py",
+        "openai-codex",
+        &agent,
+        &stub,
+        &with_clock(&CODEX),
+        5_000,
+    );
+    let value = envelope(&run);
+    assert!(
+        value["displayText"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("5h 0%")),
+        "{value}"
+    );
+    let windows = value["windows"].as_array().expect("windows");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["usedPercent"], 0.0);
+
+    let body = fixture_with(
+        "openai_codex_usage.json",
+        &[
+            ("/rate_limit/allowed", Value::Null),
+            ("/rate_limit/limit_reached", Value::Bool(false)),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("codex-all-unknown");
+    let run = run_script(
+        "openai_codex.py",
+        "openai-codex",
+        &agent,
+        &stub,
+        &with_clock(&CODEX),
+        5_000,
+    );
+    assert_error(&run, "shape-changed");
+
+    let body = fixture_with(
+        "openai_codex_usage.json",
+        &[(
+            "/rate_limit/primary_window/used_percent",
+            Value::from("abc"),
+        )],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("codex-invalid-percent");
+    let run = run_script(
+        "openai_codex.py",
+        "openai-codex",
+        &agent,
+        &stub,
+        &with_clock(&CODEX),
+        5_000,
+    );
+    assert_error(&run, "shape-changed");
+}
+
+#[test]
+fn glm_out_of_range_percentage_is_shape_changed() {
+    for value in [Value::from(150), Value::from(-10)] {
+        let body = fixture_with(
+            "glm_quota_weekly.json",
+            &[(
+                "/data/limits",
+                serde_json::json!([{
+                    "type": "TOKENS_LIMIT",
+                    "unit": 3,
+                    "number": 5,
+                    "percentage": value
+                }]),
+            )],
+        );
+        let stub = stub_always(StubReply::ok(body));
+        let agent = AgentDir::new("glm-out-of-range");
+        let run = run_script(
+            "glm_coding_plan.py",
+            "glm-coding-plan",
+            &agent,
+            &stub,
+            &with_clock(&GLM),
+            5_000,
+        );
+        assert_error(&run, "shape-changed");
+    }
+}
+
+#[test]
+fn kimi_zero_usage_is_typed() {
+    let body = fixture_with(
+        "kimi_usages_used.json",
+        &[
+            ("/usages/limit_5h/used_ratio", Value::from(0)),
+            ("/usages/limit_7d/used_ratio", Value::from(0)),
+            ("/usage/remaining", Value::from("100")),
+            ("/limits/0/detail/remaining", Value::from("100")),
+        ],
+    );
+    let stub = stub_always(StubReply::ok(body));
+    let agent = AgentDir::new("kimi-zero");
+    let run = run_script(
+        "kimi_code.py",
+        "kimi-code",
+        &agent,
+        &stub,
+        &with_clock(&KIMI),
+        5_000,
+    );
+    let value = envelope(&run);
+    for window in value["windows"].as_array().expect("windows") {
+        assert_eq!(window["usedPercent"], 0.0, "{window}");
+    }
+    let text = value["displayText"].as_str().expect("displayText");
+    assert!(text.starts_with("5h 0%"), "{text}");
+    assert!(text.contains("7d 0%"), "{text}");
+}
+
+#[test]
+fn xai_rate_limited_window_is_not_ok() {
+    let billing = fixture_with(
+        "xai_billing.json",
+        &[("/config/creditUsagePercent", Value::from(100))],
+    );
+    let stub = stub_sequence(vec![
+        StubReply::ok(fixture("xai_user.json")),
+        StubReply::ok(billing),
+    ]);
+    let agent = AgentDir::new("xai-limited");
+    let run = run_script("xai.py", "xai", &agent, &stub, &with_clock(&XAI), 5_000);
+    let value = envelope(&run);
+    assert_eq!(value["windows"][0]["status"], "rate-limited");
+    assert_eq!(value["windows"][0]["usedPercent"], 100.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1615,7 +1989,6 @@ fn codex_status_only_trusts_explicit_allowed_flags() {
         (Value::Bool(false), Value::Bool(false), "rate-limited"),
         (Value::Bool(true), Value::Bool(true), "rate-limited"),
         (Value::Bool(true), Value::Bool(false), "ok"),
-        (Value::Null, Value::Bool(false), "unknown"),
     ] {
         let body = fixture_with(
             "openai_codex_usage.json",

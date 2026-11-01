@@ -434,12 +434,15 @@ def main():
         windows.append(window)
     if not windows:
         return fail("shape-changed", "response carries no recognized windows")
+    if all(window["status"] == "unknown" for window in windows):
+        return fail("shape-changed", "response carries no usable windows")
 
     now = now_epoch()
     parts = [
         f"{window['label']} {fmt(window['usedPercent'])}%"
         + countdown_annotation(iso_epoch(window.get("resetAt")), now)
         for window in windows
+        if window["status"] != "unknown"
     ]
     envelope = {
         "schemaVersion": 1,

@@ -234,12 +234,19 @@ def number(value):
 
 
 def ratio(value):
+    """Used percent from a 0..1 ratio (or a legacy 0..100 percentage).
+
+    Out-of-range or non-finite values are invalid, not clamped: a provider
+    ratio outside the contract is drift, never a fabricated 0/100 window.
+    """
     parsed = number(value)
-    if parsed is None:
+    if parsed is None or not math.isfinite(parsed):
         return None
-    if parsed <= 1.0:
+    if 0.0 <= parsed <= 1.0:
         parsed *= 100.0
-    return max(0.0, min(100.0, parsed))
+    if not 0.0 <= parsed <= 100.0:
+        return None
+    return parsed
 
 
 def finite_number(value):
