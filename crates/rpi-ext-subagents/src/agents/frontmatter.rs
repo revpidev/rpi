@@ -48,18 +48,27 @@ fn fold_block(block: &str) -> String {
 }
 
 /// Normalize a simple-scalar frontmatter list from comma-separated or
-/// block-list syntax (`parseFrontmatterList`, frontmatter.ts:46-57). Only the
-/// standard `- item` marker is removed; ordinary hyphenated values stay intact.
+/// block-list syntax (`parseFrontmatterList`, frontmatter.ts:46-69 @ 3a63e0ad).
+/// Only the standard `- item` marker is removed; ordinary hyphenated values stay
+/// intact. A trailing ` #...` comment is dropped from unquoted `- item` lines;
+/// single-line values are left alone because [`parse_frontmatter`] has already
+/// removed their quotes, so `"notes #1.md"` must survive (v0.83.0 / #2995).
 pub fn parse_frontmatter_list(raw: Option<&str>) -> Option<Vec<String>> {
     let raw = raw?;
     let mut out = Vec::new();
     for line in raw.split('\n') {
         let value = line.trim();
-        // `value.match(/^-\s+(.+)$/)` — dash, at least one whitespace, then
+        // `value.match(/^-[\s]+(.+)$/)` — dash, at least one whitespace, then
         // content; `-read` without whitespace does not match and stays intact.
-        let item = match value.strip_prefix('-') {
-            Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
-            _ => value,
+        let list_item = match value.strip_prefix('-') {
+            Some(rest) if rest.starts_with(char::is_whitespace) => Some(rest.trim_start()),
+            _ => None,
+        };
+        // `listItem === undefined || /^["']/.test(listItem) ? listItem ?? value : strip`
+        let item = match list_item {
+            Some(item) if !item.starts_with(['"', '\'']) => strip_trailing_comment(item),
+            Some(item) => item,
+            None => value,
         };
         for part in item.split(',') {
             let trimmed = part.trim();
@@ -69,6 +78,44 @@ pub fn parse_frontmatter_list(raw: Option<&str>) -> Option<Vec<String>> {
         }
     }
     Some(out)
+}
+
+/// `item.replace(/(?:^|\s)#.*$/, "")` — drop a trailing comment marker and
+/// everything after it, but only when `#` starts the value or follows whitespace
+/// (so `read#1` stays a name).
+fn strip_trailing_comment(item: &str) -> &str {
+    let mut search = 0usize;
+    while let Some(offset) = item[search..].find('#') {
+        let index = search + offset;
+        let at_start = index == 0;
+        let after_space = item[..index].ends_with(char::is_whitespace);
+        if at_start || after_space {
+            return item[..index].trim_end();
+        }
+        search = index + 1;
+    }
+    item
+}
+
+/// A tool or extension name list whose items may each be quoted, as in
+/// `"read", "bash"` or `- "read"` (`parseUnquotedList`, frontmatter.ts:71-73
+/// @ 3a63e0ad, #3017).
+pub fn parse_unquoted_list(raw: Option<&str>) -> Option<Vec<String>> {
+    parse_frontmatter_list(raw).map(|items| items.iter().map(|item| unquote_name(item)).collect())
+}
+
+/// Strip one matching pair of surrounding single or double quotes
+/// (`unquoteName`, frontmatter.ts:61-68 @ 3a63e0ad).
+fn unquote_name(value: &str) -> String {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let first = bytes[0];
+        let last = bytes[value.len() - 1];
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
 }
 
 /// `tools` frontmatter scalar forms (TE18 FR-A, R7.1.4.1 / #1047/#1049).
@@ -87,7 +134,7 @@ pub fn parse_tools_field(raw: Option<&str>) -> Option<Vec<String>> {
     match raw.map(str::trim) {
         Some("inherit") => None,
         Some("false") => Some(Vec::new()),
-        other => parse_frontmatter_list(other),
+        other => parse_unquoted_list(other),
     }
 }
 
@@ -196,6 +243,7 @@ pub fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
     let mut current_block_lines: Option<Vec<String>> = None;
     let mut current_indent: usize = 0;
     let mut current_folded = false;
+    let mut current_literal = false;
 
     let flush = |frontmatter: &mut std::collections::BTreeMap<String, String>,
                  key: &mut Option<String>,
@@ -219,14 +267,18 @@ pub fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
         let indent = line.chars().take_while(|c| c.is_whitespace()).count();
         let trimmed = line.trim();
 
+        // Comment lines are content only inside a `|` or `>` block scalar.
+        // Elsewhere they must neither end a pending list block nor become
+        // part of its value (frontmatter.ts:104-109 @ 3a63e0ad, #2995).
+        if trimmed.starts_with('#') && !current_folded && !current_literal {
+            continue;
+        }
+
         let in_block = current_key.is_some()
             && current_block_lines.is_some()
-            && (indent > current_indent || ((current_folded) && trimmed.is_empty()));
+            && (indent > current_indent
+                || ((current_folded || current_literal) && trimmed.is_empty()));
         if in_block {
-            // Note: upstream also treats a literal `|` block's empty lines as
-            // continuation (`(currentFolded || currentLiteral) && trimmed===""`,
-            // frontmatter.ts:92); literal blocks are collected un-folded either
-            // way, so a single flag suffices here.
             if let Some(lines) = current_block_lines.as_mut() {
                 lines.push(line.to_string());
             }
@@ -240,12 +292,31 @@ pub fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
             current_folded,
         );
         current_folded = false;
+        current_literal = false;
         current_indent = 0;
 
         if let Some((key, raw_value)) = split_key_line(line) {
             let raw_value = raw_value.trim();
-            let is_quoted = (raw_value.starts_with('"') && raw_value.ends_with('"'))
-                || (raw_value.starts_with('\'') && raw_value.ends_with('\''));
+            let quote = raw_value.chars().next();
+            let name_list = matches!(
+                key,
+                "tools"
+                    | "excludeTools"
+                    | "mutationTools"
+                    | "extensions"
+                    | "subagentOnlyExtensions"
+            );
+            // `"read", "bash"` starts and ends with a quote, but it is a list.
+            // Keep those item quotes for the splitter (frontmatter.ts:140-145
+            // @ 3a63e0ad, #3017).
+            let quoted_list = name_list
+                && matches!(quote, Some('"') | Some('\''))
+                && (raw_value.contains(&format!("{},", quote.unwrap_or(' ')))
+                    || raw_value.contains(&format!(", {}", quote.unwrap_or(' '))));
+            let closing = quote.unwrap_or(' ');
+            let is_quoted = !quoted_list
+                && matches!(quote, Some('"') | Some('\''))
+                && raw_value.ends_with(closing);
             let value = if is_quoted && raw_value.len() >= 2 {
                 &raw_value[1..raw_value.len() - 1]
             } else if is_quoted {
@@ -261,6 +332,7 @@ pub fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
                 current_block_lines = Some(Vec::new());
                 current_indent = indent;
                 current_folded = is_folded;
+                current_literal = is_literal;
             } else {
                 frontmatter.insert(key.to_string(), value.to_string());
             }
@@ -380,6 +452,94 @@ mod tests {
         let parsed = parse_frontmatter("---\n# a comment\nname: x\nnot a pair\n---\nbody");
         assert_eq!(parsed.frontmatter.len(), 1);
         assert_eq!(parsed.body, "body");
+    }
+
+    // v0.83.0 (#2995/#3001): YAML comments in agent frontmatter lists.
+    fn tools_of(frontmatter: &str) -> Option<Vec<String>> {
+        let parsed = parse_frontmatter(&format!("---\n{frontmatter}\nname: worker\n---\nbody"));
+        parse_frontmatter_list(parsed.frontmatter.get("tools").map(String::as_str))
+    }
+
+    #[test]
+    fn ignores_yaml_comments_in_tool_lists() {
+        assert_eq!(
+            tools_of("tools:\n  - read\n  # note\n  - bash"),
+            Some(vec!["read".into(), "bash".into()])
+        );
+        assert_eq!(
+            tools_of("tools:\n  - read\n# note\n  - bash"),
+            Some(vec!["read".into(), "bash".into()])
+        );
+        assert_eq!(
+            tools_of("tools:\n  - read # why\n  - bash"),
+            Some(vec!["read".into(), "bash".into()])
+        );
+        assert_eq!(
+            tools_of("tools:\n  - read\n  # note, more\n  - bash"),
+            Some(vec!["read".into(), "bash".into()])
+        );
+    }
+
+    #[test]
+    fn keeps_hash_inside_quoted_list_items_and_block_scalars() {
+        assert_eq!(
+            tools_of("tools:\n  - \"a # b\"\n  - bash"),
+            Some(vec!["\"a # b\"".into(), "bash".into()])
+        );
+        let parsed = parse_frontmatter("---\ndefaultReads: \"notes #1.md\"\n---\nbody");
+        assert_eq!(
+            parse_frontmatter_list(parsed.frontmatter.get("defaultReads").map(String::as_str)),
+            Some(vec!["notes #1.md".into()])
+        );
+        let parsed = parse_frontmatter(
+            "---\ndescription: |\n  first\n  # kept\nnotes: >\n  one\n  # two\n---\nbody",
+        );
+        assert_eq!(parsed.frontmatter["description"], "first\n# kept");
+        assert_eq!(parsed.frontmatter["notes"], "one # two");
+    }
+
+    // v0.83.0 (#3017): quoted names in tool and extension lists.
+    fn unquoted_tools_of(value: &str) -> Option<Vec<String>> {
+        let parsed = parse_frontmatter(&format!("---\ntools: {value}\nname: worker\n---\nbody"));
+        parse_unquoted_list(parsed.frontmatter.get("tools").map(String::as_str))
+    }
+
+    #[test]
+    fn reads_each_quoted_item_without_its_quote_marks() {
+        assert_eq!(
+            unquoted_tools_of("\"read\", \"bash\""),
+            Some(vec!["read".into(), "bash".into()])
+        );
+        assert_eq!(
+            unquoted_tools_of("'read', 'bash'"),
+            Some(vec!["read".into(), "bash".into()])
+        );
+        assert_eq!(unquoted_tools_of("\"read\""), Some(vec!["read".into()]));
+        let parsed =
+            parse_frontmatter("---\ntools:\n  - \"read\"\n  - bash\nname: worker\n---\nbody");
+        assert_eq!(
+            parse_unquoted_list(parsed.frontmatter.get("tools").map(String::as_str)),
+            Some(vec!["read".into(), "bash".into()])
+        );
+        assert_eq!(unquoted_tools_of("false"), Some(vec!["false".into()]));
+        assert_eq!(parse_unquoted_list(None), None);
+        let description = parse_frontmatter(
+            "---\ndescription: \"Review \\\"a\\\", then continue\"\nname: worker\n---\nbody",
+        );
+        assert_eq!(
+            description.frontmatter["description"],
+            "Review \\\"a\\\", then continue"
+        );
+    }
+
+    #[test]
+    fn tools_field_still_maps_inherit_and_false_before_unquoting() {
+        assert_eq!(parse_tools_field(Some("inherit")), None);
+        assert_eq!(parse_tools_field(Some("false")), Some(vec![]));
+        assert_eq!(
+            parse_tools_field(Some("\"read\", \"bash\"")),
+            Some(vec!["read".into(), "bash".into()])
+        );
     }
 
     #[test]

@@ -115,6 +115,11 @@ pub fn replay_keys_case(input: &Value, key_matrix: &[Value]) -> Value {
             .and_then(Value::as_str)
             .unwrap_or("ctrl+]")
             .to_owned(),
+        notes_key: runtime_input
+            .get("notesKey")
+            .and_then(Value::as_str)
+            .unwrap_or("n")
+            .to_owned(),
     };
     let inputs = input
         .get("keys")

@@ -449,6 +449,7 @@ mod tests {
         assert_eq!(definition["renderResult"], json!(true));
 
         let config = AskUserQuestionConfig {
+            notes_key: None,
             guidance: crate::config::GuidanceFields {
                 description: Some("custom description".to_owned()),
                 prompt_snippet: Some("custom snippet".to_owned()),

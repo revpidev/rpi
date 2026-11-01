@@ -8,7 +8,7 @@
 //! terminal, the body scrolls between the sticky regions and overflow
 //! indicators (`↑`/`↓`/`↕`, dim) mark the clipped direction (FR-Q3-B).
 
-use crate::config::format_key_spec_for_display;
+use crate::config::{format_key_spec_for_display, format_notes_key_for_display};
 use crate::i18n::I18n;
 use crate::state::build::QuestionItem;
 use crate::state::reducer::QuestionnaireState;
@@ -28,8 +28,12 @@ pub const HINT_PART_NEW_LINE: &str = "Shift+Enter for newline";
 pub const HINT_PART_CLEAR: &str = "Ctrl+U to clear";
 /// `Space to toggle`.
 pub const HINT_PART_TOGGLE: &str = "Space to toggle";
-/// `n to add notes`.
+/// `{key} to add notes` (templated on the configurable notes key).
+pub const HINT_PART_NOTES_TEMPLATE: &str = "{key} to add notes";
+/// `n to add notes` (default-key rendering of the notes template).
 pub const HINT_PART_NOTES: &str = "n to add notes";
+/// `{key}` placeholder shared by the collapse/expand/notes hints.
+pub const KEY_PLACEHOLDER: &str = "{key}";
 /// `Tab to switch questions`.
 pub const HINT_PART_TAB: &str = "Tab to switch questions";
 /// `Esc to cancel`.
@@ -38,7 +42,9 @@ pub const HINT_PART_CANCEL: &str = "Esc to cancel";
 pub const HINT_PART_COLLAPSE_TEMPLATE: &str = "{key} to collapse";
 /// `{key} to expand · Esc to cancel` (`hint.expand_line`; the collapsed row).
 pub const COLLAPSED_HINT_TEMPLATE: &str = "{key} to expand · Esc to cancel";
-/// `n to add a note` (Submit-tab hint).
+/// `{key} to add a note` (Submit-tab hint).
+pub const REVIEW_GLOBAL_HINT_TEMPLATE: &str = "{key} to add a note";
+/// `n to add a note` (default-key rendering of the Submit-tab hint).
 pub const REVIEW_GLOBAL_HINT: &str = "n to add a note";
 /// Collapse key sentinel meaning "no shortcut".
 pub const COLLAPSE_KEY_OFF: &str = "off";
@@ -79,6 +85,8 @@ pub struct DialogModel<'a> {
     pub notes_cursor: Option<usize>,
     /// Resolved collapse key spec (`"ctrl+]"`, `"alt+o"`, or `"off"`).
     pub collapse_key: &'a str,
+    /// Resolved notes key (`resolve_notes_key` output: `"n"` by default).
+    pub notes_key: &'a str,
     /// Frame width in columns (the pane width).
     pub width: usize,
     /// Terminal width in columns (the preview breakpoint gate; the overlay
@@ -148,6 +156,7 @@ fn tab_body_height(model: &DialogModel<'_>, tab: usize, option_index: usize) -> 
             model.items_by_tab,
             model.i18n,
             model.theme,
+            model.notes_key,
             model.input_text,
             model.input_cursor,
             model.terminal_width,
@@ -244,6 +253,7 @@ pub fn build_hint_text(
     is_multi: bool,
     state: &QuestionnaireState,
     collapse_key: &str,
+    notes_key: &str,
     i18n: &I18n,
 ) -> String {
     let mut parts = vec![
@@ -254,7 +264,10 @@ pub fn build_hint_text(
         parts.push(i18n.t("hint.toggle", HINT_PART_TOGGLE).to_owned());
     }
     if question.is_some() && !state.notes_visible && !state.input_mode {
-        parts.push(i18n.t("hint.notes", HINT_PART_NOTES).to_owned());
+        parts.push(
+            i18n.t("hint.notes", HINT_PART_NOTES_TEMPLATE)
+                .replace(KEY_PLACEHOLDER, &format_notes_key_for_display(notes_key)),
+        );
     }
     if is_multi {
         parts.push(i18n.t("hint.tab", HINT_PART_TAB).to_owned());
@@ -276,13 +289,16 @@ pub fn build_hint_text(
 }
 
 /// `buildSubmitHintText` — the Submit-tab footer.
-pub fn build_submit_hint_text(state: &QuestionnaireState, i18n: &I18n) -> String {
+pub fn build_submit_hint_text(state: &QuestionnaireState, notes_key: &str, i18n: &I18n) -> String {
     let mut parts = vec![
         i18n.t("hint.enter", HINT_PART_ENTER).to_owned(),
         i18n.t("hint.navigate", HINT_PART_NAV).to_owned(),
     ];
     if !state.notes_visible {
-        parts.push(i18n.t("review.global_hint", REVIEW_GLOBAL_HINT).to_owned());
+        parts.push(
+            i18n.t("review.global_hint", REVIEW_GLOBAL_HINT_TEMPLATE)
+                .replace(KEY_PLACEHOLDER, &format_notes_key_for_display(notes_key)),
+        );
     }
     parts.push(i18n.t("hint.cancel", HINT_PART_CANCEL).to_owned());
     if state.notes_visible {
@@ -378,9 +394,11 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
             cursor = cursor.or(notes_cursor);
         }
         lines.push(truncate_line(
-            &model
-                .theme
-                .dim(&build_submit_hint_text(model.state, model.i18n)),
+            &model.theme.dim(&build_submit_hint_text(
+                model.state,
+                model.notes_key,
+                model.i18n,
+            )),
             model.width,
         ));
         // Submit-tab footer = blank + prompt + picker rows + hint (the
@@ -444,6 +462,7 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
             model.items_by_tab,
             model.i18n,
             model.theme,
+            model.notes_key,
             model.input_text,
             model.input_cursor,
             model.terminal_width,
@@ -484,6 +503,7 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
             is_multi,
             model.state,
             model.collapse_key,
+            model.notes_key,
             model.i18n,
         )),
         model.width,
@@ -706,6 +726,31 @@ mod tests {
         collapse_key: &'a str,
         width: usize,
     ) -> DialogModel<'a> {
+        model_with_notes_key(
+            state,
+            questions,
+            items,
+            i18n,
+            theme,
+            input_text,
+            collapse_key,
+            "n",
+            width,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // test helper mirrors the render context
+    fn model_with_notes_key<'a>(
+        state: &'a QuestionnaireState,
+        questions: &'a [QuestionData],
+        items: &'a [Vec<QuestionItem>],
+        i18n: &'a I18n,
+        theme: &'a Theme,
+        input_text: &'a str,
+        collapse_key: &'a str,
+        notes_key: &'a str,
+        width: usize,
+    ) -> DialogModel<'a> {
         DialogModel {
             state,
             questions,
@@ -717,6 +762,7 @@ mod tests {
             notes_text: "",
             notes_cursor: None,
             collapse_key,
+            notes_key,
             width,
             terminal_width: width,
             height: None,
@@ -864,7 +910,7 @@ mod tests {
         let i18n = I18n::for_locale("en");
         let mut state = QuestionnaireState::initial();
         state.input_mode = true;
-        let hint = build_hint_text(None, false, &state, "ctrl+]", &i18n);
+        let hint = build_hint_text(None, false, &state, "ctrl+]", "n", &i18n);
         assert!(!hint.contains("n to add notes"), "{hint}");
         assert!(hint.contains("Shift+Enter for newline"), "{hint}");
         assert!(hint.contains("Ctrl+U to clear"), "{hint}");
@@ -874,12 +920,12 @@ mod tests {
     fn submit_hint_swaps_the_note_part_when_the_editor_is_open() {
         let i18n = I18n::for_locale("en");
         let state = QuestionnaireState::initial();
-        let resting = build_submit_hint_text(&state, &i18n);
+        let resting = build_submit_hint_text(&state, "n", &i18n);
         assert!(resting.contains("n to add a note"), "{resting}");
         assert!(!resting.contains("Shift+Enter"), "{resting}");
         let mut editing = QuestionnaireState::initial();
         editing.notes_visible = true;
-        let editing = build_submit_hint_text(&editing, &i18n);
+        let editing = build_submit_hint_text(&editing, "n", &i18n);
         assert!(!editing.contains("n to add a note"), "{editing}");
         assert!(editing.contains("Shift+Enter for newline"), "{editing}");
     }
@@ -1022,7 +1068,7 @@ mod tests {
         assert!(frame.cursor.is_some(), "notes editor reports a cursor");
         // The hint builder swaps the notes part for the newline part; at this
         // width the frame's clipped footer keeps only the core prefix.
-        let hint = build_hint_text(questions.first(), false, &state, "ctrl+]", &i18n);
+        let hint = build_hint_text(questions.first(), false, &state, "ctrl+]", "n", &i18n);
         assert!(hint.contains("Shift+Enter for newline"), "{hint}");
         assert!(!hint.contains("n to add notes"), "{hint}");
         let footer = plain.last().expect("hint");

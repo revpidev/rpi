@@ -4,7 +4,7 @@
 //! four questions, multi-select, inline-input draft, Submit page — at widths
 //! 80/100/120. The generator (`scripts/ask-user-question-parity/
 //! gen-golden-frames.mjs` → `parity_runner golden`) writes one JSONL file per
-//! scenario/width into `fixtures/generated/ask-user-question-parity/
+//! scenario/width into `fixtures/generated/ask-user-question-parity-v2150/
 //! golden-frames/`; the Rust integration test and `run-parity.mjs` re-render
 //! and compare byte-for-byte, so any visual change must be re-recorded
 //! deliberately (the Q3 rich-interaction pass re-records this baseline).
@@ -288,8 +288,12 @@ pub fn renders() -> Vec<GoldenRender> {
             let params = QuestionParams {
                 questions: questions.clone(),
             };
-            let mut component =
-                QuestionnaireComponent::new(&params, I18n::for_locale("en"), "ctrl+]".to_owned());
+            let mut component = QuestionnaireComponent::new(
+                &params,
+                I18n::for_locale("en"),
+                "ctrl+]".to_owned(),
+                "n".to_owned(),
+            );
             let mut frames = Vec::new();
             for event in &events {
                 if !event.is_empty() {
@@ -517,11 +521,19 @@ mod tests {
         let params = QuestionParams {
             questions: vec![single_question()],
         };
-        let mut component =
-            QuestionnaireComponent::new(&params, I18n::for_locale("en"), "ctrl+]".to_owned());
+        let mut component = QuestionnaireComponent::new(
+            &params,
+            I18n::for_locale("en"),
+            "ctrl+]".to_owned(),
+            "n".to_owned(),
+        );
         let trait_lines = Component::render(&mut component, 80);
-        let mut fixture =
-            QuestionnaireComponent::new(&params, I18n::for_locale("en"), "ctrl+]".to_owned());
+        let mut fixture = QuestionnaireComponent::new(
+            &params,
+            I18n::for_locale("en"),
+            "ctrl+]".to_owned(),
+            "n".to_owned(),
+        );
         let fixture_lines = fixture.render_frame(80);
         assert_eq!(trait_lines, fixture_lines);
     }

@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::state::build::QuestionItem;
 use crate::state::key_router::Action;
-use crate::state::row_intent::meta;
+use crate::state::row_intent::{RowKind, meta};
 use crate::tool::types::{AnswerKind, QuestionAnswer, QuestionData, QuestionnaireResult};
 
 /// Canonical questionnaire state (upstream `QuestionnaireState`).
@@ -364,6 +364,31 @@ fn without_custom_draft(state: &QuestionnaireState, tab: usize) -> BTreeMap<usiz
     drafts
 }
 
+/// Row focused on entering a tab (`answeredRowIndex`, state-reducer.ts
+/// :127-138 @ 3a63e0ad, #281): the chosen option, or Next for a multi-select
+/// answer, so a stray Enter re-confirms the answer instead of replacing it
+/// with row 0. A custom answer starts at row 0, since focusing its row would
+/// enter input mode.
+fn answered_row_index(
+    answer: Option<&QuestionAnswer>,
+    items: &[crate::state::build::QuestionItem],
+) -> usize {
+    let mut index: Option<usize> = None;
+    match answer.map(|answer| &answer.kind) {
+        Some(AnswerKind::Option) => {
+            let label = answer.and_then(|answer| answer.answer.as_deref());
+            index = items.iter().position(|item| {
+                item.kind == RowKind::Option && Some(item.label.as_str()) == label
+            });
+        }
+        Some(AnswerKind::Multi) => {
+            index = items.iter().position(|item| item.kind == RowKind::Next);
+        }
+        _ => {}
+    }
+    index.unwrap_or(0)
+}
+
 /// `switchTabResult` — reset per-tab transients and rehydrate the target
 /// question's draft/notes.
 fn switch_tab_result(
@@ -374,7 +399,13 @@ fn switch_tab_result(
     let notes_value = notes_value_for(state, next_tab);
     let transitioned = QuestionnaireState {
         current_tab: next_tab,
-        option_index: 0,
+        option_index: answered_row_index(
+            state.answers.get(&next_tab),
+            ctx.items_by_tab
+                .get(next_tab)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        ),
         input_mode: false,
         notes_visible: false,
         multi_select_checked: sync_multi_select_from_answers(
@@ -1302,6 +1333,7 @@ mod tests {
             current_item: items[0].first(),
             items: &items[0],
             collapse_key: "ctrl+]".to_owned(),
+            notes_key: "n".to_owned(),
         };
         let action = route_key("\r", &state, &runtime);
         let result = apply(&state, &action, &ctx);

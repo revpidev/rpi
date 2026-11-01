@@ -1114,13 +1114,33 @@ static TOOL_FAILURE_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
         .expect("tool failure prefix regex")
 });
 
-/// `isContextOverflow` (model-resolution.ts @ b72714de, kept through the
+/// Separates an error from the reply text appended to it; classification
+/// reads only the part before it (`ERROR_REPLY_TEXT_SEPARATOR`,
+/// model-resolution.ts @ 3a63e0ad, #2913).
+pub const ERROR_REPLY_TEXT_SEPARATOR: &str = "\nReply text: ";
+
+/// The part of a child error that a classifier may read: everything before
+/// any appended reply text (`errorWithoutReplyText`, same file, #2913).
+pub fn error_without_reply_text(error: Option<&str>) -> Option<&str> {
+    error.map(|error| {
+        error
+            .split_once(ERROR_REPLY_TEXT_SEPARATOR)
+            .map_or(error, |(head, _)| head)
+    })
+}
+
+/// `isContextOverflow` (model-resolution.ts @ 3a63e0ad, kept through the
 /// #2270 removal): a terminal, non-retryable classification for surfacing
-/// a clear input-too-large error.
-pub fn is_context_overflow(error: Option<&str>) -> bool {
-    let Some(error) = error else {
+/// a clear input-too-large error. #2913: only the error before any appended
+/// reply text is classified, so a reply that happens to mention the context
+/// cannot reclassify a provider stop.
+pub fn is_context_overflow(full_error: Option<&str>) -> bool {
+    let Some(error) = error_without_reply_text(full_error) else {
         return false;
     };
+    if error.is_empty() {
+        return false;
+    }
     if TOOL_FAILURE_PREFIX.is_match(error.trim()) {
         return false;
     }
@@ -1391,6 +1411,23 @@ mod tests {
         assert!(!is_context_overflow(Some(
             "write failed (exit 1): token limit exceeded"
         )));
+    }
+
+    #[test]
+    fn context_overflow_ignores_appended_reply_text() {
+        // #2913: only the part before the reply-text separator is classified.
+        assert_eq!(
+            error_without_reply_text(Some("rate limit exceeded\nReply text: hello")),
+            Some("rate limit exceeded")
+        );
+        assert!(!is_context_overflow(Some(
+            "content_filter\nReply text: maximum context length is 200000 tokens"
+        )));
+        assert!(is_context_overflow(Some(
+            "maximum context length is 200000 tokens\nReply text: truncated"
+        )));
+        assert_eq!(error_without_reply_text(None), None);
+        assert_eq!(error_without_reply_text(Some("plain")), Some("plain"));
     }
 }
 

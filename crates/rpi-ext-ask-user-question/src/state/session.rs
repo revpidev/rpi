@@ -34,7 +34,7 @@ use rpi_ext_host::interactive_ui::{
 use serde_json::{Value, json};
 
 use crate::HostCall;
-use crate::config::{AskUserQuestionConfig, resolve_collapse_key};
+use crate::config::{AskUserQuestionConfig, resolve_collapse_key, resolve_notes_key};
 use crate::i18n::I18n;
 use crate::state::build::{QuestionItem, build_items_for_question};
 use crate::state::key_router::{
@@ -323,6 +323,7 @@ pub struct QuestionnaireComponent {
     input: InputBuffer,
     notes: InputBuffer,
     collapse_key: String,
+    notes_key: String,
     width: usize,
     height: Option<usize>,
     terminal_width: usize,
@@ -334,7 +335,12 @@ pub struct QuestionnaireComponent {
 
 impl QuestionnaireComponent {
     /// Build a component for `params` (items are derived with `i18n`).
-    pub fn new(params: &QuestionParams, i18n: I18n, collapse_key: String) -> Self {
+    pub fn new(
+        params: &QuestionParams,
+        i18n: I18n,
+        collapse_key: String,
+        notes_key: String,
+    ) -> Self {
         let items_by_tab = params
             .questions
             .iter()
@@ -350,6 +356,7 @@ impl QuestionnaireComponent {
             input: InputBuffer::new(),
             notes: InputBuffer::new(),
             collapse_key,
+            notes_key,
             width: 80,
             height: None,
             terminal_width: 0,
@@ -409,6 +416,7 @@ impl QuestionnaireComponent {
             notes_text: &self.notes.text(),
             notes_cursor: Some(self.notes.cursor()),
             collapse_key: &self.collapse_key,
+            notes_key: &self.notes_key,
             width,
             terminal_width: if self.terminal_width == 0 {
                 width
@@ -443,6 +451,7 @@ impl QuestionnaireComponent {
                 current_item: items.get(self.state.option_index),
                 items,
                 collapse_key: self.collapse_key.clone(),
+                notes_key: self.notes_key.clone(),
             };
             route_key(data, &self.state, &runtime)
         };
@@ -676,7 +685,9 @@ pub fn run(
     config: &AskUserQuestionConfig,
 ) -> Result<QuestionnaireResult, InteractiveUiError> {
     let collapse_key = resolve_collapse_key(config);
-    let mut component = QuestionnaireComponent::new(params, i18n.clone(), collapse_key.clone());
+    let notes_key = resolve_notes_key(config);
+    let mut component =
+        QuestionnaireComponent::new(params, i18n.clone(), collapse_key.clone(), notes_key);
     let options = mount_options(&collapse_key);
     let adapter = AbiHostAdapter { host };
     let handle = mount_component(&adapter, &options)?;
@@ -857,7 +868,8 @@ mod tests {
     fn dispatch_confirm_answers_and_finishes() {
         let i18n = I18n::for_locale("en");
         let params = params(false, 1);
-        let mut component = QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned());
+        let mut component =
+            QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned(), "n".to_owned());
         component.dispatch("\r");
         let done = component.done().expect("done");
         assert_eq!(done["answers"][0]["answer"], "A");
@@ -868,7 +880,8 @@ mod tests {
     fn dispatch_navigation_and_inline_input_keeps_drafts_per_option() {
         let i18n = I18n::for_locale("en");
         let params = params(false, 1);
-        let mut component = QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned());
+        let mut component =
+            QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned(), "n".to_owned());
         // Down to the "Type something." row and type.
         component.dispatch("\x1b[B");
         component.dispatch("\x1b[B");
@@ -899,7 +912,8 @@ mod tests {
     fn note_editor_draft_and_close() {
         let i18n = I18n::for_locale("en");
         let params = params(false, 1);
-        let mut component = QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned());
+        let mut component =
+            QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned(), "n".to_owned());
         component.dispatch("n");
         assert!(component.state.notes_visible);
         component.dispatch("n"); // 'n' types an 'n' inside the editor
@@ -934,7 +948,8 @@ mod tests {
     fn global_note_opens_from_submit_and_lifts_on_done() {
         let i18n = I18n::for_locale("en");
         let params = params(false, 2);
-        let mut component = QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned());
+        let mut component =
+            QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned(), "n".to_owned());
         component.state.current_tab = 2; // Submit tab
         component.dispatch("n");
         assert!(component.state.notes_visible);
@@ -955,7 +970,8 @@ mod tests {
     fn collapse_cycle_and_reopen() {
         let i18n = I18n::for_locale("en");
         let params = params(false, 1);
-        let mut component = QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned());
+        let mut component =
+            QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned(), "n".to_owned());
         component.dispatch("\x1d"); // ctrl+]
         assert!(component.state.collapsed);
         assert_eq!(
@@ -970,8 +986,12 @@ mod tests {
             vec![HostEffect::SetOverlayHidden { hidden: false }]
         );
 
-        let mut off =
-            QuestionnaireComponent::new(&params, I18n::for_locale("en"), "off".to_owned());
+        let mut off = QuestionnaireComponent::new(
+            &params,
+            I18n::for_locale("en"),
+            "off".to_owned(),
+            "n".to_owned(),
+        );
         off.dispatch("\x1d");
         assert!(!off.state.collapsed, "off never toggles");
         assert!(off.take_host_effects().is_empty());
@@ -985,7 +1005,8 @@ mod tests {
     fn hidden_esc_does_not_cancel() {
         let i18n = I18n::for_locale("en");
         let params = params(false, 1);
-        let mut component = QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned());
+        let mut component =
+            QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned(), "n".to_owned());
         component.dispatch("\x1d");
         assert!(component.state.collapsed);
         let _ = component.take_host_effects();
@@ -1005,7 +1026,8 @@ mod tests {
     fn external_editor_effect_and_writeback() {
         let i18n = I18n::for_locale("en");
         let params = params(false, 1);
-        let mut component = QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned());
+        let mut component =
+            QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned(), "n".to_owned());
         component.dispatch("\x1b[B");
         component.dispatch("\x1b[B"); // input mode
         component.dispatch("draft");
@@ -1245,7 +1267,8 @@ mod tests {
     fn dispose_returns_a_cancelled_result_with_partial_answers() {
         let i18n = I18n::for_locale("en");
         let params = params(false, 1);
-        let mut component = QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned());
+        let mut component =
+            QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned(), "n".to_owned());
         component.state.answers.insert(
             0,
             crate::tool::types::QuestionAnswer {
@@ -1284,7 +1307,8 @@ mod tests {
     fn theme_event_replaces_the_palette() {
         let i18n = I18n::for_locale("en");
         let params = params(false, 1);
-        let mut component = QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned());
+        let mut component =
+            QuestionnaireComponent::new(&params, i18n, "ctrl+]".to_owned(), "n".to_owned());
         component.on_theme(&serde_json::json!({"colors": {"accent": "#ff0000"}}));
         assert_eq!(
             component.theme.accent,

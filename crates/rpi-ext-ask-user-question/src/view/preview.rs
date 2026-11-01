@@ -345,10 +345,14 @@ pub const NOTES_AFFORDANCE_OVERHEAD: usize = 2;
 
 // ----- preview-block-renderer.ts -----
 
-/// `preview.notes_affordance` canonical English.
+/// `preview.notes_affordance` template (`{key}` = the notes key).
+pub const NOTES_AFFORDANCE_TEMPLATE: &str = "Notes: press {key} to add notes";
+/// `preview.notes_edit_affordance` template: the affordance once the question
+/// carries a saved note (v2.13.7, #197).
+pub const NOTES_EDIT_AFFORDANCE_TEMPLATE: &str = "Note saved: press {key} to edit";
+/// Default-key (`n`) rendering of the add-note affordance.
 pub const NOTES_AFFORDANCE_TEXT: &str = "Notes: press n to add notes";
-/// `preview.notes_edit_affordance` canonical English: the affordance once the
-/// question carries a saved note (v2.13.7, #197).
+/// Default-key (`n`) rendering of the edit-note affordance.
 pub const NOTES_EDIT_AFFORDANCE_TEXT: &str = "Note saved: press n to edit";
 
 /// Content row budget for a layout mode: preview cap minus border +
@@ -455,15 +459,17 @@ pub struct PreviewBlockRenderer {
     cache: MarkdownContentCache,
     theme: Theme,
     i18n: I18n,
+    notes_key: String,
 }
 
 impl PreviewBlockRenderer {
     /// New renderer for `question`.
-    pub fn new(question: &QuestionData, theme: Theme, i18n: I18n) -> Self {
+    pub fn new(question: &QuestionData, theme: Theme, i18n: I18n, notes_key: &str) -> Self {
         Self {
             cache: MarkdownContentCache::new(question, theme, i18n.clone()),
             theme,
             i18n,
+            notes_key: notes_key.to_owned(),
         }
     }
 
@@ -523,11 +529,17 @@ impl PreviewBlockRenderer {
         let show_affordance = focused && !notes_visible && self.cache.has(option_index);
         let affordance = if show_affordance {
             let (key, fallback) = if has_note {
-                ("preview.notes_edit_affordance", NOTES_EDIT_AFFORDANCE_TEXT)
+                (
+                    "preview.notes_edit_affordance",
+                    NOTES_EDIT_AFFORDANCE_TEMPLATE,
+                )
             } else {
-                ("preview.notes_affordance", NOTES_AFFORDANCE_TEXT)
+                ("preview.notes_affordance", NOTES_AFFORDANCE_TEMPLATE)
             };
-            self.theme.muted(self.i18n.t(key, fallback))
+            self.theme.muted(&self.i18n.t(key, fallback).replace(
+                "{key}",
+                &crate::config::format_notes_key_for_display(&self.notes_key),
+            ))
         } else {
             String::new()
         };
@@ -575,6 +587,7 @@ pub fn compose(
     items_by_tab: &[Vec<QuestionItem>],
     i18n: &I18n,
     theme: &Theme,
+    notes_key: &str,
     input_text: &str,
     input_cursor: Option<usize>,
     terminal_width: usize,
@@ -592,7 +605,7 @@ pub fn compose(
             width,
         );
     };
-    let mut block = PreviewBlockRenderer::new(question, *theme, i18n.clone());
+    let mut block = PreviewBlockRenderer::new(question, *theme, i18n.clone(), notes_key);
     // v2.13.7 (#197): a saved note switches the preview affordance to
     // `preview.notes_edit_affordance` so the key stays discoverable.
     let has_note = state
@@ -834,7 +847,7 @@ mod tests {
             options: vec![option("A", Some(&long_preview)), option("B", None)],
             multi_select: None,
         };
-        let mut block = PreviewBlockRenderer::new(&question, theme, i18n);
+        let mut block = PreviewBlockRenderer::new(&question, theme, i18n, "n");
         let stacked = block.render_block(60, 0, PreviewLayoutMode::Stacked, true, false, false);
         // Cap 15 - borders 2 - affordance 2 = 11 content rows + chrome 4.
         assert_eq!(stacked.len(), 15);
@@ -879,6 +892,7 @@ mod tests {
             std::slice::from_ref(&items),
             &i18n,
             &theme,
+            "n",
             "",
             None,
             120,
@@ -910,6 +924,7 @@ mod tests {
             std::slice::from_ref(&items),
             &i18n,
             &theme,
+            "n",
             "",
             None,
             80,

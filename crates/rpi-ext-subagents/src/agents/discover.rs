@@ -652,7 +652,7 @@ pub fn agent_from_content(
     // #1776: frontmatter excludeTools is a plain list (agents.ts:1995/2118
     // @ 0fc0eebb); empty block lists carry no effect.
     let exclude_tools =
-        super::frontmatter::parse_frontmatter_list(fm.get("excludeTools").map(String::as_str))
+        super::frontmatter::parse_unquoted_list(fm.get("excludeTools").map(String::as_str))
             .unwrap_or_default();
     let default_reads =
         super::frontmatter::parse_frontmatter_list(fm.get("defaultReads").map(String::as_str))
@@ -714,8 +714,8 @@ pub fn agent_from_content(
         None => None,
     };
     let extensions =
-        super::frontmatter::parse_frontmatter_list(fm.get("extensions").map(String::as_str));
-    let subagent_only_extensions = super::frontmatter::parse_frontmatter_list(
+        super::frontmatter::parse_unquoted_list(fm.get("extensions").map(String::as_str));
+    let subagent_only_extensions = super::frontmatter::parse_unquoted_list(
         fm.get("subagentOnlyExtensions").map(String::as_str),
     );
 

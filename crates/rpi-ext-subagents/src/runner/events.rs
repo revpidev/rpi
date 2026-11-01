@@ -1053,8 +1053,11 @@ impl ChildRunState {
                 .get("errorMessage")
                 .and_then(Value::as_str)
                 .filter(|e| !e.is_empty());
-            if let Some(error) = error_message {
-                self.assistant_error = Some(error.to_string());
+            if error_message.is_some() {
+                // #2913 (c3420699): a provider error stop keeps its reply text
+                // (bounded and labelled) so a policy refusal's explanation
+                // reaches the parent.
+                self.assistant_error = super::display::assistant_message_error(message);
             } else if has_tool_call && stop_reason == Some("toolUse") {
                 // #1919 (3e9c36e3, execution.ts:1120-1124): a recovered
                 // request can finish via a terminating tool, without a text

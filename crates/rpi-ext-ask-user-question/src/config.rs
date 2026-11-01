@@ -34,6 +34,8 @@ use crate::tool::types::{MAX_QUESTIONS, MIN_OPTIONS};
 pub const DEFAULT_COLLAPSE_KEY: &str = "ctrl+]";
 /// Sentinel value disabling the collapse shortcut (`COLLAPSE_KEY_OFF`).
 pub const COLLAPSE_KEY_OFF: &str = "off";
+/// Key that opens the notes editor (`DEFAULT_NOTES_KEY`, config.ts @ 3a63e0ad).
+pub const DEFAULT_NOTES_KEY: &str = "n";
 /// Config directory name (upstream package directory).
 pub const CONFIG_DIR_NAME: &str = "rpi-ask-user-question";
 /// Config file name.
@@ -57,6 +59,8 @@ pub struct AskUserQuestionConfig {
     pub guidance: GuidanceFields,
     /// Raw `collapseKey` string when the JSON value was a string.
     pub collapse_key: Option<String>,
+    /// Raw `notesKey` string when the JSON value was a string.
+    pub notes_key: Option<String>,
 }
 
 /// Home directory (`$HOME` on Unix, `%USERPROFILE%` on Windows — the
@@ -280,6 +284,42 @@ pub fn resolve_collapse_key(config: &AskUserQuestionConfig) -> String {
     }
 }
 
+/// Keys the questionnaire already navigates with — a notes key on one of them
+/// would shadow it (`NOTES_KEY_RESERVED`, config.ts:79 @ 3a63e0ad).
+const NOTES_KEY_RESERVED: [&str; 10] = [
+    "space", "enter", "return", "tab", "escape", "esc", "up", "down", "left", "right",
+];
+
+/// Resolve the effective notes key (`resolveNotesKey`, config.ts:81-88
+/// @ 3a63e0ad): trim, empty/unset → `n`, a single character of any script
+/// matches as typed, anything else must be a valid key spec that does not
+/// shadow navigation, else `n`.
+pub fn resolve_notes_key(config: &AskUserQuestionConfig) -> String {
+    let raw = config.notes_key.as_deref().unwrap_or("").trim();
+    if raw.is_empty() {
+        return DEFAULT_NOTES_KEY.to_owned();
+    }
+    if raw.chars().count() == 1 {
+        return raw.to_owned();
+    }
+    let spec = raw.to_lowercase();
+    if is_valid_collapse_key_spec(&spec) && !NOTES_KEY_RESERVED.contains(&spec.as_str()) {
+        spec
+    } else {
+        DEFAULT_NOTES_KEY.to_owned()
+    }
+}
+
+/// A single-character notes key shows as configured (`n`, not `N`); a spec is
+/// display-cased (`formatNotesKeyForDisplay`, config.ts:91-93 @ 3a63e0ad).
+pub fn format_notes_key_for_display(notes_key: &str) -> String {
+    if notes_key.chars().count() == 1 {
+        notes_key.to_owned()
+    } else {
+        format_key_spec_for_display(notes_key)
+    }
+}
+
 /// Pretty-print a resolved key spec for UI copy (upstream
 /// `formatKeySpecForDisplay`); display-only, never fed back into matching.
 pub fn format_key_spec_for_display(spec: &str) -> String {
@@ -312,6 +352,10 @@ pub fn load_config_from(xdg_config_home: Option<&str>, home: &Path) -> AskUserQu
         guidance: validate_guidance_fields(raw.get("guidance")),
         collapse_key: raw
             .get("collapseKey")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        notes_key: raw
+            .get("notesKey")
             .and_then(Value::as_str)
             .map(str::to_owned),
     }
@@ -492,6 +536,31 @@ mod tests {
             GuidanceFields::default(),
             "empty array is rejected"
         );
+    }
+
+    #[test]
+    fn config_notes_key_resolution_matrix() {
+        let config = |key: &str| AskUserQuestionConfig {
+            notes_key: Some(key.to_owned()),
+            ..AskUserQuestionConfig::default()
+        };
+        assert_eq!(resolve_notes_key(&AskUserQuestionConfig::default()), "n");
+        assert_eq!(resolve_notes_key(&config("")), "n");
+        assert_eq!(resolve_notes_key(&config("   ")), "n");
+        // A single character of any script matches as typed (#294).
+        assert_eq!(resolve_notes_key(&config("N")), "N");
+        assert_eq!(resolve_notes_key(&config("т")), "т");
+        // A spec is lowercased; keys the questionnaire navigates with fall back.
+        assert_eq!(resolve_notes_key(&config("Ctrl+N")), "ctrl+n");
+        for reserved in [
+            "space", "enter", "return", "tab", "escape", "esc", "up", "down", "left", "right",
+        ] {
+            assert_eq!(resolve_notes_key(&config(reserved)), "n", "{reserved}");
+        }
+        assert_eq!(resolve_notes_key(&config("ctrl+")), "n");
+        assert_eq!(format_notes_key_for_display("n"), "n");
+        assert_eq!(format_notes_key_for_display("т"), "т");
+        assert_eq!(format_notes_key_for_display("ctrl+n"), "Ctrl+N");
     }
 
     #[test]

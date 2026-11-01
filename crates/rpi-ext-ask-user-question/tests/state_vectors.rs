@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use rpi_ext_ask_user_question::parity::{replay_keys_case, replay_state_case};
 use serde_json::Value;
 
-const GENERATED: &str = "../../fixtures/generated/ask-user-question-parity";
+const GENERATED: &str = "../../fixtures/generated/ask-user-question-parity-v2150";
 const FIXTURES: &str = "../../scripts/ask-user-question-parity/fixtures.json";
 
 fn repo_path(relative: &str) -> std::path::PathBuf {

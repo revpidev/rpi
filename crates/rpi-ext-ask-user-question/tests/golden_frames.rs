@@ -3,7 +3,7 @@
 //! Re-renders the fixture matrix (single / four questions / multi-select /
 //! input draft / Submit / preview pane / notes editor / collapse-reopen ×
 //! 80/100/120) and compares it byte-for-byte against the committed JSONL in
-//! `fixtures/generated/ask-user-question-parity/golden-frames/`.
+//! `fixtures/generated/ask-user-question-parity-v2150/golden-frames/`.
 //!
 //! A mismatch means the dialog rendering changed; re-record deliberately with
 //!
@@ -23,7 +23,7 @@ use rpi_ext_host::interactive_ui::{
 
 fn golden_dir() -> String {
     format!(
-        "{}/../../fixtures/generated/ask-user-question-parity/golden-frames",
+        "{}/../../fixtures/generated/ask-user-question-parity-v2150/golden-frames",
         env!("CARGO_MANIFEST_DIR")
     )
 }

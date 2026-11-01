@@ -253,6 +253,47 @@ pub fn extract_text_from_content(content: &serde_json::Value) -> String {
     texts.join("\n")
 }
 
+/// `PROVIDER_STOP_TEXT_MAX` (utils.ts:252 @ 3a63e0ad): the reply text
+/// appended to a provider stop code is capped at 500 characters.
+pub const PROVIDER_STOP_TEXT_MAX: usize = 500;
+
+/// `assistantMessageError` (utils.ts:253-266 @ 3a63e0ad, #2913): the error
+/// to report for an assistant message. When the provider ended the turn with
+/// an error stop (`rawStopReason` is set, e.g. `content_filter`), the reply
+/// text rides along with the bare stop code: a policy refusal usually puts
+/// its explanation there. The text may also be the model's own partial
+/// reply, so it is labelled as reply text, not as the provider's message.
+///
+/// Upstream slices the reply text by UTF-16 code units; this port bounds by
+/// Unicode scalar values so a split surrogate pair can never produce invalid
+/// text (the only intentional difference; ASCII/inside-BMP text is identical).
+pub fn assistant_message_error(message: &serde_json::Value) -> Option<String> {
+    let error = message.get("errorMessage").and_then(|v| v.as_str())?;
+    if message
+        .get("rawStopReason")
+        .and_then(|v| v.as_str())
+        .is_none()
+    {
+        return Some(error.to_string());
+    }
+    let text =
+        extract_text_from_content(message.get("content").unwrap_or(&serde_json::Value::Null));
+    let text = text.trim();
+    if text.is_empty() || error.contains(text) {
+        return Some(error.to_string());
+    }
+    let bounded = if text.chars().count() > PROVIDER_STOP_TEXT_MAX {
+        let head: String = text.chars().take(PROVIDER_STOP_TEXT_MAX).collect();
+        format!("{head}…")
+    } else {
+        text.to_string()
+    };
+    Some(format!(
+        "{error}{}{bounded}",
+        crate::launch::model::ERROR_REPLY_TEXT_SEPARATOR
+    ))
+}
+
 /// `resolveCurrentPath` (long-running-guard.ts:55-69): first non-empty
 /// string among `path/file/filename/target/cwd`; `bash` additionally
 /// extracts the redirect target (`>`, `>>` or `tee `) from the command.
@@ -554,5 +595,55 @@ mod tests {
         ]);
         assert_eq!(extract_text_from_content(&content), "one\ninner\nbare");
         assert_eq!(extract_text_from_content(&json!("str")), "");
+    }
+
+    #[test]
+    fn assistant_message_error_keeps_provider_stop_text() {
+        // No rawStopReason: the provider error is reported verbatim.
+        assert_eq!(
+            assistant_message_error(&json!({ "errorMessage": "rate limit exceeded" })),
+            Some("rate limit exceeded".to_string())
+        );
+        // A raw stop reason appends the bounded, labelled reply text.
+        assert_eq!(
+            assistant_message_error(&json!({
+                "errorMessage": "content_filter",
+                "rawStopReason": "content_filter",
+                "content": [{ "type": "text", "text": "  I cannot help with that.  " }],
+            })),
+            Some("content_filter\nReply text: I cannot help with that.".to_string())
+        );
+        // Text already included in the error is not repeated.
+        assert_eq!(
+            assistant_message_error(&json!({
+                "errorMessage": "content_filter: blocked",
+                "rawStopReason": "content_filter",
+                "content": [{ "type": "text", "text": "blocked" }],
+            })),
+            Some("content_filter: blocked".to_string())
+        );
+        // Empty text keeps the bare error; long text is capped at 500 chars + ellipsis.
+        assert_eq!(
+            assistant_message_error(&json!({
+                "errorMessage": "content_filter",
+                "rawStopReason": "content_filter",
+                "content": [],
+            })),
+            Some("content_filter".to_string())
+        );
+        let long = "x".repeat(PROVIDER_STOP_TEXT_MAX + 10);
+        let expected = format!(
+            "content_filter\nReply text: {}…",
+            "x".repeat(PROVIDER_STOP_TEXT_MAX)
+        );
+        assert_eq!(
+            assistant_message_error(&json!({
+                "errorMessage": "content_filter",
+                "rawStopReason": "content_filter",
+                "content": [{ "type": "text", "text": long }],
+            })),
+            Some(expected)
+        );
+        assert_eq!(assistant_message_error(&json!({ "content": [] })), None);
     }
 }

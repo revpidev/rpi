@@ -240,6 +240,8 @@ pub struct QuestionnaireRuntime<'a> {
     pub items: &'a [QuestionItem],
     /// Resolved collapse key id (or `"off"`).
     pub collapse_key: String,
+    /// Resolved notes key (`resolve_notes_key` output: `"n"` by default).
+    pub notes_key: String,
 }
 
 /// `isConfirm`: `tui.select.confirm` or `tui.input.submit` (a Slack-style
@@ -296,12 +298,18 @@ fn build_single_select_answer(
 ) -> Option<QuestionAnswer> {
     let question = runtime.questions.get(state.current_tab)?;
     if state.input_mode {
+        // A blank draft is not an answer (#301): Enter stays on the row
+        // instead of recording an empty custom answer. Skipping a question is
+        // the Submit tab's `unanswered:` path.
         let label = runtime.input_buffer.clone();
+        if label.trim().is_empty() {
+            return None;
+        }
         return Some(QuestionAnswer {
             question_index: state.current_tab,
             question: question.question.clone(),
             kind: AnswerKind::Custom,
-            answer: (!label.is_empty()).then_some(label),
+            answer: Some(label),
             selected: None,
             notes: None,
             preview: None,
@@ -509,6 +517,33 @@ fn route_submit_tab(
     Action::Ignore
 }
 
+/// The notes shortcut (`matchesNotesKey`, key-router.ts:23-32 @ 3a63e0ad,
+/// #294): a single-character key matches the character as typed, so a
+/// non-Latin one works (pi-tui's key parser knows only ASCII); anything else
+/// matches as a pi-tui key spec.
+fn matches_notes_key(data: &str, notes_key: &str) -> bool {
+    let key = if notes_key.is_empty() {
+        NOTES_ACTIVATE_KEY
+    } else {
+        notes_key
+    };
+    data == key || matches_key(data, key)
+}
+
+/// The row a digit hotkey names (`digitRow`, key-router.ts:262-275
+/// @ 3a63e0ad, #163): `1`-`9` follow the list's numbering, so the unnumbered
+/// Next row has no digit. One key per keystroke — a pasted `"12"` matches
+/// none. Callers check it after every keybinding, so a digit bound to an
+/// action keeps that action.
+fn digit_row(data: &str, runtime: &QuestionnaireRuntime<'_>) -> Option<(usize, bool)> {
+    let index = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+        .iter()
+        .position(|digit| matches_key(data, digit))?;
+    let item = runtime.items.get(index)?;
+    let meta = meta(item.kind);
+    meta.numbered.then_some((index, meta.activates_input_mode))
+}
+
 /// `routeMultiSelectTab`.
 fn route_multi_select_tab(
     kb: &Keybindings,
@@ -517,7 +552,7 @@ fn route_multi_select_tab(
     runtime: &QuestionnaireRuntime<'_>,
 ) -> Action {
     let focused_meta = runtime.current_item.map(|item| meta(item.kind));
-    if data == SPACE_KEY {
+    if matches_key(data, rpi_tui::keys::Key::SPACE) {
         if focused_meta.is_some_and(|meta| meta.blocks_multi_toggle) {
             return Action::Ignore;
         }
@@ -542,7 +577,18 @@ fn route_multi_select_tab(
     if kb.matches(data, KEYBIND_CANCEL) {
         return Action::Cancel;
     }
-    Action::Ignore
+    // A digit toggles its row; the Type something. row's digit focuses it
+    // instead (#163).
+    let Some((index, activates_input_mode)) = digit_row(data, runtime) else {
+        return Action::Ignore;
+    };
+    if activates_input_mode {
+        return Action::Nav {
+            next_index: index,
+            input_value: runtime.input_buffer.clone(),
+        };
+    }
+    Action::Toggle { index }
 }
 
 /// `routeSingleSelectTab`.
@@ -564,7 +610,35 @@ fn route_single_select_tab(
     if kb.matches(data, KEYBIND_CANCEL) {
         return Action::Cancel;
     }
-    Action::Ignore
+    // A digit answers with its row, as Enter on it would; the Type something.
+    // row's digit focuses it instead (#163).
+    let Some((index, activates_input_mode)) = digit_row(data, runtime) else {
+        return Action::Ignore;
+    };
+    if activates_input_mode {
+        return Action::Nav {
+            next_index: index,
+            input_value: runtime.input_buffer.clone(),
+        };
+    }
+    let Some(item) = runtime.items.get(index) else {
+        return Action::Ignore;
+    };
+    let state_at_row = QuestionnaireState {
+        option_index: index,
+        ..state.clone()
+    };
+    let runtime_at_row = QuestionnaireRuntime {
+        current_item: Some(item),
+        ..runtime.clone()
+    };
+    let Some(answer) = build_single_select_answer(&state_at_row, &runtime_at_row) else {
+        return Action::Ignore;
+    };
+    Action::Confirm {
+        answer,
+        auto_advance_tab: compute_auto_advance_tab(state, runtime),
+    }
 }
 
 /// `routeKey` — the full cascade (collapse intercept → collapsed/notes/input
@@ -609,7 +683,7 @@ pub fn route_key(
     // Universal `n` activation on every question tab (above the per-mode
     // blocks: notes/input modes already returned, the Submit tab has its own
     // branch, and tab-switch ignores `n`).
-    if data == NOTES_ACTIVATE_KEY {
+    if matches_notes_key(data, &runtime.notes_key) {
         return Action::NotesEnter;
     }
 
@@ -699,6 +773,7 @@ mod tests {
                 current_item: self.items.get(tab).and_then(|items| items.get(option)),
                 items: self.items.get(tab).map(Vec::as_slice).unwrap_or(&[]),
                 collapse_key: "ctrl+]".to_owned(),
+                notes_key: "n".to_owned(),
             };
             route_key(data, state, &runtime)
         }
@@ -914,6 +989,7 @@ mod tests {
             current_item: fixture.items[0].first(),
             items: &fixture.items[0],
             collapse_key: "off".to_owned(),
+            notes_key: "n".to_owned(),
         };
         assert_eq!(route_key("\x1d", &state, &runtime), Action::Ignore);
     }
