@@ -1,6 +1,7 @@
-//! Built-in provider scripts and their registration (TE44 FR-B/FR-C).
+//! Built-in provider scripts and their registration (TE44 FR-B/FR-C;
+//! TE53 FR-B/FR-C).
 //!
-//! The four provider scripts ship inside the cdylib (`include_str!`) so the
+//! The eight provider scripts ship inside the cdylib (`include_str!`) so the
 //! plugin is self-sufficient regardless of how it was installed (source
 //! checkout, `.rpix`, project-local). At install they are materialized under
 //! `<agentDir>/rpi-usage/scripts/` and registered through
@@ -28,8 +29,11 @@ pub struct BuiltinScript {
     pub source: &'static str,
 }
 
-/// The four first-party providers (plugin 01 §3).
-pub const BUILTIN_SCRIPTS: [BuiltinScript; 4] = [
+/// The eight first-party providers (plugin 01 §3; TE53 §5.1).
+///
+/// Registration order is stable so `/usage list` and `/usage all` are
+/// deterministic; the host sorts the registered ids anyway.
+pub const BUILTIN_SCRIPTS: [BuiltinScript; 8] = [
     BuiltinScript {
         provider: "deepseek",
         file: "deepseek.py",
@@ -50,10 +54,36 @@ pub const BUILTIN_SCRIPTS: [BuiltinScript; 4] = [
         file: "kimi_code.py",
         source: include_str!("../scripts/kimi_code.py"),
     },
+    BuiltinScript {
+        provider: "opencode-go",
+        file: "opencode_go.py",
+        source: include_str!("../scripts/opencode_go.py"),
+    },
+    BuiltinScript {
+        provider: "anthropic",
+        file: "anthropic.py",
+        source: include_str!("../scripts/anthropic.py"),
+    },
+    BuiltinScript {
+        provider: "openai-codex",
+        file: "openai_codex.py",
+        source: include_str!("../scripts/openai_codex.py"),
+    },
+    BuiltinScript {
+        provider: "xai",
+        file: "xai.py",
+        source: include_str!("../scripts/xai.py"),
+    },
 ];
 
 /// Model provider id → usage provider key (FR-A "current provider"
-/// resolution). Unknown ids have no script; `/usage` explains how to add one.
+/// resolution; TE53 §5.4).
+///
+/// A model provider whose id is already a registered usage key resolves to
+/// itself. `opencode` is deliberately **not** mapped to `opencode-go`; a
+/// user-registered legacy provider named after the model keeps working
+/// through the exact-match branch, and the `/usage` direct aliases
+/// (`claude`/`gpt`/`codex`/`grok`) are command-level only.
 pub fn alias_for(model_provider: &str) -> Option<&'static str> {
     if let Some(script) = BUILTIN_SCRIPTS
         .iter()
@@ -62,12 +92,53 @@ pub fn alias_for(model_provider: &str) -> Option<&'static str> {
         return Some(script.provider);
     }
     match model_provider {
-        "deepseek" => Some("deepseek"),
         "zai" | "zai-coding-cn" => Some("glm-coding-plan"),
         "minimax" | "minimax-cn" => Some("minimax-token-plan"),
         "kimi-coding" => Some("kimi-code"),
         _ => None,
     }
+}
+
+/// `/usage` direct-position aliases (TE53 §5.4). `--provider` never expands
+/// these; it always consumes the raw registry key.
+pub const COMMAND_ALIASES: [(&str, &str); 4] = [
+    ("claude", "anthropic"),
+    ("gpt", "openai-codex"),
+    ("codex", "openai-codex"),
+    ("grok", "xai"),
+];
+
+/// Expand a direct-position provider token (alias or registry key).
+pub fn expand_command_alias(token: &str) -> &str {
+    COMMAND_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == token)
+        .map_or(token, |(_, provider)| *provider)
+}
+
+/// Providers whose automatic (footer) refresh is forbidden: only an explicit
+/// non-cached user command may run the script (TE53 §5.7, xAI).
+pub fn is_explicit_only(provider: &str) -> bool {
+    provider == "xai"
+}
+
+/// Resolve a current model provider to a registered usage provider: the
+/// first-party alias first, then an exact registry key (a user-registered
+/// legacy provider named after the model provider). `opencode` never maps
+/// to `opencode-go`; only an exact registration matches.
+pub fn current_provider(model_provider: &str, known: &[String]) -> Option<String> {
+    if model_provider.trim().is_empty() {
+        return None;
+    }
+    if let Some(provider) = alias_for(model_provider)
+        && known.iter().any(|entry| entry == provider)
+    {
+        return Some(provider.to_owned());
+    }
+    known
+        .iter()
+        .find(|entry| entry.as_str() == model_provider)
+        .cloned()
 }
 
 /// The script directory inside the agent dir.
@@ -117,12 +188,8 @@ pub fn register_builtin(host: &dyn HostCall, agent_dir: &Path) -> Result<usize, 
 fn register_path(dir: &Path, script: &BuiltinScript) -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
-        let shim = dir.join(script.file.replace(".py", ".cmd"));
-        let body = format!(
-            "@echo off\r\nwhere python >nul 2>nul\r\nif %errorlevel%==0 (python \"%~dp0{}\" %*) else (py \"%~dp0{}\" %*)\r\n",
-            script.file, script.file
-        );
-        std::fs::write(&shim, body).map_err(|error| {
+        let shim = dir.join(windows_shim_name(script.file));
+        std::fs::write(&shim, windows_shim_body(script.file)).map_err(|error| {
             format!(
                 "could not write the Windows launcher {}: {error}",
                 shim.display()
@@ -132,6 +199,33 @@ fn register_path(dir: &Path, script: &BuiltinScript) -> Result<PathBuf, String> 
     }
     #[cfg(not(windows))]
     Ok(dir.join(script.file))
+}
+
+/// `CreateProcess` cannot start a `.py` directly; the registered path is a
+/// `.cmd` shim next to the script.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_shim_name(file: &str) -> String {
+    file.replace(".py", ".cmd")
+}
+
+/// The Windows launcher body: try `python3`, then `py -3`, then `python`
+/// (TE53 FR-A R6), forwarding the exit code and all script arguments.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_shim_body(file: &str) -> String {
+    format!(
+        "@echo off\r\n\
+         where python3 >nul 2>nul\r\n\
+         if %errorlevel%==0 (\r\n\
+         \x20 python3 \"%~dp0{file}\" %*\r\n\
+         \x20 exit /b %errorlevel%\r\n\
+         )\r\n\
+         where py >nul 2>nul\r\n\
+         if %errorlevel%==0 (\r\n\
+         \x20 py -3 \"%~dp0{file}\" %*\r\n\
+         \x20 exit /b %errorlevel%\r\n\
+         )\r\n\
+         python \"%~dp0{file}\" %*\r\n"
+    )
 }
 
 /// Write `body` to `path` when missing or different; chmod 0755 on Unix.
@@ -172,12 +266,39 @@ mod tests {
         assert_eq!(alias_for("minimax"), Some("minimax-token-plan"));
         assert_eq!(alias_for("minimax-cn"), Some("minimax-token-plan"));
         assert_eq!(alias_for("kimi-coding"), Some("kimi-code"));
+        assert_eq!(alias_for("opencode-go"), Some("opencode-go"));
+        assert_eq!(alias_for("anthropic"), Some("anthropic"));
+        assert_eq!(alias_for("openai-codex"), Some("openai-codex"));
+        assert_eq!(alias_for("xai"), Some("xai"));
         // Registry keys are identities (a settings provider may be current).
         for script in BUILTIN_SCRIPTS {
             assert_eq!(alias_for(script.provider), Some(script.provider));
         }
         assert_eq!(alias_for("dgx-spark"), None);
         assert_eq!(alias_for("moonshotai"), None);
+        assert_eq!(alias_for("opencode"), None, "no opencode -> opencode-go");
+    }
+
+    #[test]
+    fn command_aliases_are_direct_position_only() {
+        assert_eq!(expand_command_alias("claude"), "anthropic");
+        assert_eq!(expand_command_alias("gpt"), "openai-codex");
+        assert_eq!(expand_command_alias("codex"), "openai-codex");
+        assert_eq!(expand_command_alias("grok"), "xai");
+        assert_eq!(expand_command_alias("opencode"), "opencode");
+        assert_eq!(expand_command_alias("deepseek"), "deepseek");
+        assert!(is_explicit_only("xai"));
+        for provider in [
+            "deepseek",
+            "glm-coding-plan",
+            "minimax-token-plan",
+            "kimi-code",
+            "opencode-go",
+            "anthropic",
+            "openai-codex",
+        ] {
+            assert!(!is_explicit_only(provider), "{provider}");
+        }
     }
 
     #[test]
@@ -209,6 +330,18 @@ mod tests {
             std::fs::read_to_string(&first[0].1).expect("body"),
             BUILTIN_SCRIPTS[0].source
         );
+    }
+
+    #[test]
+    fn windows_shim_prefers_python3_then_py3_then_python() {
+        assert_eq!(windows_shim_name("xai.py"), "xai.cmd");
+        let body = windows_shim_body("xai.py");
+        assert!(body.starts_with("@echo off\r\n"), "{body}");
+        let python3 = body.find("python3 \"%~dp0xai.py\" %*").expect("python3");
+        let py3 = body.find("py -3 \"%~dp0xai.py\" %*").expect("py -3");
+        let python = body.find("\r\npython \"%~dp0xai.py\" %*").expect("python");
+        assert!(python3 < py3 && py3 < python, "{body}");
+        assert_eq!(body.matches("exit /b %errorlevel%").count(), 2, "{body}");
     }
 
     #[test]

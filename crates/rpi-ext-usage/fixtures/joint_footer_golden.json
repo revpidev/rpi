@@ -1,0 +1,44 @@
+{
+  "_comment": "TE53 R22 joint fixture: the typed xAI envelope and the exact footer grammar strings (03 §5.7.1). The rpi-ext-statusline joint frame and the rpi-ext-usage real-plugin frame read this one file; the usage test pins the strings against the real formatter.",
+  "now_ms": 1800000000000,
+  "envelope": {
+    "schemaVersion": 1,
+    "provider": "xai",
+    "plan": "SuperGrok",
+    "displayText": "7d 42.5%(~3d22h)",
+    "windows": [
+      {
+        "id": "included_allowance",
+        "label": "7d",
+        "status": "ok",
+        "usedPercent": 42.5,
+        "remainingPercent": 57.5,
+        "resetAt": "2027-01-19T06:00:00Z"
+      },
+      {
+        "id": "product_grok_build",
+        "label": "Grok Build",
+        "status": "ok",
+        "usedPercent": 61.2,
+        "remainingPercent": 38.8,
+        "resetAt": "2027-01-19T06:00:00Z"
+      }
+    ],
+    "ledgers": [
+      {
+        "id": "on_demand",
+        "label": "On-demand",
+        "kind": "on-demand",
+        "unit": "USD",
+        "currency": "USD",
+        "used": 3.0,
+        "total": 50.0,
+        "remaining": 47.0
+      }
+    ],
+    "balance": [{ "currency": "USD", "total": 0.0 }]
+  },
+  "used": "7d 42.5% (~3d22h) / Grok Build 61.2% (~3d22h) / On-demand USD 3.00/50.00 / Balance USD 0.00",
+  "remaining": "7d 57.5% left (~3d22h) / Grok Build 38.8% left (~3d22h) / On-demand USD 3.00/50.00 / Balance USD 0.00",
+  "static": "7d 42.5% (reset 2027-01-19T06:00:00Z) / Grok Build 61.2% (reset 2027-01-19T06:00:00Z) / On-demand USD 3.00/50.00 / Balance USD 0.00"
+}

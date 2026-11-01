@@ -3378,8 +3378,10 @@ name = "rpi-ext-usage"
 version = "0.1.7"
 dependencies = [
  "abi_stable",
+ "chrono",
  "rpi-ext-host",
  "rpi-test-env",
+ "rpi-tui",
  "serde",
  "serde_json",
  "tracing",

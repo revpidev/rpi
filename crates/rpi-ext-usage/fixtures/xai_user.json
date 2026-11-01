@@ -1,0 +1,6 @@
+{
+  "userId": "test-user-id-123",
+  "subscriptionTier": "SuperGrok",
+  "email": "test@example.com",
+  "principalType": "USER"
+}

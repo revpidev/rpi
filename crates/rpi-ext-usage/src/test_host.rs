@@ -20,12 +20,18 @@ struct FakeState {
     providers: Vec<String>,
     envelopes: HashMap<String, Value>,
     failing: HashSet<String>,
+    failure_results: HashMap<String, Value>,
+    session_stats: Value,
+    unsupported_structured: bool,
     registrations: Vec<(String, String)>,
     register_error: Option<String>,
     method_errors: HashMap<String, String>,
     statuses: Vec<(String, Option<String>)>,
     notifications: Vec<String>,
+    structured_texts: Vec<String>,
+    structured_reports: Vec<Value>,
     fetch_calls: Vec<(String, bool)>,
+    cached_calls: Vec<String>,
     calls: Vec<(String, Value)>,
 }
 
@@ -39,12 +45,18 @@ impl UsageFakeHost {
                 providers: Vec::new(),
                 envelopes: HashMap::new(),
                 failing: HashSet::new(),
+                failure_results: HashMap::new(),
+                session_stats: Value::Null,
+                unsupported_structured: false,
                 registrations: Vec::new(),
                 register_error: None,
                 method_errors: HashMap::new(),
                 statuses: Vec::new(),
                 notifications: Vec::new(),
+                structured_texts: Vec::new(),
+                structured_reports: Vec::new(),
                 fetch_calls: Vec::new(),
+                cached_calls: Vec::new(),
                 calls: Vec::new(),
             }),
         }
@@ -77,11 +89,30 @@ impl UsageFakeHost {
         });
     }
 
-    /// Make `ctx.usage.fetch` answer `null` (failure) for a provider.
+    /// Make `ctx.usage.fetch` / `fetchDetailed` fail (no envelope) for a
+    /// provider.
     pub fn fail_fetch(&self, provider: &str) {
         self.with(|state| {
             state.failing.insert(provider.to_owned());
         });
+    }
+
+    /// Script exact `UsageFetchResult` JSON for a provider's detailed/cached
+    /// calls (stale, error combinations).
+    pub fn set_failure(&self, provider: &str, result: Value) {
+        self.with(|state| {
+            state.failure_results.insert(provider.to_owned(), result);
+        });
+    }
+
+    /// `ctx.sessionStats` answer.
+    pub fn set_session_stats(&self, stats: Value) {
+        self.with(|state| state.session_stats = stats);
+    }
+
+    /// Make `ui.emitStructured` answer `unsupported-output` (NullUi).
+    pub fn set_structured_unsupported(&self) {
+        self.with(|state| state.unsupported_structured = true);
     }
 
     /// Make one host method fail with a scripted error.
@@ -99,8 +130,25 @@ impl UsageFakeHost {
     }
 
     /// Recorded `ui.notify` messages.
+    #[allow(dead_code)]
     pub fn notifications(&self) -> Vec<String> {
         self.with(|state| state.notifications.clone())
+    }
+
+    /// Recorded `ui.emitStructured usageText` payloads (actual emissions).
+    pub fn structured_texts(&self) -> Vec<String> {
+        self.with(|state| state.structured_texts.clone())
+    }
+
+    /// Recorded `ui.emitStructured usageReport` payloads (actual emissions).
+    #[allow(dead_code)]
+    pub fn structured_reports(&self) -> Vec<Value> {
+        self.with(|state| state.structured_reports.clone())
+    }
+
+    /// Recorded `ctx.usage.cached` providers.
+    pub fn cached_calls(&self) -> Vec<String> {
+        self.with(|state| state.cached_calls.clone())
     }
 
     /// Recorded `ctx.usage.register` pairs.
@@ -172,6 +220,67 @@ impl HostCall for UsageFakeHost {
                         .cloned()
                         .unwrap_or(Value::Null))
                 }
+                "ctx.usage.fetchDetailed" => {
+                    let provider = args
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+                    state.fetch_calls.push((provider.clone(), force));
+                    if let Some(result) = state.failure_results.get(&provider) {
+                        return Ok(result.clone());
+                    }
+                    if state.failing.contains(&provider) {
+                        return Ok(json!({
+                            "stale": false,
+                            "error": {
+                                "kind": "transport",
+                                "action": "Check the network and provider status, then retry."
+                            }
+                        }));
+                    }
+                    match state.envelopes.get(&provider) {
+                        Some(envelope) => Ok(json!({
+                            "envelope": envelope,
+                            "source": "network",
+                            "stale": false
+                        })),
+                        None => Ok(json!({
+                            "stale": false,
+                            "error": {"kind": "no-data", "action": "This provider has no usage data."}
+                        })),
+                    }
+                }
+                "ctx.usage.cached" => {
+                    let provider = args
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    state.cached_calls.push(provider.clone());
+                    if let Some(result) = state.failure_results.get(&provider) {
+                        return Ok(result.clone());
+                    }
+                    if state.failing.contains(&provider) {
+                        return Ok(json!({
+                            "stale": false,
+                            "error": {"kind": "cache-miss", "action": "Run /usage without --cached to fetch fresh data."}
+                        }));
+                    }
+                    match state.envelopes.get(&provider) {
+                        Some(envelope) => Ok(json!({
+                            "envelope": envelope,
+                            "source": "cache",
+                            "stale": false
+                        })),
+                        None => Ok(json!({
+                            "stale": false,
+                            "error": {"kind": "cache-miss", "action": "Run /usage without --cached to fetch fresh data."}
+                        })),
+                    }
+                }
+                "ctx.sessionStats" => Ok(state.session_stats.clone()),
                 "ctx.usage.register" => {
                     if let Some(message) = &state.register_error {
                         return Err(HostError {
@@ -207,6 +316,37 @@ impl HostCall for UsageFakeHost {
                         state.notifications.push(message.to_owned());
                     }
                     Ok(Value::Null)
+                }
+                "ui.emitStructured" => {
+                    if state.unsupported_structured {
+                        return Err(HostError {
+                            kind: "call".to_owned(),
+                            message: "unsupported-output".to_owned(),
+                        });
+                    }
+                    let validate_only =
+                        args.get("validateOnly").and_then(Value::as_bool).unwrap_or(false);
+                    if validate_only {
+                        return Ok(Value::Null);
+                    }
+                    let method = args.get("method").and_then(Value::as_str).unwrap_or_default();
+                    let data = args.get("data").cloned().unwrap_or(Value::Null);
+                    match method {
+                        "usageText" => {
+                            if let Some(text) = data.as_str() {
+                                state.structured_texts.push(text.to_owned());
+                            }
+                            Ok(Value::Null)
+                        }
+                        "usageReport" => {
+                            state.structured_reports.push(data);
+                            Ok(Value::Null)
+                        }
+                        _ => Err(HostError {
+                            kind: "invalidRequest".to_owned(),
+                            message: format!("unexpected structured method: {method}"),
+                        }),
+                    }
                 }
                 "registerCommand" | "on" => Ok(Value::Null),
                 _ => Err(HostError {

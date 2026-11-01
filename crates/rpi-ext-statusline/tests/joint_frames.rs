@@ -12,9 +12,11 @@
 //! Boundary: TE52 establishes the fixture, the host row composition and the
 //! statusline side. Linking `rpi-ext-usage`'s abi_stable root module into
 //! this binary conflicts with this plugin's exported module-loader symbol,
-//! so the usage side is the exact legacy footer shape TE53 replaces with the
-//! real typed footer, xAI cached display and zero-second-request assertions.
-//! The usage plugin's own formatter/worker tests cover its render path.
+//! so the usage side reads the exact typed-footer golden strings from
+//! `crates/rpi-ext-usage/fixtures/joint_footer_golden.json` (TE53). The usage
+//! plugin's own `tests/joint_frames.rs` runs the real plugin against that
+//! same fixture and pins the strings with the real formatter, the xAI
+//! cached-only auto path and the zero-second-request assertion.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -180,6 +182,18 @@ fn compose_status_row(statusline: &str, usage: &str) -> String {
         .join(" ")
 }
 
+/// The shared TE53 typed-footer fixture (real formatter output pinned by the
+/// usage plugin's own joint frame).
+fn joint_golden() -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../rpi-ext-usage/fixtures/joint_footer_golden.json");
+    serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display())),
+    )
+    .expect("joint golden json")
+}
+
 fn strip_ansi(text: &str) -> String {
     let mut out = String::new();
     let mut chars = text.chars();
@@ -239,44 +253,46 @@ fn statusline_and_usage_compose_on_the_host_status_row() {
         .expect("statusline status text");
     assert_eq!(statusline, "Test Model · Context 6% used · 70");
 
-    // ── usage side: the legacy footer face (TE53 replaces this literal with
-    //        the typed `windows[]`/`ledgers[]` formatter and request-count
-    //        assertions on the same fixture).
-    // TE50 compact footer shape: `<label> <pct>%(~<reset-in>)`, windows
-    // joined by " / " (TE53 replaces this with the typed footer).
-    let usage = "5h 12%(~3h) / 7d 45%(~2d)";
+    // ── usage side: the typed footer from the shared TE53 golden fixture
+    //        (`windows[]` → `ledgers[]` → `balance[]`). The real usage plugin
+    //        pins these same strings in its own joint frame.
+    let golden = joint_golden();
+    let usage = golden["used"].as_str().expect("used golden").to_owned();
 
-    let row = compose_status_row(&statusline, usage);
+    let row = compose_status_row(&statusline, &usage);
     assert_eq!(
-        row, "Test Model · Context 6% used · 70 5h 12%(~3h) / 7d 45%(~2d)",
+        row,
+        format!("Test Model · Context 6% used · 70 {usage}"),
         "sorted keys: rpi-statusline before rpi-usage, one space"
     );
 
     // ── 40/80/120 columns: wrap, never truncate; every visible char stays.
-    let visible_row = strip_ansi(&row);
-    for width in [40usize, 80, 120] {
-        let lines = wrap_text_with_ansi(&row, width);
-        for line in &lines {
-            assert!(
-                visible_width(line) <= width,
-                "line exceeds {width}: {line:?}"
+    // used/remaining/static variants cover the typed footer modes.
+    for key in ["used", "remaining", "static"] {
+        let usage = golden[key].as_str().expect("golden variant").to_owned();
+        let row = compose_status_row(&statusline, &usage);
+        let visible_row = strip_ansi(&row);
+        for width in [40usize, 80, 120] {
+            let lines = wrap_text_with_ansi(&row, width);
+            for line in &lines {
+                assert!(
+                    visible_width(line) <= width,
+                    "{key} line exceeds {width}: {line:?}"
+                );
+            }
+            let rejoined = lines
+                .iter()
+                .map(|line| strip_ansi(line))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                sanitize_status_text(&rejoined),
+                sanitize_status_text(&visible_row),
+                "{key} width {width} preserves the whole row (no truncation)"
             );
-        }
-        let rejoined = lines
-            .iter()
-            .map(|line| strip_ansi(line))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(
-            sanitize_status_text(&rejoined),
-            sanitize_status_text(&visible_row),
-            "width {width} preserves the whole row (no truncation)"
-        );
-        if width == 40 {
-            assert!(lines.len() > 1, "40 columns wrap the joint row");
-        }
-        if width == 120 {
-            assert_eq!(lines.len(), 1, "120 columns keep one row");
+            if width == 40 {
+                assert!(lines.len() > 1, "{key}: 40 columns wrap the joint row");
+            }
         }
     }
 

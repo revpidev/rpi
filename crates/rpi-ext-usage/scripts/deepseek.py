@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""rpi-usage provider script: DeepSeek balance (TE44).
+"""rpi-usage provider script: DeepSeek balance (TE44 / TE53).
 
 Contract (host framework, V16-05 §7.2):
-- stdin:  {"provider", "baseUrl"?, "apiKeyEnv"?, "model"?}
+- stdin:  {"provider", "baseUrl"?, "apiKeyEnv"?, "model"?, "credentialKind"?}
 - stdout: the schemaVersion=1 usage envelope (single JSON object)
-- errors: a message on stderr + non-zero exit (the host degrades silently)
+- errors: exit 2 + `{"schemaVersion":1,"provider":...,"error":{"kind":...}}`
+  for a classified failure (the host reads it before the success shape); a
+  short sanitized line on stderr is diagnostics only
 - displayText (TE50): compact balance "<currency> <total>" entries joined by
-  " / ", no provider prefix
+  " / ", no provider prefix; unchanged byte-for-byte for the recorded
+  fixtures so old hosts keep rendering the same line
+- typed balance[] (04 §4.1): multi-currency total/granted/toppedUp entries.
+  DeepSeek is a balance provider and has no quota windows.
 
 Endpoint (public docs): GET https://api.deepseek.com/user/balance with
 `Authorization: Bearer <key>`; response:
@@ -15,11 +20,21 @@ Endpoint (public docs): GET https://api.deepseek.com/user/balance with
                       "topped_up_balance"}]}
 All amount fields ship as strings; they are parsed leniently.
 
+Endpoint policy (TE53 04 §5.1):
+- the URL is a fixed official HTTPS origin; the stdin `baseUrl` is never
+  used to derive an endpoint (a custom/proxy model origin cannot inherit the
+  subscription usage identity);
+- redirects are refused, the body is capped at 262144 bytes and every
+  request has a timeout;
+- the test-only loopback override (`RPI_USAGE_TEST_MODE=1` +
+  `RPI_USAGE_TEST_BASE_URL=http://127.0.0.1:PORT` + a credential that starts
+  with `test-`) replaces the origin and keeps the path, nothing else.
+
 Credential resolution order (never printed): the context `apiKeyEnv`, the
 conventional environment variables below, then the rpi credential store
 `<RPI_CODING_AGENT_DIR|~/.rpi/agent>/auth.json` (read-only, api_key entries;
 `$VAR` references resolve through the environment, command references are
-skipped).
+skipped). The host-injected env value is the same read-only identity.
 
 Tests: crates/rpi-ext-usage/tests/scripts_contract.rs drives this script
 against a local stub HTTP server with recorded fixtures (no network).
@@ -27,6 +42,7 @@ against a local stub HTTP server with recorded fixtures (no network).
 
 import json
 import os
+import socket
 import ssl
 import sys
 import urllib.error
@@ -37,8 +53,28 @@ PROVIDER = "deepseek"
 ENV_NAMES = ("DEEPSEEK_API_KEY",)
 AUTH_IDS = ("deepseek",)
 DEFAULT_BASE = "https://api.deepseek.com"
+BALANCE_PATH = "/user/balance"
 DEFAULT_TIMEOUT_MS = 8000
 USER_AGENT = "rpi-usage/0.1.0"
+MAX_BODY_BYTES = 262144
+
+TEST_MODE_ENV = "RPI_USAGE_TEST_MODE"
+TEST_BASE_ENV = "RPI_USAGE_TEST_BASE_URL"
+LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: a usage read must not leave its origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+def _opener():
+    return urllib.request.build_opener(
+        _NoRedirect,
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+    )
 
 
 def read_context():
@@ -107,26 +143,69 @@ def timeout_seconds():
     return DEFAULT_TIMEOUT_MS / 1000.0
 
 
+def endpoint_url(production_url, credential):
+    """Production URL unless the test-only loopback override is active."""
+    if os.environ.get(TEST_MODE_ENV) != "1":
+        return production_url
+    override = os.environ.get(TEST_BASE_ENV, "").strip()
+    if not override or not credential or not credential.startswith("test-"):
+        return production_url
+    parsed = urllib.parse.urlparse(override)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in ("http", "https") or host not in LOOPBACK_HOSTS:
+        return production_url
+    if parsed.username or parsed.password:
+        return production_url
+    target = urllib.parse.urlparse(production_url)
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, target.path, "", target.query, ""))
+
+
 def http_get(url, headers, timeout):
+    """GET with redirect refusal; answers (status, body, transport_kind)."""
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(  # noqa: S310 - fixed https endpoint
-            request, timeout=timeout, context=ssl.create_default_context()
-        ) as response:
-            return response.status, response.read(262144).decode("utf-8", "replace")
+        with _opener().open(request, timeout=timeout) as response:
+            raw = response.read(MAX_BODY_BYTES + 1)
+            if len(raw) > MAX_BODY_BYTES:
+                return response.status, "", "oversized"
+            return response.status, raw.decode("utf-8", "replace"), None
     except urllib.error.HTTPError as error:
-        return error.code, error.read(65536).decode("utf-8", "replace")
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return 0, ""
+        try:
+            error.close()
+        except OSError:
+            pass
+        return error.code, "", None
+    except (TimeoutError, socket.timeout):
+        return 0, "", "timeout"
+    except urllib.error.URLError as error:
+        if isinstance(error.reason, (TimeoutError, socket.timeout)):
+            return 0, "", "timeout"
+        return 0, "", "transport"
+    except OSError:
+        return 0, "", "transport"
 
 
-def balance_url(base):
-    base = (base or DEFAULT_BASE).strip().rstrip("/")
-    if base.endswith("/user/balance"):
-        return base
-    if base.endswith("/v1"):
-        base = base[: -len("/v1")]
-    return base + "/user/balance"
+def failure_kind(status, transport):
+    if transport == "timeout":
+        return "timeout"
+    if transport == "oversized":
+        return "shape-changed"
+    if transport:
+        return "transport"
+    if status in (401, 403):
+        return "unauthorized"
+    if status == 429:
+        return "rate-limited"
+    return "transport"
+
+
+def fail(kind, detail):
+    """Classified failure envelope (exit 2) plus a short sanitized stderr line."""
+    print(f"{PROVIDER}: {detail}", file=sys.stderr)
+    envelope = {"schemaVersion": 1, "provider": PROVIDER, "error": {"kind": kind}}
+    sys.stdout.write(json.dumps(envelope, separators=(",", ":")))
+    sys.stdout.write("\n")
+    return 2
 
 
 def number(value):
@@ -146,19 +225,25 @@ def money(value):
     return f"{value:.2f}"
 
 
+def offline():
+    """Defensive RPI_OFFLINE check (the host is the first boundary)."""
+    value = os.environ.get("RPI_OFFLINE")
+    return bool(value) and value.strip().lower() in ("1", "true", "yes")
+
+
 def main():
+    if offline():
+        return fail("offline", "offline mode: usage scripts are disabled")
     context = read_context()
     key, _source = resolve_key(context)
     if not key:
-        print(
-            f"{PROVIDER}: no API key; set {' or '.join(ENV_NAMES)} "
-            "(or log in with rpi)",
-            file=sys.stderr,
+        return fail(
+            "auth-unavailable",
+            "no API key; set DEEPSEEK_API_KEY (or log in with rpi)",
         )
-        return 1
 
-    status, body = http_get(
-        balance_url(context.get("baseUrl")),
+    status, body, transport = http_get(
+        endpoint_url(DEFAULT_BASE + BALANCE_PATH, key),
         {
             "Authorization": "Bearer " + key,
             "Accept": "application/json",
@@ -166,25 +251,19 @@ def main():
         },
         timeout_seconds(),
     )
-    if status == 0:
-        print(f"{PROVIDER}: request failed (timeout or transport error)", file=sys.stderr)
-        return 1
-    if status != 200:
-        print(f"{PROVIDER}: endpoint answered HTTP {status}", file=sys.stderr)
-        return 1
+    if transport is not None or status != 200:
+        return fail(failure_kind(status, transport), "request failed")
+
     try:
         data = json.loads(body)
     except ValueError:
-        print(f"{PROVIDER}: endpoint answered non-JSON", file=sys.stderr)
-        return 1
+        return fail("shape-changed", "endpoint answered non-JSON")
     if not isinstance(data, dict):
-        print(f"{PROVIDER}: unexpected response shape", file=sys.stderr)
-        return 1
+        return fail("shape-changed", "unexpected response shape")
 
     infos = data.get("balance_infos")
     if not isinstance(infos, list) or not infos:
-        print(f"{PROVIDER}: response carries no balance_infos", file=sys.stderr)
-        return 1
+        return fail("shape-changed", "response carries no balance_infos")
 
     entries = []
     labels = []
@@ -207,8 +286,7 @@ def main():
         entries.append(entry)
         labels.append(f"{entry['currency']} {money(total)}")
     if not entries:
-        print(f"{PROVIDER}: response carries no usable balance entries", file=sys.stderr)
-        return 1
+        return fail("shape-changed", "response carries no usable balance entries")
 
     available = data.get("is_available")
     display = " / ".join(labels)

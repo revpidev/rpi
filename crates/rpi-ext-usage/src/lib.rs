@@ -3,13 +3,14 @@
 //!
 //! `/usage` resolves the current model provider (`ctx.model`), maps it to a
 //! registered usage provider, and asks the host framework for the latest
-//! envelope: `/usage` (current provider), `/usage <provider>`, `/usage all`.
-//! The footer status line (`ui.setStatus("rpi-usage", displayText)`) follows
-//! `session_start` / `model_select` and is refreshed on `message_end` under
-//! the `usage.refreshMs` throttle. All script execution, credential
-//! injection, caching, and failure retention live in the host; this plugin
-//! ships the four provider scripts (embedded and materialized at install),
-//! the command/formatting surface, and the refresh orchestration.
+//! envelope: `/usage [--cached] [--json] [provider|all]`, `/usage list` and
+//! `/usage help` (TE53). The typed footer (`ui.setStatus("rpi-usage", ...)`)
+//! follows `session_start` / `model_select` and is refreshed on
+//! `message_end` under the `usage.refreshMs` throttle; typed future resets
+//! redraw locally every 60 seconds without a request. All script execution,
+//! credential injection, caching, and failure retention live in the host;
+//! this plugin ships the eight provider scripts (embedded and materialized at
+//! install), the command/formatting surface, and the refresh orchestration.
 //!
 //! Native runtime model (rpi-todo / rpi-plan-mode precedent):
 //! `rpi_extension_init` registers through the host-call handle, records the
@@ -198,11 +199,19 @@ fn run_job_sync(host: &dyn HostCall, job: Job) {
     let config = config::load();
     let mut state = FooterState::default();
     let now = Instant::now();
+    let now_ms = footer::now_epoch_ms();
     match job {
         Job::Refresh { throttled } => {
-            footer::refresh(host, &config, &mut state, false, throttled, now);
+            footer::refresh(host, &config, &mut state, false, throttled, now, now_ms);
         }
-        Job::Command { args } => command::handle_now(host, &config, &mut state, &args, now),
+        Job::Command { args } => {
+            if let Some(outcome) = command::handle_now(host, &config, &args, now_ms) {
+                if let Err(error) = host::emit_output(host, &outcome.output) {
+                    tracing::debug!(%error, "rpi-usage: ui.emitStructured rejected");
+                }
+                footer::apply(host, &config, &mut state, outcome.footer, now_ms);
+            }
+        }
         Job::Shutdown => {}
     }
 }
@@ -387,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn install_registers_the_command_events_and_four_providers() {
+    fn install_registers_the_command_events_and_eight_providers() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         __reset_state();
         let dir = TestDir::new("install");
@@ -403,6 +412,10 @@ mod tests {
                 "on",
                 "on",
                 "on",
+                "ctx.usage.register",
+                "ctx.usage.register",
+                "ctx.usage.register",
+                "ctx.usage.register",
                 "ctx.usage.register",
                 "ctx.usage.register",
                 "ctx.usage.register",
@@ -424,7 +437,11 @@ mod tests {
                 "deepseek",
                 "glm-coding-plan",
                 "minimax-token-plan",
-                "kimi-code"
+                "kimi-code",
+                "opencode-go",
+                "anthropic",
+                "openai-codex",
+                "xai"
             ]
         );
         for (_provider, path) in registered {
@@ -506,7 +523,16 @@ mod tests {
             None,
             &json!({"kind": "command", "name": "usage", "args": "deepseek"}),
         );
-        assert_eq!(host.notifications(), vec!["CNY 1".to_owned()]);
+        // The command report goes through ui.emitStructured usageText and the
+        // same result updates the footer (no trailing refresh).
+        let structured = host.structured_texts();
+        assert_eq!(structured.len(), 1, "{structured:?}");
+        assert!(structured[0].starts_with("deepseek"), "{structured:?}");
+        assert_eq!(host.fetch_count("deepseek"), 1);
+        assert_eq!(
+            host.statuses().last(),
+            Some(&("rpi-usage".to_owned(), Some("CNY 1".to_owned())))
+        );
     }
 
     #[test]

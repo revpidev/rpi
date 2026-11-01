@@ -1,10 +1,10 @@
 {
   "name": "rpi-usage",
   "repository": "revpidev/rpi",
-  "description": "Usage lookup: /usage queries the current model provider's balance or plan quota through the host scripted usage-provider framework — built-in DeepSeek, GLM Coding Plan, MiniMax Token Plan and Kimi Code scripts — and keeps a footer status line; custom providers drop in as user scripts.",
+  "description": "Usage lookup: /usage queries the current model provider's typed balance, plan quota or subscription windows through the host scripted usage-provider framework — built-in DeepSeek, GLM Coding Plan, MiniMax Token Plan, Kimi Code, OpenCode Go, Anthropic, OpenAI Codex and xAI scripts — and keeps a typed footer status line; --cached/--json/--provider and /usage list/help are supported, providers without quota show local session tokens only, and custom providers drop in as user scripts.",
   "author": "revpidev",
   "license": "MIT",
   "official": true,
   "lockstepHost": true,
-  "descriptionZh": "用量查询:/usage 经宿主脚本化 usage-provider 框架查询当前接入 provider 的余额/套餐配额(内置 DeepSeek/GLM Coding Plan/MiniMax Token Plan/Kimi Code 四家脚本),footer 自动展示;用户脚本可扩展自定义 provider。"
+  "descriptionZh": "用量查询:/usage 经宿主脚本化 usage-provider 框架查询当前接入 provider 的类型化余额/套餐配额/订阅窗口(内置 DeepSeek/GLM Coding Plan/MiniMax Token Plan/Kimi Code/OpenCode Go/Anthropic/OpenAI Codex/xAI 八家脚本),footer 自动展示类型化状态行;支持 --cached/--json/--provider 与 /usage list/help,无配额 provider 只显示当前会话本地 token,用户脚本可扩展自定义 provider。"
 }

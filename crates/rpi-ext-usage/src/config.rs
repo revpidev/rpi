@@ -1,10 +1,11 @@
-//! The plugin-owned `usage` settings (TE44 FR-E; plugin 01 §7).
+//! The plugin-owned `usage` settings (TE44 FR-E; plugin 01 §7; TE53 §7).
 //!
 //! The host's usage-provider framework types only the two keys it consumes
 //! itself (`usage.providers`, `usage.timeoutMs`; V16-05 §7.3 item 8). The
-//! plugin-owned keys — `enabled`, `footer`, `refreshMs` — are read directly
-//! from the same `<agentDir>/settings.json` the host reads (statusline
-//! precedent, avoiding a second source of truth).
+//! plugin-owned keys — `enabled`, `footer`, `refreshMs`, `percentage` and
+//! `resetCountdown` — are read directly from the same
+//! `<agentDir>/settings.json` the host reads (statusline precedent, avoiding
+//! a second source of truth).
 //!
 //! Fail-soft contract: a missing file, broken JSON, or a wrong-typed key
 //! falls back to the default for that key only; unknown keys are ignored. The
@@ -22,6 +23,17 @@ pub const MIN_REFRESH_MS: u64 = 1_000;
 /// Upper bound for `usage.refreshMs`.
 pub const MAX_REFRESH_MS: u64 = 3_600_000;
 
+/// `usage.percentage` (TE53 §5.7): which side of a typed percentage window
+/// the footer shows. Counted and unlimited windows keep their own unit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PercentageMode {
+    /// Show `usedPercent` (default).
+    #[default]
+    Used,
+    /// Show `remainingPercent` with a `left` marker.
+    Remaining,
+}
+
 /// Resolved plugin configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UsageConfig {
@@ -32,6 +44,11 @@ pub struct UsageConfig {
     /// `message_end` throttle window in milliseconds (`usage.refreshMs`,
     /// clamped 1s..1h; default 5min).
     pub refresh_ms: u64,
+    /// `usage.percentage` (default `used`); typed footer only.
+    pub percentage: PercentageMode,
+    /// `usage.resetCountdown` (default `true`); typed footer only. `false`
+    /// renders a static `(reset RFC3339)` label and starts no tick.
+    pub reset_countdown: bool,
 }
 
 impl Default for UsageConfig {
@@ -40,6 +57,8 @@ impl Default for UsageConfig {
             enabled: true,
             footer: true,
             refresh_ms: DEFAULT_REFRESH_MS,
+            percentage: PercentageMode::Used,
+            reset_countdown: true,
         }
     }
 }
@@ -132,6 +151,19 @@ pub fn parse_settings(root: &Value) -> UsageConfig {
             None => tracing::warn!("rpi-usage: usage.refreshMs must be a number"),
         }
     }
+    if let Some(value) = section.get("percentage") {
+        match value.as_str() {
+            Some("used") => config.percentage = PercentageMode::Used,
+            Some("remaining") => config.percentage = PercentageMode::Remaining,
+            _ => tracing::warn!("rpi-usage: usage.percentage must be \"used\" or \"remaining\""),
+        }
+    }
+    if let Some(value) = section.get("resetCountdown") {
+        match value.as_bool() {
+            Some(reset_countdown) => config.reset_countdown = reset_countdown,
+            None => tracing::warn!("rpi-usage: usage.resetCountdown must be a boolean"),
+        }
+    }
     config
 }
 
@@ -146,6 +178,8 @@ mod tests {
         assert!(config.enabled);
         assert!(config.footer);
         assert_eq!(config.refresh_ms, DEFAULT_REFRESH_MS);
+        assert_eq!(config.percentage, PercentageMode::Used);
+        assert!(config.reset_countdown);
     }
 
     #[test]
@@ -156,6 +190,8 @@ mod tests {
                 "enabled": false,
                 "footer": false,
                 "refreshMs": 120000,
+                "percentage": "remaining",
+                "resetCountdown": false,
                 "providers": { "x": "y" },
                 "timeoutMs": 3000,
                 "futureKey": true
@@ -167,6 +203,8 @@ mod tests {
                 enabled: false,
                 footer: false,
                 refresh_ms: 120_000,
+                percentage: PercentageMode::Remaining,
+                reset_countdown: false,
             }
         );
     }
@@ -182,11 +220,19 @@ mod tests {
             MAX_REFRESH_MS
         );
         let config = parse_settings(&json!({
-            "usage": {"enabled": "yes", "footer": false, "refreshMs": "soon"}
+            "usage": {
+                "enabled": "yes",
+                "footer": false,
+                "refreshMs": "soon",
+                "percentage": "half",
+                "resetCountdown": "no"
+            }
         }));
         assert!(config.enabled, "bad enabled falls back to true");
         assert!(!config.footer, "valid key survives");
         assert_eq!(config.refresh_ms, DEFAULT_REFRESH_MS);
+        assert_eq!(config.percentage, PercentageMode::Used);
+        assert!(config.reset_countdown);
     }
 
     #[test]

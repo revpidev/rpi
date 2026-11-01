@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use rpi_ext_host::api::{
     ExtensionWidgetOptions, NotifyType, SetThemeResult, TerminalInputHandler, ThemeInfo, UiBridge,
-    UiDialogOptions, Unsubscribe, WidgetContent, WorkingIndicatorOptions,
+    UiDialogOptions, UiOutputError, Unsubscribe, WidgetContent, WorkingIndicatorOptions,
 };
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::types::ComponentTree;
@@ -214,6 +214,7 @@ fn install_plugin_for_discovery(sandbox: &Sandbox, plugin: &Path) {
 struct RecordingBridge {
     notifications: Mutex<Vec<String>>,
     statuses: Mutex<Vec<(String, Option<String>)>>,
+    structured: Mutex<Vec<(String, Value)>>,
 }
 
 impl RecordingBridge {
@@ -247,6 +248,14 @@ impl RecordingBridge {
             .map(|(_, text)| text)
             .collect()
     }
+
+    /// Recorded `ui.emitStructured` calls (method, payload).
+    fn structured(&self) -> Vec<(String, Value)> {
+        self.structured
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
 }
 
 #[async_trait]
@@ -275,6 +284,41 @@ impl UiBridge for RecordingBridge {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .push(message.to_owned());
+    }
+
+    /// TUI `ui.emitStructured` (V18-10 / ADR-0039): `usageText` is shown as
+    /// is; `usageReport` is pretty-printed into the notification body.
+    /// `validateOnly` only checks the channel.
+    fn emit_structured(
+        &self,
+        method: &str,
+        data: &Value,
+        validate_only: bool,
+    ) -> Result<(), UiOutputError> {
+        if validate_only {
+            return Ok(());
+        }
+        match method {
+            "usageText" => {
+                let text = data.as_str().ok_or(UiOutputError::InvalidRequest)?;
+                self.structured
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push((method.to_owned(), data.clone()));
+                self.notify(text, NotifyType::Info);
+            }
+            "usageReport" => {
+                let text = serde_json::to_string_pretty(data)
+                    .map_err(|_| UiOutputError::InvalidRequest)?;
+                self.structured
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push((method.to_owned(), data.clone()));
+                self.notify(&text, NotifyType::Info);
+            }
+            _ => return Err(UiOutputError::InvalidRequest),
+        }
+        Ok(())
     }
     fn on_terminal_input(&self, _handler: TerminalInputHandler) -> Unsubscribe {
         Box::new(|| {})
@@ -387,6 +431,16 @@ async fn build_model_runtime(
 
 /// Boot the host with the real plugin and a real file-backed session.
 async fn boot(sandbox: Sandbox, inline: Vec<rpi_ext_host::loader::InlineExtension>) -> Fixture {
+    boot_with_model_provider(sandbox, "deepseek", inline).await
+}
+
+/// Boot with a specific faux model provider (the local-fallback test needs a
+/// provider without a registered quota script).
+async fn boot_with_model_provider(
+    sandbox: Sandbox,
+    model_provider: &str,
+    inline: Vec<rpi_ext_host::loader::InlineExtension>,
+) -> Fixture {
     let plugin = plugin_path().expect("the caller checked the cdylib");
     install_plugin_for_discovery(&sandbox, &plugin);
     let host = Arc::new(NativeExtensionHost::new(&sandbox.cwd().to_string_lossy()));
@@ -408,7 +462,7 @@ async fn boot(sandbox: Sandbox, inline: Vec<rpi_ext_host::loader::InlineExtensio
         rpi_ext_host::types::ExtensionMode::Tui,
     );
 
-    let (model_runtime, model) = build_model_runtime(&sandbox.agent_dir(), "deepseek").await;
+    let (model_runtime, model) = build_model_runtime(&sandbox.agent_dir(), model_provider).await;
     let services = rpi::core::agent_session_services::create_agent_session_services(
         rpi::core::agent_session_services::CreateAgentSessionServicesOptions {
             cwd: sandbox.cwd(),
@@ -516,10 +570,19 @@ async fn usage_command_reports_the_current_provider_and_updates_the_footer() {
         .into_iter()
         .find(|message| message.contains("CNY 9.99"))
         .expect("report");
-    assert!(report.contains("balance: CNY 9.99"), "{report}");
+    assert!(report.starts_with("deepseek (current)"), "{report}");
+    assert!(report.contains("Balance\n  CNY 9.99"), "{report}");
+    assert!(
+        fixture
+            .bridge
+            .structured()
+            .iter()
+            .any(|(method, _)| method == "usageText"),
+        "command text goes through ui.emitStructured"
+    );
     assert!(
         wait_until(Duration::from_secs(5), || {
-            fixture.bridge.last_status("rpi-usage") == Some(Some("CNY 9.99".to_owned()))
+            fixture.bridge.last_status("rpi-usage") == Some(Some("Balance CNY 9.99".to_owned()))
         })
         .await,
         "footer status: {:?}",
@@ -561,7 +624,7 @@ async fn usage_all_isolates_a_failing_provider() {
                 .bridge
                 .notifications()
                 .iter()
-                .any(|message| message.contains("no data: kimi-code"))
+                .any(|message| message.contains("Status: transport"))
         })
         .await,
         "report: {:?}",
@@ -571,11 +634,14 @@ async fn usage_all_isolates_a_failing_provider() {
         .bridge
         .notifications()
         .into_iter()
-        .find(|message| message.contains("no data: kimi-code"))
+        .find(|message| message.contains("Status: transport"))
         .expect("report");
+    assert!(report.contains("deepseek (current)"), "{report}");
+    assert!(report.contains("kimi-code\nStatus: transport"), "{report}");
     assert!(report.contains("CNY 9.99"), "{report}");
-    assert!(report.contains("5h 22%(~48m)"), "{report}");
-    assert!(report.contains("plan: pro"), "{report}");
+    assert!(report.contains("glm-coding-plan\nplan: pro"), "{report}");
+    assert!(report.contains("Quota\n  used 22 total 100 %"), "{report}");
+    assert!(report.contains("Reset: 2026-10-08T00:00:00Z"), "{report}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -598,7 +664,7 @@ async fn provider_failure_without_a_success_reports_no_data_and_success_is_retai
                 .bridge
                 .notifications()
                 .iter()
-                .any(|message| message.contains("no data for `deepseek`"))
+                .any(|message| message.contains("Status: transport"))
         })
         .await,
         "failure report: {:?}",
@@ -615,7 +681,7 @@ async fn provider_failure_without_a_success_reports_no_data_and_success_is_retai
     run_usage(&fixture, "deepseek").await;
     assert!(
         wait_until(Duration::from_secs(5), || {
-            fixture.bridge.last_status("rpi-usage") == Some(Some("CNY 9.99".to_owned()))
+            fixture.bridge.last_status("rpi-usage") == Some(Some("Balance CNY 9.99".to_owned()))
         })
         .await,
         "status: {:?}",
@@ -643,12 +709,12 @@ async fn provider_failure_without_a_success_reports_no_data_and_success_is_retai
     );
     assert_eq!(
         fixture.bridge.status_writes("rpi-usage"),
-        vec![Some("CNY 9.99".to_owned())],
+        vec![Some("Balance CNY 9.99".to_owned())],
         "no flicker write on failure"
     );
     assert_eq!(
         fixture.bridge.last_status("rpi-usage"),
-        Some(Some("CNY 9.99".to_owned()))
+        Some(Some("Balance CNY 9.99".to_owned()))
     );
 }
 
@@ -692,7 +758,7 @@ async fn statusline_entry_coexists_and_the_plugin_writes_its_own_key_only() {
         .await;
     assert!(
         wait_until(Duration::from_secs(5), || {
-            fixture.bridge.last_status("rpi-usage") == Some(Some("CNY 9.99".to_owned()))
+            fixture.bridge.last_status("rpi-usage") == Some(Some("Balance CNY 9.99".to_owned()))
                 && fixture.bridge.last_status("status") == Some(Some("repo:main".to_owned()))
         })
         .await,
@@ -710,8 +776,194 @@ async fn statusline_entry_coexists_and_the_plugin_writes_its_own_key_only() {
             .bridge
             .status_writes("rpi-usage")
             .iter()
-            .all(|text| text.as_deref() == Some("CNY 9.99")),
+            .all(|text| text.as_deref() == Some("Balance CNY 9.99")),
         "{:?}",
         fixture.bridge.statuses()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usage_json_emits_a_usage_report_frame() {
+    if plugin_path().is_none() {
+        return;
+    }
+    let sandbox = Sandbox::new("json");
+    let _env = EnvGuard::acquire(&sandbox.home(), &sandbox.agent_dir());
+    let deepseek = sandbox.write_stub("deepseek", DEEPSEEK_ENVELOPE);
+    sandbox.write_settings(&[("deepseek", deepseek)]);
+    let fixture = boot(sandbox, Vec::new()).await;
+
+    run_usage(&fixture, "--json").await;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            fixture
+                .bridge
+                .structured()
+                .iter()
+                .any(|(method, _)| method == "usageReport")
+        })
+        .await,
+        "structured reports: {:?}",
+        fixture.bridge.structured()
+    );
+    let (method, data) = fixture
+        .bridge
+        .structured()
+        .into_iter()
+        .find(|(method, _)| method == "usageReport")
+        .expect("report");
+    assert_eq!(method, "usageReport");
+    assert_eq!(data["schemaVersion"], json!(1));
+    assert_eq!(data["provider"], json!("deepseek"));
+    assert_eq!(data["stale"], json!(false));
+    assert_eq!(data["current"], json!(true));
+    assert_eq!(data["envelope"]["balance"][0]["total"], json!(9.99));
+    // The TUI notification body is the pretty JSON, with no source/action
+    // trailer line.
+    let pretty = fixture
+        .bridge
+        .notifications()
+        .into_iter()
+        .find(|message| message.contains("\"provider\": \"deepseek\""))
+        .expect("pretty report");
+    assert!(pretty.trim_start().starts_with('{'), "{pretty}");
+    assert!(pretty.trim_end().ends_with('}'), "{pretty}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cached_reads_the_cache_and_never_runs_the_script() {
+    if plugin_path().is_none() {
+        return;
+    }
+    let sandbox = Sandbox::new("cached");
+    let _env = EnvGuard::acquire(&sandbox.home(), &sandbox.agent_dir());
+    let counter = sandbox.root.join("runs.txt");
+    let stub = sandbox.write_stub(
+        "deepseek",
+        &format!("printf x >> '{}'\n{}", counter.display(), DEEPSEEK_ENVELOPE),
+    );
+    sandbox.write_settings(&[("deepseek", stub)]);
+    let fixture = boot(sandbox, Vec::new()).await;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            std::fs::read_to_string(&counter)
+                .map(|text| !text.is_empty())
+                .unwrap_or(false)
+        })
+        .await,
+        "session_start refresh runs the stub once"
+    );
+    run_usage(&fixture, "deepseek").await;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            std::fs::read_to_string(&counter)
+                .map(|text| text.len() >= 2)
+                .unwrap_or(false)
+        })
+        .await,
+        "explicit force runs the stub again"
+    );
+    let runs = std::fs::read_to_string(&counter).expect("counter").len();
+    run_usage(&fixture, "--cached deepseek").await;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            fixture
+                .bridge
+                .notifications()
+                .iter()
+                .any(|message| message.contains("Source: cache (no request)"))
+        })
+        .await,
+        "cached report: {:?}",
+        fixture.bridge.notifications()
+    );
+    run_usage(&fixture, "all --cached").await;
+    // Give a buggy implementation time to run a stub before asserting.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::read_to_string(&counter).expect("counter").len(),
+        runs,
+        "cached paths never execute a script"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unsupported_current_provider_reports_local_session_tokens() {
+    if plugin_path().is_none() {
+        return;
+    }
+    let sandbox = Sandbox::new("local");
+    let _env = EnvGuard::acquire(&sandbox.home(), &sandbox.agent_dir());
+    // No provider is registered for the faux `openrouter` model provider.
+    sandbox.write_settings(&[]);
+    let fixture = boot_with_model_provider(sandbox, "openrouter", Vec::new()).await;
+
+    run_usage(&fixture, "").await;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            fixture
+                .bridge
+                .notifications()
+                .iter()
+                .any(|message| message.starts_with("Local session tokens"))
+        })
+        .await,
+        "local report: {:?}",
+        fixture.bridge.notifications()
+    );
+    let report = fixture
+        .bridge
+        .notifications()
+        .into_iter()
+        .find(|message| message.starts_with("Local session tokens"))
+        .expect("local report");
+    for expected in [
+        "input: ",
+        "output: ",
+        "cacheRead: ",
+        "cacheWrite: ",
+        "used: ",
+        "(input + cacheWrite + output)",
+    ] {
+        assert!(report.contains(expected), "{report}");
+    }
+    for absent in ["plan:", "Window", "Balance", "Quota", "reset", "cost"] {
+        assert!(!report.contains(absent), "{report} misses {absent}");
+    }
+    assert!(
+        fixture
+            .bridge
+            .status_writes("rpi-usage")
+            .iter()
+            .all(Option::is_none),
+        "the local token report never publishes a quota footer: {:?}",
+        fixture.bridge.statuses()
+    );
+
+    run_usage(&fixture, "--json").await;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            fixture.bridge.structured().iter().any(|(method, data)| {
+                method == "usageReport"
+                    && data["source"] == json!("local")
+                    && data["localTokens"]["used"].is_number()
+            })
+        })
+        .await,
+        "local report JSON: {:?}",
+        fixture.bridge.structured()
+    );
+    let (_, data) = fixture
+        .bridge
+        .structured()
+        .into_iter()
+        .find(|(method, data)| method == "usageReport" && data["source"] == json!("local"))
+        .expect("local report JSON");
+    assert_eq!(data["provider"], json!("openrouter"));
+    assert_eq!(data["stale"], json!(false));
+    for absent in [
+        "envelope", "error", "plan", "windows", "ledgers", "balance", "quota",
+    ] {
+        assert!(data.get(absent).is_none(), "{absent}");
+    }
 }

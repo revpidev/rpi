@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-"""rpi-usage provider script: Kimi Code quota (TE44).
+"""rpi-usage provider script: Kimi Code quota (TE44 / TE53).
 
 Contract (host framework, V16-05 §7.2):
-- stdin:  {"provider", "baseUrl"?, "apiKeyEnv"?, "model"?}
+- stdin:  {"provider", "baseUrl"?, "apiKeyEnv"?, "model"?, "credentialKind"?}
 - stdout: the schemaVersion=1 usage envelope (single JSON object)
-- errors: a message on stderr + non-zero exit (the host degrades silently)
+- errors: exit 2 + `{"schemaVersion":1,"provider":...,"error":{"kind":...}}`
+  for a classified failure; a short sanitized line on stderr is diagnostics
 - displayText (TE50): compact windows "<label> <pct>%(~<reset-in>)" joined
-  by " / ", no provider prefix; RPI_USAGE_NOW_MS overrides the fetch-time
-  clock for the contract tests only (unset in production)
+  by " / ", no provider prefix; unchanged byte-for-byte for the recorded
+  fixtures so old hosts keep working
+- typed windows[] (04 §4.1): ids 5h / 7d with a percentage representation,
+  a required status and an optional RFC3339 resetAt/durationSeconds
+- optional ledgers[]: a `prepaid` `booster_wallet` ledger when the response
+  carries `extraUsage` (`{balanceCents,totalCents,currency,...}`). The booster
+  wallet is never merged with the quota windows; it is only exposed as a
+  separate typed ledger.
 
-Endpoint (pinned from the TE44 live capture, 2026-10-05):
+Endpoint (pinned from the TE44 live capture, 2026-10-05; fixed official
+origin per TE53 04 §5.1 — the stdin `baseUrl` is never used):
   GET https://api.kimi.com/coding/v1/usages
 The Kimi Code console key (`sk-kimi-*`) goes in `x-api-key`; OAuth access
 tokens use `Authorization: Bearer` (both shapes are tried).
@@ -23,6 +31,11 @@ Response (live):
               "limit_7d": {"used_ratio": 0.0, "reset_time": "<ISO>"}}}
 `usage` is the Code 7-day quota; each `limits[]` entry is a rolling window
 (300 minutes = 5-hour). Counts ship as strings; ratios are 0..1 used.
+
+Endpoint policy: redirects refused, 262144-byte body cap, request timeout.
+The test-only loopback override (`RPI_USAGE_TEST_MODE=1` +
+`RPI_USAGE_TEST_BASE_URL` loopback + a `test-` credential) replaces the
+origin and keeps the path.
 
 Credential resolution order (never printed): the context `apiKeyEnv`, the
 conventional environment variables below, then the rpi credential store
@@ -38,7 +51,9 @@ against a local stub HTTP server with recorded fixtures (no network).
 
 import datetime
 import json
+import math
 import os
+import socket
 import ssl
 import sys
 import urllib.error
@@ -48,10 +63,31 @@ import urllib.request
 PROVIDER = "kimi-code"
 ENV_NAMES = ("KIMI_API_KEY", "KIMI_CODING_API_KEY")
 AUTH_IDS = ("kimi-coding",)
-DEFAULT_BASE = "https://api.kimi.com/coding/v1"
-USAGES_SUFFIX = "/usages"
+DEFAULT_BASE = "https://api.kimi.com"
+USAGES_PATH = "/coding/v1/usages"
 DEFAULT_TIMEOUT_MS = 8000
 USER_AGENT = "rpi-usage/0.1.0"
+MAX_BODY_BYTES = 262144
+
+TEST_MODE_ENV = "RPI_USAGE_TEST_MODE"
+TEST_BASE_ENV = "RPI_USAGE_TEST_BASE_URL"
+LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+ONE_WEEK = 604_800
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: a usage read must not leave its origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+def _opener():
+    return urllib.request.build_opener(
+        _NoRedirect,
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+    )
 
 
 def read_context():
@@ -121,32 +157,73 @@ def timeout_seconds():
     return DEFAULT_TIMEOUT_MS / 1000.0
 
 
+def endpoint_url(production_url, credential):
+    """Production URL unless the test-only loopback override is active."""
+    if os.environ.get(TEST_MODE_ENV) != "1":
+        return production_url
+    override = os.environ.get(TEST_BASE_ENV, "").strip()
+    if not override or not credential or not credential.startswith("test-"):
+        return production_url
+    parsed = urllib.parse.urlparse(override)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in ("http", "https") or host not in LOOPBACK_HOSTS:
+        return production_url
+    if parsed.username or parsed.password:
+        return production_url
+    target = urllib.parse.urlparse(production_url)
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, target.path, "", target.query, ""))
+
+
 def http_get(url, headers, timeout):
+    """GET with redirect refusal; answers (status, body, transport_kind)."""
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(  # noqa: S310 - fixed https endpoint
-            request, timeout=timeout, context=ssl.create_default_context()
-        ) as response:
-            return response.status, response.read(262144).decode("utf-8", "replace")
+        with _opener().open(request, timeout=timeout) as response:
+            raw = response.read(MAX_BODY_BYTES + 1)
+            if len(raw) > MAX_BODY_BYTES:
+                return response.status, "", "oversized"
+            return response.status, raw.decode("utf-8", "replace"), None
     except urllib.error.HTTPError as error:
-        return error.code, error.read(65536).decode("utf-8", "replace")
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return 0, ""
+        try:
+            error.close()
+        except OSError:
+            pass
+        return error.code, "", None
+    except (TimeoutError, socket.timeout):
+        return 0, "", "timeout"
+    except urllib.error.URLError as error:
+        if isinstance(error.reason, (TimeoutError, socket.timeout)):
+            return 0, "", "timeout"
+        return 0, "", "transport"
+    except OSError:
+        return 0, "", "transport"
 
 
-def usages_url(base):
-    base = (base or DEFAULT_BASE).strip().rstrip("/")
-    if base.endswith(USAGES_SUFFIX):
-        return base
-    if base.endswith("/coding/v1"):
-        return base + USAGES_SUFFIX
-    if base.endswith("/coding"):
-        return base + "/v1" + USAGES_SUFFIX
-    return base + "/coding/v1" + USAGES_SUFFIX
+def failure_kind(status, transport):
+    if transport == "timeout":
+        return "timeout"
+    if transport == "oversized":
+        return "shape-changed"
+    if transport:
+        return "transport"
+    if status in (401, 403):
+        return "unauthorized"
+    if status == 429:
+        return "rate-limited"
+    return "transport"
+
+
+def fail(kind, detail):
+    """Classified failure envelope (exit 2) plus a short sanitized stderr line."""
+    print(f"{PROVIDER}: {detail}", file=sys.stderr)
+    envelope = {"schemaVersion": 1, "provider": PROVIDER, "error": {"kind": kind}}
+    sys.stdout.write(json.dumps(envelope, separators=(",", ":")))
+    sys.stdout.write("\n")
+    return 2
 
 
 def number(value):
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     if isinstance(value, str):
         try:
@@ -165,11 +242,22 @@ def ratio(value):
     return max(0.0, min(100.0, parsed))
 
 
+def finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(float(value)):
+        return None
+    return float(value)
+
+
 def window_label(window):
     if not isinstance(window, dict):
         return "5h"
     duration = number(window.get("duration"))
-    unit = str(window.get("timeUnit") or "").lower().removeprefix("time_unit_").rstrip("s")
+    unit = str(window.get("timeUnit") or "").lower()
+    if unit.startswith("time_unit_"):
+        unit = unit[len("time_unit_"):]
+    unit = unit.rstrip("s")
     if duration is None or duration <= 0:
         return "5h"
     if unit == "minute" and duration >= 60 and duration % 60 == 0:
@@ -183,6 +271,23 @@ def window_label(window):
     if unit == "minute":
         return f"{count}m"
     return "5h"
+
+
+def window_duration_seconds(window):
+    """Positive duration of a rolling window, else None."""
+    if not isinstance(window, dict):
+        return None
+    duration = number(window.get("duration"))
+    unit = str(window.get("timeUnit") or "").lower()
+    if unit.startswith("time_unit_"):
+        unit = unit[len("time_unit_"):]
+    unit = unit.rstrip("s")
+    if duration is None or duration <= 0:
+        return None
+    factor = {"second": 1, "minute": 60, "hour": 3600, "day": 86400}.get(unit)
+    if factor is None:
+        return None
+    return int(round(duration * factor))
 
 
 def count_used(detail):
@@ -211,8 +316,10 @@ def plan_name(data):
     membership = user.get("membership") if isinstance(user, dict) else None
     level = membership.get("level") if isinstance(membership, dict) else None
     if isinstance(level, str) and level.strip():
-        cleaned = level.strip().removeprefix("LEVEL_").replace("_", " ").lower()
-        return cleaned.title() or "Kimi Code"
+        cleaned = level.strip()
+        if cleaned.startswith("LEVEL_"):
+            cleaned = cleaned[len("LEVEL_"):]
+        return cleaned.replace("_", " ").lower().title() or "Kimi Code"
     return "Kimi Code"
 
 
@@ -234,6 +341,18 @@ def iso_epoch(value):
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=datetime.timezone.utc)
     return parsed.timestamp()
+
+
+def iso_from_epoch(seconds):
+    """Canonical RFC3339 UTC string for an epoch timestamp, else None."""
+    if seconds is None:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(
+            seconds, tz=datetime.timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def now_epoch():
@@ -261,46 +380,97 @@ def countdown_annotation(reset_epoch, now):
     return f"(~{max(1, int(delta // 60))}m)"
 
 
+def percent_window(window_id, label, used, reset, duration):
+    used = max(0.0, min(100.0, used))
+    window = {
+        "id": window_id,
+        "label": label,
+        "status": "rate-limited" if used >= 100.0 else "ok",
+        "usedPercent": round(used, 4),
+        "remainingPercent": round(max(0.0, 100.0 - used), 4),
+    }
+    reset_at = iso_from_epoch(reset)
+    if reset_at:
+        window["resetAt"] = reset_at
+    if duration:
+        window["durationSeconds"] = duration
+    return window
+
+
+def booster_ledger(extra):
+    """Separate prepaid ledger from `extraUsage` cents, never merged."""
+    if not isinstance(extra, dict):
+        return None
+    currency = extra.get("currency")
+    if not isinstance(currency, str) or not currency.strip():
+        currency = "USD"
+    currency = currency.strip()
+    remaining = number(extra.get("balanceCents"))
+    total = number(extra.get("totalCents"))
+    ledger = {
+        "id": "booster_wallet",
+        "label": "Booster",
+        "kind": "prepaid",
+        "unit": currency,
+        "currency": currency,
+    }
+    if remaining is not None and remaining >= 0:
+        ledger["remaining"] = round(remaining / 100.0, 4)
+    if total is not None and total > 0:
+        ledger["total"] = round(total / 100.0, 4)
+        if remaining is not None and remaining >= 0:
+            ledger["used"] = round(max(0.0, total - remaining) / 100.0, 4)
+    if "remaining" not in ledger and "total" not in ledger:
+        return None
+    return ledger
+
+
+def offline():
+    """Defensive RPI_OFFLINE check (the host is the first boundary)."""
+    value = os.environ.get("RPI_OFFLINE")
+    return bool(value) and value.strip().lower() in ("1", "true", "yes")
+
+
 def main():
+    if offline():
+        return fail("offline", "offline mode: usage scripts are disabled")
     context = read_context()
     key, _source = resolve_key(context)
     if not key:
-        print(
-            f"{PROVIDER}: no API key; set one of {', '.join(ENV_NAMES)} "
-            "(or log in with rpi)",
-            file=sys.stderr,
+        return fail(
+            "auth-unavailable",
+            "no API key; set KIMI_API_KEY or KIMI_CODING_API_KEY",
         )
-        return 1
 
-    url = usages_url(context.get("baseUrl"))
+    url = endpoint_url(DEFAULT_BASE + USAGES_PATH, key)
     candidates = [
         {"x-api-key": key},
         {"Authorization": "Bearer " + key},
     ]
     status = 0
     body = ""
+    transport = None
+    succeeded = False
     for headers in candidates:
-        status, body = http_get(
+        status, body, transport = http_get(
             url,
             {**headers, "Accept": "application/json", "User-Agent": USER_AGENT},
             timeout_seconds(),
         )
-        if status == 200:
+        if transport == "timeout":
             break
-    if status == 0:
-        print(f"{PROVIDER}: request failed (timeout or transport error)", file=sys.stderr)
-        return 1
-    if status != 200:
-        print(f"{PROVIDER}: endpoint answered HTTP {status}", file=sys.stderr)
-        return 1
+        if transport is None and status == 200:
+            succeeded = True
+            break
+    if not succeeded:
+        return fail(failure_kind(status, transport), "request failed")
+
     try:
         data = json.loads(body)
     except ValueError:
-        print(f"{PROVIDER}: endpoint answered non-JSON", file=sys.stderr)
-        return 1
+        return fail("shape-changed", "endpoint answered non-JSON")
     if not isinstance(data, dict):
-        print(f"{PROVIDER}: unexpected response shape", file=sys.stderr)
-        return 1
+        return fail("shape-changed", "unexpected response shape")
 
     usages = data.get("usages") if isinstance(data.get("usages"), dict) else {}
     weekly_detail = data.get("usage") if isinstance(data.get("usage"), dict) else {}
@@ -314,7 +484,8 @@ def main():
 
     limits = data.get("limits") if isinstance(data.get("limits"), list) else []
     first = limits[0] if limits and isinstance(limits[0], dict) else {}
-    five_label = window_label(first.get("window"))
+    five_window = first.get("window")
+    five_label = window_label(five_window)
     five_detail = first.get("detail") if isinstance(first.get("detail"), dict) else {}
     five_pct = count_percent(five_detail)
     five_reset = iso_epoch(five_detail.get("resetTime"))
@@ -323,6 +494,22 @@ def main():
         five_pct = ratio(limit_5h.get("used_ratio"))
     if five_reset is None:
         five_reset = iso_epoch(limit_5h.get("reset_time"))
+
+    windows = []
+    if five_pct is not None:
+        windows.append(
+            percent_window(
+                "5h",
+                five_label,
+                five_pct,
+                five_reset,
+                window_duration_seconds(five_window),
+            )
+        )
+    if weekly_pct is not None:
+        windows.append(
+            percent_window("7d", "7d", weekly_pct, weekly_reset, ONE_WEEK)
+        )
 
     now = now_epoch()
     parts = []
@@ -333,8 +520,7 @@ def main():
     if weekly_pct is not None:
         parts.append(f"7d {fmt(weekly_pct)}%" + countdown_annotation(weekly_reset, now))
     if not parts:
-        print(f"{PROVIDER}: response carries no recognized windows", file=sys.stderr)
-        return 1
+        return fail("shape-changed", "response carries no recognized windows")
     display = " / ".join(parts)
 
     envelope = {
@@ -342,7 +528,11 @@ def main():
         "provider": PROVIDER,
         "plan": plan_name(data),
         "displayText": display,
+        "windows": windows,
     }
+    ledger = booster_ledger(data.get("extraUsage"))
+    if ledger is not None:
+        envelope["ledgers"] = [ledger]
     limit = number(weekly_detail.get("limit"))
     remaining = number(weekly_detail.get("remaining"))
     used_count = count_used(weekly_detail)

@@ -102,7 +102,7 @@ fn every_production_module_is_file_backed_and_reachable() {
 }
 
 #[test]
-fn the_four_provider_scripts_are_present_and_embedded() {
+fn the_eight_provider_scripts_are_present_and_embedded() {
     let embedded: Vec<(String, &str)> = rpi_ext_usage::providers::BUILTIN_SCRIPTS
         .iter()
         .map(|script| (script.file.to_owned(), script.source))
@@ -116,7 +116,11 @@ fn the_four_provider_scripts_are_present_and_embedded() {
             "deepseek.py",
             "glm_coding_plan.py",
             "minimax_token_plan.py",
-            "kimi_code.py"
+            "kimi_code.py",
+            "opencode_go.py",
+            "anthropic.py",
+            "openai_codex.py",
+            "xai.py"
         ]
     );
     for (file, source) in embedded {
@@ -139,11 +143,20 @@ fn recorded_fixtures_cover_every_provider_and_degradation() {
         "deepseek_balance.json",
         "glm_quota.json",
         "glm_quota_weekly.json",
+        "glm_count_only.json",
         "glm_error.json",
         "minimax_remains.json",
+        "minimax_unlimited.json",
         "minimax_error.json",
         "kimi_usages.json",
         "kimi_usages_used.json",
+        "kimi_usages_booster.json",
+        "opencode_go_usage.json",
+        "anthropic_usage.json",
+        "openai_codex_usage.json",
+        "xai_user.json",
+        "xai_billing.json",
+        "joint_footer_golden.json",
     ];
     for name in expected {
         let path = crate_file(&format!("fixtures/{name}"));
@@ -175,6 +188,7 @@ fn direct_dependencies_include_no_http_client() {
         names,
         BTreeSet::from([
             "abi_stable".to_owned(),
+            "chrono".to_owned(),
             "rpi-ext-host".to_owned(),
             "serde".to_owned(),
             "serde_json".to_owned(),
