@@ -411,6 +411,23 @@ mod tests {
                 ]}),
                 "invalid_payload",
             ),
+            (
+                json!({"answers": [
+                    {"questionIndex": 0, "optionIndexes": [0], "notes": "x".repeat(MAX_EXTERNAL_TEXT_BYTES + 1)},
+                    {"questionIndex": 1, "text": "x"}
+                ]}),
+                "invalid_payload",
+            ),
+            (
+                json!({
+                    "answers": [
+                        {"questionIndex": 0, "optionIndexes": [0]},
+                        {"questionIndex": 1, "text": "x"}
+                    ],
+                    "globalNote": "x".repeat(MAX_EXTERNAL_TEXT_BYTES + 1)
+                }),
+                "invalid_payload",
+            ),
         ] {
             let (actual, _) =
                 resolve_external_answer(&questions(), &payload).expect_err(&format!("{payload}"));
