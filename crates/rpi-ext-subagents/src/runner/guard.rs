@@ -487,6 +487,11 @@ mod tests {
             Some(&json!({"activityTitle": "Cursor edit"})),
             &[]
         ));
+        assert!(is_mutating_tool(
+            Some("cursor"),
+            Some(&json!({"activityTitle": "cursor write"})),
+            &[]
+        ));
         assert!(!is_mutating_tool(Some("read"), None, &[]));
         assert!(!is_mutating_tool(
             Some("bash"),

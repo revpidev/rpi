@@ -1761,33 +1761,48 @@ mod tests {
     }
 
     #[test]
-    fn parallel_tool_end_keeps_the_surviving_open_tool() {
+    fn parallel_tool_end_repoints_to_the_newest_and_preserves_ended_args() {
         let mut state = ChildRunState {
             mutation_tools: vec!["edit".to_string()],
             ..ChildRunState::default()
         };
-        state.process_line(
-            &serde_json::json!({
-                "type": "tool_execution_start",
-                "toolCallId": "a",
-                "toolName": "bash",
-                "args": {"command": "sleep 10"}
-            })
-            .to_string(),
+        let start =
+            |state: &mut ChildRunState, id: &str, tool: &str, args: serde_json::Value, ts| {
+                state.process_line(
+                    &serde_json::json!({
+                        "type": "tool_execution_start",
+                        "toolCallId": id,
+                        "toolName": tool,
+                        "args": args
+                    })
+                    .to_string(),
+                    ts,
+                );
+            };
+        start(
+            &mut state,
+            "a",
+            "bash",
+            serde_json::json!({"command":"sleep 10"}),
             10,
         );
-        state.process_line(
-            &serde_json::json!({
-                "type": "tool_execution_start",
-                "toolCallId": "b",
-                "toolName": "edit",
-                "args": {"path": "src/b.ts"}
-            })
-            .to_string(),
+        start(
+            &mut state,
+            "b",
+            "edit",
+            serde_json::json!({"path":"src/b.ts"}),
             11,
         );
-        assert_eq!(state.current_tool.as_deref(), Some("edit"));
-        // Ending an earlier call must not clear the still-open edit call.
+        start(
+            &mut state,
+            "c",
+            "read",
+            serde_json::json!({"path":"src/c.ts"}),
+            12,
+        );
+        assert_eq!(state.current_tool_call_id.as_deref(), Some("c"));
+        // Ending an earlier call keeps the current display and records that
+        // call's own preview.
         state.process_line(
             &serde_json::json!({
                 "type": "tool_execution_end",
@@ -1796,12 +1811,29 @@ mod tests {
                 "isError": false
             })
             .to_string(),
-            12,
+            13,
         );
-        assert_eq!(state.current_tool.as_deref(), Some("edit"));
-        assert_eq!(state.current_tool_call_id.as_deref(), Some("b"));
-        assert_eq!(state.current_path.as_deref(), Some("src/b.ts"));
+        assert_eq!(state.current_tool_call_id.as_deref(), Some("c"));
         assert_eq!(state.recent_tools.last().unwrap().tool, "bash");
+        assert_eq!(state.recent_tools.last().unwrap().args, "sleep 10");
+        assert_eq!(state.pending_tool_calls.len(), 2);
+        // Ending the displayed call re-points to the newest survivor.
+        state.process_line(
+            &serde_json::json!({
+                "type": "tool_execution_end",
+                "toolCallId": "c",
+                "toolName": "read",
+                "isError": false
+            })
+            .to_string(),
+            14,
+        );
+        assert_eq!(state.current_tool_call_id.as_deref(), Some("b"));
+        assert_eq!(state.current_tool.as_deref(), Some("edit"));
+        assert_eq!(state.current_tool_args.as_deref(), Some("src/b.ts"));
+        assert_eq!(state.current_path.as_deref(), Some("src/b.ts"));
+        assert_eq!(state.recent_tools.last().unwrap().tool, "read");
+        assert_eq!(state.recent_tools.last().unwrap().args, "src/c.ts");
         assert_eq!(state.pending_tool_calls.len(), 1);
         // Ending the displayed call clears the slot.
         state.process_line(
@@ -1812,7 +1844,7 @@ mod tests {
                 "isError": false
             })
             .to_string(),
-            13,
+            15,
         );
         assert_eq!(state.current_tool, None);
         assert!(state.pending_tool_calls.is_empty());
