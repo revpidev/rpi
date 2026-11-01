@@ -8,6 +8,7 @@
 //! `ExtensionRunner` seam.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde_json::{Value, json};
@@ -52,6 +53,9 @@ pub struct NativeExtensionHost {
     /// resource-loader.ts:100-107). Drained by the startup pipeline with
     /// [`Self::take_warnings`].
     last_warnings: RwLock<Vec<ExtensionLoadWarning>>,
+    /// ADR-0043: whether the inbound questionnaire answer channel is already
+    /// installed on this host (one subscription per host).
+    answer_channel_installed: AtomicBool,
 }
 
 fn read<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -79,7 +83,14 @@ impl NativeExtensionHost {
             last_load: RwLock::new(None),
             last_ui: RwLock::new(None),
             last_warnings: RwLock::new(Vec::new()),
+            answer_channel_installed: AtomicBool::new(false),
         }
+    }
+
+    /// ADR-0043: claim the one-time answer-channel installation for this
+    /// host. Returns `false` when a mode already installed it.
+    pub fn claim_answer_channel(&self) -> bool {
+        !self.answer_channel_installed.swap(true, Ordering::SeqCst)
     }
 
     /// Drain the load warnings from the most recent load

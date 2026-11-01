@@ -173,7 +173,8 @@ pub fn execute(host: &dyn HostCall, params: &Value) -> Value {
     // etc.) before the questionnaire opens. Upstream would propagate a
     // listener throw; in rpi `events.emit` is fire-and-forget and a host
     // failure is logged, never fatal to the tool call.
-    if let Err(error) = events::emit_prompt(host, &typed) {
+    if let Err(error) = events::emit_prompt(host, &typed, crate::current_tool_call_id().as_deref())
+    {
         tracing::warn!(
             kind = %error.kind,
             message = %error.message,
@@ -304,7 +305,8 @@ fn resolve_without_component(host: &dyn HostCall, typed: &QuestionParams, i18n: 
 }
 
 fn emit_blocked_or_warn(host: &dyn HostCall, active: bool) {
-    if let Err(error) = events::emit_blocked(host, active) {
+    if let Err(error) = events::emit_blocked(host, active, crate::current_tool_call_id().as_deref())
+    {
         tracing::warn!(
             kind = %error.kind,
             message = %error.message,
@@ -317,7 +319,7 @@ fn emit_blocked_or_warn(host: &dyn HostCall, active: bool) {
 /// TE30 reuses it for the component). Exposed so the Q0 contract test can
 /// assert the pair is well-formed.
 pub fn emit_blocked(host: &dyn HostCall, active: bool) -> Result<(), HostError> {
-    events::emit_blocked(host, active)
+    events::emit_blocked(host, active, crate::current_tool_call_id().as_deref())
 }
 
 #[cfg(test)]

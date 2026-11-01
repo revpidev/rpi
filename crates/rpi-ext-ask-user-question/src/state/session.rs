@@ -367,6 +367,11 @@ impl QuestionnaireComponent {
         }
     }
 
+    /// ADR-0043: settle from a validated inbound answer (first answer wins).
+    pub fn settle_external(&mut self, result: crate::tool::types::QuestionnaireResult) {
+        self.result = Some(result);
+    }
+
     /// Override the palette (tests/golden frames).
     pub fn with_theme(mut self, theme: Theme) -> Self {
         self.theme = theme;
@@ -592,7 +597,11 @@ pub fn inline_row_budget(rows: usize) -> usize {
 /// overlay is already open (`mustYieldInlineSlot` reads `tui.hasOverlay()`);
 /// the rpi interactive-UI ABI exposes no overlay query, so the inline mount
 /// is unconditional (documented divergence, TE48 §7.3).
-pub fn mount_options(collapse_key: &str, capturing_overlay: bool) -> MountOptions {
+pub fn mount_options(
+    collapse_key: &str,
+    capturing_overlay: bool,
+    tool_call_id: Option<&str>,
+) -> MountOptions {
     MountOptions {
         // #313: only an overlay that takes the keys (e.g. /btw) forces the
         // stacked overlay fallback; a non-capturing HUD keeps the inline slot.
@@ -607,6 +616,11 @@ pub fn mount_options(collapse_key: &str, capturing_overlay: bool) -> MountOption
         },
         cursor: true,
         label: Some("ask_user_question".to_owned()),
+        answerable: tool_call_id.map(|tool_call_id| {
+            rpi_ext_host::interactive_ui::AnswerableOptions {
+                tool_call_id: tool_call_id.to_string(),
+            }
+        }),
         ..MountOptions::default()
     }
 }
@@ -697,7 +711,11 @@ pub fn run(
         .ok()
         .and_then(|value| value.get("capturing").and_then(serde_json::Value::as_bool))
         .unwrap_or(false);
-    let options = mount_options(&collapse_key, capturing_overlay);
+    let options = mount_options(
+        &collapse_key,
+        capturing_overlay,
+        crate::current_tool_call_id().as_deref(),
+    );
     let adapter = AbiHostAdapter { host };
     let handle = mount_component(&adapter, &options)?;
 
@@ -720,6 +738,33 @@ pub fn run(
             ComponentEvent::Theme { theme } => component.on_theme(theme),
             ComponentEvent::Visibility { hidden } => component.on_visibility(*hidden),
             ComponentEvent::Render => component.on_render(),
+            ComponentEvent::ExternalAnswer { payload } => {
+                // ADR-0043: validate all-or-nothing, then settle (first answer
+                // wins); a failed attempt changes nothing and gets a verdict.
+                if component.result.is_some() {
+                    let _ = crate::events::emit_answer_result(
+                        host,
+                        payload,
+                        Some("not_found"),
+                        Some("the questionnaire is already settled"),
+                    );
+                    continue;
+                }
+                match crate::external_answer::resolve_external_answer(&params.questions, payload) {
+                    Ok(result) => {
+                        let _ = crate::events::emit_answer_result(host, payload, None, None);
+                        component.settle_external(result);
+                    }
+                    Err((code, reason)) => {
+                        let _ = crate::events::emit_answer_result(
+                            host,
+                            payload,
+                            Some(&code),
+                            Some(&reason),
+                        );
+                    }
+                }
+            }
             ComponentEvent::Dispose { reason } => {
                 component.on_dispose(*reason);
                 let frame = current_frame(&mut component, width);
@@ -1020,7 +1065,7 @@ mod tests {
         assert!(component.state.collapsed);
         let _ = component.take_host_effects();
         // The only key the host routes while hidden is the collapse key.
-        let options = mount_options("ctrl+]", false);
+        let options = mount_options("ctrl+]", false, None);
         assert_eq!(options.keys_when_hidden, vec!["ctrl+]"]);
         assert!(!options.keys_when_hidden.iter().any(|key| key == "escape"));
         // Esc on the visible collapsed fallback row cancels (upstream parity).
@@ -1122,6 +1167,102 @@ mod tests {
     /// FR-Q3-F: `ui.editExternal` success writes back; `unknownMethod`
     /// (pre-C3 host) falls back to `ui.editor`; failure notifies
     /// `editor.failed` and keeps the draft; a cancel keeps the draft.
+    #[test]
+    fn run_loop_settles_from_an_external_answer_and_emits_a_verdict() {
+        let host = tests_support::ScriptHost::new(vec![
+            (
+                "ui.hasOverlay",
+                Ok(json!({"visible": false, "capturing": false})),
+            ),
+            ("ui.mountComponent", Ok(json!({"handle": 1}))),
+            (
+                "ui.pollComponent",
+                Ok(json!({"event": {"type": "resize", "width": 80, "height": 24}})),
+            ),
+            (
+                "ui.pollComponent",
+                Ok(json!({"event": {"type": "externalAnswer", "payload": {
+                    "toolCallId": "call-1",
+                    "answers": [{"questionIndex": 0, "optionIndexes": [1]}]
+                }}})),
+            ),
+            ("events.emit", Ok(Value::Null)),
+            ("ui.renderComponent", Ok(json!({"ok": true}))),
+        ]);
+        let params = params(false, 1);
+        let result = run(
+            &host,
+            &params,
+            &I18n::for_locale("en"),
+            &AskUserQuestionConfig::default(),
+        )
+        .expect("component session");
+        assert!(!result.cancelled);
+        assert_eq!(result.answers[0].answer.as_deref(), Some("B"));
+        let calls = host.calls();
+        let verdict = calls
+            .iter()
+            .find(|(method, args)| {
+                method == "events.emit"
+                    && args.get("channel").and_then(Value::as_str)
+                        == Some("rpi:ask-user:answer-result")
+            })
+            .map(|(_, args)| args["data"].clone())
+            .expect("verdict emitted");
+        assert_eq!(verdict["ok"], json!(true));
+        assert_eq!(verdict["toolCallId"], json!("call-1"));
+    }
+
+    #[test]
+    fn run_loop_reports_an_invalid_external_answer_and_keeps_the_dialog() {
+        let host = tests_support::ScriptHost::new(vec![
+            (
+                "ui.hasOverlay",
+                Ok(json!({"visible": false, "capturing": false})),
+            ),
+            ("ui.mountComponent", Ok(json!({"handle": 1}))),
+            (
+                "ui.pollComponent",
+                Ok(json!({"event": {"type": "resize", "width": 80, "height": 24}})),
+            ),
+            (
+                "ui.pollComponent",
+                Ok(json!({"event": {"type": "externalAnswer", "payload": {
+                    "toolCallId": "call-1", "answers": []
+                }}})),
+            ),
+            ("events.emit", Ok(Value::Null)),
+            ("ui.renderComponent", Ok(json!({"ok": true}))),
+            (
+                "ui.pollComponent",
+                Ok(json!({"event": {"type": "input", "data": "\r"}})),
+            ),
+            ("ui.renderComponent", Ok(json!({"ok": true}))),
+        ]);
+        let params = params(false, 1);
+        let result = run(
+            &host,
+            &params,
+            &I18n::for_locale("en"),
+            &AskUserQuestionConfig::default(),
+        )
+        .expect("component session");
+        // The failed event changed nothing; the terminal answer still wins.
+        assert_eq!(result.answers[0].answer.as_deref(), Some("A"));
+        let calls = host.calls();
+        let verdict = calls
+            .iter()
+            .find(|(method, args)| {
+                method == "events.emit"
+                    && args.get("channel").and_then(Value::as_str)
+                        == Some("rpi:ask-user:answer-result")
+            })
+            .map(|(_, args)| args["data"].clone())
+            .expect("verdict emitted");
+        assert_eq!(verdict["ok"], json!(false));
+        assert_eq!(verdict["code"], json!("invalid_answer"));
+    }
+
     #[test]
     fn run_loop_external_editor_success_fallback_and_failure() {
         // Success via ui.editExternal.
@@ -1298,7 +1439,7 @@ mod tests {
 
     #[test]
     fn mount_options_carry_inline_presentation_and_collapse_channel() {
-        let options = mount_options("ctrl+]", false);
+        let options = mount_options("ctrl+]", false, None);
         assert!(!options.overlay, "v2.13.0: inline editor-slot mount");
         assert!(options.overlay_options.is_none());
         assert_eq!(options.tick_ms, 0);
@@ -1306,10 +1447,18 @@ mod tests {
         assert!(options.cursor);
         assert_eq!(options.label.as_deref(), Some("ask_user_question"));
         // #313: a capturing overlay switches to the stacked overlay mount.
-        let stacked = mount_options("ctrl+]", true);
+        let stacked = mount_options("ctrl+]", true, Some("call-1"));
+        assert_eq!(
+            stacked.answerable.as_ref().map(|a| a.tool_call_id.as_str()),
+            Some("call-1")
+        );
         assert!(stacked.overlay);
         assert!(stacked.overlay_options.is_none());
-        assert!(mount_options("off", false).keys_when_hidden.is_empty());
+        assert!(
+            mount_options("off", false, None)
+                .keys_when_hidden
+                .is_empty()
+        );
         // Row budget: 70% with a 12-row floor, never above the terminal.
         assert_eq!(inline_row_budget(30), 21);
         assert_eq!(inline_row_budget(10), 10);

@@ -966,6 +966,32 @@ impl ComponentRegistry {
         closed.push_back(handle.0);
     }
 
+    /// ADR-0043: deliver an inbound `rpi:ask-user:answer` payload to the
+    /// active answerable component. The payload's `toolCallId` must name the
+    /// mount's `answerable.toolCallId`; the guest validates the rest.
+    pub(crate) fn deliver_external_answer(
+        &self,
+        payload: &Value,
+    ) -> crate::modes::interactive::interactive_mode::answer_channel::Delivery {
+        use crate::modes::interactive::interactive_mode::answer_channel::Delivery;
+        let Some(tool_call_id) = payload.get("toolCallId").and_then(Value::as_str) else {
+            return Delivery::InvalidPayload;
+        };
+        let Some(state) = self.active_state() else {
+            return Delivery::NotFound;
+        };
+        let Some(answerable) = state.options.answerable.as_ref() else {
+            return Delivery::NotFound;
+        };
+        if answerable.tool_call_id != tool_call_id {
+            return Delivery::NotFound;
+        }
+        state.push_event(ComponentEvent::ExternalAnswer {
+            payload: payload.clone(),
+        });
+        Delivery::Delivered
+    }
+
     fn active_state(&self) -> Option<Arc<MountState>> {
         self.active
             .lock()
@@ -1575,6 +1601,71 @@ mod interactive_component {
         events
     }
 
+    /// ADR-0043: inbound answers route by `toolCallId` to the answerable mount.
+    #[test]
+    fn component_registry_routes_external_answers_by_tool_call_id() {
+        use crate::modes::interactive::interactive_mode::answer_channel::Delivery;
+        use rpi_ext_host::interactive_ui::AnswerableOptions;
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let options = MountOptions {
+            answerable: Some(AnswerableOptions {
+                tool_call_id: "call-1".to_owned(),
+            }),
+            ..MountOptions::default()
+        };
+        let handle = registry
+            .mount(
+                "ext",
+                options,
+                Arc::clone(&mount) as Arc<dyn ComponentMountPoint>,
+            )
+            .expect("mount");
+        // Missing id / wrong id / unknown target.
+        assert_eq!(
+            registry.deliver_external_answer(&serde_json::json!({"answers": []})),
+            Delivery::InvalidPayload
+        );
+        assert_eq!(
+            registry.deliver_external_answer(&serde_json::json!({"toolCallId": "other"})),
+            Delivery::NotFound
+        );
+        // The matching id queues one `externalAnswer` event.
+        let payload = serde_json::json!({"toolCallId": "call-1", "cancel": true});
+        assert_eq!(
+            registry.deliver_external_answer(&payload),
+            Delivery::Delivered
+        );
+        let events = drain_events(&registry, handle);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ComponentEvent::ExternalAnswer { payload: queued } if *queued == payload
+            )),
+            "{events:?}"
+        );
+        // A non-answerable mount accepts nothing.
+        registry
+            .render(
+                "ext",
+                handle,
+                ComponentFrame::lines(vec!["x".to_owned()]).with_done(Value::Null),
+            )
+            .expect("done");
+        let unmounted = registry
+            .mount(
+                "ext",
+                MountOptions::default(),
+                Arc::clone(&mount) as Arc<dyn ComponentMountPoint>,
+            )
+            .expect("remount");
+        assert_eq!(
+            registry.deliver_external_answer(&serde_json::json!({"toolCallId": "call-1"})),
+            Delivery::NotFound
+        );
+        let _ = unmounted;
+    }
+
     // -- §4.1 registry lifecycle -------------------------------------------
 
     #[test]
@@ -1686,6 +1777,7 @@ mod interactive_component {
             cursor: true,
             max_frame_bytes: 1024,
             label: Some("ask_user_question".to_owned()),
+            answerable: None,
         };
         let handle = mount_overlay(&registry, &mount, options);
         let records = mount.overlays.lock().unwrap().clone();

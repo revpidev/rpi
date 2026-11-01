@@ -28,6 +28,7 @@
 
 pub mod config;
 pub mod events;
+pub mod external_answer;
 pub mod golden;
 pub mod i18n;
 pub mod parity_cases;
@@ -146,6 +147,30 @@ pub fn emit_terminal_attention_stdout() {
     let _ = emit_terminal_attention(std::io::stdout().is_terminal(), &mut std::io::stdout());
 }
 
+// ADR-0043: the `toolCallId` of the in-flight `ask_user_question` dispatch.
+// The guest is single-threaded per dispatch and `execute` is synchronous, so
+// a thread-local is exact and keeps parallel test threads isolated; the
+// prompt/blocked events and the mount options read it without threading a
+// parameter through every seam.
+thread_local! {
+    static CURRENT_TOOL_CALL_ID: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The tool call id of the current dispatch, if the host supplied one.
+pub(crate) fn current_tool_call_id() -> Option<String> {
+    CURRENT_TOOL_CALL_ID.with(|cell| cell.borrow().clone())
+}
+
+fn with_tool_call_id<T>(tool_call_id: Option<&str>, run: impl FnOnce() -> T) -> T {
+    CURRENT_TOOL_CALL_ID.with(|cell| {
+        *cell.borrow_mut() = tool_call_id.map(str::to_string);
+    });
+    let out = run();
+    CURRENT_TOOL_CALL_ID.with(|cell| *cell.borrow_mut() = None);
+    out
+}
+
 /// Newest host channel (session switches rebind it).
 static CHANNEL: OnceLock<Mutex<Option<NativeHostCall>>> = OnceLock::new();
 
@@ -205,7 +230,8 @@ fn dispatch_message(message: &Value) -> Value {
             if message.get("toolName").and_then(Value::as_str) == Some(tool::TOOL_NAME) =>
         {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
-            tool::execute(&host, &params)
+            let tool_call_id = message.get("toolCallId").and_then(Value::as_str);
+            with_tool_call_id(tool_call_id, || tool::execute(&host, &params))
         }
         Some("event")
             if message.get("event").and_then(Value::as_str) == Some("before_agent_start") =>

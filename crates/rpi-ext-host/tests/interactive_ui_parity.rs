@@ -269,6 +269,7 @@ fn interactive_ui_parity_mount_options() {
         cursor: false,
         max_frame_bytes: 4096,
         label: Some("ask_user_question".to_owned()),
+        answerable: None,
     };
     let wasm_full = wasm::MountOptions {
         overlay: false,
@@ -292,6 +293,7 @@ fn interactive_ui_parity_mount_options() {
         cursor: false,
         max_frame_bytes: 4096,
         label: Some("ask_user_question".to_owned()),
+        answerable: None,
     };
     let json = assert_same_json!(native_full, wasm_full);
     assert_cross_parse!(json.as_str(), native::MountOptions, wasm::MountOptions);

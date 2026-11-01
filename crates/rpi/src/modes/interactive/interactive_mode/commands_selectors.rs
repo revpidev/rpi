@@ -3107,6 +3107,12 @@ impl InteractiveMode {
                         bridge
                     });
                 host.set_ui(Some(bridge), rpi_ext_host::types::ExtensionMode::Tui);
+                if host.claim_answer_channel() {
+                    super::answer_channel::install_tui(
+                        &host.event_bus(),
+                        std::sync::Arc::downgrade(&self.ui_state),
+                    );
+                }
                 // `bindCommandContext` (agent-session.ts:3338): the fresh
                 // session's host needs the interactive `ctx.command.*`
                 // actions too (V17-11 FR-B R2).

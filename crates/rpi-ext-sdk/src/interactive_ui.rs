@@ -287,6 +287,19 @@ pub struct MountOptions {
     /// Diagnostic label (host logs, R-U12.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// ADR-0043: the mounted questionnaire may be resolved by an inbound
+    /// `rpi:ask-user:answer` event naming this tool call. Old hosts ignore
+    /// the field (the typed path is unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answerable: Option<AnswerableOptions>,
+}
+
+/// ADR-0043: which questionnaire an inbound answer may target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerableOptions {
+    /// The tool call id the questionnaire was opened for.
+    pub tool_call_id: String,
 }
 
 impl Default for MountOptions {
@@ -299,6 +312,7 @@ impl Default for MountOptions {
             cursor: true,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             label: None,
+            answerable: None,
         }
     }
 }
@@ -496,6 +510,12 @@ pub enum ComponentEvent {
         /// Why the host is disposing the component.
         reason: DisposeReason,
     },
+    /// ADR-0043: an inbound `rpi:ask-user:answer` payload for the mount's
+    /// `answerable.toolCallId`. The guest validates it and settles.
+    ExternalAnswer {
+        /// Raw event payload (untrusted).
+        payload: Value,
+    },
 }
 
 impl ComponentEvent {
@@ -511,6 +531,7 @@ impl ComponentEvent {
             Self::Visibility { .. } => "visibility",
             Self::Render => "render",
             Self::Dispose { .. } => "dispose",
+            Self::ExternalAnswer { .. } => "externalAnswer",
         }
     }
 
@@ -1254,6 +1275,9 @@ pub trait Component {
     fn on_visibility(&mut self, _hidden: bool) {}
     /// `ui.wakeComponent` fired.
     fn on_render(&mut self) {}
+    /// ADR-0043: an inbound `rpi:ask-user:answer` payload for this mount.
+    /// Default is a no-op (only answerable mounts receive it).
+    fn on_external_answer(&mut self, _payload: &Value) {}
     /// Host-forced unmount (R-U6.1).
     fn on_dispose(&mut self, _reason: DisposeReason) {}
     /// `done(result)` equivalent: `Some(value)` (including `Value::Null`)
@@ -1293,6 +1317,7 @@ pub fn run_component<C: Component, H: HostCall + ?Sized>(
             ComponentEvent::Theme { theme } => component.on_theme(theme),
             ComponentEvent::Visibility { hidden } => component.on_visibility(*hidden),
             ComponentEvent::Render => component.on_render(),
+            ComponentEvent::ExternalAnswer { payload } => component.on_external_answer(payload),
             ComponentEvent::Dispose { reason } => {
                 component.on_dispose(*reason);
                 let frame = ComponentFrame {

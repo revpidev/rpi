@@ -1369,6 +1369,11 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
             ))),
             rpi_ext_host::types::ExtensionMode::Rpc,
         );
+        if host.claim_answer_channel() {
+            crate::modes::interactive::interactive_mode::answer_channel::install_unsupported(
+                &host.event_bus(),
+            );
+        }
     }
 
     // Input loop: each command is handled on its own task so `abort` /

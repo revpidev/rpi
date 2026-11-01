@@ -646,6 +646,7 @@ fn open_editor(calls: &AsyncHostCalls, reset_defaults: bool) -> Value {
         cursor: true,
         max_frame_bytes: interactive_ui::DEFAULT_MAX_FRAME_BYTES,
         label: Some("rpi-statusline".to_owned()),
+        answerable: None,
     };
     let host = editor.host;
     match run_component(&host, editor, options) {

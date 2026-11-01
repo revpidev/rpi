@@ -29,7 +29,7 @@ pub const ASK_USER_BLOCKED_EVENT: &str = "rpi:ask-user:blocked";
 ///
 /// `hasPreview` is derived exactly like upstream: `typeof preview === "string"
 /// && preview.length > 0` (content itself is not shipped).
-pub fn build_prompt_payload(params: &QuestionParams) -> Value {
+pub fn build_prompt_payload(params: &QuestionParams, tool_call_id: Option<&str>) -> Value {
     let questions: Vec<Value> = params
         .questions
         .iter()
@@ -53,12 +53,22 @@ pub fn build_prompt_payload(params: &QuestionParams) -> Value {
             })
         })
         .collect();
-    json!({ "questions": questions })
+    let mut payload = json!({ "questions": questions });
+    if let Some(tool_call_id) = tool_call_id {
+        // ADR-0043 / #207: the id names this questionnaire on the answer
+        // channel.
+        payload["toolCallId"] = json!(tool_call_id);
+    }
+    payload
 }
 
-/// Build the `blocked` payload: `{active}`.
-pub fn build_blocked_payload(active: bool) -> Value {
-    json!({ "active": active })
+/// Build the `blocked` payload: `{active, toolCallId?}`.
+pub fn build_blocked_payload(active: bool, tool_call_id: Option<&str>) -> Value {
+    let mut payload = json!({ "active": active });
+    if let Some(tool_call_id) = tool_call_id {
+        payload["toolCallId"] = json!(tool_call_id);
+    }
+    payload
 }
 
 /// Emit [`ASK_USER_PROMPT_EVENT`] through the host (`events.emit`).
@@ -68,20 +78,64 @@ pub fn build_blocked_payload(active: bool) -> Value {
 /// shape; `rpi-ext-subagents` precedent) rather than the JS call-site names.
 /// Found by the V14-24 pilot e2e: the earlier `{"event", "payload"}` args
 /// never reached the `rpi:ask-user:*` channels on a real host.
-pub fn emit_prompt(host: &dyn HostCall, params: &QuestionParams) -> Result<(), crate::HostError> {
+pub fn emit_prompt(
+    host: &dyn HostCall,
+    params: &QuestionParams,
+    tool_call_id: Option<&str>,
+) -> Result<(), crate::HostError> {
     host.call(
         "events.emit",
-        json!({ "channel": ASK_USER_PROMPT_EVENT, "data": build_prompt_payload(params) }),
+        json!({
+            "channel": ASK_USER_PROMPT_EVENT,
+            "data": build_prompt_payload(params, tool_call_id)
+        }),
     )
     .map(|_| ())
 }
 
 /// Emit [`ASK_USER_BLOCKED_EVENT`] through the host (`events.emit`);
 /// same `channel`/`data` wire form as [`emit_prompt`].
-pub fn emit_blocked(host: &dyn HostCall, active: bool) -> Result<(), crate::HostError> {
+pub fn emit_blocked(
+    host: &dyn HostCall,
+    active: bool,
+    tool_call_id: Option<&str>,
+) -> Result<(), crate::HostError> {
     host.call(
         "events.emit",
-        json!({ "channel": ASK_USER_BLOCKED_EVENT, "data": build_blocked_payload(active) }),
+        json!({
+            "channel": ASK_USER_BLOCKED_EVENT,
+            "data": build_blocked_payload(active, tool_call_id)
+        }),
+    )
+    .map(|_| ())
+}
+
+/// `rpi:ask-user:answer-result` — one verdict per inbound answer attempt
+/// (ADR-0043).
+pub const ASK_USER_ANSWER_RESULT_EVENT: &str = "rpi:ask-user:answer-result";
+
+/// Emit one answer verdict (`{ok, code?, reason?, requestId?, toolCallId?}`).
+pub fn emit_answer_result(
+    host: &dyn HostCall,
+    request: &Value,
+    code: Option<&str>,
+    reason: Option<&str>,
+) -> Result<(), crate::HostError> {
+    let mut verdict = json!({ "ok": code.is_none() });
+    if let Some(code) = code {
+        verdict["code"] = json!(code);
+    }
+    if let Some(reason) = reason {
+        verdict["reason"] = json!(reason);
+    }
+    for field in ["requestId", "toolCallId"] {
+        if let Some(value) = request.get(field).and_then(Value::as_str) {
+            verdict[field] = json!(value);
+        }
+    }
+    host.call(
+        "events.emit",
+        json!({ "channel": ASK_USER_ANSWER_RESULT_EVENT, "data": verdict }),
     )
     .map(|_| ())
 }
@@ -134,7 +188,7 @@ mod tests {
 
     #[test]
     fn events_prompt_payload_matches_upstream_shape() {
-        let payload = build_prompt_payload(&params());
+        let payload = build_prompt_payload(&params(), None);
         assert_eq!(
             payload,
             json!({
@@ -170,8 +224,8 @@ mod tests {
 
     #[test]
     fn events_blocked_payload_is_boolean_only() {
-        assert_eq!(build_blocked_payload(true), json!({"active": true}));
-        assert_eq!(build_blocked_payload(false), json!({"active": false}));
+        assert_eq!(build_blocked_payload(true, None), json!({"active": true}));
+        assert_eq!(build_blocked_payload(false, None), json!({"active": false}));
     }
 
     #[test]

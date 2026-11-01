@@ -156,6 +156,7 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+pub(crate) mod answer_channel;
 /// Slash-command handlers and selector wiring: `commands_selectors.rs`. A
 /// submodule so it can extend the private `InteractiveUi` /
 /// `InteractiveMode` impls without exposing their fields. The `dead_code`
@@ -6087,6 +6088,9 @@ impl InteractiveMode {
                 let bridge = Arc::new(ui_bridge::InteractiveUiBridge::new(&self.ui_state));
                 *lock(&self.ui_state.extension_ui_bridge) = Some(Arc::clone(&bridge));
                 host.set_ui(Some(bridge), rpi_ext_host::types::ExtensionMode::Tui);
+                if host.claim_answer_channel() {
+                    answer_channel::install_tui(&host.event_bus(), Arc::downgrade(&self.ui_state));
+                }
                 // `bindCommandContext` (agent-session.ts:3338): interactive
                 // `ctx.command.*` actions (V17-11 FR-B R2). The actions hold a
                 // Weak UI and queue on the input inbox; the run loop owns the
