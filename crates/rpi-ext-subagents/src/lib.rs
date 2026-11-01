@@ -31,6 +31,7 @@ mod error;
 pub mod fleet;
 mod launch;
 mod messages;
+mod notice_marker;
 mod p1;
 mod paths;
 mod prompts;
@@ -788,7 +789,15 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                     return json!({"error": {"kind": "init", "message": error.to_string()}});
                 }
             }
-            for event in ["session_start", "session_shutdown", "agent_end"] {
+            for event in [
+                "session_start",
+                "session_shutdown",
+                "agent_end",
+                // FR-J R1 (#3061): the notice-marker transform runs after the
+                // host restored prompt/tool state so mid-conversation system
+                // messages keep their positions and the prompt cache stays valid.
+                notice_marker::CONTEXT_WITH_SYSTEM_EVENT,
+            ] {
                 if let Err(error) = register("on", json!({ "event": event })) {
                     return json!({"error": {"kind": "init", "message": error.to_string()}});
                 }
@@ -1143,6 +1152,9 @@ fn dispatch_message(message: &Value) -> Value {
                             }),
                         );
                     })
+                }
+                (_, notice_marker::CONTEXT_WITH_SYSTEM_EVENT) => {
+                    notice_marker::handle_context_with_system(message)
                 }
                 (PluginMode::Parent, "session_start") => {
                     let config = config::load_config();
@@ -1506,6 +1518,18 @@ pub fn render_tool_for_test(
         "result": result,
         "options": options,
     }))
+}
+
+/// Test seam: dispatch one host event through the plugin dispatcher.
+#[doc(hidden)]
+pub fn dispatch_event_for_test(event: &str, payload: Value) -> Value {
+    let mut message = json!({ "kind": "event", "event": event });
+    if let (Some(target), Some(source)) = (message.as_object_mut(), payload.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    dispatch_message(&message)
 }
 
 /// Test seam: install with a fake host (`install_for_test` pattern; one

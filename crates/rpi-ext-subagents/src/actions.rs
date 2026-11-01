@@ -1137,9 +1137,95 @@ fn read_transcript_artifact_tail(
     Ok((out, truncated))
 }
 
+/// JSON preview bound for one tool-call/tool-result part
+/// (`stringifyJsonPreview`, fleet-view.ts:169-174 @ 3a63e0ad, #3059).
+const TRANSCRIPT_PREVIEW_MAX_CHARS: usize = 240;
+
+/// `stringifyJsonPreview`: a string value is used raw, anything else is
+/// compact JSON, truncated to `TRANSCRIPT_PREVIEW_MAX_CHARS` + `…`. Counted in
+/// scalar values (upstream slices UTF-16 units; the only intentional
+/// difference, astral text never splits a surrogate pair here).
+fn stringify_json_preview(value: &Value) -> String {
+    let raw = match value {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+    if raw.chars().count() > TRANSCRIPT_PREVIEW_MAX_CHARS {
+        let mut cut: String = raw.chars().take(TRANSCRIPT_PREVIEW_MAX_CHARS - 1).collect();
+        cut.push('…');
+        cut
+    } else {
+        raw
+    }
+}
+
+/// `sessionMessageParts` + `sessionMessageLine` (fleet-view.ts:186-243
+/// @ 3a63e0ad, #3059): one session record contributes its text parts and one
+/// `[tool: <name> <input>]` part per tool call — the input is the block's
+/// `arguments` (Pi's stored field), never the non-existent `args`. Returns
+/// `None` for records that carry no renderable part.
+fn render_session_message(record: &Value) -> Option<String> {
+    let message = record.get("message").filter(|m| m.is_object());
+    let target = message.unwrap_or(record);
+    let role = target.get("role").and_then(Value::as_str)?;
+    let content = target.get("content")?;
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(text) = content.as_str() {
+        if !text.trim().is_empty() {
+            parts.push(text.to_string());
+        }
+    } else if let Some(blocks) = content.as_array() {
+        for block in blocks {
+            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    parts.push(text.to_string());
+                }
+                continue;
+            }
+            let block_type = block.get("type").and_then(Value::as_str);
+            if matches!(block_type, Some("toolCall") | Some("tool_call")) {
+                let name = block
+                    .get("name")
+                    .or_else(|| block.get("toolName"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let preview = block
+                    .get("arguments")
+                    .filter(|value| !value.is_null())
+                    .map(|value| format!(" {}", stringify_json_preview(value)))
+                    .unwrap_or_default();
+                parts.push(format!("[tool: {name}{preview}]"));
+                continue;
+            }
+            if matches!(block_type, Some("toolResult") | Some("tool_result")) {
+                let preview = block
+                    .get("result")
+                    .filter(|value| !value.is_null())
+                    .map(|value| format!(": {}", stringify_json_preview(value)))
+                    .unwrap_or_default();
+                parts.push(format!("[tool result{preview}]"));
+                continue;
+            }
+            if let Some(inner) = block.get("content") {
+                let preview = stringify_json_preview(inner);
+                if !preview.trim().is_empty() {
+                    parts.push(preview);
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let text = parts.join("\n");
+    let text = text.trim();
+    (!text.is_empty()).then(|| format!("{role}: {text}"))
+}
+
 /// Tail of a child session JSONL (rpi session format: `{"type":"message",
-/// "message":{"role","content"}}` entries): message roles + first line of
-/// text, bounded.
+/// "message":{"role","content"}}` entries): message parts (text + tool-call
+/// input previews) split into lines, newest `line_limit` kept, each line
+/// bounded.
 fn read_session_transcript_tail(path: &str, line_limit: usize) -> Result<Vec<String>, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut messages: Vec<String> = Vec::new();
@@ -1154,21 +1240,12 @@ fn read_session_transcript_tail(path: &str, line_limit: usize) -> Result<Vec<Str
         if !matches!(role, "user" | "assistant") {
             continue;
         }
-        // rpi session content is either a plain string (user turns) or a
-        // block array (assistant turns).
-        let content = &entry["message"]["content"];
-        let text = match content.as_str() {
-            Some(plain) => plain.to_string(),
-            None => crate::runner::display::extract_text_from_content(content),
-        };
-        let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-        messages.push(format!("{role}: {first}"));
+        if let Some(rendered) = render_session_message(&entry) {
+            messages.extend(rendered.split('\n').map(bounded_transcript_line));
+        }
     }
     let start = messages.len().saturating_sub(line_limit);
-    Ok(messages[start..]
-        .iter()
-        .map(|line| bounded_transcript_line(line))
-        .collect())
+    Ok(messages[start..].to_vec())
 }
 
 /// `formatRunLifecycleDebug` subset (#1037, run-status.ts:86-116): run/dir/
@@ -2308,6 +2385,51 @@ mod tests {
     }
 
     #[test]
+    fn transcript_renders_tool_call_arguments_and_bounds_previews() {
+        // #3059: Pi stores a tool call's input in `arguments`; the old
+        // `args` field never exists on a session record.
+        let record = json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "running it" },
+                    { "type": "toolCall", "name": "bash", "arguments": { "command": "ls -la" } },
+                    { "type": "toolCall", "name": "read", "args": { "path": "/tmp/ignored" } },
+                    { "type": "toolResult", "name": "bash", "result": "ok", "isError": false }
+                ]
+            }
+        });
+        let rendered = render_session_message(&record).expect("renders");
+        assert_eq!(
+            rendered,
+            "assistant: running it\n[tool: bash {\"command\":\"ls -la\"}]\n[tool: read]\n[tool result: ok]"
+        );
+        // The input preview is capped at 240 characters + an ellipsis.
+        let long = "x".repeat(400);
+        let record = json!({
+            "type": "message",
+            "message": {"role": "assistant", "content": [
+                { "type": "toolCall", "toolName": "bash", "arguments": { "command": long } }
+            ]}
+        });
+        let rendered = render_session_message(&record).expect("renders");
+        assert!(rendered.ends_with("…]"), "{rendered}");
+        let preview = rendered
+            .split_once("[tool: bash ")
+            .and_then(|(_, rest)| rest.strip_suffix(']'))
+            .expect("preview");
+        assert_eq!(preview.chars().count(), TRANSCRIPT_PREVIEW_MAX_CHARS);
+        // A record without renderable parts yields nothing.
+        assert!(
+            render_session_message(
+                &json!({"type":"message","message":{"role":"assistant","content":[]}})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn status_transcript_falls_back_to_session_file() {
         let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
             .lock()
@@ -2332,6 +2454,7 @@ mod tests {
                 "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"do the thing\"}}\n",
                 "{\"type\":\"summary\",\"summary\":\"ignored\"}\n",
                 "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]}}\n",
             ),
         )
         .unwrap();
@@ -2339,6 +2462,11 @@ mod tests {
         assert!(text.contains("Session transcript tail from "), "{}", text);
         assert!(text.contains("user: do the thing"), "{}", text);
         assert!(text.contains("assistant: done"), "{}", text);
+        assert!(
+            text.contains("assistant: [tool: bash {\"command\":\"ls\"}]"),
+            "{}",
+            text
+        );
         cleanup_run(&run_id);
     }
 
