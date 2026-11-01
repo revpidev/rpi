@@ -195,10 +195,11 @@ impl Palette {
     /// Resolve the semantic colors from a `ui.theme` reply.
     ///
     /// Theme color values may be hex, a variable name (`accent: "violet"`),
-    /// a 256-color index, or a CSS-like color function. Hex and named base
-    /// colors become ANSI; anything else (for example `okhsl(...)`) falls
-    /// back to plain text — the contract says invalid/missing colors must not
-    /// be guessed.
+    /// a 256-color index, `oklch(...)`/`okhsl(...)` (host ThemeJson), or a
+    /// named base color. Hex/index/OKLCH/OKHSL resolve to truecolor through
+    /// the host color model; named base colors map to their ANSI family;
+    /// genuinely unknown values fall back to plain text — the contract says
+    /// invalid/missing colors must not be guessed.
     pub fn from_theme(theme: &serde_json::Value) -> Self {
         let resolve = |key: &str| -> Option<String> {
             let colors = theme.get("colors")?.as_object()?;
@@ -293,8 +294,8 @@ fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
     ))
 }
 
-/// Base ANSI colors accepted as a palette value; arbitrary CSS color
-/// functions are intentionally unsupported (plain text fallback).
+/// Base ANSI color names accepted as a palette value; unknown names are a
+/// plain-text fallback (host OKLCH/OKHSL/hex are handled before this).
 fn named_sgr(name: &str) -> Option<&'static str> {
     match name.to_ascii_lowercase().as_str() {
         "black" => Some("30"),
@@ -1018,6 +1019,15 @@ mod tests {
         assert_eq!(
             value(FieldId::LiveOutputRate, &stopped).unwrap().text,
             "125.0 tok/s"
+        );
+        // Exact missing (provider reported no `usage.output`): fall back to
+        // the provider's streaming running total — still exact provider data,
+        // never a character estimate.
+        let mut no_exact = stopped.clone();
+        no_exact.live.as_mut().unwrap().output_tokens_exact = None;
+        assert_eq!(
+            value(FieldId::LiveOutputTokens, &no_exact).unwrap().text,
+            "123"
         );
         // liveTokens disabled → all live fields omitted.
         let disabled = FieldData {

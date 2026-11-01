@@ -436,15 +436,7 @@ pub async fn refresh_loop(
                         }
                         let ctx = fetch_items_ctx(&calls, items);
                         maybe_start_git(&calls, items, &ctx);
-                        let read_stats = matches!(
-                            reason,
-                            "session_start"
-                                | "session_compact"
-                                | "turn_end"
-                                | "agent_settled"
-                                | "interval"
-                                | "config_saved"
-                        );
+                        let read_stats = reads_session_stats_on(reason);
                         let data = refresh_items(&calls, items, Some(ctx), read_stats);
                         if data.is_some() {
                             last_items_data = data;
@@ -785,6 +777,21 @@ fn refresh_items(
     Some(data)
 }
 
+/// Whether an items event owns a session-totals refresh (R20 §4.4). A
+/// `message_end` only updates the live fields; model/thinking/mode/Git
+/// events reuse the cached absolute snapshot.
+fn reads_session_stats_on(reason: &str) -> bool {
+    matches!(
+        reason,
+        "session_start"
+            | "session_compact"
+            | "turn_end"
+            | "agent_settled"
+            | "interval"
+            | "config_saved"
+    )
+}
+
 /// Read `ctx.sessionStats` without the generic per-call warning (`host_ok`):
 /// a host that predates the method would otherwise log on every poll.
 fn fetch_session_stats(calls: &AsyncHostCalls) -> Option<SessionStats> {
@@ -1045,6 +1052,34 @@ mod tests {
         assert_eq!(drain_triggers(&mut rx), (true, true));
         tx.send(Trigger::Live).ok();
         assert_eq!(drain_triggers(&mut rx), (false, true));
+    }
+
+    #[test]
+    fn session_stats_reads_are_trigger_gated() {
+        for reason in [
+            "session_start",
+            "session_compact",
+            "turn_end",
+            "agent_settled",
+            "interval",
+            "config_saved",
+        ] {
+            assert!(reads_session_stats_on(reason), "{reason} reads totals");
+        }
+        for reason in [
+            "message_end",
+            "model_select",
+            "thinking_level_select",
+            "session_info_changed",
+            "agent_start",
+            "mode_change",
+            "tool_execution_end",
+        ] {
+            assert!(
+                !reads_session_stats_on(reason),
+                "{reason} must not read session totals"
+            );
+        }
     }
 
     #[test]

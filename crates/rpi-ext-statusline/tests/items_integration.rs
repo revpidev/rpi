@@ -447,6 +447,31 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         "replace switch clears the status row first"
     );
 
+    // ── 7b. Theme changes repaint: the items fingerprint includes
+    //        `ui.theme`, so a palette change with no other data movement
+    //        still re-renders (useColors=true).
+    write_settings(json!({"statusLine": {
+        "type": "items",
+        "items": ["model"],
+        "placement": "widget",
+        "useColors": true
+    }}));
+    set_canned(
+        "ui.theme",
+        json!({"appearance": "dark", "colors": {"accent": "#ff0000"}}),
+    );
+    send_event("model_select", json!({"type": "model_select"}));
+    poll_until("red accent theme", |records| {
+        last_widget_contains(records, "\u{1b}[38;2;255;0;0mTest Model")
+    });
+    set_canned(
+        "ui.theme",
+        json!({"appearance": "dark", "colors": {"accent": "#00ff00"}}),
+    );
+    poll_until("green accent after the theme change", |records| {
+        last_widget_contains(records, "\u{1b}[38;2;0;255;0mTest Model")
+    });
+
     // ── 8. Config removal restores the built-in footer through the owned
     //        channel.
     write_settings(json!({}));

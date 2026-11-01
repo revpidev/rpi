@@ -150,7 +150,7 @@ fn resume_rebinds_second_host_and_revives_the_refresh_loop() {
     )
     .expect("write settings");
 
-    // ── 宿主 A：进程启动 ─────────────────────────────────────────────
+    // ── Host A: process startup ──────────────────────────────────────
     install_fake_ctx(COOKIE_A);
     let receipt = rpi_ext_statusline::install_for_test(
         RpiHostCalls {
@@ -160,7 +160,7 @@ fn resume_rebinds_second_host_and_revives_the_refresh_loop() {
     );
     assert!(receipt.get("error").is_none(), "install A: {receipt:#?}");
 
-    // 事件驱动刷新：message_end → 脚本 → footer。
+    // Event-driven refresh: message_end → script → footer.
     let message_end = json!({"type": "message_end", "message": {
         "role": "assistant",
         "usage": {"input": 100, "output": 20, "cacheRead": 1000, "cacheWrite": 0,
@@ -189,7 +189,7 @@ fn resume_rebinds_second_host_and_revives_the_refresh_loop() {
         .filter(|(method, _)| method == "ui.setFooter")
         .count();
 
-    // ── /resume teardown：session_shutdown → 旧循环退出 ───────────────
+    // ── /resume teardown: session_shutdown → the old loop exits ──────
     rpi_ext_statusline::dispatch(
         COOKIE_A,
         RVec::from(
@@ -201,7 +201,7 @@ fn resume_rebinds_second_host_and_revives_the_refresh_loop() {
     );
     std::thread::sleep(Duration::from_millis(100));
 
-    // ── 宿主 B：重载同一插件（修复点） ────────────────────────────────
+    // ── Host B: reload the same plugin (the fix) ────────────────────
     install_fake_ctx(COOKIE_B);
     let receipt = rpi_ext_statusline::install_for_test(
         RpiHostCalls {
@@ -211,7 +211,8 @@ fn resume_rebinds_second_host_and_revives_the_refresh_loop() {
     );
     assert!(receipt.get("error").is_none(), "install B: {receipt:#?}");
 
-    // B 宿主必须重新拿到完整事件订阅（修复前：早退 → 零订阅 → 事件死）。
+    // B must receive the full subscription set again (before the fix: early
+    // return → zero subscriptions → dead events).
     let subscribed: Vec<String> = records(COOKIE_B)
         .iter()
         .filter(|(method, _)| method == "on")
@@ -238,7 +239,7 @@ fn resume_rebinds_second_host_and_revives_the_refresh_loop() {
         );
     }
 
-    // ── 新会话事件 → 刷新在 B 上恢复（新通道） ─────────────────────────
+    // ── New-session event → refreshes resume on B (new channel) ─────
     send_event(
         "session_start",
         json!({"type": "session_start", "reason": "resume"}),
@@ -248,8 +249,8 @@ fn resume_rebinds_second_host_and_revives_the_refresh_loop() {
         footer_render_ok(records) > 0
     });
 
-    // 旧宿主 A 在 rebind 之后不得再收到任何 footer 推送（stale 通道
-    // 回归断言——修复前 poll 定时器会一直烧旧 cookie）。
+    // Host A must receive no footer push after the rebind (stale-channel
+    // regression assertion — the old poll timer used to burn the old cookie).
     std::thread::sleep(Duration::from_millis(300));
     let a_footer_after = records(COOKIE_A)
         .iter()

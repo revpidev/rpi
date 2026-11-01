@@ -1,5 +1,5 @@
 //! TE52 R22 joint frames: the real rpi-statusline items renderer composed
-//! with the real rpi-usage footer formatter on the host's status row.
+//! with the TE50 compact usage footer shape on the host's status row.
 //!
 //! The test drives the actual plugin install/dispatch path against a fake
 //! host, captures the `ui.setStatus`/`ui.setWidget`/`ui.setFooter` payloads,
