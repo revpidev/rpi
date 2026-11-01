@@ -383,6 +383,35 @@ mod tests {
         assert_eq!(compute_leaf_id(&entries).as_deref(), Some("cccc3333"));
     }
 
+    /// TE51 FR-J R1 equivalence: the fork filter only removes entries; the
+    /// retained transcript keeps its original order (no entry is moved to the
+    /// front/back), which is what keeps a forked child's system-message
+    /// positions stable (#3061/#3065 semantics under rpi's file-level fork).
+    #[test]
+    fn orchestration_filter_preserves_the_retained_order() {
+        let mut entries = vec![
+            serde_json::json!({"type":"message","id":"1","message":{"role":"system","content":[{"type":"text","text":"sys"}]}}),
+            serde_json::json!({"type":"message","id":"2","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}),
+            serde_json::json!({"type":"message","id":"3","message":{"role":"user","customType":"subagent-notify","content":[]}}),
+            serde_json::json!({"type":"message","id":"4","message":{"role":"system","content":[{"type":"text","text":"mid"}]}}),
+            serde_json::json!({"type":"message","id":"5","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}),
+        ];
+        filter_orchestration_entries(&mut entries);
+        let ids: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, vec!["1", "2", "4", "5"]);
+        assert_eq!(
+            entries[2]
+                .get("message")
+                .and_then(|m| m.get("role"))
+                .and_then(Value::as_str),
+            Some("system"),
+            "mid-conversation system message stays at its original position"
+        );
+    }
+
     #[test]
     fn orchestration_filter_drops_subagent_traces() {
         let mut entries = vec![
