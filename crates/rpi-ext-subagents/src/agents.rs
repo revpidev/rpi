@@ -2,6 +2,7 @@
 
 pub mod builtin;
 pub mod discover;
+pub mod edit_distance;
 pub mod frontmatter;
 pub mod skills;
 

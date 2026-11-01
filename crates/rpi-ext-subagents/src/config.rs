@@ -925,6 +925,17 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
             let mut parsed_entry = AgentOverride::default();
             let mut ignored = Vec::new();
             for (key, field) in entry {
+                if !BUILTIN_OVERRIDE_FIELDS.contains(&key.as_str()) {
+                    let suggestion =
+                        crate::agents::edit_distance::closest_match(key, BUILTIN_OVERRIDE_FIELDS);
+                    return Err(format!(
+                        "Subagent settings in '{}' have invalid agentOverrides.{name}: unknown field '{key}'.{}",
+                        path.to_string_lossy(),
+                        suggestion
+                            .map(|suggestion| format!(" Did you mean '{suggestion}'?"))
+                            .unwrap_or_default()
+                    ));
+                }
                 match key.as_str() {
                     "description" => {
                         parsed_entry.description = Some(
@@ -1017,15 +1028,22 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                         )?);
                     }
                     "thinking" => {
+                        // #3064: a known level (off..max) or false; a typo used
+                        // to be appended to the child's model id.
                         parsed_entry.thinking = Some(match field {
                             Value::Bool(false) => None,
-                            Value::String(s) => Some(s.clone()),
+                            Value::String(level)
+                                if crate::launch::model::THINKING_LEVELS
+                                    .contains(&level.as_str()) =>
+                            {
+                                Some(level.clone())
+                            }
                             _ => {
                                 return Err(invalid_override_field(
                                     path,
                                     name,
                                     "thinking",
-                                    "a string or false",
+                                    "a known level (off, minimal, low, medium, high, xhigh, max) or false",
                                 ));
                             }
                         });
@@ -1175,6 +1193,40 @@ fn invalid_override_field(
         path.to_string_lossy()
     )
 }
+
+/// Every field an `agentOverrides` entry may set (`BUILTIN_OVERRIDE_FIELDS`,
+/// agents.ts:122-130 @ 3a63e0ad). Fields rpi does not implement stay
+/// known-but-ignored (TE-D15); a field outside this list is a typo and fails
+/// the load with the nearest known name (#3064).
+const BUILTIN_OVERRIDE_FIELDS: [&str; 27] = [
+    "description",
+    "advertise",
+    "machine",
+    "output",
+    "outputMode",
+    "defaultReads",
+    "model",
+    "defaultProvider",
+    "fast",
+    "thinking",
+    "systemPromptMode",
+    "inheritProjectContext",
+    "inheritGlobalContext",
+    "inheritSkills",
+    "defaultContext",
+    "acceptanceRole",
+    "disabled",
+    "systemPrompt",
+    "skills",
+    "tools",
+    "excludeTools",
+    "allowNestedSubagents",
+    "allowedAgents",
+    "extensions",
+    "subagentOnlyExtensions",
+    "mutationTools",
+    "toolBudget",
+];
 
 /// `parseOverrideStringArrayOrFalse` (agents.ts:741-757): array of non-empty
 /// strings or `false` (clear); anything else is a settings error.
@@ -1591,7 +1643,7 @@ mod tests {
                     "worker":{"systemPromptMode":"append",
                               "thinking":false,"defaultContext":"fork","acceptanceRole":"writer",
                               "skills":["s1"],"systemPrompt":"custom","inheritSkills":false},
-                    "reviewer":{"completionGuard":true}
+                    "reviewer":{"toolBudget":false}
                 }
             }}"#,
         )
@@ -1627,7 +1679,7 @@ mod tests {
         assert_eq!(worker.skills, Some(Some(vec!["s1".to_string()])));
         assert_eq!(worker.system_prompt.as_deref(), Some("custom"));
         assert_eq!(worker.inherit_skills, Some(false));
-        // completionGuard is beyond the documented set → ignored, not fatal.
+        // toolBudget is a known upstream field rpi does not implement → ignored, not fatal.
         assert!(
             settings
                 .overrides
@@ -1648,6 +1700,42 @@ mod tests {
         )
         .unwrap();
         assert!(read_subagent_settings(&path).is_err());
+        // #3064: a misspelled field fails the load with the nearest known name.
+        std::fs::write(
+            &path,
+            r#"{"subagents":{"agentOverrides":{"researcher":{"modle":"x"}}}}"#,
+        )
+        .unwrap();
+        let error = read_subagent_settings(&path).unwrap_err();
+        assert!(
+            error.contains("unknown field 'modle'") && error.contains("Did you mean 'model'?"),
+            "{error}"
+        );
+        // #3064: thinking must be a known level or false.
+        std::fs::write(
+            &path,
+            r#"{"subagents":{"agentOverrides":{"researcher":{"thinking":"hgih"}}}}"#,
+        )
+        .unwrap();
+        let error = read_subagent_settings(&path).unwrap_err();
+        assert!(
+            error.contains("invalid agentOverrides.researcher.thinking"),
+            "{error}"
+        );
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"subagents":{{"agentOverrides":{{"researcher":{{"thinking":"{level}"}}}}}}}}"#
+                ),
+            )
+            .unwrap();
+            let settings = read_subagent_settings(&path).unwrap();
+            assert_eq!(
+                settings.overrides.get("researcher").unwrap().thinking,
+                Some(Some(level.to_string()))
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

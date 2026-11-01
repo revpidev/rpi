@@ -1426,8 +1426,26 @@ fn write_agent_config(config: &Value, target: &Path) -> Result<(), String> {
                 };
                 body = prompt.to_string();
             }
-            "model" | "thinking" | "systemPromptMode" | "defaultContext" | "output" | "tools"
-            | "skills" | "aliases" | "allowedAgents" | "extensions" => {
+            "thinking" => {
+                // #3074: reject unknown levels when managing agents; #3077: an
+                // explicit `off` (trimmed) round-trips as `thinking: off`.
+                let Some(level) = value.as_str() else {
+                    return Err("config.thinking must be a string.".to_string());
+                };
+                let level = level.trim();
+                if level == "false" {
+                    lines.push("thinking: false".to_string());
+                } else if crate::launch::model::THINKING_LEVELS.contains(&level) {
+                    lines.push(format!("thinking: {level}"));
+                } else {
+                    return Err(format!(
+                        "config.thinking must be one of {}, or false.",
+                        crate::launch::model::THINKING_LEVELS.join(", ")
+                    ));
+                }
+            }
+            "model" | "systemPromptMode" | "defaultContext" | "output" | "tools" | "skills"
+            | "aliases" | "allowedAgents" | "extensions" => {
                 let rendered = match value {
                     Value::String(s) => s.clone(),
                     Value::Bool(b) => b.to_string(),
@@ -1940,6 +1958,43 @@ mod tests {
                 params: Some(params),
             },
         )
+    }
+
+    #[test]
+    fn agent_config_round_trips_explicit_thinking_off_and_rejects_typos() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-thinking-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("writer.md");
+        write_agent_config(
+            &serde_json::json!({"description": "Writes", "thinking": " off "}),
+            &target,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("thinking: off"), "{content}");
+        write_agent_config(
+            &serde_json::json!({"description": "Writes", "thinking": "max"}),
+            &target,
+        )
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("thinking: max")
+        );
+        for bad in ["hgih", "OFF", "none"] {
+            let error = write_agent_config(
+                &serde_json::json!({"description": "Writes", "thinking": bad}),
+                &target,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("config.thinking must be one of"),
+                "{bad}: {error}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #2681 (49a3ec7f): a multiline description serializes as a YAML
