@@ -242,7 +242,10 @@ impl RunCtx {
         object: &serde_json::Map<String, Value>,
         config: ExtensionConfig,
     ) -> Self {
-        let settings = crate::config::read_settings_pair(&host.cwd());
+        let settings = crate::config::read_settings_pair_trusted(
+            &host.cwd(),
+            host.project_trusted() != Some(false),
+        );
         let parent_session = host.parent_session(&settings);
         let parent_session_file = parent_session
             .as_ref()
@@ -331,7 +334,13 @@ impl RunCtx {
 
     /// Discover agents in both scopes for the effective cwd.
     pub fn discover(&self, scope: &str) -> Result<Vec<AgentConfig>, String> {
-        discover::discover_agents(&self.base_cwd, scope, &self.settings, None)
+        discover::discover_agents_trusted(
+            &self.base_cwd,
+            scope,
+            &self.settings,
+            None,
+            self.project_trusted.unwrap_or(true),
+        )
     }
 }
 

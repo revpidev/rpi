@@ -1053,7 +1053,10 @@ fn dispatch_message(message: &Value) -> Value {
                 calls: &state.calls,
                 cookie: state.cookie,
             };
-            let settings = config::read_settings_pair(&host.cwd());
+            let settings = config::read_settings_pair_trusted(
+                &host.cwd(),
+                host.project_trusted() != Some(false),
+            );
             let config = config::load_config();
             // ADR-0015: the host forwards the toolCallId so `toolUpdate`
             // frames can address the in-flight execution (test seams may
@@ -1122,7 +1125,10 @@ fn dispatch_message(message: &Value) -> Value {
                 calls: &state.calls,
                 cookie: state.cookie,
             };
-            let settings = config::read_settings_pair(&host.cwd());
+            let settings = config::read_settings_pair_trusted(
+                &host.cwd(),
+                host.project_trusted() != Some(false),
+            );
             let config = config::load_config();
             if let Some(outcome) = prompts::handle_prompt_command(
                 name,

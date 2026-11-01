@@ -1313,12 +1313,22 @@ pub struct SettingsPair {
 
 /// Read both settings files. Invalid files warn and contribute nothing.
 pub fn read_settings_pair(cwd: &std::path::Path) -> SettingsPair {
+    read_settings_pair_trusted(cwd, true)
+}
+
+/// Trust-aware settings pair (#2805): an untrusted project contributes no
+/// settings, session dir or exclusion roots, so a malformed or hostile
+/// project file cannot change discovery or launches. The user level is
+/// unchanged.
+pub fn read_settings_pair_trusted(cwd: &std::path::Path, project_trusted: bool) -> SettingsPair {
     let user_path = paths::get_agent_dir().join("settings.json");
     let user = read_subagent_settings(&user_path).unwrap_or_else(|message| {
         tracing::warn!(path = %user_path.to_string_lossy(), %message, "invalid subagents settings");
         SubagentSettings::default()
     });
-    let project_path = crate::agents::project_settings_path(cwd);
+    let project_path = project_trusted
+        .then(|| crate::agents::project_settings_path(cwd))
+        .flatten();
     let project = project_path
         .as_ref()
         .and_then(|p| {
@@ -1796,6 +1806,27 @@ mod tests {
         // invalid env values warn and fall through to the config value.
         assert!(!config.wait_tool_enabled());
         rpi_test_env::remove_var("RPI_SUBAGENT_WAIT_TOOL_ENABLED");
+    }
+
+    #[test]
+    fn untrusted_settings_pair_ignores_the_project_level() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-trust-{}", std::process::id()));
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".rpi")).unwrap();
+        std::fs::create_dir_all(dir.join("user")).unwrap();
+        std::fs::write(
+            project.join(".rpi").join("settings.json"),
+            r#"{"subagents":{"defaultModel":"project/model","defaultThinking":"high"}}"#,
+        )
+        .unwrap();
+        let trusted = read_settings_pair_trusted(&project, true);
+        assert_eq!(trusted.default_model.as_deref(), Some("project/model"));
+        assert_eq!(trusted.default_thinking.as_deref(), Some("high"));
+        let untrusted = read_settings_pair_trusted(&project, false);
+        assert_eq!(untrusted.default_model, None);
+        assert_eq!(untrusted.default_thinking, None);
+        assert_eq!(untrusted.project, SubagentSettings::default());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

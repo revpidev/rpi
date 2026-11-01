@@ -446,6 +446,9 @@ fn handle_management_action_inner(
     deps: &ActionDeps<'_>,
 ) -> ToolOutcome {
     let raw_params = deps.params.clone().unwrap_or(Value::Null);
+    // #2805: a declined project trust hides project agents/settings and fails
+    // project-scope management closed.
+    let trusted = deps.host.and_then(|host| host.project_trusted()) != Some(false);
     // Model-controlled names reach filesystem joins (agent files, settings
     // keys) — reject path-shaped input up front (C1, upstream sanitizeName).
     if let Some(name) = agent_name
@@ -455,8 +458,9 @@ fn handle_management_action_inner(
     }
     match action {
         "list" => {
-            let (agents, diagnostics) =
-                discover::discover_agents_with_diagnostics(cwd, "both", settings, None);
+            let (agents, diagnostics) = discover::discover_agents_with_diagnostics_trusted(
+                cwd, "both", settings, None, trusted,
+            );
             // #1717/#1720: `capabilities: true` switches to the compact
             // capability lines and attaches structured `details.agentCapabilities`
             // records (agent-management.ts:972-995 + agentCapabilityRow @
@@ -491,7 +495,8 @@ fn handle_management_action_inner(
             let Some(name) = agent_name else {
                 return ToolOutcome::error("action \"get\" requires an agent name.".to_string());
             };
-            let agents = discover::discover_agents(cwd, "both", settings, None).unwrap_or_default();
+            let agents = discover::discover_agents_trusted(cwd, "both", settings, None, trusted)
+                .unwrap_or_default();
             match discover::resolve_agent_name(&agents, name) {
                 Ok(Some(agent)) => ToolOutcome::text(format_agent_detail(agent)),
                 Ok(None) => ToolOutcome::error(format!("Unknown agent: {name}")),
@@ -886,42 +891,42 @@ fn handle_management_action_inner(
             };
             let scope = action_scope(&raw_params);
             let config_body = raw_params.get("config").cloned().unwrap_or(Value::Null);
-            manage_create_update(action, name, &config_body, cwd, settings, scope)
+            manage_create_update(action, name, &config_body, cwd, settings, scope, trusted)
         }
         "delete" => {
             let Some(name) = agent_name else {
                 return ToolOutcome::error("action \"delete\" requires an agent name.".to_string());
             };
             let scope = action_scope(&raw_params);
-            manage_delete(name, cwd, settings, scope)
+            manage_delete(name, cwd, settings, scope, trusted)
         }
         "eject" => {
             let Some(name) = agent_name else {
                 return ToolOutcome::error("action \"eject\" requires an agent name.".to_string());
             };
             let scope = action_scope(&raw_params);
-            manage_eject(name, cwd, settings, scope)
+            manage_eject(name, cwd, settings, scope, trusted)
         }
         "disable" | "enable" => {
             let Some(name) = agent_name else {
                 return ToolOutcome::error(format!("action \"{action}\" requires an agent name."));
             };
             let scope = action_scope(&raw_params);
-            manage_disable_enable(action == "disable", name, cwd, settings, scope)
+            manage_disable_enable(action == "disable", name, cwd, settings, scope, trusted)
         }
         "reset" => {
             let Some(name) = agent_name else {
                 return ToolOutcome::error("action \"reset\" requires an agent name.".to_string());
             };
             let scope = action_scope(&raw_params);
-            manage_reset(name, cwd, settings, scope)
+            manage_reset(name, cwd, settings, scope, trusted)
         }
         // Refinement overlay (agent-refinements.ts, FR-P1-08).
         "refine" | "refine.show" | "refine.rollback" => {
             let Some(name) = agent_name else {
                 return ToolOutcome::error(format!("action \"{action}\" requires an agent name."));
             };
-            manage_refine(action, name, &raw_params, cwd, settings)
+            manage_refine(action, name, &raw_params, cwd, settings, trusted)
         }
         "doctor" => ToolOutcome::text(doctor_report(cwd, settings, config)),
         other => ToolOutcome::error(format!(
@@ -1563,8 +1568,16 @@ fn manage_create_update(
     cwd: &Path,
     settings: &SettingsPair,
     scope: &str,
+    trusted: bool,
 ) -> ToolOutcome {
-    let agents = discover::discover_agents(cwd, "both", settings, None).unwrap_or_default();
+    if scope == "project" && !trusted {
+        return ToolOutcome::error(
+            "Project scope requires a trusted project; retry in a trusted session or use scope \"user\"."
+                .to_string(),
+        );
+    }
+    let agents =
+        discover::discover_agents_trusted(cwd, "both", settings, None, trusted).unwrap_or_default();
     let existing = discover::resolve_agent_name(&agents, name).ok().flatten();
     if action == "create" && existing.is_some() {
         return ToolOutcome::error(format!(
@@ -1591,8 +1604,21 @@ fn manage_create_update(
     ))
 }
 
-fn manage_delete(name: &str, cwd: &Path, settings: &SettingsPair, scope: &str) -> ToolOutcome {
-    let agents = discover::discover_agents(cwd, "both", settings, None).unwrap_or_default();
+fn manage_delete(
+    name: &str,
+    cwd: &Path,
+    settings: &SettingsPair,
+    scope: &str,
+    trusted: bool,
+) -> ToolOutcome {
+    if scope == "project" && !trusted {
+        return ToolOutcome::error(
+            "Project scope requires a trusted project; retry in a trusted session or use scope \"user\"."
+                .to_string(),
+        );
+    }
+    let agents =
+        discover::discover_agents_trusted(cwd, "both", settings, None, trusted).unwrap_or_default();
     let Some(agent) = discover::resolve_agent_name(&agents, name).ok().flatten() else {
         return ToolOutcome::error(format!("Unknown agent: {name}"));
     };
@@ -1611,8 +1637,21 @@ fn manage_delete(name: &str, cwd: &Path, settings: &SettingsPair, scope: &str) -
     ToolOutcome::text(format!("Agent '{name}' deleted."))
 }
 
-fn manage_eject(name: &str, cwd: &Path, settings: &SettingsPair, scope: &str) -> ToolOutcome {
-    let agents = discover::discover_agents(cwd, "both", settings, None).unwrap_or_default();
+fn manage_eject(
+    name: &str,
+    cwd: &Path,
+    settings: &SettingsPair,
+    scope: &str,
+    trusted: bool,
+) -> ToolOutcome {
+    if scope == "project" && !trusted {
+        return ToolOutcome::error(
+            "Project scope requires a trusted project; retry in a trusted session or use scope \"user\"."
+                .to_string(),
+        );
+    }
+    let agents =
+        discover::discover_agents_trusted(cwd, "both", settings, None, trusted).unwrap_or_default();
     let Some(agent) = discover::resolve_agent_name(&agents, name).ok().flatten() else {
         return ToolOutcome::error(format!("Unknown agent: {name}"));
     };
@@ -1650,7 +1689,14 @@ fn manage_disable_enable(
     cwd: &Path,
     settings: &SettingsPair,
     scope: &str,
+    trusted: bool,
 ) -> ToolOutcome {
+    if scope == "project" && !trusted {
+        return ToolOutcome::error(
+            "Project scope requires a trusted project; retry in a trusted session or use scope \"user\"."
+                .to_string(),
+        );
+    }
     let settings_path = if scope == "project" {
         crate::agents::project_settings_path(cwd)
     } else {
@@ -1724,7 +1770,19 @@ fn manage_disable_enable(
     }
 }
 
-fn manage_reset(name: &str, cwd: &Path, settings: &SettingsPair, scope: &str) -> ToolOutcome {
+fn manage_reset(
+    name: &str,
+    cwd: &Path,
+    settings: &SettingsPair,
+    scope: &str,
+    trusted: bool,
+) -> ToolOutcome {
+    if scope == "project" && !trusted {
+        return ToolOutcome::error(
+            "Project scope requires a trusted project; retry in a trusted session or use scope \"user\"."
+                .to_string(),
+        );
+    }
     let target = scope_agent_dir(cwd, scope).join(format!("{name}.md"));
     let mut notes = Vec::new();
     if target.exists() {
@@ -1902,8 +1960,15 @@ fn manage_refine(
     params: &Value,
     cwd: &Path,
     settings: &SettingsPair,
+    trusted: bool,
 ) -> ToolOutcome {
-    let agents = discover::discover_agents(cwd, "both", settings, None).unwrap_or_default();
+    // Refinements live in the project tree (`refinement_path`); an untrusted
+    // project must not read or write them.
+    if !trusted {
+        return ToolOutcome::error("Agent refinements require a trusted project.".to_string());
+    }
+    let agents =
+        discover::discover_agents_trusted(cwd, "both", settings, None, trusted).unwrap_or_default();
     let Some(agent) = discover::resolve_agent_name(&agents, name).ok().flatten() else {
         return ToolOutcome::error(format!("Unknown agent: {name}"));
     };

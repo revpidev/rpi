@@ -1163,6 +1163,7 @@ fn project_agent_dirs(cwd: &Path, settings: &crate::config::SettingsPair) -> Vec
 /// `discoverAgents` (agents.ts:1742-1796) P0 subset: no package level, no
 /// modelScope. Returns merged agents (disabled filtered) per scope rules.
 /// Fatal frontmatter errors propagate like the upstream throw.
+#[allow(dead_code)] // backward-compatible API surface; live paths use the trusted variant
 pub fn discover_agents(
     cwd: &Path,
     scope: &str,
@@ -1170,6 +1171,27 @@ pub fn discover_agents(
     builtin_dir: Option<&Path>,
 ) -> Result<Vec<AgentConfig>, String> {
     Ok(discover_agents_with_diagnostics(cwd, scope, settings, builtin_dir).0)
+}
+
+/// Trust-aware discovery (#2805): an untrusted project contributes no project
+/// agents (its settings are already empty when the caller used
+/// `read_settings_pair_trusted`), so `agentScope: "project"` fails closed.
+pub fn discover_agents_trusted(
+    cwd: &Path,
+    scope: &str,
+    settings: &crate::config::SettingsPair,
+    builtin_dir: Option<&Path>,
+    project_trusted: bool,
+) -> Result<Vec<AgentConfig>, String> {
+    Ok(discover_agents_with_user_dirs_with_diagnostics_trusted(
+        cwd,
+        scope,
+        settings,
+        builtin_dir,
+        user_agent_dirs(),
+        project_trusted,
+    )
+    .0)
 }
 
 /// Additive discovery entry point (R7.1.3.1): same discovery as
@@ -1188,6 +1210,24 @@ pub fn discover_agents_with_diagnostics(
         settings,
         builtin_dir,
         user_agent_dirs(),
+    )
+}
+
+/// Trust-aware variant of [`discover_agents_with_diagnostics`] (#2805).
+pub fn discover_agents_with_diagnostics_trusted(
+    cwd: &Path,
+    scope: &str,
+    settings: &crate::config::SettingsPair,
+    builtin_dir: Option<&Path>,
+    project_trusted: bool,
+) -> (Vec<AgentConfig>, Vec<DiscoverDiagnostic>) {
+    discover_agents_with_user_dirs_with_diagnostics_trusted(
+        cwd,
+        scope,
+        settings,
+        builtin_dir,
+        user_agent_dirs(),
+        project_trusted,
     )
 }
 
@@ -1217,7 +1257,26 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
     scope: &str,
     settings: &crate::config::SettingsPair,
     builtin_dir: Option<&Path>,
+    user_dirs: Vec<PathBuf>,
+) -> (Vec<AgentConfig>, Vec<DiscoverDiagnostic>) {
+    discover_agents_with_user_dirs_with_diagnostics_trusted(
+        cwd,
+        scope,
+        settings,
+        builtin_dir,
+        user_dirs,
+        true,
+    )
+}
+
+/// Trust-aware variant of the diagnostics entry point (#2805).
+pub fn discover_agents_with_user_dirs_with_diagnostics_trusted(
+    cwd: &Path,
+    scope: &str,
+    settings: &crate::config::SettingsPair,
+    builtin_dir: Option<&Path>,
     mut user_dirs: Vec<PathBuf>,
+    project_trusted: bool,
 ) -> (Vec<AgentConfig>, Vec<DiscoverDiagnostic>) {
     // #1801: user-scope `agentScanDirs` append after the (explicit or
     // default) fixed user dirs — fixed definitions win on same-name because
@@ -1281,7 +1340,8 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
         &settings.user.overrides,
     );
 
-    let mut project: Vec<AgentConfig> = if scope == "user" {
+    let mut project: Vec<AgentConfig> = if scope == "user" || !project_trusted {
+        // #2805: a declined project trust loads no project agents at all.
         Vec::new()
     } else {
         let mut agents = Vec::new();
@@ -1959,6 +2019,74 @@ mod tests {
         assert_eq!(agents[0].tools, Some(vec!["read".to_string()]));
         assert_eq!(agents[0].mcp_direct_tools, vec!["srv.tool".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn untrusted_discovery_hides_project_agents_and_fails_project_scope_closed() {
+        let root = temp_root("untrusted");
+        let project = root.join("proj");
+        let user = root.join("user");
+        std::fs::create_dir_all(project.join(".rpi")).unwrap();
+        write_agent(
+            &user.join("agents"),
+            "worker",
+            "name: worker\ndescription: user worker",
+            "u",
+        );
+        write_agent(
+            &project.join(".rpi").join("agents"),
+            "worker",
+            "name: worker\ndescription: project worker",
+            "p",
+        );
+        write_agent(
+            &project.join(".rpi").join("agents"),
+            "proj-only",
+            "name: proj-only\ndescription: project only",
+            "p",
+        );
+        let settings = crate::config::SettingsPair::default();
+        // Trusted: the project agent overrides the user one and appears.
+        let trusted = discover_agents_with_user_dirs_with_diagnostics_trusted(
+            &project,
+            "both",
+            &settings,
+            None,
+            vec![user.join("agents")],
+            true,
+        )
+        .0;
+        let worker = trusted.iter().find(|a| a.name == "worker").unwrap();
+        assert_eq!(worker.description, "project worker");
+        assert!(trusted.iter().any(|a| a.name == "proj-only"));
+        // Untrusted: only user/builtin agents, and project scope fails closed.
+        let untrusted = discover_agents_with_user_dirs_with_diagnostics_trusted(
+            &project,
+            "both",
+            &settings,
+            None,
+            vec![user.join("agents")],
+            false,
+        )
+        .0;
+        let worker = untrusted.iter().find(|a| a.name == "worker").unwrap();
+        assert_eq!(worker.description, "user worker");
+        assert!(!untrusted.iter().any(|a| a.name == "proj-only"));
+        let project_scope = discover_agents_with_user_dirs_with_diagnostics_trusted(
+            &project,
+            "project",
+            &settings,
+            None,
+            vec![],
+            false,
+        )
+        .0;
+        assert!(
+            project_scope
+                .iter()
+                .all(|agent| agent.source == AgentSource::Builtin),
+            "{project_scope:?}"
+        );
     }
 
     #[test]

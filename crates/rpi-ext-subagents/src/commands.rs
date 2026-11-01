@@ -71,9 +71,14 @@ pub fn handle_command(
             }),
         },
         "subagents" => {
-            let agents =
-                crate::agents::discover::discover_agents(&host.cwd(), "both", settings, None)
-                    .unwrap_or_default();
+            let agents = crate::agents::discover::discover_agents_trusted(
+                &host.cwd(),
+                "both",
+                settings,
+                None,
+                host.project_trusted() != Some(false),
+            )
+            .unwrap_or_default();
             json!({
                 "content": [{
                     "type": "text",
