@@ -1,0 +1,13 @@
+{
+  "//": "Regression-track attribution manifest for TE51: expected-source pin = rpiv-mono v2.13.8 @ afc21bc2 (the retired v0.1.7 parity baseline). The Rust port implements the v2.15.0 target, so each entry below is an `upstream-semantics` change owned by TE51 FR-G (cursor on the answered row/first answer wins, digit hotkeys, blank Type-something guard, configurable notes key, CSI-u Space). Everything else MATCHes at this pin.",
+  "cases": [
+    { "key": "state/tab_switch_syncs_multi_checked_from_answers", "section": "upstream-semantics", "r": "R19.1 / #281", "owner": "TE51 FR-G" },
+    { "key": "keys/digit_key_answers_a_single_select_row", "section": "upstream-semantics", "r": "R19.1 / #163", "owner": "TE51 FR-G" },
+    { "key": "keys/digit_key_toggles_a_multi_select_row", "section": "upstream-semantics", "r": "R19.1 / #163", "owner": "TE51 FR-G" },
+    { "key": "keys/digit_key_focuses_the_type_something_row", "section": "upstream-semantics", "r": "R19.1 / #163", "owner": "TE51 FR-G" },
+    { "key": "keys/blank_type_something_enter_is_ignored", "section": "upstream-semantics", "r": "R19.1 / #301", "owner": "TE51 FR-G" },
+    { "key": "keys/custom_notes_key_matches_as_typed", "section": "upstream-semantics", "r": "R19.1 / #294", "owner": "TE51 FR-G" },
+    { "key": "keys/custom_notes_key_spec_matches_ctrl_n", "section": "upstream-semantics", "r": "R19.1 / #294", "owner": "TE51 FR-G" },
+    { "key": "keys/space_csi_u_toggles_in_multi_select", "section": "upstream-semantics", "r": "R19.1 / #287", "owner": "TE51 FR-G" }
+  ]
+}

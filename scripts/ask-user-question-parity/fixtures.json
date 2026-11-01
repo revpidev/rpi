@@ -3947,6 +3947,212 @@
 						"\r"
 					]
 				}
+			},
+			{
+				"name": "digit_key_answers_a_single_select_row",
+				"input": {
+					"questions": [
+						{
+							"question": "Pick one",
+							"header": "H",
+							"options": [
+								{
+									"label": "A",
+									"description": "a"
+								},
+								{
+									"label": "B",
+									"description": "b"
+								}
+							]
+						}
+					],
+					"keys": [
+						"2"
+					]
+				}
+			},
+			{
+				"name": "digit_key_toggles_a_multi_select_row",
+				"input": {
+					"questions": [
+						{
+							"question": "Pick many",
+							"header": "HM",
+							"options": [
+								{
+									"label": "A",
+									"description": "a"
+								},
+								{
+									"label": "B",
+									"description": "b"
+								}
+							],
+							"multiSelect": true
+						}
+					],
+					"keys": [
+						"2"
+					]
+				}
+			},
+			{
+				"name": "digit_key_focuses_the_type_something_row",
+				"input": {
+					"questions": [
+						{
+							"question": "Pick one",
+							"header": "H",
+							"options": [
+								{
+									"label": "A",
+									"description": "a"
+								},
+								{
+									"label": "B",
+									"description": "b"
+								}
+							]
+						}
+					],
+					"keys": [
+						"3"
+					]
+				}
+			},
+			{
+				"name": "digit_key_outside_numbered_rows_is_ignored",
+				"input": {
+					"questions": [
+						{
+							"question": "Pick one",
+							"header": "H",
+							"options": [
+								{
+									"label": "A",
+									"description": "a"
+								},
+								{
+									"label": "B",
+									"description": "b"
+								}
+							]
+						}
+					],
+					"keys": [
+						"9"
+					]
+				}
+			},
+			{
+				"name": "blank_type_something_enter_is_ignored",
+				"input": {
+					"questions": [
+						{
+							"question": "Pick one",
+							"header": "H",
+							"options": [
+								{
+									"label": "A",
+									"description": "a"
+								},
+								{
+									"label": "B",
+									"description": "b"
+								}
+							]
+						}
+					],
+					"setup": {
+						"inputMode": true
+					},
+					"runtime": {
+						"inputBuffer": "   "
+					},
+					"keys": [
+						"\r"
+					]
+				}
+			},
+			{
+				"name": "custom_notes_key_matches_as_typed",
+				"input": {
+					"questions": [
+						{
+							"question": "Pick one",
+							"header": "H",
+							"options": [
+								{
+									"label": "A",
+									"description": "a"
+								},
+								{
+									"label": "B",
+									"description": "b"
+								}
+							]
+						}
+					],
+					"runtime": {
+						"notesKey": "т"
+					},
+					"keys": [
+						"т"
+					]
+				}
+			},
+			{
+				"name": "custom_notes_key_spec_matches_ctrl_n",
+				"input": {
+					"questions": [
+						{
+							"question": "Pick one",
+							"header": "H",
+							"options": [
+								{
+									"label": "A",
+									"description": "a"
+								},
+								{
+									"label": "B",
+									"description": "b"
+								}
+							]
+						}
+					],
+					"runtime": {
+						"notesKey": "ctrl+n"
+					},
+					"keys": [
+						"\u000e"
+					]
+				}
+			},
+			{
+				"name": "space_csi_u_toggles_in_multi_select",
+				"input": {
+					"questions": [
+						{
+							"question": "Pick many",
+							"header": "HM",
+							"options": [
+								{
+									"label": "A",
+									"description": "a"
+								},
+								{
+									"label": "B",
+									"description": "b"
+								}
+							],
+							"multiSelect": true
+						}
+					],
+					"keys": [
+						"\u001b[32u"
+					]
+				}
 			}
 		]
 	},

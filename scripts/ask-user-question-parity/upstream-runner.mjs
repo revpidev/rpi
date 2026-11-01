@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 
 const SNAPSHOT =
 	process.env.PARITY_SNAPSHOT ??
-	"/tmp/rpi-ask-user-question-parity-deps/snapshot";
+	"/tmp/rpi-ask-user-question-parity-deps/snapshot-v2150";
 
 const types = await import(`${SNAPSHOT}/tool/types.ts`);
 const normalize = await import(`${SNAPSHOT}/tool/normalize-params.ts`);
@@ -32,7 +32,9 @@ const previewBox = await import(`${SNAPSHOT}/view/components/preview/preview-box
 // 9841914c. The snapshot's own bare import resolves it from the deps
 // node_modules; this leg loads the same file by path (the runner lives
 // outside the deps tree, so bare resolution would not find it).
-const DEPS = SNAPSHOT.replace(/\/snapshot\/?$/, "");
+const DEPS =
+	process.env.PARITY_DEPS ??
+	SNAPSHOT.replace(/\/snapshot[^/]*\/?$/, "");
 const upstreamTui = await import(`${DEPS}/node_modules/@earendil-works/pi-tui/index.ts`);
 
 /** Upstream `buildItemsForQuestion` (ask-user-question.ts:289-297). */
@@ -138,6 +140,7 @@ function keysCase(input, keyMatrix) {
 		currentItem: items[state.optionIndex],
 		items,
 		collapseKey: runtimeInput.collapseKey ?? "ctrl+]",
+		notesKey: runtimeInput.notesKey ?? "n",
 	};
 	const keys = input.keys ?? keyMatrix ?? [];
 	return { actions: keys.map((data) => jsonClone(keyRouter.routeKey(data, state, runtime))) };

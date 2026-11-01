@@ -1,6 +1,6 @@
-# subagents parity report (target track: pi-subagents v0.76.1 @ 7d072b91d snapshot, ADR-0036)
+# subagents parity report (regression track: pi-subagents v0.76.1 @ 7d072b91d snapshot, ADR-0036)
 
-generated: 2026-10-16T06:45:25.054Z
+generated: 2026-11-01T06:01:18.562Z
 
 ## args
 
@@ -32,6 +32,10 @@ generated: 2026-10-16T06:45:25.054Z
 - exclude-tools: MATCH
 - bad-frontmatter-invalid-line: MATCH
 - thinking-field: MATCH
+- comments-in-tool-lists: ATTRIBUTED [upstream-semantics] R18.1 / #2995 → TE51 FR-B fields: frontmatter, tools
+- hash-inside-quoted-and-block-scalars: MATCH
+- quoted-tool-names: ATTRIBUTED [upstream-semantics] R18.1 / #3017 → TE51 FR-B fields: frontmatter, tools
+- quoted-block-list-names: MATCH
 
 ## final-output
 
@@ -49,6 +53,8 @@ generated: 2026-10-16T06:45:25.054Z
 - overflow-maximum-context-length: MATCH
 - overflow-plain-error-control: MATCH
 - overflow-tool-failure-not-overflow: MATCH
+- overflow-with-appended-reply-text: MATCH
+- provider-stop-reply-text-is-not-classified: MATCH
 
 ## model
 
@@ -91,7 +97,8 @@ generated: 2026-10-16T06:45:25.054Z
 
 ### upstream-semantics
 
-- (none)
+- frontmatter/comments-in-tool-lists (R18.1 / #2995 → TE51 FR-B)
+- frontmatter/quoted-tool-names (R18.1 / #3017 → TE51 FR-B)
 
 ### rpi-deviation
 
@@ -102,4 +109,4 @@ generated: 2026-10-16T06:45:25.054Z
 - (none)
 
 
-## RESULT: MATCH
+## RESULT: ATTRIBUTED-OK

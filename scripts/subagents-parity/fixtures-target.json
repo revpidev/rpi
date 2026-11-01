@@ -22,6 +22,22 @@
       {
         "name": "thinking-field",
         "content": "---\nname: thinker\nthinking: high\nmodel: anthropic/claude\n---\n\nBody.\n"
+      },
+      {
+        "name": "comments-in-tool-lists",
+        "content": "---\nname: worker\ndescription: Comments in lists\ntools:\n  - read\n  # note\n  - bash # why\n# column zero\nextensions:\n  - ./a.ts\n  # keep going\n  - ./b.ts\n---\n\nBody.\n"
+      },
+      {
+        "name": "hash-inside-quoted-and-block-scalars",
+        "content": "---\nname: worker\ndescription: |\n  first\n  # kept\ntools:\n  - \"a # b\"\n  - bash\nnotes: >\n  one\n  # two\n---\n\nBody.\n"
+      },
+      {
+        "name": "quoted-tool-names",
+        "content": "---\nname: worker\n# a description with a quoted comma stays a scalar\ndescription: \"Review \\\"a\\\", then continue\"\ntools: \"read\", \"bash\"\n---\n\nBody.\n"
+      },
+      {
+        "name": "quoted-block-list-names",
+        "content": "---\nname: worker\ntools:\n  - \"read\"\n  - bash\n---\n\nBody.\n"
       }
     ]
   },
@@ -90,6 +106,16 @@
         "name": "overflow-tool-failure-not-overflow",
         "kind": "context-overflow",
         "error": "write failed (exit 1): token limit exceeded"
+      },
+      {
+        "name": "overflow-with-appended-reply-text",
+        "kind": "context-overflow",
+        "error": "maximum context length is 200000 tokens\nReply text: the rest was truncated"
+      },
+      {
+        "name": "provider-stop-reply-text-is-not-classified",
+        "kind": "context-overflow",
+        "error": "content_filter\nReply text: maximum context length is 200000 tokens"
       }
     ]
   },

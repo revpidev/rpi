@@ -1,0 +1,4 @@
+{
+  "//": "Target-track attribution manifest for the v0.1.8 rebase window (TE51, ADR-0038): expected-source pin = rpiv-mono v2.15.0 @ ce6d3530. Seeded EMPTY; TE51 attributes every remaining case difference here (`upstream-semantics` vs `rpi-deviation`, each with R + owner task) while FR-G/FR-H land, and the track closes green with the manifest emptied.",
+  "cases": []
+}

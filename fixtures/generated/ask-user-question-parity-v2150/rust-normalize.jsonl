@@ -1,0 +1,9 @@
+{"name":"noop","output":{"questions":[{"question":"Q?","header":"H","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}]}]}}
+{"name":"crlf_question_and_fields","output":{"questions":[{"question":"line1\nline2","header":"H\n2","options":[{"label":"A\n1","description":"d\n1","preview":"p\n1"},{"label":"B","description":"b"}]}]}}
+{"name":"lone_cr_deleted","output":{"questions":[{"question":"GEMBA_LOG_FILE","header":"H","options":[{"label":"A","description":"d"},{"label":"B","description":"b"}]}]}}
+{"name":"mixed_terminators","output":{"questions":[{"question":"a\nbc\nd","header":"H","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}]}]}}
+{"name":"astral_emoji","output":{"questions":[{"question":"🦀\n🦀","header":"H","options":[{"label":"🦀","description":"d"},{"label":"B","description":"b"}]}]}}
+{"name":"preview_absent_stays_absent","output":{"questions":[{"question":"Q?","header":"H","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}]}]}}
+{"name":"empty_preview_string_stays_present","output":{"questions":[{"question":"Q?","header":"H","options":[{"label":"A","description":"a","preview":""},{"label":"B","description":"b"}]}]}}
+{"name":"multi_select_preserved","output":{"questions":[{"question":"Q?","header":"H","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}],"multiSelect":true}]}}
+{"name":"multi_select_false_preserved","output":{"questions":[{"question":"Q?","header":"H","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}],"multiSelect":false}]}}

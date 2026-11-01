@@ -1,26 +1,26 @@
-# ask-user-question parity report (TE28/TE29/TE30/TE31 G3/G12 — preview group added by TE31)
+# ask-user-question parity report (target track: rpiv-mono v2150 @ ce6d353041 — TE28/TE29/TE30/TE31 G3/G12, dual-track TE51)
 
-generated: 2026-10-16T07:21:54.110Z
-upstream submodule: external/rpiv-mono/packages/rpiv-ask-user-question
-submodule HEAD: afc21bc25f7d07cae9fb3103dc309240a16b9f49 (pinned afc21bc25f7d07cae9fb3103dc309240a16b9f49)
+generated: 2026-11-01T06:02:10.850Z
+upstream submodule: external/rpiv-mono (packages/rpiv-ask-user-question)
+submodule HEAD: afc21bc25f7d07cae9fb3103dc309240a16b9f49 (track pin ce6d3530410812ca504ec294995581a52170f9e1)
 typebox: 1.3.6
 
 ## snapshot (sha256 of the driven upstream modules)
 
-- tool/types.ts: d41fe638fdc2af67038e5a514ff3896628772620a5d07a513de9d876e45e7c8e
-- tool/normalize-params.ts: 97adf84ebd4a82eac70c5eff3a4905054029ec56ce6e1dfe654c9b8abee1ade5
-- tool/validate-questionnaire.ts: 5baf8e418756ce8420909c2ad5bea5f4cc6fb4ac315f625c85e26f6ae99b8edd
-- tool/response-envelope.ts: 406335512b5be540d9854bc0193ed4900f1ad316881cda38cb736bf46ef97d87
-- tool/format-answer.ts: d4504470ccdbdad60127a8f49a09d21cfd8b8a788f00ac250eb07586d889b41a
-- state/row-intent.ts: dbb44959cffb56fd031ea751d28f7c5647ef117051ec6edc5a96bb877f64ca16
-- state/i18n-bridge.ts: c2921835574265924e0a96a1d10b010d6edd78b07b7ee14e4a4b92cc2287a809
-- rpc-fallback.ts: 6df56c7d890d8ba9fa841e33c77839b25875edfeb1c8b19a7f9e86c0d59d63b6
-- state/state-reducer.ts: f6045ea83dae832176db0dab5bbb52f424577011aedbbd73bde50f5ae434d3fe
-- state/key-router.ts: 9f4ad8bf7ead9afb50fa09b1143c5864a2da7f4cacb9f2ceef733eaad3216782
-- view/components/preview/preview-layout-decider.ts: 7baf9ecd1db8af8383d2f792d69d4fd9b22623a7cbd29e1a95bc9fd480796a3b
+- tool/types.ts: 8fb488b02c914383bb2b47aff338c1b309f8bf14af5e4f450bbbfbe09530a6e1
+- tool/normalize-params.ts: 40c5ffef66159a56f5384b0a57d3c19541560acb5bd67ee03de44b643b4dd1ce
+- tool/validate-questionnaire.ts: 2a63c6204cde2b41d033c58620eb217dc0dbedbc004628c4c65f04791ad7808d
+- tool/response-envelope.ts: 36bc85b3c905da14d77e79c92a12e8018ae3281dac2db456bf192db0e53724c4
+- tool/format-answer.ts: ac3cfcb8aef95bb916ca68020fc7920c96f12058efbaa615bec63f58d63c2c6e
+- state/row-intent.ts: b146d76bb19dec2abf24e5e61a55b294784cd48256a0d8e8c0f33b93e8997a9b
+- state/i18n-bridge.ts: d465d3271ce216fc7bff8f4bc7dcded468651da4ae9b6e63de2b3f3c460d5d80
+- rpc-fallback.ts: 11074c840bc13e94cb86817fd14b2d946bb33e46f52180ad456c3183fdb1d7f7
+- state/state-reducer.ts: 6cccc0654beaca23c919d3dccc9d158cd9da6104996b6a6d9f68c90e5c5c767b
+- state/key-router.ts: 703567e30b8d0f4c29a948faf15c15de0bb5509576067ad67a5ba95ba572650f
+- view/components/preview/preview-layout-decider.ts: 0c04ccdf5cd9be94138e4e7c9d10895844f32e378a7dfd7bb296ab2738fb7918
 - view/components/preview/preview-box-renderer.ts: 20b900ead8a0e71f005aadb18c00103b2dff87391ec8c8011ebd3c47540a8c33
-- external/pi/packages/tui/src/keys.ts (pi-tui stub): b972facce4233a4623239fc38029e28cae15d0fb326558c0c09dc02cf4345fa7
-- external/pi/packages/tui/src/utils.ts (pi-tui stub, TE31): 258ff73a0ff4d2b05f8a60515a9cc37eb96c9fc03a4072ac6db2906cad1862d9
+- external/pi/packages/tui/src/keys.ts (pi-tui stub): 40cd0229bbc36cdcac24f3bdd2fce53f060ff4fe6f8522e239135212033d37f2
+- external/pi/packages/tui/src/utils.ts (pi-tui stub, TE31): 6e22ed5385c08965a46f01d6ec9686cb0eada95e34b9dc0f9a5e85d28f8f512a
 
 ## schema
 
@@ -173,6 +173,14 @@ typebox: 1.3.6
 - answered_option_confirmed: MATCH
 - empty_questions: MATCH
 - multi_select_input_mode_enter_commits_with_text: MATCH
+- digit_key_answers_a_single_select_row: MATCH
+- digit_key_toggles_a_multi_select_row: MATCH
+- digit_key_focuses_the_type_something_row: MATCH
+- digit_key_outside_numbered_rows_is_ignored: MATCH
+- blank_type_something_enter_is_ignored: MATCH
+- custom_notes_key_matches_as_typed: MATCH
+- custom_notes_key_spec_matches_ctrl_n: MATCH
+- space_csi_u_toggles_in_multi_select: MATCH
 
 ## preview
 
@@ -282,17 +290,21 @@ typebox: 1.3.6
 - submit_page-120.jsonl: MATCH (6 frames)
 - submit_page-80.jsonl: MATCH (6 frames)
 
-## locales
+## locales (against the v2150 target pin)
 
-- de.json: MATCH (181e3180d74d)
-- en.json: MATCH (092978b2c966)
-- es.json: MATCH (2f92505d4e03)
-- fr.json: MATCH (303fb2f2d3eb)
-- pt-BR.json: MATCH (1a37815ff03d)
-- pt.json: MATCH (3125153e8617)
-- ru.json: MATCH (9eceb410c5df)
-- uk.json: MATCH (4e4738bd9623)
-- zh.json: MATCH (1eb029b481e7)
+- de.json: MATCH (51989994feb2)
+- en.json: MATCH (b4b1a7e811bc)
+- es.json: MATCH (f36793c280b6)
+- fr.json: MATCH (dce2433b557c)
+- pt-BR.json: MATCH (d3eef30df4bd)
+- pt.json: MATCH (f305cc52fa60)
+- ru.json: MATCH (7167e0576061)
+- uk.json: MATCH (3c30045ccb56)
+- zh.json: MATCH (7f30c61eac12)
 
+
+## Attribution summary
+
+- (none)
 
 ## RESULT: MATCH

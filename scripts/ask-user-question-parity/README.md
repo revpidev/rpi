@@ -1,13 +1,21 @@
 # ask-user-question parity harness (TE28/TE29 G3/G12)
 
 Drives the **pinned upstream pure-function modules** (`juicesharp/rpiv-mono` →
-`packages/rpiv-ask-user-question/` @ `afc21bc2` = v2.13.8 (the TE48 rebase commit; prior pin `0fdf4f8` = v2.10.1+1) against the Rust port in `crates/rpi-ext-ask-user-question`
-and diffs the two legs case by case. **Non-zero exit = any difference.**
+`packages/rpiv-ask-user-question/`) against the Rust port in
+`crates/rpi-ext-ask-user-question` and diffs the two legs case by case.
+**Non-zero exit = any unattributed difference.**
+
+Dual-track rotation (TE51, ADR-0038): `target` (default) = the v0.1.8 target
+pin **v2.15.0** @ `ce6d3530`; `regression` = the retired v0.1.7 pin
+**v2.13.8** @ `afc21bc2`. Both snapshots are read from the git object
+database (`git show <pin>:<path>`), so `external/rpiv-mono` stays read-only
+and its HEAD may sit on either pin while the rebase lands.
 
 ```bash
 # one-time: the orchestrator installs tsx + typebox into the deps dir
 # (override with RPI_ASKQ_PARITY_DEPS; default /tmp/rpi-ask-user-question-parity-deps)
-node scripts/ask-user-question-parity/run-parity.mjs
+node scripts/ask-user-question-parity/run-parity.mjs                    # target
+node scripts/ask-user-question-parity/run-parity.mjs --track=regression # archaeology
 ```
 
 The orchestrator builds this crate's `ask_user_question_parity_runner` example
@@ -18,8 +26,12 @@ build makes the harness independent of workspace build order (mcp-parity
 precedent); a manual `cargo build -p rpi-ext-ask-user-question --example
 ask_user_question_parity_runner` step is therefore optional.
 
-Report: `fixtures/generated/ask-user-question-parity/parity-report.md` (plus
-`upstream-<group>.jsonl` / `rust-<group>.jsonl` raw legs).
+Report: `fixtures/generated/ask-user-question-parity-v2150/parity-report.md`
+(target) / `fixtures/generated/ask-user-question-parity-v2138/parity-report.md`
+(regression), plus the `upstream-<group>.jsonl` / `rust-<group>.jsonl` raw
+legs. The target track attributes pending differences through
+`expected-diffs-v2150.json` (`{key: "group/case", section, r, owner}`); the
+regression track's manifest stays empty by design.
 
 ## What runs
 
@@ -27,7 +39,7 @@ Report: `fixtures/generated/ask-user-question-parity/parity-report.md` (plus
 |------|------|
 | `fixtures.json` | Shared cases, grouped `schema` / `normalize` / `validate` / `envelope` / `row-intent` / `rpc` / `state` / `keys` |
 | `upstream-runner.mjs` | Imports the upstream TS modules via `tsx` and prints one JSON line per case |
-| `run-parity.mjs` | Verifies the submodule pin, materializes the snapshot (+ the `@earendil-works/pi-tui` keys stub), runs both legs, normalizes, diffs, checks the golden-frame baseline, writes the report |
+| `run-parity.mjs` | Verifies the submodule HEAD is one of the two track pins, materializes the track snapshot (+ the `@earendil-works/pi-tui` keys stub), runs both legs, normalizes, diffs, attributes pending target diffs, checks the golden-frame baseline (target only), writes the report |
 | `gen-golden-frames.mjs` | Re-records `golden-frames/*.jsonl` from the native fixture component (run deliberately; the files are committed) |
 | `examples/ask_user_question_parity_runner.rs` (in the crate) | Rust leg over the same fixtures via the `parity` facade |
 
@@ -35,9 +47,10 @@ Report: `fixtures/generated/ask-user-question-parity/parity-report.md` (plus
 
 Node resolves bare specifiers (`typebox`) by walking up from the importing
 file, so running the upstream modules **in place** would require writing a
-`node_modules/` into the submodule. Instead `run-parity.mjs` copies the six
-driven modules into `$RPI_ASKQ_PARITY_DEPS/snapshot/` (fresh every run) and
-records each file's sha256 in the report. The deps dir carries `tsx` + the
+`node_modules/` into the submodule. Instead `run-parity.mjs` extracts the driven
+modules from the tracked pin into `$RPI_ASKQ_PARITY_DEPS/snapshot-<track>/`
+(fresh every run, `git show` only) and records each file's sha256 in the
+report. The deps dir carries `tsx` + the
 `typebox` version from the upstream `package-lock.json` (1.3.6). The submodule
 HEAD is asserted against `afc21bc25f7d07cae9fb3103dc309240a16b9f49`.
 

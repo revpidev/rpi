@@ -15,3 +15,11 @@
 {"name":"answered_option_confirmed","output":{"actions":[{"kind":"confirm","answer":{"questionIndex":0,"question":"Pick one","kind":"option","answer":"A"}},{"kind":"ignore"},{"kind":"notes_enter"},{"kind":"cancel"},{"kind":"nav","nextIndex":2,"inputValue":""},{"kind":"nav","nextIndex":1,"inputValue":""},{"kind":"nav","nextIndex":2,"inputValue":""},{"kind":"nav","nextIndex":1,"inputValue":""},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"toggle_collapsed"},{"kind":"confirm","answer":{"questionIndex":0,"question":"Pick one","kind":"option","answer":"A"}},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"}]}}
 {"name":"empty_questions","output":{"actions":[{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"toggle_collapsed"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"},{"kind":"ignore"}]}}
 {"name":"multi_select_input_mode_enter_commits_with_text","output":{"actions":[{"kind":"multi_confirm","selected":["A"],"answer":"typed"}]}}
+{"name":"digit_key_answers_a_single_select_row","output":{"actions":[{"kind":"confirm","answer":{"questionIndex":0,"question":"Pick one","kind":"option","answer":"B"}}]}}
+{"name":"digit_key_toggles_a_multi_select_row","output":{"actions":[{"kind":"toggle","index":1}]}}
+{"name":"digit_key_focuses_the_type_something_row","output":{"actions":[{"kind":"nav","nextIndex":2,"inputValue":""}]}}
+{"name":"digit_key_outside_numbered_rows_is_ignored","output":{"actions":[{"kind":"ignore"}]}}
+{"name":"blank_type_something_enter_is_ignored","output":{"actions":[{"kind":"ignore"}]}}
+{"name":"custom_notes_key_matches_as_typed","output":{"actions":[{"kind":"notes_enter"}]}}
+{"name":"custom_notes_key_spec_matches_ctrl_n","output":{"actions":[{"kind":"notes_enter"}]}}
+{"name":"space_csi_u_toggles_in_multi_select","output":{"actions":[{"kind":"toggle","index":0}]}}

@@ -5,7 +5,7 @@
 // Runs the crate's `ask_user_question_parity_runner golden` command (the native fixture
 // component rendered at 80/100/120 columns) and writes one JSONL file per
 // scenario/width into
-// `fixtures/generated/ask-user-question-parity/golden-frames/`.
+// `fixtures/generated/ask-user-question-parity-v2150/golden-frames/`.
 //
 // The files are COMMITTED; `run-parity.mjs` re-renders and compares
 // byte-for-byte, so re-record deliberately (Q3's rich-interaction pass
@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../..");
 const RUNNER = resolve(REPO, "target/debug/examples/ask_user_question_parity_runner");
-const GOLDEN_DIR = resolve(REPO, "fixtures/generated/ask-user-question-parity/golden-frames");
+const GOLDEN_DIR = resolve(REPO, "fixtures/generated/ask-user-question-parity-v2150/golden-frames");
 
 if (!existsSync(RUNNER)) {
 	const build = spawnSync(

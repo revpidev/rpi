@@ -8,13 +8,15 @@ points with the same fixture set, then diffs the normalized outputs item by item
 
 | Track | Upstream | Purpose | Report directory |
 |----|------|------|----------|
-| `target` (**default since the TE45 rotation**) | the current pin v0.76.1 (`7d072b91d`, an out-of-repo snapshot) | active parity baseline (full mode set) | `fixtures/generated/subagents-parity-v0761/` |
-| `regression` | the retired v0.74.0 snapshot (`b6bda32f`, the v0.1.6 zero-regression baseline) | archaeology only | `fixtures/generated/subagents-parity-v074/` |
+| `target` (**default since the TE45 rotation**) | the v0.1.8 target pin v0.83.0 (`3a63e0ad`, an out-of-repo snapshot) | active parity baseline (full mode set) | `fixtures/generated/subagents-parity-v0830/` |
+| `regression` | the retired v0.76.1 snapshot (`7d072b91d`, the v0.1.7 zero-regression baseline) | archaeology only | `fixtures/generated/subagents-parity-v0761/` |
 
 Track names rotate each rebase cycle (TE13 convention): the v0.1.5 window named the then-current
 pin `regression` (default) and the new pin `target`; **TE45 kept the default on `target` and moved
 the tracks one release window forward** (2026-10, pin v0.70.0 -> v0.74.0 with M0.75), and **TE48
-moved them again** (2026-10-16, pin v0.74.0 -> v0.76.1 with V17-00). The retired v0.48
+moved them again** (2026-10-16, pin v0.74.0 -> v0.76.1 with V17-00), and **TE51** moved them for
+the v0.1.8 window (2026-11-01, pin v0.76.1 -> v0.83.0 under ADR-0038; the gitlink itself still only
+switches after TE51 acceptance). The retired v0.48
 archaeology face (live `pi-args.ts`) was removed with the TE37 rotation — the args leg is the
 frozen v0.48 golden on both tracks. The two fixture files (`fixtures.json`, `fixtures-target.json`)
 are shared and concatenated on both tracks. Both upstream legs read **snapshots** extracted by
@@ -30,11 +32,11 @@ mkdir -p /tmp/rpi-subagents-parity-deps && cd /tmp/rpi-subagents-parity-deps \
 
 cd <repo-root>
 
-# Default track (v0.76.1 snapshot = the submodule pin since V17-00/TE48)
-bash scripts/subagents-parity/setup-target-source.sh   # extracts BOTH snapshots (target v0.76.1 + regression v0.74.0) + prod deps
+# Default track (v0.83.0 snapshot = the v0.1.8 target pin, ADR-0038)
+bash scripts/subagents-parity/setup-target-source.sh   # extracts BOTH snapshots (target v0.83.0 + regression v0.76.1) + prod deps
 node scripts/subagents-parity/run-parity.mjs
 
-# The retired v0.74.0 snapshot track (archaeology)
+# The retired v0.76.1 snapshot track (archaeology)
 node scripts/subagents-parity/run-parity.mjs --track=regression
 
 # Re-record the argv/env frozen baseline ([RPI-OWN], ADR-0025 §4; v0.48-era worktree + RPI_SUBAGENTS_PARITY_ARGS_LEGACY=1 required)
@@ -130,10 +132,11 @@ track keeps the historical, emptied `expected-target-diffs.json`), or the report
 | `fixtures-target.json` | Target-track additions: frontmatter (inherit/false, excludeTools, broken frontmatter, thinking), final-output, fallback vectors (post-#2270/TE39: context-overflow only), discovery tree (TE15), notify (TE17), **inline argv [RPI-OWN] goldens (TE18: the excludeTools surface, no upstream recorder; expectations inline in the cases) and model-resolution vectors (TE18 R7.1.4.4/.5, re-anchored by TE39 at v0.70 `model-resolution.ts`)** |
 | `args-golden-v048.json` | The frozen argv/env golden file ([RPI-OWN]; covers only the 9 cases of fixtures.json; `--record-args-golden` re-records only the non-inline cases) |
 | `expected-target-diffs.json` | The regression-track difference attribution list (historical, emptied by TE14) |
-| `expected-target-diffs-v0761.json` | The v0.1.7 target-track attribution manifest (TE48 seed, empty by design) |
+| `expected-target-diffs-v0830.json` | The v0.1.8 target-track attribution manifest (TE51 seed, empty by design) |
+| `expected-target-diffs-v0761.json` | The v0.1.7 target-track manifest, reused as TE51's regression-track manifest: it carries the two `upstream-semantics` frontmatter cases (#2995/#3017) the v0.83.0 implementation intentionally changes |
 | `expected-target-diffs-v074.json` | The v0.1.6 target-track attribution manifest (TE45 seed; closed empty; historical) |
 | `expected-target-diffs-v070.json` | The v0.1.5 target-track attribution manifest (TE37 seed; closed empty by TE38/TE39; historical) |
-| `upstream-runner.mjs` | Runs upstream modules directly via tsx from the track root (v0.76.1 snapshot = target; v0.74.0 snapshot = regression); args via the golden file on both tracks; fallback/model anchored at the target's `model-resolution.ts` (TE39 followed the #2270 removal; TE45 re-anchored the `scoped` token + provider-prefixed id work; TE48 records the v0.76.1 virtual-model verification branch as an undriven face) |
+| `upstream-runner.mjs` | Runs upstream modules directly via tsx from the track root (v0.83.0 snapshot = target; v0.76.1 snapshot = regression); args via the golden file on both tracks; fallback/model anchored at the target's `model-resolution.ts` (TE39 followed the #2270 removal; TE45 re-anchored the `scoped` token + provider-prefixed id work; TE48 recorded the v0.76.1 virtual-model verification branch; TE51 drives the #2913 reply-text split and records the closest-registry-model candidates as an undriven face) |
 | `setup-target-source.sh` | Extracts the v0.76.1 target snapshot out-of-repo + installs its prod dependencies (zero writes to external/) |
 | `examples/subagents_parity_runner.rs` | Drives this crate with the same fixtures (parity facade, `lib.rs::parity`); built by the orchestrator and executed from a private copy |
 | `run-parity.mjs` | Orchestration + normalized diff + attribution + report writing; fixture materialization and the Rust binary copy land in out-of-repo temp directories |
@@ -189,6 +192,29 @@ track keeps the historical, emptied `expected-target-diffs.json`), or the report
 - Unchanged faces at v0.70 (verified): `src/agents/frontmatter.ts` (`parseFrontmatter`),
   `src/shared/utils.ts` (`getFinalOutput`); `src/agents/agents.ts` and
   `src/runs/background/notify.ts` were unchanged at v0.70 but changed by v0.74 (below).
+
+## v0.83.0 skeleton facts (TE51 close reads, ADR-0038)
+
+- The four driven faces still exist at v0.83.0 with the same exported entry points
+  (`parseFrontmatter`/`parseFrontmatterList`/`parseUnquotedList`, `getFinalOutput`,
+  `discoverAgents`, `formatSingleCompletion`/`parseSubagentNotifyContent`,
+  `isContextOverflow`/`resolveSubagentModelOverride`/`resolveModelSelection`,
+  `resolveModelScopesForAgent`). `src/agents/frontmatter.ts` (+26/−3), `src/shared/utils.ts`
+  (+27/−6), `src/runs/shared/model-resolution.ts` (+40/−2), `src/runs/background/notify.ts`
+  (+254/−30) and `src/agents/agents.ts` (+127/−48) changed in the range; the legs were
+  re-anchored by symbol, not line.
+- TE51 adds target-track cases for #2995 (YAML comments in frontmatter lists) and #3017
+  (quoted names in tool/extension lists) — `comments-in-tool-lists`,
+  `hash-inside-quoted-and-block-scalars`, `quoted-tool-names`, `quoted-block-list-names` — and
+  for #2913 (provider stop text / reply-text split in `isContextOverflow`) —
+  `overflow-with-appended-reply-text`, `provider-stop-reply-text-is-not-classified`. All MATCH.
+- The v0.83.0 model-resolution `closestModelCandidates` addition (#2792, launch-error
+  suggestions) and `assistantMessageError` itself are not driven by this harness: the launch-error
+  payload is not a pure `(model, registry)` function on the fixture surface, and `utils.ts` is
+  driven only through `getFinalOutput`. Both are covered Rust-side (unit tests) and registered in
+  the TE51 four-tuple.
+- Upstream v0.83.0 still ships no `pi-args.ts`, so the argv/env face remains the frozen v0.48
+  golden ([RPI-OWN], ADR-0025 §4).
 
 ## v0.76.1 skeleton facts (TE48 close reads, ADR-0036)
 
