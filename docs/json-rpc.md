@@ -153,6 +153,8 @@ Report objects always contain `schemaVersion:1`, `provider` and `stale`; `curren
 
 `validateOnly:true` checks the output channel without producing anything. Commands call it **before** fetching usage data, so a NullUi/subagent session fails with `unsupported-output` before running a script or touching the network. Command output is not gated on `hasUI`.
 
+TE53 consumers (`rpi-usage`): the plain `/usage` report is one `usageText` payload; `--json` is one `usageReport` object (or an array for `all`). A cache miss still carries `schemaVersion`/`provider`/`stale` plus a `cache-miss` error and omits `source`/`envelope`; a stale force failure carries `source:"cache"`, `stale:true`, the old envelope and the classified error. The unsupported-current-provider fallback is a `usageReport` with `source:"local"` and `localTokens:{input,output,cacheRead,cacheWrite,used}`, no envelope/error/quota fields, and it never runs a script. xAI is explicit-only: automatic footer refreshes never emit a supplier request, and only a non-cached user command can run its user→billing pair.
+
 ```json
 {"type":"extension_ui_request","id":"<uuid>","method":"usageReport","data":{"schemaVersion":1,"provider":"deepseek","stale":false,"source":"network","envelope":{"schemaVersion":1,"provider":"deepseek","displayText":"CNY 9.99"}}}
 ```

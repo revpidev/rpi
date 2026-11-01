@@ -114,7 +114,7 @@ Common options:
 | `--export <file> [output.html]` | Export a session file to HTML |
 | `--tools` / `--exclude-tools` / `--no-tools` | Tool allowlist/denylist with `*` patterns and `+name` / `-name` adjustments; `--tools` keeps MCP tools unless an entry starts with `mcp__` |
 | `--no-mcp` | Disable the built-in MCP client for this run |
-| `--offline` | Disable all network endpoints for this run; `/usage` then only serves the session cache and never runs a provider script |
+| `--offline` | Disable all network endpoints for this run; `/usage` serves cached usage (or the current session's local tokens when the provider has no quota script) and never runs a provider script |
 | `--use-theme <name[/name]>` | Initial interactive theme for this run |
 | `@<file>` | Attach a file (text or image) to the initial message |
 
@@ -143,7 +143,7 @@ Four hidden built-in extensions provide agent-level surfaces:
 | `builtin:mcp` | MCP servers from `~/.rpi/agent/mcp.json` and `<cwd>/.rpi/mcp.json`: `mcp__*` tools, resource tools, `/mcp`, and OAuth. `rpi-mcp-adapter` is retired — the built-in client is the supported path. |
 | `builtin:llama.cpp` | llama.cpp router integration (`/llama`) and native decision-model classifiers. |
 
-Seven first-party extensions ship as `.rpix` archives in lockstep with the host release: `rpi-subagents` (delegation, background runs, worktrees), `rpi-smart-fetch` (fingerprinted web fetch), `rpi-statusline` (script or declarative 21-field footer with a `/statusline` editor), `rpi-ask-user-question` (structured questions), `rpi-todo` (task list), `rpi-plan-mode` (read-only planning and approval), and `rpi-usage` (provider quota footer).
+Seven first-party extensions ship as `.rpix` archives in lockstep with the host release: `rpi-subagents` (delegation, background runs, worktrees), `rpi-smart-fetch` (fingerprinted web fetch), `rpi-statusline` (script or declarative 21-field footer with a `/statusline` editor), `rpi-ask-user-question` (structured questions), `rpi-todo` (task list), `rpi-plan-mode` (read-only planning and approval), and `rpi-usage` (typed quota/balance footer for eight providers, `/usage [--cached] [--json] [provider|all]`, `/usage list|help`, and a local session-token report for providers without a quota script).
 
 ### Permission modes and plan mode
 

@@ -114,7 +114,7 @@ rpi self-uninstall --purge   # 连同 ~/.rpi（会话、认证、设置）一起
 | `--export <file> [output.html]` | 将会话文件导出为 HTML |
 | `--tools` / `--exclude-tools` / `--no-tools` | 工具 allowlist/denylist，支持 `*` 模式与 `+name` / `-name` 调整；`--tools` 默认保留 MCP 工具，除非条目以 `mcp__` 开头 |
 | `--no-mcp` | 本次运行关闭内建 MCP 客户端 |
-| `--offline` | 本次运行关闭所有网络端点；`/usage` 只读取会话缓存，不执行任何 provider 脚本 |
+| `--offline` | 本次运行关闭所有网络端点；`/usage` 只读取缓存（当前 provider 无配额脚本时显示本会话本地 token），不执行任何 provider 脚本 |
 | `--use-theme <name[/name]>` | 本次运行使用的初始交互主题 |
 | `@<file>` | 将文件（文本或图片）附加到初始消息 |
 
@@ -143,7 +143,7 @@ rpi auth check|print-api-key|print-bearer-token ...  # 查看 provider 凭据
 | `builtin:mcp` | 读取 `~/.rpi/agent/mcp.json` 与 `<cwd>/.rpi/mcp.json`：`mcp__*` 工具、资源工具、`/mcp` 与 OAuth。`rpi-mcp-adapter` 已退役，内建客户端是受支持的路径。 |
 | `builtin:llama.cpp` | llama.cpp router 集成（`/llama`）与原生 decision-model classifier。 |
 
-七款第一方扩展以 `.rpix` 形式随宿主版本 lockstep 发布：`rpi-subagents`（委派、后台运行、worktree）、`rpi-smart-fetch`（浏览器指纹 web fetch）、`rpi-statusline`（脚本或 21 字段声明式 footer，含 `/statusline` 编辑器）、`rpi-ask-user-question`（结构化提问）、`rpi-todo`（任务列表）、`rpi-plan-mode`（只读规划与批准流）、`rpi-usage`（provider 配额 footer）。
+七款第一方扩展以 `.rpix` 形式随宿主版本 lockstep 发布：`rpi-subagents`（委派、后台运行、worktree）、`rpi-smart-fetch`（浏览器指纹 web fetch）、`rpi-statusline`（脚本或 21 字段声明式 footer，含 `/statusline` 编辑器）、`rpi-ask-user-question`（结构化提问）、`rpi-todo`（任务列表）、`rpi-plan-mode`（只读规划与批准流）、`rpi-usage`（八家 provider 的类型化配额/余额 footer，支持 `/usage [--cached] [--json] [provider|all]`、`/usage list|help`；无配额脚本的 provider 只显示本会话本地 token）。
 
 ### 权限模式与 plan mode
 
