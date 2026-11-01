@@ -74,9 +74,49 @@ fn invalid_params_result(message: String) -> Value {
     })
 }
 
+/// `prepareTodoArguments` (normalize-params.ts:1-43 @ 2.15.0, #193): undo a
+/// double-encoded `tasks[]` before validation. Some tool-call parsers emit
+/// nested structures as JSON strings — `tasks` itself, or its items. Only a
+/// string at an array/object position is decoded, and only when it parses to
+/// the expected shape; anything else passes through so validation still
+/// reports the real problem.
+pub fn prepare_todo_arguments(args: &Value) -> Value {
+    let Some(object) = args.as_object() else {
+        return args.clone();
+    };
+    let Some(raw_tasks) = object.get("tasks") else {
+        return args.clone();
+    };
+    let decoded_tasks = match raw_tasks {
+        Value::String(text) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null),
+        other => other.clone(),
+    };
+    let Some(tasks) = decoded_tasks.as_array() else {
+        return args.clone();
+    };
+    let decoded: Vec<Value> = tasks
+        .iter()
+        .map(|item| match item {
+            Value::String(text) => serde_json::from_str::<Value>(text)
+                .ok()
+                .filter(Value::is_object)
+                .unwrap_or_else(|| item.clone()),
+            other => other.clone(),
+        })
+        .collect();
+    // Only an unchanged ARRAY (not a decoded string) is returned as-is.
+    if raw_tasks.is_array() && decoded == *tasks {
+        return args.clone();
+    }
+    let mut out = object.clone();
+    out.insert("tasks".to_string(), Value::Array(decoded));
+    Value::Object(out)
+}
+
 /// `execute` (upstream tool body): resolve the calling session's slot,
 /// apply the mutation, commit, and wrap in the response envelope.
 pub fn execute(host: &dyn crate::HostCall, params: &Value) -> Value {
+    let params = &prepare_todo_arguments(params);
     let sid = crate::sid_of(host);
     let Some(action_value) = params.get("action") else {
         return invalid_params_result("action is required".to_owned());
@@ -274,6 +314,33 @@ mod tests {
     }
 
     #[test]
+    fn prepare_arguments_decodes_double_encoded_batches() {
+        // The whole `tasks` array arrives as a JSON string.
+        let args = json!({
+            "action": "create",
+            "tasks": "[{\"subject\":\"a\"},{\"subject\":\"b\"}]"
+        });
+        let prepared = prepare_todo_arguments(&args);
+        assert_eq!(prepared["tasks"][1]["subject"], json!("b"));
+        // Each item arrives as a JSON string.
+        let args = json!({
+            "action": "create",
+            "tasks": ["{\"subject\":\"a\"}", "{\"subject\":\"b\"}"]
+        });
+        let prepared = prepare_todo_arguments(&args);
+        assert_eq!(prepared["tasks"][0]["subject"], json!("a"));
+        // A malformed item string passes through untouched for validation.
+        let args = json!({"action": "create", "tasks": ["not json"]});
+        assert_eq!(prepare_todo_arguments(&args), args);
+        // Well-formed arguments are returned as-is.
+        let args = json!({"action": "create", "tasks": [{"subject": "a"}]});
+        assert_eq!(prepare_todo_arguments(&args), args);
+        // A non-array tasks value passes through.
+        let args = json!({"action": "create", "tasks": 42});
+        assert_eq!(prepare_todo_arguments(&args), args);
+    }
+
+    #[test]
     fn description_is_the_upstream_literal() {
         // Pin to the empty-config override (review P1-2): these tests
         // read the config through load_config() but touch no store state.
@@ -286,20 +353,21 @@ mod tests {
         assert_eq!(
             tool_definition()["description"],
             json!(
-                "Manage a task list for tracking multi-step progress. Actions: create (new task), update (change status/fields/dependencies), list (all tasks, optionally filtered by status), get (single task details), delete (tombstone), clear (reset all). Status: pending → in_progress → completed, plus deleted tombstone. Use this to plan and track multi-step work like research, design, and implementation."
+                "Manage a task list for tracking multi-step progress. Actions: create (new task, or several independent tasks at once via tasks[]), update (change status/fields/dependencies), list (all tasks, optionally filtered by status), get (single task details), delete (tombstone), clear (reset all). Status: pending → in_progress → completed, plus deleted tombstone. Use this to plan and track multi-step work like research, design, and implementation."
             )
         );
     }
 
-    /// The eight built-in guidelines, transcribed from
-    /// `todo.ts:75-83` @ `0fdf4f8`.
-    const UPSTREAM_GUIDELINES: [&str; 8] = [
+    /// The nine built-in guidelines, transcribed from `todo.ts` @ `2.15.0`
+    /// (#193 adds the batch-create rule).
+    const UPSTREAM_GUIDELINES: [&str; 9] = [
         "Use `todo` for complex work with 3+ steps, when the user gives you a list of tasks, or immediately after receiving new instructions to capture requirements. Skip it for single trivial tasks and purely conversational requests.",
         "When starting a task from the todo list, mark it in_progress BEFORE beginning work. Mark it completed IMMEDIATELY when done — never batch completions. Exactly one task in_progress at a time.",
         "Never mark a task completed if tests are failing, the implementation is partial, or you hit unresolved errors — keep it in_progress and create a new task for the blocker instead.",
         "Task status is a 4-state machine: pending → in_progress → completed, plus deleted as a tombstone. Pass activeForm (present-continuous label, e.g. 'researching existing tool') when marking in_progress.",
         "To change a task's status, call update with the task id and the target status, e.g. {\"action\":\"update\",\"id\":3,\"status\":\"completed\"} or {\"action\":\"update\",\"id\":3,\"status\":\"in_progress\",\"activeForm\":\"writing tests\"}. status is the field that changes the task; an update without a mutable field (status or another) is rejected.",
         "Use blockedBy to express dependencies (A is blocked by B). On create, pass blockedBy as the initial set. On update, use addBlockedBy / removeBlockedBy (additive merge — do not resend the full array). Cycles are rejected.",
+        "To create several independent tasks at once, pass create with tasks: [{subject}, ...]. Do not also pass subject. tasks[] cannot blockedBy each other (ids do not exist until the call commits); create the prerequisite first, then the dependent with blockedBy. Dependency chains stay single-create.",
         "list hides tombstoned (deleted) tasks by default; pass includeDeleted:true to see them. Pass status to filter by a single status.",
         "Subject must be short and imperative (e.g. 'Research existing tool'); description is for long-form detail. activeForm is a present-continuous label shown while in_progress.",
     ];
@@ -315,7 +383,7 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         crate::config::set_test_config(Some(serde_json::json!({})));
         let guidelines = crate::tool::types::default_prompt_guidelines();
-        assert_eq!(guidelines.len(), 8);
+        assert_eq!(guidelines.len(), 9);
         for (index, expected) in UPSTREAM_GUIDELINES.iter().enumerate() {
             assert_eq!(&guidelines[index], expected, "guideline #{index}");
         }
@@ -361,7 +429,7 @@ mod tests {
         let properties = &tool_definition()["parameters"]["properties"];
         assert_eq!(
             properties["subject"]["description"],
-            json!("Task subject line (required for create)")
+            json!("Task subject line (required for create unless tasks[] is set)")
         );
         assert_eq!(
             properties["description"]["description"],
@@ -409,6 +477,20 @@ mod tests {
                 "If true, list action returns deleted (tombstoned) tasks as well. Default: false."
             )
         );
+        assert_eq!(
+            properties["tasks"]["description"],
+            json!(
+                "Batch create: independent tasks in one call, one-of with subject. The whole list is validated then committed together. Items cannot blockedBy each other; create the prerequisite first, then the dependent with blockedBy."
+            )
+        );
+        let items = &properties["tasks"]["items"];
+        assert_eq!(items["required"], json!(["subject"]));
+        assert_eq!(
+            items["properties"]["blockedBy"]["description"],
+            json!(
+                "Existing task ids this item waits on. Cannot name another item in this same batch; create the prerequisite first, then the dependent with blockedBy."
+            )
+        );
         // Schema property order matches the upstream TypeBox declaration
         // order (pinned by the registration golden).
         let keys: Vec<&str> = properties
@@ -432,6 +514,7 @@ mod tests {
                 "metadata",
                 "id",
                 "includeDeleted",
+                "tasks",
             ]
         );
     }
@@ -481,7 +564,7 @@ mod tests {
         // Guidelines stay at the built-in eight.
         assert_eq!(
             definition["promptGuidelines"].as_array().map(Vec::len),
-            Some(8)
+            Some(9)
         );
     }
 
@@ -525,7 +608,7 @@ mod tests {
         );
         assert_eq!(
             definition["promptGuidelines"].as_array().map(Vec::len),
-            Some(8)
+            Some(9)
         );
     }
 
@@ -534,7 +617,7 @@ mod tests {
         let definition = definition_with(json!({"promptGuidelines": ["valid", ""]}));
         assert_eq!(
             definition["promptGuidelines"].as_array().map(Vec::len),
-            Some(8)
+            Some(9)
         );
     }
 
@@ -547,7 +630,7 @@ mod tests {
         );
         assert_eq!(
             definition["promptGuidelines"].as_array().map(Vec::len),
-            Some(8)
+            Some(9)
         );
         let definition = tool_definition_with_guidance(None);
         assert_eq!(

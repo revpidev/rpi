@@ -175,7 +175,7 @@ pub fn todo_params_schema() -> Value {
             },
             "subject": {
                 "type": "string",
-                "description": "Task subject line (required for create)"
+                "description": "Task subject line (required for create unless tasks[] is set)"
             },
             "description": {
                 "type": "string",
@@ -220,6 +220,41 @@ pub fn todo_params_schema() -> Value {
             "includeDeleted": {
                 "type": "boolean",
                 "description": "If true, list action returns deleted (tombstoned) tasks as well. Default: false."
+            },
+            "tasks": {
+                "type": "array",
+                "description": "Batch create: independent tasks in one call, one-of with subject. The whole list is validated then committed together. Items cannot blockedBy each other; create the prerequisite first, then the dependent with blockedBy.",
+                "items": {
+                    "type": "object",
+                    "required": ["subject"],
+                    "properties": {
+                        "subject": {
+                            "type": "string",
+                            "description": "Task subject line"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Long-form task description"
+                        },
+                        "activeForm": {
+                            "type": "string",
+                            "description": "Present-continuous spinner label shown while status is in_progress (e.g. 'writing tests')"
+                        },
+                        "blockedBy": {
+                            "type": "array",
+                            "items": { "type": "number" },
+                            "description": "Existing task ids this item waits on. Cannot name another item in this same batch; create the prerequisite first, then the dependent with blockedBy."
+                        },
+                        "owner": {
+                            "type": "string",
+                            "description": "Agent/owner assigned to this task"
+                        },
+                        "metadata": {
+                            "type": "object",
+                            "description": "Arbitrary metadata"
+                        }
+                    }
+                }
             }
         }
     })
@@ -233,7 +268,7 @@ pub fn todo_params_schema() -> Value {
 
 pub const DEFAULT_PROMPT_SNIPPET: &str = "Manage a task list to track multi-step progress";
 
-pub const DEFAULT_TOOL_DESCRIPTION: &str = "Manage a task list for tracking multi-step progress. Actions: create (new task), update (change status/fields/dependencies), list (all tasks, optionally filtered by status), get (single task details), delete (tombstone), clear (reset all). Status: pending → in_progress → completed, plus deleted tombstone. Use this to plan and track multi-step work like research, design, and implementation.";
+pub const DEFAULT_TOOL_DESCRIPTION: &str = "Manage a task list for tracking multi-step progress. Actions: create (new task, or several independent tasks at once via tasks[]), update (change status/fields/dependencies), list (all tasks, optionally filtered by status), get (single task details), delete (tombstone), clear (reset all). Status: pending → in_progress → completed, plus deleted tombstone. Use this to plan and track multi-step work like research, design, and implementation.";
 
 pub fn default_prompt_guidelines() -> Vec<String> {
     [
@@ -243,6 +278,7 @@ pub fn default_prompt_guidelines() -> Vec<String> {
         "Task status is a 4-state machine: pending → in_progress → completed, plus deleted as a tombstone. Pass activeForm (present-continuous label, e.g. 'researching existing tool') when marking in_progress.",
         "To change a task's status, call update with the task id and the target status, e.g. {\"action\":\"update\",\"id\":3,\"status\":\"completed\"} or {\"action\":\"update\",\"id\":3,\"status\":\"in_progress\",\"activeForm\":\"writing tests\"}. status is the field that changes the task; an update without a mutable field (status or another) is rejected.",
         "Use blockedBy to express dependencies (A is blocked by B). On create, pass blockedBy as the initial set. On update, use addBlockedBy / removeBlockedBy (additive merge — do not resend the full array). Cycles are rejected.",
+        "To create several independent tasks at once, pass create with tasks: [{subject}, ...]. Do not also pass subject. tasks[] cannot blockedBy each other (ids do not exist until the call commits); create the prerequisite first, then the dependent with blockedBy. Dependency chains stay single-create.",
         "list hides tombstoned (deleted) tasks by default; pass includeDeleted:true to see them. Pass status to filter by a single status.",
         "Subject must be short and imperative (e.g. 'Research existing tool'); description is for long-form detail. activeForm is a present-continuous label shown while in_progress.",
     ]

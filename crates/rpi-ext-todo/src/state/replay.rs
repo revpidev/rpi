@@ -19,16 +19,67 @@ use serde_json::Value;
 use crate::state::TaskState;
 use crate::tool::types::{STATE_ENTRY_TYPE, TOOL_NAME, Task};
 
+/// One persisted task, validated down to every field the renderer reads
+/// (`isTask`, replay.ts:8-25 @ 2.15.0, #230). A snapshot another extension
+/// truncated with a marker string must be skipped whole, so the last valid
+/// list stands.
+fn is_task(value: &Value) -> bool {
+    let Some(task) = value.as_object() else {
+        return false;
+    };
+    if !task.get("id").is_some_and(|value| value.as_i64().is_some()) {
+        return false;
+    }
+    if !task.get("subject").is_some_and(Value::is_string) {
+        return false;
+    }
+    if !matches!(
+        task.get("status").and_then(Value::as_str),
+        Some("pending" | "in_progress" | "completed" | "deleted")
+    ) {
+        return false;
+    }
+    let optional_string = |key: &str| {
+        task.get(key)
+            .is_none_or(|value| value.is_null() || value.is_string())
+    };
+    if !optional_string("description")
+        || !optional_string("activeForm")
+        || !optional_string("owner")
+    {
+        return false;
+    }
+    if let Some(blocked_by) = task.get("blockedBy").filter(|value| !value.is_null()) {
+        let Some(ids) = blocked_by.as_array() else {
+            return false;
+        };
+        if !ids.iter().all(|id| id.as_i64().is_some()) {
+            return false;
+        }
+    }
+    if let Some(metadata) = task.get("metadata").filter(|value| !value.is_null())
+        && !metadata.is_object()
+    {
+        return false;
+    }
+    true
+}
+
 /// Discriminator for `details` envelopes that match the persisted
-/// `TaskDetails` shape. Defensive — branch entries from older or corrupt
-/// sessions are skipped silently (upstream `isTaskDetails`).
+/// `TaskDetails` shape, down to every task (upstream `isTaskDetails`
+/// @ 2.15.0, #230). Defensive — a snapshot from an older or corrupt session
+/// is skipped whole, so replay keeps the last valid one.
 pub fn is_task_details(value: &Value) -> bool {
     if !value.is_object() {
         return false;
     }
-    let tasks = value.get("tasks").is_some_and(Value::is_array);
-    let next_id = value.get("nextId").is_some_and(Value::is_number);
-    tasks && next_id
+    let Some(tasks) = value.get("tasks").and_then(Value::as_array) else {
+        return false;
+    };
+    let next_id = value
+        .get("nextId")
+        .is_some_and(|value| value.as_i64().is_some());
+    next_id && tasks.iter().all(is_task)
 }
 
 /// Decode one matched `details` into a fresh `TaskState`. Returns `None`
@@ -177,6 +228,92 @@ mod tests {
         assert!(!is_task_details(&json!({})));
         assert!(!is_task_details(&json!({"tasks": "x", "nextId": 1})));
         assert!(!is_task_details(&json!({"tasks": [], "nextId": "1"})));
+    }
+
+    #[test]
+    fn guard_rejects_a_snapshot_whose_tasks_hold_a_malformed_entry() {
+        let truncated = json!("[output-policy: array truncated, dropped 3 item(s)]");
+        assert!(!is_task_details(
+            &json!({"tasks": [task_fixture(1, "kept"), truncated], "nextId": 58})
+        ));
+        assert!(!is_task_details(
+            &json!({"tasks": [{"id": 1, "status": "pending"}], "nextId": 2})
+        ));
+        let mut done = task_fixture(1, "x");
+        done["status"] = json!("done");
+        assert!(!is_task_details(&json!({"tasks": [done], "nextId": 2})));
+    }
+
+    #[test]
+    fn guard_rejects_optional_fields_the_renderer_would_choke_on() {
+        for extra in [
+            json!({"activeForm": 7}),
+            json!({"blockedBy": "#2"}),
+            json!({"blockedBy": ["2"]}),
+            json!({"owner": {}}),
+            json!({"metadata": "m"}),
+        ] {
+            let task = json!({
+                "id": 1,
+                "subject": "x",
+                "status": "pending",
+            });
+            let mut task = task;
+            for (key, value) in extra.as_object().unwrap() {
+                task[key] = value.clone();
+            }
+            assert!(
+                !is_task_details(&json!({"tasks": [task], "nextId": 2})),
+                "{}",
+                extra
+            );
+        }
+    }
+
+    #[test]
+    fn guard_accepts_a_task_carrying_every_optional_field() {
+        let full = json!({
+            "id": 2,
+            "subject": "full",
+            "status": "in_progress",
+            "description": "d",
+            "activeForm": "doing",
+            "blockedBy": [1],
+            "owner": "me",
+            "metadata": {"k": 1}
+        });
+        assert!(is_task_details(&json!({
+            "tasks": [task_fixture(1, "a"), full],
+            "nextId": 3
+        })));
+    }
+
+    #[test]
+    fn a_malformed_snapshot_keeps_the_last_valid_state_on_both_sources() {
+        let truncated = json!({
+            "tasks": [task_fixture(1, "A"), "[output-policy: array truncated]"],
+            "nextId": 9
+        });
+        let entries = vec![
+            state_entry(json!({"tasks": [task_fixture(1, "A")], "nextId": 2})),
+            state_entry(truncated.clone()),
+        ];
+        let state = replay_from_session_entries(&entries).expect("valid snapshot");
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.next_id, 2);
+        let results = vec![
+            tool_result(json!({
+                "action": "create", "params": {},
+                "tasks": [task_fixture(1, "A")], "nextId": 2
+            })),
+            tool_result(json!({
+                "action": "create", "params": {},
+                "tasks": truncated["tasks"].clone(), "nextId": 9
+            })),
+        ];
+        let state = replay_from_entries(&results);
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.next_id, 2);
     }
 
     #[test]

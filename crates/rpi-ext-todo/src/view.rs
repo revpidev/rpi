@@ -275,30 +275,28 @@ pub fn render_todo_call(
     state: &TaskState,
     i18n: &I18n,
 ) -> Value {
-    // `ACTION_GLYPH[args.action] ?? args.action`: an unknown/missing
-    // action renders its own JS stringification (a MISSING property is
-    // `undefined`; a JSON `null` is `"null"`) — partial streaming args
-    // hit this on the first render.
-    let glyph = match args
-        .get("action")
-        .and_then(Value::as_str)
-        .and_then(TaskAction::parse)
-    {
-        Some(action) => action_glyph(action).to_owned(),
-        None => match args.get("action") {
-            Some(value) => crate::state::reducer::js_string(value),
-            None => "undefined".to_owned(),
-        },
+    // #175: `if (args.action) text += ACTION_GLYPH[args.action] ?? args.action`.
+    // A missing/falsy action (partial streaming args, a rejected call) adds no
+    // glyph at all instead of the literal "undefined"/"null"; a truthy unknown
+    // value renders its JS stringification.
+    let glyph = match args.get("action") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value.is_empty() => None,
+        Some(Value::Bool(false)) => None,
+        Some(Value::Number(number)) if number.as_f64() == Some(0.0) => None,
+        Some(value) => Some(match value.as_str().and_then(TaskAction::parse) {
+            Some(action) => action_glyph(action).to_owned(),
+            None => crate::state::reducer::js_string(value),
+        }),
     };
     let action = args
         .get("action")
         .and_then(Value::as_str)
         .and_then(TaskAction::parse);
-    let mut text = format!(
-        "{}{}",
-        theme.fg("toolTitle", &theme.bold("todo ")),
-        theme.fg("muted", &glyph)
-    );
+    let mut text = theme.fg("toolTitle", &theme.bold("todo "));
+    if let Some(glyph) = glyph {
+        text.push_str(&theme.fg("muted", &glyph));
+    }
 
     if action == Some(TaskAction::Create) {
         // JS truthiness: an empty-string subject renders nothing extra.
@@ -309,6 +307,10 @@ pub fn render_todo_call(
         {
             text.push(' ');
             text.push_str(&theme.fg("dim", &sanitize_terminal_text(subject)));
+        } else if let Some(tasks) = args.get("tasks").and_then(Value::as_array) {
+            // #193: a batch create names the item count instead of a subject.
+            text.push(' ');
+            text.push_str(&theme.fg("dim", &format!("{} tasks", tasks.len())));
         }
     } else if matches!(
         action,
@@ -338,11 +340,59 @@ pub fn render_todo_call(
     json!({ "type": "text", "props": { "text": text } })
 }
 
+/// First line of the failure message, or `None` when the call succeeded
+/// (`failureReason`, format.ts:186-199 @ 2.15.0). The reducer reports through
+/// `details.error`; Pi rejects a call before execute with `isError` and the
+/// message as text content.
+fn failure_reason(result: &Value, is_error: bool) -> Option<String> {
+    let details_error = result
+        .get("details")
+        .and_then(|details| details.get("error"))
+        .and_then(Value::as_str);
+    let rejected_by_reducer = details_error.is_some_and(|error| !error.is_empty());
+    if !is_error && !rejected_by_reducer {
+        return None;
+    }
+    let message = details_error
+        .filter(|error| !error.is_empty())
+        .or_else(|| {
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|content| {
+                    content
+                        .iter()
+                        .find(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                })
+                .and_then(|part| part.get("text"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("");
+    let first_line = message.split('\n').next().unwrap_or("");
+    Some(sanitize_terminal_text(first_line))
+}
+
 /// The `renderResult` body (upstream `renderTodoResult`): the per-action
 /// status echo (only `create`/`update`/`delete` advertise a status;
 /// `list`/`get`/`clear` — and any result without a resolvable status —
 /// fall back to the plain success `✓`).
-pub fn render_todo_result(result: &Value, theme: &dyn TodoTheme, i18n: &I18n) -> Value {
+pub fn render_todo_result(
+    result: &Value,
+    theme: &dyn TodoTheme,
+    i18n: &I18n,
+    is_error: bool,
+) -> Value {
+    // #175: a failed call renders `✗` plus the first line of its reason —
+    // `details.error` when the reducer rejected it, otherwise Pi's isError
+    // text. Display only; the model-facing result is unchanged.
+    if let Some(failure) = failure_reason(result, is_error) {
+        let text = if failure.is_empty() {
+            theme.fg("error", "✗")
+        } else {
+            theme.fg("error", &format!("✗ {failure}"))
+        };
+        return json!({ "type": "text", "props": { "text": text } });
+    }
     let details = result.get("details").filter(|value| !value.is_null());
     let mut status: Option<TaskStatus> = None;
     if let Some(details) = details {
@@ -569,6 +619,15 @@ mod tests {
     }
 
     #[test]
+    fn render_call_batch_create_names_the_item_count() {
+        let text = call_text(
+            &json!({"action": "create", "tasks": [{"subject": "a"}, {"subject": "b"}]}),
+            &TaskState::empty(),
+        );
+        assert!(text.ends_with("2 tasks"), "{text}");
+    }
+
+    #[test]
     fn render_call_create_emits_prefix_and_subject() {
         let text = call_text(
             &json!({"action": "create", "subject": "hello"}),
@@ -623,11 +682,38 @@ mod tests {
     }
 
     #[test]
-    fn render_call_missing_action_renders_the_js_undefined_glyph() {
-        // Partial streaming args: upstream `ACTION_GLYPH[undefined] ??
-        // undefined` stringifies to the literal "undefined".
+    fn render_call_without_action_omits_the_glyph() {
+        // #175: partial streaming args (and rejected calls) carry no action;
+        // the base "todo " prefix renders alone, never "todo undefined".
         let text = call_text(&json!({}), &TaskState::empty());
-        assert!(text.contains("undefined"), "{text}");
+        assert_eq!(text, "todo ");
+        let text = call_text(&json!({"action": null}), &TaskState::empty());
+        assert_eq!(text, "todo ");
+    }
+
+    #[test]
+    fn render_result_failures_render_the_cross_and_first_reason_line() {
+        // Reducer rejection: `details.error` wins over any content text.
+        let result = json!({
+            "content": [{ "type": "text", "text": "ignored content" }],
+            "details": { "error": "Task #2 does not exist.\nsecond line" }
+        });
+        assert_eq!(result_text(&result), "✗ Task #2 does not exist.");
+        // Pi rejected the call before execute: isError + text content.
+        let result = json!({
+            "content": [{ "type": "text", "text": "Invalid params\nmore" }],
+            "details": null
+        });
+        assert_eq!(
+            render_todo_result(&result, &IdentityTheme, &I18n::for_locale("en"), true)["props"]["text"],
+            json!("✗ Invalid params")
+        );
+        // isError without any text still renders the cross alone.
+        let result = json!({"content": [], "details": null});
+        assert_eq!(
+            render_todo_result(&result, &IdentityTheme, &I18n::for_locale("en"), true)["props"]["text"],
+            json!("✗")
+        );
     }
 
     // ------------------------------------------------------------------
@@ -636,7 +722,7 @@ mod tests {
 
     fn result_text(result: &Value) -> String {
         let i18n = I18n::for_locale("en");
-        render_todo_result(result, &IdentityTheme, &i18n)["props"]["text"]
+        render_todo_result(result, &IdentityTheme, &i18n, false)["props"]["text"]
             .as_str()
             .expect("text prop")
             .to_owned()
@@ -730,6 +816,7 @@ mod tests {
             }),
             &RecordingTheme,
             &i18n,
+            false,
         );
         assert_eq!(tree["props"]["text"], json!("<dim>○ pending</dim>"));
     }

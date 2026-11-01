@@ -41,7 +41,7 @@ use crate::tool::types::{Task, TaskAction, TaskStatus};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     Create {
-        task_id: i64,
+        task_ids: Vec<i64>,
     },
     Update {
         id: i64,
@@ -260,6 +260,79 @@ fn task_changed(before: &Task, after: &Task) -> bool {
 // The reducer
 // ---------------------------------------------------------------------------
 
+/// Per-task create fields: on a batch they belong to each `tasks[]` item
+/// (`BATCH_ITEM_FIELDS`, state-reducer.ts:54-55 @ 2.15.0, #193).
+const BATCH_ITEM_FIELDS: [&str; 5] = [
+    "description",
+    "activeForm",
+    "blockedBy",
+    "owner",
+    "metadata",
+];
+
+/// `buildCreatedTask`: the pending task with truthy conditional appends in
+/// the upstream order.
+fn build_created_task(id: i64, spec: &serde_json::Map<String, Value>, subject: &str) -> Task {
+    let mut task = Task {
+        id,
+        subject: subject.to_owned(),
+        status: TaskStatus::Pending,
+        description: None,
+        active_form: None,
+        blocked_by: None,
+        owner: None,
+        metadata: None,
+    };
+    if let Some(description) = truthy_str(spec, "description") {
+        task.description = Some(description.to_owned());
+    }
+    if let Some(active_form) = truthy_str(spec, "activeForm") {
+        task.active_form = Some(active_form.to_owned());
+    }
+    if let Some(blocked_by) = value_list(spec, "blockedBy").filter(|list| !list.is_empty()) {
+        task.blocked_by = Some(
+            blocked_by
+                .iter()
+                .filter_map(|dep| dep.as_f64().map(|number| number as i64))
+                .collect(),
+        );
+    }
+    if let Some(owner) = truthy_str(spec, "owner") {
+        task.owner = Some(owner.to_owned());
+    }
+    if let Some(metadata) = spec.get("metadata").and_then(Value::as_object) {
+        task.metadata = Some(metadata.clone());
+    }
+    task
+}
+
+/// `validateCreateBlockedBy`: every dependency must exist, be live, and not be
+/// another item of the same batch (its id does not exist yet).
+fn validate_create_blocked_by(
+    state: &TaskState,
+    blocked_by: Option<&[Value]>,
+    sibling_ids: &std::collections::BTreeSet<i64>,
+) -> Option<String> {
+    let blocked_by = blocked_by.filter(|list| !list.is_empty())?;
+    for dep in blocked_by {
+        if let Some(id) = dep.as_f64().map(|number| number as i64)
+            && sibling_ids.contains(&id)
+        {
+            return Some(format!(
+                "blockedBy: #{} is another item in this batch; create the prerequisite first, then the dependent with blockedBy",
+                js_string(dep)
+            ));
+        }
+        let Some(dep_task) = state.tasks.iter().find(|task| id_matches(task.id, dep)) else {
+            return Some(format!("blockedBy: #{} not found", js_string(dep)));
+        };
+        if dep_task.status == TaskStatus::Deleted {
+            return Some(format!("blockedBy: #{} is deleted", js_string(dep)));
+        }
+    }
+    None
+}
+
 pub fn apply_task_mutation(
     state: TaskState,
     action: TaskAction,
@@ -267,69 +340,95 @@ pub fn apply_task_mutation(
 ) -> ApplyResult {
     match action {
         TaskAction::Create => {
+            // #193: `tasks[]` is the batch form, one-of with `subject`.
+            let batch = params.get("tasks").and_then(Value::as_array);
+
+            if batch.is_some() && params.contains_key("subject") {
+                return error_result(state, "create requires subject or tasks[], not both");
+            }
+
+            if let Some(batch) = batch {
+                // Each item carries its own fields; a top-level one would apply
+                // to no item, so reject instead of silently dropping it.
+                let top_level: Vec<&str> = BATCH_ITEM_FIELDS
+                    .iter()
+                    .copied()
+                    .filter(|field| params.contains_key(*field))
+                    .collect();
+                if !top_level.is_empty() {
+                    return error_result(
+                        state,
+                        format!(
+                            "create with tasks[] takes {} on each item, not at the top level",
+                            top_level.join(", ")
+                        ),
+                    );
+                }
+                if batch.is_empty() {
+                    return error_result(state, "tasks[] must be non-empty");
+                }
+                struct Item<'a> {
+                    spec: &'a serde_json::Map<String, Value>,
+                    subject: &'a str,
+                }
+                let mut items: Vec<Item<'_>> = Vec::with_capacity(batch.len());
+                for (index, entry) in batch.iter().enumerate() {
+                    let Some(spec) = entry.as_object() else {
+                        return error_result(
+                            state,
+                            format!("tasks[{index}]: subject required for create"),
+                        );
+                    };
+                    let Some(subject) = subject_present(spec) else {
+                        return error_result(
+                            state,
+                            format!("tasks[{index}]: subject required for create"),
+                        );
+                    };
+                    items.push(Item { spec, subject });
+                }
+                let sibling_ids: std::collections::BTreeSet<i64> = (0..items.len() as i64)
+                    .map(|offset| state.next_id + offset)
+                    .collect();
+                for item in &items {
+                    if let Some(error) = validate_create_blocked_by(
+                        &state,
+                        value_list(item.spec, "blockedBy"),
+                        &sibling_ids,
+                    ) {
+                        return error_result(state, error);
+                    }
+                }
+                let created: Vec<Task> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        build_created_task(state.next_id + index as i64, item.spec, item.subject)
+                    })
+                    .collect();
+                let task_ids: Vec<i64> = created.iter().map(|task| task.id).collect();
+                let mut tasks = state.tasks.clone();
+                tasks.extend(created);
+                return ApplyResult {
+                    state: TaskState {
+                        tasks,
+                        next_id: state.next_id + task_ids.len() as i64,
+                    },
+                    op: Op::Create { task_ids },
+                };
+            }
+
             let Some(subject) = subject_present(params) else {
                 return error_result(state, "subject required for create");
             };
-            if let Some(blocked_by) =
-                value_list(params, "blockedBy").filter(|list| !list.is_empty())
-            {
-                for dep in blocked_by {
-                    let Some(dep_task) = state.tasks.iter().find(|task| id_matches(task.id, dep))
-                    else {
-                        return error_result(
-                            state,
-                            format!("blockedBy: #{} not found", js_string(dep)),
-                        );
-                    };
-                    if dep_task.status == TaskStatus::Deleted {
-                        return error_result(
-                            state,
-                            format!("blockedBy: #{} is deleted", js_string(dep)),
-                        );
-                    }
-                }
+            if let Some(error) = validate_create_blocked_by(
+                &state,
+                value_list(params, "blockedBy"),
+                &Default::default(),
+            ) {
+                return error_result(state, error);
             }
-            let mut new_task = Task {
-                id: state.next_id,
-                subject: subject.to_owned(),
-                status: TaskStatus::Pending,
-                description: None,
-                active_form: None,
-                blocked_by: None,
-                owner: None,
-                metadata: None,
-            };
-            // Truthy conditional appends (upstream `if (params.x)`), in the
-            // upstream append order.
-            if let Some(description) = truthy_str(params, "description") {
-                new_task.description = Some(description.to_owned());
-            }
-            if let Some(active_form) = truthy_str(params, "activeForm") {
-                new_task.active_form = Some(active_form.to_owned());
-            }
-            if let Some(blocked_by) =
-                value_list(params, "blockedBy").filter(|list| !list.is_empty())
-            {
-                // Validation above guarantees every element numerically
-                // matches an existing task id, so the f64→i64 narrowing is
-                // lossless (`1.0` narrows to `1`, mirroring the upstream
-                // element copy).
-                new_task.blocked_by = Some(
-                    blocked_by
-                        .iter()
-                        .filter_map(|dep| dep.as_f64().map(|number| number as i64))
-                        .collect::<Vec<_>>(),
-                );
-            }
-            if let Some(owner) = truthy_str(params, "owner") {
-                new_task.owner = Some(owner.to_owned());
-            }
-            if let Some(metadata) = params.get("metadata").and_then(Value::as_object) {
-                // Upstream `if (params.metadata)` — any object is truthy in
-                // JS, so an empty `{}` is stored verbatim (F2).
-                new_task.metadata = Some(metadata.clone());
-            }
-
+            let new_task = build_created_task(state.next_id, params, subject);
             let task_id = new_task.id;
             let mut tasks = state.tasks.clone();
             tasks.push(new_task);
@@ -338,10 +437,11 @@ pub fn apply_task_mutation(
                     tasks,
                     next_id: state.next_id + 1,
                 },
-                op: Op::Create { task_id },
+                op: Op::Create {
+                    task_ids: vec![task_id],
+                },
             }
         }
-
         TaskAction::Update => {
             let Some(id_value) = id_value(params) else {
                 return error_result(state, "id required for update");
@@ -606,6 +706,123 @@ mod tests {
     // applyTaskMutation — create
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // applyTaskMutation — batch create (#193)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn batch_create_commits_every_item_with_sequential_ids() {
+        let result = apply_task_mutation(
+            empty_state(),
+            TaskAction::Create,
+            &params(json!({
+                "action": "create",
+                "tasks": [
+                    {"subject": "first", "owner": "me", "activeForm": "doing"},
+                    {"subject": "second", "description": "detail", "metadata": {"k": 1}},
+                ]
+            })),
+        );
+        assert_eq!(
+            result.op,
+            Op::Create {
+                task_ids: vec![1, 2]
+            }
+        );
+        assert_eq!(result.state.next_id, 3);
+        assert_eq!(result.state.tasks.len(), 2);
+        assert_eq!(result.state.tasks[0].subject, "first");
+        assert_eq!(result.state.tasks[0].owner.as_deref(), Some("me"));
+        assert_eq!(result.state.tasks[1].description.as_deref(), Some("detail"));
+        assert_eq!(
+            result.state.tasks[1]
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("k")),
+            Some(&json!(1))
+        );
+    }
+
+    #[test]
+    fn batch_create_is_all_or_nothing() {
+        let cases = [
+            (
+                json!({"action":"create","subject":"a","tasks":[{"subject":"b"}]}),
+                "create requires subject or tasks[], not both",
+            ),
+            (
+                json!({"action":"create","tasks":[]}),
+                "tasks[] must be non-empty",
+            ),
+            (
+                json!({"action":"create","tasks":[{"subject":"a"},{"description":"no subject"}]}),
+                "tasks[1]: subject required for create",
+            ),
+            (
+                json!({"action":"create","tasks":["marker"]}),
+                "tasks[0]: subject required for create",
+            ),
+            (
+                json!({"action":"create","tasks":[{"subject":"a"}],"owner":"me"}),
+                "create with tasks[] takes owner on each item, not at the top level",
+            ),
+            (
+                json!({"action":"create","tasks":[{"subject":"a"}],"metadata":{},"blockedBy":[1]}),
+                "create with tasks[] takes blockedBy, metadata on each item, not at the top level",
+            ),
+        ];
+        for (input, expected) in cases {
+            let result = apply_task_mutation(empty_state(), TaskAction::Create, &params(input));
+            assert_eq!(
+                result.op,
+                Op::Error {
+                    message: expected.to_owned()
+                },
+                "{expected}"
+            );
+            assert!(result.state.tasks.is_empty(), "{expected}");
+            assert_eq!(result.state.next_id, 1, "{expected}");
+        }
+    }
+
+    #[test]
+    fn batch_create_items_cannot_block_on_the_batch_and_must_name_live_tasks() {
+        let result = apply_task_mutation(
+            empty_state(),
+            TaskAction::Create,
+            &params(json!({
+                "action": "create",
+                "tasks": [{"subject": "a"}, {"subject": "b", "blockedBy": [2]}]
+            })),
+        );
+        assert_eq!(
+            result.op,
+            Op::Error {
+                message: "blockedBy: #2 is another item in this batch; create the prerequisite first, then the dependent with blockedBy".to_owned()
+            }
+        );
+        let existing = state_with(vec![task_full(1, "done", TaskStatus::Deleted)]);
+        let result = apply_task_mutation(
+            existing,
+            TaskAction::Create,
+            &params(json!({"action":"create","tasks":[{"subject":"a","blockedBy":[1]}]})),
+        );
+        assert_eq!(
+            result.op,
+            Op::Error {
+                message: "blockedBy: #1 is deleted".to_owned()
+            }
+        );
+        let existing = state_with(vec![task(1, "live")]);
+        let result = apply_task_mutation(
+            existing,
+            TaskAction::Create,
+            &params(json!({"action":"create","tasks":[{"subject":"a","blockedBy":[1]}]})),
+        );
+        assert_eq!(result.op, Op::Create { task_ids: vec![2] });
+        assert_eq!(result.state.tasks[1].blocked_by, Some(vec![1]));
+    }
+
     #[test]
     fn create_rejects_empty_subject() {
         let result = apply_task_mutation(
@@ -690,7 +907,7 @@ mod tests {
         assert_eq!(result.state.next_id, 2);
         // Immutability: the input state is untouched.
         assert!(state.tasks.is_empty());
-        assert_eq!(result.op, Op::Create { task_id: 1 });
+        assert_eq!(result.op, Op::Create { task_ids: vec![1] });
     }
 
     #[test]

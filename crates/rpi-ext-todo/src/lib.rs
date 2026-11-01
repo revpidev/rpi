@@ -365,7 +365,14 @@ fn render_dispatch(host: &NativeHostCall, message: &Value) -> Value {
         }
         Some("toolResult") => {
             let result = message.get("result").cloned().unwrap_or(Value::Null);
-            view::render_todo_result(&result, &theme, current_i18n())
+            // #175: Pi passes `context.isError` to renderResult; a call it
+            // rejected before execute has no `details.error`.
+            let is_error = message
+                .get("context")
+                .and_then(|context| context.get("isError"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            view::render_todo_result(&result, &theme, current_i18n(), is_error)
         }
         _ => Value::Null,
     }

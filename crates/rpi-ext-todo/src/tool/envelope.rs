@@ -109,17 +109,21 @@ fn format_get_lines(task: &Task, state: &TaskState) -> String {
 /// [`Op`] variant.
 pub fn format_content(op: &Op, state: &TaskState) -> String {
     match op {
-        Op::Create { task_id } => {
-            let Some(task) = state.tasks.iter().find(|task| task.id == *task_id) else {
-                // Defensive — `task_id` always resolves on the success path.
-                return format!("Created #{task_id}");
-            };
-            format!(
-                "Created #{}: {} (pending)",
-                task.id,
-                sanitize_terminal_text(&task.subject)
-            )
-        }
+        Op::Create { task_ids } => task_ids
+            .iter()
+            .map(|task_id| {
+                let Some(task) = state.tasks.iter().find(|task| task.id == *task_id) else {
+                    // Defensive — every id resolves on the success path.
+                    return format!("Created #{task_id}");
+                };
+                format!(
+                    "Created #{}: {} (pending)",
+                    task.id,
+                    sanitize_terminal_text(&task.subject)
+                )
+            })
+            .collect::<Vec<String>>()
+            .join("\n"),
         Op::Update {
             id,
             from_status,
@@ -230,10 +234,22 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
+    fn batch_create_content_lists_every_created_task() {
+        let state = state_with(vec![t(1, "a"), t(2, "b")]);
+        let content = format_content(
+            &Op::Create {
+                task_ids: vec![1, 2],
+            },
+            &state,
+        );
+        assert_eq!(content, "Created #1: a (pending)\nCreated #2: b (pending)");
+    }
+
+    #[test]
     fn create_formats_created_line() {
         let state = state_with(vec![t(1, "alpha")]);
         assert_eq!(
-            format_content(&Op::Create { task_id: 1 }, &state),
+            format_content(&Op::Create { task_ids: vec![1] }, &state),
             "Created #1: alpha (pending)"
         );
     }
@@ -452,7 +468,12 @@ mod tests {
     #[test]
     fn create_defensive_fallback_for_unknown_task_id() {
         assert_eq!(
-            format_content(&Op::Create { task_id: 999 }, &state_with(Vec::new())),
+            format_content(
+                &Op::Create {
+                    task_ids: vec![999]
+                },
+                &state_with(Vec::new())
+            ),
             "Created #999"
         );
     }
@@ -516,7 +537,7 @@ mod tests {
             crate::tool::types::TaskAction::Create,
             &json!({"subject": "alpha"}),
             &state,
-            &Op::Create { task_id: 1 },
+            &Op::Create { task_ids: vec![1] },
         );
         assert_eq!(
             envelope,
@@ -564,7 +585,7 @@ mod tests {
             crate::tool::types::TaskAction::Create,
             &json!({"subject": "alpha"}),
             &state,
-            &Op::Create { task_id: 1 },
+            &Op::Create { task_ids: vec![1] },
         );
         let details = envelope["details"].as_object().unwrap();
         let keys: Vec<&str> = details.keys().map(String::as_str).collect();
@@ -606,7 +627,7 @@ mod tests {
         // The create branch prints the literal "(pending)" even when the
         // stored status differs (upstream hardcodes it; F5).
         assert_eq!(
-            format_content(&Op::Create { task_id: 1 }, &state),
+            format_content(&Op::Create { task_ids: vec![1] }, &state),
             "Created #1: evil (pending)"
         );
         assert_eq!(
