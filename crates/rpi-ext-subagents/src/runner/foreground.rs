@@ -442,13 +442,26 @@ fn evaluate_control(
     }
     state.attention_sticky = false;
     state.activity_state = None;
+    let oldest_pending = state
+        .pending_tool_calls
+        .iter()
+        .min_by_key(|(_, pending)| pending.started_at)
+        .map(|(id, pending)| (id.clone(), pending.clone()));
+    let open_tool = oldest_pending
+        .as_ref()
+        .map(|(_, pending)| pending.tool.as_str())
+        .or(state.current_tool.as_deref());
+    let open_started = oldest_pending
+        .as_ref()
+        .map(|(_, pending)| pending.started_at)
+        .or(state.current_tool_started_at);
     if crate::runner::control::should_emit_open_tool_attention(
         &guard.control,
-        state.current_tool.as_deref(),
-        state.current_tool_started_at,
+        open_tool,
+        open_started,
         now,
     ) {
-        let event = control_event_for(
+        let mut event = control_event_for(
             state,
             guard,
             now,
@@ -460,6 +473,12 @@ fn evaluate_control(
             )),
             None,
         );
+        if let Some((id, pending)) = &oldest_pending {
+            event.current_tool = Some(pending.tool.clone());
+            event.tool_call_id = Some(id.clone());
+            event.current_path = pending.path.clone();
+            event.current_tool_duration_ms = Some(now.saturating_sub(pending.started_at));
+        }
         state.activity_state = Some(crate::runner::control::ActivityState::NeedsAttention);
         if crate::runner::control::claim_notification(
             &guard.control,
@@ -473,7 +492,7 @@ fn evaluate_control(
         state.started_at_ms.unwrap_or(now),
         state.last_activity_at,
         state.turns,
-        state.current_tool.as_deref(),
+        open_tool,
         guard.thinking.as_deref(),
         now,
     )
@@ -1103,7 +1122,12 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             .unwrap_or_else(|| Arc::new(|_text: &str, _details: &Value| {}));
         let ticker_meta = ticker_meta.clone();
         let ticker_context = ticker_context.clone();
-        let mut tick = tokio::time::interval(Duration::from_millis(ACTIVITY_TICK_MS));
+        let tick_ms = if input.stream_sink.is_some() {
+            ACTIVITY_TICK_MS
+        } else {
+            ABORT_POLL_MS
+        };
+        let mut tick = tokio::time::interval(Duration::from_millis(tick_ms));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // intervals fire immediately; upstream waits 1s
         // (the initial frame itself already fired before the
@@ -1740,7 +1764,7 @@ fn synthesize_exit_from_parts(
         output_partial,
         tool_count: state.tool_count,
         turns: state.turns,
-        activity_state: state.activity_state,
+        activity_state: None,
         control_events: state.control_events.clone(),
         last_activity_at: state.last_activity_at,
         duration_ms,
@@ -1921,6 +1945,53 @@ mod terminal_classification_tests {
                 .as_deref()
                 .is_some_and(|summary| summary.contains("edit(src/a.ts)"))
         );
+    }
+
+    #[test]
+    fn open_tool_attention_uses_the_oldest_pending_call_in_a_parallel_batch() {
+        let mut state = crate::runner::events::ChildRunState {
+            started_at_ms: Some(0),
+            last_activity_at: Some(90),
+            turns: 1,
+            current_tool: Some("edit".to_string()),
+            current_tool_call_id: Some("b".to_string()),
+            current_tool_started_at: Some(50),
+            current_path: Some("src/b.ts".to_string()),
+            ..crate::runner::events::ChildRunState::default()
+        };
+        state.pending_tool_calls.insert(
+            "a".to_string(),
+            crate::runner::events::PendingToolCall {
+                tool: "bash".to_string(),
+                path: Some("run.log".to_string()),
+                mutates: false,
+                started_at: 0,
+                args: String::new(),
+            },
+        );
+        state.pending_tool_calls.insert(
+            "b".to_string(),
+            crate::runner::events::PendingToolCall {
+                tool: "edit".to_string(),
+                path: Some("src/b.ts".to_string()),
+                mutates: true,
+                started_at: 50,
+                args: String::new(),
+            },
+        );
+        let open_guard = GuardContext {
+            control: crate::runner::control::ResolvedControlConfig {
+                active_notice_after_ms: 100,
+                ..guard_config()
+            },
+            ..guard()
+        };
+        let events = evaluate_control(&mut state, &open_guard, 120);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].reason.as_deref(), Some("tool_open_threshold"));
+        assert_eq!(events[0].current_tool.as_deref(), Some("bash"));
+        assert_eq!(events[0].tool_call_id.as_deref(), Some("a"));
+        assert_eq!(events[0].current_path.as_deref(), Some("run.log"));
     }
 
     fn test_input() -> ForegroundRunInput {

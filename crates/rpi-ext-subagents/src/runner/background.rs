@@ -982,7 +982,6 @@ pub async fn drive_run(
                     } else {
                         event.to.as_str()
                     });
-                    status["lastActivityAt"] = json!(event.ts);
                     let events = status["controlEvents"].as_array_mut();
                     if let Some(events) = events {
                         events.push(event_json.clone());
@@ -997,7 +996,6 @@ pub async fn drive_run(
                 if let Some(index) = event.index {
                     set_step_field(&control_handle, index as usize, |step| {
                         step["activityState"] = json!(event.to.as_str());
-                        step["lastActivityAt"] = json!(event.ts);
                     });
                 }
                 append_event(

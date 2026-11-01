@@ -343,7 +343,7 @@ pub fn is_mutating_tool(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         static CURSOR_MUTATION: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"^Cursor (?:edit|write)\b").expect("cursor regex"));
+            LazyLock::new(|| Regex::new(r"(?i)^Cursor (?:edit|write)\b").expect("cursor regex"));
         return CURSOR_MUTATION.is_match(title);
     }
     if tool_name != "bash" {

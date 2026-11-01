@@ -907,6 +907,8 @@ pub struct PendingToolCall {
     pub path: Option<String>,
     pub mutates: bool,
     pub started_at: u64,
+    /// Display preview captured at start (for `recentTools` on the call's end).
+    pub args: String,
 }
 
 /// Tool-end facts a runner needs for the mutating failure machine.
@@ -1056,6 +1058,7 @@ impl ChildRunState {
                         path: path.clone(),
                         mutates,
                         started_at: now_ms,
+                        args: super::display::extract_tool_args_preview(&tool_args),
                     },
                 );
                 self.current_tool_call_id = Some(tool_call_id);
@@ -1104,6 +1107,12 @@ impl ChildRunState {
                             .map(|(id, _)| id.clone());
                         key.and_then(|key| self.pending_tool_calls.remove(&key))
                     });
+                let ended_id = id.clone();
+                let ended_is_current = match (&ended_id, &self.current_tool_call_id) {
+                    (Some(ended), Some(current)) => ended == current,
+                    (None, None) => true,
+                    _ => false,
+                };
                 if let Some(pending) = pending {
                     let result_text = value
                         .get("result")
@@ -1114,8 +1123,13 @@ impl ChildRunState {
                                 .map(super::display::extract_text_from_content)
                         })
                         .unwrap_or_default();
+                    self.recent_tools.push(RecentToolEntry {
+                        tool: pending.tool.clone(),
+                        args: pending.args.clone(),
+                        end_ms: now_ms,
+                    });
                     outcome.tool_end = Some(ToolEndSignal {
-                        tool_call_id: id.unwrap_or_default(),
+                        tool_call_id: ended_id.clone().unwrap_or_default(),
                         tool: pending.tool,
                         path: pending.path,
                         mutates: pending.mutates,
@@ -1129,17 +1143,30 @@ impl ChildRunState {
                         duration_ms: value.get("durationMs").and_then(Value::as_u64),
                     });
                 }
-                if let Some(tool) = self.current_tool.take() {
-                    self.recent_tools.push(RecentToolEntry {
-                        tool,
-                        args: self.current_tool_args.take().unwrap_or_default(),
-                        end_ms: now_ms,
-                    });
+                // Parallel tool batches: only re-point the display slot when the
+                // ended call is the one currently shown; other calls stay open.
+                if ended_is_current {
+                    let next = self
+                        .pending_tool_calls
+                        .iter()
+                        .max_by_key(|(_, pending)| pending.started_at)
+                        .map(|(id, pending)| (id.clone(), pending.clone()));
+                    if let Some((id, pending)) = next {
+                        self.current_tool_call_id = Some(id);
+                        self.current_tool = Some(pending.tool);
+                        self.current_tool_args = Some(pending.args);
+                        self.current_tool_mutates = pending.mutates;
+                        self.current_tool_started_at = Some(pending.started_at);
+                        self.current_path = pending.path;
+                    } else {
+                        self.current_tool_call_id = None;
+                        self.current_tool = None;
+                        self.current_tool_args = None;
+                        self.current_tool_mutates = false;
+                        self.current_tool_started_at = None;
+                        self.current_path = None;
+                    }
                 }
-                self.current_tool_call_id = None;
-                self.current_tool_mutates = false;
-                self.current_tool_started_at = None;
-                self.current_path = None;
                 outcome.progress_event = true;
             }
             "message_update" => self.process_message_update(&value),
@@ -1731,6 +1758,64 @@ mod tests {
                 .message()
                 .starts_with("protocol_output_limit: child stdout line exceeded 16 bytes")
         );
+    }
+
+    #[test]
+    fn parallel_tool_end_keeps_the_surviving_open_tool() {
+        let mut state = ChildRunState {
+            mutation_tools: vec!["edit".to_string()],
+            ..ChildRunState::default()
+        };
+        state.process_line(
+            &serde_json::json!({
+                "type": "tool_execution_start",
+                "toolCallId": "a",
+                "toolName": "bash",
+                "args": {"command": "sleep 10"}
+            })
+            .to_string(),
+            10,
+        );
+        state.process_line(
+            &serde_json::json!({
+                "type": "tool_execution_start",
+                "toolCallId": "b",
+                "toolName": "edit",
+                "args": {"path": "src/b.ts"}
+            })
+            .to_string(),
+            11,
+        );
+        assert_eq!(state.current_tool.as_deref(), Some("edit"));
+        // Ending an earlier call must not clear the still-open edit call.
+        state.process_line(
+            &serde_json::json!({
+                "type": "tool_execution_end",
+                "toolCallId": "a",
+                "toolName": "bash",
+                "isError": false
+            })
+            .to_string(),
+            12,
+        );
+        assert_eq!(state.current_tool.as_deref(), Some("edit"));
+        assert_eq!(state.current_tool_call_id.as_deref(), Some("b"));
+        assert_eq!(state.current_path.as_deref(), Some("src/b.ts"));
+        assert_eq!(state.recent_tools.last().unwrap().tool, "bash");
+        assert_eq!(state.pending_tool_calls.len(), 1);
+        // Ending the displayed call clears the slot.
+        state.process_line(
+            &serde_json::json!({
+                "type": "tool_execution_end",
+                "toolCallId": "b",
+                "toolName": "edit",
+                "isError": false
+            })
+            .to_string(),
+            13,
+        );
+        assert_eq!(state.current_tool, None);
+        assert!(state.pending_tool_calls.is_empty());
     }
 
     #[test]
