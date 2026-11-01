@@ -47,7 +47,9 @@ function normalizeArgv(args) {
 	let skipValue = null;
 	for (const arg of args) {
 		if (skipValue) {
-			out.push(skipValue);
+			// An empty `--append-system-prompt ''` is the #2961 suppression
+			// marker, not a prompt file.
+			out.push(arg === "" ? "" : skipValue);
 			skipValue = null;
 			continue;
 		}

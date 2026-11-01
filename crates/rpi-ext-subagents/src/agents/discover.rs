@@ -438,6 +438,11 @@ pub fn read_agent_memory_file(dir: &Path) -> Option<String> {
     if meta.file_type().is_symlink() {
         return None; // unsafe: symlinked memory file
     }
+    // #3027: a named pipe (FIFO) would stall the launch while the prompt is
+    // built; skip anything that is not a regular file, like the symlink case.
+    if !meta.file_type().is_file() {
+        return None;
+    }
     let content = std::fs::read_to_string(&file).ok()?;
     let mut out = String::new();
     for (index, line) in content.lines().enumerate() {
@@ -2019,6 +2024,26 @@ mod tests {
         assert_eq!(agents[0].tools, Some(vec!["read".to_string()]));
         assert_eq!(agents[0].mcp_direct_tools, vec!["srv.tool".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_memory_skips_a_named_pipe() {
+        // #3027: reading a FIFO as MEMORY.md would stall the launch forever.
+        let dir = temp_root("fifo-memory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("MEMORY.md");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !matches!(status, Ok(status) if status.success()) {
+            return; // mkfifo unavailable: skip rather than fail.
+        }
+        assert_eq!(read_agent_memory_file(&dir), None);
+        std::fs::remove_file(&fifo).unwrap();
+        std::fs::write(&fifo, "durable note\n").unwrap();
+        assert_eq!(
+            read_agent_memory_file(&dir).as_deref(),
+            Some("durable note\n")
+        );
     }
 
     #[test]

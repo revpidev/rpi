@@ -28,7 +28,13 @@ fn normalize_argv(args: &[String]) -> Vec<String> {
     let mut skip_value: Option<&str> = None;
     for arg in args {
         if let Some(kind) = skip_value.take() {
-            normalized.push(kind.to_string());
+            // An empty `--append-system-prompt ''` is the #2961 suppression
+            // marker, not a prompt file: keep it visible to the diff.
+            normalized.push(if arg.is_empty() {
+                String::new()
+            } else {
+                kind.to_string()
+            });
             continue;
         }
         match arg.as_str() {

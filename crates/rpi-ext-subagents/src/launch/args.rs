@@ -700,6 +700,13 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
             .into(),
         );
         args.push(prompt_path.to_string_lossy().to_string());
+        if input.system_prompt_mode == "replace" {
+            // #2961: Pi fills an empty append-prompt slot from the operator's
+            // APPEND_SYSTEM.md. Passing an explicit empty source suppresses
+            // that discovery, so replace-mode children never inherit it.
+            args.push("--append-system-prompt".into());
+            args.push(String::new());
+        }
         temp_dir = Some(dir);
     }
 
@@ -1348,6 +1355,16 @@ mod tests {
             .position(|a| a == "--system-prompt")
             .expect("replace mode uses --system-prompt");
         let prompt_path = PathBuf::from(&result.args[prompt_flag + 1]);
+        // #2961: replace-mode children get an explicit empty append source so
+        // the host never fills the slot from the operator's APPEND_SYSTEM.md.
+        assert_eq!(
+            result.args.get(prompt_flag + 2).map(String::as_str),
+            Some("--append-system-prompt")
+        );
+        assert_eq!(
+            result.args.get(prompt_flag + 3).map(String::as_str),
+            Some("")
+        );
         let content = std::fs::read_to_string(&prompt_path).unwrap();
         assert!(content.starts_with("<active_agent name=\"scout\"/>\n\n"));
         assert!(content.contains("\n\nbe brief\n\n"));

@@ -16,6 +16,8 @@
           "--no-skills",
           "--system-prompt",
           "<PROMPT_FILE>",
+          "--append-system-prompt",
+          "",
           "Task: map the codebase"
         ],
         "env": {
@@ -56,6 +58,8 @@
           "--no-skills",
           "--system-prompt",
           "<PROMPT_FILE>",
+          "--append-system-prompt",
+          "",
           "Task: continue from the fork"
         ],
         "env": {
@@ -99,6 +103,8 @@
           "--no-skills",
           "--system-prompt",
           "<PROMPT_FILE>",
+          "--append-system-prompt",
+          "",
           "Task: grep around"
         ],
         "env": {
@@ -182,6 +188,8 @@
           "--no-skills",
           "--system-prompt",
           "<PROMPT_FILE>",
+          "--append-system-prompt",
+          "",
           "Task: use the extension"
         ],
         "env": {
@@ -224,6 +232,8 @@
           "--no-skills",
           "--system-prompt",
           "<PROMPT_FILE>",
+          "--append-system-prompt",
+          "",
           "Task: delegate inside"
         ],
         "env": {

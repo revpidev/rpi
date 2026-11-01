@@ -272,6 +272,8 @@
             "--no-skills",
             "--system-prompt",
             "<PROMPT_FILE>",
+            "--append-system-prompt",
+            "",
             "Task: narrow"
           ],
           "env": {
@@ -334,6 +336,8 @@
             "--no-skills",
             "--system-prompt",
             "<PROMPT_FILE>",
+            "--append-system-prompt",
+            "",
             "Task: deny from defaults"
           ],
           "env": {
