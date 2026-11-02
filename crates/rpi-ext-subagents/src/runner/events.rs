@@ -965,6 +965,9 @@ pub struct ChildRunState {
     pub pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
     pub current_tool_call_id: Option<String>,
     pub current_tool_mutates: bool,
+    /// Whether the currently displayed open-tool call already got its
+    /// `tool_open_threshold` attention event (parallel batches).
+    pub current_tool_attention_emitted: bool,
     /// Agent `mutationTools` (set once by the runner before reading).
     pub mutation_tools: Vec<String>,
     pub mutating_failures: super::guard::MutatingFailureState,
@@ -1008,6 +1011,10 @@ pub struct PendingToolCall {
     pub started_at: u64,
     /// Display preview captured at start (for `recentTools` on the call's end).
     pub args: String,
+    /// The open-tool attention for this call was already evaluated in its
+    /// own threshold window (upstream `attentionEmitted`); a parallel batch
+    /// must not let the oldest call starve every later call.
+    pub attention_emitted: bool,
 }
 
 /// Tool-end facts a runner needs for the mutating failure machine.
@@ -1078,6 +1085,7 @@ impl Default for ChildRunState {
             pending_tool_calls: std::collections::HashMap::new(),
             current_tool_call_id: None,
             current_tool_mutates: false,
+            current_tool_attention_emitted: false,
             mutation_tools: Vec::new(),
             mutating_failures: super::guard::MutatingFailureState::default(),
             active_long_running_notified: false,
@@ -1253,10 +1261,12 @@ impl ChildRunState {
                         mutates,
                         started_at: now_ms,
                         args: super::display::extract_tool_args_preview(&tool_args),
+                        attention_emitted: false,
                     },
                 );
                 self.current_tool_call_id = Some(tool_call_id);
                 self.current_tool_mutates = mutates;
+                self.current_tool_attention_emitted = false;
                 self.current_tool = tool_name;
                 self.current_tool_args = self
                     .current_tool
@@ -1369,6 +1379,7 @@ impl ChildRunState {
                         self.current_tool = Some(pending.tool);
                         self.current_tool_args = Some(pending.args);
                         self.current_tool_mutates = pending.mutates;
+                        self.current_tool_attention_emitted = pending.attention_emitted;
                         self.current_tool_started_at = Some(pending.started_at);
                         self.current_path = pending.path;
                     } else {
@@ -1376,6 +1387,7 @@ impl ChildRunState {
                         self.current_tool = None;
                         self.current_tool_args = None;
                         self.current_tool_mutates = false;
+                        self.current_tool_attention_emitted = false;
                         self.current_tool_started_at = None;
                         self.current_path = None;
                     }

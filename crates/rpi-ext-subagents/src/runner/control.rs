@@ -336,6 +336,7 @@ pub struct ControlEventInput {
     pub tool_call_id: Option<String>,
     pub current_tool_duration_ms: Option<u64>,
     pub current_path: Option<String>,
+    pub elapsed_ms: Option<u64>,
     pub recent_failure_summary: Option<String>,
     pub task_preview: Option<String>,
 }
@@ -347,9 +348,11 @@ pub fn build_control_event(input: ControlEventInput) -> ControlEvent {
         ActivityState::ActiveLongRunning => ControlEventType::ActiveLongRunning,
         ActivityState::NeedsAttention => ControlEventType::NeedsAttention,
     });
-    let elapsed_ms = input
-        .last_activity_at
-        .map(|last| input.ts.saturating_sub(last));
+    let elapsed_ms = input.elapsed_ms.or_else(|| {
+        input
+            .last_activity_at
+            .map(|last| input.ts.saturating_sub(last))
+    });
     let message = input.message.unwrap_or_else(|| match event_type {
         ControlEventType::ActiveLongRunning => {
             format!("{} is still active but long-running", input.agent)
@@ -451,9 +454,14 @@ pub fn claim_notification(
 
 /// `formatControlNudge` (`subagent-control.ts:218-227`).
 pub fn format_control_nudge(event: &ControlEvent) -> String {
+    let scope = event
+        .task_preview
+        .as_deref()
+        .map(|preview| format!(" for {preview}"))
+        .unwrap_or_default();
     if let Some(summary) = &event.recent_failure_summary {
         return format!(
-            "Resolve the recent failure: {summary}. Report the smallest next step or ask for a decision."
+            "Resolve the recent failure{scope}: {summary}. Report the smallest next step or ask for a decision."
         );
     }
     if event.current_tool.is_some() || event.current_path.is_some() {
@@ -471,7 +479,12 @@ pub fn format_control_nudge(event: &ControlEvent) -> String {
         .flatten()
         .collect::<Vec<_>>()
         .join(" at ");
-        return format!("Check {current}. Report the smallest next step or ask for a decision.");
+        return format!(
+            "Check {current}{scope}. Report the smallest next step or ask for a decision."
+        );
+    }
+    if let Some(preview) = &event.task_preview {
+        return format!("Continue {preview}. Report the smallest next step or ask for a decision.");
     }
     "What are you blocked on? Reply with the smallest next step or ask for a decision.".to_string()
 }
@@ -648,5 +661,26 @@ mod tests {
             ..ControlEventInput::default()
         });
         assert!(!format_control_notice(&no_index).contains("index:"));
+    }
+
+    #[test]
+    fn active_long_running_carries_run_elapsed_and_task_scope() {
+        let event = build_control_event(ControlEventInput {
+            event_type: Some(ControlEventType::ActiveLongRunning),
+            to: Some(ActivityState::ActiveLongRunning),
+            run_id: "run-active".to_string(),
+            agent: "worker".to_string(),
+            ts: 300_000,
+            elapsed_ms: Some(240_000),
+            task_preview: Some("Fix the parser regression".to_string()),
+            ..ControlEventInput::default()
+        });
+        assert_eq!(event.elapsed_ms, Some(240_000));
+        let notice = format_control_notice(&event);
+        assert!(notice.contains("elapsed 240s"), "{notice}");
+        assert!(
+            notice.contains("Continue Fix the parser regression."),
+            "{notice}"
+        );
     }
 }

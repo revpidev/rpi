@@ -277,24 +277,10 @@ fn foreground_control_sink(
     let config = config.clone();
     Some(std::sync::Arc::new(
         move |event: &crate::runner::control::ControlEvent| {
-            if config
-                .notify_channels
-                .contains(&ControlNotificationChannel::Async)
-            {
-                let notice = crate::runner::control::format_control_notice(event);
-                let _ = crate::host_call_static(
-                    &calls,
-                    "sendMessage",
-                    json!({
-                        "message": {
-                            "customType": "subagent_control_notice",
-                            "content": notice,
-                            "display": true,
-                        },
-                        "options": { "triggerTurn": true },
-                    }),
-                );
-            }
+            // Upstream `handleSubagentControlNotice` suppresses foreground
+            // `sendMessage` (the blocking tool call cannot show it in time);
+            // foreground users see the live tool/stream/fleet state instead.
+            // The event bus is still available for observers.
             if config
                 .notify_channels
                 .contains(&ControlNotificationChannel::Event)
@@ -651,6 +637,10 @@ fn execute_subagent_tool_inner(
     // resumable record. The child's session filename is host-assigned; the
     // record carries the run root and discovers the file on restore.
     let child_cwd = spec.cwd.clone().unwrap_or_else(|| ctx.base_cwd.clone());
+    let history_context =
+        history_child_context(&ctx, spec.context, spec.context_profile, Some(&agent));
+    let (history_dir, fork_file) =
+        history_child_sessions(&ctx, 0, spec.session_file.is_some(), history_context);
     let history_meta = crate::runner::foreground_history::ForegroundRunMeta {
         run_id: &ctx.run_id,
         session_id: ctx.parent_session_id.as_deref(),
@@ -659,10 +649,8 @@ fn execute_subagent_tool_inner(
         model: spec.model.as_deref(),
         thinking: spec.thinking.as_deref(),
         child_cwd: &child_cwd,
-        session_dir: ctx
-            .session_root_is_derived
-            .then_some(ctx.session_root.as_path()),
-        session_file: spec.session_file.as_deref(),
+        session_dir: history_dir.as_deref(),
+        session_file: spec.session_file.as_deref().or(fork_file.as_deref()),
     };
     crate::runner::foreground_history::persist_running(&history_meta);
     let outcome = match crate::p1::launch_child::run_child(&spec, &agent, &ctx, runtime) {
@@ -793,13 +781,18 @@ fn aggregate_control(results: &[Value]) -> (Option<&'static str>, Vec<Value>) {
                 events.push(event.clone());
             }
         }
-        if let Some(state) = result
-            .get("results")
-            .and_then(Value::as_array)
-            .and_then(|results| results.first())
-            .and_then(|single| single.get("activityState"))
+        let state = result
+            .get("activityState")
             .and_then(Value::as_str)
-        {
+            .or_else(|| {
+                result
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .and_then(|results| results.first())
+                    .and_then(|single| single.get("activityState"))
+                    .and_then(Value::as_str)
+            });
+        if let Some(state) = state {
             match state {
                 "needs_attention" => needs = true,
                 "active_long_running" => long = true,
@@ -1037,6 +1030,57 @@ fn derived_child_session_dir(
     }
 }
 
+/// Effective context policy for a child (mirrors `launch_child.rs`): explicit
+/// step context > top-level > agent default; `context: "profile"` uses the
+/// agent default directly.
+fn history_child_context(
+    ctx: &crate::p1::launch_child::RunCtx,
+    spec_context: Option<discover::ContextMode>,
+    context_profile: bool,
+    agent: Option<&discover::AgentConfig>,
+) -> discover::ContextMode {
+    if context_profile {
+        agent
+            .and_then(|agent| agent.default_context)
+            .unwrap_or(discover::ContextMode::Fresh)
+    } else {
+        spec_context
+            .or(ctx.top_context)
+            .or_else(|| agent.and_then(|agent| agent.default_context))
+            .unwrap_or(discover::ContextMode::Fresh)
+    }
+}
+
+fn fork_session_file(
+    ctx: &crate::p1::launch_child::RunCtx,
+    child_index: u32,
+) -> std::path::PathBuf {
+    if child_index == 0 {
+        ctx.session_root.join("fork.jsonl")
+    } else {
+        ctx.session_root.join(format!("fork-{child_index}.jsonl"))
+    }
+}
+
+/// `(session_dir, exact_session_file)` for a launch-time history record.
+/// Fresh children get their per-child root; fork children additionally carry
+/// the predictable branch file. If a fork degrades to fresh, the file is
+/// absent and restore falls back to scanning the per-child root.
+fn history_child_sessions(
+    ctx: &crate::p1::launch_child::RunCtx,
+    child_index: u32,
+    has_session_file: bool,
+    context: discover::ContextMode,
+) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    if has_session_file {
+        return (None, None);
+    }
+    let dir = derived_child_session_dir(ctx, child_index, false);
+    let fork =
+        (context == discover::ContextMode::Fork).then(|| fork_session_file(ctx, child_index));
+    (dir, fork)
+}
+
 fn agent_thinking_level(agent: &discover::AgentConfig) -> Option<&str> {
     match &agent.thinking {
         discover::ThinkingSpec::Level(level) => Some(level.as_str()),
@@ -1125,13 +1169,21 @@ fn dispatch_tasks(
                 .flatten()
         })
         .collect();
-    let history_session_dirs: Vec<Option<std::path::PathBuf>> = entries
+    let history_sessions: Vec<(Option<std::path::PathBuf>, Option<std::path::PathBuf>)> = entries
         .iter()
-        .map(|entry| {
-            derived_child_session_dir(
+        .enumerate()
+        .map(|(index, entry)| {
+            let context = history_child_context(
+                ctx,
+                entry.spec.context,
+                entry.spec.context_profile,
+                history_agents[index],
+            );
+            history_child_sessions(
                 ctx,
                 entry.spec.child_index,
                 entry.spec.session_file.is_some(),
+                context,
             )
         })
         .collect();
@@ -1157,8 +1209,12 @@ fn dispatch_tasks(
                         .thinking
                         .as_deref()
                         .or_else(|| agent.and_then(agent_thinking_level)),
-                    session_dir: history_session_dirs[index].as_deref(),
-                    session_file: entry.spec.session_file.as_deref(),
+                    session_dir: history_sessions[index].0.as_deref(),
+                    session_file: entry
+                        .spec
+                        .session_file
+                        .as_deref()
+                        .or(history_sessions[index].1.as_deref()),
                 }
             })
             .collect();
@@ -1188,7 +1244,7 @@ fn dispatch_tasks(
                 child_cwd: entry.spec.cwd.as_deref().unwrap_or(&ctx.base_cwd),
                 model: outcome.result.model.as_deref(),
                 thinking: outcome.result.thinking.as_deref(),
-                session_dir: history_session_dirs[index].as_deref(),
+                session_dir: history_sessions[index].0.as_deref(),
                 result: &outcome.result,
             },
         )
@@ -1270,8 +1326,18 @@ fn dispatch_steps(
                 .flatten()
         })
         .collect();
-    let history_session_dirs: Vec<Option<std::path::PathBuf>> = (0..steps.len())
-        .map(|index| derived_child_session_dir(ctx, index as u32, false))
+    let history_sessions: Vec<(Option<std::path::PathBuf>, Option<std::path::PathBuf>)> = steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let context = history_child_context(
+                ctx,
+                step.context,
+                step.context_profile,
+                history_agents[index],
+            );
+            history_child_sessions(ctx, index as u32, false, context)
+        })
         .collect();
     let running_children: Vec<crate::runner::foreground_history::ForegroundRunningChild<'_>> =
         steps
@@ -1293,8 +1359,8 @@ fn dispatch_steps(
                         .thinking
                         .as_deref()
                         .or_else(|| agent.and_then(agent_thinking_level)),
-                    session_dir: history_session_dirs[index].as_deref(),
-                    session_file: None,
+                    session_dir: history_sessions[index].0.as_deref(),
+                    session_file: history_sessions[index].1.as_deref(),
                 }
             })
             .collect();
@@ -1307,27 +1373,66 @@ fn dispatch_steps(
                 return ToolOutcome::mode_error("chain", error);
             }
         };
-    let final_children: Vec<crate::runner::foreground_history::ForegroundFinalChild<'_>> =
-        completed
-            .iter()
-            .chain(failed.iter())
-            .map(|outcome| {
-                let step = steps.get(outcome.index);
-                crate::runner::foreground_history::ForegroundFinalChild {
-                    index: outcome.index,
+    // Persist every declared step, including steps that never launched
+    // because a stop or the usage budget ended the chain. Otherwise the
+    // final record silently drops those steps and status/resume cannot see
+    // them.
+    let mut outcome_by_index = std::collections::BTreeMap::new();
+    for outcome in completed.iter().chain(failed.iter()) {
+        outcome_by_index.insert(outcome.index, outcome);
+    }
+    let mut synthetic_results: Vec<crate::runner::foreground::ForegroundRunResult> = Vec::new();
+    for (index, _) in steps.iter().enumerate() {
+        if !outcome_by_index.contains_key(&index) {
+            let message = "Run ended before this step started.";
+            synthetic_results.push(crate::runner::foreground::ForegroundRunResult {
+                exit_code: -1,
+                error: Some(message.to_string()),
+                final_output: message.to_string(),
+                ..crate::runner::foreground::ForegroundRunResult::default()
+            });
+        }
+    }
+    let mut synthetic = synthetic_results.iter();
+    let final_children: Vec<crate::runner::foreground_history::ForegroundFinalChild<'_>> = steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            if let Some(outcome) = outcome_by_index.get(&index) {
+                return crate::runner::foreground_history::ForegroundFinalChild {
+                    index,
                     agent: outcome.agent.as_str(),
-                    child_cwd: step
-                        .and_then(|step| step.cwd.as_deref())
-                        .unwrap_or(&ctx.base_cwd),
+                    child_cwd: step.cwd.as_deref().unwrap_or(&ctx.base_cwd),
                     model: outcome.result.model.as_deref(),
                     thinking: outcome.result.thinking.as_deref(),
-                    session_dir: history_session_dirs
-                        .get(outcome.index)
-                        .and_then(|dir| dir.as_deref()),
+                    session_dir: history_sessions
+                        .get(index)
+                        .and_then(|session| session.0.as_deref()),
                     result: &outcome.result,
-                }
-            })
-            .collect();
+                };
+            }
+            let result = synthetic
+                .next()
+                .expect("one synthetic result per unrun step");
+            crate::runner::foreground_history::ForegroundFinalChild {
+                index,
+                agent: step.agent_name.as_str(),
+                child_cwd: step.cwd.as_deref().unwrap_or(&ctx.base_cwd),
+                model: step
+                    .model
+                    .as_deref()
+                    .or_else(|| history_agents[index].and_then(|agent| agent.model.as_deref())),
+                thinking: step
+                    .thinking
+                    .as_deref()
+                    .or_else(|| history_agents[index].and_then(agent_thinking_level)),
+                session_dir: history_sessions
+                    .get(index)
+                    .and_then(|session| session.0.as_deref()),
+                result,
+            }
+        })
+        .collect();
     persist_composite_final(ctx, "chain", &final_children);
     record_runs(
         &completed
@@ -1883,5 +1988,25 @@ mod tests {
             ),
             Some(vec![false, true])
         );
+    }
+
+    #[test]
+    fn aggregate_control_reads_flat_child_details_and_prefers_attention() {
+        let results = vec![
+            json!({
+                "index": 0,
+                "activityState": "active_long_running",
+                "controlEvents": [{ "type": "active_long_running" }],
+            }),
+            json!({
+                "index": 1,
+                "activityState": "needs_attention",
+                "controlEvents": [{ "type": "needs_attention" }],
+            }),
+        ];
+        let (activity, events) = aggregate_control(&results);
+        assert_eq!(activity, Some("needs_attention"));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["type"], json!("needs_attention"));
     }
 }

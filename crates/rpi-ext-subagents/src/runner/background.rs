@@ -772,6 +772,7 @@ fn pending_step(
     model: Option<&str>,
     thinking: Option<&str>,
     key: Option<&str>,
+    cwd: Option<&std::path::Path>,
 ) -> Value {
     let mut step = json!({ "agent": agent, "status": "pending" });
     if let Some(key) = key {
@@ -782,6 +783,12 @@ fn pending_step(
     }
     if let Some(thinking) = thinking {
         step["thinking"] = json!(thinking);
+    }
+    // Resume must revive the selected child in its own working directory
+    // (`resolveAsyncResumeTarget` carries `cwd`); the launch spec is the only
+    // place that knows a per-child override before the child starts.
+    if let Some(cwd) = cwd {
+        step["cwd"] = json!(cwd.to_string_lossy());
     }
     step
 }
@@ -826,6 +833,7 @@ pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Ar
                     spec.model.as_deref(),
                     spec.thinking.as_deref(),
                     None,
+                    spec.cwd.as_deref(),
                 )]
             }
             AsyncBody::Tasks { entries, .. } => entries
@@ -836,6 +844,7 @@ pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Ar
                         entry.spec.model.as_deref(),
                         entry.spec.thinking.as_deref(),
                         Some(&entry.key),
+                        entry.spec.cwd.as_deref(),
                     )
                 })
                 .collect(),
@@ -847,6 +856,7 @@ pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Ar
                         step.model.as_deref(),
                         step.thinking.as_deref(),
                         None,
+                        step.cwd.as_deref(),
                     )
                 })
                 .collect(),
@@ -919,6 +929,21 @@ pub(crate) async fn finish_detached_with_result(
     notify: &AsyncNotify,
 ) {
     record_step_result(handle, 0, result);
+    // Detached runs are resumable like async single runs; keep the same
+    // terminal projections (the resume reader depends on `sessionFile`).
+    set_step_field(handle, 0, |step| {
+        if let Some(session_file) = &result.session_file {
+            step["sessionFile"] = json!(session_file.to_string_lossy());
+        }
+        if let Some(paths) = &result.artifact_paths {
+            step["artifactPaths"] = paths.to_json();
+        }
+        if let Some(budget) = &result.tool_budget {
+            step["toolBudget"] = budget.clone();
+            step["toolBudgetBlocked"] =
+                json!(budget.get("outcome") == Some(&json!("hard-blocked")));
+        }
+    });
     let state = if result.exit_code == 0 {
         STATE_COMPLETE
     } else {
@@ -949,35 +974,19 @@ pub async fn drive_run(
     // step index, so the same sink serves the parallel path.
     // The dispatch-owned frame sink never crosses into the background task.
     ctx.frame_sink = None;
+    // Resume needs the run-level working directory as a fallback when the
+    // selected step did not carry a per-child `cwd` override.
+    let base_cwd = ctx.base_cwd.to_string_lossy().to_string();
+    update_status(&handle, |status| {
+        status["cwd"] = json!(base_cwd);
+    });
     if matches!(
         body,
         AsyncBody::Single { .. } | AsyncBody::Steps { .. } | AsyncBody::Tasks { .. }
     ) {
         let status_handle = handle.clone();
         ctx.step_status = Some(std::sync::Arc::new(move |index: u32, activity: &Value| {
-            set_step_field(&status_handle, index as usize, |step| {
-                step["currentTool"] = activity["currentTool"].clone();
-                step["currentPath"] = activity["currentPath"].clone();
-                if let Some(started_at) = activity["currentToolStartedAt"].as_u64() {
-                    step["currentToolStartedAt"] = json!(started_at);
-                }
-                if let Some(turns) = activity["turnCount"].as_u64() {
-                    step["turnCount"] = json!(turns);
-                }
-                if let Some(tools) = activity["toolCount"].as_u64() {
-                    step["toolCount"] = json!(tools);
-                }
-                if let Some(activity_state) = activity["activityState"].as_str() {
-                    step["activityState"] = json!(activity_state);
-                } else if let Some(object) = step.as_object_mut() {
-                    object.remove("activityState");
-                }
-                if let Some(last_activity) = activity["lastActivityAt"].as_u64() {
-                    step["lastActivityAt"] = json!(last_activity);
-                } else if let Some(object) = step.as_object_mut() {
-                    object.remove("lastActivityAt");
-                }
-            });
+            project_step_activity(&status_handle, index, activity);
         }));
         // Long-running-guard notices: status + JSONL + session message +
         // event bus. The foreground guard has already deduped/claimed them.
@@ -1024,26 +1033,44 @@ pub async fn drive_run(
                         step["activityState"] = json!(event.to.as_str());
                     });
                 }
+                let channels: Vec<&str> = control_config
+                    .notify_channels
+                    .iter()
+                    .map(|channel| match channel {
+                        crate::runner::control::ControlNotificationChannel::Event => "event",
+                        crate::runner::control::ControlNotificationChannel::Async => "async",
+                        crate::runner::control::ControlNotificationChannel::Intercom => "intercom",
+                    })
+                    .collect();
+                let notice_text = crate::runner::control::format_control_notice(event);
                 append_event(
                     control_handle.run_dir.as_path(),
                     "subagent.control",
-                    event_json.clone(),
+                    json!({
+                        "event": event_json.clone(),
+                        "channels": channels,
+                        "noticeText": notice_text.clone(),
+                    }),
                 );
                 if let Some(calls) = &control_calls {
                     use crate::runner::control::ControlNotificationChannel;
-                    if control_config
-                        .notify_channels
-                        .contains(&ControlNotificationChannel::Async)
+                    // Only `needs_attention` becomes a parent message;
+                    // upstream `handleSubagentControlNotice` filters
+                    // `active_long_running` (status/fleet still carry it).
+                    if event.to == crate::runner::control::ActivityState::NeedsAttention
+                        && control_config
+                            .notify_channels
+                            .contains(&ControlNotificationChannel::Async)
                     {
-                        let notice = crate::runner::control::format_control_notice(event);
                         let _ = crate::host_call_static(
                             calls,
                             "sendMessage",
                             json!({
                                 "message": {
                                     "customType": "subagent_control_notice",
-                                    "content": notice,
+                                    "content": notice_text,
                                     "display": true,
+                                    "details": { "event": event_json.clone() },
                                 },
                                 "options": { "triggerTurn": true },
                             }),
@@ -1281,6 +1308,15 @@ pub async fn drive_run(
                     crate::p1::chain::ChainStepEvent::Failed { index, error } => {
                         fail_step(&step_handle, index, &error);
                     }
+                    crate::p1::chain::ChainStepEvent::Stopped { index } => {
+                        stop_step(&step_handle, index);
+                    }
+                });
+            let control_handle = handle.clone();
+            let control_probe: crate::p1::parallel::RunControlProbe =
+                std::sync::Arc::new(move || crate::p1::parallel::RunControlFlags {
+                    stop_requested: control_handle.control.stop_requested(),
+                    interrupt_requested: control_handle.control.interrupt_requested(),
                 });
             match crate::p1::chain::run_chain_async_with_step_sink(
                 &steps,
@@ -1288,6 +1324,7 @@ pub async fn drive_run(
                 &ctx,
                 &original_task,
                 Some(on_step),
+                Some(&control_probe),
             )
             .await
             {
@@ -1374,6 +1411,25 @@ fn apply_step_result_details(step: &mut Value, details: &Value) {
     }
 }
 
+/// Settle queued/pending/running steps that never produced a terminal
+/// outcome. Without this, a stop or budget failure leaves `pending` steps in
+/// a terminal run (status readers and resume treat them as live).
+fn settle_unfinished_steps(status: &mut Value, state: &str, error: &str) {
+    let Some(steps) = status["steps"].as_array_mut() else {
+        return;
+    };
+    for step in steps {
+        let current = step["status"].as_str().unwrap_or("");
+        if matches!(current, "pending" | "queued" | "running") {
+            step["status"] = json!(state);
+            step["terminal"] = json!(state);
+            step["exitCode"] = json!(-1);
+            step["error"] = json!(error);
+            clear_step_live_fields(step);
+        }
+    }
+}
+
 fn mark_step(handle: &Arc<AsyncRunHandle>, index: usize, state: &str) {
     update_status(handle, |status| {
         if let Some(steps) = status["steps"].as_array_mut()
@@ -1392,6 +1448,18 @@ fn fail_step(handle: &Arc<AsyncRunHandle>, index: usize, error: &str) {
         step["terminal"] = json!("failed");
         step["exitCode"] = json!(-1);
         step["error"] = json!(error);
+        clear_step_live_fields(step);
+    });
+}
+
+/// Mark a queued chain step stopped when a stop request arrived before its
+/// launch (the child never starts).
+fn stop_step(handle: &Arc<AsyncRunHandle>, index: usize) {
+    set_step_field(handle, index, |step| {
+        step["status"] = json!("stopped");
+        step["terminal"] = json!("stopped");
+        step["exitCode"] = json!(-1);
+        step["error"] = json!("Stopped before completion.");
         clear_step_live_fields(step);
     });
 }
@@ -1454,6 +1522,35 @@ fn set_step_field(handle: &Arc<AsyncRunHandle>, index: usize, mutate: impl FnOnc
             mutate(step);
         }
         sync_aggregate_activity_state(status);
+    });
+}
+
+/// Mirror one foreground activity snapshot into an async/detached step. Shared
+/// by `drive_run` and the detached continuation so both keep status,
+/// `lastActivityAt`, and guard state live.
+pub(crate) fn project_step_activity(handle: &Arc<AsyncRunHandle>, index: u32, activity: &Value) {
+    set_step_field(handle, index as usize, |step| {
+        step["currentTool"] = activity["currentTool"].clone();
+        step["currentPath"] = activity["currentPath"].clone();
+        if let Some(started_at) = activity["currentToolStartedAt"].as_u64() {
+            step["currentToolStartedAt"] = json!(started_at);
+        }
+        if let Some(turns) = activity["turnCount"].as_u64() {
+            step["turnCount"] = json!(turns);
+        }
+        if let Some(tools) = activity["toolCount"].as_u64() {
+            step["toolCount"] = json!(tools);
+        }
+        if let Some(activity_state) = activity["activityState"].as_str() {
+            step["activityState"] = json!(activity_state);
+        } else if let Some(object) = step.as_object_mut() {
+            object.remove("activityState");
+        }
+        if let Some(last_activity) = activity["lastActivityAt"].as_u64() {
+            step["lastActivityAt"] = json!(last_activity);
+        } else if let Some(object) = step.as_object_mut() {
+            object.remove("lastActivityAt");
+        }
     });
 }
 
@@ -1947,6 +2044,14 @@ async fn finish_with_handoff(
             object.remove("activityState");
             object.remove("lastActivityAt");
         }
+        let (unfinished_state, unfinished_error) = if stopped {
+            ("stopped", "Stopped before completion.")
+        } else if state == STATE_COMPLETE {
+            ("failed", "Run finished before this step settled.")
+        } else {
+            ("failed", "Run failed before this step settled.")
+        };
+        settle_unfinished_steps(status, unfinished_state, unfinished_error);
         clear_steps_terminal(status);
     });
     append_event(
@@ -1977,6 +2082,7 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
         // A failed chain leaves its last step with live activity fields
         // (currentTool/activityState); terminal steps must not keep them, or
         // `subagent_wait` can report attention for a dead run.
+        settle_unfinished_steps(status, "failed", error);
         clear_steps_terminal(status);
     });
     append_event(
@@ -2255,6 +2361,7 @@ pub async fn harvest_for_shutdown() {
                     object.remove("activityState");
                     object.remove("lastActivityAt");
                 }
+                settle_unfinished_steps(status, "stopped", "Stopped before completion.");
                 clear_steps_terminal(status);
             }
         });
@@ -2325,6 +2432,11 @@ pub fn reconcile_stale_runs() {
             object.remove("activityState");
             object.remove("lastActivityAt");
         }
+        settle_unfinished_steps(
+            &mut status,
+            "failed",
+            "stale: owning host process exited before the run finished",
+        );
         clear_steps_terminal(&mut status);
         let write_result = crate::artifacts::write_metadata(&status_path, &status);
         append_event(
@@ -3704,18 +3816,21 @@ pub(crate) mod tests {
 
     #[test]
     fn pending_steps_carry_the_launch_model_and_thinking() {
+        let cwd = std::path::Path::new("/tmp/child-cwd");
         let step = pending_step(
             "worker",
             Some("anthropic/claude-5"),
             Some("high"),
             Some("impl"),
+            Some(cwd),
         );
         assert_eq!(step["agent"], json!("worker"));
         assert_eq!(step["status"], json!("pending"));
         assert_eq!(step["key"], json!("impl"));
         assert_eq!(step["model"], json!("anthropic/claude-5"));
         assert_eq!(step["thinking"], json!("high"));
-        let bare = pending_step("scout", None, None, None);
+        assert_eq!(step["cwd"], json!("/tmp/child-cwd"));
+        let bare = pending_step("scout", None, None, None, None);
         assert!(bare.get("model").is_none());
         assert!(bare.get("key").is_none());
     }
@@ -4142,6 +4257,25 @@ pub(crate) mod tests {
             status["steps"][0]["sessionFile"],
             json!("/tmp/settled-child.jsonl")
         );
+        assert_eq!(status["steps"][1]["status"], json!("stopped"));
+        assert_eq!(status["steps"][1]["terminal"], json!("stopped"));
+        assert!(status["steps"][1].get("currentTool").is_none(), "{status}");
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        remove_status_gate(&handle.run_id);
+    }
+
+    #[tokio::test]
+    async fn detached_result_projects_session_file_for_resume() {
+        let handle = gate_test_handle("detached-session");
+        let mut result = foreground_result(0, None);
+        result.session_file = Some(PathBuf::from("/tmp/detached-child.jsonl"));
+        finish_detached_with_result(&handle, &result, &AsyncNotify { calls: None }).await;
+        let status = status_snapshot(&handle);
+        assert_eq!(
+            status["steps"][0]["sessionFile"],
+            json!("/tmp/detached-child.jsonl")
+        );
+        assert_eq!(status["state"], json!(STATE_COMPLETE));
         let _ = std::fs::remove_dir_all(&handle.run_dir);
         remove_status_gate(&handle.run_id);
     }

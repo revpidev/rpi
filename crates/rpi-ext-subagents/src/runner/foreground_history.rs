@@ -63,22 +63,37 @@ fn bounded_output(value: &str) -> String {
 /// Newest `.jsonl` session file under `dir`, if any (the child's session
 /// filename is host-assigned, so the launch record only knows the directory).
 pub(crate) fn newest_session_file(dir: &Path) -> Option<PathBuf> {
+    // A history-provided root is untrusted input: never scan `/`, and never
+    // follow a symlinked directory (which could point at `/` or another
+    // user's tree). The record is normally private, but the read path must
+    // still be fail-closed.
+    if dir.parent().is_none() || !safe_scan_dir(dir) {
+        return None;
+    }
     fn walk(dir: &Path, best: &mut Option<(SystemTime, PathBuf)>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Ok(metadata) = entry.metadata() else {
+            let Ok(file_type) = entry.file_type() else {
                 continue;
             };
-            if metadata.is_dir() {
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 walk(&path, best);
                 continue;
             }
-            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            if !file_type.is_file()
+                || path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+            {
                 continue;
             }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
             let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
             if best.as_ref().is_none_or(|(current, _)| modified > *current) {
                 *best = Some((modified, path));
@@ -88,6 +103,19 @@ pub(crate) fn newest_session_file(dir: &Path) -> Option<PathBuf> {
     let mut best = None;
     walk(dir, &mut best);
     best.map(|(_, path)| path)
+}
+
+fn safe_scan_dir(dir: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    let Ok(canonical) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    canonical.parent().is_some()
 }
 
 fn write_record(run_id: &str, record: &Value) -> Result<(), String> {
@@ -405,7 +433,12 @@ pub fn restore_interrupted() -> usize {
             let session_file = child["sessionFile"]
                 .as_str()
                 .map(PathBuf::from)
-                .filter(|path| path.is_file())
+                .filter(|path| {
+                    path.is_file()
+                        && std::fs::symlink_metadata(path)
+                            .map(|metadata| !metadata.file_type().is_symlink())
+                            .unwrap_or(false)
+                })
                 .or_else(|| {
                     child["sessionDir"]
                         .as_str()

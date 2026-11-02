@@ -475,6 +475,15 @@ pub fn run_parallel(
     concurrency: usize,
     worktree: Option<std::sync::Arc<WorktreePlan>>,
 ) -> Result<Vec<ParallelTaskOutcome>, String> {
+    // Foreground runs have a user-abort probe rather than an async control
+    // handle; surface it as a stop probe so queued tasks do not start after
+    // the user cancels the batch.
+    let control_probe: Option<RunControlProbe> = ctx.abort_probe.clone().map(|probe| {
+        Arc::new(move || RunControlFlags {
+            stop_requested: probe(),
+            interrupt_requested: false,
+        }) as RunControlProbe
+    });
     runtime.block_on(run_parallel_async(
         entries,
         agents,
@@ -482,7 +491,7 @@ pub fn run_parallel(
         concurrency,
         worktree,
         None,
-        None,
+        control_probe,
     ))
 }
 
@@ -536,6 +545,29 @@ pub async fn run_parallel_async(
                         .acquire()
                         .await
                         .expect("global semaphore is never closed");
+                    // A stop request cancels the whole batch: a task that has
+                    // not started yet must not acquire a child after the
+                    // running children have been signalled. Upstream returns
+                    // a stopped step for every queued task instead of
+                    // launching it.
+                    if control_probe
+                        .as_ref()
+                        .is_some_and(|probe| probe().stop_requested)
+                    {
+                        let reason = "Stopped before completion.".to_string();
+                        if let Some(sink) = &on_step {
+                            sink(
+                                index,
+                                ParallelStepEvent::Finished {
+                                    exit_code: -1,
+                                    error: Some(reason.clone()),
+                                    terminal: StepTerminal::Stopped,
+                                    details: None,
+                                },
+                            );
+                        }
+                        return (index, Some(Err(reason)));
+                    }
                     if let Some(sink) = &on_step {
                         sink(index, ParallelStepEvent::Started);
                     }
@@ -885,6 +917,18 @@ pub fn child_details(entry: &TaskEntry, outcome: &ChildOutcome, run_id: &str) ->
     }
     if let Some(truncation) = &result.truncation {
         single["truncation"] = truncation.clone();
+    }
+    // Control state belongs to the child result (upstream `SingleResult`
+    // carries `activityState`/`controlEvents`); the composite details
+    // aggregator reads these fields.
+    if let Some(activity) = result.activity_state {
+        single["activityState"] = json!(activity.as_str());
+    }
+    if let Some(last_activity) = result.last_activity_at {
+        single["lastActivityAt"] = json!(last_activity);
+    }
+    if !result.control_events.is_empty() {
+        single["controlEvents"] = json!(result.control_events);
     }
     single["finalOutput"] = json!(result.final_output);
     if let Some(saved) = &outcome.saved_output_path {
@@ -1253,5 +1297,115 @@ mod tests {
         assert!(text.contains("FAILED (exit code 3): boom"));
         assert!(text.contains("TIMED OUT"));
         assert!(text.contains("EMPTY OUTPUT (no textual response returned)"));
+    }
+
+    #[test]
+    fn child_details_carry_control_state_for_composite_aggregation() {
+        let entries =
+            parse_tasks(&json!([{"key": "a", "agent": "scout", "task": "t"}]), 8).unwrap();
+        let result = crate::runner::foreground::ForegroundRunResult {
+            activity_state: Some(crate::runner::control::ActivityState::NeedsAttention),
+            last_activity_at: Some(42),
+            control_events: vec![crate::runner::control::build_control_event(
+                crate::runner::control::ControlEventInput {
+                    run_id: "run".to_string(),
+                    agent: "scout".to_string(),
+                    to: Some(crate::runner::control::ActivityState::NeedsAttention),
+                    reason: Some("idle".to_string()),
+                    ts: 100,
+                    ..crate::runner::control::ControlEventInput::default()
+                },
+            )],
+            ..crate::runner::foreground::ForegroundRunResult::default()
+        };
+        let outcome = ChildOutcome {
+            agent_name: "scout".to_string(),
+            context: discover::ContextMode::Fresh,
+            result,
+            saved_output_path: None,
+            tool_budget: None,
+            session_name: None,
+            output_mode: "inline",
+        };
+        let details = child_details(&entries[0], &outcome, "run");
+        assert_eq!(details["activityState"], json!("needs_attention"));
+        assert_eq!(details["lastActivityAt"], json!(42));
+        assert_eq!(
+            details["controlEvents"][0]["type"],
+            json!("needs_attention")
+        );
+    }
+
+    #[test]
+    fn stop_probe_skips_queued_tasks_without_spawning() {
+        let agents = crate::agents::builtin::load_builtin_agents(None);
+        let entries = parse_tasks(
+            &json!([
+                {"key": "a", "agent": "scout", "task": "a"},
+                {"key": "b", "agent": "worker", "task": "b"}
+            ]),
+            8,
+        )
+        .unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos())
+            .unwrap_or(0);
+        let base =
+            std::env::temp_dir().join(format!("rpi-parallel-stop-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = RunCtx {
+            settings: Default::default(),
+            config: Default::default(),
+            base_cwd: base.clone(),
+            parent_session: None,
+            parent_session_file: None,
+            parent_session_id: None,
+            parent_model: None,
+            project_trusted: None,
+            registry: Vec::new(),
+            host_builtin_tool_names: Ok(Vec::new()),
+            run_id: "stop-parallel".to_string(),
+            top_model: None,
+            top_thinking: None,
+            top_context: None,
+            top_timeout_ms: None,
+            top_turn_budget: None,
+            top_tool_budget: None,
+            usage_budget: None,
+            artifacts_dir: None,
+            session_root: base.join("sessions"),
+            session_root_is_derived: true,
+            frame_sink: None,
+            step_status: None,
+            control: crate::runner::control::ResolvedControlConfig::default(),
+            control_sink: None,
+            abort_probe: None,
+            detach_ctx: None,
+        };
+        let probe: RunControlProbe = Arc::new(|| RunControlFlags {
+            stop_requested: true,
+            interrupt_requested: false,
+        });
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let outcomes = runtime
+            .block_on(run_parallel_async(
+                &entries,
+                &agents,
+                &ctx,
+                2,
+                None,
+                None,
+                Some(probe),
+            ))
+            .expect("stop is a normal batch outcome");
+        assert_eq!(outcomes.len(), 2);
+        for outcome in &outcomes {
+            assert_eq!(outcome.exit_code, -1);
+            assert_eq!(outcome.error.as_deref(), Some("Stopped before completion."));
+        }
+        // No child session/artifact was created for either skipped task.
+        assert!(!base.join("sessions").exists(), "no child should spawn");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

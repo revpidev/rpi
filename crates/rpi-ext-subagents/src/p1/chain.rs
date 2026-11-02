@@ -490,10 +490,55 @@ pub enum ChainStepEvent {
         index: usize,
         error: String,
     },
+    /// A stop request arrived before this step started; queued steps settle
+    /// without launching a child.
+    Stopped {
+        index: usize,
+    },
 }
 
 /// Sink receiving the per-step chain lifecycle events.
 pub type ChainStepSink = Arc<dyn Fn(ChainStepEvent) + Send + Sync>;
+
+/// Synthesize the terminal outcome for a step that never launched because
+/// the run-wide usage budget was exhausted. Kept in the same shape as a
+/// normal failed `StepOutcome` so history/status/resume see a terminal step.
+fn budget_exhausted_outcome(index: usize, agent: &str, message: &str) -> StepOutcome {
+    terminal_without_launch(index, agent, 1, message)
+}
+
+/// Synthesize a stopped/failed step outcome for a step that never launched.
+fn terminal_without_launch(
+    index: usize,
+    agent: &str,
+    exit_code: i32,
+    message: &str,
+) -> StepOutcome {
+    StepOutcome {
+        result: crate::runner::foreground::ForegroundRunResult {
+            exit_code,
+            error: Some(message.to_string()),
+            final_output: message.to_string(),
+            ..crate::runner::foreground::ForegroundRunResult::default()
+        },
+        index,
+        agent: agent.to_string(),
+        output: message.to_string(),
+        exit_code,
+        error: Some(message.to_string()),
+        thinking: None,
+        timed_out: false,
+        process_signal: None,
+        details: json!({
+            "index": index,
+            "agent": agent,
+            "task": "[prompt redacted]",
+            "exitCode": exit_code,
+            "error": message,
+            "finalOutput": message,
+        }),
+    }
+}
 
 /// Async core (see [`run_chain`]) — direct call from runtime tasks.
 pub async fn run_chain_async(
@@ -502,7 +547,24 @@ pub async fn run_chain_async(
     ctx: &RunCtx,
     original_task: &str,
 ) -> Result<(Vec<StepOutcome>, Option<StepOutcome>), String> {
-    run_chain_async_with_step_sink(steps, agents, ctx, original_task, None).await
+    // Foreground runs carry a user-abort probe; it must stop the chain
+    // between steps just like the async control handle does.
+    let control_probe: Option<crate::p1::parallel::RunControlProbe> =
+        ctx.abort_probe.clone().map(|probe| {
+            std::sync::Arc::new(move || crate::p1::parallel::RunControlFlags {
+                stop_requested: probe(),
+                interrupt_requested: false,
+            }) as crate::p1::parallel::RunControlProbe
+        });
+    run_chain_async_with_step_sink(
+        steps,
+        agents,
+        ctx,
+        original_task,
+        None,
+        control_probe.as_ref(),
+    )
+    .await
 }
 
 /// [`run_chain_async`] with per-step lifecycle notifications.
@@ -512,6 +574,7 @@ pub async fn run_chain_async_with_step_sink(
     ctx: &RunCtx,
     original_task: &str,
     on_step: Option<ChainStepSink>,
+    control_probe: Option<&crate::p1::parallel::RunControlProbe>,
 ) -> Result<(Vec<StepOutcome>, Option<StepOutcome>), String> {
     // #2507 (TE45) + v0.1.6 review round 2 (B2): resolve every step's
     // literal agent name before the chain directory (and its progress file)
@@ -536,6 +599,29 @@ pub async fn run_chain_async_with_step_sink(
     let mut previous_output: Option<String> = None;
     let mut first_progress_seen = false;
     for (index, step) in steps.iter().enumerate() {
+        // A stop request settles the current and every remaining step as
+        // stopped without launching another child (upstream checks
+        // `stopped` before each sequential step, subagent-runner.ts:4451).
+        if control_probe.is_some_and(|probe| probe().stop_requested) {
+            let message = "Stopped before completion.";
+            if let Some(on_step) = &on_step {
+                for (remaining, _) in steps.iter().enumerate().skip(index) {
+                    on_step(ChainStepEvent::Stopped { index: remaining });
+                }
+            }
+            // Report the unlaunched step so the foreground path cannot treat
+            // an aborted chain as success; the async path additionally sees
+            // `handle.control.stop_requested` and finishes as stopped.
+            return Ok((
+                completed,
+                Some(terminal_without_launch(
+                    index,
+                    &steps[index].agent_name,
+                    -1,
+                    message,
+                )),
+            ));
+        }
         let agent = resolved_step_agents[index];
         let default_template = if index == 0 { "{task}" } else { "{previous}" };
         let outputs_snapshot = outputs.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -608,7 +694,26 @@ pub async fn run_chain_async_with_step_sink(
             usage_budget.as_ref(),
             accumulated_cost,
         )? {
-            break;
+            // Upstream marks the run failed/partial at budget exhaustion;
+            // silently breaking here used to report a complete run with
+            // pending steps. Settle this step and every remaining step with
+            // the budget diagnostic.
+            let message = "Usage budget exhausted.".to_string();
+            if let Some(on_step) = &on_step {
+                for (remaining, remaining_step) in steps.iter().enumerate().skip(index) {
+                    on_step(ChainStepEvent::Finished {
+                        outcome: Box::new(budget_exhausted_outcome(
+                            remaining,
+                            &remaining_step.agent_name,
+                            &message,
+                        )),
+                    });
+                }
+            }
+            return Ok((
+                completed,
+                Some(budget_exhausted_outcome(index, &step.agent_name, &message)),
+            ));
         }
         if let Some(on_step) = &on_step {
             on_step(ChainStepEvent::Started { index });
@@ -692,6 +797,15 @@ pub async fn run_chain_async_with_step_sink(
         }
         if let Some(paths) = &outcome.result.artifact_paths {
             details["artifactPaths"] = paths.to_json();
+        }
+        if let Some(activity) = outcome.result.activity_state {
+            details["activityState"] = json!(activity.as_str());
+        }
+        if let Some(last_activity) = outcome.result.last_activity_at {
+            details["lastActivityAt"] = json!(last_activity);
+        }
+        if !outcome.result.control_events.is_empty() {
+            details["controlEvents"] = json!(outcome.result.control_events);
         }
         details["finalOutput"] = json!(outcome.result.final_output);
         if let Some(saved) = &outcome.saved_output_path {
@@ -950,6 +1064,134 @@ mod tests {
             !chain_dir.exists(),
             "failed preflight left {}",
             chain_dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stop_probe_prevents_the_next_chain_step_without_spawning() {
+        let agents = crate::agents::builtin::load_builtin_agents(None);
+        let steps = parse_steps(&json!([
+            {"agent": "scout", "task": "scan"},
+            {"agent": "worker", "task": "ship"}
+        ]))
+        .unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos())
+            .unwrap_or(0);
+        let base =
+            std::env::temp_dir().join(format!("rpi-chain-stop-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = RunCtx {
+            settings: Default::default(),
+            config: Default::default(),
+            base_cwd: base.clone(),
+            parent_session: None,
+            parent_session_file: None,
+            parent_session_id: None,
+            parent_model: None,
+            project_trusted: None,
+            registry: Vec::new(),
+            host_builtin_tool_names: Ok(Vec::new()),
+            run_id: "stop1".to_string(),
+            top_model: None,
+            top_thinking: None,
+            top_context: None,
+            top_timeout_ms: None,
+            top_turn_budget: None,
+            top_tool_budget: None,
+            usage_budget: None,
+            artifacts_dir: None,
+            session_root: base.join("sessions"),
+            session_root_is_derived: true,
+            frame_sink: None,
+            step_status: None,
+            control: crate::runner::control::ResolvedControlConfig::default(),
+            control_sink: None,
+            abort_probe: None,
+            detach_ctx: None,
+        };
+        let probe: crate::p1::parallel::RunControlProbe =
+            std::sync::Arc::new(|| crate::p1::parallel::RunControlFlags {
+                stop_requested: true,
+                interrupt_requested: false,
+            });
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (completed, failed) = runtime
+            .block_on(run_chain_async_with_step_sink(
+                &steps,
+                &agents,
+                &ctx,
+                "task",
+                None,
+                Some(&probe),
+            ))
+            .expect("stop is a normal terminal outcome");
+        assert!(completed.is_empty());
+        let failed = failed.expect("unlaunched step is reported");
+        assert_eq!(failed.exit_code, -1);
+        assert_eq!(failed.error.as_deref(), Some("Stopped before completion."));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn usage_budget_exhaustion_reports_a_failed_chain_without_spawning() {
+        let agents = crate::agents::builtin::load_builtin_agents(None);
+        let steps = parse_steps(&json!([
+            {"agent": "scout", "task": "scan"},
+            {"agent": "worker", "task": "ship"}
+        ]))
+        .unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos())
+            .unwrap_or(0);
+        let base =
+            std::env::temp_dir().join(format!("rpi-chain-budget-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = RunCtx {
+            settings: Default::default(),
+            config: Default::default(),
+            base_cwd: base.clone(),
+            parent_session: None,
+            parent_session_file: None,
+            parent_session_id: None,
+            parent_model: None,
+            project_trusted: None,
+            registry: Vec::new(),
+            host_builtin_tool_names: Ok(Vec::new()),
+            run_id: "budget1".to_string(),
+            top_model: None,
+            top_thinking: None,
+            top_context: None,
+            top_timeout_ms: None,
+            top_turn_budget: None,
+            top_tool_budget: None,
+            usage_budget: Some(json!({"costUsd": {"hard": 0.0}})),
+            artifacts_dir: None,
+            session_root: base.join("sessions"),
+            session_root_is_derived: true,
+            frame_sink: None,
+            step_status: None,
+            control: crate::runner::control::ResolvedControlConfig::default(),
+            control_sink: None,
+            abort_probe: None,
+            detach_ctx: None,
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (completed, failed) = runtime
+            .block_on(run_chain_async_with_step_sink(
+                &steps, &agents, &ctx, "task", None, None,
+            ))
+            .expect("budget exhaustion is a terminal outcome");
+        assert!(completed.is_empty());
+        let failed = failed.expect("budget-exhausted step is reported");
+        assert_eq!(failed.exit_code, 1);
+        assert_eq!(failed.error.as_deref(), Some("Usage budget exhausted."));
+        assert!(
+            !base.join("sessions").exists(),
+            "no child may spawn after budget exhaustion"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

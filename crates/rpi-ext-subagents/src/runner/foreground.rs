@@ -466,6 +466,11 @@ fn control_event_for(
             .current_tool_started_at
             .map(|started| now.saturating_sub(started)),
         current_path: state.current_path.clone(),
+        elapsed_ms: matches!(
+            reason,
+            "time_threshold" | "turn_threshold" | "token_threshold"
+        )
+        .then(|| now.saturating_sub(state.started_at_ms.unwrap_or(now))),
         task_preview: guard.task_preview.clone(),
         recent_failure_summary,
         ..crate::runner::control::ControlEventInput::default()
@@ -505,33 +510,45 @@ fn evaluate_control(
         state.attention_sticky = false;
         return events;
     }
-    if state.attention_sticky && state.last_activity_at == state.attention_activity_at {
-        // A failure/idle notice stays visible until the child produces new
-        // activity (upstream keeps `progress.activityState` across ticks).
+    // A failure/idle notice stays visible until the child produces new
+    // activity (upstream keeps `progress.activityState` across ticks), but a
+    // second open tool that crosses its own threshold while the latch is set
+    // must still get its event.
+    let attention_sticky =
+        state.attention_sticky && state.last_activity_at == state.attention_activity_at;
+    if attention_sticky {
         state.activity_state = Some(crate::runner::control::ActivityState::NeedsAttention);
-        return events;
+    } else {
+        state.attention_sticky = false;
+        state.activity_state = None;
     }
-    state.attention_sticky = false;
-    state.activity_state = None;
-    let oldest_pending = state
+    // Pick the oldest open call that has not had its own threshold notice
+    // yet. Filtering before claiming is what lets a second/third parallel
+    // call get attention while the first remains open (upstream
+    // `attentionEmitted`, execution.ts:884-886).
+    let pending_candidate = state
         .pending_tool_calls
         .iter()
+        .filter(|(_, pending)| !pending.attention_emitted)
         .min_by_key(|(_, pending)| pending.started_at)
         .map(|(id, pending)| (id.clone(), pending.clone()));
-    let open_tool = oldest_pending
+    let open_tool = pending_candidate
         .as_ref()
         .map(|(_, pending)| pending.tool.as_str())
         .or(state.current_tool.as_deref());
-    let open_started = oldest_pending
+    let open_started = pending_candidate
         .as_ref()
         .map(|(_, pending)| pending.started_at)
         .or(state.current_tool_started_at);
-    if crate::runner::control::should_emit_open_tool_attention(
-        &guard.control,
-        open_tool,
-        open_started,
-        now,
-    ) {
+    let can_emit_open_tool = pending_candidate.is_some() || !state.current_tool_attention_emitted;
+    if can_emit_open_tool
+        && crate::runner::control::should_emit_open_tool_attention(
+            &guard.control,
+            open_tool,
+            open_started,
+            now,
+        )
+    {
         let mut event = control_event_for(
             state,
             guard,
@@ -544,11 +561,20 @@ fn evaluate_control(
             )),
             None,
         );
-        if let Some((id, pending)) = &oldest_pending {
+        if let Some((id, pending)) = &pending_candidate {
             event.current_tool = Some(pending.tool.clone());
             event.tool_call_id = Some(id.clone());
             event.current_path = pending.path.clone();
             event.current_tool_duration_ms = Some(now.saturating_sub(pending.started_at));
+        }
+        // Mark before the notification claim: a `notifyOn` filter must not
+        // make the same call eligible forever and starve later calls.
+        if let Some((id, _)) = &pending_candidate {
+            if let Some(pending) = state.pending_tool_calls.get_mut(id) {
+                pending.attention_emitted = true;
+            }
+        } else {
+            state.current_tool_attention_emitted = true;
         }
         state.activity_state = Some(crate::runner::control::ActivityState::NeedsAttention);
         if crate::runner::control::claim_notification(
@@ -558,16 +584,17 @@ fn evaluate_control(
         ) {
             record_control_event(state, event, &mut events);
         }
-    } else if crate::runner::control::derive_activity_state(
-        &guard.control,
-        state.started_at_ms.unwrap_or(now),
-        state.last_activity_at,
-        state.turns,
-        open_tool,
-        guard.thinking.as_deref(),
-        now,
-    )
-    .is_some()
+    } else if !attention_sticky
+        && crate::runner::control::derive_activity_state(
+            &guard.control,
+            state.started_at_ms.unwrap_or(now),
+            state.last_activity_at,
+            state.turns,
+            open_tool,
+            guard.thinking.as_deref(),
+            now,
+        )
+        .is_some()
     {
         let event = control_event_for(
             state,
@@ -586,7 +613,8 @@ fn evaluate_control(
         ) {
             record_control_event(state, event, &mut events);
         }
-    } else if !state.active_long_running_notified
+    } else if !attention_sticky
+        && !state.active_long_running_notified
         && let Some(trigger) = crate::runner::guard::next_long_running_trigger(
             &guard.control,
             &crate::runner::guard::LongRunningMetrics {
@@ -615,7 +643,7 @@ fn evaluate_control(
         ) {
             record_control_event(state, event, &mut events);
         }
-    } else if state.active_long_running_notified {
+    } else if !attention_sticky && state.active_long_running_notified {
         state.activity_state = Some(crate::runner::control::ActivityState::ActiveLongRunning);
     }
     events
@@ -1142,14 +1170,12 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                             })
                         });
                         let frame = frame_sink.as_ref().map(|_| {
-                            let frame = streaming::single_update_details(
+                            streaming::single_update_details(
                                 &state,
                                 &stream_meta,
                                 &context_label,
                                 now_ms,
-                            );
-                            state.pending_control_events.clear();
-                            frame
+                            )
                         });
                         (outcome, status_fields, frame, control_events)
                     }
@@ -1191,6 +1217,12 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                     if must_push || heartbeat {
                         sink(&text, &details);
                         last_pushed = Some((signature, std::time::Instant::now()));
+                        // Only a delivered frame may drain the pending control
+                        // events; a signature-throttled frame must not lose
+                        // them from the next emitted snapshot.
+                        if let Ok(mut state) = stdout_state.lock() {
+                            state.pending_control_events.clear();
+                        }
                     }
                 }
             },
@@ -1359,14 +1391,12 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                             })
                         });
                         let frame = ticker_has_frame.then(|| {
-                            let frame = streaming::single_update_details(
+                            streaming::single_update_details(
                                 &state,
                                 &ticker_meta,
                                 &ticker_context,
                                 now_ms,
-                            );
-                            state.pending_control_events.clear();
-                            frame
+                            )
                         });
                         (frame, control_events, status_fields)
                     };
@@ -1382,6 +1412,9 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                     }
                     if let Some((text, details)) = frame {
                         ticker_sink(&text, &details);
+                        if let Ok(mut state) = ticker_state.lock() {
+                            state.pending_control_events.clear();
+                        }
                     }
                 }
             }
@@ -1455,7 +1488,17 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             }
             let mut continuation_input = input.clone();
             continuation_input.stream_sink = None;
-            continuation_input.step_status = None;
+            // Keep the detached run's status/activity projection live while
+            // the continuation owns the child (upstream keeps the interval).
+            let status_handle = handle.clone();
+            continuation_input.step_status =
+                Some(std::sync::Arc::new(move |index: u32, activity: &Value| {
+                    crate::runner::background::project_step_activity(
+                        &status_handle,
+                        index,
+                        activity,
+                    );
+                }));
             continuation_input.abort_probe = None;
             let notify = crate::runner::background::AsyncNotify {
                 calls: Some(detach_ctx.calls),
@@ -1627,6 +1670,23 @@ async fn finish_detached_child(
     slot: Option<PathBuf>,
     ledger_session: String,
 ) {
+    // The detached continuation keeps evaluating the long-running guard on
+    // the same cadence as a foreground child (upstream keeps the interval).
+    let guard = GuardContext {
+        control: input.control.clone(),
+        run_id: input.run_id.clone(),
+        agent: input.agent_name.clone(),
+        index: input.child_index,
+        thinking: input.thinking.clone(),
+        tool_budget: input
+            .tool_budget_env
+            .as_deref()
+            .and_then(crate::p1::tool_budget::budget_from_value),
+        task_preview: (!input.task.is_empty()).then(|| input.task.clone()),
+    };
+    let detached_step_status = input.step_status.clone();
+    let detached_control_sink = input.control_sink.clone();
+    let eval_state = state.clone();
     // Cooperative stop through `subagent({action:"stop"})`: the registered
     // handle's control flag, drained on the abort-poll cadence (TERM →
     // grace → KILL, the shutdown ladder shape).
@@ -1641,6 +1701,34 @@ async fn finish_detached_child(
             tokio::select! {
                 status = child_guard.wait() => break status,
                 _ = tokio::time::sleep(Duration::from_millis(ABORT_POLL_MS)) => {
+                    let now = artifacts::now_millis();
+                    let (events, fields) = {
+                        let mut state = eval_state.lock().unwrap_or_else(|e| e.into_inner());
+                        let events = evaluate_control(&mut state, &guard, now);
+                        let fields = detached_step_status.as_ref().map(|_| {
+                            json!({
+                                "currentTool": state.current_tool.clone(),
+                                "currentToolArgs": state.current_tool_args.clone(),
+                                "currentToolStartedAt": state.current_tool_started_at,
+                                "currentPath": state.current_path.clone(),
+                                "turnCount": state.turns,
+                                "toolCount": state.tool_count,
+                                "activityState": state.activity_state.map(|state| state.as_str()),
+                                "lastActivityAt": state.last_activity_at,
+                            })
+                        });
+                        (events, fields)
+                    };
+                    for event in &events {
+                        if let Some(sink) = &detached_control_sink {
+                            sink(event);
+                        }
+                    }
+                    if let Some(fields) = &fields
+                        && let Some(status) = &detached_step_status
+                    {
+                        status(input.child_index, fields);
+                    }
                     continue;
                 }
             }
@@ -2335,6 +2423,7 @@ mod terminal_classification_tests {
                 mutates: false,
                 started_at: 0,
                 args: String::new(),
+                attention_emitted: false,
             },
         );
         state.pending_tool_calls.insert(
@@ -2345,6 +2434,7 @@ mod terminal_classification_tests {
                 mutates: true,
                 started_at: 50,
                 args: String::new(),
+                attention_emitted: false,
             },
         );
         let open_guard = GuardContext {
@@ -2360,6 +2450,16 @@ mod terminal_classification_tests {
         assert_eq!(events[0].current_tool.as_deref(), Some("bash"));
         assert_eq!(events[0].tool_call_id.as_deref(), Some("a"));
         assert_eq!(events[0].current_path.as_deref(), Some("run.log"));
+
+        // The first call was notified, but the second open call must still
+        // get its own event once it crosses the threshold; the oldest call
+        // must not starve it (the attention latch is still set here).
+        let events = evaluate_control(&mut state, &open_guard, 170);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].reason.as_deref(), Some("tool_open_threshold"));
+        assert_eq!(events[0].current_tool.as_deref(), Some("edit"));
+        assert_eq!(events[0].tool_call_id.as_deref(), Some("b"));
+        assert!(state.pending_tool_calls["b"].attention_emitted);
     }
 
     fn test_input() -> ForegroundRunInput {

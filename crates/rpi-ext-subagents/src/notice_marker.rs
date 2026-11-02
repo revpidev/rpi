@@ -189,6 +189,12 @@ mod tests {
         let once = handle_context_with_system(&event);
         let twice = handle_context_with_system(&once);
         assert_eq!(once, twice);
+        // Repeated requests must serialize to identical bytes; marking is
+        // in-place and never reorders or re-wraps the message list.
+        assert_eq!(
+            serde_json::to_vec(&once).unwrap(),
+            serde_json::to_vec(&twice).unwrap()
+        );
         // Quoted marker text inside a body does not count as a wrapper.
         let event = json!({
             "messages": [{"role":"custom","customType":"subagent-notify",

@@ -529,24 +529,22 @@ fn resume_from_foreground_record(
         .expect("child_for_resume requires sessionFile");
     let task =
         task.unwrap_or_else(|| "Continue the interrupted task from this session.".to_string());
-    let mut params = serde_json::json!({
-        "agent": agent,
-        "task": task,
-        "sessionFile": session_file,
-        "async": true,
-    });
-    if let Some(cwd) = record["cwd"].as_str().filter(|cwd| !cwd.is_empty()) {
-        params["cwd"] = json!(cwd);
-    }
-    if let Some(model) = child["model"].as_str().filter(|model| !model.is_empty()) {
-        params["model"] = json!(model);
-    }
-    if let Some(thinking) = child["thinking"]
-        .as_str()
-        .filter(|thinking| !thinking.is_empty())
-    {
-        params["thinking"] = json!(thinking);
-    }
+    // The selected child's own cwd/model/thinking are authoritative; the
+    // record-level cwd is only a fallback for records written before those
+    // fields existed.
+    let params = revived_run_params(
+        &agent,
+        &task,
+        session_file,
+        child["cwd"]
+            .as_str()
+            .filter(|cwd| !cwd.is_empty())
+            .or_else(|| record["cwd"].as_str().filter(|cwd| !cwd.is_empty())),
+        child["model"].as_str().filter(|model| !model.is_empty()),
+        child["thinking"]
+            .as_str()
+            .filter(|thinking| !thinking.is_empty()),
+    );
     let result = crate::tool::execute_subagent_tool(&params, host, settings, config, runtime, None);
     ToolOutcome {
         text: result["content"][0]["text"]
@@ -556,6 +554,59 @@ fn resume_from_foreground_record(
         details: result.get("details").cloned().unwrap_or(Value::Null),
         is_error: result["isError"].as_bool().unwrap_or(false),
     }
+}
+
+/// Build the async revive request. The selected child controls the working
+/// directory and model/thinking, matching upstream `resolveAsyncResumeTarget`
+/// (`cwd`/`model`/`thinking` are carried into `executeAsyncSingle`).
+fn revived_run_params(
+    agent: &str,
+    task: &str,
+    session_file: &str,
+    cwd: Option<&str>,
+    model: Option<&str>,
+    thinking: Option<&str>,
+) -> Value {
+    let mut params = serde_json::json!({
+        "agent": agent,
+        "task": task,
+        "sessionFile": session_file,
+        "async": true,
+    });
+    if let Some(cwd) = cwd.filter(|value| !value.is_empty()) {
+        params["cwd"] = json!(cwd);
+    }
+    if let Some(model) = model.filter(|value| !value.is_empty()) {
+        params["model"] = json!(model);
+    }
+    if let Some(thinking) = thinking.filter(|value| !value.is_empty()) {
+        params["thinking"] = json!(thinking);
+    }
+    params
+}
+
+/// Parse an integer child index from JSON. Integral floats are accepted like
+/// `Number.isInteger(1.0)`; fractional/non-number values are not.
+fn parse_requested_index(value: &Value) -> Result<i64, ()> {
+    if let Some(value) = value.as_i64() {
+        return Ok(value);
+    }
+    if let Some(value) = value.as_u64() {
+        return Ok(i64::try_from(value).unwrap_or(i64::MAX));
+    }
+    if let Some(value) = value.as_f64()
+        && value.is_finite()
+        && value.fract() == 0.0
+    {
+        if value >= i64::MAX as f64 {
+            return Ok(i64::MAX);
+        }
+        if value <= i64::MIN as f64 {
+            return Ok(i64::MIN);
+        }
+        return Ok(value as i64);
+    }
+    Err(())
 }
 
 /// Resolve the async-resume child index (`resolveAsyncResumeTarget`,
@@ -572,12 +623,12 @@ fn resolve_async_resume_index(
             "Async run '{run_id}' has {step_count} children. Provide index to choose one."
         )),
         None => Ok(0),
-        Some(value) => match value.as_i64() {
-            Some(value) if value >= 0 && (value as usize) < step_count => Ok(value as usize),
-            Some(value) => Err(format!(
+        Some(value) => match parse_requested_index(value) {
+            Ok(value) if value >= 0 && (value as usize) < step_count => Ok(value as usize),
+            Ok(value) => Err(format!(
                 "Async run '{run_id}' has {step_count} children. Index {value} is out of range."
             )),
-            None => Err(format!("Async run '{run_id}' index must be an integer.")),
+            Err(()) => Err(format!("Async run '{run_id}' index must be an integer.")),
         },
     }
 }
@@ -743,7 +794,15 @@ fn handle_management_action_inner(
                 {
                     continue;
                 }
-                let resume = if resumable_runs.contains(&run.run_id.as_str()) {
+                // Multi-child records are rendered as per-child lines below
+                // (with the required `index`), so the run-level line must not
+                // advertise an unindexed resume.
+                let multi_child = persisted
+                    .iter()
+                    .find(|record| record["runId"].as_str() == Some(run.run_id.as_str()))
+                    .and_then(|record| record["children"].as_array())
+                    .is_some_and(|children| children.len() > 1);
+                let resume = if resumable_runs.contains(&run.run_id.as_str()) && !multi_child {
                     format!(" · resume {}", run.run_id)
                 } else {
                     String::new()
@@ -762,27 +821,41 @@ fn handle_management_action_inner(
             }
             for record in persisted.iter().take(10) {
                 let run_id = record["runId"].as_str().unwrap_or("?");
-                if memory.runs.iter().any(|run| run.run_id == run_id) {
+                let in_memory = memory.runs.iter().any(|run| run.run_id == run_id);
+                let Some(children) = record["children"].as_array() else {
+                    continue;
+                };
+                if in_memory && children.len() <= 1 {
                     continue;
                 }
-                let child = &record["children"][0];
-                let state = child["status"].as_str().unwrap_or("?");
-                let resume = if resumable_runs.contains(&run_id) {
-                    format!(" · resume {run_id}")
-                } else {
-                    String::new()
-                };
-                lines.push(format!(
-                    "- {} agent={} state={}{}{}",
-                    run_id,
-                    child["agent"].as_str().unwrap_or("?"),
-                    state,
-                    child["error"]
+                for (index, child) in children.iter().enumerate() {
+                    let state = child["status"].as_str().unwrap_or("?");
+                    // A multi-child record needs the index to be resumable
+                    // (`child_for_resume` rejects an unindexed composite).
+                    let resumable = child["sessionFile"]
                         .as_str()
-                        .map(|error| format!(" error={error}"))
-                        .unwrap_or_default(),
-                    resume
-                ));
+                        .is_some_and(|path| path.ends_with(".jsonl") && Path::new(path).is_file());
+                    let resume = if resumable {
+                        if children.len() > 1 {
+                            format!(" · resume {run_id} index {index}")
+                        } else {
+                            format!(" · resume {run_id}")
+                        }
+                    } else {
+                        String::new()
+                    };
+                    lines.push(format!(
+                        "- {} agent={} state={}{}{}",
+                        run_id,
+                        child["agent"].as_str().unwrap_or("?"),
+                        state,
+                        child["error"]
+                            .as_str()
+                            .map(|error| format!(" error={error}"))
+                            .unwrap_or_default(),
+                        resume
+                    ));
+                }
             }
             lines.push(String::new());
             lines.push("Background runs:".to_string());
@@ -1019,16 +1092,16 @@ fn handle_management_action_inner(
                 Ok(Some(record)) => {
                     let resume_index = match resume_index {
                         None => None,
-                        Some(value) => match value.as_i64() {
-                            Some(value) if value >= 0 => Some(value as usize),
-                            Some(value) => {
+                        Some(value) => match parse_requested_index(value) {
+                            Ok(value) if value >= 0 => Some(value as usize),
+                            Ok(value) => {
                                 return ToolOutcome::error(format!(
                                     "Foreground run '{}' has {} children. Index {value} is out of range.",
                                     record["runId"].as_str().unwrap_or(&id),
                                     record["children"].as_array().map(Vec::len).unwrap_or(0)
                                 ));
                             }
-                            None => {
+                            Err(()) => {
                                 return ToolOutcome::error(format!(
                                     "Foreground run '{}' index must be an integer.",
                                     record["runId"].as_str().unwrap_or(&id)
@@ -1116,13 +1189,23 @@ fn handle_management_action_inner(
             let agent_name = selected["agent"].as_str().unwrap_or("worker").to_string();
             let task = task
                 .unwrap_or_else(|| "Continue the interrupted task from this session.".to_string());
-            // New async run reviving the old session file.
-            let params = serde_json::json!({
-                "agent": agent_name,
-                "task": task,
-                "sessionFile": session_file,
-                "async": true,
-            });
+            // New async run reviving the old session file in the selected
+            // child's cwd/model/thinking (upstream `resolveAsyncResumeTarget`);
+            // the run-level cwd covers single-agent records written before
+            // the per-step field existed.
+            let params = revived_run_params(
+                &agent_name,
+                &task,
+                &session_file,
+                selected["cwd"]
+                    .as_str()
+                    .filter(|cwd| !cwd.is_empty())
+                    .or_else(|| status["cwd"].as_str().filter(|cwd| !cwd.is_empty())),
+                selected["model"].as_str().filter(|model| !model.is_empty()),
+                selected["thinking"]
+                    .as_str()
+                    .filter(|thinking| !thinking.is_empty()),
+            );
             let host_cwd = host.cwd();
             let settings = match crate::config::read_settings_pair_trusted(
                 &host_cwd,
@@ -3023,6 +3106,43 @@ mod tests {
         cleanup_run(&run_id);
     }
 
+    /// TE51 re-review P1: revive requests carry the selected child's
+    /// cwd/model/thinking, not only agent/task/sessionFile.
+    #[test]
+    fn revived_run_params_carry_selected_child_context() {
+        let params = revived_run_params(
+            "worker",
+            "continue",
+            "/tmp/child.jsonl",
+            Some("/tmp/child-cwd"),
+            Some("anthropic/model"),
+            Some("high"),
+        );
+        assert_eq!(params["agent"], json!("worker"));
+        assert_eq!(params["task"], json!("continue"));
+        assert_eq!(params["sessionFile"], json!("/tmp/child.jsonl"));
+        assert_eq!(params["cwd"], json!("/tmp/child-cwd"));
+        assert_eq!(params["model"], json!("anthropic/model"));
+        assert_eq!(params["thinking"], json!("high"));
+        assert_eq!(params["async"], json!(true));
+        let bare = revived_run_params("scout", "x", "/tmp/s.jsonl", None, None, None);
+        assert!(bare.get("cwd").is_none());
+        assert!(bare.get("model").is_none());
+        assert!(bare.get("thinking").is_none());
+    }
+
+    /// Integral JSON floats are accepted like `Number.isInteger(1.0)`;
+    /// fractional/non-number values are rejected.
+    #[test]
+    fn requested_index_accepts_integral_floats() {
+        assert_eq!(parse_requested_index(&json!(1)).unwrap(), 1);
+        assert_eq!(parse_requested_index(&json!(1.0)).unwrap(), 1);
+        assert_eq!(parse_requested_index(&json!(-1.0)).unwrap(), -1);
+        assert!(parse_requested_index(&json!(1.5)).is_err());
+        assert!(parse_requested_index(&json!("1")).is_err());
+        assert!(parse_requested_index(&json!(null)).is_err());
+    }
+
     /// TE51 re-review P2: async resume resolution matches
     /// `resolveAsyncResumeTarget` — explicit index for multi-child runs,
     /// range/integer validation, single-child default 0.
@@ -3036,6 +3156,10 @@ mod tests {
         );
         assert_eq!(
             resolve_async_resume_index("r", steps, Some(&json!(1))).unwrap(),
+            1
+        );
+        assert_eq!(
+            resolve_async_resume_index("r", steps, Some(&json!(1.0))).unwrap(),
             1
         );
         assert_eq!(
