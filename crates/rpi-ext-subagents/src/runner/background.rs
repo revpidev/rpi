@@ -1537,12 +1537,18 @@ impl AsyncNotify {
         let status = status_snapshot(handle);
         let run_id = &handle.run_id;
         let result_path = async_results_dir().join(format!("{run_id}.json"));
-        let result = json!({
+        let completed_at = now_millis();
+        let duration_ms = completed_at.saturating_sub(handle.started_ms);
+        let mut result = json!({
             "runId": run_id,
             "state": state,
             "output": output,
-            "completedAt": iso8601(now_millis()),
+            "completedAt": iso8601(completed_at),
+            "durationMs": duration_ms,
         });
+        if let Some(handoff_path) = handoff_path {
+            result["handoffPath"] = json!(handoff_path.to_string_lossy());
+        }
         // R7.1.7.3 (#1981): the result file is persisted BEFORE
         // sendMessage — save first, report success after. An exhausted
         // write (R7.1.7.1) flips the notice to failure semantics with the
@@ -1564,7 +1570,7 @@ impl AsyncNotify {
             result_write: &result_write,
             result_path: &result_path,
             run_id,
-            duration_ms: Some(now_millis().saturating_sub(handle.started_ms)),
+            duration_ms: Some(duration_ms),
             handoff_path,
         });
         if let Some(calls) = &self.calls {
@@ -1689,14 +1695,19 @@ fn send_completion_message(
 /// outlived the host that launched it, or the host call errored). Runs at
 /// each parent `session_start`; a successful send removes the result file,
 /// so a notice is not duplicated. `MAX_RESEND` bounds the scan.
-pub fn resend_pending_results(calls: &crate::AsyncHostCalls) {
+pub fn resend_pending_results(calls: &crate::AsyncHostCalls, session_id: Option<&str>) {
+    // No current session id means no safe recipient: upstream replays only
+    // the notices bound to the starting session.
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
     const MAX_RESEND: usize = 20;
     let Ok(entries) = std::fs::read_dir(async_results_dir()) else {
         return;
     };
-    let mut sent = 0usize;
+    let mut attempted = 0usize;
     for entry in entries.flatten() {
-        if sent >= MAX_RESEND {
+        if attempted >= MAX_RESEND {
             break;
         }
         let path = entry.path();
@@ -1717,6 +1728,10 @@ pub fn resend_pending_results(calls: &crate::AsyncHostCalls) {
             // A corrupt/missing status must not abort the scan (#3042).
             _ => continue,
         };
+        // Never deliver another session's result into this parent context.
+        if status["sessionId"].as_str() != Some(session_id) {
+            continue;
+        }
         if !matches!(
             status["state"].as_str().unwrap_or(""),
             STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
@@ -1725,6 +1740,9 @@ pub fn resend_pending_results(calls: &crate::AsyncHostCalls) {
         }
         let state = result["state"].as_str().unwrap_or(STATE_COMPLETE);
         let output = result["output"].as_str().unwrap_or_default();
+        let handoff = result["handoffPath"].as_str().map(std::path::PathBuf::from);
+        let duration_ms = result["durationMs"].as_u64();
+        attempted += 1;
         let details = completion_details(&CompletionNotice {
             status: &status,
             state,
@@ -1732,12 +1750,19 @@ pub fn resend_pending_results(calls: &crate::AsyncHostCalls) {
             result_write: &Ok(()),
             result_path: &path,
             run_id,
-            duration_ms: None,
-            handoff_path: None,
+            duration_ms,
+            handoff_path: handoff.as_deref(),
         });
         if send_completion_message(calls, &details).is_ok() {
             let _ = std::fs::remove_file(&path);
-            sent += 1;
+            let _ = crate::host_call_static(
+                calls,
+                "events.emit",
+                json!({
+                    "channel": "subagent:async-complete",
+                    "data": { "runId": run_id, "state": state },
+                }),
+            );
         }
     }
 }
@@ -2194,6 +2219,11 @@ pub fn reconcile_stale_runs() {
             "run.reconciled",
             json!({ "reason": "owner-dead", "reapedChildPids": reaped }),
         );
+        // The run is terminal now; close its pending supervisor asks so a
+        // later wait/drain does not keep yielding on a dead owner.
+        if let Some(run_id) = status["runId"].as_str() {
+            crate::p1::supervisor::close_requests_for_run(run_id);
+        }
         // The reconciled write is terminal: a failure surfaces after
         // run.reconciled (TE17 R7.1.7.1 — no run handle exists here, so the
         // event carries the runId from the status document).
@@ -3362,6 +3392,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&run_dir).unwrap();
         let status = json!({
             "runId": run_id,
+            "sessionId": "resend-session",
             "mode": "single",
             "state": STATE_COMPLETE,
             "steps": [{ "agent": "scout", "status": "complete" }],
@@ -3395,7 +3426,18 @@ pub(crate) mod tests {
 
         FAKE_SEND_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
         let before = FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst);
-        resend_pending_results(&calls);
+        // Another session must not receive this run's result.
+        resend_pending_results(&calls, Some("other-session"));
+        assert!(
+            result_path.exists(),
+            "other session leaves the result pending"
+        );
+        assert_eq!(
+            FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "other session issues no sendMessage"
+        );
+        resend_pending_results(&calls, Some("resend-session"));
         assert!(!result_path.exists(), "successful resend removes the file");
         assert!(
             FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst) > before,
@@ -3477,12 +3519,28 @@ pub(crate) mod tests {
             }),
         )
         .unwrap();
+        // A pending ask from the dead run must be closed with it.
+        let channel = crate::p1::supervisor::channels_root().join("deadrun-worker-0");
+        let _ = std::fs::remove_dir_all(&channel);
+        crate::p1::supervisor::ensure_channel(&channel);
+        std::fs::write(
+            channel.join("requests").join("ask.json"),
+            json!({ "id": "ask", "reason": "need_decision", "runId": "deadrun",
+                    "orchestratorSessionId": "s", "createdAt": "2026-09-26T00:00:00.000Z" })
+            .to_string(),
+        )
+        .unwrap();
         reconcile_stale_runs();
         let status: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("status.json")).unwrap())
                 .unwrap();
         assert_eq!(status["state"], json!(STATE_FAILED));
+        assert!(
+            crate::p1::supervisor::read_requests(&channel).is_empty(),
+            "dead run's pending ask is closed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&channel);
     }
 
     #[cfg(unix)]

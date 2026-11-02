@@ -16,6 +16,9 @@ use crate::runner::budget;
 #[derive(Debug, Clone)]
 pub struct ForegroundRunRecord {
     pub run_id: String,
+    /// Parent session that launched the run; `status` keeps the heading
+    /// honest across session switches.
+    pub session_id: Option<String>,
     pub agent: String,
     pub exit_code: i32,
     pub duration_ms: u64,
@@ -656,7 +659,10 @@ fn execute_subagent_tool_inner(
         model: spec.model.as_deref(),
         thinking: spec.thinking.as_deref(),
         child_cwd: &child_cwd,
-        session_dir: &ctx.session_root,
+        session_dir: ctx
+            .session_root_is_derived
+            .then_some(ctx.session_root.as_path()),
+        session_file: spec.session_file.as_deref(),
     };
     crate::runner::foreground_history::persist_running(&history_meta);
     let outcome = match crate::p1::launch_child::run_child(&spec, &agent, &ctx, runtime) {
@@ -700,6 +706,7 @@ fn execute_subagent_tool_inner(
             .unwrap_or_else(|e| e.into_inner());
         memory.runs.push(ForegroundRunRecord {
             run_id: ctx.run_id.clone(),
+            session_id: ctx.parent_session_id.clone(),
             agent: outcome.agent_name.clone(),
             exit_code: result.exit_code,
             duration_ms: result.duration_ms,
@@ -1072,6 +1079,7 @@ fn dispatch_tasks(
             .map(|o| (o.agent.clone(), o.exit_code, 0, o.error.clone()))
             .collect::<Vec<_>>(),
         &ctx.run_id,
+        ctx.parent_session_id.as_deref(),
     );
 
     let any_failed = outcomes.iter().any(|o| o.exit_code != 0);
@@ -1138,6 +1146,7 @@ fn dispatch_steps(
             .map(|s| (s.agent.clone(), s.exit_code, 0, s.error.clone()))
             .collect::<Vec<_>>(),
         &ctx.run_id,
+        ctx.parent_session_id.as_deref(),
     );
 
     // Chain output: the last completed step's output (or the failure text).
@@ -1374,13 +1383,18 @@ fn clone_ctx_for_async(ctx: &crate::p1::launch_child::RunCtx) -> crate::p1::laun
     clone
 }
 
-fn record_runs(records: &[(String, i32, u64, Option<String>)], run_id: &str) {
+fn record_runs(
+    records: &[(String, i32, u64, Option<String>)],
+    run_id: &str,
+    session_id: Option<&str>,
+) {
     let mut memory = FOREGROUND_RUN_MEMORY
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     for (agent, exit_code, duration_ms, error) in records {
         memory.runs.push(ForegroundRunRecord {
             run_id: run_id.to_string(),
+            session_id: session_id.map(str::to_string),
             agent: agent.clone(),
             exit_code: *exit_code,
             duration_ms: *duration_ms,
@@ -1578,6 +1592,7 @@ mod tests {
             usage_budget: None,
             artifacts_dir: None,
             session_root: dir.join("sessions"),
+            session_root_is_derived: true,
             frame_sink: None,
             step_status: None,
             control: crate::runner::control::ResolvedControlConfig::default(),

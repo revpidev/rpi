@@ -865,6 +865,7 @@ mod tests {
             usage_budget: None,
             artifacts_dir: None,
             session_root: base.join("sessions"),
+            session_root_is_derived: true,
             frame_sink: None,
             step_status: None,
             control: crate::runner::control::ResolvedControlConfig::default(),

@@ -93,8 +93,16 @@ fn newest_session_file(dir: &Path) -> Option<PathBuf> {
 fn write_record(run_id: &str, record: &Value) -> Result<(), String> {
     let path = record_path(run_id).ok_or_else(|| "invalid run id".to_string())?;
     let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-    crate::artifacts::write_metadata(&path, record).map_err(|error| error.to_string())
+    crate::paths::create_private_dir_all(dir).map_err(|error| error.to_string())?;
+    crate::artifacts::write_metadata(&path, record).map_err(|error| error.to_string())?;
+    // Final records inline up to 64 KiB of child output; keep the file
+    // owner-only (`writePrivateAtomicJson` upstream).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 fn read_record(path: &Path) -> Option<Value> {
@@ -116,18 +124,31 @@ pub struct ForegroundRunMeta<'a> {
     pub model: Option<&'a str>,
     pub thinking: Option<&'a str>,
     pub child_cwd: &'a Path,
-    pub session_dir: &'a Path,
+    /// Per-run session root (unique) or `None` for an explicit shared root.
+    pub session_dir: Option<&'a Path>,
+    /// Exact resume/continuation file when known (explicit `sessionFile`).
+    pub session_file: Option<&'a Path>,
 }
 
 /// Launch-time record for one single foreground child.
 pub fn persist_running(meta: &ForegroundRunMeta<'_>) {
+    // Upstream `compactRun` refuses records without a session id; a record
+    // that no session can resolve is worse than no record.
+    let Some(session_id) = meta.session_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
     let mut child = json!({
         "agent": meta.agent,
         "index": 0,
         "status": "running",
         "cwd": meta.child_cwd.to_string_lossy(),
-        "sessionDir": meta.session_dir.to_string_lossy(),
     });
+    if let Some(dir) = meta.session_dir {
+        child["sessionDir"] = json!(dir.to_string_lossy());
+    }
+    if let Some(file) = meta.session_file {
+        child["sessionFile"] = json!(file.to_string_lossy());
+    }
     if let Some(model) = meta.model {
         child["model"] = json!(model);
     }
@@ -138,7 +159,7 @@ pub fn persist_running(meta: &ForegroundRunMeta<'_>) {
         "runId": meta.run_id,
         "mode": "single",
         "cwd": meta.cwd.to_string_lossy(),
-        "sessionId": meta.session_id.unwrap_or_default(),
+        "sessionId": session_id,
         "updatedAt": now_millis(),
         "owner": {
             "pid": std::process::id(),
@@ -156,6 +177,9 @@ pub fn persist_final(
     meta: &ForegroundRunMeta<'_>,
     result: &crate::runner::foreground::ForegroundRunResult,
 ) {
+    let Some(session_id) = meta.session_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
     let status = if result.exit_code == 0
         && result.error.is_none()
         && !result.timed_out
@@ -199,7 +223,7 @@ pub fn persist_final(
         "runId": meta.run_id,
         "mode": "single",
         "cwd": meta.cwd.to_string_lossy(),
-        "sessionId": meta.session_id.unwrap_or_default(),
+        "sessionId": session_id,
         "updatedAt": now_millis(),
         "children": [child],
     });
@@ -220,7 +244,8 @@ pub fn discard_running(run_id: &str) {
     let running = record["children"]
         .as_array()
         .is_some_and(|children| children.iter().any(|child| child["status"] == "running"));
-    if running {
+    let own_record = record["owner"]["pid"].as_u64() == Some(std::process::id() as u64);
+    if running && own_record {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -283,6 +308,9 @@ pub fn restore_interrupted() -> usize {
                 object.remove("owner");
             }
             if write_record(&run_id, &record).is_ok() {
+                // A restored run is terminal; its pending supervisor asks
+                // must not keep a later wait/drain yielding.
+                crate::p1::supervisor::close_requests_for_run(&run_id);
                 restored += 1;
             }
         }
@@ -293,11 +321,23 @@ pub fn restore_interrupted() -> usize {
 
 /// Whether a recorded owning process may still be alive. A missing boot id
 /// degrades to a plain liveness check; another boot is dead without probing.
+#[cfg(unix)]
 fn owner_may_be_alive(pid: u64, recorded_boot_id: Option<u64>) -> bool {
     if pid == 0 {
         return false;
     }
     crate::runner::background::recorded_pid_matches(pid, recorded_boot_id)
+}
+
+/// Non-unix fallback: rpi has no process-start-time probe there, and the
+/// capacity-slot path deliberately treats every pid as alive. For foreground
+/// history that would disable restore entirely, so only the current process
+/// is assumed alive; another host's record is treated as interrupted. This
+/// is conservative for recovery (a still-running foreign child could be
+/// resumed twice) and is registered as a Windows variant, not parity.
+#[cfg(not(unix))]
+fn owner_may_be_alive(pid: u64, _recorded_boot_id: Option<u64>) -> bool {
+    pid == std::process::id() as u64
 }
 
 /// One remembered record by exact run id.
@@ -307,8 +347,10 @@ pub fn find(run_id: &str) -> Option<Value> {
 }
 
 fn matches_session(record: &Value, session_id: Option<&str>) -> bool {
-    let recorded = record["sessionId"].as_str().unwrap_or_default();
-    session_id.is_none_or(|session_id| recorded.is_empty() || recorded == session_id)
+    match session_id.filter(|id| !id.is_empty()) {
+        Some(session_id) => record["sessionId"].as_str() == Some(session_id),
+        None => false,
+    }
 }
 
 /// Resolve an exact id or a unique prefix among remembered records, optionally
@@ -319,10 +361,14 @@ pub fn find_prefix_for_session(
     session_id: Option<&str>,
 ) -> Result<Option<Value>, String> {
     let requested = requested.trim();
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
+        return Ok(None);
+    };
     if requested.is_empty() {
         return Ok(None);
     }
-    if let Some(record) = find(requested).filter(|record| matches_session(record, session_id)) {
+    if let Some(record) = find(requested).filter(|record| matches_session(record, Some(session_id)))
+    {
         return Ok(Some(record));
     }
     let Ok(entries) = std::fs::read_dir(history_dir()) else {
@@ -331,7 +377,7 @@ pub fn find_prefix_for_session(
     let mut matches: Vec<Value> = entries
         .flatten()
         .filter_map(|entry| read_record(&entry.path()))
-        .filter(|record| matches_session(record, session_id))
+        .filter(|record| matches_session(record, Some(session_id)))
         .filter(|record| {
             record["runId"]
                 .as_str()
@@ -357,16 +403,16 @@ pub fn find_prefix_for_session(
 
 /// Remembered records for one parent session, newest first.
 pub fn list_for_session(session_id: Option<&str>, limit: usize) -> Vec<Value> {
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
+        return Vec::new();
+    };
     let Ok(entries) = std::fs::read_dir(history_dir()) else {
         return Vec::new();
     };
     let mut records: Vec<Value> = entries
         .flatten()
         .filter_map(|entry| read_record(&entry.path()))
-        .filter(|record| {
-            let recorded = record["sessionId"].as_str().unwrap_or_default();
-            session_id.is_none_or(|session_id| recorded.is_empty() || recorded == session_id)
-        })
+        .filter(|record| record["sessionId"].as_str() == Some(session_id))
         .collect();
     records.sort_by(|left, right| {
         right["updatedAt"]
@@ -541,7 +587,12 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(find_prefix_for_session(&run_id, None).unwrap().is_some());
+        assert!(find_prefix_for_session(&run_id, None).unwrap().is_none());
+        assert!(
+            find_prefix_for_session(&run_id, Some(""))
+                .unwrap()
+                .is_none()
+        );
         let _ = record_path(&run_id).map(std::fs::remove_file);
     }
 

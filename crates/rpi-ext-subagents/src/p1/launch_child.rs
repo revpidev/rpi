@@ -216,6 +216,10 @@ pub struct RunCtx {
     pub usage_budget: Option<Value>,
     pub artifacts_dir: Option<PathBuf>,
     pub session_root: PathBuf,
+    /// True when `session_root` is the per-run derived directory (unique to
+    /// this `run_id`), false for an explicit `sessionDir`/`defaultSessionDir`
+    /// shared by every run.
+    pub session_root_is_derived: bool,
     /// Streaming frame sink (TE09 FR-A): foreground dispatches install the
     /// toolUpdate seam here; parallel/async paths leave it None (upstream
     /// wraps only the single and chain foreground flows).
@@ -282,12 +286,13 @@ impl RunCtx {
                     .unwrap_or_else(mkdtemp_session_root),
             },
         };
-        let session_root =
-            if object.get("sessionDir").is_some() || config.default_session_dir.is_some() {
-                session_root
-            } else {
-                session_root.join(&run_id)
-            };
+        let session_root_is_derived =
+            object.get("sessionDir").is_none() && config.default_session_dir.is_none();
+        let session_root = if session_root_is_derived {
+            session_root.join(&run_id)
+        } else {
+            session_root
+        };
         let artifacts_enabled = object.get("artifacts") != Some(&Value::Bool(false));
         let preference =
             crate::artifacts::ArtifactDirPreference::parse(Some(config.artifact_dir_preference()))
@@ -335,6 +340,7 @@ impl RunCtx {
             run_id,
             artifacts_dir,
             session_root,
+            session_root_is_derived,
             // Streaming sinks are per-dispatch concerns: the tool layer
             // installs them on the assembled ctx (None here keeps the
             // non-streaming default for every other constructor caller).
@@ -1252,6 +1258,7 @@ mod te18_fork_tests {
             usage_budget: None,
             artifacts_dir: None,
             session_root: std::env::temp_dir(),
+            session_root_is_derived: true,
             frame_sink: None,
             step_status: None,
             control: crate::runner::control::ResolvedControlConfig::default(),
@@ -1444,6 +1451,7 @@ mod te18_gate_budget_tests {
             usage_budget: None,
             artifacts_dir: None,
             session_root: std::env::temp_dir(),
+            session_root_is_derived: true,
             frame_sink: None,
             step_status: None,
             control: crate::runner::control::ResolvedControlConfig::default(),

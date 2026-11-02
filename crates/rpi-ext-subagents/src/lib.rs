@@ -1306,7 +1306,16 @@ fn dispatch_message(message: &Value) -> Value {
                         call: state.calls.call,
                         cookie: state.cookie,
                     };
-                    runner::background::resend_pending_results(&calls);
+                    let session_id =
+                        host_call_ok(&state.calls, state.cookie, "ctx.sessionFile", json!({}))
+                            .and_then(|session| {
+                                session
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .filter(|id| !id.is_empty());
+                    runner::background::resend_pending_results(&calls, session_id.as_deref());
                     Value::Null
                 }
                 (PluginMode::Parent, "session_shutdown") => {

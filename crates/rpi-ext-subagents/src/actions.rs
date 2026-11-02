@@ -679,6 +679,10 @@ fn handle_management_action_inner(
                 };
             }
             // Foreground memory + live async registry (async-status.ts shape).
+            let current_session = deps
+                .host
+                .and_then(|host| host.parent_session(settings))
+                .map(|session| session.id);
             let memory = FOREGROUND_RUN_MEMORY
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
@@ -687,6 +691,11 @@ fn handle_management_action_inner(
                 lines.push("- (none)".to_string());
             }
             for run in memory.runs.iter().rev().take(10) {
+                if let Some(session_id) = current_session.as_deref()
+                    && run.session_id.as_deref() != Some(session_id)
+                {
+                    continue;
+                }
                 lines.push(format!(
                     "- {} agent={} exitCode={} durationMs={}{}",
                     run.run_id,
@@ -714,7 +723,10 @@ fn handle_management_action_inner(
                 }
                 let child = &record["children"][0];
                 let state = child["status"].as_str().unwrap_or("?");
-                let resume = if child["sessionFile"].as_str().is_some() {
+                let resume = if child["sessionFile"]
+                    .as_str()
+                    .is_some_and(|path| Path::new(path).is_file())
+                {
                     format!(" · resume {run_id}")
                 } else {
                     String::new()
@@ -957,10 +969,7 @@ fn handle_management_action_inner(
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
-            let current_session = deps
-                .host
-                .and_then(|host| host.parent_session(settings))
-                .map(|session| session.id);
+            let current_session = host.parent_session(settings).map(|session| session.id);
             match crate::runner::foreground_history::find_prefix_for_session(
                 &id,
                 current_session.as_deref(),
