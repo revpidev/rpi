@@ -428,10 +428,12 @@ pub fn should_escalate_mutating_failures(state: &MutatingFailureState, threshold
 
 /// `summarizeRecentMutatingFailures` (`long-running-guard.ts`).
 pub fn summarize_recent_mutating_failures(state: &MutatingFailureState) -> String {
+    // Upstream keeps the bounded queue in insertion order and joins it
+    // oldest→newest (`recentFailures` push + shift, long-running-guard.ts:
+    // 255-260); reversing here flipped the summary.
     state
         .recent_failures
         .iter()
-        .rev()
         .take(3)
         .map(|failure| {
             let target = failure
@@ -557,5 +559,28 @@ mod tests {
         assert!(summarize_recent_mutating_failures(&state).contains("edit(a)"));
         reset_mutating_failure_state(&mut state);
         assert_eq!(state.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn failure_summary_keeps_insertion_order_and_caps_at_three() {
+        // Upstream pushes to `recentFailures` and joins oldest→newest
+        // (long-running-guard.ts:255-260); the newest failure is last.
+        let mut state = MutatingFailureState::default();
+        for (index, path) in ["a.ts", "b.ts", "c.ts", "d.ts"].into_iter().enumerate() {
+            record_mutating_failure(
+                &mut state,
+                FailedMutatingAttempt {
+                    tool: "edit".to_string(),
+                    path: Some(path.to_string()),
+                    error: format!("error-{index}"),
+                    ts: index as u64,
+                },
+                300_000,
+            );
+        }
+        assert_eq!(
+            summarize_recent_mutating_failures(&state),
+            "edit(b.ts): error-1 | edit(c.ts): error-2 | edit(d.ts): error-3"
+        );
     }
 }

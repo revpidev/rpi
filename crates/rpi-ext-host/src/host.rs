@@ -8,12 +8,13 @@
 //! `ExtensionRunner` seam.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde_json::{Value, json};
 
-use crate::api::{EventBus, ExtensionRuntime, HostActions, InsertionMap, UiBridge};
+use crate::api::{
+    CommandContextActions, EventBus, ExtensionRuntime, HostActions, InsertionMap, UiBridge,
+};
 use crate::error::ExtError;
 use crate::loader::{DiscoverConfig, ExtensionLoader, PreTrustRecord};
 use crate::runner::{ExtensionErrorListener, ExtensionRunnerCore};
@@ -34,6 +35,11 @@ struct LoadSpec {
     no_extensions: bool,
 }
 
+/// Installer for the inbound questionnaire answer channel (ADR-0043).
+///
+/// Kept on the host so `/reload` can re-attach it to the fresh `EventBus`.
+pub type AnswerChannelInstaller = Arc<dyn Fn(EventBus) + Send + Sync>;
+
 /// The L0 extension host: native (boxed-closure) extensions over one shared
 /// runtime, with the wasm (L1) backend landing in W6 behind the same
 /// capability surface.
@@ -53,9 +59,14 @@ pub struct NativeExtensionHost {
     /// resource-loader.ts:100-107). Drained by the startup pipeline with
     /// [`Self::take_warnings`].
     last_warnings: RwLock<Vec<ExtensionLoadWarning>>,
-    /// ADR-0043: whether the inbound questionnaire answer channel is already
-    /// installed on this host (one subscription per host).
-    answer_channel_installed: AtomicBool,
+    /// ADR-0043: installer for the inbound questionnaire answer channel.
+    /// Kept (not just a one-shot flag) so `/reload`, which swaps in a fresh
+    /// `ExtensionRuntime`/`EventBus`, can re-attach the handler to the new
+    /// bus instead of silently losing the channel.
+    answer_channel_installer: RwLock<Option<AnswerChannelInstaller>>,
+    /// `ctx.command.*` actions are per session/mode too; kept so `/reload`
+    /// can re-bind them on the fresh runtime (the runtime itself is replaced).
+    command_actions: RwLock<Option<Arc<dyn CommandContextActions>>>,
 }
 
 fn read<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -83,14 +94,24 @@ impl NativeExtensionHost {
             last_load: RwLock::new(None),
             last_ui: RwLock::new(None),
             last_warnings: RwLock::new(Vec::new()),
-            answer_channel_installed: AtomicBool::new(false),
+            answer_channel_installer: RwLock::new(None),
+            command_actions: RwLock::new(None),
         }
     }
 
-    /// ADR-0043: claim the one-time answer-channel installation for this
-    /// host. Returns `false` when a mode already installed it.
-    pub fn claim_answer_channel(&self) -> bool {
-        !self.answer_channel_installed.swap(true, Ordering::SeqCst)
+    /// Bind `ctx.command.*` actions and remember them for `/reload`.
+    pub fn set_command_actions(&self, actions: Option<Arc<dyn CommandContextActions>>) {
+        *write(&self.command_actions) = actions.clone();
+        self.runtime().set_command_actions(actions);
+    }
+
+    /// ADR-0043: install the inbound answer channel for this host and keep
+    /// the installer for `/reload`. The handler is installed on the current
+    /// bus immediately; a later reload re-installs it on the fresh bus.
+    /// Calling again replaces the previous installer (one channel per host).
+    pub fn install_answer_channel(&self, installer: AnswerChannelInstaller) {
+        *write(&self.answer_channel_installer) = Some(Arc::clone(&installer));
+        installer(self.event_bus());
     }
 
     /// Drain the load warnings from the most recent load
@@ -401,6 +422,16 @@ impl NativeExtensionHost {
         }
         *write(&self.runtime) = new_runtime.clone();
         write(&self.loader).set_runtime(new_runtime);
+        // ADR-0043: the fresh runtime owns a fresh EventBus. Re-install the
+        // answer channel so external answers keep reaching the questionnaire
+        // (and every attempt still gets a verdict) after `/reload`.
+        if let Some(installer) = read(&self.answer_channel_installer).clone() {
+            installer(self.event_bus());
+        }
+        // `ctx.command.*` actions live on the runtime; replay them too.
+        if let Some(actions) = read(&self.command_actions).clone() {
+            self.runtime().set_command_actions(Some(actions));
+        }
 
         let Some(spec) = spec else {
             self.install(Vec::new());

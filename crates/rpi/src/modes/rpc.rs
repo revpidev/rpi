@@ -711,6 +711,32 @@ async fn rebind_session(
     let error_output = state.output.clone();
     // `ctx.shutdown()` → flag honored at the next `agent_settled`
     // (rpc-mode.ts:727-730).
+    // Bind the host surfaces BEFORE `bind_extensions`: its `session_start`
+    // dispatch must already see the RPC UI bridge and answer channel (the
+    // interactive path attaches the bridge first for the same reason).
+    if let Some(runtime) = runtime.upgrade()
+        && let Some(host) =
+            crate::core::extension_host_adapter::host_of_runner(&session.extension_runner())
+    {
+        host.set_command_actions(Some(Arc::new(
+            crate::core::extension_context::RuntimeCommandActions::new(&runtime),
+        )));
+        // Every replacement session owns a fresh host/runtime: re-attach the
+        // RPC UI bridge and the ADR-0043 answer channel here, not only at
+        // startup (otherwise `/new`/`/resume` leaves the new host with no
+        // responder and no verdict channel).
+        host.set_ui(
+            Some(Arc::new(ui_bridge::RpcUiBridge::new(
+                state.output.clone(),
+                state.pending_ui.clone(),
+                crate::core::themes::default_theme_json(),
+            ))),
+            rpi_ext_host::types::ExtensionMode::Rpc,
+        );
+        host.install_answer_channel(std::sync::Arc::new(|bus| {
+            crate::modes::interactive::interactive_mode::answer_channel::install_unsupported(&bus);
+        }));
+    }
     let shutdown_state = Arc::downgrade(state);
     session
         .bind_extensions(ExtensionBindings {
@@ -730,18 +756,6 @@ async fn rebind_session(
             })),
         })
         .await;
-
-    // `bindCommandContext` (runner.ts:410-418): runtime-backed command
-    // actions on the session's host (Weak — the runtime owns this closure's
-    // inverse path).
-    if let Some(runtime) = runtime.upgrade()
-        && let Some(host) =
-            crate::core::extension_host_adapter::host_of_runner(&session.extension_runner())
-    {
-        host.runtime().set_command_actions(Some(Arc::new(
-            crate::core::extension_context::RuntimeCommandActions::new(&runtime),
-        )));
-    }
 
     let event_output = state.output.clone();
     let state_weak = Arc::downgrade(state);
@@ -1348,33 +1362,9 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
             })));
     }
 
-    // Initial bind (rpc-mode.ts:381).
+    // Initial bind (rpc-mode.ts:381): also attaches the RPC UI bridge and
+    // the answer channel (the same path every replacement session uses).
     rebind_session(&state, initial_session.clone(), &Arc::downgrade(&runtime)).await;
-
-    // `setUIContext(createExtensionUIContext(), "rpc")` (T15 W4): the RPC
-    // extension UI bridge rides the session's extension host.
-    if let Some(host) = initial_session
-        .extension_runner()
-        .as_any()
-        .and_then(|any| {
-            any.downcast_ref::<crate::core::extension_host_adapter::ExtensionHostAdapter>()
-        })
-        .map(|adapter| adapter.host().clone())
-    {
-        host.set_ui(
-            Some(Arc::new(ui_bridge::RpcUiBridge::new(
-                output.clone(),
-                state.pending_ui.clone(),
-                crate::core::themes::default_theme_json(),
-            ))),
-            rpi_ext_host::types::ExtensionMode::Rpc,
-        );
-        if host.claim_answer_channel() {
-            crate::modes::interactive::interactive_mode::answer_channel::install_unsupported(
-                &host.event_bus(),
-            );
-        }
-    }
 
     // Input loop: each command is handled on its own task so `abort` /
     // `abort_bash` can land while a long-running `bash`/`prompt` is in

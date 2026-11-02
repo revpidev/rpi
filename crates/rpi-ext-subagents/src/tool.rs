@@ -1019,6 +1019,62 @@ fn step_output_claims(
 }
 
 /// `tasks` composition dispatch (FR-P1-01, ADR-0018).
+/// Session directory of a child in a derived per-run root (the lookup used
+/// after the child exits). An explicit/shared root is not recorded: the
+/// newest `.jsonl` there could belong to another run.
+fn derived_child_session_dir(
+    ctx: &crate::p1::launch_child::RunCtx,
+    child_index: u32,
+    has_session_file: bool,
+) -> Option<std::path::PathBuf> {
+    if has_session_file || !ctx.session_root_is_derived {
+        return None;
+    }
+    if ctx.session_root == ctx.base_cwd {
+        Some(ctx.session_root.clone())
+    } else {
+        Some(ctx.session_root.join(format!("run-{child_index}")))
+    }
+}
+
+fn agent_thinking_level(agent: &discover::AgentConfig) -> Option<&str> {
+    match &agent.thinking {
+        discover::ThinkingSpec::Level(level) => Some(level.as_str()),
+        _ => None,
+    }
+}
+
+/// Launch-time foreground-history record for a composite batch. The fields
+/// mirror the single-child record so `status`/`restore`/`resume` share one
+/// reader (upstream `ForegroundResumeRun` admits `parallel`/`chain`).
+fn persist_composite_running(
+    ctx: &crate::p1::launch_child::RunCtx,
+    mode: &str,
+    children: &[crate::runner::foreground_history::ForegroundRunningChild<'_>],
+) {
+    crate::runner::foreground_history::persist_running_children(
+        &ctx.run_id,
+        ctx.parent_session_id.as_deref(),
+        &ctx.base_cwd,
+        mode,
+        children,
+    );
+}
+
+fn persist_composite_final(
+    ctx: &crate::p1::launch_child::RunCtx,
+    mode: &str,
+    children: &[crate::runner::foreground_history::ForegroundFinalChild<'_>],
+) {
+    crate::runner::foreground_history::persist_final_children(
+        &ctx.run_id,
+        ctx.parent_session_id.as_deref(),
+        &ctx.base_cwd,
+        mode,
+        children,
+    );
+}
+
 fn dispatch_tasks(
     object: &serde_json::Map<String, Value>,
     agents: &[discover::AgentConfig],
@@ -1059,6 +1115,54 @@ fn dispatch_tasks(
         Ok(plan) => plan,
         Err(error) => return ToolOutcome::mode_error("parallel", error),
     };
+    // TE51 review P1-7: composite foreground runs get the same history as a
+    // single run (upstream `ForegroundResumeRun` admits mode parallel/chain).
+    let history_agents: Vec<Option<&discover::AgentConfig>> = entries
+        .iter()
+        .map(|entry| {
+            discover::resolve_agent_name(agents, &entry.spec.agent_name)
+                .ok()
+                .flatten()
+        })
+        .collect();
+    let history_session_dirs: Vec<Option<std::path::PathBuf>> = entries
+        .iter()
+        .map(|entry| {
+            derived_child_session_dir(
+                ctx,
+                entry.spec.child_index,
+                entry.spec.session_file.is_some(),
+            )
+        })
+        .collect();
+    let running_children: Vec<crate::runner::foreground_history::ForegroundRunningChild<'_>> =
+        entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let agent = history_agents[index];
+                crate::runner::foreground_history::ForegroundRunningChild {
+                    index: entry.spec.child_index as usize,
+                    agent: agent
+                        .map(|agent| agent.name.as_str())
+                        .unwrap_or(entry.spec.agent_name.as_str()),
+                    child_cwd: entry.spec.cwd.as_deref().unwrap_or(&ctx.base_cwd),
+                    model: entry
+                        .spec
+                        .model
+                        .as_deref()
+                        .or_else(|| agent.and_then(|agent| agent.model.as_deref())),
+                    thinking: entry
+                        .spec
+                        .thinking
+                        .as_deref()
+                        .or_else(|| agent.and_then(agent_thinking_level)),
+                    session_dir: history_session_dirs[index].as_deref(),
+                    session_file: entry.spec.session_file.as_deref(),
+                }
+            })
+            .collect();
+    persist_composite_running(ctx, "parallel", &running_children);
     let outcomes = match crate::p1::parallel::run_parallel(
         &entries,
         agents,
@@ -1068,8 +1172,28 @@ fn dispatch_tasks(
         worktree_plan.clone(),
     ) {
         Ok(outcomes) => outcomes,
-        Err(error) => return ToolOutcome::mode_error("parallel", error),
+        Err(error) => {
+            crate::runner::foreground_history::discard_running(&ctx.run_id);
+            return ToolOutcome::mode_error("parallel", error);
+        }
     };
+    let final_children: Vec<crate::runner::foreground_history::ForegroundFinalChild<'_>> = entries
+        .iter()
+        .zip(outcomes.iter())
+        .enumerate()
+        .map(
+            |(index, (entry, outcome))| crate::runner::foreground_history::ForegroundFinalChild {
+                index: entry.spec.child_index as usize,
+                agent: outcome.agent.as_str(),
+                child_cwd: entry.spec.cwd.as_deref().unwrap_or(&ctx.base_cwd),
+                model: outcome.result.model.as_deref(),
+                thinking: outcome.result.thinking.as_deref(),
+                session_dir: history_session_dirs[index].as_deref(),
+                result: &outcome.result,
+            },
+        )
+        .collect();
+    persist_composite_final(ctx, "parallel", &final_children);
     if let Some(plan) = &worktree_plan {
         crate::p1::parallel::finalize_worktree_handoff(plan, &ctx.run_id, &ctx.base_cwd);
     }
@@ -1135,11 +1259,76 @@ fn dispatch_steps(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // TE51 review P1-7: chain runs persist a composite foreground record too
+    // (mode "chain"); every declared step starts in `running` so a host exit
+    // leaves a restorable shape.
+    let history_agents: Vec<Option<&discover::AgentConfig>> = steps
+        .iter()
+        .map(|step| {
+            discover::resolve_agent_name(agents, &step.agent_name)
+                .ok()
+                .flatten()
+        })
+        .collect();
+    let history_session_dirs: Vec<Option<std::path::PathBuf>> = (0..steps.len())
+        .map(|index| derived_child_session_dir(ctx, index as u32, false))
+        .collect();
+    let running_children: Vec<crate::runner::foreground_history::ForegroundRunningChild<'_>> =
+        steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let agent = history_agents[index];
+                crate::runner::foreground_history::ForegroundRunningChild {
+                    index,
+                    agent: agent
+                        .map(|agent| agent.name.as_str())
+                        .unwrap_or(step.agent_name.as_str()),
+                    child_cwd: step.cwd.as_deref().unwrap_or(&ctx.base_cwd),
+                    model: step
+                        .model
+                        .as_deref()
+                        .or_else(|| agent.and_then(|agent| agent.model.as_deref())),
+                    thinking: step
+                        .thinking
+                        .as_deref()
+                        .or_else(|| agent.and_then(agent_thinking_level)),
+                    session_dir: history_session_dirs[index].as_deref(),
+                    session_file: None,
+                }
+            })
+            .collect();
+    persist_composite_running(ctx, "chain", &running_children);
     let (completed, failed) =
         match crate::p1::chain::run_chain(&steps, agents, ctx, runtime, &original_task) {
             Ok(result) => result,
-            Err(error) => return ToolOutcome::mode_error("chain", error),
+            Err(error) => {
+                crate::runner::foreground_history::discard_running(&ctx.run_id);
+                return ToolOutcome::mode_error("chain", error);
+            }
         };
+    let final_children: Vec<crate::runner::foreground_history::ForegroundFinalChild<'_>> =
+        completed
+            .iter()
+            .chain(failed.iter())
+            .map(|outcome| {
+                let step = steps.get(outcome.index);
+                crate::runner::foreground_history::ForegroundFinalChild {
+                    index: outcome.index,
+                    agent: outcome.agent.as_str(),
+                    child_cwd: step
+                        .and_then(|step| step.cwd.as_deref())
+                        .unwrap_or(&ctx.base_cwd),
+                    model: outcome.result.model.as_deref(),
+                    thinking: outcome.result.thinking.as_deref(),
+                    session_dir: history_session_dirs
+                        .get(outcome.index)
+                        .and_then(|dir| dir.as_deref()),
+                    result: &outcome.result,
+                }
+            })
+            .collect();
+    persist_composite_final(ctx, "chain", &final_children);
     record_runs(
         &completed
             .iter()

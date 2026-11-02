@@ -244,6 +244,9 @@ pub struct ParallelTaskOutcome {
     pub output_target_path: Option<std::path::PathBuf>,
     pub output_target_exists: bool,
     pub details: Value,
+    /// The raw child result (foreground-history/resume projection; the public
+    /// details shape stays `details`).
+    pub result: crate::runner::foreground::ForegroundRunResult,
 }
 
 /// Per-child lifecycle events for the parallel batch (rpi#29). `Started`
@@ -597,6 +600,12 @@ pub async fn run_parallel_async(
         .zip(entries.iter())
         .map(|(outcome, entry)| {
             let skipped = |reason: String| ParallelTaskOutcome {
+                result: crate::runner::foreground::ForegroundRunResult {
+                    exit_code: -1,
+                    error: Some(reason.clone()),
+                    final_output: format!("(skipped — {reason})"),
+                    ..crate::runner::foreground::ForegroundRunResult::default()
+                },
                 agent: entry.spec.agent_name.clone(),
                 output: format!("(skipped — {reason})"),
                 exit_code: -1,
@@ -818,6 +827,7 @@ pub fn project_outcome(
         .as_ref()
         .is_some_and(|path| path.exists());
     ParallelTaskOutcome {
+        result: outcome.result.clone(),
         agent: outcome.agent_name.clone(),
         output: outcome.result.final_output.clone(),
         exit_code: outcome.result.exit_code,
@@ -1213,6 +1223,7 @@ mod tests {
             index: u64,
         ) -> ParallelTaskOutcome {
             ParallelTaskOutcome {
+                result: Default::default(),
                 agent: agent.into(),
                 output: output.into(),
                 exit_code: exit,

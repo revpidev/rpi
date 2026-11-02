@@ -253,6 +253,22 @@ pub fn extract_text_from_content(content: &serde_json::Value) -> String {
     texts.join("\n")
 }
 
+/// Text of a `tool_execution_end` payload's `result` (or a `toolResult`
+/// message's `content`). The child wire wraps the executed tool result in a
+/// `ToolResult` object — `{"content":[...],"structuredContent":...}` — while
+/// upstream's `extractTextFromContent` receives the bare content array from
+/// `message_end`. Accept both shapes so a real failure reason is not replaced
+/// by the generic fallback.
+pub fn extract_tool_result_text(result: &serde_json::Value) -> String {
+    match result {
+        serde_json::Value::Object(object) => match object.get("content") {
+            Some(content) => extract_text_from_content(content),
+            None => String::new(),
+        },
+        other => extract_text_from_content(other),
+    }
+}
+
 /// `PROVIDER_STOP_TEXT_MAX` (utils.ts:252 @ 3a63e0ad): the reply text
 /// appended to a provider stop code is capped at 500 characters.
 pub const PROVIDER_STOP_TEXT_MAX: usize = 500;

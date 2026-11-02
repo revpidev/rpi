@@ -109,6 +109,12 @@ pub struct ChildLifecycleState {
     /// A compaction started after the terminal event; the drain must wait for
     /// `compaction_end` before its grace window can expire.
     pub compaction_after_final_open: bool,
+    /// The drain ladder had to signal the child after a clean terminal
+    /// assistant stop / `agent_settled` (execution.ts:1375
+    /// `forcedDrainAfterFinalSuccess`). The terminal classification then
+    /// reports exit 0 and no process signal; without this, SIGTERM (the rpi
+    /// child exits 143) read as a failed run.
+    pub forced_drain_after_final_success: bool,
 }
 
 pub fn project_child_lifecycle(
@@ -142,6 +148,7 @@ pub fn project_child_lifecycle(
         state.clean_terminal_stop_received = false;
         state.drain_armed = false;
         state.compaction_after_final_open = false;
+        state.forced_drain_after_final_success = false;
         return ChildLifecycleAction::CancelDrain;
     }
     if event_type == Some("agent_end") {
@@ -978,6 +985,18 @@ pub struct ChildRunState {
     pub started_at_ms: Option<u64>,
     /// Terminal-drain / post-final-compaction lifecycle flags.
     pub lifecycle: ChildLifecycleState,
+    /// Resolved tool budget for THIS child (parent-side copy; the child
+    /// enforces the same budget from its env). Drives the live
+    /// `result.toolBudget` projection upstream keeps from
+    /// `tool_execution_start` (execution.ts:1108-1110).
+    pub tool_budget_config: Option<crate::p1::tool_budget::ResolvedToolBudget>,
+    /// Latest `toolBudgetState` projection. `hard-reached` is visible after
+    /// the count passes the hard cap and before a call is actually blocked;
+    /// a blocked toolResult switches it to `hard-blocked` (#2876).
+    pub tool_budget: Option<Value>,
+    /// A toolResult carrying this budget's blocked message was observed
+    /// (`result.toolBudgetBlocked`).
+    pub tool_budget_blocked: bool,
 }
 
 /// One in-flight tool call (`pendingToolResultsByCallId`).
@@ -1000,6 +1019,10 @@ pub struct ToolEndSignal {
     pub mutates: bool,
     pub is_error: bool,
     pub error: String,
+    /// The full result text matched this run's anchored tool-budget block
+    /// message (computed before `error` is clamped for display; the block
+    /// message can exceed the summary limit).
+    pub budget_blocked: bool,
     pub ts: u64,
     pub started_at: Option<u64>,
     pub duration_ms: Option<u64>,
@@ -1066,6 +1089,9 @@ impl Default for ChildRunState {
             seen_control_keys: std::collections::BTreeSet::new(),
             started_at_ms: None,
             lifecycle: ChildLifecycleState::default(),
+            tool_budget_config: None,
+            tool_budget: None,
+            tool_budget_blocked: false,
         }
     }
 }
@@ -1080,6 +1106,61 @@ impl ChildRunState {
             self.last_activity_at = Some(now_ms);
         }
         outcome
+    }
+
+    /// execution.ts:1108-1110: after a tool start, keep `result.toolBudget`
+    /// in sync with the running count; a previously blocked tool stays
+    /// attributed. With a block list narrower than `*`, the count can pass
+    /// the hard cap without any call being blocked — that is exactly the
+    /// `hard-reached` state #2876 added.
+    fn refresh_tool_budget_projection(&mut self) {
+        let Some(budget) = self.tool_budget_config.as_ref() else {
+            return;
+        };
+        let blocked = self
+            .tool_budget
+            .as_ref()
+            .and_then(|state| state.get("blockedTool"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        self.tool_budget = Some(crate::p1::tool_budget::tool_budget_state(
+            budget,
+            self.tool_count,
+            blocked.as_deref(),
+        ));
+    }
+
+    /// #2876 (execution.ts:1191-1209): the child reports a blocked call as a
+    /// toolResult message (`{block:true, reason}` rendered by the host), not
+    /// as an executed tool. The projection switches to `hard-blocked` and
+    /// the count is raised past the hard cap because that call was counted
+    /// without ever reaching `tool_execution_start`.
+    fn observe_tool_result_budget(&mut self, message: &Value) {
+        let Some(budget) = self.tool_budget_config.as_ref() else {
+            return;
+        };
+        let text = message
+            .get("content")
+            .map(super::display::extract_text_from_content)
+            .unwrap_or_default();
+        let named = message
+            .get("toolName")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .or_else(|| crate::p1::tool_budget::classify_blocked_message(budget, &text));
+        let Some(tool) = named else {
+            return;
+        };
+        if !crate::p1::tool_budget::is_tool_budget_blocked_message(budget, &text, Some(&tool)) {
+            return;
+        }
+        self.tool_budget = Some(crate::p1::tool_budget::tool_budget_state(
+            budget,
+            self.tool_count.max(budget.hard + 1),
+            Some(&tool),
+        ));
+        self.tool_budget_blocked = true;
     }
 
     fn process_line_inner(&mut self, line: &str, now_ms: u64) -> LineOutcome {
@@ -1183,6 +1264,7 @@ impl ChildRunState {
                     .map(|_| super::display::extract_tool_args_preview(&tool_args));
                 self.current_tool_started_at = Some(now_ms);
                 self.current_path = path;
+                self.refresh_tool_budget_projection();
                 outcome.progress_event = true;
             }
             "tool_execution_end" => {
@@ -1227,15 +1309,31 @@ impl ChildRunState {
                     _ => false,
                 };
                 if let Some(pending) = pending {
+                    // The child wire wraps an executed tool's result as
+                    // `{"content":[...],"structuredContent":...}`; a
+                    // `tool_result_end` carries the same shape under
+                    // `message`. `extract_text_from_content` accepts the
+                    // content array, so unwrap the object first — otherwise
+                    // every failure text degrades to the generic fallback.
                     let result_text = value
                         .get("result")
-                        .map(super::display::extract_text_from_content)
+                        .map(super::display::extract_tool_result_text)
                         .or_else(|| {
                             value
                                 .get("message")
-                                .map(super::display::extract_text_from_content)
+                                .map(super::display::extract_tool_result_text)
                         })
                         .unwrap_or_default();
+                    // Classify the block against the FULL text: the summary
+                    // keeps the upstream 180-char first line, but the
+                    // anchored matcher must not see a truncated message.
+                    let budget_blocked = self.tool_budget_config.as_ref().is_some_and(|budget| {
+                        crate::p1::tool_budget::is_tool_budget_blocked_message(
+                            budget,
+                            &result_text,
+                            Some(pending.tool.as_str()),
+                        )
+                    });
                     self.recent_tools.push(RecentToolEntry {
                         tool: pending.tool.clone(),
                         args: pending.args.clone(),
@@ -1252,6 +1350,7 @@ impl ChildRunState {
                             .find(|line| !line.trim().is_empty())
                             .map(|line| line.trim().chars().take(180).collect())
                             .unwrap_or_else(|| "mutating tool failed".to_string()),
+                        budget_blocked,
                         ts: now_ms,
                         started_at: Some(pending.started_at),
                         duration_ms: value.get("durationMs").and_then(Value::as_u64),
@@ -1435,6 +1534,9 @@ impl ChildRunState {
                     &super::streaming::recent_output_lines(content),
                 );
             }
+        }
+        if role == "toolResult" {
+            self.observe_tool_result_budget(message);
         }
         outcome.progress_event = true;
         self.messages.push(message.clone());
@@ -2351,6 +2453,145 @@ mod tests {
         assert_eq!(
             format_empty_terminal_assistant_response_error(&[plain]),
             "Subagent produced no output (possible model cold-start or empty response)."
+        );
+    }
+
+    fn budget(
+        hard: u64,
+        block: crate::p1::tool_budget::BlockList,
+    ) -> crate::p1::tool_budget::ResolvedToolBudget {
+        crate::p1::tool_budget::ResolvedToolBudget {
+            hard,
+            soft: None,
+            block,
+        }
+    }
+
+    #[test]
+    fn tool_end_reads_the_failure_reason_out_of_the_result_object() {
+        // The child wire nests an executed tool's result as
+        // `{"content":[...],"structuredContent":...}`. Reading the object as
+        // if it were the content array always produced an empty string, so
+        // every mutating failure degraded to "mutating tool failed".
+        let mut state = ChildRunState::default();
+        state.process_line(
+            r#"{"type":"tool_execution_start","toolCallId":"call-1","toolName":"edit","args":{"path":"src/a.ts"}}"#,
+            1,
+        );
+        let outcome = state.process_line(
+            r#"{"type":"tool_execution_end","toolCallId":"call-1","toolName":"edit","result":{"content":[{"type":"text","text":"EACCES: permission denied"}],"structuredContent":{}},"isError":true}"#,
+            2,
+        );
+        let signal = outcome.tool_end.expect("tool end signal");
+        assert!(signal.mutates, "edit with a path mutates");
+        assert!(signal.is_error);
+        assert_eq!(signal.error, "EACCES: permission denied");
+    }
+
+    #[test]
+    fn tool_end_accepts_a_bare_content_array_and_a_nested_tool_result() {
+        let mut state = ChildRunState::default();
+        state.process_line(
+            r#"{"type":"tool_execution_start","toolCallId":"call-2","toolName":"write","args":{"path":"a.txt"}}"#,
+            1,
+        );
+        let outcome = state.process_line(
+            r#"{"type":"tool_execution_end","toolCallId":"call-2","toolName":"write","result":[{"type":"text","text":"disk full"}],"isError":true}"#,
+            2,
+        );
+        assert_eq!(outcome.tool_end.expect("tool end").error, "disk full");
+
+        let mut state = ChildRunState::default();
+        state.process_line(
+            r#"{"type":"tool_execution_start","toolCallId":"call-3","toolName":"edit","args":{"path":"b.txt"}}"#,
+            1,
+        );
+        let outcome = state.process_line(
+            r#"{"type":"tool_execution_end","toolCallId":"call-3","toolName":"edit","result":{"content":[{"type":"tool_result","content":[{"type":"text","text":"read-only fs"}]}]},"isError":true}"#,
+            2,
+        );
+        assert_eq!(outcome.tool_end.expect("tool end").error, "read-only fs");
+    }
+
+    #[test]
+    fn live_tool_budget_reports_hard_reached_until_a_call_is_blocked() {
+        let mut state = ChildRunState {
+            // A block list narrower than the tools being called: the count
+            // passes the hard cap without a blocked call.
+            tool_budget_config: Some(budget(
+                2,
+                crate::p1::tool_budget::BlockList::Names(vec!["bash".to_string()]),
+            )),
+            ..ChildRunState::default()
+        };
+        for (index, _) in (0..3).enumerate() {
+            state.process_line(
+                &format!(
+                    r#"{{"type":"tool_execution_start","toolCallId":"c{index}","toolName":"read","args":{{"path":"f{index}"}}}}"#
+                ),
+                1 + index as u64,
+            );
+        }
+        let projection = state.tool_budget.expect("projection");
+        assert_eq!(projection["outcome"], "hard-reached", "{projection}");
+        assert_eq!(projection["toolCount"], 3);
+        assert!(projection.get("blockedTool").is_none());
+        assert!(!state.tool_budget_blocked);
+    }
+
+    #[test]
+    fn live_tool_budget_switches_to_hard_blocked_on_the_blocked_tool_result() {
+        let budget = budget(2, crate::p1::tool_budget::BlockList::All);
+        let mut state = ChildRunState {
+            tool_budget_config: Some(budget.clone()),
+            ..ChildRunState::default()
+        };
+        for (index, tool) in ["read", "read", "bash"].into_iter().enumerate() {
+            state.process_line(
+                &format!(
+                    r#"{{"type":"tool_execution_start","toolCallId":"c{index}","toolName":"{tool}","args":{{}}}}"#
+                ),
+                1 + index as u64,
+            );
+        }
+        let blocked = crate::p1::tool_budget::tool_budget_blocked_message(&budget, "bash", 3);
+        let line = serde_json::json!({
+            "type": "message_end",
+            "message": {
+                "role": "toolResult",
+                "toolName": "bash",
+                "content": [{"type": "text", "text": blocked}],
+                "isError": true,
+            }
+        });
+        state.process_line(&line.to_string(), 10);
+        let projection = state.tool_budget.expect("projection");
+        assert_eq!(projection["outcome"], "hard-blocked", "{projection}");
+        assert_eq!(projection["blockedTool"], "bash");
+        assert_eq!(projection["toolCount"], 3);
+        assert!(state.tool_budget_blocked);
+    }
+
+    #[test]
+    fn a_different_budget_block_message_does_not_flip_the_projection() {
+        let mut state = ChildRunState {
+            tool_budget_config: Some(budget(5, crate::p1::tool_budget::BlockList::All)),
+            ..ChildRunState::default()
+        };
+        state.process_line(
+            r#"{"type":"tool_execution_start","toolCallId":"c0","toolName":"bash","args":{"command":"true"}}"#,
+            1,
+        );
+        let foreign = "Tool budget hard limit reached after 99 tool calls (hard 98). The 'bash' tool is blocked so you can finalize from the context you already have.";
+        let line = serde_json::json!({
+            "type": "message_end",
+            "message": {"role": "toolResult", "toolName": "bash", "content": [{"type": "text", "text": foreign}]}
+        });
+        state.process_line(&line.to_string(), 2);
+        assert!(!state.tool_budget_blocked);
+        assert_ne!(
+            state.tool_budget.expect("projection")["outcome"],
+            "hard-blocked"
         );
     }
 

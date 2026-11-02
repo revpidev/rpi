@@ -301,9 +301,14 @@ fn e2e_real_rpi_child_and_stream_fixture() {
     assert_eq!(single["agent"], "reviewer");
     assert_eq!(single["exitCode"], 0);
     assert_eq!(single["context"], "fresh");
-    // Child session file exists under the derived run-0 dir.
-    let session_dir = single["sessionFile"].as_str().unwrap_or("");
-    assert!(!session_dir.is_empty() || result["details"]["artifacts"].is_object());
+    // Child session file exists under the derived run-0 dir. The real child
+    // is the only authority on its filename; the runner must discover and
+    // report it so `status`/`resume` work for a completed fresh run.
+    let session_file = single["sessionFile"].as_str().unwrap_or("");
+    assert!(
+        session_file.ends_with(".jsonl") && Path::new(session_file).is_file(),
+        "fresh run must report its persisted child session: {single}"
+    );
     // Artifacts trail in project mode.
     let artifacts = result["details"]["artifacts"]["dir"]
         .as_str()

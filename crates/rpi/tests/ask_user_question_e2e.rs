@@ -808,9 +808,6 @@ fn find_jsonl(dir: &Path) -> Option<PathBuf> {
         .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
 }
 
-/// FR-A/R-Q5.1/Q5.4/Q5.6: two questions — a multi-select (Space + Next
-/// row) then a single-select — auto-advance onto q2, explicit `Tab`/
-/// `Shift+Tab` tab hopping through the real pipeline, the global note
 /// ADR-0043: an inbound `rpi:ask-user:answer` on the real host bus settles
 /// the open TUI questionnaire, and exactly one answer-result verdict is
 /// emitted (no synthetic keys).
@@ -840,6 +837,9 @@ async fn tui_external_answer_settles_the_open_questionnaire() {
     assert_eq!(verdicts[0]["toolCallId"], json!("tool:1"));
 }
 
+/// FR-A/R-Q5.1/Q5.4/Q5.6: two questions — a multi-select (Space + Next
+/// row) then a single-select — auto-advance onto q2, explicit `Tab`/
+/// `Shift+Tab` tab hopping through the real pipeline, the global note
 /// (`n` on Submit) and Submit; the envelope carries the multi answer, the
 /// option answer and the global note. (`↑` and the per-question notes
 /// editor stay covered by the TE30/TE31 key matrix + golden frames; every

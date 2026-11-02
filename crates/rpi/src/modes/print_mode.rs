@@ -165,11 +165,9 @@ pub async fn run_print_mode(
                 _ => rpi_ext_host::types::ExtensionMode::Print,
             },
         );
-        if host.claim_answer_channel() {
-            crate::modes::interactive::interactive_mode::answer_channel::install_unsupported(
-                &host.event_bus(),
-            );
-        }
+        host.install_answer_channel(std::sync::Arc::new(|bus| {
+            crate::modes::interactive::interactive_mode::answer_channel::install_unsupported(&bus);
+        }));
     }
     // JSON mode: stream each event to stdout as it is emitted
     // (print-mode.ts:108-112 `writeRawStdout(JSON.stringify(toJsonEvent(event)))`).

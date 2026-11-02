@@ -14,8 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rpi_ext_host::api::{CommandContextActions, NavigateTreeOptions, WithSessionFn};
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::InlineExtension;
+use serde_json::json;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -272,4 +274,96 @@ async fn wat_fixture_guest_loads_and_subscribes() {
     let errors = host.load_paths(&[wasm]).await;
     assert!(errors.is_empty(), "{errors:?}");
     assert!(host.has_handlers("session_start"));
+}
+
+/// ADR-0043 / TE51 P0-4: `/reload` swaps in a fresh `ExtensionRuntime` and
+/// `EventBus`. The inbound answer channel must be re-installed on the new
+/// bus; a one-shot "installed" flag silently lost it, so every external
+/// answer after `/reload` got no verdict at all.
+#[tokio::test]
+async fn reload_reinstalls_the_answer_channel_on_the_fresh_bus() {
+    let host = Arc::new(NativeExtensionHost::new("/tmp"));
+    let installs = Arc::new(AtomicU64::new(0));
+    let hits = Arc::new(AtomicU64::new(0));
+    let installer_installs = Arc::clone(&installs);
+    let installer_hits = Arc::clone(&hits);
+    host.install_answer_channel(Arc::new(move |bus| {
+        installer_installs.fetch_add(1, Ordering::SeqCst);
+        let hits = Arc::clone(&installer_hits);
+        let _ = bus.on(
+            "rpi:ask-user:answer",
+            Arc::new(move |_payload| {
+                hits.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+    }));
+    host.event_bus()
+        .emit("rpi:ask-user:answer", json!({ "toolCallId": "a" }));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(installs.load(Ordering::SeqCst), 1);
+
+    host.reload().await;
+    assert_eq!(
+        installs.load(Ordering::SeqCst),
+        2,
+        "reload must re-run the installer"
+    );
+    // The fresh runtime's bus must carry the handler again: with the old
+    // one-shot flag no handler existed here at all.
+    host.event_bus()
+        .emit("rpi:ask-user:answer", json!({ "toolCallId": "b" }));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "the answer channel must be installed on the post-reload bus"
+    );
+}
+
+/// Minimal `ctx.command.*` actions stub for the reload replay assertion.
+struct StubCommandActions;
+
+#[async_trait::async_trait]
+impl CommandContextActions for StubCommandActions {
+    async fn wait_for_idle(&self) {}
+    async fn new_session(
+        &self,
+        _parent_session: Option<String>,
+        _with_session: Option<WithSessionFn>,
+    ) -> bool {
+        false
+    }
+    async fn fork(
+        &self,
+        _entry_id: &str,
+        _position: Option<String>,
+        _with_session: Option<WithSessionFn>,
+    ) -> bool {
+        false
+    }
+    async fn navigate_tree(&self, _target_id: &str, _options: NavigateTreeOptions) -> bool {
+        false
+    }
+    async fn switch_session(
+        &self,
+        _session_path: &str,
+        _with_session: Option<WithSessionFn>,
+    ) -> bool {
+        false
+    }
+    async fn reload(&self) {}
+}
+
+/// `/reload` swaps the runtime, so the mode-bound `ctx.command.*` actions must
+/// be replayed (the interactive/RPC init only sets them once).
+#[tokio::test]
+async fn reload_replays_the_command_context_actions() {
+    let host = Arc::new(NativeExtensionHost::new("/tmp"));
+    assert!(host.runtime().command_actions().is_none());
+    host.set_command_actions(Some(Arc::new(StubCommandActions)));
+    assert!(host.runtime().command_actions().is_some());
+    host.reload().await;
+    assert!(
+        host.runtime().command_actions().is_some(),
+        "the fresh runtime must keep ctx.command.* actions"
+    );
 }

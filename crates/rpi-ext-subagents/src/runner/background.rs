@@ -978,28 +978,6 @@ pub async fn drive_run(
                     object.remove("lastActivityAt");
                 }
             });
-            // The run-level state is an aggregate of the live steps; a clear
-            // tick (child resumed) must clear it too, not only an event.
-            update_status(&status_handle, |status| {
-                let mut needs = false;
-                let mut long = false;
-                if let Some(steps) = status["steps"].as_array() {
-                    for step in steps {
-                        match step["activityState"].as_str() {
-                            Some("needs_attention") => needs = true,
-                            Some("active_long_running") => long = true,
-                            _ => {}
-                        }
-                    }
-                }
-                if needs {
-                    status["activityState"] = json!("needs_attention");
-                } else if long {
-                    status["activityState"] = json!("active_long_running");
-                } else if let Some(object) = status.as_object_mut() {
-                    object.remove("activityState");
-                }
-            });
         }));
         // Long-running-guard notices: status + JSONL + session message +
         // event bus. The foreground guard has already deduped/claimed them.
@@ -1366,6 +1344,32 @@ fn mark_step(handle: &Arc<AsyncRunHandle>, index: usize, state: &str) {
     });
 }
 
+/// Recompute the run-level `activityState` from the steps on every step
+/// write (subagent-runner.ts:2778-2786 `syncAggregateActivityState`). Without
+/// this, a step that finished kept the run in `needs_attention` until
+/// `finish`, and `subagent_wait` (which checks attention before terminal)
+/// could report attention for a completed run in that window.
+fn sync_aggregate_activity_state(status: &mut Value) {
+    let mut needs_attention = false;
+    let mut active_long_running = false;
+    if let Some(steps) = status["steps"].as_array() {
+        for step in steps {
+            match step["activityState"].as_str() {
+                Some("needs_attention") => needs_attention = true,
+                Some("active_long_running") => active_long_running = true,
+                _ => {}
+            }
+        }
+    }
+    if needs_attention {
+        status["activityState"] = json!("needs_attention");
+    } else if active_long_running {
+        status["activityState"] = json!("active_long_running");
+    } else if let Some(object) = status.as_object_mut() {
+        object.remove("activityState");
+    }
+}
+
 fn set_step_field(handle: &Arc<AsyncRunHandle>, index: usize, mutate: impl FnOnce(&mut Value)) {
     update_status(handle, |status| {
         if let Some(steps) = status["steps"].as_array_mut()
@@ -1373,6 +1377,7 @@ fn set_step_field(handle: &Arc<AsyncRunHandle>, index: usize, mutate: impl FnOnc
         {
             mutate(step);
         }
+        sync_aggregate_activity_state(status);
     });
 }
 
@@ -1718,6 +1723,7 @@ pub fn resend_pending_results(calls: &crate::AsyncHostCalls, session_id: Option<
             continue;
         };
         let Ok(result) = serde_json::from_str::<Value>(&raw) else {
+            tracing::warn!(path = %path.display(), "skipping corrupt pending async result");
             continue;
         };
         let Some(run_id) = result["runId"].as_str() else {
@@ -2183,6 +2189,11 @@ pub fn reconcile_stale_runs() {
             continue;
         };
         let Ok(mut status) = serde_json::from_str::<Value>(&raw) else {
+            // FR-D R2: skip one corrupt status, warn, keep sweeping the rest.
+            tracing::warn!(
+                path = %status_path.display(),
+                "skipping corrupt async status during stale-run reconciliation"
+            );
             continue;
         };
         if !matches!(
@@ -2794,19 +2805,15 @@ pub(crate) mod tests {
         .await
         .expect("bounded wait");
         assert!(not_stopped.get("attention").is_none(), "{not_stopped}");
-        // A resumed child clears both step and run activity; the wait must
-        // stop reporting stale attention.
-        update_status(&handle, |status| {
-            status["steps"][0]["status"] = json!("running");
-            if let Some(step) = status["steps"][0].as_object_mut() {
-                step.remove("activityState");
-                step.remove("lastActivityAt");
-            }
-            if let Some(object) = status.as_object_mut() {
-                object.remove("activityState");
-                object.remove("lastActivityAt");
-            }
-        });
+        // A child that ends clears both step and run activity; the wait must
+        // not report stale attention in the window before `finish`. Only the
+        // step result is recorded here — the run-level aggregate must follow
+        // on its own.
+        record_step_result(&handle, 0, &foreground_result(0, None));
+        assert!(
+            status_snapshot(&handle).get("activityState").is_none(),
+            "run-level attention must clear with the step"
+        );
         let cleared = wait_for_runs_with_session_asks(
             Some("te51-wait-attention"),
             false,
@@ -3766,6 +3773,8 @@ pub(crate) mod tests {
             tool_count: 0,
             turns: 1,
             activity_state: None,
+            tool_budget: None,
+            tool_budget_blocked: false,
             control_events: Vec::new(),
             last_activity_at: None,
             duration_ms: 1,

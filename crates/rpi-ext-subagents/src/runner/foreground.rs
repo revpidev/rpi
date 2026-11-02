@@ -78,6 +78,60 @@ const DRAIN_TERM_TO_KILL_MS: u64 = 3000;
 const FINAL_COMPACTION_MAX_MS: u64 = 5 * 60 * 1000;
 const SHUTDOWN_TERM_TO_KILL_MS: u64 = 3000;
 const POST_EXIT_DRAIN_HARD_MS: u64 = 8000;
+/// After a steer is delivered, keep the terminal drain open long enough for
+/// the child to start its follow-up turn (upstream `queuedDrainHold`,
+/// execution.ts:699-720). The child's ack file is the delivery signal; a
+/// pending request file holds the drain until the child consumes it.
+const STEER_DRAIN_HOLD_MS: u64 = 5000;
+/// Upper bound on the contiguous steer hold so an unconsumed inbox file
+/// cannot keep the child alive forever (TE-D55; mirrors the bounded
+/// compaction wait).
+const STEER_DRAIN_HOLD_MAX_MS: u64 = 60_000;
+
+fn file_mtime_ms(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+}
+
+/// `childSessionHasQueuedMessages` approximation for the subprocess model:
+/// a steer request is queued while it sits in the inbox, and a recent ack
+/// means `sendUserMessage` was accepted but the child may not have started
+/// its turn yet. Holding the drain prevents a SIGTERM (now classified as a
+/// successful forced drain) from silently discarding a post-terminal steer.
+fn steer_hold_active(inbox: &std::path::Path, now_ms: u64) -> bool {
+    if let Ok(entries) = std::fs::read_dir(inbox) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "capability.json"
+                || name == "steer-inbox-closed.json"
+                || !name.ends_with(".json")
+            {
+                continue;
+            }
+            return true;
+        }
+    }
+    let Some(ack_dir) = inbox
+        .parent()
+        .and_then(|parent| parent.parent())
+        .map(|control| control.join("steer-acks"))
+    else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(ack_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().to_string();
+        name.ends_with(".json")
+            && file_mtime_ms(&entry.path())
+                .is_some_and(|mtime| now_ms.saturating_sub(mtime) < STEER_DRAIN_HOLD_MS)
+    })
+}
 
 /// Live children registry for the shutdown sweep. `kill_on_drop(true)` covers
 /// future-drop and process-exit; this covers `session_shutdown` events and the
@@ -260,6 +314,10 @@ pub struct ForegroundRunInput {
     pub task_delivery: Option<TaskDelivery>,
     pub cwd: PathBuf,
     pub session_dir: Option<PathBuf>,
+    /// `session_dir` is this run's own derived root (`<runId>` below the
+    /// parent session dir), so a post-run `.jsonl` lookup cannot pick up
+    /// another run's transcript. Explicit/shared roots stay `false`.
+    pub session_dir_is_derived: bool,
     pub session_file: Option<PathBuf>,
     pub model: Option<String>,
     pub thinking: Option<String>,
@@ -335,6 +393,13 @@ pub struct ForegroundRunResult {
     /// Assistant turns (`AgentProgress.turnCount` terminal projection).
     pub turns: u64,
     pub activity_state: Option<crate::runner::control::ActivityState>,
+    /// Live `result.toolBudget` projection (execution.ts:490/1108-1110):
+    /// present whenever this child runs with a budget. Terminal `outcome` is
+    /// `within-budget` / `soft-reached` / `hard-reached` / `hard-blocked`
+    /// (#2876).
+    pub tool_budget: Option<Value>,
+    /// `result.toolBudgetBlocked` (execution.ts:1201-1209).
+    pub tool_budget_blocked: bool,
     pub control_events: Vec<crate::runner::control::ControlEvent>,
     pub last_activity_at: Option<u64>,
     pub duration_ms: u64,
@@ -363,14 +428,15 @@ struct GuardContext {
     agent: String,
     index: u32,
     thinking: Option<String>,
+    /// The launch's resolved budget, so a blocked mutating call is not
+    /// counted as a failure and the tool-end projection stays exact.
+    tool_budget: Option<crate::p1::tool_budget::ResolvedToolBudget>,
+    /// Task text for `ControlEvent.taskPreview` (subagent-control.ts:184;
+    /// execution.ts:914 passes the task on every foreground event).
+    task_preview: Option<String>,
 }
 
 const MUTATING_FAILURE_WINDOW_MS: u64 = 5 * 60 * 1000;
-
-fn is_budget_blocked(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("tool budget") || lower.contains("budget exceeded")
-}
 
 fn control_event_for(
     state: &crate::runner::events::ChildRunState,
@@ -400,6 +466,7 @@ fn control_event_for(
             .current_tool_started_at
             .map(|started| now.saturating_sub(started)),
         current_path: state.current_path.clone(),
+        task_preview: guard.task_preview.clone(),
         recent_failure_summary,
         ..crate::runner::control::ControlEventInput::default()
     })
@@ -563,9 +630,29 @@ fn process_tool_end(
     if !guard.control.enabled || !signal.mutates {
         return events;
     }
-    if !crate::runner::guard::did_mutating_tool_fail(signal.is_error)
-        || is_budget_blocked(&signal.error)
-    {
+    // #2876/#2302: a hard-budget block has its own signal and is not a
+    // failing mutation. The message must match this run's exact shape
+    // (count + hard + tool attribution), never a loose substring: an
+    // ordinary error that merely mentions the budget must not reset the
+    // failure streak. `events` classified the full result text; the guard
+    // check is the fallback for test-constructed signals.
+    let budget_blocked = signal.budget_blocked
+        || guard.tool_budget.as_ref().is_some_and(|budget| {
+            crate::p1::tool_budget::is_tool_budget_blocked_message(
+                budget,
+                &signal.error,
+                Some(signal.tool.as_str()),
+            )
+        });
+    if budget_blocked && let Some(budget) = guard.tool_budget.as_ref() {
+        state.tool_budget = Some(crate::p1::tool_budget::tool_budget_state(
+            budget,
+            state.tool_count.max(budget.hard + 1),
+            Some(signal.tool.as_str()),
+        ));
+        state.tool_budget_blocked = true;
+    }
+    if !crate::runner::guard::did_mutating_tool_fail(signal.is_error) || budget_blocked {
         crate::runner::guard::reset_mutating_failure_state(&mut state.mutating_failures);
         return events;
     }
@@ -756,10 +843,19 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
 
     let run_started = artifacts::now_millis();
     let state = Arc::new(Mutex::new(ChildRunState::default()));
+    let tool_budget = input
+        .tool_budget_env
+        .as_deref()
+        .and_then(crate::p1::tool_budget::budget_from_value);
     {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         state.mutation_tools = input.mutation_tools.clone();
         state.started_at_ms = Some(run_started);
+        state.tool_budget_config = tool_budget.clone();
+        if let Some(budget) = tool_budget.as_ref() {
+            // execution.ts:490: the result starts at `within-budget`.
+            state.tool_budget = Some(crate::p1::tool_budget::tool_budget_state(budget, 0, None));
+        }
     }
     let raw_tail = Arc::new(Mutex::new(BoundedByteTail::new(MAX_CHILD_STDERR_BYTES)));
     // V13-01 (FR-A/FR-B): one persistent write handle per child run instead
@@ -829,7 +925,9 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     // (watchdog/budget triggers — P1 surfaces); the P0 trigger set only starts
     // this ladder on a clean terminal, so no error is recorded here.
     let drain_run_id = input.run_id.clone();
+    let drain_inbox = input.steer_inbox.clone();
     let drain_task = tokio::spawn(async move {
+        let mut steer_hold_since: Option<u64> = None;
         loop {
             tokio::time::sleep(Duration::from_millis(25)).await;
             if drain_exited.load(Ordering::SeqCst) {
@@ -848,6 +946,21 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             };
             let now = artifacts::now_millis();
             let elapsed = now.saturating_sub(armed_at);
+            // Upstream re-arms the final drain while the child session has
+            // queued messages. Without this a steer delivered just after the
+            // terminal stop can be lost to the SIGTERM.
+            if let Some(inbox) = drain_inbox.as_deref()
+                && steer_hold_active(inbox, now)
+            {
+                let since = *steer_hold_since.get_or_insert(now);
+                if now.saturating_sub(since) < STEER_DRAIN_HOLD_MAX_MS {
+                    let mut state = drain_state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.lifecycle.drain_armed_at = Some(now);
+                    continue;
+                }
+            } else {
+                steer_hold_since = None;
+            }
             if compaction_open {
                 if elapsed < FINAL_COMPACTION_MAX_MS {
                     continue;
@@ -862,6 +975,19 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             }
             if drain_exited.load(Ordering::SeqCst) {
                 return;
+            }
+            // Upstream execution.ts:1375 `forcedDrainAfterFinalSuccess`: a
+            // drain forced after a clean terminal stop (or `agent_settled`)
+            // without a child error is a successful run, so the SIGTERM we
+            // are about to send must not classify it as failed. A bounded
+            // compaction that overran (TE-D53) is not silently converted.
+            if !compaction_open {
+                let mut state = drain_state.lock().unwrap_or_else(|e| e.into_inner());
+                if (state.lifecycle.clean_terminal_stop_received || state.agent_settled_received)
+                    && state.assistant_error.is_none()
+                {
+                    state.lifecycle.forced_drain_after_final_success = true;
+                }
             }
             signal_pid(child_pid, Signal::Term);
             tokio::time::sleep(Duration::from_millis(DRAIN_TERM_TO_KILL_MS)).await;
@@ -892,6 +1018,8 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         agent: input.agent_name.clone(),
         index: input.child_index,
         thinking: input.thinking.clone(),
+        tool_budget: tool_budget.clone(),
+        task_preview: (!input.task.is_empty()).then(|| input.task.clone()),
     };
     let frame_sink = input.stream_sink.clone();
     let step_status = input.step_status.clone();
@@ -1428,7 +1556,6 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         persist_artifacts(input, paths, &result, &input.task);
     }
     result.artifact_paths = artifact_paths;
-    result.session_file = input.session_file.clone();
     result
 }
 
@@ -1568,7 +1695,6 @@ async fn finish_detached_child(
         persist_artifacts(&input, paths, &result, &input.task);
     }
     result.artifact_paths = artifact_paths;
-    result.session_file = input.session_file.clone();
     crate::runner::background::finish_detached_with_result(&handle, &result, &notify).await;
     if let Some(slot) = slot {
         crate::runner::background::ActiveAsyncCapacity::open(&ledger_session).release(&slot);
@@ -1698,16 +1824,33 @@ fn synthesize_exit_from_parts(
     duration_ms: u64,
 ) -> ForegroundRunResult {
     let final_output_raw = events::get_final_output(&state.messages);
+    // execution.ts:1375-1383: a clean terminal (or `agent_settled`) followed
+    // by a forced drain is exit 0 and carries no process signal — the drain
+    // is the runner's cleanup, not the child's outcome. The empty-terminal
+    // variant still fails through the empty-output gate below.
+    let forced_drain_after_final_success = state.lifecycle.forced_drain_after_final_success;
+    let forced_drain_after_empty_terminal = forced_drain_after_final_success
+        && events::has_empty_terminal_assistant_response(&state.messages);
 
-    // finalCode = (signal) ? (code ?? 1) : (code ?? 0) — a forced drain after
-    // a clean terminal is upstream's exit-0 case, approximated by a 0 code.
+    // finalCode = (signal) ? (code ?? 1) : (code ?? 0), overridden by a
+    // successful forced drain.
     let mut exit_code = match (code, signal_of_status) {
         (_, Some(_)) => code.unwrap_or(1),
         (Some(0), _) => 0,
         (Some(other), _) => other,
         (None, _) => 1,
     };
-    let process_signal = signal_of_status.map(signal_name);
+    if forced_drain_after_final_success && !forced_drain_after_empty_terminal {
+        exit_code = 0;
+    }
+    // A forced drain is the runner's cleanup, never the child's cause of
+    // death — including the empty-terminal variant, which must surface the
+    // empty-output diagnostic rather than "terminated by signal SIGTERM".
+    let process_signal = if forced_drain_after_final_success {
+        None
+    } else {
+        signal_of_status.map(signal_name)
+    };
 
     let mut error = if timed_out {
         Some(format!(
@@ -1743,7 +1886,13 @@ fn synthesize_exit_from_parts(
             process_signal.clone().unwrap_or_default()
         ));
     }
-    if error.is_none() && exit_code != 0 && !raw_stdout.trim().is_empty() {
+    // A forced drain's 143/signal code must not turn the child's own stdout
+    // into the failure reason (the JSON event stream is not an error).
+    if error.is_none()
+        && exit_code != 0
+        && !forced_drain_after_final_success
+        && !raw_stdout.trim().is_empty()
+    {
         error = Some(raw_stdout.trim().to_string());
     }
 
@@ -1779,6 +1928,13 @@ fn synthesize_exit_from_parts(
         final_output = format!("{timeout_note}\n\nPartial output before timeout:\n{final_output}");
     }
 
+    // A forced drain is exit 0 only when no child error won; the
+    // empty-terminal variant then flows into the empty-output gate and gets
+    // the real diagnostic (upstream `finalCode = forcedDrainAfterFinalSuccess
+    // && !forcedDrainAfterEmptyTerminal ? 0 : ...`).
+    if forced_drain_after_final_success && error.is_none() {
+        exit_code = 0;
+    }
     // Empty terminal response (execution.ts:1449-1468 @ v0.66.0, R7.1.1.2
     // #1921): a clean exit with no final text, or a final assistant message
     // that carries no text, is an empty-output failure. Upstream gates this
@@ -1837,12 +1993,26 @@ fn synthesize_exit_from_parts(
         output_partial,
         tool_count: state.tool_count,
         turns: state.turns,
-        activity_state: None,
+        // Upstream keeps the terminal `progress.activityState` on the result
+        // (it is only cleared by interrupt/abort paths). `None` here threw
+        // away a live `needs_attention`/`active_long_running` value.
+        activity_state: state.activity_state,
+        tool_budget: state.tool_budget.clone(),
+        tool_budget_blocked: state.tool_budget_blocked,
         control_events: state.control_events.clone(),
         last_activity_at: state.last_activity_at,
         duration_ms,
         artifact_paths: None,
-        session_file: None,
+        session_file: input.session_file.clone().or_else(|| {
+            // Fresh children get a host-assigned filename under the derived
+            // per-run root; without this lookup a completed run had no
+            // sessionFile to resume from. Explicit/shared roots are skipped
+            // (the newest .jsonl there may belong to another run).
+            if !input.session_dir_is_derived {
+                return None;
+            }
+            super::foreground_history::newest_session_file(input.session_dir.as_deref()?)
+        }),
         messages: state.messages,
         truncation: truncation_json,
     }
@@ -1869,6 +2039,8 @@ fn failed_result(
         tool_count: 0,
         turns: 0,
         activity_state: None,
+        tool_budget: None,
+        tool_budget_blocked: false,
         control_events: Vec::new(),
         last_activity_at: None,
         duration_ms: start.elapsed().as_millis() as u64,
@@ -1969,6 +2141,8 @@ mod terminal_classification_tests {
             agent: "worker".to_string(),
             index: 0,
             thinking: None,
+            tool_budget: None,
+            task_preview: None,
         }
     }
 
@@ -2029,6 +2203,115 @@ mod terminal_classification_tests {
                 .recent_failure_summary
                 .as_deref()
                 .is_some_and(|summary| summary.contains("edit(src/a.ts)"))
+        );
+    }
+
+    fn test_budget() -> crate::p1::tool_budget::ResolvedToolBudget {
+        crate::p1::tool_budget::ResolvedToolBudget {
+            hard: 2,
+            soft: None,
+            block: crate::p1::tool_budget::BlockList::All,
+        }
+    }
+
+    #[test]
+    fn budget_blocked_mutating_end_is_not_a_failure() {
+        let budget = test_budget();
+        let mut state = crate::runner::events::ChildRunState {
+            tool_count: 3,
+            ..crate::runner::events::ChildRunState::default()
+        };
+        let mut guard = guard();
+        guard.tool_budget = Some(budget.clone());
+        let signal = crate::runner::events::ToolEndSignal {
+            tool: "edit".to_string(),
+            mutates: true,
+            is_error: true,
+            error: crate::p1::tool_budget::tool_budget_blocked_message(&budget, "edit", 3),
+            ts: 220,
+            ..crate::runner::events::ToolEndSignal::default()
+        };
+        assert!(process_tool_end(&mut state, &guard, &signal).is_empty());
+        assert_eq!(state.mutating_failures.consecutive_failures, 0);
+        assert!(state.tool_budget_blocked);
+        assert_eq!(
+            state.tool_budget.expect("projection")["outcome"],
+            "hard-blocked"
+        );
+    }
+
+    #[test]
+    fn an_error_that_merely_mentions_the_budget_still_counts_as_a_failure() {
+        // The old loose substring check treated any error containing
+        // "tool budget" as a block and reset the failure streak.
+        let mut guard = guard();
+        guard.tool_budget = Some(test_budget());
+        let signal = crate::runner::events::ToolEndSignal {
+            tool: "edit".to_string(),
+            path: Some("budget.toml".to_string()),
+            mutates: true,
+            is_error: true,
+            error: "could not read the tool budget file: EACCES".to_string(),
+            ts: 1,
+            ..crate::runner::events::ToolEndSignal::default()
+        };
+        let mut state = crate::runner::events::ChildRunState::default();
+        assert!(process_tool_end(&mut state, &guard, &signal).is_empty());
+        assert_eq!(state.mutating_failures.consecutive_failures, 1);
+        assert!(!state.tool_budget_blocked);
+    }
+
+    #[test]
+    fn terminal_drain_holds_while_a_steer_is_pending_or_recently_delivered() {
+        let root = std::env::temp_dir().join(format!("rpi-sub-steer-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let inbox = root.join("control/steer-targets/0");
+        let acks = root.join("control/steer-acks");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::create_dir_all(&acks).unwrap();
+        let now = crate::artifacts::now_millis();
+        assert!(!steer_hold_active(&inbox, now));
+        // Reserved bookkeeping files never hold the drain.
+        std::fs::write(inbox.join("capability.json"), "{}").unwrap();
+        std::fs::write(inbox.join("steer-inbox-closed.json"), "{}").unwrap();
+        std::fs::write(inbox.join("notes.txt"), "x").unwrap();
+        assert!(!steer_hold_active(&inbox, now));
+        // A queued steer request holds it.
+        std::fs::write(inbox.join("req-1.json"), "{}").unwrap();
+        assert!(steer_hold_active(&inbox, now));
+        std::fs::remove_file(inbox.join("req-1.json")).unwrap();
+        // A just-delivered steer has not started its turn yet.
+        std::fs::write(acks.join("req-1.json"), "{}").unwrap();
+        assert!(steer_hold_active(&inbox, now));
+        assert!(!steer_hold_active(
+            &inbox,
+            now + STEER_DRAIN_HOLD_MS + 1_000
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn control_events_carry_the_task_preview() {
+        let mut guard = guard();
+        guard.task_preview = Some("Fix the parser regression".to_string());
+        let state = crate::runner::events::ChildRunState {
+            started_at_ms: Some(0),
+            last_activity_at: Some(0),
+            turns: 1,
+            ..crate::runner::events::ChildRunState::default()
+        };
+        let event = control_event_for(
+            &state,
+            &guard,
+            150,
+            crate::runner::control::ActivityState::NeedsAttention,
+            "idle",
+            None,
+            None,
+        );
+        assert_eq!(
+            event.task_preview.as_deref(),
+            Some("Fix the parser regression")
         );
     }
 
@@ -2102,6 +2385,7 @@ mod terminal_classification_tests {
             task_delivery: None,
             cwd: std::env::temp_dir(),
             session_dir: None,
+            session_dir_is_derived: false,
             session_file: None,
             model: None,
             thinking: None,
@@ -2217,6 +2501,67 @@ mod terminal_classification_tests {
             result.error.as_deref(),
             Some("Subagent produced no output (possible model cold-start or empty response).")
         );
+    }
+
+    #[test]
+    fn forced_drain_after_an_empty_terminal_surfaces_the_empty_output_error() {
+        let mut state = events::ChildRunState::default();
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"stop","usage":{"output":0}}}"#,
+            0,
+        );
+        state.lifecycle.forced_drain_after_final_success = true;
+        let result = synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            Some(143),
+            None,
+            false,
+            false,
+            None,
+            None,
+            r#"{"type":"agent_start"}"#.to_string(),
+            0,
+        );
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.process_signal, None);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Subagent produced no output (possible model cold-start or empty response).")
+        );
+        assert!(
+            !result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("SIGTERM")
+        );
+    }
+
+    #[test]
+    fn forced_drain_after_a_terminal_reply_is_a_success() {
+        let mut state = events::ChildRunState::default();
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop","usage":{"output":1}}}"#,
+            0,
+        );
+        state.lifecycle.forced_drain_after_final_success = true;
+        let result = synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            Some(143),
+            None,
+            false,
+            false,
+            None,
+            None,
+            String::new(),
+            0,
+        );
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.process_signal, None);
+        assert_eq!(result.error, None);
+        assert_eq!(result.final_output, "done");
     }
 
     /// #2653 (9bc8f2d1): text still streaming when the run times out is

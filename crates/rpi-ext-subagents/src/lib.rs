@@ -995,7 +995,7 @@ async fn steer_inbox_loop(calls: RpiHostCalls, cookie: usize, inbox: PathBuf) {
                 Some("follow_up") => "followUp",
                 _ => "steer",
             };
-            let _ = host_call(
+            if host_call_ok(
                 &calls,
                 cookie,
                 "sendUserMessage",
@@ -1003,7 +1003,14 @@ async fn steer_inbox_loop(calls: RpiHostCalls, cookie: usize, inbox: PathBuf) {
                     "content": message,
                     "options": { "deliverAs": deliver_as },
                 }),
-            );
+            )
+            .is_none()
+            {
+                // Delivery failed: keep the request queued and do NOT ack it
+                // (a failed injection must not look delivered; the bounded
+                // drain hold keeps the child alive for a retry).
+                continue;
+            }
             // Ack + consume.
             if let Some(acks) = inbox.parent() {
                 let ack_dir = acks.parent().map(|p| p.join("steer-acks"));

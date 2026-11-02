@@ -6088,17 +6088,19 @@ impl InteractiveMode {
                 let bridge = Arc::new(ui_bridge::InteractiveUiBridge::new(&self.ui_state));
                 *lock(&self.ui_state.extension_ui_bridge) = Some(Arc::clone(&bridge));
                 host.set_ui(Some(bridge), rpi_ext_host::types::ExtensionMode::Tui);
-                if host.claim_answer_channel() {
-                    answer_channel::install_tui(&host.event_bus(), Arc::downgrade(&self.ui_state));
+                {
+                    let ui = Arc::downgrade(&self.ui_state);
+                    host.install_answer_channel(Arc::new(move |bus| {
+                        answer_channel::install_tui(&bus, ui.clone());
+                    }));
                 }
                 // `bindCommandContext` (agent-session.ts:3338): interactive
                 // `ctx.command.*` actions (V17-11 FR-B R2). The actions hold a
                 // Weak UI and queue on the input inbox; the run loop owns the
                 // actual mutation.
-                host.runtime()
-                    .set_command_actions(Some(Arc::new(InteractiveCommandActions::new(
-                        &self.ui_state,
-                    ))));
+                host.set_command_actions(Some(Arc::new(InteractiveCommandActions::new(
+                    &self.ui_state,
+                ))));
             }
         }
 

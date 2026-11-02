@@ -238,6 +238,15 @@ pub fn snapshot_stream_result(
         map.insert("toolCalls".to_string(), json!(tool_calls));
     }
     map.insert("progress".to_string(), progress);
+    // The terminal result's live tool-budget projection rides in every
+    // streaming snapshot (execution.ts:252-280 copies `result.toolBudget`);
+    // the blocked flag appears only once a call was actually blocked.
+    if let Some(budget) = &state.tool_budget {
+        map.insert("toolBudget".to_string(), budget.clone());
+    }
+    if state.tool_budget_blocked {
+        map.insert("toolBudgetBlocked".to_string(), json!(true));
+    }
     Value::Object(map)
 }
 
@@ -318,6 +327,26 @@ mod tests {
             .to_string(),
             1_300,
         );
+    }
+
+    #[test]
+    fn streamed_result_carries_the_live_tool_budget() {
+        let budget = crate::p1::tool_budget::ResolvedToolBudget {
+            hard: 0,
+            soft: None,
+            block: crate::p1::tool_budget::BlockList::All,
+        };
+        let mut state = ChildRunState {
+            tool_budget_config: Some(budget.clone()),
+            tool_budget: Some(crate::p1::tool_budget::tool_budget_state(&budget, 0, None)),
+            ..ChildRunState::default()
+        };
+        feed_tool_start(&mut state, "read", &json!({"path": "README.md"}));
+        let (_text, details) = single_update_details(&state, &meta(), "fresh", 2_000);
+        let projection = &details["results"][0]["toolBudget"];
+        assert_eq!(projection["outcome"], "hard-reached", "{details}");
+        assert_eq!(projection["toolCount"], 1);
+        assert!(details["results"][0].get("toolBudgetBlocked").is_none());
     }
 
     #[test]

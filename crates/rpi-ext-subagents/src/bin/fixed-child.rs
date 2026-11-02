@@ -39,6 +39,21 @@ fn main() {
     } else {
         mode
     };
+    // TE51 P0-3: emulate the real child's host-assigned session file under
+    // `--session-dir` so the plugin's post-run discovery/resume path can be
+    // exercised end to end.
+    if std::env::var("RPI_E2E_WRITE_SESSION").is_ok() {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(index) = args.iter().position(|arg| arg == "--session-dir")
+            && let Some(dir) = args.get(index + 1)
+        {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(
+                std::path::Path::new(dir).join("fixed-session.jsonl"),
+                "{\"type\":\"session\",\"version\":3,\"id\":\"fixed\"}\n",
+            );
+        }
+    }
     if let Ok(dump_dir) = std::env::var("RPI_E2E_DUMP_DIR") {
         // TE05: parallel children dump into `child-<index>/` alongside the
         // flat files (flat keeps the P0 single-run assertions stable;
@@ -149,6 +164,21 @@ fn main() {
                 r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"terminal end reply"}],"usage":{"input":10,"output":4,"cost":{"total":0.01}},"model":"faux/fixed-1","stopReason":"stop"}}"#,
             );
             emit(&mut out, r#"{"type":"agent_end","willRetry":false}"#);
+        }
+        // TE51 review P0-2: the child delivers its final answer and then
+        // stays alive past the 1s terminal-drain grace. The runner SIGTERMs
+        // it; a forced drain after a clean terminal is a successful run
+        // (exit 0, no process signal) and must keep the reply.
+        "terminal-end-stay" => {
+            emit(
+                &mut out,
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"reply after terminal stay"}],"usage":{"input":10,"output":4,"cost":{"total":0.01}},"model":"faux/fixed-1","stopReason":"stop"}}"#,
+            );
+            emit(&mut out, r#"{"type":"agent_end","willRetry":false}"#);
+            // The runner only sees the terminal events once they are flushed.
+            let _ = out.flush();
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+            emit(&mut out, r#"{"type":"agent_settled"}"#);
         }
         // TE51 FR-J R2: a compaction starts after that terminal `agent_end`
         // and finishes before the process exits — the reply must survive it.

@@ -15,9 +15,9 @@
 //! owner is dead is rewritten as `stopped` with the discovered child session
 //! file, which `subagent({action:"resume", id})` can revive. Final saves
 //! replace the running record; a launch that fails before spawning discards
-//! it. Composite foreground runs are not admitted yet (their child session
-//! files are resolved per index; the single-run case is the resumable one
-//! upstream also admits at launch).
+//! it. Composite `parallel`/`chain` runs are admitted with one child entry
+//! per index (rpi extension, TE-D54; upstream reads the same record shape
+//! but only writes single-run records in v0.83.0).
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -62,7 +62,7 @@ fn bounded_output(value: &str) -> String {
 
 /// Newest `.jsonl` session file under `dir`, if any (the child's session
 /// filename is host-assigned, so the launch record only knows the directory).
-fn newest_session_file(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn newest_session_file(dir: &Path) -> Option<PathBuf> {
     fn walk(dir: &Path, best: &mut Option<(SystemTime, PathBuf)>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -106,12 +106,30 @@ fn write_record(run_id: &str, record: &Value) -> Result<(), String> {
 }
 
 fn read_record(path: &Path) -> Option<Value> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let record: Value = serde_json::from_str(&raw).ok()?;
-    record["runId"].as_str()?;
-    record["children"]
-        .as_array()
-        .filter(|children| !children.is_empty())?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "failed to read foreground run history");
+            return None;
+        }
+    };
+    let record: Value = match serde_json::from_str(&raw) {
+        Ok(record) => record,
+        Err(error) => {
+            // FR-D R2: a corrupt record is skipped, but never silently.
+            tracing::warn!(path = %path.display(), %error, "skipping corrupt foreground run history");
+            return None;
+        }
+    };
+    if record["runId"].as_str().is_none()
+        || record["children"]
+            .as_array()
+            .is_none_or(|children| children.is_empty())
+    {
+        tracing::warn!(path = %path.display(), "skipping malformed foreground run history");
+        return None;
+    }
     Some(record)
 }
 
@@ -130,45 +148,106 @@ pub struct ForegroundRunMeta<'a> {
     pub session_file: Option<&'a Path>,
 }
 
+/// One child in a launch-time record.
+pub struct ForegroundRunningChild<'a> {
+    pub index: usize,
+    pub agent: &'a str,
+    pub child_cwd: &'a Path,
+    pub model: Option<&'a str>,
+    pub thinking: Option<&'a str>,
+    /// Per-run session root (unique) or `None` for an explicit shared root.
+    pub session_dir: Option<&'a Path>,
+    /// Exact resume/continuation file when known (explicit `sessionFile`).
+    pub session_file: Option<&'a Path>,
+}
+
+/// One child in a final record.
+pub struct ForegroundFinalChild<'a> {
+    pub index: usize,
+    pub agent: &'a str,
+    pub child_cwd: &'a Path,
+    pub model: Option<&'a str>,
+    pub thinking: Option<&'a str>,
+    pub session_dir: Option<&'a Path>,
+    pub result: &'a crate::runner::foreground::ForegroundRunResult,
+}
+
 /// Launch-time record for one single foreground child.
 pub fn persist_running(meta: &ForegroundRunMeta<'_>) {
+    persist_running_children(
+        meta.run_id,
+        meta.session_id,
+        meta.cwd,
+        "single",
+        &[ForegroundRunningChild {
+            index: 0,
+            agent: meta.agent,
+            child_cwd: meta.child_cwd,
+            model: meta.model,
+            thinking: meta.thinking,
+            session_dir: meta.session_dir,
+            session_file: meta.session_file,
+        }],
+    );
+}
+
+/// Launch-time record for a composite (`parallel` / `chain`) foreground run.
+/// Upstream's run history admits `single`/`parallel`/`chain` records
+/// (foreground-history.ts:135-152); rpi keeps the same per-child shape so a
+/// host exit before the batch finishes leaves every child resumable.
+pub fn persist_running_children(
+    run_id: &str,
+    session_id: Option<&str>,
+    cwd: &Path,
+    mode: &str,
+    children: &[ForegroundRunningChild<'_>],
+) {
     // Upstream `compactRun` refuses records without a session id; a record
     // that no session can resolve is worse than no record.
-    let Some(session_id) = meta.session_id.filter(|id| !id.is_empty()) else {
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
         return;
     };
-    let mut child = json!({
-        "agent": meta.agent,
-        "index": 0,
-        "status": "running",
-        "cwd": meta.child_cwd.to_string_lossy(),
-    });
-    if let Some(dir) = meta.session_dir {
-        child["sessionDir"] = json!(dir.to_string_lossy());
+    if children.is_empty() {
+        return;
     }
-    if let Some(file) = meta.session_file {
-        child["sessionFile"] = json!(file.to_string_lossy());
-    }
-    if let Some(model) = meta.model {
-        child["model"] = json!(model);
-    }
-    if let Some(thinking) = meta.thinking {
-        child["thinking"] = json!(thinking);
-    }
+    let children: Vec<Value> = children
+        .iter()
+        .map(|child| {
+            let mut value = json!({
+                "agent": child.agent,
+                "index": child.index,
+                "status": "running",
+                "cwd": child.child_cwd.to_string_lossy(),
+            });
+            if let Some(dir) = child.session_dir {
+                value["sessionDir"] = json!(dir.to_string_lossy());
+            }
+            if let Some(file) = child.session_file {
+                value["sessionFile"] = json!(file.to_string_lossy());
+            }
+            if let Some(model) = child.model {
+                value["model"] = json!(model);
+            }
+            if let Some(thinking) = child.thinking {
+                value["thinking"] = json!(thinking);
+            }
+            value
+        })
+        .collect();
     let record = json!({
-        "runId": meta.run_id,
-        "mode": "single",
-        "cwd": meta.cwd.to_string_lossy(),
+        "runId": run_id,
+        "mode": mode,
+        "cwd": cwd.to_string_lossy(),
         "sessionId": session_id,
         "updatedAt": now_millis(),
         "owner": {
             "pid": std::process::id(),
             "bootId": process_boot_id(std::process::id() as u64),
         },
-        "children": [child],
+        "children": children,
     });
-    if let Err(error) = write_record(meta.run_id, &record) {
-        tracing::warn!(run = %meta.run_id, %error, "failed to persist foreground run history");
+    if let Err(error) = write_record(run_id, &record) {
+        tracing::warn!(run = %run_id, %error, "failed to persist foreground run history");
     }
 }
 
@@ -177,9 +256,54 @@ pub fn persist_final(
     meta: &ForegroundRunMeta<'_>,
     result: &crate::runner::foreground::ForegroundRunResult,
 ) {
-    let Some(session_id) = meta.session_id.filter(|id| !id.is_empty()) else {
+    persist_final_children(
+        meta.run_id,
+        meta.session_id,
+        meta.cwd,
+        "single",
+        &[ForegroundFinalChild {
+            index: 0,
+            agent: meta.agent,
+            child_cwd: meta.child_cwd,
+            model: meta.model,
+            thinking: meta.thinking,
+            session_dir: meta.session_dir,
+            result,
+        }],
+    );
+}
+
+/// Final record for a composite (`parallel` / `chain`) foreground run.
+pub fn persist_final_children(
+    run_id: &str,
+    session_id: Option<&str>,
+    cwd: &Path,
+    mode: &str,
+    children: &[ForegroundFinalChild<'_>],
+) {
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
         return;
     };
+    if children.is_empty() {
+        return;
+    }
+    let values: Vec<Value> = children.iter().map(final_child_json).collect();
+    let record = json!({
+        "runId": run_id,
+        "mode": mode,
+        "cwd": cwd.to_string_lossy(),
+        "sessionId": session_id,
+        "updatedAt": now_millis(),
+        "children": values,
+    });
+    if let Err(error) = write_record(run_id, &record) {
+        tracing::warn!(run = %run_id, %error, "failed to persist foreground run history");
+    }
+    prune();
+}
+
+fn final_child_json(child: &ForegroundFinalChild<'_>) -> Value {
+    let result = child.result;
     let status = if result.exit_code == 0
         && result.error.is_none()
         && !result.timed_out
@@ -189,48 +313,43 @@ pub fn persist_final(
     } else {
         "failed"
     };
-    let mut child = json!({
-        "agent": meta.agent,
-        "index": 0,
+    let mut value = json!({
+        "agent": child.agent,
+        "index": child.index,
         "status": status,
-        "cwd": meta.child_cwd.to_string_lossy(),
+        "cwd": child.child_cwd.to_string_lossy(),
         "exitCode": result.exit_code,
         "timedOut": result.timed_out,
         "finalOutput": bounded_output(&result.final_output),
     });
-    if let Some(model) = result.model.as_deref().or(meta.model) {
-        child["model"] = json!(model);
+    if let Some(model) = result.model.as_deref().or(child.model) {
+        value["model"] = json!(model);
     }
-    if let Some(thinking) = result.thinking.as_deref().or(meta.thinking) {
-        child["thinking"] = json!(thinking);
+    if let Some(thinking) = result.thinking.as_deref().or(child.thinking) {
+        value["thinking"] = json!(thinking);
     }
     if let Some(error) = &result.error {
-        child["error"] = json!(error);
+        value["error"] = json!(error);
     }
     if let Some(signal) = &result.process_signal {
-        child["processSignal"] = json!(signal);
+        value["processSignal"] = json!(signal);
+    }
+    // Keep the derived per-run root on the final record too: a later
+    // `restore`-style fallback can find the child session even if the host
+    // changed its filename, and `status` keeps the launch shape.
+    if let Some(dir) = child.session_dir {
+        value["sessionDir"] = json!(dir.to_string_lossy());
     }
     if let Some(path) = &result.session_file {
-        child["sessionFile"] = json!(path.to_string_lossy());
+        value["sessionFile"] = json!(path.to_string_lossy());
     }
     if let Some(paths) = &result.artifact_paths {
-        child["artifactPaths"] = paths.to_json();
+        value["artifactPaths"] = paths.to_json();
     }
     if result.output_partial {
-        child["outputPartial"] = json!(true);
+        value["outputPartial"] = json!(true);
     }
-    let record = json!({
-        "runId": meta.run_id,
-        "mode": "single",
-        "cwd": meta.cwd.to_string_lossy(),
-        "sessionId": session_id,
-        "updatedAt": now_millis(),
-        "children": [child],
-    });
-    if let Err(error) = write_record(meta.run_id, &record) {
-        tracing::warn!(run = %meta.run_id, %error, "failed to persist foreground run history");
-    }
-    prune();
+    value
 }
 
 /// Drop a running record for a launch that never spawned a child.
@@ -462,15 +581,60 @@ fn prune() {
     }
 }
 
-/// The resumable child of a remembered record: the last child with a
-/// persisted session file. `None` when there is nothing to revive.
-pub fn resumable_child(record: &Value) -> Option<&Value> {
-    let children = record["children"].as_array()?;
-    children.iter().rev().find(|child| {
-        child["sessionFile"]
-            .as_str()
-            .is_some_and(|path| path.ends_with(".jsonl") && Path::new(path).is_file())
-    })
+/// Select the child a resume revives (`resolveForegroundResumeTarget`,
+/// subagent-executor.ts:987-1027): a multi-child (`parallel`/`chain`) run
+/// requires an explicit index; the single-child run defaults to index 0.
+/// Every failure names the offending child and file.
+pub fn child_for_resume(record: &Value, index: Option<usize>) -> Result<&Value, String> {
+    let run_id = record["runId"].as_str().unwrap_or("?");
+    let Some(children) = record["children"].as_array() else {
+        return Err(format!(
+            "Foreground run '{run_id}' does not have a persisted child session to resume from."
+        ));
+    };
+    // Upstream refuses to revive a run with any detached child while it may
+    // still be live (subagent-executor.ts:997).
+    if children
+        .iter()
+        .any(|child| child["status"].as_str() == Some("detached"))
+    {
+        return Err(format!(
+            "Foreground run '{run_id}' is detached for intercom coordination and cannot be revived safely while any child may still be live. Reply to the supervisor request first, then wait with bg_wait({{ id: \"{run_id}\" }}); use status to recover the result and do not launch a replacement while it remains detached."
+        ));
+    }
+    if children.len() > 1 && index.is_none() {
+        return Err(format!(
+            "Foreground run '{run_id}' has {} children. Provide index to choose one.",
+            children.len()
+        ));
+    }
+    let index = index.unwrap_or(0);
+    if index >= children.len() {
+        return Err(format!(
+            "Foreground run '{run_id}' has {} children. Index {index} is out of range.",
+            children.len()
+        ));
+    }
+    let child = &children[index];
+    let Some(path) = child["sessionFile"]
+        .as_str()
+        .filter(|path| !path.is_empty())
+    else {
+        return Err(format!(
+            "Foreground run '{run_id}' child {index} does not have a persisted session file to resume from."
+        ));
+    };
+    if !path.ends_with(".jsonl") {
+        return Err(format!(
+            "Foreground run '{run_id}' child {index} session file must be a .jsonl file: {path}"
+        ));
+    }
+    if !Path::new(path).is_file() {
+        return Err(format!(
+            "Foreground run '{run_id}' child {index} session file does not exist: {path}"
+        ));
+    }
+    Ok(child)
 }
 
 #[cfg(test)]
@@ -561,7 +725,141 @@ mod tests {
             "runId": "fg-none",
             "children": [{ "agent": "worker", "index": 0, "status": "stopped" }],
         });
-        assert!(resumable_child(&record).is_none());
+        assert!(child_for_resume(&record, None).is_err());
+    }
+
+    #[test]
+    fn composite_resume_requires_an_index_and_selects_that_child() {
+        let dir = temp_root("composite-resume");
+        let first = dir.join("first.jsonl");
+        let second = dir.join("second.jsonl");
+        std::fs::write(&first, "{}").unwrap();
+        std::fs::write(&second, "{}").unwrap();
+        let record = json!({
+            "runId": "fg-composite",
+            "mode": "parallel",
+            "cwd": "/tmp",
+            "sessionId": "session-a",
+            "children": [
+                { "agent": "scout", "index": 0, "status": "completed",
+                  "sessionFile": first.to_string_lossy() },
+                { "agent": "worker", "index": 1, "status": "failed",
+                  "sessionFile": second.to_string_lossy() },
+            ],
+        });
+        let error = child_for_resume(&record, None).unwrap_err();
+        assert!(
+            error.contains("has 2 children. Provide index to choose one."),
+            "{error}"
+        );
+        assert_eq!(
+            child_for_resume(&record, Some(1)).unwrap()["agent"],
+            json!("worker")
+        );
+        let error = child_for_resume(&record, Some(2)).unwrap_err();
+        assert!(error.contains("Index 2 is out of range"), "{error}");
+        let missing = json!({
+            "runId": "fg-composite",
+            "mode": "chain",
+            "children": [
+                { "agent": "scout", "index": 0, "status": "completed" },
+                { "agent": "worker", "index": 1, "status": "failed" },
+            ],
+        });
+        let error = child_for_resume(&missing, Some(1)).unwrap_err();
+        assert!(
+            error.contains("child 1 does not have a persisted session file"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn composite_history_round_trips_children_and_session_files() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = temp_root("composite-history");
+        let first = dir.join("first.jsonl");
+        let second = dir.join("second.jsonl");
+        std::fs::write(&first, "{}").unwrap();
+        std::fs::write(&second, "{}").unwrap();
+        let run_id = format!("fg-composite-history-{}", now_millis());
+        let child_path = dir.join("child");
+        let ok = crate::runner::foreground::ForegroundRunResult {
+            exit_code: 0,
+            final_output: "first output".to_string(),
+            model: Some("faux/1".to_string()),
+            session_file: Some(first.clone()),
+            ..Default::default()
+        };
+        let failed = crate::runner::foreground::ForegroundRunResult {
+            exit_code: 1,
+            error: Some("boom".to_string()),
+            final_output: "second output".to_string(),
+            session_file: Some(second.clone()),
+            ..Default::default()
+        };
+        let running = [
+            ForegroundRunningChild {
+                index: 0,
+                agent: "scout",
+                child_cwd: &child_path,
+                model: None,
+                thinking: None,
+                session_dir: Some(&dir),
+                session_file: None,
+            },
+            ForegroundRunningChild {
+                index: 1,
+                agent: "worker",
+                child_cwd: &child_path,
+                model: None,
+                thinking: None,
+                session_dir: Some(&dir),
+                session_file: None,
+            },
+        ];
+        persist_running_children(&run_id, Some("session-a"), &dir, "parallel", &running);
+        let record = find(&run_id).expect("running record");
+        assert_eq!(record["mode"], json!("parallel"));
+        assert_eq!(record["children"].as_array().unwrap().len(), 2);
+        assert_eq!(record["children"][1]["status"], json!("running"));
+
+        let finals = [
+            ForegroundFinalChild {
+                index: 0,
+                agent: "scout",
+                child_cwd: &child_path,
+                model: None,
+                thinking: None,
+                session_dir: Some(&dir),
+                result: &ok,
+            },
+            ForegroundFinalChild {
+                index: 1,
+                agent: "worker",
+                child_cwd: &child_path,
+                model: None,
+                thinking: None,
+                session_dir: Some(&dir),
+                result: &failed,
+            },
+        ];
+        persist_final_children(&run_id, Some("session-a"), &dir, "parallel", &finals);
+        let record = find(&run_id).expect("final record");
+        assert_eq!(record["children"][0]["status"], json!("completed"));
+        assert_eq!(record["children"][1]["status"], json!("failed"));
+        assert_eq!(
+            record["children"][1]["sessionFile"],
+            json!(second.to_string_lossy())
+        );
+        assert!(
+            child_for_resume(&record, Some(1)).is_ok(),
+            "final composite record must resolve its failed child"
+        );
+        assert_eq!(
+            list_for_session(Some("session-a"), 10)[0]["runId"],
+            json!(run_id)
+        );
+        let _ = record_path(&run_id).map(std::fs::remove_file);
     }
 
     #[test]
@@ -610,7 +908,10 @@ mod tests {
                 "sessionFile": session.to_string_lossy(),
             }],
         });
-        assert!(resumable_child(&record).is_none(), "non-jsonl rejected");
+        assert!(
+            child_for_resume(&record, None).is_err(),
+            "non-jsonl rejected"
+        );
         let jsonl = dir.join("session.jsonl");
         std::fs::write(&jsonl, "{}").unwrap();
         let record = json!({
@@ -622,7 +923,7 @@ mod tests {
                 "sessionFile": jsonl.to_string_lossy(),
             }],
         });
-        assert!(resumable_child(&record).is_some(), "jsonl accepted");
+        assert!(child_for_resume(&record, None).is_ok(), "jsonl accepted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

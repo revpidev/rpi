@@ -206,7 +206,6 @@ fn blocked_message_parts(text: &str) -> Option<(u64, u64, String)> {
 /// `isToolBudgetBlockedMessage` (tool-budget.ts:76-84): the whole message
 /// must match the runtime format AND the embedded hard limit and tool name
 /// must belong to this run.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_tool_budget_blocked_message(
     budget: &ResolvedToolBudget,
     result_text: &str,
@@ -297,10 +296,16 @@ pub fn budget_to_env_value(budget: &ResolvedToolBudget) -> String {
 /// parent's admission already validated the raw config).
 pub fn budget_from_env() -> Option<ResolvedToolBudget> {
     let raw = std::env::var(TOOL_BUDGET_ENV).ok()?;
+    budget_from_value(&raw)
+}
+
+/// Decode the encoded budget form (the value the parent writes into the
+/// child env and keeps for its own live `toolBudget` projection).
+pub fn budget_from_value(raw: &str) -> Option<ResolvedToolBudget> {
     if raw.trim().is_empty() {
         return None;
     }
-    let value: Value = serde_json::from_str(&raw).ok()?;
+    let value: Value = serde_json::from_str(raw).ok()?;
     validate_tool_budget_config(Some(&value), "toolBudget")
         .ok()
         .flatten()

@@ -441,6 +441,45 @@ pub fn try_fork_session(ctx: &RunCtx, branch_file: &Path, effective_cwd: &Path) 
     }
 }
 
+/// Project-tree prompt overlays (agent memory + refinement guidance).
+/// An untrusted project contributes none of these: the management path
+/// already refuses to read/write refinements there, and the launch path must
+/// match it instead of failing open.
+fn project_prompt_overlays(
+    ctx: &RunCtx,
+    agent: &AgentConfig,
+    effective_cwd: &std::path::Path,
+) -> Vec<String> {
+    let mut overlays = Vec::new();
+    let project_memory_allowed = ctx.project_trusted != Some(false)
+        || agent
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.scope == "user");
+    if let Some(memory) = &agent.memory
+        && project_memory_allowed
+        && let Some(dir) = memory.resolve_dir(effective_cwd, &agent.name)
+        && let Some(text) = discover::read_agent_memory_file(&dir)
+    {
+        let writable = agent
+            .tools
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .any(|t| matches!(t.as_str(), "edit" | "write" | "bash"))
+            })
+            .unwrap_or(false);
+        overlays.push(discover::build_agent_memory_injection(&text, writable));
+    }
+    if ctx.project_trusted != Some(false)
+        && let Some(overlay) = crate::actions::agent_refinement_overlay(effective_cwd, &agent.name)
+    {
+        overlays.push(overlay);
+    }
+    overlays
+}
+
 /// Launch one child to completion (foreground, with model fallback chain).
 /// Synchronous entry for the single-run path (host dispatch thread).
 pub fn run_child(
@@ -749,35 +788,15 @@ pub async fn run_child_async(
             system_prompt = format!("{system_prompt}\n\n{injection}");
         }
     }
-    // Per-agent memory injection (FR-P1-08, agent-memory.ts:193): the
-    // MEMORY.md head rides the system prompt; write tools switch the block
-    // to read-write.
-    if let Some(memory) = &agent.memory
-        && let Some(dir) = memory.resolve_dir(&effective_cwd, &agent.name)
-        && let Some(text) = discover::read_agent_memory_file(&dir)
-    {
-        let writable = agent
-            .tools
-            .as_ref()
-            .map(|tools| {
-                tools
-                    .iter()
-                    .any(|t| matches!(t.as_str(), "edit" | "write" | "bash"))
-            })
-            .unwrap_or(false);
-        let injection = discover::build_agent_memory_injection(&text, writable);
+    // Project-scoped prompt overlays (FR-P1-08): per-agent MEMORY.md and the
+    // project refinement guidance. Both are read from the project tree, so an
+    // untrusted project contributes neither (user-scoped memory is not a
+    // project resource and stays).
+    for injection in project_prompt_overlays(ctx, agent, &effective_cwd) {
         if system_prompt.is_empty() {
             system_prompt = injection;
         } else {
             system_prompt = format!("{system_prompt}\n\n{injection}");
-        }
-    }
-    // Project refinement overlay (FR-P1-08, execution.ts:1492).
-    if let Some(overlay) = crate::actions::agent_refinement_overlay(&effective_cwd, &agent.name) {
-        if system_prompt.is_empty() {
-            system_prompt = overlay;
-        } else {
-            system_prompt = format!("{system_prompt}\n\n{overlay}");
         }
     }
 
@@ -972,6 +991,7 @@ pub async fn run_child_async(
         task_delivery: None,
         cwd: effective_cwd.clone(),
         session_dir,
+        session_dir_is_derived: ctx.session_root_is_derived,
         session_file,
         model: candidates.first().cloned(),
         thinking,
@@ -1020,6 +1040,16 @@ pub async fn run_child_async(
     // authoritative tool attribution, with the final output / error text as
     // fallbacks.
     let tool_budget_report: Option<Value> = effective_tool_budget.as_ref().and_then(|budget| {
+        // The event stream maintains the projection (tool starts + blocked
+        // toolResult). Keep a transcript fallback for truncated/oversized
+        // event streams, and let a blocked message win over a projection that
+        // missed it.
+        let live = result.tool_budget.clone().unwrap_or_else(|| {
+            crate::p1::tool_budget::tool_budget_state(budget, result.tool_count, None)
+        });
+        if result.tool_budget_blocked {
+            return Some(live);
+        }
         let from_transcript: Option<String> = result
             .messages
             .iter()
@@ -1266,6 +1296,114 @@ mod te18_fork_tests {
             abort_probe: None,
             detach_ctx: None,
         }
+    }
+
+    fn prompt_agent(memory: Option<crate::agents::discover::MemoryConfig>) -> AgentConfig {
+        AgentConfig {
+            name: "scout".to_string(),
+            local_name: "scout".to_string(),
+            package_name: None,
+            description: "d".to_string(),
+            aliases: None,
+            tools: None,
+            exclude_tools: Vec::new(),
+            mcp_direct_tools: Vec::new(),
+            mutation_tools: Vec::new(),
+            model: None,
+            allowed_agents: None,
+            thinking: crate::agents::discover::ThinkingSpec::Unset,
+            system_prompt_mode: "replace",
+            inherit_project_context: true,
+            inherit_skills: false,
+            default_context: None,
+            default_async: None,
+            default_timeout_ms: None,
+            system_prompt: String::new(),
+            source: crate::agents::discover::AgentSource::Project,
+            file_path: PathBuf::from("/tmp/scout.md"),
+            skills: Vec::new(),
+            extensions: None,
+            subagent_only_extensions: None,
+            output: None,
+            output_mode: None,
+            advertise: None,
+            allow_nested_subagents: None,
+            model_provider: None,
+            default_reads: Vec::new(),
+            default_progress: false,
+            max_subagent_depth: None,
+            disabled: None,
+            acceptance_role: None,
+            memory,
+            frontmatter_fields: Default::default(),
+        }
+    }
+
+    fn project_fixture(name: &str, with_memory: bool) -> (PathBuf, AgentConfig) {
+        let root =
+            std::env::temp_dir().join(format!("rpi-sub-trust-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let refinement = root
+            .join(".rpi")
+            .join("subagents")
+            .join("refinements")
+            .join("scout.md");
+        std::fs::create_dir_all(refinement.parent().unwrap()).unwrap();
+        std::fs::write(
+            &refinement,
+            "---\nagent: scout\nrevision: 1\n---\n\n```rpi-subagents-refinement-current\nPrefer small patches.\n```\n\n```rpi-subagents-refinement-snapshots-json\n[]\n```\n",
+        )
+        .unwrap();
+        let memory = with_memory.then(|| {
+            let dir = root
+                .join(".rpi")
+                .join("agent-memory")
+                .join("notes")
+                .join("scout");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("MEMORY.md"),
+                "# Memory\n- remember the parser fix\n",
+            )
+            .unwrap();
+            crate::agents::discover::MemoryConfig {
+                scope: "project",
+                path: "notes".to_string(),
+            }
+        });
+        (root, prompt_agent(memory))
+    }
+
+    #[test]
+    fn untrusted_project_contributes_no_refinement_or_project_memory() {
+        let (root, agent) = project_fixture("untrusted", true);
+        let mut ctx = ctx_with(None, None);
+        ctx.project_trusted = Some(false);
+        let overlays = project_prompt_overlays(&ctx, &agent, &root);
+        assert!(
+            overlays.is_empty(),
+            "untrusted project must not inject project overlays: {overlays:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trusted_project_still_injects_refinement_and_project_memory() {
+        let (root, agent) = project_fixture("trusted", true);
+        let mut ctx = ctx_with(None, None);
+        ctx.project_trusted = Some(true);
+        let overlays = project_prompt_overlays(&ctx, &agent, &root);
+        assert_eq!(overlays.len(), 2, "{overlays:?}");
+        assert!(
+            overlays[0].contains("remember the parser fix"),
+            "memory first, then refinement: {overlays:?}"
+        );
+        assert!(
+            overlays[1].contains("<rpi-subagents-refinement"),
+            "{overlays:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

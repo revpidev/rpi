@@ -463,6 +463,31 @@ fn e2e_fixed_child_full_pipeline() {
     assert_eq!(result["isError"], Value::Bool(false), "{result}");
     assert_eq!(result["content"][0]["text"], json!("terminal end reply"));
 
+    // TE51 review P0-2: a child that stays alive after its final answer is
+    // SIGTERMed by the terminal-drain ladder. The forced drain after a clean
+    // terminal must classify as exit 0 / no signal, with the reply intact.
+    rpi_test_env::set_var("RPI_E2E_MODE", "terminal-end-stay");
+    let started = std::time::Instant::now();
+    let result = execute(json!({ "agent": "scout", "task": "stay after final reply" }));
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(900),
+        "the drain grace must have elapsed before the child was terminated"
+    );
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    assert_eq!(
+        result["content"][0]["text"],
+        json!("reply after terminal stay")
+    );
+    assert_eq!(
+        result["details"]["results"][0]["exitCode"],
+        json!(0),
+        "a forced drain after final success is exit 0: {result}"
+    );
+    assert!(
+        result["details"]["results"][0]["processSignal"].is_null(),
+        "the drain signal must not surface as the child's outcome: {result}"
+    );
+
     // A compaction that starts after that terminal event and finishes before
     // exit must not drop or delay the reply.
     rpi_test_env::set_var("RPI_E2E_MODE", "terminal-agent-end-compaction");
@@ -590,6 +615,123 @@ fn e2e_fixed_child_full_pipeline() {
         "context reflects the degraded mode"
     );
     assert_eq!(single["exitCode"], 0);
+
+    // ---- Scenario 2b: fresh run records its host-assigned session -------
+    // TE51 review P0-3: a fresh child gets its session file from the child
+    // host under the derived per-run root. The final record must carry it so
+    // `status`/`resume` work for a completed run, not only for interrupted
+    // ones restored through sessionDir.
+    let sessions = sandbox.root.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let parent_session = sessions.join("20260814_parent-abc12345.jsonl");
+    std::fs::write(
+        &parent_session,
+        r#"{"type":"session","version":3,"id":"abc12345","timestamp":"2026-08-14T00:00:00.000Z"}"#,
+    )
+    .unwrap();
+    *host.session_file.lock().unwrap_or_else(|e| e.into_inner()) = Some(json!({
+        "path": parent_session.to_string_lossy(),
+        "id": "abc12345",
+    }));
+    rpi_test_env::set_var("RPI_E2E_WRITE_SESSION", "1");
+    rpi_test_env::set_var("RPI_E2E_MODE", "ok");
+    let result = execute(json!({
+        "agent": "scout",
+        "task": "fresh run with a session",
+        "timeoutMs": 30000,
+        "artifacts": false
+    }));
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    let run_id = result["details"]["runId"]
+        .as_str()
+        .expect("run id")
+        .to_string();
+    let session_file = result["details"]["results"][0]["sessionFile"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        session_file.ends_with(".jsonl"),
+        "fresh run must report its child session file: {result}"
+    );
+    assert!(
+        Path::new(&session_file).is_file(),
+        "reported session file must exist: {session_file}"
+    );
+    // `status` reads the persisted final record, not the in-memory list.
+    let status = execute(json!({ "action": "status" }));
+    let status_text = status["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        status_text.contains(&run_id) && status_text.contains("resume"),
+        "completed foreground run must be resumable from status:\n{status_text}"
+    );
+    let resumed = execute(json!({
+        "action": "resume",
+        "id": run_id,
+        "task": "continue the fresh run"
+    }));
+    assert_eq!(
+        resumed["isError"],
+        Value::Bool(false),
+        "resume of a completed fresh run must use its persisted session: {resumed}"
+    );
+    let _ = rpi_ext_subagents::execute_tool_for_test(
+        "subagent_wait",
+        &json!({ "all": true, "timeoutMs": 30000 }),
+    );
+
+    // TE51 review P1-7: a composite foreground run persists every child and
+    // resume requires an explicit index (upstream `resolveForegroundResumeTarget`).
+    let tasks = execute(json!({
+        "tasks": [
+            { "agent": "scout", "task": "batch child 0" },
+            { "agent": "worker", "task": "batch child 1" }
+        ],
+        "async": false,
+        "timeoutMs": 30000,
+        "artifacts": false
+    }));
+    assert_eq!(tasks["isError"], Value::Bool(false), "{tasks}");
+    let batch_run_id = tasks["details"]["runId"]
+        .as_str()
+        .expect("batch run id")
+        .to_string();
+    for index in 0..2 {
+        let file = tasks["details"]["results"][index]["sessionFile"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            file.ends_with(".jsonl") && Path::new(file).is_file(),
+            "composite child {index} must report its session file: {tasks}"
+        );
+    }
+    let no_index = execute(json!({
+        "action": "resume",
+        "id": batch_run_id,
+        "task": "continue without an index"
+    }));
+    assert_eq!(no_index["isError"], Value::Bool(true), "{no_index}");
+    assert!(
+        no_index["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("has 2 children. Provide index to choose one."),
+        "{no_index}"
+    );
+    let indexed = execute(json!({
+        "action": "resume",
+        "id": batch_run_id,
+        "index": 1,
+        "task": "continue the second child"
+    }));
+    assert_eq!(indexed["isError"], Value::Bool(false), "{indexed}");
+    let _ = rpi_ext_subagents::execute_tool_for_test(
+        "subagent_wait",
+        &json!({ "all": true, "timeoutMs": 30000 }),
+    );
+
+    rpi_test_env::remove_var("RPI_E2E_WRITE_SESSION");
+    *host.session_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
     // ---- Scenario 3: fork from a persisted parent session --------------
     let sessions = sandbox.root.join("sessions");
@@ -848,7 +990,10 @@ fn e2e_fixed_child_full_pipeline() {
 
     // ---- Scenario 5b: terminal drain reclaims a stuck child ------------
     // The child reaches a clean terminal stop but keeps running; the drain
-    // ladder SIGTERMs it after the 1s grace (execution.ts:571-623).
+    // ladder SIGTERMs it after the 1s grace (execution.ts:571-623). Upstream
+    // classifies that forced drain as a successful run
+    // (`forcedDrainAfterFinalSuccess`, execution.ts:1375-1383): exit 0, no
+    // process signal, final reply preserved.
     let dump = sandbox.dump("drain");
     rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
     rpi_test_env::set_var("RPI_E2E_MODE", "partial_then_hang");
@@ -860,7 +1005,16 @@ fn e2e_fixed_child_full_pipeline() {
         "artifacts": false
     }));
     let elapsed = started.elapsed();
-    assert_eq!(result["isError"], Value::Bool(true), "{result}");
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    assert_eq!(
+        result["details"]["results"][0]["exitCode"],
+        json!(0),
+        "a forced drain after a clean terminal is exit 0: {result}"
+    );
+    assert!(
+        result["details"]["results"][0]["processSignal"].is_null(),
+        "the drain signal is not the child outcome: {result}"
+    );
     assert!(
         elapsed.as_secs() < 20,
         "drain ladder finished promptly: {elapsed:?}"
@@ -1741,7 +1895,15 @@ fn e2e_fixed_child_full_pipeline() {
             "subagent_wait",
             &json!({ "all": true, "timeoutMs": 10000 }),
         );
-        assert_eq!(wait["isError"], Value::Bool(false), "{wait}");
+        // A child that finished before the wait started leaves no active run;
+        // that drain outcome is as good as a successful wait (the point is to
+        // stop racing the residual-child sweep).
+        let drained = wait["isError"] == Value::Bool(false)
+            || wait["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("No active async runs");
+        assert!(drained, "{wait}");
     }
 
     // ---- Scenario 15 (TE11): render dispatch + fleet widget lifecycle ----
@@ -2081,6 +2243,16 @@ fn e2e_fixed_child_full_pipeline() {
         assert_no_rpi_subagent_children(),
         "no residual children at end"
     );
+    // Resume runs inherit scout's `output: context.md`; the run-id suffix
+    // lands them in the crate directory. Remove the test residue.
+    if let Ok(entries) = std::fs::read_dir(env!("CARGO_MANIFEST_DIR")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("context.") && name.ends_with(".md") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
     let _ = std::fs::remove_dir_all(&sandbox.root);
 }
 

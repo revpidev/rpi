@@ -503,6 +503,7 @@ fn management_scope(params: &Value, action: &str) -> Result<&'static str, String
 /// resume call returns immediately (upstream `executeAsyncSingle`).
 fn resume_from_foreground_record(
     record: &Value,
+    index: Option<usize>,
     task: Option<String>,
     host: &dyn crate::HostContext,
     settings: &SettingsPair,
@@ -518,33 +519,14 @@ fn resume_from_foreground_record(
             "Foreground run {run_id} is still running; resume applies to interrupted or completed runs."
         ));
     }
-    let Some(child) = crate::runner::foreground_history::resumable_child(record) else {
-        // Name the exact upstream failure when the record has a candidate
-        // file: wrong extension or missing file, not a generic "no session".
-        if let Some(last) = record["children"]
-            .as_array()
-            .and_then(|children| children.last())
-            && let Some(path) = last["sessionFile"].as_str().filter(|path| !path.is_empty())
-        {
-            if !path.ends_with(".jsonl") {
-                return ToolOutcome::error(format!(
-                    "Foreground run '{run_id}' child 0 session file must be a .jsonl file: {path}"
-                ));
-            }
-            if !Path::new(path).is_file() {
-                return ToolOutcome::error(format!(
-                    "Foreground run '{run_id}' child 0 session file does not exist: {path}"
-                ));
-            }
-        }
-        return ToolOutcome::error(format!(
-            "Foreground run '{run_id}' does not have a persisted child session to resume from."
-        ));
+    let child = match crate::runner::foreground_history::child_for_resume(record, index) {
+        Ok(child) => child,
+        Err(message) => return ToolOutcome::error(message),
     };
     let agent = child["agent"].as_str().unwrap_or("worker").to_string();
     let session_file = child["sessionFile"]
         .as_str()
-        .expect("resumable_child requires sessionFile");
+        .expect("child_for_resume requires sessionFile");
     let task =
         task.unwrap_or_else(|| "Continue the interrupted task from this session.".to_string());
     let mut params = serde_json::json!({
@@ -708,14 +690,42 @@ fn handle_management_action_inner(
             if memory.runs.is_empty() {
                 lines.push("- (none)".to_string());
             }
+            // #3025: foreground runs remembered from an earlier host process
+            // (the in-memory list dies with the process). Read the persisted
+            // records up front: an in-memory run must still show its resume
+            // hint when its final record carries a session file.
+            let session_id = deps
+                .host
+                .and_then(|host| host.parent_session(settings))
+                .map(|session| session.id);
+            let persisted =
+                crate::runner::foreground_history::list_for_session(session_id.as_deref(), 50);
+            let resumable_runs: Vec<&str> = persisted
+                .iter()
+                .filter(|record| {
+                    record["children"].as_array().is_some_and(|children| {
+                        children.iter().any(|child| {
+                            child["sessionFile"].as_str().is_some_and(|path| {
+                                path.ends_with(".jsonl") && Path::new(path).is_file()
+                            })
+                        })
+                    })
+                })
+                .filter_map(|record| record["runId"].as_str())
+                .collect();
             for run in memory.runs.iter().rev().take(10) {
                 if let Some(session_id) = current_session.as_deref()
                     && run.session_id.as_deref() != Some(session_id)
                 {
                     continue;
                 }
+                let resume = if resumable_runs.contains(&run.run_id.as_str()) {
+                    format!(" · resume {}", run.run_id)
+                } else {
+                    String::new()
+                };
                 lines.push(format!(
-                    "- {} agent={} exitCode={} durationMs={}{}",
+                    "- {} agent={} exitCode={} durationMs={}{}{resume}",
                     run.run_id,
                     run.agent,
                     run.exit_code,
@@ -726,25 +736,14 @@ fn handle_management_action_inner(
                         .unwrap_or_default()
                 ));
             }
-            // #3025: foreground runs remembered from an earlier host process
-            // (the in-memory list dies with the process).
-            let session_id = deps
-                .host
-                .and_then(|host| host.parent_session(settings))
-                .map(|session| session.id);
-            for record in
-                crate::runner::foreground_history::list_for_session(session_id.as_deref(), 10)
-            {
+            for record in persisted.iter().take(10) {
                 let run_id = record["runId"].as_str().unwrap_or("?");
                 if memory.runs.iter().any(|run| run.run_id == run_id) {
                     continue;
                 }
                 let child = &record["children"][0];
                 let state = child["status"].as_str().unwrap_or("?");
-                let resume = if child["sessionFile"]
-                    .as_str()
-                    .is_some_and(|path| path.ends_with(".jsonl") && Path::new(path).is_file())
-                {
+                let resume = if resumable_runs.contains(&run_id) {
                     format!(" · resume {run_id}")
                 } else {
                     String::new()
@@ -988,13 +987,39 @@ fn handle_management_action_inner(
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
             let current_session = host.parent_session(settings).map(|session| session.id);
+            let resume_index = raw_params.get("index");
             match crate::runner::foreground_history::find_prefix_for_session(
                 &id,
                 current_session.as_deref(),
             ) {
                 Ok(Some(record)) => {
+                    let resume_index = match resume_index {
+                        None => None,
+                        Some(value) => match value.as_i64() {
+                            Some(value) if value >= 0 => Some(value as usize),
+                            Some(value) => {
+                                return ToolOutcome::error(format!(
+                                    "Foreground run '{}' has {} children. Index {value} is out of range.",
+                                    record["runId"].as_str().unwrap_or(&id),
+                                    record["children"].as_array().map(Vec::len).unwrap_or(0)
+                                ));
+                            }
+                            None => {
+                                return ToolOutcome::error(format!(
+                                    "Foreground run '{}' index must be an integer.",
+                                    record["runId"].as_str().unwrap_or(&id)
+                                ));
+                            }
+                        },
+                    };
                     return resume_from_foreground_record(
-                        &record, task, host, settings, config, runtime,
+                        &record,
+                        resume_index,
+                        task,
+                        host,
+                        settings,
+                        config,
+                        runtime,
                     );
                 }
                 Ok(None) => {}
@@ -1007,6 +1032,17 @@ fn handle_management_action_inner(
                 }
                 Err(message) => return ToolOutcome::error(message),
             };
+            // async-resume.ts:487-489: a resume may only revive a run owned by
+            // the active parent session. Without this check any run id could
+            // pull another session's child context into this one.
+            if let Some(current) = current_session.as_deref()
+                && let Some(owner) = status["sessionId"].as_str()
+                && owner != current
+            {
+                return ToolOutcome::error(format!(
+                    "Async run '{id}' was not found in the active session."
+                ));
+            }
             if matches!(status["state"].as_str(), Some("running") | Some("queued")) {
                 return ToolOutcome::error(format!(
                     "Background run {id} is still {state}; resume applies to interrupted or stopped runs.",
@@ -1984,19 +2020,21 @@ fn write_agent_config(config: &Value, target: &Path) -> Result<(), String> {
                         }
                     }
                     Value::Array(items) => {
-                        let names: Vec<&str> = items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::trim)
-                            .collect();
-                        if names.iter().any(|name| name.is_empty()) {
-                            return Err(
-                                "config.mutationTools must be a comma-separated string, empty string, string array, or false when provided.".to_string(),
-                            );
+                        let mut names: Vec<&str> = Vec::with_capacity(items.len());
+                        for item in items {
+                            let Some(name) = item.as_str() else {
+                                return Err(
+                                    "config.mutationTools must be a comma-separated string, empty string, string array, or false when provided.".to_string(),
+                                );
+                            };
+                            let name = name.trim();
+                            if !name.is_empty() {
+                                names.push(name);
+                            }
                         }
-                        if !names.is_empty() {
-                            lines.push(format!("mutationTools: {}", names.join(", ")));
-                        }
+                        // An explicit empty array clears the list; writing
+                        // nothing would fall back to the omitted/inherit state.
+                        lines.push(format!("mutationTools: {}", names.join(", ")));
                     }
                     _ => {
                         return Err(
@@ -2029,10 +2067,22 @@ fn write_agent_config(config: &Value, target: &Path) -> Result<(), String> {
                     Value::String(s) => s.clone(),
                     Value::Bool(b) => b.to_string(),
                     Value::Array(items) => {
-                        let names: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
-                        if names.is_empty() {
-                            continue;
+                        let mut names: Vec<&str> = Vec::with_capacity(items.len());
+                        for item in items {
+                            let Some(name) = item.as_str() else {
+                                return Err(format!(
+                                    "config.{key} must be a string or an array of strings when provided."
+                                ));
+                            };
+                            let name = name.trim();
+                            if !name.is_empty() {
+                                names.push(name);
+                            }
                         }
+                        // An explicit empty array is a meaningful value for
+                        // list fields (e.g. `allowedAgents: []` denies every
+                        // descendant, `tools: []` is the empty allowlist).
+                        // Dropping the line silently fell back to inherit.
                         names.join(", ")
                     }
                     other => other.to_string(),
@@ -2791,6 +2841,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn agent_config_preserves_empty_arrays_and_rejects_non_string_items() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-arrays-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("arrays.md");
+        write_agent_config(
+            &serde_json::json!({
+                "description": "Arrays",
+                "allowedAgents": [],
+                "tools": [],
+                "extensions": [],
+                "skills": [],
+                "mutationTools": [],
+            }),
+            &target,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&target).unwrap();
+        for key in [
+            "allowedAgents",
+            "tools",
+            "extensions",
+            "skills",
+            "mutationTools",
+        ] {
+            // An explicit empty list must stay a written field: dropping the
+            // line turned `allowedAgents: []` back into "unrestricted".
+            assert!(
+                content
+                    .lines()
+                    .any(|line| line.trim_end() == format!("{key}:")),
+                "{key} must be written explicitly:
+{content}"
+            );
+        }
+        for bad in [
+            serde_json::json!({"description": "Arrays", "tools": ["read", 3]}),
+            serde_json::json!({"description": "Arrays", "allowedAgents": [null]}),
+            serde_json::json!({"description": "Arrays", "skills": [1]}),
+            serde_json::json!({"description": "Arrays", "mutationTools": ["edit", {}]}),
+        ] {
+            let error = write_agent_config(&bad, &target).unwrap_err();
+            assert!(
+                error.contains("must be a string") || error.contains("string array"),
+                "{bad}: {error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                content,
+                "invalid input must not write: {bad}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #2681 (49a3ec7f): a multiline description serializes as a YAML
     /// literal block (`description: |-` + two-space-indented lines) and
     /// survives the discovery parser round-trip; single-line descriptions
@@ -2831,6 +2937,63 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TE51 review P1-8: async resume is session-scoped (async-resume.ts:
+    /// 487-489). A run id from another parent session must not be revivable.
+    #[test]
+    fn resume_rejects_a_run_owned_by_another_session() {
+        struct ScopedHost;
+        impl crate::HostContext for ScopedHost {
+            fn cwd(&self) -> PathBuf {
+                PathBuf::from("/tmp")
+            }
+            fn parent_model(&self) -> Option<String> {
+                None
+            }
+            fn parent_session(&self, _settings: &SettingsPair) -> Option<crate::ParentSession> {
+                Some(crate::ParentSession {
+                    file: None,
+                    id: "session-current".to_string(),
+                })
+            }
+        }
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("resume-scoped-{}", std::process::id());
+        let runtime = crate::PluginRuntime::new().expect("plugin runtime");
+        action_test_run(
+            &run_id,
+            "failed",
+            json!([{ "agent": "w", "status": "failed", "sessionFile": "/tmp/s.json" }]),
+        );
+        {
+            let runs = crate::runner::background::ASYNC_RUNS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let handle = runs.get(run_id.as_str()).expect("registered run");
+            let mut status = handle.status.write().unwrap_or_else(|e| e.into_inner());
+            status["sessionId"] = json!("session-other");
+        }
+        let outcome = handle_management_action_with(
+            "resume",
+            None,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+            &ActionDeps {
+                host: Some(&ScopedHost),
+                runtime: Some(&runtime),
+                params: Some(json!({ "action": "resume", "id": run_id, "task": "continue" })),
+            },
+        );
+        assert!(outcome.is_error, "{}", outcome.text);
+        assert_eq!(
+            outcome.text,
+            format!("Async run '{run_id}' was not found in the active session.")
+        );
+        cleanup_run(&run_id);
     }
 
     /// TE38 W5 (#2242 @ b72714de): a stopped last child has no continuation

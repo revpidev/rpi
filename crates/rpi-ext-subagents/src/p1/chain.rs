@@ -233,7 +233,11 @@ pub fn cleanup_old_chain_dirs(root: &Path, max_age_ms: u64) {
 /// `resolveChainPath` (settings.ts:351): `~` expansion, absolute passthrough,
 /// relative against the chain dir.
 pub fn resolve_chain_path(file_path: &str, chain_dir: &Path) -> PathBuf {
-    let expanded = crate::paths::expand_tilde_and_resolve(file_path);
+    // `resolveChainPath` (settings.ts:241-244): expand `~`, then relative
+    // paths join the chain directory — NOT the process cwd. Resolving
+    // relative to cwd made `reads: ["context.md"]` depend on whatever file
+    // happened to exist in the invocation directory.
+    let expanded = crate::paths::normalize_path(file_path);
     if expanded.is_absolute() {
         expanded
     } else {
@@ -372,6 +376,8 @@ pub struct StepOutcome {
     pub timed_out: bool,
     pub process_signal: Option<String>,
     pub details: Value,
+    /// The raw child result (foreground-history/resume projection).
+    pub result: crate::runner::foreground::ForegroundRunResult,
 }
 
 /// Run the chain sequentially (chain-execution.ts executeChain sequential
@@ -643,6 +649,7 @@ pub async fn run_chain_async(
             details["savedOutputPath"] = json!(saved.to_string_lossy());
         }
         let step_outcome = StepOutcome {
+            result: outcome.result.clone(),
             index,
             agent: outcome.agent_name.clone(),
             output: outcome.result.final_output.clone(),
@@ -754,7 +761,10 @@ mod tests {
             &chain_dir,
         );
         assert!(prefix.starts_with("[Read from: "));
-        assert!(prefix.contains("context.md"));
+        assert!(
+            prefix.contains(&chain_dir.join("context.md").to_string_lossy().to_string()),
+            "relative reads resolve under the chain dir: {prefix}"
+        );
         assert!(!prefix.contains("absent.md"));
         assert!(prefix.contains("[Write to: /tmp/chain-x/plan.md]"));
         assert!(prefix.ends_with("\n\n"));
