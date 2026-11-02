@@ -1224,6 +1224,9 @@ fn status_transcript_roots(
 /// containment check into a no-op.
 fn push_configured_root(roots: &mut Vec<PathBuf>, dir: &str) {
     let root = paths::expand_tilde_and_resolve(dir);
+    // Canonicalize so a configured symlink to `/` cannot turn the containment
+    // check into a no-op; the final retain also drops a literal `/`.
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
     if root.parent().is_some() {
         roots.push(root);
     }
@@ -2932,6 +2935,23 @@ mod tests {
             "{}",
             invalid.text
         );
+        let invalid_type = manage_with_host(&trusted, json!({ "action": "list", "agentScope": 7 }));
+        assert!(invalid_type.is_error);
+        assert!(
+            invalid_type.text.contains("agentScope must be"),
+            "{}",
+            invalid_type.text
+        );
+        let broken = manage_with_host(
+            &trusted,
+            json!({ "action": "get", "agent": "broken", "agentScope": "project" }),
+        );
+        assert!(broken.is_error, "{}", broken.text);
+        assert!(
+            broken.text.contains("invalid configuration"),
+            "{}",
+            broken.text
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3459,6 +3479,28 @@ mod tests {
             text.len()
         );
         cleanup_run(&run_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_transcript_roots_reject_a_symlinked_filesystem_root() {
+        let link = paths::temp_root_dir().join(format!("rootlink-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let settings = SettingsPair {
+            session_dir: Some(link.to_string_lossy().to_string()),
+            ..SettingsPair::default()
+        };
+        let roots = status_transcript_roots(
+            Path::new("/tmp"),
+            &settings,
+            &crate::config::ExtensionConfig::new(),
+        );
+        assert!(
+            !roots.iter().any(|root| root.parent().is_none()),
+            "{roots:?}"
+        );
+        let _ = std::fs::remove_file(&link);
     }
 
     #[test]
