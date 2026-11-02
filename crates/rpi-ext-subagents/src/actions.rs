@@ -1213,7 +1213,17 @@ fn status_transcript_roots(
     {
         push_configured_root(&mut roots, dir);
     }
-    roots.retain(|root| root.parent().is_some());
+    // Canonicalize every root before containment is ever checked: a configured
+    // `sessionDir` symlink to `/` (or a canonical root equal to `/`) would
+    // otherwise pass the lexical check and turn realpath containment into a
+    // no-op. Roots that are themselves filesystem roots are dropped.
+    roots = roots
+        .into_iter()
+        .filter_map(|root| {
+            let root = std::fs::canonicalize(&root).unwrap_or(root);
+            root.parent().is_some().then_some(root)
+        })
+        .collect();
     roots.sort();
     roots.dedup();
     roots
@@ -3483,14 +3493,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn status_transcript_roots_reject_a_symlinked_filesystem_root() {
+    fn status_transcript_rejects_a_symlinked_root_read() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("transcript-rootlink-{}", std::process::id());
         let link = paths::temp_root_dir().join(format!("rootlink-{}", std::process::id()));
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink("/", &link).unwrap();
+        let canary = std::env::temp_dir().join(format!("{run_id}-canary.jsonl"));
+        std::fs::write(
+            &canary,
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ROOTLINK-SECRET\"}]}}\n",
+        )
+        .unwrap();
+        let canary_through_link = link.join(canary.strip_prefix("/").unwrap());
+        action_test_run(
+            &run_id,
+            "complete",
+            json!([{
+                "agent": "worker",
+                "status": "complete",
+                "transcriptPath": canary_through_link.to_string_lossy(),
+            }]),
+        );
         let settings = SettingsPair {
             session_dir: Some(link.to_string_lossy().to_string()),
             ..SettingsPair::default()
         };
+        let text = format_status_transcript(
+            &run_id,
+            None,
+            80,
+            Path::new("/tmp"),
+            &settings,
+            &crate::config::ExtensionConfig::new(),
+        )
+        .expect("view renders");
+        assert!(!text.contains("ROOTLINK-SECRET"), "{text}");
+        assert!(
+            text.contains("outside trusted roots")
+                || text.contains("resolves outside trusted roots"),
+            "{text}"
+        );
         let roots = status_transcript_roots(
             Path::new("/tmp"),
             &settings,
@@ -3501,6 +3546,8 @@ mod tests {
             "{roots:?}"
         );
         let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&canary);
+        cleanup_run(&run_id);
     }
 
     #[test]
