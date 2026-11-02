@@ -469,7 +469,7 @@ pub fn resumable_child(record: &Value) -> Option<&Value> {
     children.iter().rev().find(|child| {
         child["sessionFile"]
             .as_str()
-            .is_some_and(|path| !path.is_empty() && Path::new(path).is_file())
+            .is_some_and(|path| path.ends_with(".jsonl") && Path::new(path).is_file())
     })
 }
 
@@ -594,6 +594,36 @@ mod tests {
                 .is_none()
         );
         let _ = record_path(&run_id).map(std::fs::remove_file);
+    }
+
+    #[test]
+    fn resume_requires_a_jsonl_session_file() {
+        let dir = temp_root("jsonl");
+        let session = dir.join("session.txt");
+        std::fs::write(&session, "{}").unwrap();
+        let record = json!({
+            "runId": "fg-text",
+            "children": [{
+                "agent": "worker",
+                "index": 0,
+                "status": "stopped",
+                "sessionFile": session.to_string_lossy(),
+            }],
+        });
+        assert!(resumable_child(&record).is_none(), "non-jsonl rejected");
+        let jsonl = dir.join("session.jsonl");
+        std::fs::write(&jsonl, "{}").unwrap();
+        let record = json!({
+            "runId": "fg-jsonl",
+            "children": [{
+                "agent": "worker",
+                "index": 0,
+                "status": "stopped",
+                "sessionFile": jsonl.to_string_lossy(),
+            }],
+        });
+        assert!(resumable_child(&record).is_some(), "jsonl accepted");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

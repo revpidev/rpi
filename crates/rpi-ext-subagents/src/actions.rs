@@ -519,6 +519,24 @@ fn resume_from_foreground_record(
         ));
     }
     let Some(child) = crate::runner::foreground_history::resumable_child(record) else {
+        // Name the exact upstream failure when the record has a candidate
+        // file: wrong extension or missing file, not a generic "no session".
+        if let Some(last) = record["children"]
+            .as_array()
+            .and_then(|children| children.last())
+            && let Some(path) = last["sessionFile"].as_str().filter(|path| !path.is_empty())
+        {
+            if !path.ends_with(".jsonl") {
+                return ToolOutcome::error(format!(
+                    "Foreground run '{run_id}' child 0 session file must be a .jsonl file: {path}"
+                ));
+            }
+            if !Path::new(path).is_file() {
+                return ToolOutcome::error(format!(
+                    "Foreground run '{run_id}' child 0 session file does not exist: {path}"
+                ));
+            }
+        }
         return ToolOutcome::error(format!(
             "Foreground run '{run_id}' does not have a persisted child session to resume from."
         ));
@@ -725,7 +743,7 @@ fn handle_management_action_inner(
                 let state = child["status"].as_str().unwrap_or("?");
                 let resume = if child["sessionFile"]
                     .as_str()
-                    .is_some_and(|path| Path::new(path).is_file())
+                    .is_some_and(|path| path.ends_with(".jsonl") && Path::new(path).is_file())
                 {
                     format!(" · resume {run_id}")
                 } else {
@@ -1018,6 +1036,16 @@ fn handle_management_action_inner(
                     "Background run {id} has no persisted child session to resume from."
                 ));
             };
+            if !session_file.ends_with(".jsonl") {
+                return ToolOutcome::error(format!(
+                    "Async run '{id}' session file must be a .jsonl file: {session_file}"
+                ));
+            }
+            if !Path::new(&session_file).is_file() {
+                return ToolOutcome::error(format!(
+                    "Async run '{id}' session file does not exist: {session_file}"
+                ));
+            }
             let agent_name = steps
                 .last()
                 .and_then(|step| step["agent"].as_str())
