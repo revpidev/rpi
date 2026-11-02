@@ -957,7 +957,14 @@ fn handle_management_action_inner(
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
-            match crate::runner::foreground_history::find_prefix(&id) {
+            let current_session = deps
+                .host
+                .and_then(|host| host.parent_session(settings))
+                .map(|session| session.id);
+            match crate::runner::foreground_history::find_prefix_for_session(
+                &id,
+                current_session.as_deref(),
+            ) {
                 Ok(Some(record)) => {
                     return resume_from_foreground_record(
                         &record, task, host, settings, config, runtime,

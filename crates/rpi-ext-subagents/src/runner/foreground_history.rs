@@ -306,13 +306,23 @@ pub fn find(run_id: &str) -> Option<Value> {
     read_record(&path)
 }
 
-/// Resolve an exact id or a unique prefix among remembered records.
-pub fn find_prefix(requested: &str) -> Result<Option<Value>, String> {
+fn matches_session(record: &Value, session_id: Option<&str>) -> bool {
+    let recorded = record["sessionId"].as_str().unwrap_or_default();
+    session_id.is_none_or(|session_id| recorded.is_empty() || recorded == session_id)
+}
+
+/// Resolve an exact id or a unique prefix among remembered records, optionally
+/// restricted to the caller's session (upstream `resolveForegroundResumeTarget`
+/// only resolves runs from the current session).
+pub fn find_prefix_for_session(
+    requested: &str,
+    session_id: Option<&str>,
+) -> Result<Option<Value>, String> {
     let requested = requested.trim();
     if requested.is_empty() {
         return Ok(None);
     }
-    if let Some(record) = find(requested) {
+    if let Some(record) = find(requested).filter(|record| matches_session(record, session_id)) {
         return Ok(Some(record));
     }
     let Ok(entries) = std::fs::read_dir(history_dir()) else {
@@ -321,6 +331,7 @@ pub fn find_prefix(requested: &str) -> Result<Option<Value>, String> {
     let mut matches: Vec<Value> = entries
         .flatten()
         .filter_map(|entry| read_record(&entry.path()))
+        .filter(|record| matches_session(record, session_id))
         .filter(|record| {
             record["runId"]
                 .as_str()
@@ -420,6 +431,10 @@ pub fn resumable_child(record: &Value) -> Option<&Value> {
 mod tests {
     use super::*;
 
+    /// `async_results_dir()` is process-global; history tests must not see
+    /// another test's running record during `restore_interrupted`.
+    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "rpi-fg-history-{tag}-{}-{}",
@@ -433,6 +448,7 @@ mod tests {
 
     #[test]
     fn interrupted_owner_restores_with_the_child_session_file() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let dir = temp_root("restore");
         let run_id = format!("fg-{}", now_millis());
         let session_file = dir.join("run-0").join("session.jsonl");
@@ -453,7 +469,7 @@ mod tests {
             }],
         });
         write_record(&run_id, &record).unwrap();
-        assert_eq!(restore_interrupted(), 1);
+        restore_interrupted();
         let restored = find(&run_id).expect("record present");
         assert_eq!(restored["children"][0]["status"], "stopped");
         assert_eq!(
@@ -461,8 +477,9 @@ mod tests {
             Some(session_file.to_str().unwrap())
         );
         assert!(restored.get("owner").is_none());
-        // The restore is idempotent.
-        assert_eq!(restore_interrupted(), 0);
+        // The restore is idempotent for this record.
+        restore_interrupted();
+        assert_eq!(find(&run_id).unwrap()["children"][0]["status"], "stopped");
         let _ = std::fs::remove_dir_all(&dir);
         if let Some(path) = record_path(&run_id) {
             let _ = std::fs::remove_file(path);
@@ -471,6 +488,7 @@ mod tests {
 
     #[test]
     fn live_owner_is_not_restored() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let run_id = format!("fg-live-{}", now_millis());
         let record = json!({
             "runId": run_id,
@@ -485,13 +503,14 @@ mod tests {
             "children": [{ "agent": "worker", "index": 0, "status": "running" }],
         });
         write_record(&run_id, &record).unwrap();
-        assert_eq!(restore_interrupted(), 0);
+        restore_interrupted();
         assert_eq!(find(&run_id).unwrap()["children"][0]["status"], "running");
         let _ = record_path(&run_id).map(std::fs::remove_file);
     }
 
     #[test]
     fn resume_requires_a_persisted_session_file() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let record = json!({
             "runId": "fg-none",
             "children": [{ "agent": "worker", "index": 0, "status": "stopped" }],
@@ -500,7 +519,35 @@ mod tests {
     }
 
     #[test]
+    fn resume_resolution_is_scoped_to_the_current_session() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let run_id = format!("fg-scope-{}", now_millis());
+        let record = json!({
+            "runId": run_id,
+            "mode": "single",
+            "cwd": "/tmp",
+            "sessionId": "session-a",
+            "updatedAt": 1,
+            "children": [{ "agent": "worker", "index": 0, "status": "completed" }],
+        });
+        write_record(&run_id, &record).unwrap();
+        assert!(
+            find_prefix_for_session(&run_id, Some("session-a"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            find_prefix_for_session(&run_id, Some("session-b"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(find_prefix_for_session(&run_id, None).unwrap().is_some());
+        let _ = record_path(&run_id).map(std::fs::remove_file);
+    }
+
+    #[test]
     fn output_is_bounded_at_a_utf8_boundary() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
         let text = "é".repeat(MAX_INLINE_OUTPUT_BYTES);
         let bounded = bounded_output(&text);
         assert!(bounded.len() <= MAX_INLINE_OUTPUT_BYTES);
