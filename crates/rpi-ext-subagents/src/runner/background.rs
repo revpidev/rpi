@@ -671,7 +671,7 @@ pub fn process_boot_id(pid: u64) -> Option<u64> {
 
 /// Whether `pid` is alive AND started at `boot_id` (pid-reuse guard). A
 /// recorded `boot_id` of `None` (non-unix) degrades to a liveness check.
-fn pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
+pub(crate) fn pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
     if !pid_alive(pid) {
         return false;
     }
@@ -679,6 +679,13 @@ fn pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
         Some(expected) => process_boot_id(pid) == Some(expected),
         None => true,
     }
+}
+
+/// Crate-visible liveness probe for other run-history surfaces
+/// (`foreground_history`); the boot-id guard is the same one the stale-run
+/// reconciler uses.
+pub(crate) fn recorded_pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
+    pid_matches(pid, boot_id)
 }
 
 /// Persist a spawned child pid for `run_id` (ADR-0019 crash branch): the
@@ -757,6 +764,28 @@ pub fn receipt(run_id: &str, run_dir: &Path) -> Value {
     })
 }
 
+/// Seed a pending step with the launch model/thinking when the caller
+/// specified them, so status/inspect show the planned model before the
+/// child's first terminal result (#2893).
+fn pending_step(
+    agent: &str,
+    model: Option<&str>,
+    thinking: Option<&str>,
+    key: Option<&str>,
+) -> Value {
+    let mut step = json!({ "agent": agent, "status": "pending" });
+    if let Some(key) = key {
+        step["key"] = json!(key);
+    }
+    if let Some(model) = model {
+        step["model"] = json!(model);
+    }
+    if let Some(thinking) = thinking {
+        step["thinking"] = json!(thinking);
+    }
+    step
+}
+
 /// Initialize the run directory and status document, register the run.
 pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Arc<AsyncRunHandle> {
     let run_dir = async_runs_dir().join(run_id);
@@ -792,15 +821,34 @@ pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Ar
         let mut current = status.write().unwrap_or_else(|e| e.into_inner());
         let step_agents: Vec<Value> = match body {
             AsyncBody::Single { spec, .. } => {
-                vec![json!({ "agent": spec.agent_name, "status": "pending" })]
+                vec![pending_step(
+                    &spec.agent_name,
+                    spec.model.as_deref(),
+                    spec.thinking.as_deref(),
+                    None,
+                )]
             }
             AsyncBody::Tasks { entries, .. } => entries
                 .iter()
-                .map(|e| json!({ "key": e.key, "agent": e.spec.agent_name, "status": "pending" }))
+                .map(|entry| {
+                    pending_step(
+                        &entry.spec.agent_name,
+                        entry.spec.model.as_deref(),
+                        entry.spec.thinking.as_deref(),
+                        Some(&entry.key),
+                    )
+                })
                 .collect(),
             AsyncBody::Steps { steps, .. } => steps
                 .iter()
-                .map(|s| json!({ "agent": s.agent_name, "status": "pending" }))
+                .map(|step| {
+                    pending_step(
+                        &step.agent_name,
+                        step.model.as_deref(),
+                        step.thinking.as_deref(),
+                        None,
+                    )
+                })
                 .collect(),
         };
         current["steps"] = Value::Array(step_agents);
@@ -1062,7 +1110,7 @@ pub async fn drive_run(
                 Ok(None) => {
                     finish_failed(
                         &handle,
-                        &format!("Unknown agent: {}", spec.agent_name),
+                        &crate::agents::discover::unknown_agent_error(&spec.agent_name, &agents),
                         &notify,
                     )
                     .await;
@@ -1509,62 +1557,38 @@ impl AsyncNotify {
             );
         }
 
-        // agent: the run's last declared step agent (single/chain carry the
-        // child agents; a parallel batch reports its mode — upstream's
-        // CompletionNotification.agent comes from the run record).
-        let steps = status["steps"].as_array().cloned().unwrap_or_default();
-        let (notify_status, notice_output, output_path) =
-            resolve_notice(state, output, &steps, &result_write, &result_path);
-        let agent = steps
-            .iter()
-            .rev()
-            .find_map(|step| step["agent"].as_str().map(str::to_string))
-            .unwrap_or_else(|| status["mode"].as_str().unwrap_or("unknown").to_string());
-        let session_file = steps
-            .iter()
-            .find_map(|step| step["sessionFile"].as_str().map(str::to_string));
-        // R7.1.7.2 (#1629/#1938): the notice carries the run id (parent can
-        // `status {id}` immediately) and the saved output artifact path when
-        // one exists.
-        let details = crate::messages::SubagentNotifyDetails {
-            agent,
-            status: notify_status,
-            source: None,
-            task_info: None,
-            result_preview: notice_output,
+        let details = completion_details(&CompletionNotice {
+            status: &status,
+            state,
+            output,
+            result_write: &result_write,
+            result_path: &result_path,
+            run_id,
             duration_ms: Some(now_millis().saturating_sub(handle.started_ms)),
-            run_id: Some(run_id.clone()),
-            output_path,
-            handoff_path: handoff_path.map(|p| p.to_string_lossy().to_string()),
-            session_label: session_file.as_deref().map(|_| "Session file".to_string()),
-            session_value: session_file,
-        };
-        let content = crate::messages::format_single_completion(&details);
-        let display = notify_status != "completed";
+            handoff_path,
+        });
         if let Some(calls) = &self.calls {
-            let message = json!({
-                "customType": "subagent-notify",
-                "content": content,
-                "display": display,
-            });
-            // sendMessage is synchronous through the ABI envelope; fire it
-            // and treat acceptance as any non-error response. The options
-            // carry `triggerTurn: true` — upstream sendCompletion always
-            // sends one (notify.ts:178-182: `result.triggerTurn !== false`,
-            // true by default) so a finished run wakes the parent session to
-            // process the result; the rpi host default is false (a silent
-            // append), which would lose that wake-up semantics.
-            let response = crate::host_call_static(
-                calls,
-                "sendMessage",
-                json!({ "message": message, "options": { "triggerTurn": true } }),
-            );
-            if response.get("error").is_none() {
-                let _ = std::fs::remove_file(&result_path);
+            // sendMessage is synchronous through the ABI envelope; acceptance
+            // is any non-error response. A failed delivery keeps the result
+            // file for `resend_pending_results` on the next session start
+            // (#3032/#2968) and records one diagnostic event.
+            match send_completion_message(calls, &details) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&result_path);
+                }
+                Err(error) => {
+                    append_event(
+                        handle.run_dir.as_path(),
+                        "run.result_delivery_failed",
+                        json!({
+                            "runId": run_id,
+                            "error": error,
+                            "resultPath": result_path.to_string_lossy(),
+                        }),
+                    );
+                }
             }
-        }
-        // Bus event (subagent:async-complete) is observation-only.
-        if let Some(calls) = &self.calls {
+            // Bus event (subagent:async-complete) is observation-only.
             let _ = crate::host_call_static(
                 calls,
                 "events.emit",
@@ -1573,6 +1597,147 @@ impl AsyncNotify {
                     "data": { "runId": run_id, "state": state },
                 }),
             );
+        }
+    }
+}
+
+/// Inputs for one completion notice.
+struct CompletionNotice<'a> {
+    status: &'a Value,
+    state: &'a str,
+    output: &'a str,
+    result_write: &'a std::io::Result<()>,
+    result_path: &'a Path,
+    run_id: &'a str,
+    duration_ms: Option<u64>,
+    handoff_path: Option<&'a Path>,
+}
+
+/// Build the notification details from a status document. Shared by the
+/// terminal send and the session-start resend path.
+fn completion_details(notice: &CompletionNotice<'_>) -> crate::messages::SubagentNotifyDetails {
+    let steps = notice.status["steps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let (notify_status, notice_output, output_path) = resolve_notice(
+        notice.state,
+        notice.output,
+        &steps,
+        notice.result_write,
+        notice.result_path,
+    );
+    let agent = steps
+        .iter()
+        .rev()
+        .find_map(|step| step["agent"].as_str().map(str::to_string))
+        .unwrap_or_else(|| {
+            notice.status["mode"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string()
+        });
+    let session_file = steps
+        .iter()
+        .find_map(|step| step["sessionFile"].as_str().map(str::to_string));
+    crate::messages::SubagentNotifyDetails {
+        agent,
+        status: notify_status,
+        source: None,
+        task_info: None,
+        result_preview: notice_output,
+        duration_ms: notice.duration_ms,
+        run_id: Some(notice.run_id.to_string()),
+        output_path,
+        handoff_path: notice.handoff_path.map(|p| p.to_string_lossy().to_string()),
+        session_label: session_file.as_deref().map(|_| "Session file".to_string()),
+        session_value: session_file,
+    }
+}
+
+/// Send one completion message. `Err` means the host rejected the call; the
+/// caller decides whether to keep the result file for a later retry.
+fn send_completion_message(
+    calls: &crate::AsyncHostCalls,
+    details: &crate::messages::SubagentNotifyDetails,
+) -> Result<(), String> {
+    let content = crate::messages::format_single_completion(details);
+    let display = details.status != "completed";
+    let message = json!({
+        "customType": "subagent-notify",
+        "content": content,
+        "display": display,
+    });
+    // triggerTurn wakes the parent session; the rpi host default is false
+    // (notify.ts:178-182: `result.triggerTurn !== false`, true by default).
+    let response = crate::host_call_static(
+        calls,
+        "sendMessage",
+        json!({ "message": message, "options": { "triggerTurn": true } }),
+    );
+    match response.get("error") {
+        None => Ok(()),
+        Some(error) => Err(error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string())),
+    }
+}
+
+/// Resend completion notices whose original `sendMessage` failed (the run
+/// outlived the host that launched it, or the host call errored). Runs at
+/// each parent `session_start`; a successful send removes the result file,
+/// so a notice is not duplicated. `MAX_RESEND` bounds the scan.
+pub fn resend_pending_results(calls: &crate::AsyncHostCalls) {
+    const MAX_RESEND: usize = 20;
+    let Ok(entries) = std::fs::read_dir(async_results_dir()) else {
+        return;
+    };
+    let mut sent = 0usize;
+    for entry in entries.flatten() {
+        if sent >= MAX_RESEND {
+            break;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(result) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(run_id) = result["runId"].as_str() else {
+            continue;
+        };
+        let status = match read_run_status(run_id) {
+            Ok(Some(status)) => status,
+            // A corrupt/missing status must not abort the scan (#3042).
+            _ => continue,
+        };
+        if !matches!(
+            status["state"].as_str().unwrap_or(""),
+            STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
+        ) {
+            continue;
+        }
+        let state = result["state"].as_str().unwrap_or(STATE_COMPLETE);
+        let output = result["output"].as_str().unwrap_or_default();
+        let details = completion_details(&CompletionNotice {
+            status: &status,
+            state,
+            output,
+            result_write: &Ok(()),
+            result_path: &path,
+            run_id,
+            duration_ms: None,
+            handoff_path: None,
+        });
+        if send_completion_message(calls, &details).is_ok() {
+            let _ = std::fs::remove_file(&path);
+            sent += 1;
         }
     }
 }
@@ -1673,6 +1838,9 @@ async fn finish_with_handoff(
     // Terminal status-write failures surface after the terminal event line
     // (TE17 R7.1.7.1: state first, diagnostic second).
     flush_pending_status_write_failure(handle);
+    // A terminal child cannot consume a supervisor reply; close its asks so
+    // they do not keep a later wait/drain yielding on a dead run.
+    crate::p1::supervisor::close_requests_for_run(&handle.run_id);
     notify.send(handle, state, output, handoff_path).await;
     // Terminal handle stays registered (see prune_terminal_runs): wait/stop
     // poll this table for the terminal transition.
@@ -1694,6 +1862,7 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
         json!({ "runId": handle.run_id, "error": error }),
     );
     flush_pending_status_write_failure(handle);
+    crate::p1::supervisor::close_requests_for_run(&handle.run_id);
     notify.send(handle, STATE_FAILED, error, None).await;
     prune_terminal_runs();
 }
@@ -1745,8 +1914,9 @@ pub fn deliver_steer(
         // #1976/#1983: a run past shutdown never accepts steering — report
         // instead of queueing a request no child will read.
         return Err(format!(
-            "Background run {} is {state} and cannot be steered.",
-            handle.run_id
+            "Background run {} is {state} and cannot be steered. Inspect it with subagent({{ action: \"status\", id: \"{id}\" }}); if it is resumable, continue with subagent({{ action: \"resume\", id: \"{id}\", task: \"<continuation>\" }}).",
+            handle.run_id,
+            id = handle.run_id
         ));
     }
     let steps: Vec<Value> = status["steps"].as_array().cloned().unwrap_or_default();
@@ -1780,8 +1950,9 @@ pub fn deliver_steer(
         if !step_live(step) {
             let step_state = step["status"].as_str().unwrap_or("unknown");
             return Err(format!(
-                "Background run {} child {explicit} is {step_state} and cannot be steered.",
-                handle.run_id
+                "Background run {} child {explicit} is {step_state} and cannot be steered. Inspect it with subagent({{ action: \"status\", id: \"{run}\" }}); if it is resumable, continue with subagent({{ action: \"resume\", id: \"{run}\", task: \"<continuation>\" }}).",
+                handle.run_id,
+                run = handle.run_id
             ));
         }
     } else if !steps.is_empty() && !steps.iter().any(step_live) {
@@ -1843,17 +2014,33 @@ fn steer_needs_decision_message(run_id: &str, asks: &[Value]) -> String {
 
 /// Read a finished or live run's status.json by id (resume lookup). The id
 /// is model-controlled and joins a filesystem path — path-shaped ids are
-/// rejected before the lookup (C1).
-pub fn read_run_status(run_id: &str) -> Option<Value> {
+/// rejected before the lookup (C1). A corrupt status file is a parse error,
+/// not "run not found" (FR-D R2 / #3042): callers must not silently skip an
+/// explicitly named bad run.
+pub fn read_run_status(run_id: &str) -> Result<Option<Value>, String> {
     if crate::paths::ensure_safe_component(run_id, "Run id").is_err() {
-        return None;
+        return Ok(None);
     }
     if let Some(handle) = find_run(run_id) {
-        return Some(status_snapshot(&handle));
+        return Ok(Some(status_snapshot(&handle)));
     }
     let path = async_runs_dir().join(run_id).join("status.json");
-    let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to read status for run '{run_id}' at {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    serde_json::from_str(&raw).map(Some).map_err(|error| {
+        format!(
+            "Corrupt status for run '{run_id}' at {}: {error}",
+            path.display()
+        )
+    })
 }
 
 /// `requestAsyncInterrupt`: pause marker; the run becomes `paused` between
@@ -1951,6 +2138,7 @@ pub async fn harvest_for_shutdown() {
         // The host-shutdown stop is terminal too: surface a deferred
         // status-write failure after the terminal event (TE17 R7.1.7.1).
         flush_pending_status_write_failure(handle);
+        crate::p1::supervisor::close_requests_for_run(&handle.run_id);
         unregister_run(&handle.run_id);
     }
 }
@@ -2457,6 +2645,16 @@ pub fn format_async_run_list(runs: &[Value]) -> String {
                 ),
                 step["status"].as_str().unwrap_or_default().to_string(),
             ];
+            if let Some(model) = step["model"].as_str().filter(|model| !model.is_empty()) {
+                // #2734/#2825: show the provider-qualified model the child
+                // actually reported (or the launch model before its result).
+                parts.push(match step["thinking"].as_str() {
+                    Some(thinking) if !thinking.is_empty() => {
+                        format!("model {model} ({thinking})")
+                    }
+                    _ => format!("model {model}"),
+                });
+            }
             if let Some(activity) = format_step_activity(step, now_ms) {
                 parts.push(activity);
             }
@@ -3129,6 +3327,83 @@ pub(crate) mod tests {
         assert_eq!(path, None, "no saved-output line for a missing file");
     }
 
+    static FAKE_SEND_FAILS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static FAKE_SEND_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn fake_notify_host_call(
+        _cookie: rpi_ext_host::native::PluginCookie,
+        request: abi_stable::std_types::RVec<u8>,
+    ) -> abi_stable::std_types::RVec<u8> {
+        let parsed: Value = serde_json::from_slice(&request[..]).unwrap_or(Value::Null);
+        let method = parsed.get("call").and_then(Value::as_str).unwrap_or("");
+        let response = if method == "sendMessage" {
+            FAKE_SEND_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if FAKE_SEND_FAILS.load(std::sync::atomic::Ordering::SeqCst) {
+                json!({ "error": { "message": "host busy" } })
+            } else {
+                json!({ "ok": true })
+            }
+        } else {
+            json!({ "ok": Value::Null })
+        };
+        abi_stable::std_types::RVec::from(serde_json::to_vec(&response).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn failed_completion_notice_is_kept_and_resent_on_session_start() {
+        let run_id = format!(
+            "resend-{}-{}",
+            std::process::id(),
+            crate::artifacts::now_millis()
+        );
+        let run_dir = async_runs_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let status = json!({
+            "runId": run_id,
+            "mode": "single",
+            "state": STATE_COMPLETE,
+            "steps": [{ "agent": "scout", "status": "complete" }],
+        });
+        crate::artifacts::write_metadata(&run_dir.join("status.json"), &status).unwrap();
+        let handle = Arc::new(AsyncRunHandle {
+            run_id: run_id.clone(),
+            status: Arc::new(RwLock::new(status.clone())),
+            control: Arc::new(AsyncControl::default()),
+            run_dir: run_dir.clone(),
+            started_ms: 0,
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
+        });
+        let calls = crate::AsyncHostCalls {
+            call: fake_notify_host_call,
+            cookie: 0,
+        };
+        FAKE_SEND_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
+        let notify = AsyncNotify { calls: Some(calls) };
+        notify
+            .send(&handle, STATE_COMPLETE, "report body", None)
+            .await;
+        let result_path = async_results_dir().join(format!("{run_id}.json"));
+        assert!(
+            result_path.exists(),
+            "failed delivery keeps the result file"
+        );
+        let events = std::fs::read_to_string(run_dir.join("events.jsonl")).unwrap();
+        assert!(events.contains("run.result_delivery_failed"), "{events}");
+
+        FAKE_SEND_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        let before = FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        resend_pending_results(&calls);
+        assert!(!result_path.exists(), "successful resend removes the file");
+        assert!(
+            FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "resend issued a sendMessage"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
     #[tokio::test]
     async fn notify_send_records_result_write_failure_event() {
         let (handle, dir) = te17_handle("send-fail");
@@ -3155,6 +3430,38 @@ pub(crate) mod tests {
         assert!(diagnostic["attempts"].is_u64());
         let _ = std::fs::remove_dir_all(&result_dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_steps_carry_the_launch_model_and_thinking() {
+        let step = pending_step(
+            "worker",
+            Some("anthropic/claude-5"),
+            Some("high"),
+            Some("impl"),
+        );
+        assert_eq!(step["agent"], json!("worker"));
+        assert_eq!(step["status"], json!("pending"));
+        assert_eq!(step["key"], json!("impl"));
+        assert_eq!(step["model"], json!("anthropic/claude-5"));
+        assert_eq!(step["thinking"], json!("high"));
+        let bare = pending_step("scout", None, None, None);
+        assert!(bare.get("model").is_none());
+        assert!(bare.get("key").is_none());
+    }
+
+    #[test]
+    fn corrupt_status_is_a_parse_error_not_a_missing_run() {
+        let run_id = format!("corrupt-status-{}", std::process::id());
+        let run_dir = async_runs_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("status.json"), "{not json").unwrap();
+        let error = read_run_status(&run_id).expect_err("corrupt status is an error");
+        assert!(error.contains("Corrupt status"), "{error}");
+        assert!(error.contains(&run_id), "{error}");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        assert_eq!(read_run_status(&format!("missing-{run_id}")).unwrap(), None);
     }
 
     #[test]

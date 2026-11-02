@@ -236,7 +236,7 @@ fn tool_surface_integration() {
             result["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("Unknown agent: nonexistent"),
+                .contains("Unknown agent 'nonexistent'"),
             "{params}: {result}"
         );
         assert!(

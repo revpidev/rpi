@@ -638,13 +638,33 @@ fn execute_subagent_tool_inner(
     }
     let agent = match discover::resolve_agent_name(&agents, &spec.agent_name) {
         Ok(Some(agent)) => agent.clone(),
-        Ok(None) => return ToolOutcome::error(format!("Unknown agent: {}", spec.agent_name)),
+        Ok(None) => {
+            return ToolOutcome::error(discover::unknown_agent_error(&spec.agent_name, &agents));
+        }
         Err(message) => return ToolOutcome::error(message),
     };
 
+    // #3025: remember the running foreground child so a host exit leaves a
+    // resumable record. The child's session filename is host-assigned; the
+    // record carries the run root and discovers the file on restore.
+    let child_cwd = spec.cwd.clone().unwrap_or_else(|| ctx.base_cwd.clone());
+    let history_meta = crate::runner::foreground_history::ForegroundRunMeta {
+        run_id: &ctx.run_id,
+        session_id: ctx.parent_session_id.as_deref(),
+        cwd: &ctx.base_cwd,
+        agent: &agent.name,
+        model: spec.model.as_deref(),
+        thinking: spec.thinking.as_deref(),
+        child_cwd: &child_cwd,
+        session_dir: &ctx.session_root,
+    };
+    crate::runner::foreground_history::persist_running(&history_meta);
     let outcome = match crate::p1::launch_child::run_child(&spec, &agent, &ctx, runtime) {
         Ok(outcome) => outcome,
-        Err(error) => return ToolOutcome::error(error),
+        Err(error) => {
+            crate::runner::foreground_history::discard_running(&ctx.run_id);
+            return ToolOutcome::error(error);
+        }
     };
     let result = &outcome.result;
 
@@ -654,6 +674,10 @@ fn execute_subagent_tool_inner(
     // ask itself was already surfaced as a `triggerTurn` message at detach
     // time, so the receipt only points at it.
     if result.detached {
+        // The detached continuation is an async run with its own status
+        // document; drop the foreground running record so `resume` does not
+        // resolve the same run twice.
+        crate::runner::foreground_history::discard_running(&ctx.run_id);
         let details = assemble_single_details(&ctx, &spec, &agent, &outcome);
         let reason = result.detach_reason.as_deref().unwrap_or("user request");
         let text = format!(
@@ -668,6 +692,7 @@ fn execute_subagent_tool_inner(
     }
 
     let details = assemble_single_details(&ctx, &spec, &agent, &outcome);
+    crate::runner::foreground_history::persist_final(&history_meta, result);
 
     {
         let mut memory = FOREGROUND_RUN_MEMORY
@@ -1238,7 +1263,9 @@ fn dispatch_async(
         let spec = crate::p1::launch_child::ChildSpec::from_params(object);
         match discover::resolve_agent_name(agents, &spec.agent_name) {
             Ok(Some(_)) => {}
-            Ok(None) => return ToolOutcome::error(format!("Unknown agent: {}", spec.agent_name)),
+            Ok(None) => {
+                return ToolOutcome::error(discover::unknown_agent_error(&spec.agent_name, agents));
+            }
             Err(message) => return ToolOutcome::error(message),
         }
         crate::runner::background::AsyncBody::Single {

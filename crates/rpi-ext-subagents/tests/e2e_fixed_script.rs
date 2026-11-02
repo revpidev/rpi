@@ -327,12 +327,13 @@ fn e2e_fixed_child_full_pipeline() {
     let model_pos = find_flag("--model").expect("model inherited");
     assert_eq!(argv_lines[model_pos + 1], "faux/faux-1:low");
     // tools allowlist is the scout frontmatter list, single comma flag;
-    // TE05: intercomBridge (default always) appends contact_supervisor
-    // (FR-P1-10 applyIntercomBridgeToAgent).
+    // TE05: intercomBridge (default always) keeps contact_supervisor
+    // (FR-P1-10 applyIntercomBridgeToAgent); upstream v0.83 removed the
+    // stale generic `intercom` entry from the builtin assets.
     let tools_pos = find_flag("--tools").expect("scout declares tools");
     assert_eq!(
         argv_lines[tools_pos + 1],
-        "read,grep,find,ls,bash,write,intercom,contact_supervisor"
+        "read,grep,find,ls,bash,write,contact_supervisor"
     );
     // context files inherited (no --no-context-files), skills not (--no-skills).
     assert!(find_flag("--no-context-files").is_none());
@@ -397,9 +398,9 @@ fn e2e_fixed_child_full_pipeline() {
         );
     }
     assert!(env_text.contains(&format!("RPI_SUBAGENT_RUN_ID={run_id}")));
-    // TE05: intercomBridge (default always) appends contact_supervisor to the
-    // required list (FR-P1-10).
-    assert!(env_text.contains("RPI_SUBAGENT_REQUIRED_TOOLS=[\"read\",\"grep\",\"find\",\"ls\",\"bash\",\"write\",\"intercom\",\"contact_supervisor\"]"));
+    // TE05: intercomBridge (default always) keeps contact_supervisor in the
+    // required list (FR-P1-10); v0.83 removed the stale `intercom` entry.
+    assert!(env_text.contains("RPI_SUBAGENT_REQUIRED_TOOLS=[\"read\",\"grep\",\"find\",\"ls\",\"bash\",\"write\",\"contact_supervisor\"]"));
 
     // artifacts trail (project mode).
     let artifacts_dir = sandbox.project.join(".rpi/subagents/artifacts");

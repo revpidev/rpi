@@ -1787,6 +1787,86 @@ pub fn resolve_agent_name<'a>(
     Ok(None)
 }
 
+/// Bounds for the available-agent hint (#2792): at most 30 rows and an
+/// 80-character description per row.
+pub const MAX_LISTED_AGENTS: usize = 30;
+pub const MAX_LISTED_DESCRIPTION_CHARS: usize = 80;
+
+/// `formatAvailableAgentLines` (agents.ts:352-367): one line per agent the
+/// caller can launch instead, so a misspelled name needs no separate list
+/// call.
+pub fn format_available_agent_lines(agents: &[AgentConfig]) -> Vec<String> {
+    let mut sorted: Vec<&AgentConfig> = agents.iter().collect();
+    sorted.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.source.as_str().cmp(right.source.as_str()))
+    });
+    let mut lines: Vec<String> = sorted
+        .iter()
+        .take(MAX_LISTED_AGENTS)
+        .map(|agent| {
+            let description = agent
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let short: String = if description.chars().count() > MAX_LISTED_DESCRIPTION_CHARS {
+                let mut cut: String = description
+                    .chars()
+                    .take(MAX_LISTED_DESCRIPTION_CHARS.saturating_sub(1))
+                    .collect();
+                cut.push('…');
+                cut
+            } else {
+                description
+            };
+            if short.is_empty() {
+                format!("- {} ({})", agent.name, agent.source.as_str())
+            } else {
+                format!("- {} ({}) — {short}", agent.name, agent.source.as_str())
+            }
+        })
+        .collect();
+    if sorted.len() > MAX_LISTED_AGENTS {
+        lines.push(format!(
+            "+{} more; {{action:\"list\"}}",
+            sorted.len() - MAX_LISTED_AGENTS
+        ));
+    }
+    if lines.is_empty() {
+        lines.push("- (none)".to_string());
+    }
+    lines
+}
+
+/// `suggestAgentName` (agents.ts:369-371): the closest name or alias when
+/// `name` looks like a typo of one.
+pub fn suggest_agent_name(name: &str, agents: &[AgentConfig]) -> Option<String> {
+    let candidates: Vec<String> = agents
+        .iter()
+        .flat_map(|agent| {
+            std::iter::once(agent.name.clone())
+                .chain(std::iter::once(agent.local_name.clone()))
+                .chain(agent.aliases.clone().unwrap_or_default())
+        })
+        .collect();
+    super::edit_distance::closest_match(name.trim(), candidates.iter().map(String::as_str))
+}
+
+/// `formatUnknownAgentError` launch subset (#2792): the typo hint plus the
+/// launchable agents, so the model does not need a separate `list` call.
+pub fn unknown_agent_error(name: &str, agents: &[AgentConfig]) -> String {
+    let suggestion = suggest_agent_name(name, agents);
+    let problem = match suggestion {
+        Some(suggestion) => format!("Unknown agent '{name}'. Did you mean '{suggestion}'?"),
+        None => format!("Unknown agent '{name}'."),
+    };
+    let mut lines = vec![format!("{problem} Available agents:")];
+    lines.extend(format_available_agent_lines(agents));
+    lines.join("\n")
+}
+
 fn finish_agent_match<'a>(
     matches: Vec<&'a AgentConfig>,
     raw: &str,
@@ -2396,6 +2476,37 @@ mod tests {
         let worker = agents.iter().find(|a| a.name == "worker").unwrap();
         assert_eq!(worker.acceptance_role.as_deref(), Some("writer"));
         assert_eq!(worker.default_context, Some(ContextMode::Fresh));
+    }
+
+    #[test]
+    fn builtin_read_only_agents_declare_their_acceptance_role() {
+        // #2868: oracle/reviewer are role-driven read-only agents; the v0.48
+        // assets shipped without the role and with a stale `intercom` tool.
+        let agents = crate::agents::builtin::load_builtin_agents(None);
+        for name in ["oracle", "reviewer"] {
+            let agent = agents.iter().find(|a| a.name == name).unwrap();
+            assert_eq!(
+                agent.acceptance_role.as_deref(),
+                Some("read-only"),
+                "{name} acceptance role"
+            );
+        }
+        for agent in &agents {
+            let tools = agent.tools.as_deref().unwrap_or_default();
+            assert!(
+                !tools.iter().any(|tool| tool == "intercom"),
+                "{} still declares the removed intercom tool: {tools:?}",
+                agent.name
+            );
+        }
+        let reviewer = agents.iter().find(|a| a.name == "reviewer").unwrap();
+        assert!(
+            reviewer
+                .tools
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&"contact_supervisor".to_string())
+        );
     }
 }
 

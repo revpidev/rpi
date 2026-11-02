@@ -366,21 +366,115 @@ pub fn resolve_subagent_model_candidate(
     None
 }
 
+/// `suggestAlternateProviderModel` (model-resolution.ts:251-266 @ v0.83.0):
+/// an explicit `provider/id` whose id exists under another provider.
+fn suggest_alternate_provider_model(
+    model: &str,
+    available_models: &[AvailableModel],
+) -> Option<String> {
+    let (base_model, thinking_suffix) = split_thinking_suffix(model);
+    let (query_provider, query_id_raw) = split_qualified_model_query(base_model, available_models);
+    let query_provider = query_provider?;
+    let suggestion = resolve_base_model_candidate(query_id_raw, available_models, None)?;
+    let matched = available_models
+        .iter()
+        .find(|entry| entry.full_id == suggestion)?;
+    if normalize_model_segment(&matched.provider) == query_provider {
+        return None;
+    }
+    Some(format!("{suggestion}{thinking_suffix}"))
+}
+
+const MAX_MODEL_CANDIDATES: usize = 5;
+
+/// `closestModelCandidates` (model-resolution.ts:269-291 @ v0.83.0): the
+/// same registry id under any provider first, then near spellings. Used by
+/// the launch-error diagnostic so an unknown model returns usable choices.
+fn closest_model_candidates(model: &str, available_models: &[AvailableModel]) -> Vec<String> {
+    let (base_model, thinking_suffix) = split_thinking_suffix(model);
+    let (query_provider, query_id_raw) = split_qualified_model_query(base_model, available_models);
+    let query_id = normalize_model_segment(query_id_raw);
+    let query_id_no_date = strip_trailing_date_stamp(&query_id);
+    let mut candidates: Vec<(bool, usize, bool, String)> = available_models
+        .iter()
+        .filter_map(|entry| {
+            let id = normalize_model_segment(&entry.id);
+            let distance = crate::agents::edit_distance::edit_distance(&query_id, &id);
+            let same_id = id == query_id || strip_trailing_date_stamp(&id) == query_id_no_date;
+            let same_provider = query_provider
+                .as_deref()
+                .is_some_and(|provider| normalize_model_segment(&entry.provider) == provider);
+            let close = distance <= std::cmp::max(2, id.chars().count() / 3);
+            (same_id || close).then(|| {
+                (
+                    same_id,
+                    distance,
+                    same_provider,
+                    format!("{}{thinking_suffix}", entry.full_id),
+                )
+            })
+        })
+        .collect();
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    candidates
+        .into_iter()
+        .take(MAX_MODEL_CANDIDATES)
+        .map(|(_, _, _, full_id)| full_id)
+        .collect()
+}
+
+fn is_virtual_provider(provider: &str) -> bool {
+    matches!(provider, "rpi-virtual" | "pi-virtual")
+}
+
 /// `resolveRequiredSubagentModelCandidate` (model-resolution.ts:235-247
 /// @ 0fc0eebb, #1093 / R7.1.4.5): the strict resolution with a fail-closed
 /// error — a non-empty registry must match the requested model before the
 /// child spawns, instead of forwarding an invalid `--model` to the child.
-/// The upstream "Did you mean" cross-provider suggestion is not ported
-/// (upstream `suggestAlternateProviderModel` depends on the in-process
-/// registry shape); the model name + registry pointer are kept verbatim.
+/// v0.83.0 (#2771/#2792/#2821) adds the cross-provider suggestion, the two
+/// closest registry candidates and the virtual-model remedy.
 pub fn resolve_required_subagent_model_candidate(
     model: &str,
     available_models: Option<&[AvailableModel]>,
     preferred_provider: Option<&str>,
 ) -> Result<String, String> {
-    resolve_subagent_model_candidate(model, available_models, preferred_provider).ok_or_else(|| {
-        format!("Unknown subagent model '{model}' in the active rpi model registry.")
-    })
+    if let Some(resolved) =
+        resolve_subagent_model_candidate(model, available_models, preferred_provider)
+    {
+        return Ok(resolved);
+    }
+    let models = available_models.unwrap_or_default();
+    let suggestion = suggest_alternate_provider_model(model, models);
+    let mut candidates = closest_model_candidates(model, models);
+    if let Some(suggestion) = &suggestion {
+        candidates.retain(|candidate| candidate != suggestion);
+    }
+    let mut error = format!("Unknown subagent model '{model}' in the active rpi model registry.");
+    if let Some(suggestion) = suggestion {
+        error.push_str(&format!(" Did you mean '{suggestion}'?"));
+    }
+    if !candidates.is_empty() {
+        error.push_str(&format!(
+            " Closest registry models: {}.",
+            candidates.join(", ")
+        ));
+    }
+    if models
+        .iter()
+        .any(|entry| is_virtual_provider(&entry.provider))
+    {
+        error.push_str(
+            " If the model is an extension-registered virtual model, the extension that registers it must load in this child: list it in `subagentOnlyExtensions` or `extensions`, or register it from the host so it loads for every launch.",
+        );
+    }
+    Err(error)
 }
 
 /// R7.1.4.4 (TE18 FR-D): the explicit empty-registry branch — fuzzy
@@ -1481,11 +1575,23 @@ mod te18_model_tests {
     fn required_candidate_fails_closed_upstream_message() {
         let registry = models();
         let error =
+            resolve_required_subagent_model_candidate("anthropic/claude-6", Some(&registry), None)
+                .unwrap_err();
+        // v0.83.0 message: model name + registry pointer + closest ids.
+        assert!(
+            error.starts_with(
+                "Unknown subagent model 'anthropic/claude-6' in the active rpi model registry."
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("Closest registry models: anthropic/claude-5"),
+            "{error}"
+        );
+        // A model with no near candidates keeps the plain diagnostic.
+        let error =
             resolve_required_subagent_model_candidate("faux/primary", Some(&registry), None)
                 .unwrap_err();
-        // Upstream message (model-resolution.ts:235-247 @ b72714de): model
-        // name + active-registry pointer. (The cross-provider "Did you
-        // mean" suggestion is not ported — in-process registry dependency.)
         assert_eq!(
             error,
             "Unknown subagent model 'faux/primary' in the active rpi model registry."
@@ -1495,6 +1601,30 @@ mod te18_model_tests {
             resolve_required_subagent_model_candidate("faux/primary", None, None),
             Ok("faux/primary".to_string())
         );
+    }
+
+    #[test]
+    fn unknown_virtual_model_names_the_required_child_extension() {
+        let registry = vec![
+            AvailableModel {
+                full_id: "rpi-virtual/summarizer".into(),
+                provider: "rpi-virtual".into(),
+                id: "summarizer".into(),
+            },
+            AvailableModel {
+                full_id: "anthropic/claude-5".into(),
+                provider: "anthropic".into(),
+                id: "claude-5".into(),
+            },
+        ];
+        let error =
+            resolve_required_subagent_model_candidate("missing-model", Some(&registry), None)
+                .unwrap_err();
+        assert!(
+            error.contains("extension-registered virtual model"),
+            "{error}"
+        );
+        assert!(error.contains("subagentOnlyExtensions"), "{error}");
     }
 
     #[test]

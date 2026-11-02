@@ -497,6 +497,21 @@ pub fn preflight_self_extension(
     None
 }
 
+/// `<dir>/<name>.<suffix><ext>` next to `output_path`, with `.md` when it has
+/// no extension (`suffixedOutputPath`, subagent-executor.ts:3737-3740).
+fn suffixed_output_path(output_path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let stem = output_path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("output");
+    let extension = output_path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|extension| !extension.is_empty())
+        .unwrap_or("md");
+    output_path.with_file_name(format!("{stem}.{suffix}.{extension}"))
+}
+
 pub async fn run_child_async(
     spec: &ChildSpec,
     agent: &AgentConfig,
@@ -760,14 +775,23 @@ pub async fn run_child_async(
         }
     }
 
-    // Output path: child override > agent frontmatter.
+    // Output path: child override > agent frontmatter. A resumed run without
+    // its own output must not overwrite the report the original run owns
+    // (#2840): write `<name>.<new run id prefix><ext>` next to it instead.
     let output_path = match &spec.output {
         OutputOverride::Path(path) => Some(path.clone()),
         OutputOverride::Disabled => None,
         OutputOverride::Inherit => agent
             .output
             .as_deref()
-            .map(crate::paths::expand_tilde_and_resolve),
+            .map(crate::paths::expand_tilde_and_resolve)
+            .map(|path| {
+                if spec.session_file.is_some() {
+                    suffixed_output_path(&path, &ctx.run_id.chars().take(8).collect::<String>())
+                } else {
+                    path
+                }
+            }),
     };
 
     // Effective output mode (#1305, subagent-executor.ts:3260 @ 0fc0eebb):
@@ -1377,6 +1401,22 @@ mod te18_gate_budget_tests {
 
         // Path resolved: nothing is rejected either way.
         assert!(preflight_self_extension(&names_all, &agents, resolved).is_none());
+    }
+
+    #[test]
+    fn resumed_output_is_suffixed_next_to_the_original_report() {
+        assert_eq!(
+            suffixed_output_path(std::path::Path::new("/x/report.md"), "abc12345"),
+            std::path::PathBuf::from("/x/report.abc12345.md")
+        );
+        assert_eq!(
+            suffixed_output_path(std::path::Path::new("/x/report"), "abc12345"),
+            std::path::PathBuf::from("/x/report.abc12345.md")
+        );
+        assert_eq!(
+            suffixed_output_path(std::path::Path::new("/x/report.txt"), "abc12345"),
+            std::path::PathBuf::from("/x/report.abc12345.txt")
+        );
     }
 
     #[test]

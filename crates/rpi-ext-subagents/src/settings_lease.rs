@@ -737,6 +737,56 @@ mod tests {
         )));
     }
 
+    /// V18-02 FR-A R4/R6 + TE51 FR-F R2: two new-protocol writers (host-style
+    /// and subagents-style, both A+B) and an old host holding only A
+    /// interleave on one file. Every writer re-reads under the lock, so no
+    /// top-level key is lost.
+    #[test]
+    fn concurrent_writers_preserve_each_others_settings_keys() {
+        let dir = temp_dir("settings-lease-writers");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let path_c = path.clone();
+        let a = std::thread::spawn(move || {
+            with_settings_file_lease(&path_a, || {
+                let mut root: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&path_a).unwrap()).unwrap();
+                root["defaultModel"] = serde_json::json!("model-a");
+                write_settings_json(&path_a, &root).map_err(|error| error.to_string())
+            })
+            .unwrap();
+        });
+        let b = std::thread::spawn(move || {
+            with_settings_file_lease(&path_b, || {
+                let mut root: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&path_b).unwrap()).unwrap();
+                root["subagents"] = serde_json::json!({"agentOverrides": {}});
+                write_settings_json(&path_b, &root).map_err(|error| error.to_string())
+            })
+            .unwrap();
+        });
+        let c = std::thread::spawn(move || {
+            with_settings_file_lease(&path_c, || {
+                let mut root: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&path_c).unwrap()).unwrap();
+                root["statusLine"] = serde_json::json!({"type": "command"});
+                write_settings_json(&path_c, &root).map_err(|error| error.to_string())
+            })
+            .unwrap();
+        });
+        a.join().unwrap();
+        b.join().unwrap();
+        c.join().unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["defaultModel"], serde_json::json!("model-a"));
+        assert_eq!(root["subagents"]["agentOverrides"], serde_json::json!({}));
+        assert_eq!(root["statusLine"]["type"], "command");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn foreign_host_free_lease_lock_is_not_evicted() {
         let dir = temp_dir("foreign-host");

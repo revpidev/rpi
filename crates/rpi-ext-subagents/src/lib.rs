@@ -1292,6 +1292,21 @@ fn dispatch_message(message: &Value) -> Value {
                         cookie: state.cookie,
                     };
                     actions::refresh_advertised_catalog(Some(&host), &host.cwd(), &config);
+                    // #3025: mark foreground runs cut off by a host exit as
+                    // stopped with their persisted child session so `status`
+                    // and `resume` can see them.
+                    let restored = runner::foreground_history::restore_interrupted();
+                    if restored > 0 {
+                        tracing::info!(restored, "restored interrupted foreground subagent runs");
+                    }
+                    // Results whose completion notice never reached the
+                    // parent (host call error or the launching Pi exiting)
+                    // are resent once on the next session start (#3032).
+                    let calls = AsyncHostCalls {
+                        call: state.calls.call,
+                        cookie: state.cookie,
+                    };
+                    runner::background::resend_pending_results(&calls);
                     Value::Null
                 }
                 (PluginMode::Parent, "session_shutdown") => {

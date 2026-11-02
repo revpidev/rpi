@@ -18,6 +18,23 @@ use serde_json::{Value, json};
 
 use crate::runner::display::{format_duration, shorten_path};
 
+/// `CHILD_OUTPUT_PREVIEW_MAX_BYTES` (notify.ts:177 @ v0.83.0): child output
+/// inlined into the parent context is capped; the full report stays on disk
+/// (the `Saved output:` line points at it).
+const MAX_RESULT_PREVIEW_BYTES: usize = 2_000;
+const PREVIEW_TRUNCATION_MARKER: &str = "...[preview truncated]";
+
+fn bounded_result_preview(value: &str) -> String {
+    if value.len() <= MAX_RESULT_PREVIEW_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_RESULT_PREVIEW_BYTES.saturating_sub(PREVIEW_TRUNCATION_MARKER.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &value[..end], PREVIEW_TRUNCATION_MARKER)
+}
+
 /// `SubagentNotifyDetails` (notify.ts:20-30 @ v0.48; v0.66 :23-47) — the
 /// parsed projection of one completion. `source` is always async in rpi
 /// (no detached foreground face), so the foreground variant of `task_kind`
@@ -86,11 +103,11 @@ pub fn format_single_completion(details: &SubagentNotifyDetails) -> String {
         details.task_info.clone().unwrap_or_default()
     )];
     lines.push(String::new());
-    let preview = details.result_preview.trim();
+    let preview = bounded_result_preview(details.result_preview.trim());
     lines.push(if preview.is_empty() {
         "(no output)".to_string()
     } else {
-        preview.to_string()
+        preview
     });
     if details.output_path.is_some() {
         lines.push(String::new());
@@ -538,6 +555,19 @@ mod tests {
             format_single_completion(&d),
             "Background task failed: **scout**\n\n(no output)\n\nParallel handoff: /tmp/handoff.md"
         );
+    }
+
+    #[test]
+    fn long_previews_are_capped_and_point_at_the_saved_report() {
+        let long = "x".repeat(20_000);
+        let mut d = details("worker", "completed", &long);
+        d.output_path = Some("/tmp/report.md".to_string());
+        let text = format_single_completion(&d);
+        assert!(text.contains(PREVIEW_TRUNCATION_MARKER), "truncated");
+        assert!(text.contains("Saved output: /tmp/report.md"), "{text}");
+        assert!(text.len() < 2_200, "bounded preview, got {}", text.len());
+        let parsed = parse_subagent_notify_content(&text).unwrap();
+        assert_eq!(parsed.output_path.as_deref(), Some("/tmp/report.md"));
     }
 
     #[test]

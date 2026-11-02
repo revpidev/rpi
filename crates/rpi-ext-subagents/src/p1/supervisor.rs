@@ -111,6 +111,39 @@ pub fn read_requests(dir: &Path) -> Vec<Value> {
     requests
 }
 
+/// Drop every pending request owned by `run_id` when the run reaches a
+/// terminal state or the host shuts down. A dead child cannot consume a
+/// reply, and a stale blocking ask would otherwise keep `subagent_wait` and
+/// headless auto-drain yielding forever (the `eb91202f` shutdown half).
+pub fn close_requests_for_run(run_id: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(channels_root()) else {
+        return 0;
+    };
+    let mut closed = 0;
+    for channel in entries.flatten() {
+        let requests = channel.path().join("requests");
+        let Ok(files) = std::fs::read_dir(&requests) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let owned = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .and_then(|request| request["runId"].as_str().map(str::to_string))
+                .as_deref()
+                == Some(run_id);
+            if owned && std::fs::remove_file(&path).is_ok() {
+                closed += 1;
+            }
+        }
+    }
+    closed
+}
+
 /// `requestMatchesContext` (L453): only the orchestrator session sees the
 /// request (wrong-session lifecycle).
 pub fn request_matches_session(request: &Value, orchestrator_session_id: &str) -> bool {
@@ -604,6 +637,37 @@ mod tests {
             1
         );
         assert_eq!(prompt.matches("Intercom orchestration channel:").count(), 1);
+    }
+
+    #[test]
+    fn closing_a_run_removes_only_its_requests() {
+        let run_id = format!("close-run-{}", std::process::id());
+        let other_run = format!("keep-run-{}", std::process::id());
+        for (run, id) in [(&run_id, "r1"), (&other_run, "r2")] {
+            let channel = channels_root().join(format!("close-test-{run}-worker-0"));
+            let _ = std::fs::remove_dir_all(&channel);
+            ensure_channel(&channel);
+            std::fs::write(
+                channel.join("requests").join(format!("{id}.json")),
+                json!({ "id": id, "reason": "need_decision", "runId": run,
+                        "orchestratorSessionId": "session-close", "createdAt": "2026-09-26T00:00:00.000Z" })
+                    .to_string(),
+            )
+            .unwrap();
+        }
+        assert_eq!(close_requests_for_run(&run_id), 1);
+        assert_eq!(close_requests_for_run(&run_id), 0, "second pass is a no-op");
+        // The other run's request survives.
+        let other_channel = channels_root().join(format!("close-test-{other_run}-worker-0"));
+        assert_eq!(read_requests(&other_channel).len(), 1);
+        let _ = std::fs::remove_dir_all(format!(
+            "{}/close-test-{run_id}-worker-0",
+            channels_root().display()
+        ));
+        let _ = std::fs::remove_dir_all(format!(
+            "{}/close-test-{other_run}-worker-0",
+            channels_root().display()
+        ));
     }
 
     /// TE38 T1 (#2327 @ b72714de): supervisor scanning is fail-soft — a

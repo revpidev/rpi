@@ -443,7 +443,10 @@ pub fn validate_task_agents(entries: &[TaskEntry], agents: &[AgentConfig]) -> Re
     entries.iter().try_for_each(|entry| {
         match discover::resolve_agent_name(agents, &entry.spec.agent_name)? {
             Some(_) => Ok(()),
-            None => Err(format!("Unknown agent: {}", entry.spec.agent_name)),
+            None => Err(discover::unknown_agent_error(
+                &entry.spec.agent_name,
+                agents,
+            )),
         }
     })
 }
@@ -624,7 +627,12 @@ async fn launch_one(
 ) -> Option<Result<ParallelTaskOutcome, String>> {
     let agent = match discover::resolve_agent_name(agents, &entry.spec.agent_name) {
         Ok(Some(agent)) => agent.clone(),
-        Ok(None) => return Some(Err(format!("Unknown agent: {}", entry.spec.agent_name))),
+        Ok(None) => {
+            return Some(Err(discover::unknown_agent_error(
+                &entry.spec.agent_name,
+                agents,
+            )));
+        }
         Err(message) => return Some(Err(message)),
     };
     // Worktree isolation (FR-P1-06): create → redirect cwd → run → capture
@@ -1012,10 +1020,12 @@ mod tests {
             8,
         )
         .unwrap();
-        assert_eq!(
-            validate_task_agents(&entries, &agents).unwrap_err(),
-            "Unknown agent: scoutt"
+        let error = validate_task_agents(&entries, &agents).unwrap_err();
+        assert!(
+            error.starts_with("Unknown agent 'scoutt'. Did you mean 'scout'?"),
+            "{error}"
         );
+        assert!(error.contains("Available agents:"), "{error}");
         let entries =
             parse_tasks(&json!([{"key": "a", "agent": "scout", "task": "scan"}]), 8).unwrap();
         assert!(validate_task_agents(&entries, &agents).is_ok());

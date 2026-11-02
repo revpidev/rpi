@@ -498,6 +498,66 @@ fn management_scope(params: &Value, action: &str) -> Result<&'static str, String
     }
 }
 
+/// Revive a remembered foreground run (#3025): the child session file is
+/// the authoritative continuation point; the new attempt runs async so the
+/// resume call returns immediately (upstream `executeAsyncSingle`).
+fn resume_from_foreground_record(
+    record: &Value,
+    task: Option<String>,
+    host: &dyn crate::HostContext,
+    settings: &SettingsPair,
+    config: &crate::config::ExtensionConfig,
+    runtime: &crate::PluginRuntime,
+) -> ToolOutcome {
+    let run_id = record["runId"].as_str().unwrap_or("?");
+    if record["children"]
+        .as_array()
+        .is_some_and(|children| children.iter().any(|child| child["status"] == "running"))
+    {
+        return ToolOutcome::error(format!(
+            "Foreground run {run_id} is still running; resume applies to interrupted or completed runs."
+        ));
+    }
+    let Some(child) = crate::runner::foreground_history::resumable_child(record) else {
+        return ToolOutcome::error(format!(
+            "Foreground run '{run_id}' does not have a persisted child session to resume from."
+        ));
+    };
+    let agent = child["agent"].as_str().unwrap_or("worker").to_string();
+    let session_file = child["sessionFile"]
+        .as_str()
+        .expect("resumable_child requires sessionFile");
+    let task =
+        task.unwrap_or_else(|| "Continue the interrupted task from this session.".to_string());
+    let mut params = serde_json::json!({
+        "agent": agent,
+        "task": task,
+        "sessionFile": session_file,
+        "async": true,
+    });
+    if let Some(cwd) = record["cwd"].as_str().filter(|cwd| !cwd.is_empty()) {
+        params["cwd"] = json!(cwd);
+    }
+    if let Some(model) = child["model"].as_str().filter(|model| !model.is_empty()) {
+        params["model"] = json!(model);
+    }
+    if let Some(thinking) = child["thinking"]
+        .as_str()
+        .filter(|thinking| !thinking.is_empty())
+    {
+        params["thinking"] = json!(thinking);
+    }
+    let result = crate::tool::execute_subagent_tool(&params, host, settings, config, runtime, None);
+    ToolOutcome {
+        text: result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        details: result.get("details").cloned().unwrap_or(Value::Null),
+        is_error: result["isError"].as_bool().unwrap_or(false),
+    }
+}
+
 fn handle_management_action_inner(
     action: &str,
     agent_name: Option<&str>,
@@ -637,6 +697,38 @@ fn handle_management_action_inner(
                         .as_ref()
                         .map(|error| format!(" error={error}"))
                         .unwrap_or_default()
+                ));
+            }
+            // #3025: foreground runs remembered from an earlier host process
+            // (the in-memory list dies with the process).
+            let session_id = deps
+                .host
+                .and_then(|host| host.parent_session(settings))
+                .map(|session| session.id);
+            for record in
+                crate::runner::foreground_history::list_for_session(session_id.as_deref(), 10)
+            {
+                let run_id = record["runId"].as_str().unwrap_or("?");
+                if memory.runs.iter().any(|run| run.run_id == run_id) {
+                    continue;
+                }
+                let child = &record["children"][0];
+                let state = child["status"].as_str().unwrap_or("?");
+                let resume = if child["sessionFile"].as_str().is_some() {
+                    format!(" · resume {run_id}")
+                } else {
+                    String::new()
+                };
+                lines.push(format!(
+                    "- {} agent={} state={}{}{}",
+                    run_id,
+                    child["agent"].as_str().unwrap_or("?"),
+                    state,
+                    child["error"]
+                        .as_str()
+                        .map(|error| format!(" error={error}"))
+                        .unwrap_or_default(),
+                    resume
                 ));
             }
             lines.push(String::new());
@@ -865,8 +957,21 @@ fn handle_management_action_inner(
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
-            let Some(status) = crate::runner::background::read_run_status(&id) else {
-                return ToolOutcome::error(format!("No background run matches '{id}'."));
+            match crate::runner::foreground_history::find_prefix(&id) {
+                Ok(Some(record)) => {
+                    return resume_from_foreground_record(
+                        &record, task, host, settings, config, runtime,
+                    );
+                }
+                Ok(None) => {}
+                Err(message) => return ToolOutcome::error(message),
+            }
+            let status = match crate::runner::background::read_run_status(&id) {
+                Ok(Some(status)) => status,
+                Ok(None) => {
+                    return ToolOutcome::error(format!("No background run matches '{id}'."));
+                }
+                Err(message) => return ToolOutcome::error(message),
             };
             if matches!(status["state"].as_str(), Some("running") | Some("queued")) {
                 return ToolOutcome::error(format!(
@@ -1056,7 +1161,7 @@ pub fn format_status_transcript(
     settings: &SettingsPair,
     config: &crate::config::ExtensionConfig,
 ) -> Result<String, String> {
-    let status = crate::runner::background::read_run_status(id)
+    let status = crate::runner::background::read_run_status(id)?
         .ok_or_else(|| format!("No background run matches '{id}'."))?;
     let run_id = status["runId"].as_str().unwrap_or("?").to_string();
     let steps: Vec<Value> = status["steps"].as_array().cloned().unwrap_or_default();
@@ -1535,7 +1640,7 @@ fn read_session_transcript_tail(
 /// state/mode + process terminal + a bounded events summary — deliberately
 /// no prompts, secrets, or transcript bodies.
 pub fn format_run_lifecycle_debug(id: &str) -> Result<String, String> {
-    let status = crate::runner::background::read_run_status(id)
+    let status = crate::runner::background::read_run_status(id)?
         .ok_or_else(|| format!("No background run matches '{id}'."))?;
     let run_id = status["runId"].as_str().unwrap_or("?").to_string();
     let run_dir = crate::runner::background::async_runs_dir().join(&run_id);
@@ -3661,7 +3766,7 @@ mod tests {
         // Oracle declares thinking high and an explicit tool list.
         assert!(listing.contains("Thinking: high"), "{}", listing);
         assert!(
-            listing.contains("Tools: read, grep, find, ls, bash, intercom"),
+            listing.contains("Tools: read, grep, find, ls, bash"),
             "{}",
             listing
         );

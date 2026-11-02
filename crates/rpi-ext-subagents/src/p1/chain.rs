@@ -451,7 +451,7 @@ fn resolve_step_agents<'a>(
         .iter()
         .map(|step| {
             discover::resolve_agent_name(agents, &step.agent_name)?
-                .ok_or_else(|| format!("Unknown agent: {}", step.agent_name))
+                .ok_or_else(|| discover::unknown_agent_error(&step.agent_name, agents))
         })
         .collect()
 }
@@ -795,10 +795,14 @@ mod tests {
         ]))
         .unwrap();
         let error = resolve_step_agents(&steps, &agents).unwrap_err();
-        assert_eq!(error, "Unknown agent: workr");
+        assert!(
+            error.starts_with("Unknown agent 'workr'. Did you mean 'worker'?"),
+            "{error}"
+        );
+        assert!(error.contains("Available agents:"), "{error}");
         assert_eq!(
             validate_step_agents(&steps, &agents).unwrap_err(),
-            "Unknown agent: workr",
+            error,
             "the dispatch-side preflight sees the same miss"
         );
         // A valid chain preflights clean; aliases still pass.
@@ -872,7 +876,10 @@ mod tests {
         let error = runtime
             .block_on(run_chain_async(&steps, &agents, &ctx, "task"))
             .expect_err("unknown agent must fail the chain");
-        assert_eq!(error, "Unknown agent: workr");
+        assert!(
+            error.starts_with("Unknown agent 'workr'. Did you mean 'worker'?"),
+            "{error}"
+        );
         let chain_dir = project_chain_runs_dir(&base).join(&ctx.run_id);
         assert!(
             !chain_dir.exists(),

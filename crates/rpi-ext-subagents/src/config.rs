@@ -36,8 +36,9 @@ use crate::paths;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtensionConfig {
-    /// `toolDescriptionMode`: full (default) | compact | custom. Invalid values
-    /// warn and fall back to `full` at description-build time, like upstream.
+    /// `toolDescriptionMode`: compact (default) | full | custom. Invalid
+    /// values warn and fall back to `full` at description-build time, like
+    /// upstream.
     pub tool_description_mode: Option<String>,
     /// `asyncByDefault` (default true). Parsed in P0; effective only from
     /// FR-P1-04 — P0 runs are always foreground (requirements §3.1).

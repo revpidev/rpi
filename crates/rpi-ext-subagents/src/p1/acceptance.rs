@@ -57,6 +57,12 @@ pub fn infer_level(
     is_async: bool,
 ) -> (String, bool) {
     let lowered_task = task.to_lowercase();
+    // #2868: an explicit read-only acceptance role wins over name/task
+    // heuristics and asks for no acceptance evidence (upstream
+    // acceptance.ts:109-116).
+    if acceptance_role == Some("read-only") {
+        return ("none".to_string(), false);
+    }
     let read_only_name = ["reviewer", "oracle", "scout", "researcher", "analyst"]
         .iter()
         .any(|name| agent_name.contains(name));
@@ -626,6 +632,9 @@ mod tests {
         // Read-only agent → attested.
         let (level, review) = infer_level("reviewer", None, "check the diff", false);
         assert_eq!((level.as_str(), review), ("attested", false));
+        // Declared read-only role → none, even for a writer-named agent.
+        let (level, review) = infer_level("worker", Some("read-only"), "review the diff", false);
+        assert_eq!((level.as_str(), review), ("none", false));
         // Writer role → checked.
         let (level, _) = infer_level("worker", Some("writer"), "t", false);
         assert_eq!(level, "checked");

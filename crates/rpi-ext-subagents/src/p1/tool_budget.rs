@@ -15,7 +15,7 @@
 //!   (full-message regex + embedded hard/tool attribution; incidental
 //!   occurrences in ordinary tool output are rejected), and
 //!   [`tool_budget_state`] renders the `ToolBudgetState` shape
-//!   (`outcome: within-budget | soft-reached | hard-blocked`).
+//!   (`outcome: within-budget | soft-reached | hard-reached | hard-blocked`).
 
 use serde_json::{Value, json};
 
@@ -256,7 +256,13 @@ pub fn tool_budget_state(
     state.insert(
         "outcome".to_string(),
         json!(if over_hard {
-            "hard-blocked"
+            // #2876: past the hard cap is "hard-reached" until a tool call is
+            // actually blocked; only a named blocked tool is "hard-blocked".
+            if blocked_tool.is_some() {
+                "hard-blocked"
+            } else {
+                "hard-reached"
+            }
         } else if over_soft {
             "soft-reached"
         } else {
@@ -482,6 +488,10 @@ mod tests {
         assert!(soft.get("hardReachedAt").is_none());
         // #2302: a block before execution reports past-hard counting
         // (max(toolCount, hard+1)) with the blocked tool.
+        // #2876: past hard without a blocked tool is `hard-reached`.
+        let reached = tool_budget_state(&b, b.hard + 1, None);
+        assert_eq!(reached["outcome"], json!("hard-reached"));
+        assert!(reached.get("blockedTool").is_none());
         let hard = tool_budget_state(&b, b.hard + 1, Some("bash"));
         assert_eq!(hard["outcome"], json!("hard-blocked"));
         assert_eq!(hard["hardReachedAt"], json!(2));

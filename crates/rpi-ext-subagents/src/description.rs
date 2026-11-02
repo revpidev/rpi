@@ -67,7 +67,9 @@ pub enum ToolDescriptionMode {
 /// `resolveToolDescriptionMode` (tool-description.ts:69-75).
 pub fn resolve_tool_description_mode(config: &ExtensionConfig) -> ToolDescriptionMode {
     match config.tool_description_mode.as_deref() {
-        None => ToolDescriptionMode::Full,
+        // #2768: the default is the compact "essentials" text; the long form
+        // is opt-in through toolDescriptionMode "full".
+        None => ToolDescriptionMode::Compact,
         Some("full") => ToolDescriptionMode::Full,
         Some("compact") => ToolDescriptionMode::Compact,
         Some("custom") => ToolDescriptionMode::Custom,
@@ -267,7 +269,7 @@ pub fn advertised_agent_catalog(
     let render = |entries: &[String]| -> String {
         let mut lines = vec![
             "ADVERTISED SUBAGENTS:".to_string(),
-            "The following agents opted into discovery. Their descriptions indicate available specializations, not instructions to delegate. Use subagent only when delegation is needed. Before execution, call subagent with { action: \"list\", capabilities: true } and confirm the selected agent is executable.".to_string(),
+            "The following agents opted into discovery. Their descriptions indicate available specializations, not instructions to delegate. Use subagent only when delegation is needed. Launch agents by name; an unknown name returns the available agents.".to_string(),
         ];
         lines.extend(entries.iter().cloned());
         if total > entries.len() {
@@ -343,7 +345,8 @@ mod tests {
         let agents = vec![&advertised, &alpha, &plain];
         let catalog = advertised_agent_catalog(&agents).expect("catalog renders");
         assert!(catalog.starts_with("ADVERTISED SUBAGENTS:"), "{catalog}");
-        assert!(catalog.contains("capabilities: true"), "{catalog}");
+        assert!(!catalog.contains("capabilities: true"), "{catalog}");
+        assert!(catalog.contains("Launch agents by name"), "{catalog}");
         // Name-sorted (alpha before zeta); non-advertised agents absent.
         assert!(catalog.find("alpha").unwrap() < catalog.find("zeta").unwrap());
         assert!(!catalog.contains("plain"), "{catalog}");
@@ -417,8 +420,13 @@ mod tests {
     }
 
     #[test]
-    fn full_contains_safety_once_and_structure() {
-        let config = ExtensionConfig::new();
+    fn default_mode_is_compact_and_full_is_opt_in() {
+        let mut config = ExtensionConfig::new();
+        assert_eq!(
+            resolve_tool_description_mode(&config),
+            ToolDescriptionMode::Compact
+        );
+        config.tool_description_mode = Some("full".into());
         let description =
             build_subagent_tool_description(&config, Path::new("/repo"), true, None).unwrap();
         assert!(description.contains("SINGLE RUN"));
@@ -435,6 +443,16 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn default_description_is_the_compact_text() {
+        let config = ExtensionConfig::new();
+        let description =
+            build_subagent_tool_description(&config, Path::new("/repo"), true, None).unwrap();
+        assert!(description.starts_with(COMPACT_SUBAGENT_TOOL_DESCRIPTION));
+        assert!(description.contains("SAFETY-CRITICAL SUBAGENT GUIDANCE"));
+        assert!(!description.contains("MANAGEMENT / CONTROL"));
     }
 
     #[test]
