@@ -101,8 +101,8 @@ it is in scope.
 1. **Upstream parity pin.** The behavioral gold standard is pinned in
    `UPSTREAM.md` (currently `4a080252f`, Pi v1.4.0). Behavior changes that
    diverge from upstream require an ADR first (registered in the docs
-   repository). The red-line pins (`4a080252f` / subagents `7d072b91d` /
-   smart-fetch `b0111612` / rpiv-mono `afc21bc2`) move only via the documented
+   repository). The red-line pins (`4a080252f` / subagents `3a63e0ad` /
+   smart-fetch `b0111612` / rpiv-mono `ce6d3530`) move only via the documented
    rebase process, never opportunistically. (mcp-adapter was removed from the
    pin set with ADR-0037, TE49.)
 2. **Quality gates are local and mandatory.** CI builds releases but is not

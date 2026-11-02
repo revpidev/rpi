@@ -216,7 +216,7 @@ The site is deployed from the [rpi-pages](https://github.com/revpidev/rpi-pages)
 | `crates/rpi-test-*` | Faux provider, test environment helpers, and a native-plugin fixture |
 | `fixtures/` | Contract/parity test fixtures (generator scripts + golden data) |
 | `scripts/` | Dev scripts (upstream pin verification, parity harnesses, catalog refresh, release tooling) |
-| `external/` | Pinned upstream submodules: `pi` (v1.4.0), `pi-subagents` (v0.76.1), `rpiv-mono` (v2.13.8), `agent-smart-fetch` (v0.3.17) — see `UPSTREAM.md` |
+| `external/` | Pinned upstream submodules: `pi` (v1.4.0), `pi-subagents` (v0.83.0), `rpiv-mono` (v2.15.0), `agent-smart-fetch` (v0.3.17) — see `UPSTREAM.md` |
 | `vendor/syntect` | Patched syntect fork used by the build-time grammar rewrite (see `vendor/syntect/PATCHES.md`) |
 | `changes/` | Per-version release notes (the changelog single source of truth) |
 | `docs/` | Public protocol/reference docs (`json-rpc.md`, `codemode.md`) |
