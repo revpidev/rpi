@@ -508,8 +508,12 @@ fn format_long_running_facts(event: &ControlEvent) -> Option<String> {
 pub fn format_control_notice(event: &ControlEvent) -> String {
     let nudge = format_control_nudge(event);
     let steer = format!(
-        "subagent({{ action: \"steer\", id: \"{}\", message: {} }})",
+        "subagent({{ action: \"steer\", id: \"{}\"{}, message: {} }})",
         event.run_id,
+        event
+            .index
+            .map(|index| format!(", index: {index}"))
+            .unwrap_or_default(),
         serde_json::to_string(&nudge).unwrap_or_else(|_| "\"\"".to_string())
     );
     let status = format!(
@@ -634,5 +638,15 @@ mod tests {
             "{notice}"
         );
         assert!(notice.contains("subagent"), "{notice}");
+        assert!(notice.contains("index: 0"), "{notice}");
+        let no_index = build_control_event(ControlEventInput {
+            to: Some(ActivityState::NeedsAttention),
+            run_id: "run-2".to_string(),
+            agent: "worker".to_string(),
+            ts: 61_000,
+            last_activity_at: Some(1_000),
+            ..ControlEventInput::default()
+        });
+        assert!(!format_control_notice(&no_index).contains("index:"));
     }
 }

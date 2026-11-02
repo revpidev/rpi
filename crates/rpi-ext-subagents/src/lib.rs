@@ -308,8 +308,31 @@ impl HostContext for HostCallsContext<'_> {
     }
 
     fn project_trusted(&self) -> Option<bool> {
-        host_call_ok(self.calls, self.cookie, "ctx.isProjectTrusted", json!({}))
-            .and_then(|value| value.as_bool())
+        // Runtime twin of the init-time decision (`run_init` above): an old
+        // host without `ctx.isProjectTrusted` keeps the trusted default, but
+        // every other error or malformed answer fails closed. A `None` from
+        // `host_call_ok` would make every `!= Some(false)` caller fail open.
+        let response = host_call(self.calls, self.cookie, "ctx.isProjectTrusted", json!({}));
+        if let Some(error) = response.get("error") {
+            let kind = error.get("kind").and_then(Value::as_str);
+            if kind == Some("unknownMethod") {
+                return None;
+            }
+            tracing::warn!(
+                kind = kind.unwrap_or("unknown"),
+                "ctx.isProjectTrusted failed; treating the project as untrusted"
+            );
+            return Some(false);
+        }
+        match response.get("ok") {
+            Some(Value::Bool(value)) => Some(*value),
+            _ => {
+                tracing::warn!(
+                    "ctx.isProjectTrusted returned a malformed answer; treating the project as untrusted"
+                );
+                Some(false)
+            }
+        }
     }
 
     /// Authoritative parent session identity (V13-02, closes TE-D16):
@@ -794,35 +817,40 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             ) {
                 return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
-            // Bundled prompt templates register as commands (FR-P1-07).
-            for (name, body) in prompts::BUNDLED_PROMPTS {
-                let spec = prompts::parse_template(body);
-                let description = format!(
-                    "Prompt shortcut: {}",
-                    spec.description.as_deref().unwrap_or(name)
-                );
+            // #2977/#2989: `enableSlashCommands:false` turns off every
+            // command surface this plugin owns (bundled prompt templates,
+            // the prompt-workflow command and /run, /subagents*).
+            if config.slash_commands_enabled() {
+                // Bundled prompt templates register as commands (FR-P1-07).
+                for (name, body) in prompts::BUNDLED_PROMPTS {
+                    let spec = prompts::parse_template(body);
+                    let description = format!(
+                        "Prompt shortcut: {}",
+                        spec.description.as_deref().unwrap_or(name)
+                    );
+                    if let Err(error) = register(
+                        "registerCommand",
+                        json!({ "name": name, "description": description }),
+                    ) {
+                        return json!({"error": {"kind": "init", "message": error.to_string()}});
+                    }
+                }
                 if let Err(error) = register(
                     "registerCommand",
-                    json!({ "name": name, "description": description }),
+                    json!({
+                        "name": "prompt-workflow",
+                        "description": "Run a subagent prompt template (/prompt-workflow <name> [args] [--fork|--fresh|--bg|--subagent <agent>])"
+                    }),
                 ) {
                     return json!({"error": {"kind": "init", "message": error.to_string()}});
                 }
-            }
-            if let Err(error) = register(
-                "registerCommand",
-                json!({
-                    "name": "prompt-workflow",
-                    "description": "Run a subagent prompt template (/prompt-workflow <name> [args] [--fork|--fresh|--bg|--subagent <agent>])"
-                }),
-            ) {
-                return json!({"error": {"kind": "init", "message": error.to_string()}});
-            }
-            for (name, description) in commands::command_definitions() {
-                if let Err(error) = register(
-                    "registerCommand",
-                    json!({ "name": name, "description": description }),
-                ) {
-                    return json!({"error": {"kind": "init", "message": error.to_string()}});
+                for (name, description) in commands::command_definitions() {
+                    if let Err(error) = register(
+                        "registerCommand",
+                        json!({ "name": name, "description": description }),
+                    ) {
+                        return json!({"error": {"kind": "init", "message": error.to_string()}});
+                    }
                 }
             }
             for event in [
@@ -1205,6 +1233,14 @@ fn dispatch_message(message: &Value) -> Value {
                 }
             };
             let config = config::load_config();
+            if !config.slash_commands_enabled() {
+                return json!({
+                    "error": {
+                        "kind": "invalidRequest",
+                        "message": "slash commands are disabled by config.enableSlashCommands."
+                    }
+                });
+            }
             if let Some(outcome) = prompts::handle_prompt_command(
                 name,
                 args,
@@ -2109,6 +2145,73 @@ mod parent_session_tests {
             _ => json!({ "ok": Value::Null }),
         };
         RVec::from(serde_json::to_vec(&response).unwrap_or_default())
+    }
+
+    fn scripted_trust() -> &'static std::sync::Mutex<HashMap<usize, Value>> {
+        static TRUST: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, Value>>> =
+            std::sync::OnceLock::new();
+        TRUST.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+    }
+
+    extern "C" fn trust_host_call(cookie: PluginCookie, request: RVec<u8>) -> RVec<u8> {
+        let parsed: Value = serde_json::from_slice(&request[..]).unwrap_or(Value::Null);
+        let method = parsed.get("call").and_then(Value::as_str).unwrap_or("");
+        let response = match method {
+            "ctx.isProjectTrusted" => scripted_trust()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(cookie as usize))
+                .cloned()
+                .unwrap_or_else(|| json!({ "error": { "kind": "unknownMethod" } })),
+            "ctx.cwd" => json!({ "ok": "/tmp" }),
+            _ => json!({ "ok": Value::Null }),
+        };
+        RVec::from(serde_json::to_vec(&response).unwrap_or_default())
+    }
+
+    fn with_trust_answer(answer: Value, f: impl FnOnce(&HostCallsContext<'_>)) {
+        let cookie = unique_cookie();
+        scripted_trust()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(cookie, answer);
+        let calls = RpiHostCalls {
+            call: trust_host_call,
+        };
+        let ctx = HostCallsContext {
+            calls: &calls,
+            cookie,
+        };
+        f(&ctx);
+        scripted_trust()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&cookie);
+    }
+
+    #[test]
+    fn runtime_trust_fails_closed_on_every_error_but_unknown_method() {
+        with_trust_answer(json!({ "error": { "kind": "boom" } }), |ctx| {
+            assert_eq!(ctx.project_trusted(), Some(false));
+        });
+        with_trust_answer(json!({ "error": { "message": "transport" } }), |ctx| {
+            assert_eq!(ctx.project_trusted(), Some(false));
+        });
+        with_trust_answer(json!({ "ok": "yes" }), |ctx| {
+            assert_eq!(ctx.project_trusted(), Some(false));
+        });
+        with_trust_answer(Value::Null, |ctx| {
+            assert_eq!(ctx.project_trusted(), Some(false));
+        });
+        with_trust_answer(json!({ "ok": true }), |ctx| {
+            assert_eq!(ctx.project_trusted(), Some(true));
+        });
+        with_trust_answer(json!({ "ok": false }), |ctx| {
+            assert_eq!(ctx.project_trusted(), Some(false));
+        });
+        with_trust_answer(json!({ "error": { "kind": "unknownMethod" } }), |ctx| {
+            assert_eq!(ctx.project_trusted(), None);
+        });
     }
 
     fn unique_cookie() -> usize {

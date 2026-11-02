@@ -387,6 +387,12 @@ pub fn apply_task_mutation(
                     };
                     items.push(Item { spec, subject });
                 }
+                let Some(next_id_after) = state.next_id.checked_add(items.len() as i64) else {
+                    return error_result(
+                        state,
+                        "task id overflow: nextId exceeds the supported range",
+                    );
+                };
                 let sibling_ids: std::collections::BTreeSet<i64> = (0..items.len() as i64)
                     .map(|offset| state.next_id + offset)
                     .collect();
@@ -412,7 +418,7 @@ pub fn apply_task_mutation(
                 return ApplyResult {
                     state: TaskState {
                         tasks,
-                        next_id: state.next_id + task_ids.len() as i64,
+                        next_id: next_id_after,
                     },
                     op: Op::Create { task_ids },
                 };
@@ -430,13 +436,16 @@ pub fn apply_task_mutation(
             }
             let new_task = build_created_task(state.next_id, params, subject);
             let task_id = new_task.id;
+            let Some(next_id) = state.next_id.checked_add(1) else {
+                return error_result(
+                    state,
+                    "task id overflow: nextId exceeds the supported range",
+                );
+            };
             let mut tasks = state.tasks.clone();
             tasks.push(new_task);
             ApplyResult {
-                state: TaskState {
-                    tasks,
-                    next_id: state.next_id + 1,
-                },
+                state: TaskState { tasks, next_id },
                 op: Op::Create {
                     task_ids: vec![task_id],
                 },

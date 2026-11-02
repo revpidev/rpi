@@ -458,6 +458,22 @@ pub(crate) fn refresh_advertised_catalog(
     }
 }
 
+const PROJECT_SCOPE_REQUIRES_TRUST: &str = "Project scope requires a trusted project; retry in a trusted session or use agentScope \"user\" or \"both\".";
+
+/// `normalizeListScope` (agent-management.ts): list/get accept
+/// `user|project|both`; an explicit invalid value is a loud error, not a
+/// silent fallback to `both`.
+fn management_scope(params: &Value, action: &str) -> Result<&'static str, String> {
+    match params.get("agentScope").and_then(Value::as_str) {
+        None | Some("both") => Ok("both"),
+        Some("user") => Ok("user"),
+        Some("project") => Ok("project"),
+        Some(other) => Err(format!(
+            "agentScope must be 'user', 'project', or 'both' for {action}; got '{other}'."
+        )),
+    }
+}
+
 fn handle_management_action_inner(
     action: &str,
     agent_name: Option<&str>,
@@ -479,8 +495,15 @@ fn handle_management_action_inner(
     }
     match action {
         "list" => {
+            let scope = match management_scope(&raw_params, action) {
+                Ok(scope) => scope,
+                Err(error) => return ToolOutcome::error(error),
+            };
+            if scope == "project" && !trusted {
+                return ToolOutcome::error(PROJECT_SCOPE_REQUIRES_TRUST.to_string());
+            }
             let (agents, diagnostics) = discover::discover_agents_with_diagnostics_trusted(
-                cwd, "both", settings, None, trusted,
+                cwd, scope, settings, None, trusted,
             );
             // #1717/#1720: `capabilities: true` switches to the compact
             // capability lines and attaches structured `details.agentCapabilities`
@@ -516,8 +539,18 @@ fn handle_management_action_inner(
             let Some(name) = agent_name else {
                 return ToolOutcome::error("action \"get\" requires an agent name.".to_string());
             };
-            let agents = discover::discover_agents_trusted(cwd, "both", settings, None, trusted)
-                .unwrap_or_default();
+            let scope = match management_scope(&raw_params, action) {
+                Ok(scope) => scope,
+                Err(error) => return ToolOutcome::error(error),
+            };
+            if scope == "project" && !trusted {
+                return ToolOutcome::error(PROJECT_SCOPE_REQUIRES_TRUST.to_string());
+            }
+            let agents =
+                match discover::discover_agents_trusted(cwd, scope, settings, None, trusted) {
+                    Ok(agents) => agents,
+                    Err(error) => return ToolOutcome::error(error),
+                };
             match discover::resolve_agent_name(&agents, name) {
                 Ok(Some(agent)) => ToolOutcome::text(format_agent_detail(agent)),
                 Ok(None) => ToolOutcome::error(format!("Unknown agent: {name}")),
@@ -550,7 +583,7 @@ fn handle_management_action_inner(
                     .get("index")
                     .and_then(Value::as_u64)
                     .map(|v| v as usize);
-                return match format_status_transcript(&id, index, lines) {
+                return match format_status_transcript(&id, index, lines, cwd, settings, config) {
                     Ok(text) => ToolOutcome::text(text),
                     Err(message) => ToolOutcome::error(message),
                 };
@@ -969,19 +1002,29 @@ fn handle_management_action_inner(
 }
 
 /// `formatAsyncRunTranscript` subset (#1963, run-status.ts + fleet-view.ts
-/// @ 0fc0eebb): bounded transcript tail for one child of a run. Sources in
-/// order: the step's live transcript artifact (`transcriptPath`, stamped at
-/// launch) → the step's saved output (`artifactPaths.outputPath` /
-/// `savedOutputPath`) → the persisted child session file. `lines` bounds the
-/// tail (default 80, cap 500, fleet-view.ts `transcriptLineLimit`); the
-/// rendered body is additionally byte-bounded (#2017 @ b72714de:
+/// @ 0fc0eebb): bounded transcript tail for one child of a run. Source order
+/// is session file (structured records with `toolCall.arguments`) → live
+/// transcript artifact → saved output. The session file is preferred for a
+/// completed child because that is the only source that carries the tool-call
+/// input preview R18.9.5 requires; a live child without a session file falls
+/// back to the transcript artifact stamped at launch. `lines` bounds the tail
+/// (default 80, cap 500, fleet-view.ts `transcriptLineLimit`); the rendered
+/// body is additionally byte-bounded (#2017 @ b72714de:
 /// `MAX_TRANSCRIPT_BODY_BYTES` 32 KiB, whole recent lines preferred, "…
-/// [earlier lines omitted]" marker); each rendered line is capped so the
-/// body can never explode the tool result.
+/// [earlier lines omitted]" marker); each rendered line is capped so the body
+/// can never explode the tool result.
+///
+/// Every path comes from the run's status document, so it is validated the
+/// same way upstream `readContainedTextTail` / `validateTranscriptPath` do:
+/// trusted roots, no symlink, regular file only, realpath still inside the
+/// roots. A refused path is a warning; it is never read.
 pub fn format_status_transcript(
     id: &str,
     index: Option<usize>,
     line_limit: usize,
+    cwd: &Path,
+    settings: &SettingsPair,
+    config: &crate::config::ExtensionConfig,
 ) -> Result<String, String> {
     let status = crate::runner::background::read_run_status(id)
         .ok_or_else(|| format!("No background run matches '{id}'."))?;
@@ -1000,14 +1043,13 @@ pub fn format_status_transcript(
         ));
     };
     let agent = step["agent"].as_str().unwrap_or("subagent");
+    let roots = status_transcript_roots(cwd, settings, config);
     let mut lines = vec![
         format!("Run: {run_id}"),
         format!("State: {}", status["state"].as_str().unwrap_or("?")),
         format!("Mode: {}", status["mode"].as_str().unwrap_or("single")),
         format!("Child: {index} ({agent})"),
     ];
-    // Source resolution: live transcript artifact → saved output → session
-    // file tail (upstream `outputPaths` → `recentOutput` → session tail).
     let transcript_path = step["transcriptPath"]
         .as_str()
         .or_else(|| step["artifactPaths"]["transcriptPath"].as_str())
@@ -1026,61 +1068,77 @@ pub fn format_status_transcript(
     if let Some(path) = &session_file {
         lines.push(format!("Session: {path}"));
     }
+
+    let mut warnings: Vec<String> = Vec::new();
     let mut body: Vec<String> = Vec::new();
     let mut source = "Transcript tail".to_string();
-    if let Some(path) = transcript_path
-        .as_deref()
-        .filter(|p| std::path::Path::new(p).is_file())
+
+    // 1. Session file first: structured records carry `toolCall.arguments`.
+    if body.is_empty()
+        && let Some(path) = session_file.as_deref()
     {
-        match read_transcript_artifact_tail(path, line_limit) {
-            Ok(tail) => {
-                source = if tail.1 {
+        match read_session_transcript_tail(path, line_limit, &roots) {
+            Ok(Some(tail)) => {
+                source = format!("Session transcript tail from {path}");
+                body = tail;
+            }
+            Ok(None) => {}
+            Err(error) => warnings.push(format!("Session warning: {error}")),
+        }
+    }
+
+    // 2. Live transcript artifact (stdout/stderr interleave).
+    if body.is_empty()
+        && let Some(path) = transcript_path.as_deref()
+    {
+        match read_transcript_artifact_tail(path, line_limit, &roots) {
+            Ok(Some((tail, truncated, malformed))) => {
+                source = if truncated {
                     format!("Transcript tail from {path} (tail truncated)")
                 } else {
                     format!("Transcript tail from {path}")
                 };
-                body = tail.0;
-            }
-            Err(error) => {
-                lines.push(format!(
-                    "Transcript warning: failed to read {path}: {error}"
-                ));
-            }
-        }
-    }
-    if body.is_empty()
-        && let Some(path) = output_path
-            .as_deref()
-            .filter(|p| std::path::Path::new(p).is_file())
-        && let Ok(raw) = std::fs::read_to_string(path)
-    {
-        let all: Vec<&str> = raw.lines().collect();
-        let start = all.len().saturating_sub(line_limit);
-        body = all[start..]
-            .iter()
-            .map(|line| bounded_transcript_line(line))
-            .collect();
-        source = if start > 0 {
-            format!("Output tail from {path} (tail truncated)")
-        } else {
-            format!("Output tail from {path}")
-        };
-    }
-    if body.is_empty()
-        && let Some(path) = session_file
-            .as_deref()
-            .filter(|p| std::path::Path::new(p).is_file())
-    {
-        match read_session_transcript_tail(path, line_limit) {
-            Ok(tail) => {
-                source = format!("Session transcript tail from {path}");
                 body = tail;
+                if malformed > 0 {
+                    warnings.push(format!(
+                        "Transcript warning: skipped {malformed} malformed record{}",
+                        if malformed == 1 { "" } else { "s" }
+                    ));
+                }
             }
-            Err(error) => lines.push(format!("Session warning: {error}")),
+            Ok(None) => {}
+            Err(error) => warnings.push(format!("Transcript warning: {error}")),
         }
     }
+
+    // 3. Plain saved output.
+    if body.is_empty()
+        && let Some(path) = output_path.as_deref()
+    {
+        match read_trusted_tail(path, &roots, TRANSCRIPT_TAIL_BYTES) {
+            Ok(Some(raw)) => {
+                let all: Vec<&str> = raw.lines().collect();
+                let start = all.len().saturating_sub(line_limit);
+                body = all[start..]
+                    .iter()
+                    .map(|line| bounded_transcript_line(line))
+                    .collect();
+                source = if start > 0 {
+                    format!("Output tail from {path} (tail truncated)")
+                } else {
+                    format!("Output tail from {path}")
+                };
+            }
+            Ok(None) => {}
+            Err(error) => warnings.push(format!("Output warning: {error}")),
+        }
+    }
+
     // #2017 body byte budget (TE38 W6): applies to whichever source won.
     bound_transcript_body(&mut body);
+    if !warnings.is_empty() {
+        lines.extend(warnings);
+    }
     if body.is_empty() {
         lines.push(format!(
             "No transcript available for child {index} yet (the child may not have started or produced output)."
@@ -1091,6 +1149,125 @@ pub fn format_status_transcript(
         lines.extend(body);
     }
     Ok(lines.join("\n"))
+}
+
+/// Upper bound on each transcript source read (upstream `TRANSCRIPT_TAIL_BYTES`).
+const TRANSCRIPT_TAIL_BYTES: u64 = 1024 * 1024;
+
+/// Trusted roots for a background run's status transcript. They are derived
+/// from the current host cwd/settings, never from the paths being validated.
+fn status_transcript_roots(
+    cwd: &Path,
+    settings: &SettingsPair,
+    config: &crate::config::ExtensionConfig,
+) -> Vec<PathBuf> {
+    let mut roots = vec![
+        paths::get_project_artifacts_dir(cwd),
+        paths::temp_artifacts_dir(),
+        paths::resolve_parent_session_dir(cwd, settings.session_dir.as_deref()),
+        paths::get_agent_dir().join("sessions"),
+        paths::temp_root_dir(),
+        crate::runner::background::async_runs_dir(),
+    ];
+    if let Some(dir) = settings
+        .session_dir
+        .as_deref()
+        .filter(|dir| !dir.trim().is_empty())
+    {
+        roots.push(paths::expand_tilde_and_resolve(dir));
+    }
+    if let Some(dir) = config
+        .default_session_dir
+        .as_deref()
+        .filter(|dir| !dir.trim().is_empty())
+    {
+        roots.push(paths::expand_tilde_and_resolve(dir));
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// `readContainedTextTail` (fleet-view.ts:138-183): resolve a status-provided
+/// path against trusted roots, refuse symlinks/non-files, and require the
+/// canonical path to stay inside a canonical root. `Ok(None)` = missing file
+/// (silent, matching upstream); `Err` = refused/unreadable (rendered warning).
+fn read_trusted_tail(
+    path: &str,
+    roots: &[PathBuf],
+    max_bytes: u64,
+) -> Result<Option<String>, String> {
+    if roots.is_empty() {
+        return Err(format!(
+            "refusing to read transcript path without a trusted root: {path}"
+        ));
+    }
+    let candidate = Path::new(path);
+    if !candidate.is_absolute() {
+        return Err(format!("refusing a non-absolute transcript path: {path}"));
+    }
+    if !roots.iter().any(|root| candidate.starts_with(root)) {
+        return Err(format!(
+            "refusing a transcript path outside trusted roots: {path}"
+        ));
+    }
+    let metadata = match std::fs::symlink_metadata(candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "transcript path could not be inspected: {path}: {error}"
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!("refusing a symlink transcript path: {path}"));
+    }
+    if !metadata.is_file() {
+        return Err(format!("refusing a non-file transcript path: {path}"));
+    }
+    let real = std::fs::canonicalize(candidate)
+        .map_err(|error| format!("transcript path could not be resolved: {path}: {error}"))?;
+    let real_roots: Vec<PathBuf> = roots
+        .iter()
+        .filter(|root| root.exists())
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    if !real_roots.iter().any(|root| real.starts_with(root)) {
+        return Err(format!(
+            "refusing a transcript path that resolves outside trusted roots: {path}"
+        ));
+    }
+    read_file_tail(&real, max_bytes)
+        .map(Some)
+        .map_err(|error| format!("failed to read {path}: {error}"))
+}
+
+/// Bounded tail read (upstream `readTextTail`): read at most `max_bytes` from
+/// the end and drop the first partial line when the read started mid-file.
+fn read_file_tail(path: &Path, max_bytes: u64) -> Result<String, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let size = std::fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .len();
+    let start = size.saturating_sub(max_bytes);
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))
+            .map_err(|error| error.to_string())?;
+    }
+    let mut buffer = Vec::with_capacity((size - start) as usize);
+    file.read_to_end(&mut buffer)
+        .map_err(|error| error.to_string())?;
+    let mut text = String::from_utf8_lossy(&buffer).into_owned();
+    if start > 0 {
+        if let Some(newline) = text.find('\n') {
+            text = text[newline + 1..].to_string();
+        } else {
+            text.clear();
+        }
+    }
+    Ok(text)
 }
 
 /// Per-rendered-line cap for transcript views (#2015 single-line bound;
@@ -1136,21 +1313,31 @@ fn bounded_transcript_line(line: &str) -> String {
     }
 }
 
-/// Tail of the live transcript artifact: each line is one child stdout
-/// event (JSON); message events render `role: first line of text`, tool
-/// events render the tool name, anything else the event type. Non-JSON
-/// lines (stderr interleave) render as-is.
+/// Tail of the live transcript artifact. The writer stores one
+/// `stdout: <child event>` / `stderr: <text>` line per record; older files and
+/// tests may hold raw event JSON. Parse both, render message/tool events, and
+/// skip malformed records instead of echoing arbitrary file content.
 fn read_transcript_artifact_tail(
     path: &str,
     line_limit: usize,
-) -> Result<(Vec<String>, bool), String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    roots: &[PathBuf],
+) -> Result<Option<(Vec<String>, bool, usize)>, String> {
+    let Some(raw) = read_trusted_tail(path, roots, TRANSCRIPT_TAIL_BYTES)? else {
+        return Ok(None);
+    };
     let all: Vec<&str> = raw.lines().collect();
     let truncated = all.len() > line_limit;
     let start = all.len().saturating_sub(line_limit);
     let mut out = Vec::new();
+    let mut malformed = 0usize;
     for line in &all[start..] {
-        let rendered = match serde_json::from_str::<Value>(line) {
+        let trimmed = line.trim();
+        let event_line = trimmed.strip_prefix("stdout: ").unwrap_or(trimmed);
+        if let Some(stderr) = event_line.strip_prefix("stderr: ") {
+            out.push(bounded_transcript_line(&format!("stderr: {stderr}")));
+            continue;
+        }
+        let rendered = match serde_json::from_str::<Value>(event_line) {
             Ok(event) => {
                 let event_type = event["type"].as_str().unwrap_or("event");
                 match event_type {
@@ -1168,11 +1355,14 @@ fn read_transcript_artifact_tail(
                     other => other.to_string(),
                 }
             }
-            Err(_) => line.trim().to_string(),
+            Err(_) => {
+                malformed += 1;
+                continue;
+            }
         };
         out.push(bounded_transcript_line(&rendered));
     }
-    Ok((out, truncated))
+    Ok(Some((out, truncated, malformed)))
 }
 
 /// JSON preview bound for one tool-call/tool-result part
@@ -1261,9 +1451,16 @@ fn render_session_message(record: &Value) -> Option<String> {
 /// Tail of a child session JSONL (rpi session format: `{"type":"message",
 /// "message":{"role","content"}}` entries): message parts (text + tool-call
 /// input previews) split into lines, newest `line_limit` kept, each line
-/// bounded.
-fn read_session_transcript_tail(path: &str, line_limit: usize) -> Result<Vec<String>, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+/// bounded. The file is read through the same trusted-root/bounded-tail gate
+/// as every other status path.
+fn read_session_transcript_tail(
+    path: &str,
+    line_limit: usize,
+    roots: &[PathBuf],
+) -> Result<Option<Vec<String>>, String> {
+    let Some(raw) = read_trusted_tail(path, roots, TRANSCRIPT_TAIL_BYTES)? else {
+        return Ok(None);
+    };
     let mut messages: Vec<String> = Vec::new();
     for line in raw.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
@@ -1277,7 +1474,7 @@ fn read_session_transcript_tail(path: &str, line_limit: usize) -> Result<Vec<Str
         }
     }
     let start = messages.len().saturating_sub(line_limit);
-    Ok(messages[start..].to_vec())
+    Ok(Some(messages[start..].to_vec()))
 }
 
 /// `formatRunLifecycleDebug` subset (#1037, run-status.ts:86-116): run/dir/
@@ -2575,13 +2772,131 @@ mod tests {
         cleanup_run(&run_id);
     }
 
+    struct TrustHost {
+        trusted: Option<bool>,
+        cwd: PathBuf,
+    }
+    impl crate::HostContext for TrustHost {
+        fn cwd(&self) -> PathBuf {
+            self.cwd.clone()
+        }
+        fn parent_model(&self) -> Option<String> {
+            None
+        }
+        fn parent_session(&self, _settings: &SettingsPair) -> Option<crate::ParentSession> {
+            None
+        }
+        fn project_trusted(&self) -> Option<bool> {
+            self.trusted
+        }
+    }
+
+    fn write_project_agent(project: &Path, name: &str) {
+        let dir = paths::get_project_config_dir(project).join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.md")),
+            format!("---\nname: {name}\ndescription: project only\n---\nproject body\n"),
+        )
+        .unwrap();
+    }
+
+    fn manage_with_host(host: &dyn crate::HostContext, params: Value) -> ToolOutcome {
+        let action = params["action"].as_str().unwrap_or("list").to_string();
+        let agent = params
+            .get("agent")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        handle_management_action_with(
+            &action,
+            agent.as_deref(),
+            &host.cwd(),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+            &ActionDeps {
+                host: Some(host),
+                runtime: None,
+                params: Some(params),
+            },
+        )
+    }
+
+    #[test]
+    fn management_scope_is_honoured_and_project_scope_fails_closed() {
+        let root = paths::temp_root_dir().join(format!("mgmt-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        write_project_agent(&project, "proj-only");
+
+        let untrusted = TrustHost {
+            trusted: Some(false),
+            cwd: project.clone(),
+        };
+        let outcome = manage_with_host(
+            &untrusted,
+            json!({ "action": "list", "agentScope": "project" }),
+        );
+        assert!(outcome.is_error);
+        assert!(
+            outcome
+                .text
+                .contains("Project scope requires a trusted project")
+        );
+
+        let outcome = manage_with_host(
+            &untrusted,
+            json!({ "action": "get", "agent": "proj-only", "agentScope": "project" }),
+        );
+        assert!(outcome.is_error);
+        assert!(
+            outcome
+                .text
+                .contains("Project scope requires a trusted project")
+        );
+
+        let trusted = TrustHost {
+            trusted: Some(true),
+            cwd: project.clone(),
+        };
+        let user_list =
+            manage_with_host(&trusted, json!({ "action": "list", "agentScope": "user" }));
+        assert!(!user_list.text.contains("proj-only"), "{}", user_list.text);
+        let project_list = manage_with_host(
+            &trusted,
+            json!({ "action": "list", "agentScope": "project" }),
+        );
+        assert!(
+            project_list.text.contains("proj-only"),
+            "{}",
+            project_list.text
+        );
+        let detail = manage_with_host(
+            &trusted,
+            json!({ "action": "get", "agent": "proj-only", "agentScope": "project" }),
+        );
+        assert!(!detail.is_error, "{}", detail.text);
+        assert!(detail.text.contains("Agent: proj-only"), "{}", detail.text);
+
+        let invalid =
+            manage_with_host(&trusted, json!({ "action": "list", "agentScope": "bogus" }));
+        assert!(invalid.is_error);
+        assert!(
+            invalid.text.contains("agentScope must be"),
+            "{}",
+            invalid.text
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn status_transcript_view_reads_bounded_tail() {
         let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let run_id = format!("transcript-view-{}", std::process::id());
-        let base = std::env::temp_dir().join(&run_id);
+        let base = paths::temp_root_dir().join(&run_id);
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         // Live transcript artifact with mixed events.
@@ -2615,7 +2930,15 @@ mod tests {
             }]),
         );
         std::fs::write(&transcript, body).unwrap();
-        let text = format_status_transcript(&run_id, None, 5).expect("view renders");
+        let text = format_status_transcript(
+            &run_id,
+            None,
+            5,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+        )
+        .expect("view renders");
         assert!(text.starts_with("Run: "), "{}", text);
         assert!(text.contains("Mode: parallel"), "{}", text);
         assert!(text.contains("Child: 0 (worker)"), "{}", text);
@@ -2656,7 +2979,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let run_id = format!("transcript-budget-{}", std::process::id());
-        let base = std::env::temp_dir().join(&run_id);
+        let base = paths::temp_root_dir().join(&run_id);
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         // 100 lines × ~900 chars ≈ 90 KiB rendered body — over the budget.
@@ -2682,7 +3005,15 @@ mod tests {
             }]),
         );
         std::fs::write(&transcript, body).unwrap();
-        let text = format_status_transcript(&run_id, None, 500).expect("view renders");
+        let text = format_status_transcript(
+            &run_id,
+            None,
+            500,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+        )
+        .expect("view renders");
         assert!(
             text.contains("… [earlier lines omitted]"),
             "marker missing: {}",
@@ -2775,7 +3106,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let run_id = format!("transcript-session-{}", std::process::id());
-        let base = std::env::temp_dir().join(&run_id);
+        let base = paths::temp_root_dir().join(&run_id);
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let session = base.join("session.jsonl");
@@ -2798,7 +3129,15 @@ mod tests {
             ),
         )
         .unwrap();
-        let text = format_status_transcript(&run_id, None, 80).expect("view renders");
+        let text = format_status_transcript(
+            &run_id,
+            None,
+            80,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+        )
+        .expect("view renders");
         assert!(text.contains("Session transcript tail from "), "{}", text);
         assert!(text.contains("user: do the thing"), "{}", text);
         assert!(text.contains("assistant: done"), "{}", text);
@@ -2807,6 +3146,209 @@ mod tests {
             "{}",
             text
         );
+        cleanup_run(&run_id);
+    }
+
+    #[test]
+    fn status_transcript_reads_the_production_stdout_prefix() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("transcript-prefix-{}", std::process::id());
+        let base = paths::temp_root_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let transcript = base.join("run_transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "stdout: {\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"rendered from stdout\"}]}}\n",
+                "stderr: a warning line\n",
+            ),
+        )
+        .unwrap();
+        action_test_run(
+            &run_id,
+            "running",
+            json!([{
+                "agent": "worker",
+                "status": "running",
+                "transcriptPath": transcript.to_string_lossy(),
+            }]),
+        );
+        let text = format_status_transcript(
+            &run_id,
+            None,
+            80,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+        )
+        .expect("view renders");
+        assert!(text.contains("assistant: rendered from stdout"), "{text}");
+        assert!(text.contains("stderr: a warning line"), "{text}");
+        cleanup_run(&run_id);
+    }
+
+    #[test]
+    fn status_transcript_prefers_session_records_over_the_artifact() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("transcript-priority-{}", std::process::id());
+        let base = paths::temp_root_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let transcript = base.join("run_transcript.jsonl");
+        let session = base.join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            "stdout: {\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"artifact text\"}]}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &session,
+            "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}},{\"type\":\"text\",\"text\":\"session text\"}]}}\n",
+        )
+        .unwrap();
+        action_test_run(
+            &run_id,
+            "complete",
+            json!([{
+                "agent": "worker",
+                "status": "complete",
+                "transcriptPath": transcript.to_string_lossy(),
+                "sessionFile": session.to_string_lossy(),
+            }]),
+        );
+        let text = format_status_transcript(
+            &run_id,
+            None,
+            80,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+        )
+        .expect("view renders");
+        assert!(text.contains("Session transcript tail from "), "{text}");
+        assert!(text.contains("[tool: bash {\"command\":\"ls\"}]"), "{text}");
+        assert!(!text.contains("artifact text"), "{text}");
+        cleanup_run(&run_id);
+    }
+
+    #[test]
+    fn status_transcript_refuses_paths_outside_trusted_roots() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("transcript-outside-{}", std::process::id());
+        let base = paths::temp_root_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let outside = std::env::temp_dir().join(format!("{run_id}-secret.txt"));
+        std::fs::write(&outside, "TOP-SECRET-CONTENT\n").unwrap();
+        action_test_run(
+            &run_id,
+            "complete",
+            json!([{
+                "agent": "worker",
+                "status": "complete",
+                "transcriptPath": outside.to_string_lossy(),
+            }]),
+        );
+        let text = format_status_transcript(
+            &run_id,
+            None,
+            80,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+        )
+        .expect("view renders");
+        assert!(!text.contains("TOP-SECRET-CONTENT"), "{text}");
+        assert!(text.contains("outside trusted roots"), "{text}");
+        let _ = std::fs::remove_file(&outside);
+        cleanup_run(&run_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_transcript_refuses_a_symlink_leaf() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("transcript-symlink-{}", std::process::id());
+        let base = paths::temp_root_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let outside = std::env::temp_dir().join(format!("{run_id}-target.txt"));
+        std::fs::write(&outside, "SYMLINK-SECRET\n").unwrap();
+        let link = base.join("link.txt");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        action_test_run(
+            &run_id,
+            "complete",
+            json!([{
+                "agent": "worker",
+                "status": "complete",
+                "transcriptPath": link.to_string_lossy(),
+            }]),
+        );
+        let text = format_status_transcript(
+            &run_id,
+            None,
+            80,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+        )
+        .expect("view renders");
+        assert!(!text.contains("SYMLINK-SECRET"), "{text}");
+        assert!(text.contains("refusing a symlink"), "{text}");
+        let _ = std::fs::remove_file(&outside);
+        cleanup_run(&run_id);
+    }
+
+    #[test]
+    fn status_transcript_skips_malformed_records_instead_of_echoing_them() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("transcript-malformed-{}", std::process::id());
+        let base = paths::temp_root_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let transcript = base.join("run_transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "stdout: {\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"good line\"}]}}\n",
+                "NOT-JSON-ARBITRARY-CONTENT\n",
+            ),
+        )
+        .unwrap();
+        action_test_run(
+            &run_id,
+            "running",
+            json!([{
+                "agent": "worker",
+                "status": "running",
+                "transcriptPath": transcript.to_string_lossy(),
+            }]),
+        );
+        let text = format_status_transcript(
+            &run_id,
+            None,
+            80,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+        )
+        .expect("view renders");
+        assert!(text.contains("assistant: good line"), "{text}");
+        assert!(!text.contains("NOT-JSON-ARBITRARY-CONTENT"), "{text}");
+        assert!(text.contains("skipped 1 malformed record"), "{text}");
         cleanup_run(&run_id);
     }
 

@@ -19,15 +19,61 @@ use serde_json::Value;
 use crate::state::TaskState;
 use crate::tool::types::{STATE_ENTRY_TYPE, TOOL_NAME, Task};
 
+/// `Number.isSafeInteger` bound (`2^53 - 1`). Replay must reject ids a JS
+/// host would reject; rpi's `i64` range is wider and an unbounded `nextId`
+/// would overflow on the next create.
+const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+fn is_safe_integer(value: &Value) -> bool {
+    if let Some(number) = value.as_i64() {
+        return (-JS_MAX_SAFE_INTEGER..=JS_MAX_SAFE_INTEGER).contains(&number);
+    }
+    value.as_f64().is_some_and(|number| {
+        number.is_finite()
+            && number.fract() == 0.0
+            && (-(JS_MAX_SAFE_INTEGER as f64)..=(JS_MAX_SAFE_INTEGER as f64)).contains(&number)
+    })
+}
+
+/// Normalize an integral JSON float (`0.0`) to an integer so `serde` can
+/// decode a snapshot a JS host accepts (`Number.isSafeInteger(0.0)` is true).
+fn normalize_integer(value: &Value) -> Option<Value> {
+    if value.is_i64() || value.is_u64() {
+        return Some(value.clone());
+    }
+    let number = value.as_f64()?;
+    if number.is_finite() && number.fract() == 0.0 {
+        Some(Value::from(number as i64))
+    } else {
+        None
+    }
+}
+
+fn normalize_task_row(row: &Value) -> Option<Value> {
+    let mut task = row.as_object()?.clone();
+    if let Some(id) = task.get("id") {
+        task.insert("id".to_string(), normalize_integer(id)?);
+    }
+    if let Some(blocked_by) = task.get("blockedBy").and_then(Value::as_array) {
+        let mut ids = Vec::with_capacity(blocked_by.len());
+        for id in blocked_by {
+            ids.push(normalize_integer(id)?);
+        }
+        task.insert("blockedBy".to_string(), Value::Array(ids));
+    }
+    Some(Value::Object(task))
+}
+
 /// One persisted task, validated down to every field the renderer reads
 /// (`isTask`, replay.ts:8-25 @ 2.15.0, #230). A snapshot another extension
 /// truncated with a marker string must be skipped whole, so the last valid
-/// list stands.
+/// list stands. Optional fields accept only absence or their declared type:
+/// an explicit `null` is not `undefined` upstream and skips the snapshot.
 fn is_task(value: &Value) -> bool {
     let Some(task) = value.as_object() else {
         return false;
     };
-    if !task.get("id").is_some_and(|value| value.as_i64().is_some()) {
+    if !task.get("id").is_some_and(is_safe_integer) {
         return false;
     }
     if !task.get("subject").is_some_and(Value::is_string) {
@@ -39,25 +85,22 @@ fn is_task(value: &Value) -> bool {
     ) {
         return false;
     }
-    let optional_string = |key: &str| {
-        task.get(key)
-            .is_none_or(|value| value.is_null() || value.is_string())
-    };
+    let optional_string = |key: &str| task.get(key).is_none_or(Value::is_string);
     if !optional_string("description")
         || !optional_string("activeForm")
         || !optional_string("owner")
     {
         return false;
     }
-    if let Some(blocked_by) = task.get("blockedBy").filter(|value| !value.is_null()) {
+    if let Some(blocked_by) = task.get("blockedBy") {
         let Some(ids) = blocked_by.as_array() else {
             return false;
         };
-        if !ids.iter().all(|id| id.as_i64().is_some()) {
+        if !ids.iter().all(is_safe_integer) {
             return false;
         }
     }
-    if let Some(metadata) = task.get("metadata").filter(|value| !value.is_null())
+    if let Some(metadata) = task.get("metadata")
         && !metadata.is_object()
     {
         return false;
@@ -76,9 +119,7 @@ pub fn is_task_details(value: &Value) -> bool {
     let Some(tasks) = value.get("tasks").and_then(Value::as_array) else {
         return false;
     };
-    let next_id = value
-        .get("nextId")
-        .is_some_and(|value| value.as_i64().is_some());
+    let next_id = value.get("nextId").is_some_and(is_safe_integer);
     next_id && tasks.iter().all(is_task)
 }
 
@@ -92,9 +133,9 @@ fn decode_snapshot(details: &Value) -> Option<TaskState> {
     let tasks_value = details.get("tasks")?;
     let mut tasks = Vec::with_capacity(tasks_value.as_array()?.len());
     for row in tasks_value.as_array()? {
-        tasks.push(serde_json::from_value::<Task>(row.clone()).ok()?);
+        tasks.push(serde_json::from_value::<Task>(normalize_task_row(row)?).ok()?);
     }
-    let next_id = details.get("nextId")?.as_i64()?;
+    let next_id = normalize_integer(details.get("nextId")?)?.as_i64()?;
     Some(TaskState { tasks, next_id })
 }
 
@@ -313,6 +354,58 @@ mod tests {
         ];
         let state = replay_from_entries(&results);
         assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.next_id, 2);
+    }
+
+    #[test]
+    fn guard_rejects_explicit_null_optional_fields() {
+        for key in [
+            "description",
+            "activeForm",
+            "owner",
+            "blockedBy",
+            "metadata",
+        ] {
+            let mut task = task_fixture(1, "x");
+            task[key] = Value::Null;
+            assert!(
+                !is_task_details(&json!({"tasks": [task], "nextId": 2})),
+                "{key}: null must skip the whole snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_enforces_the_js_safe_integer_bound() {
+        let max = 9_007_199_254_740_991i64;
+        let over = 9_007_199_254_740_992i64;
+        assert!(is_task_details(&json!({
+            "tasks": [{"id": max, "subject": "x", "status": "pending"}],
+            "nextId": max
+        })));
+        assert!(!is_task_details(&json!({
+            "tasks": [{"id": over, "subject": "x", "status": "pending"}],
+            "nextId": 2
+        })));
+        assert!(!is_task_details(&json!({
+            "tasks": [{"id": 1, "subject": "x", "status": "pending", "blockedBy": [over]}],
+            "nextId": 2
+        })));
+        assert!(!is_task_details(&json!({
+            "tasks": [{"id": 1, "subject": "x", "status": "pending"}],
+            "nextId": over
+        })));
+    }
+
+    #[test]
+    fn guard_accepts_integral_json_floats_like_number_is_safe_integer() {
+        let state = replay_from_entries(&[tool_result(json!({
+            "action": "create", "params": {},
+            "tasks": [{"id": 1.0, "subject": "x", "status": "pending"}],
+            "nextId": 2.0
+        }))]);
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.tasks[0].id, 1);
         assert_eq!(state.next_id, 2);
     }
 

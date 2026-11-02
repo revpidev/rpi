@@ -21,11 +21,9 @@ Read the matching reference file before acting. Paths are relative to this `SKIL
 | Task | Read |
 | --- | --- |
 | Decide whether to delegate, choose agents, compare tool versus slash commands, apply prompt techniques, or understand builtin roles | `references/prompting-and-roles.md` |
-| Run one-child, parallel, chained, async, forked, gate-checked, or supervisor-coordinated workflows | `references/execution-controls.md` |
-| List agents, manage refinement overlays, edit agent definition files, or use prompt-template integration | `references/management-authoring-rpc.md` |
-| Check safety constraints, best practices, standard workflows, or error handling | `references/constraints-and-recipes.md` |
+| Run one-child, parallel, chained, async, forked, gate-checked, worktree or supervisor-coordinated workflows; manage agents/refinements; check constraints, recipes and error handling | `references/orchestration.md` |
 
-For broad or uncertain requests, read more than one reference. For complex work, start with `references/prompting-and-roles.md` and `references/execution-controls.md`, then consult `references/constraints-and-recipes.md` before launching or reviewing child work.
+For broad or uncertain requests, read both references. For complex work, start with `references/orchestration.md`, then consult `references/prompting-and-roles.md` before writing child prompts.
 
 ## Always-on constraints
 

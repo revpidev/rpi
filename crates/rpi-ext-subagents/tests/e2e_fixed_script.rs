@@ -477,6 +477,41 @@ fn e2e_fixed_child_full_pipeline() {
         json!("reply before compaction")
     );
 
+    // A compaction that runs longer than the 1s drain grace must keep the
+    // child alive: the runner waits for compaction_end instead of aborting it.
+    rpi_test_env::set_var("RPI_E2E_MODE", "terminal-agent-end-slow-compaction");
+    let started = std::time::Instant::now();
+    let result = execute(json!({ "agent": "scout", "task": "slow compaction" }));
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(1400),
+        "the slow-compaction child must be allowed to finish"
+    );
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    assert_eq!(
+        result["content"][0]["text"],
+        json!("reply before slow compaction")
+    );
+    assert!(
+        result["details"]["results"][0]["processSignal"].is_null(),
+        "compaction must not be terminated: {result}"
+    );
+
+    // A retrying compaction cancels the terminal drain; the later final reply
+    // must survive instead of being SIGTERMed during the retry gap.
+    rpi_test_env::set_var("RPI_E2E_MODE", "terminal-agent-end-compaction-retry");
+    let started = std::time::Instant::now();
+    let result = execute(json!({ "agent": "scout", "task": "compaction retry" }));
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(1400),
+        "the retry child must be allowed to finish"
+    );
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    assert_eq!(result["content"][0]["text"], json!("after retry"));
+    assert!(
+        result["details"]["results"][0]["processSignal"].is_null(),
+        "a compaction retry must not be terminated: {result}"
+    );
+
     // Same shape in the background: the run still reaches a terminal state
     // with the reply (no "exited before writing a result").
     rpi_test_env::set_var("RPI_E2E_MODE", "terminal-agent-end");
@@ -1056,6 +1091,49 @@ fn e2e_fixed_child_full_pipeline() {
                 "child {index} env carries its index: {env_text}"
             );
         }
+    }
+
+    // ---- Scenario 9b (FR-C): built-in parallel workflow (ADR-0038/4) ----
+    {
+        let dump = sandbox.dump("workflow-parallel");
+        rpi_test_env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        rpi_test_env::set_var("RPI_E2E_MODE", "ok");
+        let result = execute(json!({
+            "workflow": "parallel",
+            "args": {
+                "tasks": [
+                    { "agent": "scout", "task": "workflow A" },
+                    { "agent": "reviewer", "task": "workflow B" }
+                ]
+            },
+            "async": false
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        assert_eq!(result["details"]["mode"], "parallel");
+        let results = result["details"]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["agent"], "scout");
+        assert_eq!(results[1]["agent"], "reviewer");
+        // The native tasks entry point still works independently.
+        let native = execute(json!({
+            "tasks": [{ "agent": "scout", "task": "native" }],
+            "async": false
+        }));
+        assert_eq!(native["details"]["mode"], "parallel");
+        // Invalid named-workflow shapes fail before any child starts.
+        let invalid = execute(json!({
+            "workflow": "parallel",
+            "args": { "tasks": [{ "agent": "scout", "task": "x", "thinking": "high" }] },
+            "async": false
+        }));
+        assert_eq!(invalid["isError"], Value::Bool(true), "{invalid}");
+        assert!(
+            invalid["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("accepts only agent, task, cwd, model"),
+            "{invalid}"
+        );
     }
 
     // ---- Scenario 10 (TE05): chain steps composition (FR-P1-02) --------

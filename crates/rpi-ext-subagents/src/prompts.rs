@@ -47,18 +47,10 @@ pub const BUNDLED_PROMPTS: [(&str, &str); 5] = [
 /// The bundled orchestration skill body (SKILL.md + references).
 pub const ORCHESTRATION_SKILL_SKILL_MD: &str =
     include_str!("../assets/skills/rpi-subagents/SKILL.md");
-pub const ORCHESTRATION_SKILL_REFERENCES: [(&str, &str); 4] = [
+pub const ORCHESTRATION_SKILL_REFERENCES: [(&str, &str); 2] = [
     (
-        "constraints-and-recipes.md",
-        include_str!("../assets/skills/rpi-subagents/references/constraints-and-recipes.md"),
-    ),
-    (
-        "execution-controls.md",
-        include_str!("../assets/skills/rpi-subagents/references/execution-controls.md"),
-    ),
-    (
-        "management-authoring-rpc.md",
-        include_str!("../assets/skills/rpi-subagents/references/management-authoring-rpc.md"),
+        "orchestration.md",
+        include_str!("../assets/skills/rpi-subagents/references/orchestration.md"),
     ),
     (
         "prompting-and-roles.md",
@@ -70,9 +62,11 @@ pub const ORCHESTRATION_SKILL_REFERENCES: [(&str, &str); 4] = [
 /// byte-exact upstream copy with no version marker; v2 is the localized
 /// rewrite (no `workflowScript` teaching); v3 renames the skill directory
 /// `pi-subagents` → `rpi-subagents` (de-pi brand pass) and removes a
-/// previously-shipped legacy directory. Bump this whenever the bundled
-/// bodies change so existing installs are upgraded in place.
-const ORCHESTRATION_SKILL_LAYOUT_VERSION: u32 = 3;
+/// previously-shipped legacy directory; v4 consolidates the three large
+/// execution/constraints/management references into `orchestration.md`
+/// (upstream #3044 slim-down). Bump this whenever the bundled bodies change
+/// so existing installs are upgraded in place.
+const ORCHESTRATION_SKILL_LAYOUT_VERSION: u32 = 4;
 
 /// Install the orchestration skill into `<agentDir>/skills/rpi-subagents/`
 /// (upstream ships it with the package; rpi has no package skill path, so the

@@ -164,6 +164,42 @@ fn main() {
                 r#"{"type":"compaction_end","reason":"auto","willRetry":false}"#,
             );
         }
+        // TE51 FR-J R2: a compaction starts after that terminal `agent_end`
+        // and takes longer than the 1s drain grace — the runner must wait for
+        // `compaction_end` instead of aborting the child.
+        "terminal-agent-end-slow-compaction" => {
+            emit(
+                &mut out,
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"reply before slow compaction"}],"usage":{"input":10,"output":4,"cost":{"total":0.01}},"model":"faux/fixed-1","stopReason":"stop"}}"#,
+            );
+            emit(&mut out, r#"{"type":"agent_end","willRetry":false}"#);
+            emit(&mut out, r#"{"type":"compaction_start","reason":"auto"}"#);
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            emit(
+                &mut out,
+                r#"{"type":"compaction_end","reason":"auto","willRetry":false}"#,
+            );
+        }
+        // A compaction retry cancels the terminal drain; the child keeps
+        // working and settles later instead of being killed during the gap.
+        "terminal-agent-end-compaction-retry" => {
+            emit(
+                &mut out,
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"before retry"}],"usage":{"input":10,"output":4,"cost":{"total":0.01}},"model":"faux/fixed-1","stopReason":"stop"}}"#,
+            );
+            emit(&mut out, r#"{"type":"agent_end","willRetry":false}"#);
+            emit(&mut out, r#"{"type":"compaction_start","reason":"auto"}"#);
+            emit(
+                &mut out,
+                r#"{"type":"compaction_end","reason":"auto","willRetry":true}"#,
+            );
+            emit(&mut out, r#"{"type":"agent_start"}"#);
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            emit(
+                &mut out,
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"after retry"}],"usage":{"input":20,"output":6,"cost":{"total":0.02}},"model":"faux/fixed-1","stopReason":"stop"}}"#,
+            );
+        }
         // TE09: a run with real tool activity — tool_execution_start/end
         // pairs, a tool result and the final assistant message, so the
         // streaming snapshots carry currentTool/recentTools/toolCalls.

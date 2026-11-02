@@ -983,6 +983,23 @@ mod tests {
     }
 
     #[test]
+    fn tasks_accept_per_child_cwd_and_model() {
+        let tasks = json!([{
+            "key": "a",
+            "agent": "scout",
+            "task": "t",
+            "cwd": "/tmp/per-child",
+            "model": "provider/model"
+        }]);
+        let entries = parse_tasks(&tasks, 8).unwrap();
+        assert_eq!(
+            entries[0].spec.cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/per-child"))
+        );
+        assert_eq!(entries[0].spec.model.as_deref(), Some("provider/model"));
+    }
+
+    #[test]
     fn task_agents_validate_before_any_launch() {
         // B1: the batch preflight rejects a misspelled later task; the
         // per-entry skip in `launch_one` stays as defense in depth.

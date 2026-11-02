@@ -99,6 +99,10 @@ pub struct ExtensionConfig {
     /// thresholds. Raw JSON because `resolveControlConfig` is lenient and
     /// ignores invalid positive integers/lists.
     pub control: Option<Value>,
+    /// `enableSlashCommands` (#2977/#2989): register the plugin's slash
+    /// commands. Defaults to true; an explicit false disables registration
+    /// and direct command dispatch.
+    pub enable_slash_commands: Option<bool>,
 }
 
 impl Default for ExtensionConfig {
@@ -133,6 +137,7 @@ impl ExtensionConfig {
             intercom_bridge: None,
             wait_tool_default_timeout_ms: None,
             control: None,
+            enable_slash_commands: None,
         }
     }
 
@@ -146,6 +151,11 @@ impl ExtensionConfig {
     /// unless the config says `false`).
     pub fn include_jsonl(&self) -> bool {
         self.artifacts_include_jsonl.unwrap_or(true)
+    }
+
+    /// `enableSlashCommands` default true (#2977/#2989).
+    pub fn slash_commands_enabled(&self) -> bool {
+        self.enable_slash_commands.unwrap_or(true)
     }
 
     /// `artifactConfig.cleanupDays` with the upstream default 7    /// (DEFAULT_ARTIFACT_CONFIG, types.ts:1958-1967).
@@ -380,6 +390,12 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
         match flag {
             Value::Bool(b) => config.async_by_default = Some(*b),
             _ => return Err("config.asyncByDefault must be a boolean".into()),
+        }
+    }
+    if let Some(flag) = object.get("enableSlashCommands") {
+        match flag {
+            Value::Bool(b) => config.enable_slash_commands = Some(*b),
+            _ => return Err("config.enableSlashCommands must be a boolean".into()),
         }
     }
     for (key, target) in [
@@ -1633,6 +1649,18 @@ mod tests {
         assert_eq!(config.cleanup_days_or_default(), 7);
         assert!(config.resolve_async_by_default());
         assert_eq!(config.resolve_default_timeout_ms(), None);
+        assert!(config.slash_commands_enabled());
+    }
+
+    #[test]
+    fn enable_slash_commands_defaults_true_and_validates_type() {
+        assert!(parse("{}").unwrap().slash_commands_enabled());
+        assert!(
+            !parse(r#"{"enableSlashCommands":false}"#)
+                .unwrap()
+                .slash_commands_enabled()
+        );
+        assert!(parse(r#"{"enableSlashCommands":"no"}"#).is_err());
     }
 
     /// rpi#30: the run-wide child cap resolves with the upstream default 20

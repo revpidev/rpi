@@ -155,6 +155,15 @@ pub fn tool_parameters_schema() -> Value {
                 "minItems": 1,
                 "description": "Chain composition (ADR-0018): sequential children; task templates may interpolate {task} (original), {previous} (prior step output), {outputs.<name>} (bound step output) and {chain_dir}; per-step output/reads/skill/progress overrides; a failed step stops the chain and returns completed steps."
             },
+            "workflow": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Built-in named workflow (ADR-0038 decision 4). Supported: parallel. Must not be combined with agent, task, tasks or steps."
+            },
+            "args": {
+                "type": "object",
+                "description": "Named-workflow arguments. workflow \"parallel\" requires args.tasks: a non-empty array of {agent, task, cwd?, model?} items."
+            },
             "concurrency": {
                 "type": "integer",
                 "minimum": 1,
@@ -298,6 +307,102 @@ fn foreground_control_sink(
     ))
 }
 
+/// Resolve the upstream named `parallel` workflow into the native `tasks`
+/// input. Validation mirrors `resolveParallel` + `buildTasksScript`
+/// (`workflow-resources.ts:164-173`, `structured-workflow-scripts.ts:99-120`
+/// @ 3a63e0ad): only `args.tasks` is accepted, and each item is exactly
+/// `{agent, task, cwd?, model?}`. The translation does not touch the native
+/// `tasks`/`steps` parsers; it only feeds the shared scheduler.
+fn normalize_workflow_request(object: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+    let Some(workflow_value) = object.get("workflow").cloned() else {
+        if object.contains_key("args") {
+            return Err("args is only valid together with workflow.".to_string());
+        }
+        return Ok(());
+    };
+    if object.get("action").is_some() {
+        return Err("workflow cannot be combined with action.".to_string());
+    }
+    let workflow = workflow_value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "workflow must be a non-empty string.".to_string())?;
+    if workflow != "parallel" {
+        return Err(format!(
+            "Unknown workflow '{workflow}'. Supported workflows: parallel."
+        ));
+    }
+    if object.get("agent").is_some() || object.get("task").is_some() {
+        return Err(
+            "workflow cannot be combined with agent or task; pass args.tasks instead.".to_string(),
+        );
+    }
+    if object.get("tasks").is_some() || object.get("steps").is_some() {
+        return Err(
+            "workflow cannot be combined with tasks or steps; use one composition mode."
+                .to_string(),
+        );
+    }
+    let args = object
+        .get("args")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "workflow 'parallel' requires args.tasks.".to_string())?;
+    let unsupported: Vec<&str> = args
+        .keys()
+        .filter(|key| key.as_str() != "tasks")
+        .map(String::as_str)
+        .collect();
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "workflow 'parallel' args contain unsupported fields: {}. Pass args.tasks: [{{ agent, task }}, ...].",
+            unsupported.join(", ")
+        ));
+    }
+    let tasks = args
+        .get("tasks")
+        .and_then(Value::as_array)
+        .filter(|tasks| !tasks.is_empty())
+        .ok_or_else(|| {
+            "workflow 'parallel' args.tasks must be a non-empty array of {agent, task} items."
+                .to_string()
+        })?;
+    for (index, item) in tasks.iter().enumerate() {
+        let item = item
+            .as_object()
+            .ok_or_else(|| format!("workflow 'parallel' args.tasks[{index}] must be an object."))?;
+        let unsupported: Vec<&str> = item
+            .keys()
+            .filter(|key| !matches!(key.as_str(), "agent" | "task" | "cwd" | "model"))
+            .map(String::as_str)
+            .collect();
+        if !unsupported.is_empty() {
+            return Err(format!(
+                "workflow 'parallel' args.tasks[{index}] accepts only agent, task, cwd, model; got {}.",
+                unsupported.join(", ")
+            ));
+        }
+        if item
+            .get("agent")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(format!(
+                "workflow 'parallel' args.tasks[{index}] is missing a non-empty agent."
+            ));
+        }
+        if !item.get("task").is_some_and(Value::is_string) {
+            return Err(format!(
+                "workflow 'parallel' args.tasks[{index}] is missing a string task."
+            ));
+        }
+    }
+    object.insert("tasks".to_string(), Value::Array(tasks.clone()));
+    object.remove("workflow");
+    object.remove("args");
+    Ok(())
+}
+
 /// The whole tool entry point. Returns the AgentToolResult JSON.
 /// `tool_call_id` is the in-flight dispatch id (ADR-0015): present → the
 /// run installs a `toolUpdate` streaming seam; None (test seams) keeps the
@@ -323,7 +428,7 @@ fn execute_subagent_tool_inner(
     runtime: &crate::PluginRuntime,
     tool_call_id: Option<&str>,
 ) -> ToolOutcome {
-    let object = params.as_object().cloned().unwrap_or_default();
+    let mut object = params.as_object().cloned().unwrap_or_default();
 
     // ADR-0016: workflowScript is a schema-level placeholder that must fail
     // loudly instead of letting the model assume JS execution.
@@ -333,6 +438,10 @@ fn execute_subagent_tool_inner(
         return ToolOutcome::error(
                 "workflowScript is not supported in rpi (see ADR-0016): this build has no JavaScript engine. Use { agent, task } for direct single delegation; composite workflows arrive with P1.".to_string(),
             );
+    }
+
+    if object.get("workflow").is_some() && object.get("action").is_some() {
+        return ToolOutcome::error("workflow cannot be combined with action.".to_string());
     }
 
     if let Some(action) = object.get("action").and_then(Value::as_str)
@@ -351,6 +460,13 @@ fn execute_subagent_tool_inner(
             config,
             &deps,
         );
+    }
+
+    // FR-C / ADR-0038 decision 4: a named `parallel` workflow is data-driven;
+    // it translates to the native tasks scheduler, which remains a separate
+    // public entry point with its own schema and result semantics.
+    if let Err(error) = normalize_workflow_request(&mut object) {
+        return ToolOutcome::mode_error("parallel", error);
     }
 
     // Composite entries (FR-P1-01/02/03, ADR-0018): `tasks` (parallel) and
@@ -1287,6 +1403,61 @@ fn format_failed_single_run_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_the_builtin_parallel_workflow() {
+        let mut object = serde_json::json!({
+            "workflow": "parallel",
+            "args": {"tasks": [
+                {"agent": "scout", "task": "a", "cwd": "/tmp", "model": "p/m"},
+                {"agent": "worker", "task": "b"}
+            ]}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        normalize_workflow_request(&mut object).expect("valid parallel workflow");
+        assert!(object.get("workflow").is_none());
+        assert!(object.get("args").is_none());
+        let tasks = object["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["cwd"], "/tmp");
+        assert_eq!(tasks[1]["agent"], "worker");
+    }
+
+    #[test]
+    fn rejects_invalid_builtin_parallel_workflow_shapes() {
+        for (value, needle) in [
+            (
+                serde_json::json!({"workflow": "review"}),
+                "Unknown workflow",
+            ),
+            (
+                serde_json::json!({"workflow": "parallel", "args": {"other": []}}),
+                "unsupported fields",
+            ),
+            (
+                serde_json::json!({"workflow": "parallel", "args": {"tasks": []}}),
+                "non-empty array",
+            ),
+            (
+                serde_json::json!({"workflow": "parallel", "args": {"tasks": [{"agent": "scout", "task": "x", "thinking": "high"}]}}),
+                "accepts only agent, task, cwd, model",
+            ),
+            (
+                serde_json::json!({"workflow": "parallel", "agent": "scout", "args": {"tasks": [{"agent": "scout", "task": "x"}]}}),
+                "cannot be combined with agent",
+            ),
+            (
+                serde_json::json!({"args": {"tasks": [{"agent": "scout", "task": "x"}]}}),
+                "only valid together with workflow",
+            ),
+        ] {
+            let mut object = value.as_object().unwrap().clone();
+            let error = normalize_workflow_request(&mut object).expect_err("rejected");
+            assert!(error.contains(needle), "{error}");
+        }
+    }
 
     /// TE38 W1 (#2081/#2325 shared semantics): `build_worktree_plan` — the
     /// dispatch-time admission seam — rejects a dirty source tree with the

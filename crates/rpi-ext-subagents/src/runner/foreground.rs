@@ -72,6 +72,10 @@ const FINAL_STOP_GRACE_MS: u64 = 1000;
 const TIMEOUT_SIGINT_TO_TERM_MS: u64 = 1000;
 const TIMEOUT_TERM_TO_KILL_MS: u64 = 4000;
 const DRAIN_TERM_TO_KILL_MS: u64 = 3000;
+/// Upper bound on how long a post-final compaction may hold the drain open.
+/// Compaction is allowed to finish, but a stuck child must not hang the run
+/// forever (R18.9.2: the wait is bounded).
+const FINAL_COMPACTION_MAX_MS: u64 = 5 * 60 * 1000;
 const SHUTDOWN_TERM_TO_KILL_MS: u64 = 3000;
 const POST_EXIT_DRAIN_HARD_MS: u64 = 8000;
 
@@ -581,7 +585,7 @@ fn process_tool_end(
     ) {
         let summary =
             crate::runner::guard::summarize_recent_mutating_failures(&state.mutating_failures);
-        let event = control_event_for(
+        let mut event = control_event_for(
             state,
             guard,
             signal.ts,
@@ -593,6 +597,16 @@ fn process_tool_end(
             )),
             Some(summary),
         );
+        // The display slot may already point at another overlapping call by
+        // the time the end event is processed. The ended call's own facts are
+        // authoritative (execution.ts:1181-1189 passes `toolSnapshot` fields
+        // explicitly instead of reading the current progress slot).
+        event.current_tool = Some(signal.tool.clone());
+        event.current_path = signal.path.clone();
+        event.tool_call_id = Some(signal.tool_call_id.clone());
+        event.current_tool_duration_ms = signal
+            .started_at
+            .map(|started| signal.ts.saturating_sub(started));
         state.activity_state = Some(crate::runner::control::ActivityState::NeedsAttention);
         if crate::runner::control::claim_notification(
             &guard.control,
@@ -777,42 +791,86 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     // Shared run flags.
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let terminal_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let child_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stream_error = Arc::new(Mutex::new(None::<String>));
+    let drain_state = state.clone();
+    let drain_exited = child_exited.clone();
 
     // Timeout ladder: SIGINT → 1s → SIGTERM → 4s → SIGKILL (1021-1044).
     let timeout_ms = input.timeout_ms;
     let timed_out_flag = timed_out.clone();
+    let timeout_exited = child_exited.clone();
     let timeout_task = tokio::spawn(async move {
         let Some(timeout_ms) = timeout_ms else {
             return;
         };
         tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
         timed_out_flag.store(true, Ordering::SeqCst);
+        if timeout_exited.load(Ordering::SeqCst) {
+            return;
+        }
         signal_pid(child_pid, Signal::Int);
         tokio::time::sleep(Duration::from_millis(TIMEOUT_SIGINT_TO_TERM_MS)).await;
+        if timeout_exited.load(Ordering::SeqCst) {
+            return;
+        }
         signal_pid(child_pid, Signal::Term);
         tokio::time::sleep(Duration::from_millis(TIMEOUT_TERM_TO_KILL_MS)).await;
-        signal_pid(child_pid, Signal::Kill);
+        if !timeout_exited.load(Ordering::SeqCst) {
+            signal_pid(child_pid, Signal::Kill);
+        }
     });
 
     // Terminal-drain ladder: after the terminal event, 1s grace then
-    // SIGTERM → 3s → SIGKILL (571-623). Upstream records the
-    // "did not exit within 1000ms" error only when the drain fired WITHOUT a
-    // clean terminal state (watchdog/budget triggers — P1 surfaces); the P0
-    // trigger set only starts this ladder on a clean terminal, so no error is
-    // recorded here.
-    let terminal_flag = terminal_seen.clone();
+    // SIGTERM → 3s → SIGKILL (571-623). The event parser owns the lifecycle
+    // flags: a compaction started after the terminal event holds the grace
+    // open until `compaction_end`, a retry cancels it, and a fresh arm
+    // restarts the 1s window. Upstream records the "did not exit within
+    // 1000ms" error only when the drain fired WITHOUT a clean terminal state
+    // (watchdog/budget triggers — P1 surfaces); the P0 trigger set only starts
+    // this ladder on a clean terminal, so no error is recorded here.
+    let drain_run_id = input.run_id.clone();
     let drain_task = tokio::spawn(async move {
         loop {
-            if terminal_flag.load(Ordering::SeqCst) {
-                break;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if drain_exited.load(Ordering::SeqCst) {
+                return;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let (armed, armed_at, compaction_open) = {
+                let state = drain_state.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    state.lifecycle.drain_armed,
+                    state.lifecycle.drain_armed_at,
+                    state.lifecycle.compaction_after_final_open,
+                )
+            };
+            let Some(armed_at) = armed_at.filter(|_| armed) else {
+                continue;
+            };
+            let now = artifacts::now_millis();
+            let elapsed = now.saturating_sub(armed_at);
+            if compaction_open {
+                if elapsed < FINAL_COMPACTION_MAX_MS {
+                    continue;
+                }
+                tracing::warn!(
+                    run = %drain_run_id,
+                    elapsed_ms = elapsed,
+                    "post-final compaction exceeded the bounded drain wait; terminating the child"
+                );
+            } else if elapsed < FINAL_STOP_GRACE_MS {
+                continue;
+            }
+            if drain_exited.load(Ordering::SeqCst) {
+                return;
+            }
+            signal_pid(child_pid, Signal::Term);
+            tokio::time::sleep(Duration::from_millis(DRAIN_TERM_TO_KILL_MS)).await;
+            if !drain_exited.load(Ordering::SeqCst) {
+                signal_pid(child_pid, Signal::Kill);
+            }
+            return;
         }
-        tokio::time::sleep(Duration::from_millis(FINAL_STOP_GRACE_MS)).await;
-        signal_pid(child_pid, Signal::Term);
-        tokio::time::sleep(Duration::from_millis(DRAIN_TERM_TO_KILL_MS)).await;
-        signal_pid(child_pid, Signal::Kill);
     });
 
     // stdout reader: bounded line reader + event accumulation + artifacts.
@@ -863,6 +921,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         };
         sink(&text, &details);
     }
+    let stdout_exited = child_exited.clone();
     let stdout_task = tokio::spawn(async move {
         let Some(mut stdout) = stdout else {
             return;
@@ -875,14 +934,21 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
 
         // Protocol-limit path (execution.ts:1047-1062): record the error and
         // run the SIGTERM → 3s → SIGKILL ladder.
+        let limit_exited = stdout_exited.clone();
         let on_limit = {
             let error_slot = stdout_protocol_error.clone();
             move |limit: &events::ProtocolOutputLimit| {
                 *error_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(limit.message());
+                let limit_exited = limit_exited.clone();
                 tokio::spawn(async move {
+                    if limit_exited.load(Ordering::SeqCst) {
+                        return;
+                    }
                     signal_pid(child_pid, Signal::Term);
                     tokio::time::sleep(Duration::from_millis(DRAIN_TERM_TO_KILL_MS)).await;
-                    signal_pid(child_pid, Signal::Kill);
+                    if !limit_exited.load(Ordering::SeqCst) {
+                        signal_pid(child_pid, Signal::Kill);
+                    }
                 });
             }
         };
@@ -1216,7 +1282,17 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         }
     };
     let exit_status = match wait_outcome {
-        WaitOutcome::Exited(status) => status,
+        WaitOutcome::Exited(status) => {
+            // The child has been reaped: stop the signal ladders before any
+            // further await (the post-exit pipe drain can outlive the child
+            // when a grandchild inherited the descriptors). The `child_exited`
+            // flag closes the check-then-signal window for a task that is
+            // already past its sleep.
+            child_exited.store(true, Ordering::SeqCst);
+            timeout_task.abort();
+            drain_task.abort();
+            status
+        }
         WaitOutcome::Detached(ask) => {
             // #55 intercom coordination detach (upstream
             // INTERCOM_DETACH_REQUEST_EVENT → detachForeground("intercom
@@ -1925,20 +2001,32 @@ mod terminal_classification_tests {
         let events = evaluate_control(&mut state, &guard(), 210);
         assert!(events.is_empty());
         assert_eq!(state.activity_state, None);
-        // Mutating failures escalate at the configured threshold.
+        // Mutating failures escalate at the configured threshold. The display
+        // slot has already been re-pointed at another overlapping call; the
+        // event must still name the call that actually failed.
+        state.current_tool = Some("read".to_string());
+        state.current_path = Some("src/other.ts".to_string());
+        state.current_tool_call_id = Some("read-1".to_string());
+        state.current_tool_started_at = Some(10);
         let signal = crate::runner::events::ToolEndSignal {
+            tool_call_id: "edit-1".to_string(),
             tool: "edit".to_string(),
             path: Some("src/a.ts".to_string()),
             mutates: true,
             is_error: true,
             error: "boom".to_string(),
             ts: 220,
+            started_at: Some(0),
             ..crate::runner::events::ToolEndSignal::default()
         };
         assert!(process_tool_end(&mut state, &guard(), &signal).is_empty());
         let events = process_tool_end(&mut state, &guard(), &signal);
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0].reason.as_deref(), Some("tool_failures"));
+        assert_eq!(events[0].current_tool.as_deref(), Some("edit"));
+        assert_eq!(events[0].current_path.as_deref(), Some("src/a.ts"));
+        assert_eq!(events[0].tool_call_id.as_deref(), Some("edit-1"));
+        assert_eq!(events[0].current_tool_duration_ms, Some(220));
         assert!(
             events[0]
                 .recent_failure_summary

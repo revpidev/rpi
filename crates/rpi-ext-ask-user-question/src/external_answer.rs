@@ -30,6 +30,18 @@ fn reject(code: &str, reason: impl Into<String>) -> Reject {
     (code.to_owned(), reason.into())
 }
 
+/// `Number.isInteger`: JSON `0` and `0.0` are both integers upstream. Rust's
+/// `as_i64` only accepts the integer representation, so askq used to reject
+/// the integral-float spelling as `invalid_payload`.
+fn json_integer(value: &Value) -> Option<f64> {
+    let number = if let Some(integer) = value.as_i64() {
+        integer as f64
+    } else {
+        value.as_f64()?
+    };
+    (number.is_finite() && number.fract() == 0.0).then_some(number)
+}
+
 fn is_record(value: &Value) -> Option<&Map<String, Value>> {
     value.as_object()
 }
@@ -53,7 +65,7 @@ fn resolve_entry(
         Some(Value::Array(items)) => {
             let mut indexes = Vec::with_capacity(items.len());
             for item in items {
-                let Some(value) = item.as_i64() else {
+                let Some(value) = json_integer(item) else {
                     return Err(reject(
                         "invalid_payload",
                         format!("question {index}: optionIndexes must be an array of integers"),
@@ -105,17 +117,18 @@ fn resolve_entry(
     }
 
     let invalid = |reason: String| reject("invalid_answer", format!("question {index}: {reason}"));
-    let picked: Vec<i64> = option_indexes.unwrap_or_default();
-    let option_count = question.options.len() as i64;
-    if let Some(out) = picked
+    let picked_values = option_indexes.unwrap_or_default();
+    let option_count = question.options.len() as f64;
+    if let Some(out) = picked_values
         .iter()
-        .find(|value| **value < 0 || **value >= option_count)
+        .find(|value| **value < 0.0 || **value >= option_count)
     {
         return Err(invalid(format!(
             "option index {out} out of range (0..{})",
-            option_count.saturating_sub(1)
+            question.options.len().saturating_sub(1)
         )));
     }
+    let picked: Vec<i64> = picked_values.iter().map(|value| *value as i64).collect();
     let mut sorted = picked.clone();
     sorted.sort_unstable();
     sorted.dedup();
@@ -238,22 +251,22 @@ pub fn resolve_external_answer(
         let Some(entry) = is_record(entry) else {
             return Err(reject("invalid_payload", "each answer must be an object"));
         };
-        let Some(index) = entry.get("questionIndex").and_then(Value::as_i64) else {
+        let Some(index_value) = entry.get("questionIndex").and_then(json_integer) else {
             return Err(reject(
                 "invalid_payload",
                 "questionIndex must be an integer",
             ));
         };
-        if index < 0 || index as usize >= questions.len() {
+        if index_value < 0.0 || index_value >= questions.len() as f64 {
             return Err(reject(
                 "invalid_answer",
                 format!(
-                    "questionIndex {index} out of range (0..{})",
+                    "questionIndex {index_value} out of range (0..{})",
                     questions.len().saturating_sub(1)
                 ),
             ));
         }
-        let index = index as usize;
+        let index = index_value as usize;
         if by_question.insert(index, entry).is_some() {
             return Err(reject(
                 "invalid_answer",
@@ -352,6 +365,56 @@ mod tests {
         )
         .expect_err("cancel with answers");
         assert_eq!(code, "invalid_payload");
+    }
+
+    #[test]
+    fn accepts_integral_json_floats_for_indexes() {
+        let result = resolve_external_answer(
+            &questions(),
+            &json!({
+                "answers": [
+                    {"questionIndex": 0.0, "optionIndexes": [1.0]},
+                    {"questionIndex": 1.0, "optionIndexes": [0.0, 1.0]}
+                ]
+            }),
+        )
+        .expect("integral floats are integers upstream");
+        assert_eq!(result.answers[0].answer.as_deref(), Some("B"));
+        assert_eq!(
+            result.answers[1].selected.as_deref(),
+            Some(["X".to_string(), "Y".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn fractional_and_out_of_range_numbers_keep_their_error_codes() {
+        let (code, _) = resolve_external_answer(
+            &questions(),
+            &json!({"answers": [
+                {"questionIndex": 0.5},
+                {"questionIndex": 1, "text": "x"}
+            ]}),
+        )
+        .expect_err("fractional index");
+        assert_eq!(code, "invalid_payload");
+        let (code, _) = resolve_external_answer(
+            &questions(),
+            &json!({"answers": [
+                {"questionIndex": 0, "optionIndexes": [0.5]},
+                {"questionIndex": 1, "text": "x"}
+            ]}),
+        )
+        .expect_err("fractional option index");
+        assert_eq!(code, "invalid_payload");
+        let (code, _) = resolve_external_answer(
+            &questions(),
+            &json!({"answers": [
+                {"questionIndex": 0, "optionIndexes": [1e20]},
+                {"questionIndex": 1, "text": "x"}
+            ]}),
+        )
+        .expect_err("out of range");
+        assert_eq!(code, "invalid_answer");
     }
 
     #[test]

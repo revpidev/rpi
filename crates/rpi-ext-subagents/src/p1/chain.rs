@@ -684,6 +684,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn steps_accept_per_child_cwd_and_model() {
+        let steps = serde_json::json!([{
+            "agent": "scout",
+            "task": "t",
+            "cwd": "/tmp/per-step",
+            "model": "provider/model"
+        }]);
+        let specs = parse_steps(&steps).unwrap();
+        assert_eq!(
+            specs[0].cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/per-step"))
+        );
+        assert_eq!(specs[0].model.as_deref(), Some("provider/model"));
+    }
+
+    #[test]
     fn output_references_resolve() {
         let mut outputs = BTreeMap::new();
         outputs.insert("scan".to_string(), "the scan".to_string());

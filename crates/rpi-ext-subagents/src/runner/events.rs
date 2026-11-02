@@ -87,18 +87,96 @@ pub enum ChildLifecycleAction {
     None,
 }
 
+/// Drain/lifecycle flags shared by the event parser and the runner's
+/// terminal-drain task. Ported from `ChildLifecycleState`
+/// (`runs/shared/child-lifecycle.ts` @ 3a63e0ad): a compaction retry cancels
+/// the drain; an agent restart clears it; a post-final compaction keeps the
+/// base upstream `compactionAfterFinalOpen` behavior (the drain waits for the
+/// compaction to finish before restarting its grace window).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChildLifecycleState {
+    /// A retrying `compaction_end` is in flight; `agent_settled` must not
+    /// start the drain while this is true.
+    pub compaction_retry_active: bool,
+    /// The child produced a clean terminal assistant stop. A following
+    /// non-retrying `agent_end` re-arms the drain instead of cancelling it.
+    pub clean_terminal_stop_received: bool,
+    /// The runner's terminal-drain ladder is armed.
+    pub drain_armed: bool,
+    /// Wall-clock millisecond timestamp of the last drain arm/re-arm. The
+    /// drain task measures its 1s grace from here.
+    pub drain_armed_at: Option<u64>,
+    /// A compaction started after the terminal event; the drain must wait for
+    /// `compaction_end` before its grace window can expire.
+    pub compaction_after_final_open: bool,
+}
+
 pub fn project_child_lifecycle(
     event_type: Option<&str>,
     will_retry: bool,
     terminal_assistant_stop: bool,
+    state: &mut ChildLifecycleState,
+    now_ms: u64,
 ) -> ChildLifecycleAction {
-    if event_type == Some("agent_end") && will_retry {
+    if event_type == Some("compaction_end") {
+        state.compaction_retry_active = will_retry;
+        let after_final = state.compaction_after_final_open;
+        state.compaction_after_final_open = false;
+        if will_retry {
+            state.drain_armed = false;
+            return ChildLifecycleAction::CancelDrain;
+        }
+        if after_final && state.drain_armed {
+            // Upstream clears the timers and calls startFinalDrain again: the
+            // 1s grace restarts after the compaction ended.
+            state.drain_armed_at = Some(now_ms);
+            return ChildLifecycleAction::StartDrain;
+        }
+        return ChildLifecycleAction::None;
+    }
+    if matches!(
+        event_type,
+        Some("agent_start" | "auto_retry_start" | "turn_start")
+    ) {
+        state.compaction_retry_active = false;
+        state.clean_terminal_stop_received = false;
+        state.drain_armed = false;
+        state.compaction_after_final_open = false;
+        return ChildLifecycleAction::CancelDrain;
+    }
+    if event_type == Some("agent_end") {
+        if !will_retry {
+            state.compaction_retry_active = false;
+        }
+        if will_retry {
+            state.drain_armed = false;
+            state.compaction_after_final_open = false;
+            return ChildLifecycleAction::CancelDrain;
+        }
+        if state.clean_terminal_stop_received {
+            // Pi may not emit `agent_settled` after a clean final stop; the
+            // non-retrying agent_end re-arms the drain instead of cancelling.
+            state.drain_armed = true;
+            state.drain_armed_at = Some(now_ms);
+            return ChildLifecycleAction::StartDrain;
+        }
+        state.drain_armed = false;
+        state.compaction_after_final_open = false;
         return ChildLifecycleAction::CancelDrain;
     }
     if event_type == Some("agent_settled") {
+        if state.compaction_retry_active {
+            return ChildLifecycleAction::None;
+        }
+        state.drain_armed = true;
+        state.drain_armed_at = Some(now_ms);
         return ChildLifecycleAction::StartDrain;
     }
     if terminal_assistant_stop {
+        state.clean_terminal_stop_received = true;
+        state.compaction_retry_active = false;
+        state.drain_armed = true;
+        state.drain_armed_at = Some(now_ms);
         return ChildLifecycleAction::StartDrain;
     }
     ChildLifecycleAction::None
@@ -898,6 +976,8 @@ pub struct ChildRunState {
     pub seen_control_keys: std::collections::BTreeSet<String>,
     /// Run start (set by the runner from StreamMeta; used by the idle rule).
     pub started_at_ms: Option<u64>,
+    /// Terminal-drain / post-final-compaction lifecycle flags.
+    pub lifecycle: ChildLifecycleState,
 }
 
 /// One in-flight tool call (`pendingToolResultsByCallId`).
@@ -921,6 +1001,7 @@ pub struct ToolEndSignal {
     pub is_error: bool,
     pub error: String,
     pub ts: u64,
+    pub started_at: Option<u64>,
     pub duration_ms: Option<u64>,
 }
 
@@ -984,6 +1065,7 @@ impl Default for ChildRunState {
             attention_activity_at: None,
             seen_control_keys: std::collections::BTreeSet::new(),
             started_at_ms: None,
+            lifecycle: ChildLifecycleState::default(),
         }
     }
 }
@@ -1011,13 +1093,44 @@ impl ChildRunState {
         match event_type {
             "agent_settled" => {
                 self.agent_settled_received = true;
-                outcome.lifecycle = project_child_lifecycle(Some(event_type), false, false);
+                outcome.lifecycle = project_child_lifecycle(
+                    Some(event_type),
+                    false,
+                    false,
+                    &mut self.lifecycle,
+                    now_ms,
+                );
             }
             "agent_end" => {
                 outcome.lifecycle = project_child_lifecycle(
                     Some(event_type),
                     value.get("willRetry") == Some(&Value::Bool(true)),
                     false,
+                    &mut self.lifecycle,
+                    now_ms,
+                );
+            }
+            "agent_start" | "auto_retry_start" | "turn_start" => {
+                outcome.lifecycle = project_child_lifecycle(
+                    Some(event_type),
+                    false,
+                    false,
+                    &mut self.lifecycle,
+                    now_ms,
+                );
+            }
+            "compaction_start" => {
+                if self.lifecycle.drain_armed {
+                    self.lifecycle.compaction_after_final_open = true;
+                }
+            }
+            "compaction_end" => {
+                outcome.lifecycle = project_child_lifecycle(
+                    Some(event_type),
+                    value.get("willRetry") == Some(&Value::Bool(true)),
+                    false,
+                    &mut self.lifecycle,
+                    now_ms,
                 );
             }
             "tool_execution_start" => {
@@ -1140,6 +1253,7 @@ impl ChildRunState {
                             .map(|line| line.trim().chars().take(180).collect())
                             .unwrap_or_else(|| "mutating tool failed".to_string()),
                         ts: now_ms,
+                        started_at: Some(pending.started_at),
                         duration_ms: value.get("durationMs").and_then(Value::as_u64),
                     });
                 }
@@ -1171,7 +1285,7 @@ impl ChildRunState {
             }
             "message_update" => self.process_message_update(&value),
             "message_end" | "tool_result_end" => {
-                self.process_message_end(event_type, &value, &mut outcome);
+                self.process_message_end(event_type, &value, &mut outcome, now_ms);
             }
             _ => {}
         }
@@ -1215,7 +1329,13 @@ impl ChildRunState {
         (!self.partial_text.trim().is_empty()).then(|| self.partial_text.clone())
     }
 
-    fn process_message_end(&mut self, event_type: &str, event: &Value, outcome: &mut LineOutcome) {
+    fn process_message_end(
+        &mut self,
+        event_type: &str,
+        event: &Value,
+        outcome: &mut LineOutcome,
+        now_ms: u64,
+    ) {
         // `tool_result_end` carries the toolResult message under `message`.
         let Some(message) = event.get("message") else {
             return;
@@ -1267,7 +1387,8 @@ impl ChildRunState {
                 self.assistant_error = None;
             }
             if stop_reason == Some("stop") && !has_tool_call {
-                outcome.lifecycle = project_child_lifecycle(None, false, true);
+                outcome.lifecycle =
+                    project_child_lifecycle(None, false, true, &mut self.lifecycle, now_ms);
                 // #1919 (execution.ts:1125-1130): a clean terminal stop with
                 // text clears a recovered assistant error. Text presence is
                 // judged on the same `extractTextFromContent` source as the
@@ -1705,22 +1826,89 @@ mod tests {
 
     #[test]
     fn lifecycle_projection_rules() {
+        let mut state = ChildLifecycleState::default();
         assert_eq!(
-            project_child_lifecycle(Some("agent_end"), true, false),
+            project_child_lifecycle(Some("agent_end"), true, false, &mut state, 1),
             ChildLifecycleAction::CancelDrain
         );
+        let mut state = ChildLifecycleState::default();
         assert_eq!(
-            project_child_lifecycle(Some("agent_settled"), false, false),
+            project_child_lifecycle(Some("agent_settled"), false, false, &mut state, 1),
             ChildLifecycleAction::StartDrain
         );
+        assert!(state.drain_armed);
+        let mut state = ChildLifecycleState::default();
         assert_eq!(
-            project_child_lifecycle(None, false, true),
+            project_child_lifecycle(None, false, true, &mut state, 1),
             ChildLifecycleAction::StartDrain
         );
+        assert!(state.clean_terminal_stop_received);
+        let mut state = ChildLifecycleState::default();
         assert_eq!(
-            project_child_lifecycle(Some("agent_end"), false, false),
+            project_child_lifecycle(Some("agent_end"), false, false, &mut state, 1),
+            ChildLifecycleAction::CancelDrain
+        );
+    }
+
+    #[test]
+    fn compaction_after_final_waits_and_restarts_the_drain() {
+        let mut state = ChildLifecycleState::default();
+        assert_eq!(
+            project_child_lifecycle(None, false, true, &mut state, 1_000),
+            ChildLifecycleAction::StartDrain
+        );
+        assert!(state.drain_armed);
+        // `compaction_start` is handled by the parser: it sets the wait flag
+        // while the drain is armed.
+        state.compaction_after_final_open = true;
+        assert_eq!(
+            project_child_lifecycle(Some("compaction_end"), false, false, &mut state, 2_000),
+            ChildLifecycleAction::StartDrain
+        );
+        assert!(state.drain_armed);
+        assert_eq!(state.drain_armed_at, Some(2_000));
+        assert!(!state.compaction_after_final_open);
+    }
+
+    #[test]
+    fn compaction_retry_cancels_the_drain_and_agent_start_clears_it() {
+        let mut state = ChildLifecycleState::default();
+        project_child_lifecycle(None, false, true, &mut state, 1_000);
+        state.compaction_after_final_open = true;
+        assert_eq!(
+            project_child_lifecycle(Some("compaction_end"), true, false, &mut state, 2_000),
+            ChildLifecycleAction::CancelDrain
+        );
+        assert!(!state.drain_armed);
+        assert!(state.compaction_retry_active);
+        assert_eq!(
+            project_child_lifecycle(Some("agent_settled"), false, false, &mut state, 2_100),
             ChildLifecycleAction::None
         );
+        assert_eq!(
+            project_child_lifecycle(Some("agent_start"), false, false, &mut state, 2_200),
+            ChildLifecycleAction::CancelDrain
+        );
+        assert!(!state.compaction_retry_active);
+        assert!(!state.clean_terminal_stop_received);
+    }
+
+    #[test]
+    fn parser_tracks_compaction_start_only_while_the_drain_is_armed() {
+        let mut state = ChildRunState::default();
+        state.process_line(r#"{"type":"compaction_start"}"#, 1_000);
+        assert!(!state.lifecycle.compaction_after_final_open);
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}"#,
+            2_000,
+        );
+        assert!(state.lifecycle.drain_armed);
+        state.process_line(r#"{"type":"compaction_start"}"#, 3_000);
+        assert!(state.lifecycle.compaction_after_final_open);
+        state.process_line(r#"{"type":"compaction_end","willRetry":false}"#, 4_000);
+        assert!(!state.lifecycle.compaction_after_final_open);
+        assert!(state.lifecycle.drain_armed);
+        assert_eq!(state.lifecycle.drain_armed_at, Some(4_000));
     }
 
     #[test]

@@ -357,12 +357,7 @@ fn orchestration_skill_marker_gates_upgrade_and_reinstall() {
     let upgraded = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
     assert!(!upgraded.contains("workflowScript"), "{upgraded}");
     assert!(upgraded.contains("tasks"), "{upgraded}");
-    for name in [
-        "constraints-and-recipes.md",
-        "execution-controls.md",
-        "management-authoring-rpc.md",
-        "prompting-and-roles.md",
-    ] {
+    for name in ["orchestration.md", "prompting-and-roles.md"] {
         let body = std::fs::read_to_string(skill_dir.join("references").join(name)).unwrap();
         assert!(
             !body.contains("workflowScript"),
@@ -371,7 +366,7 @@ fn orchestration_skill_marker_gates_upgrade_and_reinstall() {
     }
     assert_eq!(
         std::fs::read_to_string(skill_dir.join(".rpi-layout-version")).unwrap(),
-        "3"
+        "4"
     );
     assert!(
         !legacy_dir.exists(),
