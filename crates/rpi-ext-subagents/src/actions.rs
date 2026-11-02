@@ -558,6 +558,30 @@ fn resume_from_foreground_record(
     }
 }
 
+/// Resolve the async-resume child index (`resolveAsyncResumeTarget`,
+/// async-resume.ts:494-506,566-576): a multi-child run requires an explicit
+/// `index`, and the selected child must exist.
+fn resolve_async_resume_index(
+    run_id: &str,
+    steps: &[Value],
+    requested: Option<&Value>,
+) -> Result<usize, String> {
+    let step_count = steps.len();
+    match requested {
+        None if step_count > 1 => Err(format!(
+            "Async run '{run_id}' has {step_count} children. Provide index to choose one."
+        )),
+        None => Ok(0),
+        Some(value) => match value.as_i64() {
+            Some(value) if value >= 0 && (value as usize) < step_count => Ok(value as usize),
+            Some(value) => Err(format!(
+                "Async run '{run_id}' has {step_count} children. Index {value} is out of range."
+            )),
+            None => Err(format!("Async run '{run_id}' index must be an integer.")),
+        },
+    }
+}
+
 fn handle_management_action_inner(
     action: &str,
     agent_name: Option<&str>,
@@ -1050,23 +1074,30 @@ fn handle_management_action_inner(
                 ));
             }
             let steps = status["steps"].as_array().cloned().unwrap_or_default();
+            // TE51 re-review P2: honor the requested child like upstream
+            // `resolveAsyncResumeTarget` instead of silently using the last
+            // step. Multi-child runs require the index to be explicit.
+            let step_index = match resolve_async_resume_index(&id, &steps, resume_index) {
+                Ok(index) => index,
+                Err(message) => return ToolOutcome::error(message),
+            };
+            let Some(selected) = steps.get(step_index) else {
+                return ToolOutcome::error(format!(
+                    "Background run {id} has no persisted child session to resume from."
+                ));
+            };
             // TE38 W5 (#2242 @ b72714de): a stopped child has no continuation
             // to revive — resume must not resurrect it (`resolveAsyncResumeTarget`
             // rejects `status == "stopped" || stopped == true` for the selected
-            // step; rpi resumes the last step, so the gate lands there).
-            if let Some(last) = steps.last()
-                && (last["status"].as_str() == Some("stopped")
-                    || last["stopped"].as_bool() == Some(true))
+            // step).
+            if selected["status"].as_str() == Some("stopped")
+                || selected["stopped"].as_bool() == Some(true)
             {
                 return ToolOutcome::error(format!(
-                    "Async run '{id}' child {} was stopped and cannot be resumed. Start a new run instead.",
-                    steps.len().saturating_sub(1)
+                    "Async run '{id}' child {step_index} was stopped and cannot be resumed. Start a new run instead."
                 ));
             }
-            let session_file = steps
-                .last()
-                .and_then(|step| step["sessionFile"].as_str())
-                .map(str::to_string);
+            let session_file = selected["sessionFile"].as_str().map(str::to_string);
             let Some(session_file) = session_file else {
                 return ToolOutcome::error(format!(
                     "Background run {id} has no persisted child session to resume from."
@@ -1082,11 +1113,7 @@ fn handle_management_action_inner(
                     "Async run '{id}' session file does not exist: {session_file}"
                 ));
             }
-            let agent_name = steps
-                .last()
-                .and_then(|step| step["agent"].as_str())
-                .unwrap_or("worker")
-                .to_string();
+            let agent_name = selected["agent"].as_str().unwrap_or("worker").to_string();
             let task = task
                 .unwrap_or_else(|| "Continue the interrupted task from this session.".to_string());
             // New async run reviving the old session file.
@@ -2992,6 +3019,117 @@ mod tests {
         assert_eq!(
             outcome.text,
             format!("Async run '{run_id}' was not found in the active session.")
+        );
+        cleanup_run(&run_id);
+    }
+
+    /// TE51 re-review P2: async resume resolution matches
+    /// `resolveAsyncResumeTarget` — explicit index for multi-child runs,
+    /// range/integer validation, single-child default 0.
+    #[test]
+    fn async_resume_index_resolution_matches_upstream() {
+        let steps = json!([{ "agent": "a" }, { "agent": "b" }]);
+        let steps = steps.as_array().expect("array");
+        assert_eq!(
+            resolve_async_resume_index("r", steps, None).unwrap_err(),
+            "Async run 'r' has 2 children. Provide index to choose one."
+        );
+        assert_eq!(
+            resolve_async_resume_index("r", steps, Some(&json!(1))).unwrap(),
+            1
+        );
+        assert_eq!(
+            resolve_async_resume_index("r", steps, Some(&json!(2))).unwrap_err(),
+            "Async run 'r' has 2 children. Index 2 is out of range."
+        );
+        assert_eq!(
+            resolve_async_resume_index("r", steps, Some(&json!(-1))).unwrap_err(),
+            "Async run 'r' has 2 children. Index -1 is out of range."
+        );
+        assert_eq!(
+            resolve_async_resume_index("r", steps, Some(&json!("1"))).unwrap_err(),
+            "Async run 'r' index must be an integer."
+        );
+        let single = json!([{ "agent": "a" }]);
+        assert_eq!(
+            resolve_async_resume_index("r", single.as_array().expect("array"), None).unwrap(),
+            0
+        );
+    }
+
+    /// TE51 re-review P2: the action consumes the selected child (not the
+    /// last step) and rejects a multi-child run without an index.
+    #[test]
+    fn async_resume_requires_and_honors_index() {
+        struct IndexHost;
+        impl crate::HostContext for IndexHost {
+            fn cwd(&self) -> PathBuf {
+                PathBuf::from("/tmp")
+            }
+            fn parent_model(&self) -> Option<String> {
+                None
+            }
+            fn parent_session(&self, _settings: &SettingsPair) -> Option<crate::ParentSession> {
+                None
+            }
+        }
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("resume-index-{}", std::process::id());
+        let missing = std::env::temp_dir().join(format!(
+            "rpi-resume-index-missing-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        action_test_run(
+            &run_id,
+            "failed",
+            json!([
+                { "agent": "first", "status": "failed", "sessionFile": "/tmp/rpi-resume-first.jsonl" },
+                { "agent": "second", "status": "failed", "sessionFile": missing.to_string_lossy() }
+            ]),
+        );
+        let runtime = crate::PluginRuntime::new().expect("plugin runtime");
+        let invoke = |params: Value| {
+            handle_management_action_with(
+                "resume",
+                None,
+                Path::new("/tmp"),
+                &SettingsPair::default(),
+                &crate::config::ExtensionConfig::new(),
+                &ActionDeps {
+                    host: Some(&IndexHost),
+                    runtime: Some(&runtime),
+                    params: Some(params),
+                },
+            )
+        };
+        let no_index = invoke(json!({ "action": "resume", "id": run_id, "task": "continue" }));
+        assert!(no_index.is_error, "{}", no_index.text);
+        assert_eq!(
+            no_index.text,
+            format!("Async run '{run_id}' has 2 children. Provide index to choose one.")
+        );
+        let out_of_range = invoke(json!({
+            "action": "resume", "id": run_id, "index": 5, "task": "continue"
+        }));
+        assert!(out_of_range.is_error, "{}", out_of_range.text);
+        assert_eq!(
+            out_of_range.text,
+            format!("Async run '{run_id}' has 2 children. Index 5 is out of range.")
+        );
+        let selected = invoke(json!({
+            "action": "resume", "id": run_id, "index": 1, "task": "continue"
+        }));
+        assert!(selected.is_error, "{}", selected.text);
+        assert!(
+            selected.text.contains(&format!(
+                "session file does not exist: {}",
+                missing.display()
+            )),
+            "selected child 1, not the last/first step: {}",
+            selected.text
         );
         cleanup_run(&run_id);
     }

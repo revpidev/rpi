@@ -206,7 +206,7 @@ pub fn tool_parameters_schema() -> Value {
             "index": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "Child index for status view:transcript (and steer targetIndex alias)."
+                "description": "Child index for status view:transcript, steer targetIndex alias, and async resume selection (required when the run has multiple children)."
             },
             "lines": {
                 "type": "integer",

@@ -369,8 +369,8 @@ pub fn discard_running(run_id: &str) {
     }
 }
 
-/// Rewrite interrupted single runs whose owner host is dead. Returns the
-/// number of records restored.
+/// Rewrite interrupted runs whose owner host is dead. Returns the number
+/// of records restored.
 pub fn restore_interrupted() -> usize {
     let Ok(entries) = std::fs::read_dir(history_dir()) else {
         return 0;

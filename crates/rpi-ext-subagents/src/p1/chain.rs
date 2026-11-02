@@ -471,12 +471,47 @@ pub fn validate_step_agents(steps: &[StepSpec], agents: &[AgentConfig]) -> Resul
     resolve_step_agents(steps, agents).map(|_| ())
 }
 
+/// Per-step lifecycle events for async chain runs. `Started` fires
+/// immediately before the child launches (pending → running, upstream
+/// subagent-runner.ts:4540-4550); `Finished` fires as soon as that step
+/// settles so its terminal fields land while the rest of the chain runs
+/// (upstream writes each step terminal inside the loop, :4704-4712).
+#[derive(Debug, Clone)]
+pub enum ChainStepEvent {
+    Started {
+        index: usize,
+    },
+    Finished {
+        outcome: Box<StepOutcome>,
+    },
+    /// The child never produced an outcome (spawn/dispatch failure); the
+    /// started step must still leave `running`.
+    Failed {
+        index: usize,
+        error: String,
+    },
+}
+
+/// Sink receiving the per-step chain lifecycle events.
+pub type ChainStepSink = Arc<dyn Fn(ChainStepEvent) + Send + Sync>;
+
 /// Async core (see [`run_chain`]) — direct call from runtime tasks.
 pub async fn run_chain_async(
     steps: &[StepSpec],
     agents: &[AgentConfig],
     ctx: &RunCtx,
     original_task: &str,
+) -> Result<(Vec<StepOutcome>, Option<StepOutcome>), String> {
+    run_chain_async_with_step_sink(steps, agents, ctx, original_task, None).await
+}
+
+/// [`run_chain_async`] with per-step lifecycle notifications.
+pub async fn run_chain_async_with_step_sink(
+    steps: &[StepSpec],
+    agents: &[AgentConfig],
+    ctx: &RunCtx,
+    original_task: &str,
+    on_step: Option<ChainStepSink>,
 ) -> Result<(Vec<StepOutcome>, Option<StepOutcome>), String> {
     // #2507 (TE45) + v0.1.6 review round 2 (B2): resolve every step's
     // literal agent name before the chain directory (and its progress file)
@@ -575,6 +610,9 @@ pub async fn run_chain_async(
         )? {
             break;
         }
+        if let Some(on_step) = &on_step {
+            on_step(ChainStepEvent::Started { index });
+        }
         // TE09 FR-B (chain-execution.ts:448-479): under a dispatch sink every
         // step's streaming frame is re-wrapped as a chain-mode snapshot —
         // accumulated terminal results/progress + the live step frame,
@@ -611,7 +649,18 @@ pub async fn run_chain_async(
                 sink(text, &chain_details);
             }));
         }
-        let outcome = launch_child::run_child_async(&spec, agent, &step_ctx).await?;
+        let outcome = match launch_child::run_child_async(&spec, agent, &step_ctx).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(on_step) = &on_step {
+                    on_step(ChainStepEvent::Failed {
+                        index,
+                        error: error.clone(),
+                    });
+                }
+                return Err(error);
+            }
+        };
         accumulated_cost += outcome
             .result
             .usage
@@ -660,6 +709,11 @@ pub async fn run_chain_async(
             process_signal: outcome.result.process_signal.clone(),
             details,
         };
+        if let Some(on_step) = &on_step {
+            on_step(ChainStepEvent::Finished {
+                outcome: Box::new(step_outcome.clone()),
+            });
+        }
         // Terminal projection into the chain accumulator (FR-B): the next
         // step's frames carry this step's final details + progress.
         {

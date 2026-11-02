@@ -259,13 +259,17 @@ pub struct ParallelTaskOutcome {
 /// v0.66 #1060/#1474 (R7.1.6.1): `Finished` carries the child's
 /// [`StepTerminal`] so a stop-requested child is recorded `stopped`, never
 /// `failed` (04 §3.3.5).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ParallelStepEvent {
     Started,
     Finished {
         exit_code: i32,
         error: Option<String>,
         terminal: StepTerminal,
+        /// Terminal child details (model/thinking/sessionFile/artifactPaths/
+        /// savedOutputPath). The async runner merges the resume/artifact
+        /// fields into the step so `status`/`resume` work for tasks runs.
+        details: Option<Value>,
     },
 }
 
@@ -548,7 +552,7 @@ pub async fn run_parallel_async(
                             .as_ref()
                             .map(|probe| probe())
                             .unwrap_or_default();
-                        let (exit_code, error, terminal) = match &outcome {
+                        let (exit_code, error, terminal, details) = match &outcome {
                             Some(Ok(result)) => (
                                 result.exit_code,
                                 result.error.clone(),
@@ -558,16 +562,19 @@ pub async fn run_parallel_async(
                                     result.details["processSignal"].as_str(),
                                     control,
                                 ),
+                                Some(result.details.clone()),
                             ),
                             Some(Err(reason)) => (
                                 -1,
                                 Some(reason.clone()),
                                 classify_terminal(-1, false, None, control),
+                                None,
                             ),
                             None => (
                                 -1,
                                 Some("launch failed without a reason".to_owned()),
                                 classify_terminal(-1, false, None, control),
+                                None,
                             ),
                         };
                         sink(
@@ -576,6 +583,7 @@ pub async fn run_parallel_async(
                                 exit_code,
                                 error,
                                 terminal,
+                                details,
                             },
                         );
                     }

@@ -1195,6 +1195,7 @@ pub async fn drive_run(
                             exit_code,
                             error,
                             terminal,
+                            details,
                         } => {
                             mark_step(&event_handle, index, terminal.as_status());
                             set_step_field(&event_handle, index, |step| {
@@ -1203,20 +1204,12 @@ pub async fn drive_run(
                                 if let Some(error) = &error {
                                     step["error"] = json!(error);
                                 }
+                                if let Some(details) = &details {
+                                    apply_step_result_details(step, details);
+                                }
                                 // Terminal steps drop the live-activity
                                 // fields (same rule as record_step_result).
-                                if let Some(object) = step.as_object_mut() {
-                                    for key in [
-                                        "currentTool",
-                                        "currentToolArgs",
-                                        "currentToolStartedAt",
-                                        "currentPath",
-                                        "activityState",
-                                        "lastActivityAt",
-                                    ] {
-                                        object.remove(key);
-                                    }
-                                }
+                                clear_step_live_fields(step);
                             });
                         }
                     }
@@ -1270,66 +1263,113 @@ pub async fn drive_run(
             steps,
             original_task,
         } => {
-            mark_step(&handle, 0, "running");
-            match crate::p1::chain::run_chain_async(&steps, &agents, &ctx, &original_task).await {
-                Ok((completed, failed)) => {
-                    for step in &completed {
-                        // R7.1.6.1: the same terminal classifier as single
-                        // and parallel runs (a stopped/timed-out step must
-                        // not render as failed).
-                        let terminal = crate::p1::parallel::classify_terminal(
-                            step.exit_code,
-                            step.timed_out,
-                            step.process_signal.as_deref(),
-                            run_control_flags(&handle),
-                        );
-                        mark_step(&handle, step.index, terminal.as_status());
-                        set_step_field(&handle, step.index, |target| {
-                            target["exitCode"] = json!(step.exit_code);
-                            target["terminal"] = json!(terminal.as_status());
-                            if let Some(thinking) = &step.thinking {
-                                target["thinking"] = json!(thinking);
-                            }
-                            if let Some(error) = &step.error {
-                                target["error"] = json!(error);
-                            }
-                        });
+            // Every step goes pending → running at its own launch
+            // (upstream subagent-runner.ts:4540-4550); the sink also clears
+            // stale live fields and the run-level activity, so a long chain
+            // never shows later steps as pending once they start.
+            let step_handle = handle.clone();
+            let on_step: crate::p1::chain::ChainStepSink =
+                std::sync::Arc::new(move |event| match event {
+                    crate::p1::chain::ChainStepEvent::Started { index } => {
+                        begin_step(&step_handle, index);
                     }
+                    crate::p1::chain::ChainStepEvent::Finished { outcome } => {
+                        // Per-step terminal projection (upstream writes each
+                        // step as it settles, not at chain end).
+                        record_chain_step_outcome(&step_handle, &outcome);
+                    }
+                    crate::p1::chain::ChainStepEvent::Failed { index, error } => {
+                        fail_step(&step_handle, index, &error);
+                    }
+                });
+            match crate::p1::chain::run_chain_async_with_step_sink(
+                &steps,
+                &agents,
+                &ctx,
+                &original_task,
+                Some(on_step),
+            )
+            .await
+            {
+                Ok((completed, failed)) => {
+                    // Every step already settled through the chain sink
+                    // (`record_chain_step_outcome`); re-classifying here
+                    // would downgrade a completed step to stopped when a
+                    // stop arrives after it finished. Keep only the chain
+                    // terminal transition.
                     let last_output = completed
                         .last()
                         .map(|s| s.output.clone())
                         .unwrap_or_default();
                     match failed {
                         Some(failure) => {
-                            let terminal = crate::p1::parallel::classify_terminal(
-                                failure.exit_code,
-                                failure.timed_out,
-                                failure.process_signal.as_deref(),
-                                run_control_flags(&handle),
-                            );
-                            mark_step(&handle, failure.index, terminal.as_status());
-                            set_step_field(&handle, failure.index, |target| {
-                                target["exitCode"] = json!(failure.exit_code);
-                                target["terminal"] = json!(terminal.as_status());
-                                if let Some(thinking) = &failure.thinking {
-                                    target["thinking"] = json!(thinking);
-                                }
-                                if let Some(error) = &failure.error {
-                                    target["error"] = json!(error);
-                                }
-                            });
-                            finish_failed(
-                                &handle,
-                                failure.error.as_deref().unwrap_or("chain step failed"),
-                                &notify,
-                            )
-                            .await
+                            let error = failure.error.as_deref().unwrap_or("chain step failed");
+                            if handle.control.stop_requested() {
+                                finish(&handle, STATE_STOPPED, error, &notify).await
+                            } else {
+                                finish_failed(&handle, error, &notify).await
+                            }
                         }
                         None => finish(&handle, STATE_COMPLETE, &last_output, &notify).await,
                     }
                 }
-                Err(error) => finish_failed(&handle, &error, &notify).await,
+                Err(error) => {
+                    if handle.control.stop_requested() {
+                        finish(&handle, STATE_STOPPED, &error, &notify).await
+                    } else {
+                        finish_failed(&handle, &error, &notify).await
+                    }
+                }
             }
+        }
+    }
+}
+
+/// Live-activity fields that only make sense while a step is pending or
+/// running (upstream `resetStepLiveDetail`, subagent-runner.ts:484-491, and
+/// the terminal step writes at :3740-3755).
+const STEP_LIVE_FIELDS: [&str; 6] = [
+    "currentTool",
+    "currentToolArgs",
+    "currentToolStartedAt",
+    "currentPath",
+    "activityState",
+    "lastActivityAt",
+];
+
+fn clear_step_live_fields(step: &mut Value) {
+    if let Some(object) = step.as_object_mut() {
+        for key in STEP_LIVE_FIELDS {
+            object.remove(key);
+        }
+    }
+}
+
+fn clear_steps_terminal(status: &mut Value) {
+    if let Some(steps) = status["steps"].as_array_mut() {
+        for step in steps {
+            clear_step_live_fields(step);
+        }
+    }
+}
+
+/// Merge the terminal child details that `status`/`resume` need into one
+/// step (the same fields `record_step_result` and the single-run path
+/// persist). Only additive fields are copied; the caller owns status,
+/// exitCode and live-field cleanup.
+fn apply_step_result_details(step: &mut Value, details: &Value) {
+    for key in [
+        "model",
+        "thinking",
+        "outputPartial",
+        "sessionFile",
+        "artifactPaths",
+        "savedOutputPath",
+        "toolBudget",
+        "toolBudgetBlocked",
+    ] {
+        if let Some(value) = details.get(key) {
+            step[key] = value.clone();
         }
     }
 }
@@ -1341,6 +1381,42 @@ fn mark_step(handle: &Arc<AsyncRunHandle>, index: usize, state: &str) {
         {
             step["status"] = json!(state);
         }
+    });
+}
+
+/// Mark a chain step failed when its child never produced an outcome
+/// (spawn/dispatch error), so a started step cannot stay `running`.
+fn fail_step(handle: &Arc<AsyncRunHandle>, index: usize, error: &str) {
+    set_step_field(handle, index, |step| {
+        step["status"] = json!("failed");
+        step["terminal"] = json!("failed");
+        step["exitCode"] = json!(-1);
+        step["error"] = json!(error);
+        clear_step_live_fields(step);
+    });
+}
+
+/// Step start for chain runs (upstream subagent-runner.ts:4540-4550): mark
+/// the step running, drop any prior error/live detail, stamp activity time
+/// and clear the run-level activity state.
+fn begin_step(handle: &Arc<AsyncRunHandle>, index: usize) {
+    let at = now_millis();
+    update_status(handle, |status| {
+        if let Some(steps) = status["steps"].as_array_mut()
+            && let Some(step) = steps.get_mut(index)
+        {
+            step["status"] = json!("running");
+            if let Some(object) = step.as_object_mut() {
+                object.remove("error");
+            }
+            clear_step_live_fields(step);
+            step["lastActivityAt"] = json!(at);
+        }
+        status["lastActivityAt"] = json!(at);
+        if let Some(object) = status.as_object_mut() {
+            object.remove("activityState");
+        }
+        sync_aggregate_activity_state(status);
     });
 }
 
@@ -1434,17 +1510,36 @@ fn record_step_result(
         }
         // Terminal steps drop the live-activity fields (upstream shows
         // currentTool only for pending/running steps).
-        if let Some(object) = step.as_object_mut() {
-            for key in [
-                "currentTool",
-                "currentToolArgs",
-                "currentToolStartedAt",
-                "currentPath",
-                "activityState",
-                "lastActivityAt",
-            ] {
-                object.remove(key);
-            }
+        clear_step_live_fields(step);
+    });
+}
+
+/// Persist one settled chain step: terminal classification plus the
+/// resume/artifact fields the chain's own details shape does not carry
+/// (`sessionFile`, `savedOutputPath`).
+fn record_chain_step_outcome(
+    handle: &Arc<AsyncRunHandle>,
+    outcome: &crate::p1::chain::StepOutcome,
+) {
+    record_step_result(handle, outcome.index, &outcome.result);
+    set_step_field(handle, outcome.index, |step| {
+        if let Some(thinking) = &outcome.thinking {
+            step["thinking"] = json!(thinking);
+        }
+        if outcome.timed_out {
+            step["timedOut"] = json!(true);
+        }
+        if let Some(signal) = &outcome.process_signal {
+            step["processSignal"] = json!(signal);
+        }
+        if let Some(session_file) = &outcome.result.session_file {
+            step["sessionFile"] = json!(session_file.to_string_lossy());
+        }
+        if let Some(paths) = &outcome.result.artifact_paths {
+            step["artifactPaths"] = paths.to_json();
+        }
+        if let Some(saved) = outcome.details["savedOutputPath"].as_str() {
+            step["savedOutputPath"] = json!(saved);
         }
     });
 }
@@ -1852,14 +1947,7 @@ async fn finish_with_handoff(
             object.remove("activityState");
             object.remove("lastActivityAt");
         }
-        if let Some(steps) = status["steps"].as_array_mut() {
-            for step in steps {
-                if let Some(object) = step.as_object_mut() {
-                    object.remove("activityState");
-                    object.remove("lastActivityAt");
-                }
-            }
-        }
+        clear_steps_terminal(status);
     });
     append_event(
         handle.run_dir.as_path(),
@@ -1886,6 +1974,10 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
             object.remove("activityState");
             object.remove("lastActivityAt");
         }
+        // A failed chain leaves its last step with live activity fields
+        // (currentTool/activityState); terminal steps must not keep them, or
+        // `subagent_wait` can report attention for a dead run.
+        clear_steps_terminal(status);
     });
     append_event(
         handle.run_dir.as_path(),
@@ -2159,6 +2251,11 @@ pub async fn harvest_for_shutdown() {
                 status["state"] = json!(STATE_STOPPED);
                 status["stopped"] = json!(true);
                 status["stoppedReason"] = json!("host-shutdown");
+                if let Some(object) = status.as_object_mut() {
+                    object.remove("activityState");
+                    object.remove("lastActivityAt");
+                }
+                clear_steps_terminal(status);
             }
         });
         append_event(
@@ -2224,6 +2321,11 @@ pub fn reconcile_stale_runs() {
         status["state"] = json!(STATE_FAILED);
         status["error"] = json!("stale: owning host process exited before the run finished");
         status["updatedAt"] = json!(iso8601(now_millis()));
+        if let Some(object) = status.as_object_mut() {
+            object.remove("activityState");
+            object.remove("lastActivityAt");
+        }
+        clear_steps_terminal(&mut status);
         let write_result = crate::artifacts::write_metadata(&status_path, &status);
         append_event(
             &run_dir,
@@ -2406,6 +2508,13 @@ pub async fn wait_for_runs_with_session_asks(
                     continue;
                 };
                 let status = handle.status.read().unwrap_or_else(|e| e.into_inner());
+                // A terminal run cannot need attention any more. Terminal
+                // handles stay registered for the wait/status poll, so a
+                // stale step `activityState` (or a step left live by an
+                // older writer) must not outrank the terminal result.
+                if is_terminal(status["state"].as_str().unwrap_or("")) {
+                    continue;
+                }
                 let step_attention = status["steps"].as_array().and_then(|steps| {
                     steps.iter().find_map(|step| {
                         (step["activityState"].as_str() == Some("needs_attention")).then(|| {
@@ -2827,6 +2936,118 @@ pub(crate) mod tests {
         .expect("cleared wait");
         assert!(cleared.get("attention").is_none(), "{cleared}");
         unregister_run("te51-wait-attention");
+    }
+
+    /// TE51 re-review P1: `finish_failed` runs for a failed chain and must
+    /// drop every step's live fields — a stale `activityState` would keep
+    /// `subagent_wait` reporting attention for a dead run.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn finish_failed_clears_chain_step_live_fields() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let steps = crate::p1::chain::parse_steps(&json!([
+            {"agent": "worker", "task": "one"},
+            {"agent": "worker", "task": "two"}
+        ]))
+        .unwrap();
+        let handle = start_run(
+            "te51-chain-failed-cleanup",
+            None,
+            &AsyncBody::Steps {
+                steps,
+                original_task: "chain task".to_string(),
+            },
+        );
+        update_status(&handle, |status| {
+            status["steps"][0]["status"] = json!("complete");
+            status["steps"][0]["currentTool"] = json!("bash");
+            status["steps"][0]["activityState"] = json!("needs_attention");
+            status["steps"][1]["status"] = json!("running");
+            status["steps"][1]["currentTool"] = json!("edit");
+            status["steps"][1]["currentToolArgs"] = json!({"path": "x"});
+            status["steps"][1]["currentToolStartedAt"] = json!(1);
+            status["steps"][1]["currentPath"] = json!("/tmp/x");
+            status["steps"][1]["activityState"] = json!("needs_attention");
+            status["steps"][1]["lastActivityAt"] = json!(2);
+            status["activityState"] = json!("needs_attention");
+            status["lastActivityAt"] = json!(2);
+        });
+        finish_failed(&handle, "chain step failed", &AsyncNotify { calls: None }).await;
+        let status = status_snapshot(&handle);
+        assert_eq!(status["state"], json!(STATE_FAILED));
+        assert!(status.get("activityState").is_none(), "{status}");
+        assert!(status.get("lastActivityAt").is_none(), "{status}");
+        for step in status["steps"].as_array().expect("steps") {
+            for key in [
+                "currentTool",
+                "currentToolArgs",
+                "currentToolStartedAt",
+                "currentPath",
+                "activityState",
+                "lastActivityAt",
+            ] {
+                assert!(step.get(key).is_none(), "{key} survived: {step}");
+            }
+        }
+        unregister_run("te51-chain-failed-cleanup");
+        remove_status_gate("te51-chain-failed-cleanup");
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+    }
+
+    /// TE51 re-review P1: an active wait must not turn a terminal (failed)
+    /// chain back into an attention stop just because a step still carries a
+    /// live `activityState` from the failure window.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn wait_ignores_stale_step_attention_once_the_run_is_terminal() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let steps = crate::p1::chain::parse_steps(&json!([
+            {"agent": "worker", "task": "one"},
+            {"agent": "worker", "task": "two"}
+        ]))
+        .unwrap();
+        let handle = start_run(
+            "te51-chain-wait-terminal",
+            None,
+            &AsyncBody::Steps {
+                steps,
+                original_task: "chain task".to_string(),
+            },
+        );
+        update_status(&handle, |status| {
+            status["steps"][0]["status"] = json!("running");
+        });
+        let waiter = tokio::spawn(async move {
+            wait_for_runs(Some("te51-chain-wait-terminal"), false, 5_000, None, None).await
+        });
+        // Let the wait take its initial (running) snapshot, then move the
+        // run to the shape a pre-fix `finish_failed` left behind.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        update_status(&handle, |status| {
+            status["state"] = json!(STATE_FAILED);
+            status["steps"][1]["status"] = json!("failed");
+            status["steps"][1]["currentTool"] = json!("edit");
+            status["steps"][1]["activityState"] = json!("needs_attention");
+            status["activityState"] = json!("needs_attention");
+        });
+        let started = std::time::Instant::now();
+        let result = waiter
+            .await
+            .expect("wait task panicked")
+            .expect("run was active at wait start");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "wait returned within a poll cycle, not the 5s timeout"
+        );
+        assert!(result.get("attention").is_none(), "{result}");
+        assert_eq!(result["runs"][0]["state"], json!(STATE_FAILED));
+        unregister_run("te51-chain-wait-terminal");
+        remove_status_gate("te51-chain-wait-terminal");
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
     }
 
     #[tokio::test]
@@ -3783,6 +4004,146 @@ pub(crate) mod tests {
             messages: Vec::new(),
             truncation: None,
         }
+    }
+
+    /// TE51 re-review P2: every chain step enters `running` at its own
+    /// launch and drops the previous live detail (upstream
+    /// subagent-runner.ts:4540-4550).
+    #[test]
+    fn begin_step_moves_pending_to_running_and_clears_live_detail() {
+        let handle = gate_test_handle("begin-step");
+        update_status(&handle, |status| {
+            status["steps"][0]["status"] = json!("pending");
+            status["steps"][0]["error"] = json!("old");
+            status["steps"][0]["currentTool"] = json!("bash");
+            status["steps"][0]["activityState"] = json!("needs_attention");
+            status["activityState"] = json!("needs_attention");
+        });
+        begin_step(&handle, 0);
+        let status = status_snapshot(&handle);
+        assert_eq!(status["steps"][0]["status"], json!("running"));
+        assert!(status["steps"][0].get("error").is_none(), "{status}");
+        assert!(status["steps"][0].get("currentTool").is_none(), "{status}");
+        assert!(
+            status["steps"][0].get("activityState").is_none(),
+            "{status}"
+        );
+        assert!(status["steps"][0]["lastActivityAt"].is_u64(), "{status}");
+        assert!(status.get("activityState").is_none(), "{status}");
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        remove_status_gate(&handle.run_id);
+    }
+
+    /// TE51 re-review P2 follow-up: chain steps settle individually and
+    /// carry the child `sessionFile`/saved path, so status/resume work while
+    /// the rest of the chain runs (and after a failed chain).
+    #[test]
+    fn chain_step_settle_records_session_file_and_clears_live_fields() {
+        let handle = gate_test_handle("chain-settle");
+        update_status(&handle, |status| {
+            status["steps"][0]["currentTool"] = json!("edit");
+            status["steps"][0]["currentToolArgs"] = json!({"path": "x"});
+            status["steps"][0]["activityState"] = json!("needs_attention");
+            status["activityState"] = json!("needs_attention");
+        });
+        let mut result = foreground_result(0, Some("high"));
+        result.session_file = Some(PathBuf::from("/tmp/chain-child.jsonl"));
+        let outcome = crate::p1::chain::StepOutcome {
+            index: 0,
+            agent: "worker".to_string(),
+            output: "out".to_string(),
+            exit_code: 0,
+            error: None,
+            thinking: Some("high".to_string()),
+            timed_out: false,
+            process_signal: None,
+            details: json!({ "savedOutputPath": "/tmp/chain-output.md" }),
+            result,
+        };
+        record_chain_step_outcome(&handle, &outcome);
+        let status = status_snapshot(&handle);
+        let step = &status["steps"][0];
+        assert_eq!(step["status"], json!("complete"));
+        assert_eq!(step["terminal"], json!("complete"));
+        assert_eq!(step["sessionFile"], json!("/tmp/chain-child.jsonl"));
+        assert_eq!(step["savedOutputPath"], json!("/tmp/chain-output.md"));
+        assert_eq!(step["thinking"], json!("high"));
+        assert!(step.get("currentTool").is_none(), "{status}");
+        assert!(step.get("currentToolArgs").is_none(), "{status}");
+        assert!(step.get("activityState").is_none(), "{status}");
+        assert!(status.get("activityState").is_none(), "{status}");
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        remove_status_gate(&handle.run_id);
+    }
+
+    #[test]
+    fn fail_step_marks_running_step_failed_and_clears_live_fields() {
+        let handle = gate_test_handle("fail-step");
+        update_status(&handle, |status| {
+            status["steps"][0]["status"] = json!("running");
+            status["steps"][0]["currentTool"] = json!("bash");
+            status["steps"][0]["activityState"] = json!("needs_attention");
+            status["activityState"] = json!("needs_attention");
+        });
+        fail_step(&handle, 0, "spawn failed");
+        let status = status_snapshot(&handle);
+        let step = &status["steps"][0];
+        assert_eq!(step["status"], json!("failed"));
+        assert_eq!(step["terminal"], json!("failed"));
+        assert_eq!(step["exitCode"], json!(-1));
+        assert_eq!(step["error"], json!("spawn failed"));
+        assert!(step.get("currentTool").is_none(), "{status}");
+        assert!(step.get("activityState").is_none(), "{status}");
+        assert!(status.get("activityState").is_none(), "{status}");
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        remove_status_gate(&handle.run_id);
+    }
+
+    /// TE51 re-review blocker: a stop after an earlier step settled must not
+    /// rewrite that step's terminal status (which would make a completed
+    /// child non-resumable).
+    #[tokio::test]
+    async fn finish_keeps_a_settled_chain_step_complete_after_stop() {
+        let handle = gate_test_handle("settled-stop");
+        update_status(&handle, |status| {
+            status["steps"] = json!([
+                { "agent": "worker", "status": "pending" },
+                { "agent": "worker", "status": "running" }
+            ]);
+        });
+        let mut result = foreground_result(0, None);
+        result.session_file = Some(PathBuf::from("/tmp/settled-child.jsonl"));
+        let outcome = crate::p1::chain::StepOutcome {
+            index: 0,
+            agent: "worker".to_string(),
+            output: "out".to_string(),
+            exit_code: 0,
+            error: None,
+            thinking: None,
+            timed_out: false,
+            process_signal: None,
+            details: json!({}),
+            result,
+        };
+        record_chain_step_outcome(&handle, &outcome);
+        handle.control.request_stop();
+        finish(
+            &handle,
+            STATE_COMPLETE,
+            "stopped after step 1",
+            &AsyncNotify { calls: None },
+        )
+        .await;
+        let status = status_snapshot(&handle);
+        assert_eq!(status["state"], json!(STATE_STOPPED));
+        assert_eq!(status["steps"][0]["status"], json!("complete"));
+        assert_eq!(status["steps"][0]["terminal"], json!("complete"));
+        assert_eq!(
+            status["steps"][0]["sessionFile"],
+            json!("/tmp/settled-child.jsonl")
+        );
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        remove_status_gate(&handle.run_id);
     }
 
     #[test]
