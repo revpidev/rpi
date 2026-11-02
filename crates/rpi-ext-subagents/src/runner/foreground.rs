@@ -790,7 +790,6 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
 
     // Shared run flags.
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let terminal_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let child_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stream_error = Arc::new(Mutex::new(None::<String>));
     let drain_state = state.clone();
@@ -878,7 +877,6 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     // reads snapshots between lines); the run no longer copies it out.
     let stdout_state = state.clone();
     let stdout_raw = raw_tail.clone();
-    let stdout_terminal = terminal_seen.clone();
     let stdout_protocol_error = stream_error.clone();
     let stream_meta = StreamMeta {
         index: input.child_index,
@@ -1038,7 +1036,6 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                     ChildLifecycleAction::CancelDrain => terminal = false,
                     ChildLifecycleAction::None => {}
                 }
-                stdout_terminal.store(terminal, Ordering::SeqCst);
                 // Per-event streaming face (execution.ts:914/929/972/1005
                 // fireUpdate): one frame per progress-bearing event.
                 if let Some(ref fields) = status_fields

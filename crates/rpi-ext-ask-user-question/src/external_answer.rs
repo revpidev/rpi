@@ -415,6 +415,15 @@ mod tests {
         )
         .expect_err("out of range");
         assert_eq!(code, "invalid_answer");
+        let (code, _) = resolve_external_answer(
+            &questions(),
+            &json!({"answers": [
+                {"questionIndex": 1e20},
+                {"questionIndex": 1, "text": "x"}
+            ]}),
+        )
+        .expect_err("huge question index");
+        assert_eq!(code, "invalid_answer");
     }
 
     #[test]

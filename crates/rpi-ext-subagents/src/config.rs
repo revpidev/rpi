@@ -158,7 +158,8 @@ impl ExtensionConfig {
         self.enable_slash_commands.unwrap_or(true)
     }
 
-    /// `artifactConfig.cleanupDays` with the upstream default 7    /// (DEFAULT_ARTIFACT_CONFIG, types.ts:1958-1967).
+    /// `artifactConfig.cleanupDays` with the upstream default 7
+    /// (DEFAULT_ARTIFACT_CONFIG, types.ts:1958-1967).
     pub fn cleanup_days_or_default(&self) -> u64 {
         self.cleanup_days.unwrap_or(7)
     }

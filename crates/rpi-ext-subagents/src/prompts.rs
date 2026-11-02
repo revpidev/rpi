@@ -97,6 +97,25 @@ pub fn install_orchestration_skill_at(agent_dir: &Path) {
     for (name, body) in ORCHESTRATION_SKILL_REFERENCES {
         let _ = std::fs::write(references.join(name), body);
     }
+    // v4 consolidated three references into `orchestration.md`; remove the
+    // retired files from an upgraded install so they are not dead weight.
+    let current: std::collections::BTreeSet<&str> = ORCHESTRATION_SKILL_REFERENCES
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(&references) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let retired = path.extension().and_then(|ext| ext.to_str()) == Some("md")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !current.contains(name));
+            if retired {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
     let _ = std::fs::write(
         &version_path,
         ORCHESTRATION_SKILL_LAYOUT_VERSION.to_string(),

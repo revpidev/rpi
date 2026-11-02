@@ -460,16 +460,40 @@ pub(crate) fn refresh_advertised_catalog(
 
 const PROJECT_SCOPE_REQUIRES_TRUST: &str = "Project scope requires a trusted project; retry in a trusted session or use agentScope \"user\" or \"both\".";
 
+/// `findBlockingAgentDiagnostic` subset (agent-management.ts): when a
+/// named agent was skipped because its definition is invalid, `get` must
+/// surface that parse/validation error instead of "Unknown agent".
+fn blocking_agent_diagnostic<'a>(
+    name: &str,
+    diagnostics: &'a [discover::DiscoverDiagnostic],
+) -> Option<&'a discover::DiscoverDiagnostic> {
+    let requested = name.trim();
+    let dashed = requested.replace(' ', "-");
+    diagnostics.iter().find(|diagnostic| {
+        diagnostic
+            .path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem == requested || stem == dashed)
+    })
+}
+
 /// `normalizeListScope` (agent-management.ts): list/get accept
 /// `user|project|both`; an explicit invalid value is a loud error, not a
 /// silent fallback to `both`.
 fn management_scope(params: &Value, action: &str) -> Result<&'static str, String> {
-    match params.get("agentScope").and_then(Value::as_str) {
-        None | Some("both") => Ok("both"),
-        Some("user") => Ok("user"),
-        Some("project") => Ok("project"),
+    match params.get("agentScope") {
+        None => Ok("both"),
+        Some(Value::String(scope)) => match scope.as_str() {
+            "both" => Ok("both"),
+            "user" => Ok("user"),
+            "project" => Ok("project"),
+            other => Err(format!(
+                "agentScope must be 'user', 'project', or 'both' for {action}; got '{other}'."
+            )),
+        },
         Some(other) => Err(format!(
-            "agentScope must be 'user', 'project', or 'both' for {action}; got '{other}'."
+            "agentScope must be 'user', 'project', or 'both' for {action}; got {other}."
         )),
     }
 }
@@ -546,14 +570,20 @@ fn handle_management_action_inner(
             if scope == "project" && !trusted {
                 return ToolOutcome::error(PROJECT_SCOPE_REQUIRES_TRUST.to_string());
             }
-            let agents =
-                match discover::discover_agents_trusted(cwd, scope, settings, None, trusted) {
-                    Ok(agents) => agents,
-                    Err(error) => return ToolOutcome::error(error),
-                };
+            let (agents, diagnostics) = discover::discover_agents_with_diagnostics_trusted(
+                cwd, scope, settings, None, trusted,
+            );
             match discover::resolve_agent_name(&agents, name) {
                 Ok(Some(agent)) => ToolOutcome::text(format_agent_detail(agent)),
-                Ok(None) => ToolOutcome::error(format!("Unknown agent: {name}")),
+                Ok(None) => {
+                    if let Some(diagnostic) = blocking_agent_diagnostic(name, &diagnostics) {
+                        return ToolOutcome::error(format!(
+                            "Agent '{name}' has invalid configuration: {}",
+                            diagnostic.error
+                        ));
+                    }
+                    ToolOutcome::error(format!("Unknown agent: {name}"))
+                }
                 Err(message) => ToolOutcome::error(message),
             }
         }
@@ -1174,18 +1204,29 @@ fn status_transcript_roots(
         .as_deref()
         .filter(|dir| !dir.trim().is_empty())
     {
-        roots.push(paths::expand_tilde_and_resolve(dir));
+        push_configured_root(&mut roots, dir);
     }
     if let Some(dir) = config
         .default_session_dir
         .as_deref()
         .filter(|dir| !dir.trim().is_empty())
     {
-        roots.push(paths::expand_tilde_and_resolve(dir));
+        push_configured_root(&mut roots, dir);
     }
+    roots.retain(|root| root.parent().is_some());
     roots.sort();
     roots.dedup();
     roots
+}
+
+/// Add a configured session root only when it is a real directory scope. A
+/// trusted project setting `sessionDir: "/"` would otherwise turn the
+/// containment check into a no-op.
+fn push_configured_root(roots: &mut Vec<PathBuf>, dir: &str) {
+    let root = paths::expand_tilde_and_resolve(dir);
+    if root.parent().is_some() {
+        roots.push(root);
+    }
 }
 
 /// `readContainedTextTail` (fleet-view.ts:138-183): resolve a status-provided
@@ -2828,6 +2869,11 @@ mod tests {
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
         write_project_agent(&project, "proj-only");
+        std::fs::write(
+            paths::get_project_config_dir(&project).join("agents/broken.md"),
+            "---\nname: broken\ndescription: broken\nasync: nope\n---\nbody\n",
+        )
+        .unwrap();
 
         let untrusted = TrustHost {
             trusted: Some(false),
@@ -3308,6 +3354,128 @@ mod tests {
         assert!(text.contains("refusing a symlink"), "{text}");
         let _ = std::fs::remove_file(&outside);
         cleanup_run(&run_id);
+    }
+
+    #[test]
+    fn status_transcript_refuses_relative_and_dotdot_paths() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("transcript-dotdot-{}", std::process::id());
+        let base = paths::temp_artifacts_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let secret = std::env::temp_dir().join(format!("{run_id}-secret.txt"));
+        std::fs::write(&secret, "DOTDOT-SECRET\n").unwrap();
+        action_test_run(
+            &run_id,
+            "complete",
+            json!([{
+                "agent": "worker",
+                "status": "complete",
+                "transcriptPath": base.join("../../../").join(format!("{run_id}-secret.txt")).to_string_lossy(),
+            }]),
+        );
+        let text = format_status_transcript(
+            &run_id,
+            None,
+            80,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+        )
+        .expect("view renders");
+        assert!(!text.contains("DOTDOT-SECRET"), "{text}");
+        assert!(text.contains("outside trusted roots"), "{text}");
+        // A relative status path is refused before any filesystem lookup.
+        action_test_run(
+            &run_id,
+            "complete",
+            json!([{
+                "agent": "worker",
+                "status": "complete",
+                "transcriptPath": "relative.jsonl",
+            }]),
+        );
+        let text = format_status_transcript(
+            &run_id,
+            None,
+            80,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+        )
+        .expect("view renders");
+        assert!(text.contains("non-absolute"), "{text}");
+        let _ = std::fs::remove_file(&secret);
+        cleanup_run(&run_id);
+    }
+
+    #[test]
+    fn status_transcript_bounds_a_large_artifact_to_the_tail() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("transcript-large-{}", std::process::id());
+        let base = paths::temp_artifacts_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let transcript = base.join("run_transcript.jsonl");
+        let mut body = String::new();
+        body.push_str("stdout: {\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"FIRST-MARKER\"}]}}\n");
+        let filler = format!(
+            "stdout: {{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n",
+            "filler ".repeat(180)
+        );
+        for _ in 0..2000 {
+            body.push_str(&filler);
+        }
+        body.push_str("stdout: {\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"LAST-MARKER\"}]}}\n");
+        assert!(body.len() > 2 * 1024 * 1024);
+        std::fs::write(&transcript, body).unwrap();
+        action_test_run(
+            &run_id,
+            "complete",
+            json!([{
+                "agent": "worker",
+                "status": "complete",
+                "transcriptPath": transcript.to_string_lossy(),
+            }]),
+        );
+        let text = format_status_transcript(
+            &run_id,
+            None,
+            500,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+        )
+        .expect("view renders");
+        assert!(!text.contains("FIRST-MARKER"), "old tail must be dropped");
+        assert!(text.contains("LAST-MARKER"), "newest line must survive");
+        assert!(
+            text.len() < 64 * 1024,
+            "body must stay bounded: {}",
+            text.len()
+        );
+        cleanup_run(&run_id);
+    }
+
+    #[test]
+    fn status_transcript_roots_reject_a_filesystem_root_session_dir() {
+        let settings = SettingsPair {
+            session_dir: Some("/".to_string()),
+            ..SettingsPair::default()
+        };
+        let config = crate::config::ExtensionConfig {
+            default_session_dir: Some("/".to_string()),
+            ..crate::config::ExtensionConfig::new()
+        };
+        let roots = status_transcript_roots(Path::new("/tmp"), &settings, &config);
+        assert!(
+            !roots.iter().any(|root| root.parent().is_none()),
+            "{roots:?}"
+        );
     }
 
     #[test]

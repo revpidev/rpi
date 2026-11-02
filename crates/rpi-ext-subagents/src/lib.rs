@@ -485,6 +485,29 @@ fn pack(value: &Value) -> RVec<u8> {
     RVec::from(serde_json::to_vec(value).unwrap_or_else(|_| b"null".to_vec()))
 }
 
+/// Command registrations gated by `enableSlashCommands` (#2977/#2989).
+/// Extracted so the gate is testable without driving a full init.
+fn slash_command_definitions(config: &config::ExtensionConfig) -> Vec<(String, String)> {
+    if !config.slash_commands_enabled() {
+        return Vec::new();
+    }
+    let mut definitions = Vec::new();
+    for (name, body) in prompts::BUNDLED_PROMPTS {
+        let spec = prompts::parse_template(body);
+        let description = format!(
+            "Prompt shortcut: {}",
+            spec.description.as_deref().unwrap_or(name)
+        );
+        definitions.push((name.to_string(), description));
+    }
+    definitions.push((
+        "prompt-workflow".to_string(),
+        "Run a subagent prompt template (/prompt-workflow <name> [args] [--fork|--fresh|--bg|--subagent <agent>])".to_string(),
+    ));
+    definitions.extend(commands::command_definitions());
+    definitions
+}
+
 fn plugin_mode() -> PluginMode {
     let child = std::env::var(launch::args::SUBAGENT_CHILD_ENV)
         .ok()
@@ -820,37 +843,12 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             // #2977/#2989: `enableSlashCommands:false` turns off every
             // command surface this plugin owns (bundled prompt templates,
             // the prompt-workflow command and /run, /subagents*).
-            if config.slash_commands_enabled() {
-                // Bundled prompt templates register as commands (FR-P1-07).
-                for (name, body) in prompts::BUNDLED_PROMPTS {
-                    let spec = prompts::parse_template(body);
-                    let description = format!(
-                        "Prompt shortcut: {}",
-                        spec.description.as_deref().unwrap_or(name)
-                    );
-                    if let Err(error) = register(
-                        "registerCommand",
-                        json!({ "name": name, "description": description }),
-                    ) {
-                        return json!({"error": {"kind": "init", "message": error.to_string()}});
-                    }
-                }
+            for (name, description) in slash_command_definitions(&config) {
                 if let Err(error) = register(
                     "registerCommand",
-                    json!({
-                        "name": "prompt-workflow",
-                        "description": "Run a subagent prompt template (/prompt-workflow <name> [args] [--fork|--fresh|--bg|--subagent <agent>])"
-                    }),
+                    json!({ "name": name, "description": description }),
                 ) {
                     return json!({"error": {"kind": "init", "message": error.to_string()}});
-                }
-                for (name, description) in commands::command_definitions() {
-                    if let Err(error) = register(
-                        "registerCommand",
-                        json!({ "name": name, "description": description }),
-                    ) {
-                        return json!({"error": {"kind": "init", "message": error.to_string()}});
-                    }
                 }
             }
             for event in [
@@ -2187,6 +2185,24 @@ mod parent_session_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&cookie);
+    }
+
+    #[test]
+    fn slash_command_registrations_follow_the_config_gate() {
+        let enabled = config::ExtensionConfig::new();
+        let definitions = slash_command_definitions(&enabled);
+        assert!(
+            definitions
+                .iter()
+                .any(|(name, _)| name == "prompt-workflow")
+        );
+        assert!(definitions.iter().any(|(name, _)| name == "run"));
+        assert!(definitions.iter().any(|(name, _)| name == "subagents"));
+        let disabled = config::ExtensionConfig {
+            enable_slash_commands: Some(false),
+            ..config::ExtensionConfig::new()
+        };
+        assert!(slash_command_definitions(&disabled).is_empty());
     }
 
     #[test]

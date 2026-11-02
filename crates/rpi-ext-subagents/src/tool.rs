@@ -391,10 +391,23 @@ fn normalize_workflow_request(object: &mut serde_json::Map<String, Value>) -> Re
                 "workflow 'parallel' args.tasks[{index}] is missing a non-empty agent."
             ));
         }
-        if !item.get("task").is_some_and(Value::is_string) {
+        if item
+            .get("task")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
             return Err(format!(
-                "workflow 'parallel' args.tasks[{index}] is missing a string task."
+                "workflow 'parallel' args.tasks[{index}] is missing a non-empty task."
             ));
+        }
+        for field in ["cwd", "model"] {
+            if let Some(value) = item.get(field)
+                && value.as_str().is_none_or(|text| text.trim().is_empty())
+            {
+                return Err(format!(
+                    "workflow 'parallel' args.tasks[{index}].{field} must be a non-empty string."
+                ));
+            }
         }
     }
     object.insert("tasks".to_string(), Value::Array(tasks.clone()));
@@ -1447,6 +1460,27 @@ mod tests {
             (
                 serde_json::json!({"workflow": "parallel", "agent": "scout", "args": {"tasks": [{"agent": "scout", "task": "x"}]}}),
                 "cannot be combined with agent",
+            ),
+            (
+                serde_json::json!({"workflow": "parallel", "tasks": [{"agent": "scout", "task": "x"}], "args": {"tasks": [{"agent": "scout", "task": "x"}]}}),
+                "cannot be combined with tasks",
+            ),
+            (
+                serde_json::json!({"workflow": "parallel", "steps": [{"agent": "scout", "task": "x"}], "args": {"tasks": [{"agent": "scout", "task": "x"}]}}),
+                "cannot be combined with tasks",
+            ),
+            (
+                serde_json::json!({"workflow": "parallel", "action": "list", "args": {"tasks": [{"agent": "scout", "task": "x"}]}}),
+                "cannot be combined with action",
+            ),
+            (serde_json::json!({"workflow": 7}), "non-empty string"),
+            (
+                serde_json::json!({"workflow": "parallel", "args": {"tasks": [{"task": "x"}]}}),
+                "missing a non-empty agent",
+            ),
+            (
+                serde_json::json!({"workflow": "parallel", "args": {"tasks": [{"agent": "scout"}]}}),
+                "missing a non-empty task",
             ),
             (
                 serde_json::json!({"args": {"tasks": [{"agent": "scout", "task": "x"}]}}),

@@ -354,6 +354,14 @@ fn orchestration_skill_marker_gates_upgrade_and_reinstall() {
     rpi_ext_subagents::test_support::install_orchestration_skill_at(&agent_dir);
 
     let skill_dir = agent_dir.join("skills").join("rpi-subagents");
+    std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+    std::fs::write(skill_dir.join("references").join("retired.md"), "old").unwrap();
+    std::fs::write(skill_dir.join(".rpi-layout-version"), "3").unwrap();
+    rpi_ext_subagents::test_support::install_orchestration_skill_at(&agent_dir);
+    assert!(
+        !skill_dir.join("references").join("retired.md").exists(),
+        "retired references are pruned on upgrade"
+    );
     let upgraded = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
     assert!(!upgraded.contains("workflowScript"), "{upgraded}");
     assert!(upgraded.contains("tasks"), "{upgraded}");
