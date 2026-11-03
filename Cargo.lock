@@ -3337,6 +3337,7 @@ dependencies = [
  "abi_stable",
  "chrono",
  "fs2",
+ "regex",
  "rpi-ext-host",
  "rpi-ext-sdk",
  "rpi-test-env",

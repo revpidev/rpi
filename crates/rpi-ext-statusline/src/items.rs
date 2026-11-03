@@ -2,7 +2,7 @@
 //!
 //! Two modes share the `statusLine` object:
 //! - `type:"command"` keeps the TE12 script contract unchanged;
-//! - `type:"items"` renders the strict 21-field whitelist without starting a
+//! - `type:"items"` renders the strict 26-field whitelist without starting a
 //!   shell.
 //!
 //! The parser canonicalizes aliases, keeps the first occurrence of a
@@ -55,19 +55,29 @@ pub struct ItemsConfig {
 
 impl Default for ItemsConfig {
     fn default() -> Self {
+        // Default install: realtime token statistics only. Every other field
+        // (model/session/context/cost/Git/...) stays off until the user
+        // enables it through `/statusline`. `liveTokens` is on so the two
+        // live rows actually render while a response streams.
         Self {
             entries: vec![
-                ItemEntry::known(FieldId::SessionDuration),
                 ItemEntry::known(FieldId::LiveOutputTokens),
+                ItemEntry::known(FieldId::LiveOutputRate),
             ],
             unknown: Vec::new(),
             separator: DEFAULT_SEPARATOR.to_owned(),
             padding: 0,
-            placement: Placement::Widget,
+            // Keep the default rows on the shared bottom status line with
+            // rpi-usage (dot-separated by the host), instead of a separate
+            // widget above the built-in footer.
+            placement: Placement::Status,
             refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
             use_colors: true,
             number_format: NumberFormat::Compact,
-            live_tokens: LiveTokens::default(),
+            live_tokens: LiveTokens {
+                enabled: true,
+                refresh_ms: DEFAULT_LIVE_REFRESH_MS,
+            },
         }
     }
 }
@@ -202,7 +212,8 @@ pub fn parse_items(object: &Map<String, Value>) -> ItemsConfig {
     if let Some(format) = object.get("numberFormat").and_then(Value::as_str) {
         config.number_format = NumberFormat::parse(Some(format));
     }
-    config.live_tokens = crate::config::parse_live_tokens(object.get("liveTokens"));
+    config.live_tokens =
+        crate::config::parse_live_tokens_with_default(object.get("liveTokens"), true);
     config
 }
 
@@ -266,23 +277,24 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_the_two_presets_with_display_defaults() {
+    fn defaults_are_the_realtime_token_rows_with_display_defaults() {
         let config = parse(json!({"type": "items"}));
         let fields: Vec<FieldId> = config.fields().collect();
         assert_eq!(
             fields,
-            vec![FieldId::SessionDuration, FieldId::LiveOutputTokens]
+            vec![FieldId::LiveOutputTokens, FieldId::LiveOutputRate]
         );
         assert_eq!(config.separator, " · ");
         assert_eq!(config.padding, 0);
-        assert_eq!(config.placement, Placement::Widget);
+        assert_eq!(config.placement, Placement::Status);
         assert_eq!(config.refresh_interval_secs, 5);
         assert!(config.use_colors);
         assert_eq!(config.number_format, NumberFormat::Compact);
-        assert!(!config.live_tokens.enabled);
-        // liveTokens=false → the live preset is pending, only duration shows.
-        assert!(!config.live_enabled());
-        assert!(config.needs_duration());
+        // Default install: realtime token statistics are the only enabled
+        // fields, and the live switch is on.
+        assert!(config.live_tokens.enabled);
+        assert!(config.live_enabled());
+        assert!(!config.needs_duration());
     }
 
     #[test]
@@ -342,19 +354,20 @@ mod tests {
             "numberFormat": "weird",
             "liveTokens": "yes"
         }));
-        // Non-array items → default preset.
+        // Non-array items → default realtime-token preset.
         let fields: Vec<FieldId> = config.fields().collect();
         assert_eq!(
             fields,
-            vec![FieldId::SessionDuration, FieldId::LiveOutputTokens]
+            vec![FieldId::LiveOutputTokens, FieldId::LiveOutputRate]
         );
         assert_eq!(config.separator, DEFAULT_SEPARATOR);
         assert_eq!(config.padding, crate::config::MAX_PADDING);
-        assert_eq!(config.placement, Placement::Widget);
+        assert_eq!(config.placement, Placement::Status);
         assert_eq!(config.refresh_interval_secs, 1);
         assert!(config.use_colors);
         assert_eq!(config.number_format, NumberFormat::Compact);
-        assert!(!config.live_tokens.enabled);
+        // A malformed liveTokens value falls back to the items default (on).
+        assert!(config.live_tokens.enabled);
     }
 
     #[test]
@@ -422,10 +435,10 @@ mod tests {
         assert_eq!(object["type"], json!("items"));
         assert_eq!(
             object["items"],
-            json!(["session-duration", "live-output-tokens"])
+            json!(["live-output-tokens", "live-output-rate"])
         );
         assert_eq!(object["separator"], json!(" · "));
-        assert_eq!(object["placement"], json!("widget"));
+        assert_eq!(object["placement"], json!("status"));
         assert_eq!(object["refreshInterval"], json!(5));
         assert_eq!(object["useColors"], json!(true));
         assert_eq!(object["numberFormat"], json!("compact"));

@@ -141,6 +141,16 @@ fn live_output_object(live: &LiveSnapshot) -> Value {
         "output_tokens_exact".into(),
         json!(live.output_tokens_exact),
     );
+    // 2026-11 tiered token accounting: provider-exact when available, else
+    // the local model tokenizer, else the CJK bucket estimate. Scripts may
+    // read `tokens.total`/`tokens.source`; the legacy fields above are
+    // unchanged.
+    if let Some(tokens) = live.tokens {
+        object.insert(
+            "tokens".into(),
+            serde_json::to_value(tokens).unwrap_or(Value::Null),
+        );
+    }
     Value::Object(object)
 }
 
@@ -376,6 +386,7 @@ mod tests {
             delta_ms: 1042,
             elapsed_ms: 51_200,
             output_tokens_exact: None,
+            tokens: None,
         });
         let payload = build_stdin_json(&snapshot);
         assert_eq!(payload["rpi"]["live_output"]["streaming"], true);
@@ -414,6 +425,21 @@ mod tests {
             build_stdin_json(&snapshot)["rpi"]["live_output"]["output_tokens_exact"],
             812
         );
+        // Tiered accounting block: additive, with the source marker.
+        snapshot.live_output.as_mut().unwrap().tokens =
+            Some(crate::tokens::TokenBreakdown::from_tiers(
+                10,
+                5,
+                2,
+                crate::tokens::TokenSource::ExactTokenizer,
+            ));
+        let live = &build_stdin_json(&snapshot)["rpi"]["live_output"];
+        assert_eq!(live["tokens"]["text"], 10);
+        assert_eq!(live["tokens"]["thinking"], 5);
+        assert_eq!(live["tokens"]["toolcall"], 2);
+        assert_eq!(live["tokens"]["total"], 17);
+        assert_eq!(live["tokens"]["source"], "exact_tokenizer");
+        assert_eq!(live["tokens"]["tiers_exact"], true);
         // Never streamed / liveTokens unconfigured → block omitted.
         snapshot.live_output = None;
         assert!(

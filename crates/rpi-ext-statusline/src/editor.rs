@@ -21,6 +21,7 @@ use rpi_ext_sdk::interactive_ui::{
     OverlayOptions, SizeValue, run_component,
 };
 use rpi_ext_sdk::output;
+use rpi_tui::utils::{truncate_to_width, visible_width, wrap_text_with_ansi};
 use serde_json::{Map, Value, json};
 
 use crate::AsyncHostCalls;
@@ -86,6 +87,14 @@ struct Editor {
     page: Page,
     cursor: usize,
     option_cursor: usize,
+    /// Terminal/content width from the host resize event (0 before the first
+    /// render).
+    width: usize,
+    /// Maximum frame height from `maxHeight` (the host reports the resolved
+    /// budget through `resize`; `None` before the first event).
+    height: Option<usize>,
+    /// First visible field/option row (the dialog window follows the cursor).
+    scroll: usize,
     state: State,
     message: Option<String>,
     reset_armed: bool,
@@ -338,7 +347,7 @@ impl Editor {
                 "widget keeps the built-in footer and rpi-usage (recommended)"
             }
             config::Placement::Status => {
-                "status shares the host status row: single space, auto-wrap"
+                "status shares the host status row: dot-separated, auto-wrap"
             }
         }
     }
@@ -359,7 +368,60 @@ impl Editor {
         if let Some(message) = &self.message {
             parts.push(message.clone());
         }
+        if self.reset_armed {
+            parts.push("reset: press r again to confirm, any other key cancels".to_owned());
+        }
         parts.join(" · ")
+    }
+
+    /// Rows available to the page body after the frame chrome.
+    fn body_budget(&self, boxed: bool) -> usize {
+        // Boxed: top, tabs, rule, column header, footer rule, status, hint,
+        // bottom. Unboxed: tabs, rule, header, footer rule, status, hint.
+        let chrome = if boxed { 8 } else { 7 };
+        match self.height {
+            Some(height) if height > 0 => height.saturating_sub(chrome).max(1),
+            _ => usize::MAX,
+        }
+    }
+
+    /// Visible window `(start, end)` for `total` rows, keeping `cursor` in
+    /// view. The stored scroll offset follows the window so repeated renders
+    /// are stable.
+    fn window(&mut self, total: usize, budget: usize, cursor: usize) -> (usize, usize) {
+        if budget >= total {
+            self.scroll = 0;
+            return (0, total);
+        }
+        let cursor = cursor.min(total.saturating_sub(1));
+        let mut start = self.scroll.min(total.saturating_sub(budget));
+        if cursor < start {
+            start = cursor;
+        } else if cursor >= start + budget {
+            start = cursor + 1 - budget;
+        }
+        self.scroll = start;
+        (start, (start + budget).min(total))
+    }
+
+    fn tabs_line(&self, palette: Option<&fields::Palette>) -> String {
+        let mut parts = Vec::new();
+        for (page, label) in [
+            (Page::Fields, format!("Fields {}", self.draft.entries.len())),
+            (Page::Options, "Options".to_owned()),
+            (Page::Preview, "Preview".to_owned()),
+        ] {
+            if page == self.page {
+                parts.push(paint_bold(
+                    palette,
+                    fields::Tone::Accent,
+                    &format!("[{label}]"),
+                ));
+            } else {
+                parts.push(paint(palette, fields::Tone::Muted, &label));
+            }
+        }
+        parts.join("  ")
     }
 }
 
@@ -368,78 +430,361 @@ enum Row {
     Unknown { raw: String },
 }
 
+/// Right-align `suffix` in a `total`-wide header when there is room.
+fn right_align(header: &str, suffix: &str, total: usize) -> String {
+    let header_width = visible_width(header);
+    let suffix_width = visible_width(suffix);
+    if header_width + suffix_width + 1 > total {
+        return header.to_owned();
+    }
+    format!(
+        "{header}{}{suffix}",
+        " ".repeat(total - header_width - suffix_width)
+    )
+}
+
+/// ANSI painter for the dialog chrome. SGR parameters come from the host
+/// theme palette (the same model as the field values), so the editor and the
+/// rendered statusline stay visually consistent.
+fn paint(palette: Option<&fields::Palette>, tone: fields::Tone, text: &str) -> String {
+    match palette.and_then(|palette| palette.sgr(tone)) {
+        Some(sgr) => format!("\x1b[{sgr}m{text}\x1b[0m"),
+        None => text.to_owned(),
+    }
+}
+
+fn paint_bold(palette: Option<&fields::Palette>, tone: fields::Tone, text: &str) -> String {
+    match palette.and_then(|palette| palette.sgr(tone)) {
+        Some(sgr) => format!("\x1b[{sgr};1m{text}\x1b[0m"),
+        None => text.to_owned(),
+    }
+}
+
+/// Selected-row paint: the theme's `selectedBg` when available, reverse video
+/// otherwise. Without a palette the row stays plain (the `>` marker still
+/// identifies the cursor).
+fn paint_selected(palette: Option<&fields::Palette>, text: &str) -> String {
+    if let Some(background) = palette.and_then(|palette| palette.selected_bg_sgr()) {
+        format!("\x1b[{background}m{text}\x1b[0m")
+    } else if palette.is_some() {
+        format!("\x1b[7m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn box_top(width: usize, title: &str, palette: Option<&fields::Palette>) -> String {
+    if width < 4 {
+        return paint(palette, fields::Tone::Info, &"─".repeat(width));
+    }
+    let title = format!(" {title} ");
+    let title_width = visible_width(&title);
+    let fill = width.saturating_sub(3 + title_width);
+    if fill == 0 {
+        return format!(
+            "{}{}{}",
+            paint(palette, fields::Tone::Info, "┌─"),
+            paint_bold(palette, fields::Tone::Accent, &title),
+            paint(palette, fields::Tone::Info, "┐")
+        );
+    }
+    format!(
+        "{}{}{}{}",
+        paint(palette, fields::Tone::Info, "┌─"),
+        paint_bold(palette, fields::Tone::Accent, &title),
+        paint(palette, fields::Tone::Info, &"─".repeat(fill)),
+        paint(palette, fields::Tone::Info, "┐")
+    )
+}
+
+fn box_bottom(width: usize, palette: Option<&fields::Palette>) -> String {
+    if width < 4 {
+        return paint(palette, fields::Tone::Info, &"─".repeat(width));
+    }
+    format!(
+        "{}{}{}",
+        paint(palette, fields::Tone::Info, "└"),
+        paint(
+            palette,
+            fields::Tone::Info,
+            &"─".repeat(width.saturating_sub(2))
+        ),
+        paint(palette, fields::Tone::Info, "┘")
+    )
+}
+
+fn rule_line(width: usize, boxed: bool, palette: Option<&fields::Palette>) -> String {
+    if boxed && width >= 4 {
+        format!(
+            "{}{}{}",
+            paint(palette, fields::Tone::Info, "├"),
+            paint(
+                palette,
+                fields::Tone::Info,
+                &"─".repeat(width.saturating_sub(2))
+            ),
+            paint(palette, fields::Tone::Info, "┤")
+        )
+    } else {
+        paint(palette, fields::Tone::Info, &"─".repeat(width.max(1)))
+    }
+}
+
+/// One content row inside the optional box: `│ ` + padded body + ` │`.
+fn content_line(
+    width: usize,
+    boxed: bool,
+    palette: Option<&fields::Palette>,
+    text: &str,
+) -> String {
+    let inner = if boxed {
+        width.saturating_sub(4)
+    } else {
+        width.max(1)
+    };
+    let body = truncate_to_width(text, inner, "…", true);
+    if boxed {
+        format!(
+            "{} {} {}",
+            paint(palette, fields::Tone::Info, "│"),
+            body,
+            paint(palette, fields::Tone::Info, "│")
+        )
+    } else {
+        body
+    }
+}
+
 impl Component for Editor {
-    fn render(&mut self, _width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<String> {
+        // The host normally delivers a resize before the first render; a
+        // zero-width frame (scripted mounts/tests) still needs a readable
+        // default so the title and content are present.
+        let width = if width == 0 { 80 } else { width };
+        self.width = width;
+        let boxed = width >= 24 && self.height.is_none_or(|height| height >= 10);
+        let inner = if boxed {
+            width.saturating_sub(4)
+        } else {
+            width.max(1)
+        };
+        let budget = self.body_budget(boxed);
+        let palette = if self.draft.use_colors {
+            self.data.palette.clone()
+        } else {
+            None
+        };
+        let palette = palette.as_ref();
         let mut lines = Vec::new();
-        lines.push("rpi-statusline".to_owned());
+        if boxed {
+            lines.push(box_top(width, "rpi-statusline", palette));
+        }
+        lines.push(content_line(
+            width,
+            boxed,
+            palette,
+            &self.tabs_line(palette),
+        ));
+        lines.push(rule_line(width, boxed, palette));
+
+        let id_width = 24.min(inner.saturating_sub(12)).max(8);
+        let mut data = self.data.clone();
+        data.preview = true;
+        data.number_format = self.draft.number_format;
+        data.palette = palette.cloned();
+
         match self.page {
             Page::Fields => {
-                lines.push(
-                    "fields · [x] selected · [ ] available · [?] unknown (preserved)".to_owned(),
-                );
-                let mut data = self.data.clone();
-                data.preview = true;
-                data.number_format = self.draft.number_format;
-                data.palette = self
-                    .draft
-                    .use_colors
-                    .then(|| self.data.palette.clone())
-                    .flatten();
-                for (index, row) in self.rows().iter().enumerate() {
-                    let marker = if index == self.cursor { ">" } else { " " };
-                    let line = match row {
+                let rows = self.rows();
+                let total = rows.len();
+                let (start, end) = self.window(total, budget, self.cursor);
+                let range = if total == 0 {
+                    "0/0".to_owned()
+                } else {
+                    format!("{}-{}/{}", start + 1, end, total)
+                };
+                let header = format!("  {:<id_width$} VALUE", "FIELD");
+                let header = right_align(&header, &range, inner);
+                lines.push(content_line(
+                    width,
+                    boxed,
+                    palette,
+                    &paint(palette, fields::Tone::Muted, &header),
+                ));
+                for (index, row) in rows
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(end.saturating_sub(start))
+                {
+                    let at_cursor = index == self.cursor;
+                    let (check, id, value, tone, selected) = match row {
                         Row::Known { field, selected } => {
-                            let check = if *selected { "[x]" } else { "[ ]" };
                             let value = fields::value(*field, &data)
                                 .map(|value| value.text)
                                 .unwrap_or_else(|| fields::placeholder(*field));
-                            format!("{marker} {check} {:<22} {value}", field.id())
+                            (
+                                if *selected { "[x]" } else { "[ ]" }.to_owned(),
+                                field.id().to_owned(),
+                                value,
+                                if *selected {
+                                    fields::Tone::Accent
+                                } else {
+                                    fields::Tone::Plain
+                                },
+                                *selected,
+                            )
                         }
-                        Row::Unknown { raw } => {
-                            format!("{marker} [?] {raw:<22} (unknown id preserved)")
-                        }
+                        Row::Unknown { raw } => (
+                            "[?]".to_owned(),
+                            raw.clone(),
+                            "(unknown id preserved)".to_owned(),
+                            fields::Tone::Warning,
+                            true,
+                        ),
                     };
-                    lines.push(line);
+                    let marker = if at_cursor { ">" } else { " " };
+                    let id_padded = format!("{id:<id_width$}");
+                    let plain = format!("{marker} {check} {id_padded} {value}");
+                    let line = if at_cursor {
+                        paint_selected(palette, &truncate_to_width(&plain, inner, "…", true))
+                    } else {
+                        format!(
+                            "{} {} {} {}",
+                            paint(palette, fields::Tone::Muted, marker),
+                            paint(
+                                palette,
+                                if selected {
+                                    fields::Tone::Success
+                                } else {
+                                    fields::Tone::Muted
+                                },
+                                &check,
+                            ),
+                            paint(palette, tone, &id_padded),
+                            paint(palette, fields::Tone::Muted, &value),
+                        )
+                    };
+                    lines.push(content_line(width, boxed, palette, &line));
                 }
             }
             Page::Options => {
-                lines.push("options · ←/→ cycle · Enter edits/cycles".to_owned());
-                for (index, row) in self.option_rows().iter().enumerate() {
-                    let marker = if index == self.option_cursor {
-                        ">"
+                let rows = self.option_rows();
+                let total = rows.len();
+                let (start, end) = self.window(total, budget, self.option_cursor);
+                let range = format!("{}-{}/{}", start + 1, end, total);
+                let header = format!("  {:<20} VALUE", "OPTION");
+                let header = right_align(&header, &range, inner);
+                lines.push(content_line(
+                    width,
+                    boxed,
+                    palette,
+                    &paint(palette, fields::Tone::Muted, &header),
+                ));
+                for (index, row) in rows
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(end.saturating_sub(start))
+                {
+                    let at_cursor = index == self.option_cursor;
+                    let (name, value) = row.split_once(':').unwrap_or((row.as_str(), ""));
+                    let name = format!("{name:<20}");
+                    let plain = format!("{} {name} {value}", if at_cursor { ">" } else { " " });
+                    let line = if at_cursor {
+                        paint_selected(palette, &truncate_to_width(&plain, inner, "…", true))
                     } else {
-                        " "
+                        format!(
+                            "{} {} {}",
+                            paint(palette, fields::Tone::Muted, " "),
+                            paint(palette, fields::Tone::Accent, &name),
+                            paint(palette, fields::Tone::Muted, value),
+                        )
                     };
-                    lines.push(format!("{marker} {row}"));
+                    lines.push(content_line(width, boxed, palette, &line));
                 }
             }
             Page::Preview => {
-                lines.push("preview · real data; missing values show placeholders".to_owned());
-                match self.preview_line() {
-                    Some(line) if !line.is_empty() => lines.push(line),
-                    _ => lines
-                        .push("(no custom output — the built-in footer is restored)".to_owned()),
-                }
-                lines.push(String::new());
-                lines.push(self.placement_hint().to_owned());
+                lines.push(content_line(
+                    width,
+                    boxed,
+                    palette,
+                    &paint(
+                        palette,
+                        fields::Tone::Muted,
+                        "  PREVIEW · real data; missing values show placeholders",
+                    ),
+                ));
+                let mut preview = match self.preview_line() {
+                    Some(line) if !line.is_empty() => wrap_text_with_ansi(&line, inner),
+                    _ => vec!["(no custom output — the built-in footer is restored)".to_owned()],
+                };
+                preview.push(String::new());
+                preview.extend(wrap_text_with_ansi(self.placement_hint(), inner));
                 if self.draft.has_live_field() && !self.draft.live_tokens.enabled {
-                    lines.push(
+                    preview.push(
                         "live fields are selected but liveTokens is off (pending preset)"
                             .to_owned(),
                     );
                 }
+                // The PREVIEW header occupies one body row, so the
+                // remaining budget is one smaller (keeps the frame at most
+                // exactly the host's maxHeight).
+                let preview_budget = budget.saturating_sub(1).max(1);
+                for line in preview.into_iter().take(preview_budget) {
+                    let tone = if line.contains("liveTokens is off") {
+                        fields::Tone::Warning
+                    } else if line.starts_with('(') {
+                        fields::Tone::Muted
+                    } else {
+                        fields::Tone::Plain
+                    };
+                    lines.push(content_line(
+                        width,
+                        boxed,
+                        palette,
+                        &paint(palette, tone, &line),
+                    ));
+                }
             }
         }
-        lines.push(String::new());
-        if self.reset_armed {
-            lines.push("reset: press r again to confirm, any other key cancels".to_owned());
+
+        lines.push(rule_line(width, boxed, palette));
+        let status = self.status_line();
+        let status_tone = if self.message.is_some() || self.reset_armed {
+            fields::Tone::Warning
+        } else {
+            match self.state {
+                State::Applied => fields::Tone::Success,
+                State::Saving => fields::Tone::Warning,
+                State::Editing | State::Previewing => fields::Tone::Muted,
+            }
+        };
+        lines.push(content_line(
+            width,
+            boxed,
+            palette,
+            &paint(palette, status_tone, &status),
+        ));
+        lines.push(content_line(
+            width,
+            boxed,
+            palette,
+            &paint(
+                palette,
+                fields::Tone::Muted,
+                "↑/↓ move · space toggle · K/J reorder · tab page · s save · r reset · q cancel",
+            ),
+        ));
+        if boxed {
+            lines.push(box_bottom(width, palette));
         }
-        lines.push(self.status_line());
-        lines.push(
-            "↑/↓ move · space toggle · K/J reorder · tab page · s save · r reset · q cancel"
-                .to_owned(),
-        );
         lines
+    }
+
+    fn on_resize(&mut self, width: usize, height: usize) {
+        self.width = width;
+        self.height = Some(height);
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -566,8 +911,9 @@ fn fetch_data(
         .and_then(|value| serde_json::from_value::<SessionStats>(value).ok());
     let live = crate::with_engine(|engine| {
         let now = std::time::Instant::now();
-        engine.live_view(now)
-    });
+        engine.live_peek(now)
+    })
+    .map(|peek| peek.into_view(model.as_ref().map(|model| model.id.as_str())));
     let palette = use_colors
         .then(|| value("ui.theme"))
         .flatten()
@@ -628,6 +974,9 @@ fn open_editor(calls: &AsyncHostCalls, reset_defaults: bool) -> Value {
         page: Page::Fields,
         cursor: 0,
         option_cursor: 0,
+        width: 0,
+        height: None,
+        scroll: 0,
         state: State::Editing,
         message: None,
         reset_armed: false,
@@ -638,7 +987,7 @@ fn open_editor(calls: &AsyncHostCalls, reset_defaults: bool) -> Value {
         overlay_options: Some(OverlayOptions {
             anchor: Some(OverlayAnchor::Center),
             width: Some(SizeValue::Percent(80.0)),
-            max_height: Some(SizeValue::Percent(80.0)),
+            max_height: Some(SizeValue::Percent(70.0)),
             ..OverlayOptions::default()
         }),
         tick_ms: 0,
@@ -742,7 +1091,15 @@ Fields: model, model-with-reasoning, reasoning, permission-mode, run-state,\n\
 current-dir, project-name, git-branch, context-used, context-remaining,\n\
 context-window-size, context-tokens, session-name, session-cost,\n\
 session-duration, used-tokens, total-input-tokens, total-output-tokens,\n\
-streaming, live-output-tokens, live-output-rate.\n\
+cache-read-tokens, cache-write-tokens, streaming, live-output-tokens,\n\
+live-output-rate, live-text-tokens, live-thinking-tokens,\n\
+live-toolcall-tokens.\n\
+\n\
+Live tokens prefer provider usage, then the model tokenizer in\n\
+~/.rpi/agent/tokenizer, then a CJK-aware estimate (~ prefix).\n\
+\n\
+Default items: live-output-tokens + live-output-rate only (all other\n\
+fields off); adjust them in the editor.\n\
 \n\
 Editor keys: ↑/↓ move · space toggle · K/J reorder · tab page · s save · r reset · q cancel.";
 
@@ -769,7 +1126,7 @@ pub fn handle_command(calls: &AsyncHostCalls, args: &str) -> Value {
                     "ui.confirm",
                     json!({
                         "title": "Reset status line?",
-                        "message": "Restore the default items (session-duration, live-output-tokens) and display options. Other settings are untouched.",
+                        "message": "Restore the default realtime-token items (live-output-tokens, live-output-rate) and display options. Other settings are untouched.",
                     }),
                 )
                 .ok()
@@ -860,6 +1217,9 @@ mod tests {
             page: Page::Fields,
             cursor: 0,
             option_cursor: 0,
+            width: 80,
+            height: None,
+            scroll: 0,
             state: State::Editing,
             message: None,
             reset_armed: false,
@@ -893,7 +1253,7 @@ mod tests {
         let mut editor = editor();
         // Rows: selected duration, selected live-output, unknown, then the
         // remaining fields in registry order.
-        assert_eq!(editor.rows().len(), 21 + 1);
+        assert_eq!(editor.rows().len(), 26 + 1);
         // Select `model` (cursor at its row).
         let model_row = editor
             .rows()
@@ -932,10 +1292,10 @@ mod tests {
         let fields: Vec<FieldId> = editor.draft.fields().collect();
         assert_eq!(
             fields,
-            vec![FieldId::SessionDuration, FieldId::LiveOutputTokens]
+            vec![FieldId::LiveOutputTokens, FieldId::LiveOutputRate]
         );
         assert_eq!(editor.draft.unknown, vec!["legacy-id"]);
-        assert_eq!(editor.draft.placement, Placement::Widget);
+        assert_eq!(editor.draft.placement, Placement::Status);
     }
 
     #[test]
@@ -948,12 +1308,15 @@ mod tests {
         editor.cycle_option(true);
         assert_eq!(editor.draft.number_format, fields::NumberFormat::Exact);
         editor.option_cursor = 3;
+        editor.draft.placement = Placement::Widget;
         editor.cycle_option(true);
         assert_eq!(editor.draft.placement, Placement::Status);
         editor.option_cursor = 4;
-        editor.cycle_option(true);
+        // The default draft has liveTokens on; one cycle turns it off.
         assert!(editor.draft.live_tokens.enabled);
-        assert!(editor.draft.live_enabled());
+        editor.cycle_option(true);
+        assert!(!editor.draft.live_tokens.enabled);
+        assert!(!editor.draft.live_enabled());
     }
 
     #[test]
@@ -980,9 +1343,59 @@ mod tests {
     }
 
     #[test]
+    fn dialog_is_boxed_layered_and_stays_within_the_height_budget() {
+        let mut editor = editor();
+        editor.on_resize(80, 20);
+        let lines = editor.render(80);
+        assert!(
+            lines.len() <= 20,
+            "frame fits the reported height: {lines:#?}"
+        );
+        assert_eq!(lines.len(), 20, "the body fills the remaining rows");
+        assert!(lines[0].contains("rpi-statusline"), "title row: {lines:#?}");
+        assert!(lines[0].contains('┌'), "boxed title: {lines:#?}");
+        assert!(
+            lines[1].contains("Fields")
+                && lines[1].contains("Options")
+                && lines[1].contains("Preview"),
+            "page tabs are distinct from the list: {lines:#?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("FIELD")));
+        assert!(
+            lines.iter().any(|line| line.contains("editing")),
+            "status band: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("↑/↓ move")),
+            "hint band: {lines:#?}"
+        );
+        assert!(
+            lines.last().is_some_and(|line| line.contains('┘')),
+            "bottom border: {lines:#?}"
+        );
+        // Moving to the tail scrolls the window instead of growing the frame.
+        editor.cursor = editor.rows().len().saturating_sub(1);
+        let lines = editor.render(80);
+        assert_eq!(lines.len(), 20, "scrolled frame keeps the same height");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("live-toolcall-tokens")),
+            "the cursor row is in view: {lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("FIELD") && line.contains('/')),
+            "range indicator: {lines:#?}"
+        );
+    }
+
+    #[test]
     fn preview_shows_empty_output_guidance_and_placement_hints() {
         let mut editor = editor();
         editor.draft.set_items(&[]);
+        editor.draft.placement = Placement::Widget;
         editor.page = Page::Preview;
         let lines = editor.render(80);
         assert!(
@@ -1007,6 +1420,7 @@ mod tests {
         // Live fields selected with liveTokens off → pending note.
         editor.draft.set_items(&["streaming".into()]);
         editor.draft.placement = Placement::Widget;
+        editor.draft.live_tokens.enabled = false;
         let lines = editor.render(80);
         assert!(lines.iter().any(|line| line.contains("liveTokens is off")));
     }
@@ -1030,7 +1444,8 @@ mod tests {
         assert!(!editor.draft.has_field(FieldId::SessionDuration));
         editor.handle_input("r");
         assert!(!editor.reset_armed);
-        assert!(editor.draft.has_field(FieldId::SessionDuration));
+        assert!(editor.draft.has_field(FieldId::LiveOutputTokens));
+        assert!(editor.draft.has_field(FieldId::LiveOutputRate));
     }
 
     #[test]
@@ -1120,9 +1535,10 @@ mod tests {
             session_dir: None,
         };
         let text = config_text(&items);
-        assert!(text.contains("items (Widget)"));
-        assert!(text.contains("session-duration"));
-        assert!(text.contains("liveTokens: off"));
+        assert!(text.contains("items (Status)"));
+        assert!(text.contains("live-output-tokens"));
+        assert!(text.contains("live-output-rate"));
+        assert!(text.contains("liveTokens: on"));
         let command = config::SettingsSnapshot {
             status_line: Some(StatusLine::Command(config::StatusLineConfig {
                 command: "echo hi".into(),

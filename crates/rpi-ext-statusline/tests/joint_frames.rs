@@ -4,7 +4,7 @@
 //! The test drives the actual plugin install/dispatch path against a fake
 //! host, captures the `ui.setStatus`/`ui.setWidget`/`ui.setFooter` payloads,
 //! then composes the two plugin keys in the host's frozen order: sorted by
-//! key, whitespace-folded, joined with a single space and wrapped to the
+//! key, whitespace-folded, joined with a ` · ` separator and wrapped to the
 //! terminal width by `rpi_tui::utils::wrap_text_with_ansi` — the exact
 //! helper the built-in footer uses. 40/80/120 columns and the three
 //! placements are covered.
@@ -179,7 +179,7 @@ fn compose_status_row(statusline: &str, usage: &str) -> String {
         .values()
         .map(|text| sanitize_status_text(text))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" · ")
 }
 
 /// The shared TE53 typed-footer fixture (real formatter output pinned by the
@@ -262,8 +262,8 @@ fn statusline_and_usage_compose_on_the_host_status_row() {
     let row = compose_status_row(&statusline, &usage);
     assert_eq!(
         row,
-        format!("Test Model · Context 6% used · 70 {usage}"),
-        "sorted keys: rpi-statusline before rpi-usage, one space"
+        format!("Test Model · Context 6% used · 70 · {usage}"),
+        "sorted keys: rpi-statusline before rpi-usage, dot separator"
     );
 
     // ── 40/80/120 columns: wrap, never truncate; every visible char stays.

@@ -130,6 +130,38 @@ pub struct LiveSnapshot {
     pub delta_ms: u128,
     pub elapsed_ms: u128,
     pub output_tokens_exact: Option<u64>,
+    /// Tiered token count (provider exact or local tokenizer/heuristic).
+    /// Filled by the caller after the engine lock is released; `None` until
+    /// the first snapshot with text data.
+    pub tokens: Option<crate::tokens::TokenBreakdown>,
+}
+
+/// A cheap clone of the live measurement used to count tokens **outside**
+/// the engine lock (the dispatch thread must never wait on a tokenizer).
+#[derive(Debug, Clone, Default)]
+pub struct LivePeek {
+    pub streaming: bool,
+    pub output_tokens: Option<u64>,
+    pub output_tokens_exact: Option<u64>,
+    pub decode_ms: u128,
+    pub text: String,
+    pub thinking: String,
+    pub toolcall: String,
+}
+
+impl LivePeek {
+    /// Project the peek plus a token breakdown into the fields' `LiveView`.
+    pub fn into_view(self, model_id: Option<&str>) -> LiveView {
+        let tokens =
+            crate::tokens::count_breakdown(model_id, &self.text, &self.thinking, &self.toolcall);
+        LiveView {
+            streaming: self.streaming,
+            output_tokens: self.output_tokens,
+            output_tokens_exact: self.output_tokens_exact,
+            decode_ms: self.decode_ms,
+            tokens: Some(tokens),
+        }
+    }
 }
 
 impl LiveMeasure {
@@ -141,6 +173,16 @@ impl LiveMeasure {
         if role != Some("assistant") {
             return;
         }
+        self.begin_stream();
+    }
+
+    /// Begin a message block without a `message_start` event. This covers
+    /// two real cases: the user enabled `liveTokens` while a response was
+    /// already streaming (the subscription was added mid-flight), and a
+    /// dropped `message_start` after a session host rebind. The first delta
+    /// observed becomes the block/clock anchor, so live tokens and rate start
+    /// updating instead of waiting for the next message.
+    fn begin_stream(&mut self) {
         self.streaming = true;
         self.text_chars = 0;
         self.thinking_chars = 0;
@@ -179,6 +221,12 @@ impl LiveMeasure {
         else {
             return;
         };
+        // A delta can arrive without a live message_start (mid-stream enable
+        // or a dropped start event): treat it as the block/clock anchor so
+        // the estimated tokens/rate update immediately.
+        if !self.streaming {
+            self.begin_stream();
+        }
         let chars = delta.chars().count() as u64;
         match event_type {
             Some("text_delta") => {
@@ -237,14 +285,18 @@ impl LiveMeasure {
         self.streaming
     }
 
-    /// Project the provider-reported live values used by items fields. No
-    /// character estimate is exposed: both counts come from provider usage.
-    pub fn view(&self, now: Instant) -> LiveView {
-        LiveView {
+    /// Project the current live values. Token accounting is *not* done here:
+    /// the caller clones this peek and counts outside the engine lock so a
+    /// large tokenizer run never blocks the streaming dispatch thread.
+    pub fn peek(&self, now: Instant) -> LivePeek {
+        LivePeek {
             streaming: self.streaming,
             output_tokens: self.streaming_output_tokens,
             output_tokens_exact: self.output_tokens_exact,
             decode_ms: self.decode_ms(now),
+            text: self.text.clone(),
+            thinking: self.thinking.clone(),
+            toolcall: self.toolcall.clone(),
         }
     }
 
@@ -325,6 +377,7 @@ impl LiveMeasure {
             delta_ms,
             elapsed_ms: self.elapsed_ms(now),
             output_tokens_exact: self.output_tokens_exact,
+            tokens: None,
         }
     }
 
@@ -423,9 +476,6 @@ pub struct EngineState {
     pub session_stats: SessionStatsCache,
     /// Local Git probe cache for project-name/git-branch (TE52 R20 §4.4).
     pub git: GitCache,
-    /// Command-mode `liveTokens.enabled` captured at install (§1.5: runtime
-    /// edits require a restart). Items mode reconciles dynamically instead.
-    pub command_live_fixed: bool,
 }
 
 /// Mtime tolerance below the session-start wall clock: the host creates
@@ -447,14 +497,13 @@ impl Default for EngineState {
             mounted: None,
             session_stats: SessionStatsCache::default(),
             git: GitCache::default(),
-            command_live_fixed: false,
         }
     }
 }
 
 impl EngineState {
-    /// Whether live-token bookkeeping is armed (subscription-time decision,
-    /// fixed at install; §1.5 启用时机注记).
+    /// Arm live-token bookkeeping (reconciled from the current config on
+    /// every poll; no restart needed).
     pub fn arm_live_measure(&mut self) {
         self.live.get_or_insert_with(LiveMeasure::default);
     }
@@ -470,9 +519,10 @@ impl EngineState {
     }
 
     /// Project the current live measurement (items fields; `None` when the
-    /// measurement is disarmed).
-    pub fn live_view(&self, now: Instant) -> Option<LiveView> {
-        self.live.as_ref().map(|live| live.view(now))
+    /// measurement is disarmed). This is a cheap clone; token counting is
+    /// done by the caller via [`LiveMeasure::peek`].
+    pub fn live_peek(&self, now: Instant) -> Option<LivePeek> {
+        self.live.as_ref().map(|live| live.peek(now))
     }
 
     /// `message_end`: accumulate `message.usage` when present (assistant
@@ -704,6 +754,21 @@ mod tests {
         live.on_message_start(Some("assistant"));
         live.on_message_update(&delta("text_delta", "x"));
         assert_eq!(live.snapshot(Instant::now()).output_tokens, None);
+    }
+
+    #[test]
+    fn live_measure_starts_from_the_first_observed_delta_mid_stream() {
+        let mut live = LiveMeasure::default();
+        assert!(!live.is_streaming());
+        // No message_start was observed (liveTokens enabled mid-flight).
+        live.on_message_update(&delta_with_usage("text_delta", "hello", 3));
+        assert!(live.is_streaming(), "the first delta anchors the block");
+        let snapshot = live.snapshot(Instant::now());
+        assert_eq!(snapshot.text, "hello");
+        assert_eq!(snapshot.output_tokens, Some(3));
+        assert_eq!(snapshot.message_id, "1");
+        // The block clock starts at that first delta, so decode_ms is small.
+        assert!(snapshot.decode_ms < 5);
     }
 
     /// #45 companion: the decode anchor is the wall clock of the FIRST

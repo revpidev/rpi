@@ -1,8 +1,9 @@
 //! Field-driven event subscriptions (TE52 R20 §4.4 / 04 §3.4).
 //!
 //! The base lifecycle set is always subscribed. Command mode adds its TE12
-//! events (`message_end`, `tool_execution_end`) plus the load-time-fixed live
-//! events; items mode adds only the events its selected fields need:
+//! events (`message_end`, `tool_execution_end`) plus the live events when
+//! `liveTokens.enabled` is currently true; items mode adds only the events its
+//! selected fields need:
 //!
 //! | capability | events |
 //! |---|---|
@@ -32,29 +33,29 @@ pub const BASE_EVENTS: [&str; 5] = [
     "thinking_level_select",
 ];
 
-/// The TE12 command-mode event table (minus the live pair, which is fixed at
-/// load time). `session_compact` is command-mode-specific here because the
+/// The TE12 command-mode event table (minus the live pair, which follows the
+/// current `liveTokens.enabled` switch). `session_compact` is command-mode-specific here because the
 /// TE52 contract forbids registering it for an items selection that does not
 /// read session totals.
 pub const COMMAND_EVENTS: [&str; 3] = ["message_end", "tool_execution_end", "session_compact"];
 
-/// Live event names (command: load-time fixed; items: field-driven).
+/// Live event names (command: current `liveTokens.enabled`; items: field-driven).
 pub const LIVE_EVENTS: [&str; 3] = ["message_start", "message_update", "message_end"];
 
 /// Compute the desired event set for a configuration.
 ///
-/// `command_live_fixed` is the value captured at plugin install for command
-/// mode (runtime `liveTokens` edits require a restart there).
-pub fn desired_events(
-    config: Option<&StatusLine>,
-    command_live_fixed: bool,
-) -> BTreeSet<&'static str> {
+/// `command_live` is the CURRENT `statusLine.liveTokens.enabled` for command
+/// mode. Reconciliation runs on every poll, so enabling the switch takes
+/// effect within one poll without restarting the session; disabling it removes
+/// the streaming subscriptions immediately (the zero-overhead-when-off
+/// property is preserved).
+pub fn desired_events(config: Option<&StatusLine>, command_live: bool) -> BTreeSet<&'static str> {
     let mut desired: BTreeSet<&'static str> = BASE_EVENTS.iter().copied().collect();
     match config {
         None => {}
         Some(StatusLine::Command(_)) => {
             desired.extend(COMMAND_EVENTS);
-            if command_live_fixed {
+            if command_live {
                 desired.extend(LIVE_EVENTS);
             }
         }
@@ -177,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn command_mode_uses_the_te12_table_plus_load_time_live() {
+    fn command_mode_uses_the_te12_table_plus_the_current_live_switch() {
         let desired = desired_events(Some(&command()), false);
         for event in COMMAND_EVENTS {
             assert!(desired.contains(event), "{event}");
@@ -194,6 +195,24 @@ mod tests {
         let live = desired_events(Some(&command()), true);
         for event in LIVE_EVENTS {
             assert!(live.contains(event), "{event}");
+        }
+    }
+
+    #[test]
+    fn command_live_switch_is_reconciled_from_the_current_config() {
+        let mut config = command();
+        if let StatusLine::Command(command) = &mut config {
+            command.live_tokens.enabled = false;
+        }
+        let off = desired_events(Some(&config), false);
+        assert!(!off.contains("message_start"));
+        assert!(!off.contains("message_update"));
+        if let StatusLine::Command(command) = &mut config {
+            command.live_tokens.enabled = true;
+        }
+        let on = desired_events(Some(&config), true);
+        for event in LIVE_EVENTS {
+            assert!(on.contains(event), "{event}");
         }
     }
 

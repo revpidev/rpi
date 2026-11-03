@@ -1,4 +1,4 @@
-//! The strict 21-field registry for `statusLine.type:"items"` (TE52 /
+//! The strict 26-field registry for `statusLine.type:"items"` (TE52 /
 //! ADR-0040 R20 §4.2–§4.3).
 //!
 //! One static descriptor table describes every field: its canonical id, an
@@ -14,8 +14,10 @@
 //!   `total-input = input + cacheRead + cacheWrite`, `total-output = output`).
 //! - Context values come from `ctx.getContextUsage()` (the active context),
 //!   not from the session totals.
-//! - Live values come from [`LiveView`] (provider-reported exact output only;
-//!   no character estimate).
+//! - Live values come from [`LiveView`]: the provider's exact output usage
+//!   when available, otherwise the model tokenizer / CJK-aware estimate from
+//!   [`crate::tokens`]. Estimates are marked with `~`; they are never
+//!   presented as provider-exact.
 //! - Values are sanitized (control characters, data ANSI SGR stripped) and
 //!   colors are generated only from the host theme palette.
 
@@ -23,6 +25,7 @@ use chrono::{DateTime, Utc};
 
 use crate::git::GitInfo;
 use crate::session_stats::SessionStats;
+use crate::tokens::TokenBreakdown;
 
 /// Token/window number formatting (`statusLine.numberFormat`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,7 +46,7 @@ impl NumberFormat {
     }
 }
 
-/// The 21 whitelisted fields, in the canonical registry order.
+/// The 26 whitelisted fields, in the canonical registry order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldId {
     // Model & mode (5)
@@ -61,21 +64,26 @@ pub enum FieldId {
     ContextRemaining,
     ContextWindowSize,
     ContextTokens,
-    // Session & tokens (6)
+    // Session & tokens (8)
     SessionName,
     SessionCost,
     SessionDuration,
     UsedTokens,
     TotalInputTokens,
     TotalOutputTokens,
-    // Live (3)
+    CacheReadTokens,
+    CacheWriteTokens,
+    // Live (6)
     Streaming,
     LiveOutputTokens,
     LiveOutputRate,
+    LiveTextTokens,
+    LiveThinkingTokens,
+    LiveToolcallTokens,
 }
 
-/// All 21 fields in registry order.
-pub const ALL_FIELDS: [FieldId; 21] = [
+/// All 26 fields in registry order.
+pub const ALL_FIELDS: [FieldId; 26] = [
     FieldId::Model,
     FieldId::ModelWithReasoning,
     FieldId::Reasoning,
@@ -94,9 +102,14 @@ pub const ALL_FIELDS: [FieldId; 21] = [
     FieldId::UsedTokens,
     FieldId::TotalInputTokens,
     FieldId::TotalOutputTokens,
+    FieldId::CacheReadTokens,
+    FieldId::CacheWriteTokens,
     FieldId::Streaming,
     FieldId::LiveOutputTokens,
     FieldId::LiveOutputRate,
+    FieldId::LiveTextTokens,
+    FieldId::LiveThinkingTokens,
+    FieldId::LiveToolcallTokens,
 ];
 
 impl FieldId {
@@ -121,9 +134,14 @@ impl FieldId {
             Self::UsedTokens => "used-tokens",
             Self::TotalInputTokens => "total-input-tokens",
             Self::TotalOutputTokens => "total-output-tokens",
+            Self::CacheReadTokens => "cache-read-tokens",
+            Self::CacheWriteTokens => "cache-write-tokens",
             Self::Streaming => "streaming",
             Self::LiveOutputTokens => "live-output-tokens",
             Self::LiveOutputRate => "live-output-rate",
+            Self::LiveTextTokens => "live-text-tokens",
+            Self::LiveThinkingTokens => "live-thinking-tokens",
+            Self::LiveToolcallTokens => "live-toolcall-tokens",
         }
     }
 
@@ -148,7 +166,12 @@ impl FieldId {
     pub const fn is_live(self) -> bool {
         matches!(
             self,
-            Self::Streaming | Self::LiveOutputTokens | Self::LiveOutputRate
+            Self::Streaming
+                | Self::LiveOutputTokens
+                | Self::LiveOutputRate
+                | Self::LiveTextTokens
+                | Self::LiveThinkingTokens
+                | Self::LiveToolcallTokens
         )
     }
 
@@ -156,7 +179,12 @@ impl FieldId {
     pub const fn is_session_total(self) -> bool {
         matches!(
             self,
-            Self::SessionCost | Self::UsedTokens | Self::TotalInputTokens | Self::TotalOutputTokens
+            Self::SessionCost
+                | Self::UsedTokens
+                | Self::TotalInputTokens
+                | Self::TotalOutputTokens
+                | Self::CacheReadTokens
+                | Self::CacheWriteTokens
         )
     }
 
@@ -189,6 +217,7 @@ pub struct Palette {
     warning: Option<String>,
     error: Option<String>,
     info: Option<String>,
+    selected_bg: Option<String>,
 }
 
 impl Palette {
@@ -215,6 +244,7 @@ impl Palette {
             warning: resolve("warning"),
             error: resolve("error"),
             info: resolve("border").or_else(|| resolve("accent")),
+            selected_bg: resolve("selectedBg").or_else(|| resolve("selectionBg")),
         }
     }
 
@@ -229,6 +259,11 @@ impl Palette {
             Tone::Error => self.error.as_deref(),
             Tone::Info => self.info.as_deref(),
         }
+    }
+
+    /// Selected-row background SGR parameters, when the theme provides one.
+    pub fn selected_bg_sgr(&self) -> Option<&str> {
+        self.selected_bg.as_deref()
     }
 }
 
@@ -318,7 +353,7 @@ fn named_sgr(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Current live measurement projection (provider-reported values only).
+/// Current live measurement projection (provider values + token estimate).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LiveView {
     /// An assistant message is in flight.
@@ -329,17 +364,27 @@ pub struct LiveView {
     pub output_tokens_exact: Option<u64>,
     /// First delta → now / frozen at `message_end`.
     pub decode_ms: u128,
+    /// Tiered token count from the model tokenizer or the CJK heuristic.
+    /// `None` only for a live view assembled without text data (tests).
+    pub tokens: Option<TokenBreakdown>,
 }
 
 impl LiveView {
-    /// The provider-reported output count for the current message: the
-    /// streaming running total while in flight, the exact `message_end`
-    /// value once the stream settles (R20 §4.3).
-    pub fn reported_output(self) -> Option<u64> {
-        if self.streaming {
+    /// The output count for the current message: the provider's exact value
+    /// while in flight or once the stream settles, otherwise the local
+    /// tokenizer/heuristic breakdown (R20 §4.3 + the 2026-11 realtime
+    /// estimate extension).
+    pub fn reported_output(self) -> Option<TokenBreakdown> {
+        let estimated = self.tokens.unwrap_or_default();
+        let provider = if self.streaming {
             self.output_tokens.or(self.output_tokens_exact)
         } else {
             self.output_tokens_exact.or(self.output_tokens)
+        };
+        match provider {
+            Some(total) if total > 0 => Some(estimated.with_provider_total(total)),
+            _ if estimated.total > 0 => Some(estimated),
+            _ => None,
         }
     }
 }
@@ -541,34 +586,99 @@ fn raw_value(id: FieldId, data: &FieldData) -> Option<FieldValue> {
                 Tone::Muted,
             ))
         }
+        FieldId::CacheReadTokens => {
+            let tokens = data.stats.as_ref()?.tokens;
+            Some(FieldValue::new(
+                format!(
+                    "{} cache-read",
+                    format_tokens(tokens.cache_read, data.number_format)
+                ),
+                Tone::Muted,
+            ))
+        }
+        FieldId::CacheWriteTokens => {
+            let tokens = data.stats.as_ref()?.tokens;
+            Some(FieldValue::new(
+                format!(
+                    "{} cache-write",
+                    format_tokens(tokens.cache_write, data.number_format)
+                ),
+                Tone::Muted,
+            ))
+        }
         FieldId::Streaming => {
             let live = data.live?;
             live.streaming
                 .then(|| FieldValue::new("streaming", Tone::Success))
         }
         FieldId::LiveOutputTokens => {
-            let live = data.live?;
-            let output = if live.streaming {
-                live.output_tokens
-            } else {
-                live.output_tokens_exact.or(live.output_tokens)
-            }?;
+            let tokens = data.live?.reported_output()?;
             Some(FieldValue::new(
-                format_tokens(output, data.number_format),
+                format!(
+                    "{}{}",
+                    tokens.total_marker(),
+                    format_tokens(tokens.total, data.number_format)
+                ),
                 Tone::Success,
             ))
         }
         FieldId::LiveOutputRate => {
             let live = data.live?;
-            let output = live.reported_output()?;
-            if live.decode_ms == 0 {
+            let tokens = live.reported_output()?;
+            if live.decode_ms < MIN_RATE_DECODE_MS {
                 return None;
             }
-            let rate = output as f64 * 1000.0 / live.decode_ms as f64;
-            Some(FieldValue::new(format!("{rate:.1} tok/s"), Tone::Success))
+            let rate = tokens.total as f64 * 1000.0 / live.decode_ms as f64;
+            Some(FieldValue::new(
+                format!("{}{rate:.1} tok/s", tokens.total_marker()),
+                Tone::Success,
+            ))
+        }
+        FieldId::LiveTextTokens => {
+            let tokens = data.live?.reported_output()?;
+            (tokens.text > 0).then(|| {
+                FieldValue::new(
+                    format!(
+                        "{}{} text",
+                        tokens.tier_marker(),
+                        format_tokens(tokens.text, data.number_format)
+                    ),
+                    Tone::Success,
+                )
+            })
+        }
+        FieldId::LiveThinkingTokens => {
+            let tokens = data.live?.reported_output()?;
+            (tokens.thinking > 0).then(|| {
+                FieldValue::new(
+                    format!(
+                        "{}{} think",
+                        tokens.tier_marker(),
+                        format_tokens(tokens.thinking, data.number_format)
+                    ),
+                    Tone::Success,
+                )
+            })
+        }
+        FieldId::LiveToolcallTokens => {
+            let tokens = data.live?.reported_output()?;
+            (tokens.toolcall > 0).then(|| {
+                FieldValue::new(
+                    format!(
+                        "{}{} tool",
+                        tokens.tier_marker(),
+                        format_tokens(tokens.toolcall, data.number_format)
+                    ),
+                    Tone::Success,
+                )
+            })
         }
     }
 }
+
+/// The rate is hidden until the decode window is long enough to be stable
+/// (same 0.5 s guard as the reference statusline script).
+const MIN_RATE_DECODE_MS: u128 = 500;
 
 fn reasoning_text(data: &FieldData) -> Option<String> {
     data.thinking
@@ -770,6 +880,7 @@ pub fn valid_separator(separator: &str) -> bool {
 mod tests {
     use super::*;
     use crate::session_stats::TokenStats;
+    use crate::tokens::{TokenBreakdown, TokenSource};
     use serde_json::json;
 
     fn stats() -> SessionStats {
@@ -810,6 +921,12 @@ mod tests {
                 output_tokens: Some(123),
                 output_tokens_exact: None,
                 decode_ms: 2_500,
+                tokens: Some(TokenBreakdown::from_tiers(
+                    100,
+                    20,
+                    3,
+                    TokenSource::Estimated,
+                )),
             }),
             git: Some(GitInfo {
                 root: Some("/work/project".into()),
@@ -827,12 +944,12 @@ mod tests {
     }
 
     #[test]
-    fn registry_is_exactly_21_unique_fields() {
-        assert_eq!(ALL_FIELDS.len(), 21);
+    fn registry_is_exactly_26_unique_fields() {
+        assert_eq!(ALL_FIELDS.len(), 26);
         let mut ids: Vec<&str> = ALL_FIELDS.iter().map(|id| id.id()).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 21);
+        assert_eq!(ids.len(), 26);
         for id in ALL_FIELDS {
             assert_eq!(FieldId::parse(id.id()), Some(id));
         }
@@ -864,6 +981,14 @@ mod tests {
         assert_eq!(
             value(FieldId::TotalOutputTokens, &data).unwrap().text,
             "20 out"
+        );
+        assert_eq!(
+            value(FieldId::CacheReadTokens, &data).unwrap().text,
+            "30 cache-read"
+        );
+        assert_eq!(
+            value(FieldId::CacheWriteTokens, &data).unwrap().text,
+            "40 cache-write"
         );
         assert_eq!(value(FieldId::SessionCost, &data).unwrap().text, "$0.0123");
         // started 10:00 → now 12:34:56 = 2h 34m.
@@ -983,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn live_fields_need_a_provider_reported_count() {
+    fn live_fields_prefer_provider_then_estimate() {
         let data = data();
         assert_eq!(value(FieldId::Streaming, &data).unwrap().text, "streaming");
         assert_eq!(value(FieldId::LiveOutputTokens, &data).unwrap().text, "123");
@@ -992,12 +1117,31 @@ mod tests {
             value(FieldId::LiveOutputRate, &data).unwrap().text,
             "49.2 tok/s"
         );
-        // No exact output → rate omitted (no character estimate).
-        let mut no_tokens = data.clone();
-        no_tokens.live.as_mut().unwrap().output_tokens = None;
-        assert_eq!(value(FieldId::LiveOutputTokens, &no_tokens), None);
-        assert_eq!(value(FieldId::LiveOutputRate, &no_tokens), None);
-        // decode_ms=0 → rate omitted.
+        // The tier rows are available while streaming.
+        assert_eq!(
+            value(FieldId::LiveTextTokens, &data).unwrap().text,
+            "~100 text"
+        );
+        assert_eq!(
+            value(FieldId::LiveThinkingTokens, &data).unwrap().text,
+            "~20 think"
+        );
+        assert_eq!(
+            value(FieldId::LiveToolcallTokens, &data).unwrap().text,
+            "~3 tool"
+        );
+        // No provider usage → the estimate still shows (marked `~`).
+        let mut estimated = data.clone();
+        estimated.live.as_mut().unwrap().output_tokens = None;
+        assert_eq!(
+            value(FieldId::LiveOutputTokens, &estimated).unwrap().text,
+            "~123"
+        );
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &estimated).unwrap().text,
+            "~49.2 tok/s"
+        );
+        // Too-short decode window → rate omitted (stable display guard).
         let mut no_decode = data.clone();
         no_decode.live.as_mut().unwrap().decode_ms = 0;
         assert_eq!(value(FieldId::LiveOutputRate, &no_decode), None);
@@ -1008,6 +1152,12 @@ mod tests {
                 output_tokens: Some(123),
                 output_tokens_exact: Some(500),
                 decode_ms: 4_000,
+                tokens: Some(TokenBreakdown::from_tiers(
+                    100,
+                    20,
+                    3,
+                    TokenSource::Estimated,
+                )),
             }),
             ..data.clone()
         };
@@ -1022,8 +1172,7 @@ mod tests {
             "125.0 tok/s"
         );
         // Exact missing (provider reported no `usage.output`): fall back to
-        // the provider's streaming running total — still exact provider data,
-        // never a character estimate.
+        // the provider's streaming running total, then to the estimate.
         let mut no_exact = stopped.clone();
         no_exact.live.as_mut().unwrap().output_tokens_exact = None;
         assert_eq!(

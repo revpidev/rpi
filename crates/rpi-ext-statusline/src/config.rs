@@ -34,10 +34,10 @@ pub const DEFAULT_LIVE_REFRESH_MS: u64 = 1000;
 pub const MIN_LIVE_REFRESH_MS: u64 = 300;
 pub const MAX_LIVE_REFRESH_MS: u64 = 5000;
 
-/// Parsed `statusLine.liveTokens` (bool | object). `enabled` is evaluated
-/// ONCE at plugin load (it fixes the subscription set — adding the key at
-/// runtime does not subscribe; restart required), while `refresh_ms` is
-/// re-read on every tick and applies immediately.
+/// Parsed `statusLine.liveTokens` (bool | object). Both `enabled` and
+/// `refresh_ms` are re-read on every poll/tick: enabling or disabling the
+/// switch reconciles the streaming subscriptions dynamically (no restart),
+/// and `refresh_ms` applies immediately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveTokens {
     pub enabled: bool,
@@ -66,7 +66,7 @@ pub enum Placement {
     /// status entries — are hidden while active).
     Replace,
     /// `ui.setStatus` — append below the built-in footer (single line: the
-    /// host joins all extension statuses onto one row and folds
+    /// host joins extension statuses onto one row with ` · ` and folds
     /// multi-line whitespace).
     Status,
     /// `ui.setWidget` below the editor — a full ComponentTree (same
@@ -86,13 +86,14 @@ impl Placement {
         }
     }
 
-    /// Items-mode placement parser: `widget` is the frozen default, an
-    /// unknown value falls back to it.
+    /// Items-mode placement parser: `status` is the default (the token rows
+    /// sit on the shared bottom row with rpi-usage), an unknown value falls
+    /// back to it.
     pub(crate) fn parse_items(value: &str) -> Self {
         match value {
             "replace" => Placement::Replace,
-            "status" => Placement::Status,
-            _ => Placement::Widget,
+            "widget" => Placement::Widget,
+            _ => Placement::Status,
         }
     }
 }
@@ -111,8 +112,8 @@ pub struct StatusLineConfig {
     /// Script execution timeout (rpi `timeoutMs` extension).
     pub timeout_ms: u64,
     /// `statusLine.liveTokens` (rpi extension; 03-realtime-token-count
-    /// §1.5). `enabled` here reflects the CURRENT settings read — only
-    /// the load-time evaluation fixes the subscription set.
+    /// §1.5). `enabled` here reflects the CURRENT settings read; the refresh
+    /// loop reconciles the subscription set from it on every poll.
     pub live_tokens: LiveTokens,
 }
 
@@ -122,7 +123,7 @@ pub struct StatusLineConfig {
 pub enum StatusLine {
     /// TE12 script mode — unchanged stdin/timeout/failure semantics.
     Command(StatusLineConfig),
-    /// Declarative 21-field mode (TE52 / ADR-0040).
+    /// Declarative 26-field mode (TE52 / ADR-0040).
     Items(ItemsConfig),
 }
 
@@ -237,21 +238,36 @@ fn parse_command(object: &serde_json::Map<String, Value>) -> Option<StatusLineCo
 
 /// §1.5: `true` = on with defaults; an object may override `refreshMs`
 /// (clamped 300..5000, out-of-range/invalid falls back to the default);
-/// `false` / missing / wrong type = off. Command mode evaluates `enabled`
-/// once at load; items mode reconciles it dynamically.
+/// `false` = off. The missing/wrong-type default is caller-specific: command
+/// mode defaults to off, while the items default install enables the realtime
+/// token rows (see [`parse_live_tokens_with_default`]). Both modes reconcile
+/// the subscription set dynamically.
 pub(crate) fn parse_live_tokens(value: Option<&Value>) -> LiveTokens {
+    parse_live_tokens_with_default(value, false)
+}
+
+/// Parse `liveTokens` with an explicit missing/malformed default. Command
+/// mode defaults to off; items mode defaults to on (the default install is
+/// the realtime token rows only).
+pub(crate) fn parse_live_tokens_with_default(
+    value: Option<&Value>,
+    default_enabled: bool,
+) -> LiveTokens {
     let mut live = LiveTokens {
         enabled: true,
         ..LiveTokens::default()
     };
     match value {
         Some(Value::Bool(true)) => {}
+        Some(Value::Bool(false)) => live.enabled = false,
         Some(Value::Object(object)) => {
             if let Some(refresh) = object.get("refreshMs").and_then(Value::as_u64) {
                 live.refresh_ms = refresh.clamp(MIN_LIVE_REFRESH_MS, MAX_LIVE_REFRESH_MS);
             }
         }
-        _ => return LiveTokens::default(),
+        _ => {
+            live.enabled = default_enabled;
+        }
     }
     live
 }
@@ -339,8 +355,8 @@ mod tests {
         };
         let fields: Vec<FieldId> = config.fields().collect();
         assert_eq!(fields, vec![FieldId::Model, FieldId::ProjectName]);
-        // The default items placement is widget (command keeps replace).
-        assert_eq!(config.placement, Placement::Widget);
+        // The default items placement is status (command keeps replace).
+        assert_eq!(config.placement, Placement::Status);
     }
 
     #[test]
@@ -407,10 +423,10 @@ mod tests {
     #[test]
     fn mode_helpers_project_the_frozen_defaults() {
         let items = parse(json!({"type": "items"})).expect("items");
-        assert_eq!(items.placement(), Placement::Widget);
+        assert_eq!(items.placement(), Placement::Status);
         assert_eq!(items.padding(), 0);
         assert_eq!(items.refresh_interval_secs(), Some(5));
-        assert!(!items.live_tokens().enabled);
+        assert!(items.live_tokens().enabled);
         let command = parse(json!({"type": "command", "command": "echo x"})).expect("command");
         assert_eq!(command.placement(), Placement::Replace);
         assert_eq!(command.refresh_interval_secs(), None);

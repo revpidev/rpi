@@ -584,16 +584,18 @@ impl Component for FooterComponent {
         let mut lines = vec![pwd_line, format!("{dim_stats_left}{dim_remainder}")];
 
         // Extension statuses: sorted by key, whitespace-folded, joined with a
-        // single space, then wrapped to the terminal width (R3.2.6 /
-        // ADR-0040). Wrapping never truncates and re-opens active ANSI SGR
-        // codes, so the footer grows with the content.
+        // ` · ` separator, then wrapped to the terminal width (R3.2.6 /
+        // ADR-0040). The dot keeps adjacent plugin entries (for example the
+        // statusline token row and the usage quota row) visually distinct.
+        // Wrapping never truncates and re-opens active ANSI SGR codes, so the
+        // footer grows with the content.
         let extension_statuses = self.footer_data.get_extension_statuses();
         if !extension_statuses.is_empty() {
             let status_line = extension_statuses
                 .values()
                 .map(|text| sanitize_status_text(text))
                 .collect::<Vec<_>>()
-                .join(" ");
+                .join(" · ");
             lines.extend(wrap_text_with_ansi(&status_line, width));
         }
 
@@ -971,9 +973,9 @@ mod tests {
         let lines = footer.render(80);
         assert_eq!(lines.len(), 3);
         let status_line = strip_ansi(&lines[2]);
-        // Sorted by key and sanitized (single spaces).
+        // Sorted by key, sanitized, and dot-separated.
         assert_eq!(
-            status_line, "a status with newlines z status",
+            status_line, "a status with newlines · z status",
             "status: {status_line}"
         );
     }
@@ -1041,7 +1043,7 @@ mod tests {
         let lines = footer.render(80);
         assert_eq!(lines.len(), 3);
         let status_line = strip_ansi(&lines[2]);
-        assert_eq!(status_line, "CNY 9.99 repo:main", "status: {status_line}");
+        assert_eq!(status_line, "CNY 9.99 · repo:main", "status: {status_line}");
         // Cleared independently: the statusline entry survives.
         footer_data.remove_extension_status("rpi-usage");
         let lines = footer.render(80);

@@ -161,7 +161,8 @@ fn live_tokens_lifecycle_over_the_carrier_seam() {
     std::fs::create_dir_all(&agent).expect("mkdir");
     rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent);
 
-    // liveTokens configured BEFORE install (load-time evaluation).
+    // liveTokens configured before install (the test wrapper also exercises
+    // dynamic enable/disable through the poll-time reconciliation).
     let stdin_log = agent.join("stdin.log");
     let runs_log = agent.join("runs.log");
     write_settings(json!({"statusLine": {
@@ -393,6 +394,17 @@ fn live_tokens_lifecycle_over_the_carrier_seam() {
                 .as_str()
                 .is_some_and(|text| text.starts_with("0123456789")),
             "raw text visible to the script"
+        );
+        // 2026-11 tiered token accounting: provider usage wins while the
+        // tier split stays proportional; the block is additive to the
+        // legacy fields above.
+        let tokens = live.get("tokens").expect("tiered token block");
+        assert!(tokens["total"].as_u64().unwrap_or(0) > 0, "{tokens:#?}");
+        assert_eq!(tokens["source"], "exact_provider", "{tokens:#?}");
+        assert!(
+            tokens["text"].as_u64().unwrap_or(0) + tokens["thinking"].as_u64().unwrap_or(0)
+                == tokens["total"].as_u64().unwrap_or(0),
+            "tiers add up: {tokens:#?}"
         );
     }
 

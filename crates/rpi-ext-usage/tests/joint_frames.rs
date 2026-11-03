@@ -228,8 +228,8 @@ fn real_usage_footer_composes_on_the_host_row_without_requests() {
     );
 
     // Host status-row composition: sorted keys (statusline before usage),
-    // one space, wrap-to-width with no truncation at 40/80/120.
-    let row = format!("{STATUSLINE} {footer}");
+    // ` · ` separator, wrap-to-width with no truncation at 40/80/120.
+    let row = format!("{STATUSLINE} · {footer}");
     for width in [40usize, 80, 120] {
         let lines = wrap_text_with_ansi(&row, width);
         for line in &lines {

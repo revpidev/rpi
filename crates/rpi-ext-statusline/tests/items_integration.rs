@@ -191,13 +191,31 @@ fn last_widget_contains(records: &[(String, Value)], needle: &str) -> bool {
         .is_some_and(|text| text.contains(needle))
 }
 
+fn status_texts(records: &[(String, Value)]) -> Vec<String> {
+    calls_of(records, "ui.setStatus")
+        .iter()
+        .filter_map(|args| {
+            (args.get("key").and_then(Value::as_str) == Some("rpi-statusline"))
+                .then(|| args.get("text").and_then(Value::as_str).map(str::to_owned))
+                .flatten()
+        })
+        .collect()
+}
+
+fn last_status_contains(records: &[(String, Value)], needle: &str) -> bool {
+    status_texts(records)
+        .last()
+        .is_some_and(|text| text.contains(needle))
+}
+
 #[test]
 fn items_mode_lifecycle_over_the_carrier_seam() {
     let agent = std::env::temp_dir().join(format!("rpi-statusline-items-{}", std::process::id()));
     std::fs::create_dir_all(&agent).expect("mkdir");
     rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent);
 
-    // Default items: session-duration + pending live-output-tokens; live off.
+    // Default install: realtime token statistics only (live-output-tokens +
+    // live-output-rate, liveTokens on); every other field is off.
     write_settings(json!({"statusLine": {"type": "items"}}));
     install_fake_ctx();
     let receipt = rpi_ext_statusline::install_for_test(
@@ -208,7 +226,8 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
     );
     assert!(receipt.get("error").is_none(), "install: {receipt:#?}");
 
-    // ── 1. Field-driven subscription set at install: base lifecycle only.
+    // ── 1. Field-driven subscription set at install: base lifecycle plus the
+    //        live message events; no session totals, Git, mode or run-state.
     let at_install = subscribed(&records());
     for event in [
         "session_start",
@@ -216,13 +235,13 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         "model_select",
         "thinking_level_select",
         "session_shutdown",
+        "message_start",
+        "message_update",
+        "message_end",
     ] {
         assert!(at_install.iter().any(|s| s == event), "missing {event}");
     }
     for event in [
-        "message_start",
-        "message_update",
-        "message_end",
         "tool_execution_end",
         "turn_end",
         "session_compact",
@@ -236,21 +255,58 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         );
     }
 
-    // ── 2. Default frame: only the wall-clock duration (live preset is
-    //        hidden while liveTokens=false). No shell, no command.
-    let now = poll_until("duration-only widget", |records| {
-        widget_texts(records).last().is_some_and(|text| {
-            text.starts_with(|c: char| c.is_ascii_digit()) && text.contains('d')
-        })
-    });
-    let text = widget_texts(&now).last().cloned().unwrap_or_default();
+    // ── 2. Default frame: idle = no custom output; a stream then shows the
+    //        estimated token/rate pair live, and the exact provider count on
+    //        message_end. No shell, no command.
+    std::thread::sleep(Duration::from_millis(1200));
     assert!(
-        !text.contains("live") && !text.contains("·"),
-        "single duration value, no separator: {text:?}"
+        widget_texts(&records())
+            .last()
+            .is_none_or(|text| text.is_empty()),
+        "idle default frame has no live values: {:?}",
+        widget_texts(&records()).last()
     );
+    send_event(
+        "message_start",
+        json!({"type": "message_start", "message": {"role": "assistant"}}),
+    );
+    send_event(
+        "message_update",
+        json!({
+            "type": "message_update",
+            "message": {"role": "assistant"},
+            "assistantMessageEvent": {
+                "type": "text_delta",
+                "contentIndex": 0,
+                "delta": "hello world"
+            },
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(650));
+    let now = poll_until("default estimated token rows", |records| {
+        last_status_contains(records, "~") && last_status_contains(records, "tok/s")
+    });
+    let text = status_texts(&now).last().cloned().unwrap_or_default();
+    assert!(text.contains('~'), "estimate marker: {text:?}");
+    assert!(text.contains("tok/s"), "live rate: {text:?}");
     assert!(
-        calls_of(&now, "ui.setStatus").is_empty(),
-        "widget placement never touches the status row"
+        calls_of(&now, "ui.setWidget").is_empty(),
+        "status placement never mounts a widget"
+    );
+    send_event(
+        "message_end",
+        json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "usage": {"output": 42}},
+        }),
+    );
+    let now = poll_until("default exact token rows", |records| {
+        last_status_contains(records, "42") && last_status_contains(records, "tok/s")
+    });
+    let text = status_texts(&now).last().cloned().unwrap_or_default();
+    assert!(
+        !text.contains('~'),
+        "exact count drops the marker: {text:?}"
     );
     assert!(
         !records()
@@ -263,7 +319,7 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
     );
 
     // ── 3. Field selection reconciles the extra subscriptions and renders
-    //        the strict 21-field values (aliases + unknown id skipped).
+    //        the strict 26-field values (aliases + unknown id skipped).
     write_settings(json!({"statusLine": {
         "type": "items",
         "items": [
@@ -272,9 +328,12 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
             "context-used",
             "used-tokens",
             "total-input-tokens",
+            "cache-read-tokens",
+            "cache-write-tokens",
             "session-cost",
             "hostname"
         ],
+        "placement": "widget",
         "useColors": false
     }}));
     send_event("turn_end", json!({"type": "turn_end"}));
@@ -290,6 +349,8 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         text.contains("80 in"),
         "input + cacheRead + cacheWrite: {text:?}"
     );
+    assert!(text.contains("30 cache-read"), "{text:?}");
+    assert!(text.contains("40 cache-write"), "{text:?}");
     assert!(text.contains("$0.0123"), "local cost estimate: {text:?}");
     assert!(
         !text.contains("hostname"),
@@ -312,11 +373,13 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
     );
 
     // ── 4. Live fields + liveTokens: message events are added dynamically;
-    //        streaming output renders from provider usage only.
+    //        streaming output prefers provider usage and falls back to the
+    //        built-in token estimate.
     write_settings(json!({"statusLine": {
         "type": "items",
         "items": ["streaming", "live-output-tokens"],
         "liveTokens": {"refreshMs": 300},
+        "placement": "widget",
         "useColors": false
     }}));
     send_event("model_select", json!({"type": "model_select"}));
@@ -363,11 +426,78 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         widget_texts(&records()).last()
     );
 
+    // ── 4b. No provider usage while streaming: the built-in estimate makes
+    //        the token/rate rows update live instead of waiting for
+    //        message_end. The tier split is visible too.
+    write_settings(json!({"statusLine": {
+        "type": "items",
+        "items": [
+            "streaming",
+            "live-output-tokens",
+            "live-output-rate",
+            "live-text-tokens"
+        ],
+        "liveTokens": {"refreshMs": 300},
+        "placement": "widget",
+        "useColors": false
+    }}));
+    send_event("model_select", json!({"type": "model_select"}));
+    poll_until("estimated live fields subscribed", |records| {
+        let events = subscribed(records);
+        ["message_start", "message_update", "message_end"]
+            .iter()
+            .all(|event| events.iter().any(|seen| seen == event))
+    });
+    send_event(
+        "message_start",
+        json!({"type": "message_start", "message": {"role": "assistant"}}),
+    );
+    send_event(
+        "message_update",
+        json!({
+            "type": "message_update",
+            "message": {"role": "assistant"},
+            "assistantMessageEvent": {
+                "type": "text_delta",
+                "contentIndex": 0,
+                "delta": "hello world"
+            },
+        }),
+    );
+    // Give the 300ms ticker a full rate window (>500ms) and wait for the
+    // estimate-marked rows.
+    std::thread::sleep(Duration::from_millis(650));
+    let now = poll_until("estimated live widget", |records| {
+        last_widget_contains(records, "~") && last_widget_contains(records, "tok/s")
+    });
+    let text = widget_texts(&now).last().cloned().unwrap_or_default();
+    assert!(text.contains("streaming"), "{text:?}");
+    assert!(text.contains("~"), "estimate marker: {text:?}");
+    assert!(text.contains("tok/s"), "live rate: {text:?}");
+    assert!(text.contains("text"), "tier row: {text:?}");
+    assert!(
+        !text.contains("25") && !text.contains("40"),
+        "no provider usage was reported for this message: {text:?}"
+    );
+    send_event(
+        "message_end",
+        json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "usage": {"output": 0}},
+        }),
+    );
+    // The frozen estimate remains visible after the stream settles (0 usage
+    // is the provider's aborted/no-usage signal and never becomes "exact 0").
+    poll_until("frozen estimate after message_end", |records| {
+        last_widget_contains(records, "~") && last_widget_contains(records, "text")
+    });
+
     // ── 5. Turning live off stops the events and clears the measurement.
     write_settings(json!({"statusLine": {
         "type": "items",
         "items": ["model"],
         "liveTokens": false,
+        "placement": "widget",
         "useColors": false
     }}));
     send_event("model_select", json!({"type": "model_select"}));
@@ -395,7 +525,11 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
     assert!(!final_events.is_empty());
 
     // ── 6. Empty items: the widget key is cleared (no blank footer).
-    write_settings(json!({"statusLine": {"type": "items", "items": []}}));
+    write_settings(json!({"statusLine": {
+        "type": "items",
+        "items": [],
+        "placement": "widget"
+    }}));
     send_event("model_select", json!({"type": "model_select"}));
     poll_until("empty items clears the widget", |records| {
         calls_of(records, "ui.setWidget").iter().any(|args| {

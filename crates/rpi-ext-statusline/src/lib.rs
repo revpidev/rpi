@@ -32,6 +32,7 @@ pub mod session_stats;
 pub mod settings_write;
 pub mod state;
 pub mod subscriptions;
+pub mod tokens;
 
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -184,19 +185,10 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let initial = config::load_settings_snapshot();
-    let command_live_fixed = matches!(
-        initial.status_line,
-        Some(config::StatusLine::Command(ref config)) if config.live_tokens.enabled
-    );
     let _ = TRIGGERS.set(Mutex::new(tx));
-    let mut engine = EngineState::default();
-    engine.command_live_fixed = command_live_fixed;
-    let _ = ENGINE.set(Mutex::new(engine));
+    let _ = ENGINE.set(Mutex::new(EngineState::default()));
     let _ = SUBSCRIPTIONS.set(Mutex::new(subscriptions::SubscriptionState::default()));
     let _ = CHANNEL.set(Arc::new(RwLock::new(channel)));
-    if command_live_fixed {
-        with_engine(|engine| engine.arm_live_measure());
-    }
     reconcile_subscriptions(&channel, &initial);
     runtime.spawn(refresh::refresh_loop(
         Arc::clone(CHANNEL.get().expect("channel cell just set")),
@@ -213,19 +205,30 @@ pub(crate) fn reconcile_subscriptions(
     channel: &AsyncHostCalls,
     settings: &config::SettingsSnapshot,
 ) {
-    let desired = {
-        let command_live_fixed = with_engine(|engine| engine.command_live_fixed);
-        subscriptions::desired_events(settings.status_line.as_ref(), command_live_fixed)
-    };
+    let command_live = matches!(
+        settings.status_line.as_ref(),
+        Some(config::StatusLine::Command(config)) if config.live_tokens.enabled
+    );
+    let desired = subscriptions::desired_events(settings.status_line.as_ref(), command_live);
     if let Some(state) = SUBSCRIPTIONS.get() {
         state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .reconcile(channel, &desired);
     }
-    if let Some(config::StatusLine::Items(items)) = settings.status_line.as_ref() {
-        // Items live membership is dynamic: disabled → off + clear.
-        with_engine(|engine| engine.set_live_measure(items.live_enabled()));
+    // Live membership is dynamic in both modes: disabled → off + clear,
+    // enabled → arm the measurement. Command mode used to require a restart;
+    // the poll-time reconciliation removes that trap (the event set still
+    // stays empty while the switch is off, so the zero-overhead property is
+    // unchanged).
+    match settings.status_line.as_ref() {
+        Some(config::StatusLine::Items(items)) => {
+            with_engine(|engine| engine.set_live_measure(items.live_enabled()));
+        }
+        Some(config::StatusLine::Command(config)) => {
+            with_engine(|engine| engine.set_live_measure(config.live_tokens.enabled));
+        }
+        None => with_engine(|engine| engine.set_live_measure(false)),
     }
 }
 
@@ -264,7 +267,13 @@ fn handle_dispatch(message: &Value) -> Value {
         }
         "message_start" => {
             // Bookkeeping only (FR-D); never the debounce must-run path.
+            // Arm on the event itself: a stream may start immediately after
+            // a config save, before the next poll-time reconcile runs. Live
+            // events only arrive while the streaming subscription is active,
+            // so arming here is always correct (and avoids dropping the
+            // first deltas of that window).
             with_engine(|engine| {
+                engine.arm_live_measure();
                 if let Some(live) = engine.live.as_mut() {
                     live.on_message_start(payload.pointer("/message/role").and_then(Value::as_str));
                 }
@@ -274,8 +283,11 @@ fn handle_dispatch(message: &Value) -> Value {
         "message_update" => {
             // FR-A + #45: O(1) amortized per delta — count the chars,
             // retain the raw delta text and read the cumulative partial's
-            // provider usage; all inside LiveMeasure.
+            // provider usage; all inside LiveMeasure. Same arm-on-event
+            // rule as message_start (also covers enabling liveTokens
+            // mid-stream).
             with_engine(|engine| {
+                engine.arm_live_measure();
                 if let Some(live) = engine.live.as_mut() {
                     live.on_message_update(&payload);
                 }

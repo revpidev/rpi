@@ -250,6 +250,12 @@ pub async fn refresh_loop(
                 let settings = config::load_settings_snapshot();
                 match settings.status_line {
                     Some(StatusLine::Command(_)) => {
+                        // A newer live frame supersedes an in-flight script
+                        // (single-flight discipline; the generation bump in
+                        // `refresh_tick` discards its late result).
+                        if let Some(token) = inflight.take() {
+                            token.cancel();
+                        }
                         if let Some(token) =
                             refresh_tick(&calls, &done_tx, &mut generation, "message_update", None)
                         {
@@ -258,7 +264,16 @@ pub async fn refresh_loop(
                     }
                     Some(StatusLine::Items(items)) => {
                         if bridge_ready && !bridge_abandoned {
-                            publish_items_from_cache(&calls, &items, last_items_data.as_mut());
+                            // The first live tick can arrive before any regular
+                            // event built the cached data frame (a stream may
+                            // start right after install). Build it once so the
+                            // estimated tokens/rate are visible immediately.
+                            if last_items_data.is_none() {
+                                let ctx = fetch_items_ctx(&calls, &items);
+                                last_items_data = refresh_items(&calls, &items, Some(ctx), false);
+                            } else {
+                                publish_items_from_cache(&calls, &items, last_items_data.as_mut());
+                            }
                         }
                     }
                     None => restore_if_mounted(&calls),
@@ -476,12 +491,12 @@ fn drain_triggers(rx: &mut UnboundedReceiver<Trigger>) -> (bool, bool) {
     }
 }
 
-/// Whether the current configuration enables live measurement (command:
-/// load-time fixed; items: dynamic).
+/// Whether the current configuration enables live measurement (both modes
+/// are read from the current settings on every tick).
 fn live_currently_enabled() -> bool {
     let snapshot = config::load_settings_snapshot();
     match snapshot.status_line {
-        Some(StatusLine::Command(_)) => with_engine(|engine| engine.command_live_fixed),
+        Some(StatusLine::Command(config)) => config.live_tokens.enabled,
         Some(StatusLine::Items(items)) => items.live_enabled(),
         None => false,
     }
@@ -615,7 +630,7 @@ fn snapshot_from_engine(
     settings_session_dir: Option<&str>,
     hook_event_name: &str,
 ) -> Snapshot {
-    with_engine(|engine| {
+    let mut snapshot = with_engine(|engine| {
         if let Some(info) = &ctx.session_file {
             let path = info.get("path").and_then(Value::as_str).map(str::to_owned);
             if let Some(id) = info.get("id").and_then(Value::as_str)
@@ -656,7 +671,36 @@ fn snapshot_from_engine(
             live_output,
             hook_event_name: hook_event_name.to_owned(),
         }
-    })
+    });
+    // Token accounting runs AFTER the engine lock is released: a large
+    // model tokenizer must never block the streaming dispatch thread.
+    if let Some(live) = snapshot.live_output.as_mut() {
+        let model_id = snapshot
+            .model
+            .as_ref()
+            .and_then(|model| model.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut tokens = crate::tokens::count_breakdown(
+            model_id.as_deref(),
+            &live.text,
+            &live.thinking,
+            &live.toolcall,
+        );
+        // Same precedence as the UI fields: a provider-reported running/exact
+        // total overrides the local estimate while the tier split keeps its
+        // proportions.
+        let provider_total = if live.streaming {
+            live.output_tokens.or(live.output_tokens_exact)
+        } else {
+            live.output_tokens_exact.or(live.output_tokens)
+        };
+        if let Some(total) = provider_total.filter(|total| *total > 0) {
+            tokens = tokens.with_provider_total(total);
+        }
+        live.tokens = Some(tokens);
+    }
+    snapshot
 }
 
 /// Pull the command-mode session facts over host calls (six reads; each
@@ -831,16 +875,18 @@ fn build_field_data(items: &ItemsConfig, ctx: &CtxData) -> FieldData {
         percent: usage.get("percent").and_then(Value::as_f64),
     });
     let now = Instant::now();
-    let (stats, live, git) = with_engine(|engine| {
+    let (stats, live_peek, git) = with_engine(|engine| {
         (
             engine.session_stats.snapshot().cloned(),
             items
                 .live_enabled()
-                .then(|| engine.live_view(now))
+                .then(|| engine.live_peek(now))
                 .flatten(),
             engine.git.info().cloned(),
         )
     });
+    let model_id = model.as_ref().map(|model| model.id.as_str());
+    let live = live_peek.map(|peek| peek.into_view(model_id));
     FieldData {
         cwd: Some(ctx.cwd.clone()).filter(|cwd| !cwd.is_empty()),
         model,
@@ -873,16 +919,17 @@ fn publish_items_from_cache(
         return;
     };
     let now = Instant::now();
-    let (live, git) = with_engine(|engine| {
+    let model_id = data.model.as_ref().map(|model| model.id.clone());
+    let (live_peek, git) = with_engine(|engine| {
         (
             items
                 .live_enabled()
-                .then(|| engine.live_view(now))
+                .then(|| engine.live_peek(now))
                 .flatten(),
             engine.git.info().cloned(),
         )
     });
-    data.live = live;
+    data.live = live_peek.map(|peek| peek.into_view(model_id.as_deref()));
     data.git = git;
     data.now = Some(Utc::now());
     data.number_format = items.number_format;
