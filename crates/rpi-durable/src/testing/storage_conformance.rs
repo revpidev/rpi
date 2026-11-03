@@ -1838,6 +1838,80 @@ fn case_12_task_owners_and_status(storage: Arc<dyn Storage>) -> ConformanceFutur
     })
 }
 
+fn case_sleeping(storage: Arc<dyn Storage>) -> ConformanceFuture {
+    Box::pin(async move {
+        let root = create_root(&storage).await?;
+        let sleeping_id: TaskId =
+            id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
+        let mut sleeping = pending_task(sleeping_id, root, "next");
+        sleeping.state = TaskState::Sleeping {
+            checkpoint: serde_json::json!({ "phase": "next" }),
+            until: 61_000.0,
+        };
+        sleeping.memos = Some({
+            let mut memos = JsonObject::new();
+            memos.insert("kept".to_string(), JsonValue::Bool(true));
+            memos
+        });
+        storage
+            .commit(
+                &[StorageWrite::Task {
+                    value: sleeping.clone(),
+                }],
+                &BACKGROUND_CONTEXT,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        check_eq!(task_by_id(&storage, sleeping_id).await?, sleeping);
+        let scan = |status| {
+            let storage = Arc::clone(&storage);
+            async move {
+                storage
+                    .scan_tasks(
+                        TaskQuery {
+                            status: Some(status),
+                            ..Default::default()
+                        },
+                        10,
+                        None,
+                        &BACKGROUND_CONTEXT,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                    .map(|page| page.items)
+            }
+        };
+        check_eq!(
+            scan(crate::types::TaskStatus::Sleeping).await?,
+            vec![sleeping.clone()]
+        );
+        let running = TaskRecord {
+            state: TaskState::Running {
+                checkpoint: serde_json::json!({ "phase": "next" }),
+            },
+            ..sleeping
+        };
+        storage
+            .commit(
+                &[StorageWrite::Task {
+                    value: running.clone(),
+                }],
+                &BACKGROUND_CONTEXT,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        check_eq!(
+            scan(crate::types::TaskStatus::Sleeping).await?,
+            Vec::<TaskRecord>::new()
+        );
+        check_eq!(
+            scan(crate::types::TaskStatus::Running).await?,
+            vec![running]
+        );
+        Ok(())
+    })
+}
+
 fn case_13_request_ids(storage: Arc<dyn Storage>) -> ConformanceFuture {
     Box::pin(async move {
         let root = create_root(&storage).await?;
@@ -3914,6 +3988,10 @@ pub fn create_storage_conformance() -> Vec<ConformanceCase> {
             run: case_12_task_owners_and_status,
         },
         ConformanceCase {
+            name: "stores and scans sleeping tasks by status",
+            run: case_sleeping,
+        },
+        ConformanceCase {
             name: "indexes request IDs per conversation and replaces complete submission records",
             run: case_13_request_ids,
         },
@@ -3989,5 +4067,17 @@ where
         Ok(())
     } else {
         Err(failures.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_storage_conformance;
+
+    #[test]
+    fn includes_the_complete_upstream_case_list() {
+        let cases = create_storage_conformance();
+        assert_eq!(cases.len(), 25);
+        assert_eq!(cases[12].name, "stores and scans sleeping tasks by status");
     }
 }

@@ -5,6 +5,7 @@
 //! durable task and submission records and extracted by later invocations.
 
 mod scheduler_support;
+mod session_support;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -881,8 +882,93 @@ async fn a_listener_panic_emits_one_listener_error() {
                 && attributes.get("type").and_then(JsonValue::as_str) == Some("listener_error")
         })
         .count();
-    assert_eq!(events, 1, "one listener_error event");
+    assert_eq!(events, 0, "no listener event without a telemetry context");
     assert_eq!(metrics, 1, "one listener_error metric");
+}
+
+#[tokio::test]
+async fn a_listener_panic_inside_a_span_emits_one_event_and_one_metric() {
+    let recorder = Recorder::default();
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let telemetry = TelemetryContext::new(Arc::new(recorder.root()) as Arc<dyn TelemetrySink>);
+    let opened = open_with_telemetry(Arc::clone(&storage), all_tasks(), telemetry.clone()).await;
+    let conversation = root(&opened.harness).await;
+    let _subscription = opened
+        .harness
+        .session()
+        .subscribe_commits(Arc::new(|_, _| panic!("host listener")));
+    let span = telemetry.start_span("pi.durable.submit", JsonObject::new(), Vec::new());
+    let commit_context = with_context_value(&TELEMETRY_CONTEXT_KEY, span.context(), &context());
+    opened
+        .harness
+        .session()
+        .commit(
+            commit_fn(move |tx| {
+                Box::pin(async move {
+                    tx.append_entry(
+                        conversation,
+                        rpi_durable::session::EntryDraft::new("test.listener"),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            }),
+            &commit_context,
+        )
+        .await
+        .expect("commit");
+    let snapshot = recorder.last_span("pi.durable.submit");
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|name| name == "pi.durable.report"),
+        "spans: {:?}; root events: {:?}; metrics: {:?}",
+        recorder
+            .0
+            .spans
+            .lock()
+            .expect("spans")
+            .iter()
+            .map(|span| (span.name.clone(), span.events.clone()))
+            .collect::<Vec<_>>(),
+        recorder.0.root_events.lock().expect("events"),
+        recorder.0.metrics.lock().expect("metrics")
+    );
+    let report_attributes: Vec<_> = snapshot
+        .events
+        .iter()
+        .zip(&snapshot.event_attributes)
+        .filter(|(name, _)| *name == "pi.durable.report")
+        .map(|(_, attributes)| attributes)
+        .collect();
+    assert_eq!(report_attributes.len(), 1);
+    assert_eq!(report_attributes[0]["type"], "listener_error");
+    assert!(
+        !recorder
+            .0
+            .root_events
+            .lock()
+            .expect("events")
+            .iter()
+            .any(|(name, attributes)| {
+                name == "pi.durable.report"
+                    && attributes.get("type").and_then(JsonValue::as_str) == Some("listener_error")
+            })
+    );
+    let metrics = recorder.0.metrics.lock().expect("metrics");
+    assert_eq!(
+        metrics
+            .iter()
+            .filter(|(name, _, attributes)| {
+                name == "pi.durable.reports"
+                    && attributes.get("type").and_then(JsonValue::as_str) == Some("listener_error")
+            })
+            .count(),
+        1
+    );
+    drop(metrics);
+    span.end(JsonObject::new());
 }
 
 #[tokio::test]
@@ -1014,20 +1100,25 @@ async fn report_events_carry_only_their_kind_attributes() {
             .filter(|(name, _)| name == "pi.durable.report")
             .map(|(_, attributes)| attributes.clone()),
     );
-    let parked = events
-        .iter()
-        .find(|event| event.get("type").and_then(JsonValue::as_str) == Some("task_parked"))
-        .unwrap_or_else(|| panic!("no task_parked event: {events:?}"));
     assert!(
-        parked.get("reason").is_none(),
-        "task_parked has no fixed reason: {parked:?}"
+        events
+            .iter()
+            .all(|event| { event.get("type").and_then(JsonValue::as_str) != Some("task_parked") })
     );
-    assert_eq!(parked["task.id"], JsonValue::from(id.get()));
-    assert_eq!(
-        parked.keys().cloned().collect::<Vec<_>>(),
-        vec!["type".to_string(), "task.id".to_string()],
-        "only the kind's fixed attributes: {parked:?}"
-    );
+    let metrics = recorder.0.metrics.lock().expect("metrics").clone();
+    let parked: Vec<_> = metrics
+        .iter()
+        .filter(|(name, _, attributes)| {
+            name == "pi.durable.reports"
+                && attributes.get("type").and_then(JsonValue::as_str) == Some("task_parked")
+        })
+        .collect();
+    assert!(!parked.is_empty(), "task_parked metric: {metrics:?}");
+    assert!(parked.iter().all(|(_, value, attributes)| {
+        *value == 1.0 && attributes.keys().cloned().collect::<Vec<_>>() == vec!["type".to_string()]
+    }));
+    drop(parked);
+    drop(metrics);
     // A faulted task carries the fixed reason; a host error carries none.
     assert!(events.iter().all(|event| {
         event.get("type").and_then(JsonValue::as_str) != Some("task_faulted")
@@ -1128,9 +1219,8 @@ fn recorder_storage() -> Arc<dyn Storage> {
     Arc::new(MemoryStorage::new())
 }
 
-/// R-D9: a host `onReport` info callback that throws is contained, and a report
-/// outside the scheduler's context path still emits its fixed telemetry
-/// (upstream `safeReport`).
+/// R-D9: a host `onReport` info callback that throws is contained. A report
+/// without a context records its metric but no event (upstream `safeReport`).
 #[tokio::test]
 async fn a_panicking_report_callback_is_contained_and_still_reported() {
     let recorder = Recorder::default();
@@ -1145,22 +1235,125 @@ async fn a_panicking_report_callback_is_contained_and_still_reported() {
         })),
     )
     .await;
-    // Failing the Session runs the failure reporter, which reports
-    // `session_failed` through the throwing callback.
     opened.harness.session().fail("storage exploded");
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let events: Vec<(String, JsonObject)> = recorder.0.root_events.lock().expect("events").clone();
-    let report = events
+    assert!(
+        !recorder
+            .0
+            .root_events
+            .lock()
+            .expect("events")
+            .iter()
+            .any(|(name, attributes)| {
+                name == "pi.durable.report"
+                    && attributes.get("type").and_then(JsonValue::as_str) == Some("session_failed")
+            })
+    );
+    let metrics = recorder.0.metrics.lock().expect("metrics");
+    let reports: Vec<_> = metrics
         .iter()
-        .find(|(name, attributes)| {
-            name == "pi.durable.report"
+        .filter(|(name, _, attributes)| {
+            name == "pi.durable.reports"
                 && attributes.get("type").and_then(JsonValue::as_str) == Some("session_failed")
         })
-        .unwrap_or_else(|| panic!("no session_failed report event: {events:?}"));
+        .collect();
+    assert_eq!(reports.len(), 1, "one session_failed metric: {metrics:?}");
+    assert_eq!(reports[0].1, 1.0);
     assert_eq!(
-        report.1.keys().cloned().collect::<Vec<_>>(),
-        vec!["type".to_string()],
-        "session_failed carries no extra attribute: {:?}",
-        report.1
+        reports[0].2.keys().cloned().collect::<Vec<_>>(),
+        vec!["type".to_string()]
     );
+}
+
+struct GatedTerminalTask {
+    gate: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl rpi_durable::harness::TaskDefinition for GatedTerminalTask {
+    fn name(&self) -> &str {
+        "test.gated-terminal"
+    }
+
+    fn version(&self) -> u64 {
+        1
+    }
+
+    fn initial(&self) -> JsonValue {
+        serde_json::json!({ "phase": "step" })
+    }
+
+    async fn run_phase(
+        &self,
+        _phase: &str,
+        _task: rpi_durable::harness::RunningTask,
+        runtime: &dyn rpi_durable::harness::TaskRuntime,
+        context: &Context,
+    ) -> rpi_durable::session::SessionResult<()> {
+        self.gate.notified().await;
+        runtime
+            .commit(
+                scheduler_support::commit_next(rpi_durable::harness::NextTaskState::Terminal {
+                    outcome: rpi_durable::types::TaskOutcome::Completed {
+                        result: serde_json::json!({}),
+                    },
+                }),
+                context,
+            )
+            .await
+    }
+}
+
+#[tokio::test]
+async fn a_failed_terminal_commit_does_not_publish_its_outcome() {
+    let recorder = Recorder::default();
+    let telemetry = TelemetryContext::new(Arc::new(recorder.root()) as Arc<dyn TelemetrySink>);
+    let storage = Arc::new(session_support::ControlledStorage::new());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut tasks = all_tasks();
+    tasks.push(Arc::new(GatedTerminalTask { gate: gate.clone() }));
+    let opened = open_with_telemetry(storage.clone(), tasks, telemetry).await;
+    let conversation = root(&opened.harness).await;
+    let _id = add_task(
+        &opened.harness,
+        conversation,
+        Spec::owned("test.gated-terminal", serde_json::json!({})),
+    )
+    .await;
+    opened.harness.resume().expect("resume");
+    for _ in 0..200 {
+        if recorder.span_count("pi.durable.phase") > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(recorder.span_count("pi.durable.phase"), 1);
+    storage.fail_next_commit(rpi_durable::errors::StorageError::message(
+        "terminal commit failed",
+    ));
+    gate.notify_waiters();
+    for _ in 0..200 {
+        if opened.harness.session().failure().is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        opened
+            .harness
+            .session()
+            .failure()
+            .is_some_and(|failure| failure.contains("terminal commit failed"))
+    );
+    let span = recorder.last_span("pi.durable.phase");
+    assert!(span.ended, "the failed terminal commit still ends its span");
+    assert_eq!(
+        span.end_attributes["outcome"], "aborted",
+        "an uncommitted terminal outcome must not leak into the phase: {:?}",
+        span.end_attributes
+    );
+    let metrics = recorder.0.metrics.lock().expect("metrics");
+    assert!(metrics.iter().any(|(name, _, attributes)| {
+        name == "pi.durable.phase.duration" && attributes["outcome"] == "aborted"
+    }));
 }

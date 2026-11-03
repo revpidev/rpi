@@ -283,8 +283,10 @@ struct Invocation {
     trace: Option<crate::chord::telemetry::TelemetryCarrier>,
     /// Immutable creation-time links, attached to every phase span.
     links: Option<Vec<crate::chord::telemetry::TelemetryCarrier>>,
-    /// Terminal outcome committed by this invocation, for the phase span.
+    /// Outcome staged by a terminal commit; cleared if that commit fails.
     terminal_outcome: Mutex<Option<TaskOutcome>>,
+    /// Scheduler-decided fault, retained even if its commit fails (upstream `invocation.fault`).
+    fault: Mutex<Option<TaskOutcome>>,
     controller: CancellationToken,
     /// Context passed to handlers; cancelled by `controller`.
     context: Context,
@@ -857,10 +859,7 @@ impl SchedulerInner {
         info: crate::harness::types::ReportInfo,
         context: Option<&Context>,
     ) {
-        let telemetry = context
-            .map(Context::telemetry)
-            .unwrap_or_else(|| self.telemetry.clone());
-        emit_report_telemetry(&telemetry, &info);
+        emit_report_telemetry(&self.telemetry, &info, context);
         if let Some(report) = &self.report_info {
             // A host callback that throws is contained (upstream `contained`).
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(info)));
@@ -1371,9 +1370,9 @@ impl SchedulerInner {
 
     /// Fail the Session for one of the scheduler's own commits; ignored once
     /// closing. The Session reports the failure once.
-    fn fail_session(&self, error: impl std::fmt::Display) {
+    fn fail_session(&self, error: impl std::fmt::Display, context: Option<&Context>) {
         if !self.closing.load(Ordering::SeqCst) {
-            self.session.fail(error.to_string());
+            self.session.fail_with_context(error.to_string(), context);
         }
     }
 
@@ -1757,7 +1756,7 @@ impl SchedulerInner {
                     set.insert(id);
                 }
             }
-            self.fail_session(error);
+            self.fail_session(error, None);
         }
         self.settle_idle();
     }
@@ -2265,7 +2264,7 @@ impl SchedulerInner {
         }
         .await;
         if let Err(error) = result {
-            self.fail_session(error);
+            self.fail_session(error, None);
         }
         self.draining.store(false, Ordering::SeqCst);
         // A wakeup that arrived during a failed pass still needs its pass.
@@ -2601,6 +2600,7 @@ impl SchedulerInner {
             trace: record.trace.clone(),
             links,
             terminal_outcome: Mutex::new(None),
+            fault: Mutex::new(None),
             controller,
             context,
             watches: Mutex::new(Vec::new()),
@@ -2746,14 +2746,35 @@ impl SchedulerInner {
         parent.start_span("pi.durable.phase", attributes, links)
     }
 
-    /// The end outcome of a finished phase, from its terminal outcome, the
-    /// next state, or the live record it left behind.
+    fn committed_outcome(&self, invocation: &Invocation) -> Option<TaskOutcome> {
+        self.live
+            .lock()
+            .ok()
+            .and_then(|live| live.get(&invocation.task_id).cloned())
+            .and_then(|record| match record.state {
+                TaskState::Completing { outcome } | TaskState::Terminal { outcome } => {
+                    Some(outcome)
+                }
+                _ => None,
+            })
+    }
+
+    /// The end outcome of a finished phase, from the scheduler's fault or the
+    /// committed record, then the next state (upstream `#phase` finally).
     fn phase_outcome(&self, invocation: &Invocation, next: Option<&RunningTask>) -> String {
         if let Some(outcome) = invocation
-            .terminal_outcome
+            .fault
             .lock()
             .ok()
             .and_then(|outcome| outcome.clone())
+            .or_else(|| {
+                invocation
+                    .terminal_outcome
+                    .lock()
+                    .ok()
+                    .and_then(|outcome| outcome.clone())
+            })
+            .or_else(|| self.committed_outcome(invocation))
         {
             return match outcome {
                 TaskOutcome::Completed { .. } => "done".to_string(),
@@ -2777,8 +2798,6 @@ impl SchedulerInner {
             _ if invocation.ended.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) => {
                 "aborted".to_string()
             }
-            // Upstream's `next=${checkpoint.phase}`: the phase the record would
-            // run next, which a failed commit leaves in place.
             Some(_) => match record
                 .as_ref()
                 .and_then(|record| record_checkpoint(record).get("phase").cloned())
@@ -2798,10 +2817,18 @@ impl SchedulerInner {
         previous: Option<&PhaseResult>,
     ) -> Option<String> {
         if let Some(outcome) = invocation
-            .terminal_outcome
+            .fault
             .lock()
             .ok()
             .and_then(|outcome| outcome.clone())
+            .or_else(|| {
+                invocation
+                    .terminal_outcome
+                    .lock()
+                    .ok()
+                    .and_then(|outcome| outcome.clone())
+            })
+            .or_else(|| self.committed_outcome(invocation))
         {
             match outcome {
                 TaskOutcome::Completed { .. } | TaskOutcome::Aborted { .. } => return None,
@@ -3044,7 +3071,7 @@ impl SchedulerInner {
                                     detail: None,
                                 },
                             };
-                            if let Ok(mut slot) = inv.terminal_outcome.lock() {
+                            if let Ok(mut slot) = inv.fault.lock() {
                                 *slot = Some(outcome.clone());
                             }
                             this.terminate(tx, &current.record, outcome).await?;
@@ -3059,8 +3086,11 @@ impl SchedulerInner {
         match result {
             Ok(value) => Ok(value),
             Err(error) => {
+                if let Ok(mut slot) = invocation.terminal_outcome.lock() {
+                    *slot = None;
+                }
                 self.end(invocation);
-                self.fail_session(error);
+                self.fail_session(error, Some(context));
                 Ok(None)
             }
         }
@@ -3730,29 +3760,45 @@ impl TaskRuntime for InvocationRuntime {
 
     async fn owned_tasks(&self, context: &Context) -> SessionResult<Vec<TaskRecord>> {
         self.ensure_open()?;
-        // A cancelled caller does not get a list (upstream `throwIfAborted`).
         if let Some(signal) = context.abort_signal()
             && signal.is_cancelled()
         {
             return Err(SessionError::Aborted);
         }
-        let task_id = self.invocation.task_id;
-        let mut owned: Vec<TaskRecord> = self
-            .inner
-            .live
-            .lock()
-            .map(|live| {
-                live.values()
-                    .filter(|record| {
-                        record.owner == Some(task_id)
-                            && !matches!(record.state, TaskState::Terminal { .. })
-                    })
-                    .cloned()
-                    .collect()
+        let inner = Arc::clone(&self.inner);
+        let invocation = Arc::clone(&self.invocation);
+        let context = context.clone();
+        self.inner
+            .session
+            .read_on_line(move || {
+                Box::pin(async move {
+                    if invocation.ended.load(Ordering::SeqCst) {
+                        return Err(ended_error(invocation.task_id));
+                    }
+                    if let Some(signal) = context.abort_signal()
+                        && signal.is_cancelled()
+                    {
+                        return Err(SessionError::Aborted);
+                    }
+                    let task_id = invocation.task_id;
+                    let mut owned: Vec<TaskRecord> = inner
+                        .live
+                        .lock()
+                        .map(|live| {
+                            live.values()
+                                .filter(|record| {
+                                    record.owner == Some(task_id)
+                                        && !matches!(record.state, TaskState::Terminal { .. })
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    owned.sort_by_key(|record| record.id);
+                    Ok(owned)
+                })
             })
-            .unwrap_or_default();
-        owned.sort_by_key(|record| record.id);
-        Ok(owned)
+            .await
     }
 
     async fn abort_owned(&self, id: TaskId, context: &Context) -> SessionResult<()> {
@@ -4442,12 +4488,12 @@ fn overlay_of(tx: &Transaction) -> Overlay {
     Overlay { tasks, edges }
 }
 
-/// Replace a live record's state; memos disappear once an outcome is decided.
-/// Emit one report's fixed telemetry: the event carries only its kind's
-/// attributes, and the counter only its type (upstream `safeReport`).
+/// Emit one report's fixed telemetry: the counter always uses the root context,
+/// while the event exists only on a caller-supplied context (upstream `safeReport`).
 pub(crate) fn emit_report_telemetry(
     telemetry: &crate::chord::telemetry::TelemetryContext,
     info: &crate::harness::types::ReportInfo,
+    context: Option<&Context>,
 ) {
     let mut attributes = JsonObject::new();
     attributes.insert(
@@ -4490,7 +4536,11 @@ pub(crate) fn emit_report_telemetry(
         crate::harness::types::ReportKind::SessionFailed
         | crate::harness::types::ReportKind::ListenerError => {}
     }
-    telemetry.add_event("pi.durable.report", attributes);
+    if let Some(context) = context {
+        context
+            .telemetry()
+            .add_event("pi.durable.report", attributes);
+    }
     telemetry.record_metric(
         "pi.durable.reports",
         1.0,
@@ -4576,5 +4626,93 @@ fn json_equal(left: &JsonValue, right: &JsonValue) -> bool {
                 })
         }
         _ => left == right,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn owned_tasks_rechecks_the_invocation_on_the_mutation_line() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let session = SessionImpl::new(Arc::clone(&storage), None);
+        let inner = Arc::new(SchedulerInner::new(SchedulerDeps {
+            session: Arc::clone(&session),
+            storage,
+            models: Models::new(None).into(),
+            registry: Arc::new(crate::harness::registry::RegistryImpl::with_builtins(
+                Vec::new(),
+            )),
+            settings: crate::harness::types::SettingsSource::Fixed(
+                crate::harness::types::HarnessSettings::default(),
+            ),
+            env: None,
+            report: Arc::new(|_| {}),
+            report_info: None,
+            now: Arc::new(|| 0.0),
+            set_timer: None,
+            on_wake: None,
+            telemetry: None,
+            context: crate::chord::context::BACKGROUND_CONTEXT.clone(),
+        }));
+        let task_id: TaskId = crate::ids::id_from_number(2);
+        let conversation_id: ConversationId = crate::ids::id_from_number(1);
+        let record = TaskRecord {
+            id: task_id,
+            conversation_id,
+            kind: "test".to_string(),
+            version: 1,
+            input: JsonValue::Null,
+            trace: None,
+            links: Vec::new(),
+            owner: None,
+            background: false,
+            abort_requested: false,
+            abort_reason: None,
+            abandon_on_restart: false,
+            restarts: None,
+            started_at: None,
+            ended_at: None,
+            state: TaskState::Running {
+                checkpoint: serde_json::json!({ "phase": "step" }),
+            },
+            memos: None,
+        };
+        let invocation = inner.create_invocation(&record, InvocationMode::Run);
+        let runtime = InvocationRuntime {
+            inner: Arc::clone(&inner),
+            invocation: Arc::clone(&invocation),
+            context: invocation.context.clone(),
+            snapshot: Arc::new(Mutex::new(inner.registry.snapshot())),
+            agent: Arc::new(tokio::sync::OnceCell::new()),
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let held_session = Arc::clone(&session);
+        let held = tokio::spawn(async move {
+            held_session
+                .read_on_line(move || {
+                    Box::pin(async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        Ok(())
+                    })
+                })
+                .await
+        });
+        started_rx.await.expect("line held");
+        let mut owned = Box::pin(runtime.owned_tasks(&crate::chord::context::BACKGROUND_CONTEXT));
+        assert!(futures::poll!(&mut owned).is_pending());
+        inner.end(&invocation);
+        release_tx.send(()).expect("release line");
+        let error = owned
+            .await
+            .expect_err("ended invocation must not return a stale list");
+        assert!(
+            error.to_string().contains("invocation has ended"),
+            "{error}"
+        );
+        held.await.expect("join").expect("line job");
     }
 }

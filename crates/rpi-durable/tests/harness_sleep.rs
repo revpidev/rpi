@@ -86,8 +86,11 @@ impl TaskDefinition for SleepTask {
     }
 }
 
-/// One armed callback and its delay.
-type ArmedTimer = (u64, Arc<dyn Fn() + Send + Sync>);
+struct ArmedTimer {
+    delay_ms: u64,
+    background: bool,
+    callback: Arc<dyn Fn() + Send + Sync>,
+}
 
 #[derive(Default)]
 struct FakeTimer {
@@ -99,26 +102,45 @@ struct FakeTimer {
 impl FakeTimer {
     fn set_timer(self: &Arc<Self>) -> SetTimer {
         let timer = Arc::clone(self);
-        Arc::new(move |callback, delay_ms, _options: TimerOptions| {
+        Arc::new(move |callback, delay_ms, options: TimerOptions| {
             if timer.decline {
                 return None;
             }
-            timer
-                .armed
-                .lock()
-                .expect("armed")
-                .push((delay_ms, Arc::clone(&callback)));
+            timer.armed.lock().expect("armed").push(ArmedTimer {
+                delay_ms,
+                background: options.background,
+                callback: Arc::clone(&callback),
+            });
             let timer = Arc::clone(&timer);
             Some(Arc::new(move || {
-                timer.disarmed.fetch_add(1, Ordering::SeqCst);
+                let mut armed = timer.armed.lock().expect("armed");
+                let active = armed.len();
+                armed.retain(|armed| !Arc::ptr_eq(&armed.callback, &callback));
+                if armed.len() != active {
+                    timer.disarmed.fetch_add(1, Ordering::SeqCst);
+                }
             }))
         })
     }
 
+    fn foreground_delays(&self) -> Vec<u64> {
+        self.armed
+            .lock()
+            .expect("armed")
+            .iter()
+            .filter(|armed| !armed.background)
+            .map(|armed| armed.delay_ms)
+            .collect()
+    }
+
     fn fire(&self) {
-        let armed: Vec<_> = self.armed.lock().expect("armed").drain(..).collect();
-        for (_, callback) in armed {
-            callback();
+        let mut armed = self.armed.lock().expect("armed");
+        let (background, foreground): (Vec<_>, Vec<_>) =
+            armed.drain(..).partition(|armed| armed.background);
+        *armed = background;
+        drop(armed);
+        for armed in foreground {
+            (armed.callback)();
         }
     }
 }
@@ -299,7 +321,7 @@ async fn on_wake_replaces_the_timer_and_host_resume_wakes_the_task() {
 
     wait_for_status(&opened.harness, id, TaskStatus::Sleeping).await;
     assert!(
-        timer.armed.lock().expect("armed").is_empty(),
+        timer.foreground_delays().is_empty(),
         "onWake owns the alarm"
     );
     assert!(
@@ -320,6 +342,15 @@ async fn on_wake_replaces_the_timer_and_host_resume_wakes_the_task() {
         .await
         .expect("settle");
     assert_eq!(settled.result, serde_json::json!({ "woke": true }));
+    opened
+        .harness
+        .close(&BACKGROUND_CONTEXT.clone())
+        .await
+        .expect("close");
+    assert!(
+        timer.armed.lock().expect("armed").is_empty(),
+        "background document timers are released on close"
+    );
 }
 
 #[tokio::test]

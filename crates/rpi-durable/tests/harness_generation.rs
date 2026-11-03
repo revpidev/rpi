@@ -60,26 +60,39 @@ fn assistant_texts(entries: &[EntryRecord]) -> Vec<String> {
     texts
 }
 
-type PartialArmed = std::sync::Mutex<Vec<(u64, Arc<dyn Fn() + Send + Sync>)>>;
+struct ArmedPartial {
+    background: bool,
+    callback: Arc<dyn Fn() + Send + Sync>,
+}
+
+type PartialArmed = std::sync::Mutex<Vec<ArmedPartial>>;
 
 #[derive(Default)]
 struct PartialTimer {
     armed: PartialArmed,
-    delays: std::sync::Mutex<Vec<u64>>,
-    armed_total: Arc<AtomicUsize>,
-    disarmed: Arc<AtomicUsize>,
+    delays: std::sync::Mutex<Vec<(u64, bool)>>,
 }
 
 impl PartialTimer {
     fn set_timer(self: &Arc<Self>) -> rpi_durable::harness::SetTimer {
         let timer = Arc::clone(self);
-        Arc::new(move |callback, delay, _options| {
-            timer.armed_total.fetch_add(1, Ordering::SeqCst);
-            timer.delays.lock().expect("delays").push(delay);
-            timer.armed.lock().expect("armed").push((delay, callback));
-            let disarmed = Arc::clone(&timer.disarmed);
+        Arc::new(move |callback, delay, options| {
+            timer
+                .delays
+                .lock()
+                .expect("delays")
+                .push((delay, options.background));
+            timer.armed.lock().expect("armed").push(ArmedPartial {
+                background: options.background,
+                callback: Arc::clone(&callback),
+            });
+            let timer = Arc::clone(&timer);
             Some(Arc::new(move || {
-                disarmed.fetch_add(1, Ordering::SeqCst);
+                timer
+                    .armed
+                    .lock()
+                    .expect("armed")
+                    .retain(|armed| !Arc::ptr_eq(&armed.callback, &callback));
             }))
         })
     }
@@ -89,14 +102,18 @@ impl PartialTimer {
             .lock()
             .expect("delays")
             .iter()
-            .filter(|candidate| **candidate == delay)
+            .filter(|(candidate, background)| *candidate == delay && !background)
             .count()
     }
 
     fn fire(&self) {
-        let callbacks: Vec<_> = self.armed.lock().expect("armed").drain(..).collect();
-        for (_, callback) in callbacks {
-            callback();
+        let mut armed = self.armed.lock().expect("armed");
+        let (background, foreground): (Vec<_>, Vec<_>) =
+            armed.drain(..).partition(|armed| armed.background);
+        *armed = background;
+        drop(armed);
+        for armed in foreground {
+            (armed.callback)();
         }
     }
 }
@@ -625,12 +642,12 @@ async fn partial_progress_uses_the_harness_timer() {
     let conversation = root_ready(&opened.harness).await;
     let _submission = submit_input(&conversation, "partial").await;
     for _ in 0..200 {
-        if !timer.armed.lock().expect("armed").is_empty() {
+        if timer.arms_with_delay(500) == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert_eq!(timer.armed.lock().expect("armed")[0].0, 500);
+    assert_eq!(timer.arms_with_delay(500), 1);
     let live = opened
         .harness
         .session()
@@ -671,17 +688,11 @@ async fn partial_progress_uses_the_harness_timer() {
             .and_then(|generation| generation.message)
             .is_some()
         {
-            let armed = timer.armed_total.load(Ordering::SeqCst);
-            let disarmed = timer.disarmed.load(Ordering::SeqCst);
-            assert!(
-                armed - disarmed <= 1,
-                "timers accumulated: armed={armed}, disarmed={disarmed}"
-            );
+            assert_eq!(timer.arms_with_delay(500), 1);
             opened.harness.close(&context()).await.expect("close");
-            assert_eq!(
-                timer.armed_total.load(Ordering::SeqCst),
-                timer.disarmed.load(Ordering::SeqCst),
-                "every timer is disarmed after close"
+            assert!(
+                timer.armed.lock().expect("armed").is_empty(),
+                "every timer is released after close"
             );
             return;
         }
@@ -788,9 +799,9 @@ async fn continuous_partials_do_not_rearm_the_timer_until_a_flush() {
         Some("onetwothree")
     );
     opened.harness.close(&context()).await.expect("close");
-    assert_eq!(
-        timer.armed_total.load(Ordering::SeqCst),
-        timer.disarmed.load(Ordering::SeqCst)
+    assert!(
+        timer.armed.lock().expect("armed").is_empty(),
+        "every timer is released after close"
     );
 }
 
@@ -852,9 +863,9 @@ async fn zero_partial_interval_does_not_arm_without_pending_output() {
     );
     assert_eq!(timer.arms_with_delay(0), armed_after_partial);
     opened.harness.close(&context()).await.expect("close");
-    assert_eq!(
-        timer.armed_total.load(Ordering::SeqCst),
-        timer.disarmed.load(Ordering::SeqCst)
+    assert!(
+        timer.armed.lock().expect("armed").is_empty(),
+        "every timer is released after close"
     );
 }
 

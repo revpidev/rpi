@@ -1,175 +1,26 @@
 #!/usr/bin/env python3
-"""Synchronize the four configuration schemas from the pinned Pi checkout.
+"""Generate the four configuration schemas from rpi's typed configuration models.
 
-The schemas are generated upstream from the TypeScript configuration models
-(settings/models/keybindings/theme). rpi keeps the same contracts, so this
-script vendors the generated JSON, rewrites the public `$id` from pi.dev to
-revpi.dev and writes both the repository copy (`schemas/`) and the site copy
-(`../rpi-pages/schemas/`). No schema is hand-edited.
+The Rust generator and the runtime loaders share the same document definitions.
+This wrapper preserves the existing command-line interface and forwards to the
+generator, which writes both `schemas/` and `../rpi-pages/schemas/`.
 """
 
 from __future__ import annotations
 
-import argparse
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-UPSTREAM = ROOT / "external" / "pi"
-SOURCE_DIR = UPSTREAM / "packages" / "coding-agent" / "schemas"
-OUTPUT_DIR = ROOT / "schemas"
-SITE_DIR = ROOT.parent / "rpi-pages" / "schemas"
-SCHEMAS = (
-    "settings.schema.json",
-    "models.schema.json",
-    "keybindings.schema.json",
-    "theme.schema.json",
-)
-EXPECTED_PIN = "4a080252f06caf63a525d7873c5d94d3c23887e0"
-GENERATED_COMMENT = (
-    "This file is generated from the pinned Pi v1.4.0 TypeScript source "
-    "(4a080252f) by scripts/sync-config-schemas.py in the rpi repository. "
-    "Do not edit it manually; run the script to refresh it."
-)
-ID_RE = re.compile(r'"\$id"\s*:\s*"https://pi\.dev/schemas/([^"]+)"')
-COMMENT_RE = re.compile(r'"\$comment"\s*:\s*"[^"]*"')
-# Upstream describes `auto` as "Radius when authenticated, otherwise a gist".
-# rpi has no Radius share backend, so the published contract must describe the
-# actual mapping instead of promising a service rpi never calls.
-UPSTREAM_SHARE_DESCRIPTION = (
-    '"description": "Destination used by /share. \\"auto\\" uses Radius when '
-    'authenticated and otherwise creates a GitHub gist."'
-)
-RPI_SHARE_DESCRIPTION = (
-    '"description": "Destination used by /share. \\"auto\\" and \\"gist\\" '
-    'create a GitHub gist; \\"radius\\" is recognized but unsupported and '
-    'fails explicitly."'
-)
-
-
-class SyncError(Exception):
-    pass
-
-
-def assert_pin() -> None:
-    try:
-        head = subprocess.check_output(
-            ["git", "-C", str(UPSTREAM), "rev-parse", "HEAD"], text=True
-        ).strip()
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise SyncError(f"cannot read external/pi HEAD: {error}") from error
-    if head != EXPECTED_PIN:
-        raise SyncError(
-            f"external/pi HEAD is {head}, expected {EXPECTED_PIN}; update the "
-            "ADR/UPSTREAM pin before regenerating schemas"
-        )
-
-
-def render(source: Path) -> bytes:
-    text = source.read_text(encoding="utf-8")
-    text, ids = ID_RE.subn(
-        lambda match: f'"$id": "https://revpi.dev/schemas/{match.group(1)}"', text
-    )
-    if ids != 1:
-        raise SyncError(f"{source}: expected exactly one pi.dev $id, found {ids}")
-    text, comments = COMMENT_RE.subn(f'"$comment": "{GENERATED_COMMENT}"', text)
-    if comments != 1:
-        raise SyncError(f"{source}: expected exactly one $comment, found {comments}")
-    app_text = {
-        "models.schema.json": [
-            ("pi infers", "rpi infers", 1),
-            ("pi-controlled values", "rpi-controlled values", 2),
-            ("Pi warms only tiers", "rpi warms only tiers", 2),
-            ("When omitted, Pi auto-detects", "When omitted, rpi auto-detects", 1),
-        ],
-        "settings.schema.json": [
-            ("Pi-managed HTTP clients", "rpi-managed HTTP clients", 1),
-        ],
-        "theme.schema.json": [
-            ("Pi Coding Agent Theme", "Rpi Coding Agent Theme", 1),
-            ("Theme schema for Pi coding agent", "Theme schema for the rpi coding agent", 1),
-        ],
-    }
-    for old, new, expected in app_text.get(source.name, []):
-        count = text.count(old)
-        if count != expected:
-            raise SyncError(
-                f"{source}: expected {expected} occurrence(s) of {old!r}, found {count}"
-            )
-        text = text.replace(old, new)
-    if source.name == "settings.schema.json":
-        text, share = text.replace(
-            UPSTREAM_SHARE_DESCRIPTION, RPI_SHARE_DESCRIPTION
-        ), text.count(UPSTREAM_SHARE_DESCRIPTION)
-        if share != 1:
-            raise SyncError(
-                f"{source}: expected exactly one sessionShareDestination "
-                f"description, found {share}"
-            )
-    if "https://pi.dev" in text:
-        raise SyncError(f"{source}: a pi.dev reference survived the rewrite")
-    return text.encode("utf-8")
-
-
-def expected_files() -> dict[str, bytes]:
-    files: dict[str, bytes] = {}
-    for name in SCHEMAS:
-        source = SOURCE_DIR / name
-        if not source.is_file():
-            raise SyncError(f"missing upstream schema: {source}")
-        files[name] = render(source)
-    return files
-
-
-def write_files(files: dict[str, bytes], output: Path) -> None:
-    output.mkdir(parents=True, exist_ok=True)
-    for name, data in files.items():
-        (output / name).write_bytes(data)
-
-
-def check_files(files: dict[str, bytes], output: Path) -> bool:
-    if not output.is_dir():
-        if output == OUTPUT_DIR:
-            print(f"missing repository schema directory: {output}", file=sys.stderr)
-            return False
-        print(f"note: {output} not present; skipping site copy", file=sys.stderr)
-        return True
-    ok = True
-    for name, data in files.items():
-        target = output / name
-        if not target.is_file() or target.read_bytes() != data:
-            print(f"out of date: {target}", file=sys.stderr)
-            ok = False
-    return ok
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--check", action="store_true")
-    parser.add_argument("--no-site", action="store_true")
-    args = parser.parse_args()
-
-    try:
-        assert_pin()
-        files = expected_files()
-        outputs = [OUTPUT_DIR]
-        if not args.no_site:
-            outputs.append(SITE_DIR)
-        if args.check:
-            results = [check_files(files, output) for output in outputs]
-            return 0 if all(results) else 1
-        for output in outputs:
-            write_files(files, output)
-        print(
-            "config schemas synchronized: "
-            + ", ".join(str(output) for output in outputs)
-        )
-        return 0
-    except SyncError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
+    return subprocess.run(
+        ["cargo", "run", "-q", "-p", "rpi", "--bin", "generate_config_schemas", "--", *sys.argv[1:]],
+        cwd=ROOT,
+        check=False,
+    ).returncode
 
 
 if __name__ == "__main__":

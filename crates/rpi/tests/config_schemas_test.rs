@@ -1,8 +1,7 @@
 //! V18-02 R3.1.1: the four published configuration schemas are generated from
-//! the pinned Pi v1.4.0 configuration models, branded for revpi.dev and free
-//! of pi.dev endpoints. Runtime loading is covered by the settings/theme
-//! tests; this test pins the public artifacts and validates representative
-//! documents against them.
+//! rpi's typed configuration models, branded for revpi.dev and free of pi.dev
+//! endpoints. These tests pin the public artifacts and check both published
+//! validation and the runtime loader contract.
 
 use std::path::PathBuf;
 
@@ -150,4 +149,127 @@ fn builtin_theme_validates_against_the_published_theme_schema() {
         "theme: {:?}",
         validator.iter_errors(&theme).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn settings_schema_rejects_invalid_rpi_own_values() {
+    let (_schema, validator) = schema("settings.schema.json");
+    for settings in [
+        serde_json::json!({"usage": {"providers": {"deepseek": {"script": 42}}}}),
+        serde_json::json!({"usage": {"providers": {"deepseek": ""}}}),
+        serde_json::json!({"usage": {"timeoutMs": -1}}),
+        serde_json::json!({"statusLine": {"type": "other"}}),
+        serde_json::json!({"terminal": {"images": "other"}}),
+    ] {
+        assert!(!validator.is_valid(&settings), "accepted {settings}");
+    }
+}
+
+#[test]
+fn settings_schema_and_loader_share_numeric_union_and_null_contracts() {
+    let (_schema, validator) = schema("settings.schema.json");
+    let check = |settings: Value, accepted: bool| {
+        assert_eq!(
+            validator.is_valid(&settings),
+            accepted,
+            "schema {settings}: {:?}",
+            validator.iter_errors(&settings).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rpi::core::config_schemas::validate_settings_document(&settings).is_ok(),
+            accepted,
+            "typed loader {settings}"
+        );
+    };
+    check(
+        serde_json::json!({
+            "usage": {"timeoutMs": 1500.9},
+            "codemode": {"inlineBudget": 12.9},
+            "branchSummary": {"reserveTokens": 10.9},
+            "retry": {"maxRetries": 3.9, "provider": {"timeoutMs": 10.9}},
+            "terminal": {"imageWidthCells": 80.9},
+            "fullscreenWheelScrollLines": 7.9,
+            "editorPaddingX": 2.9,
+            "autocompleteMaxVisible": 9.9
+        }),
+        true,
+    );
+    for settings in [
+        serde_json::json!({"compaction": {"reserveTokens": 12.9}}),
+        serde_json::json!({"thinkingBudgets": {"medium": 100.9}}),
+        serde_json::json!({"usage": {"refreshMs": 200.9}}),
+        serde_json::json!({"statusLine": {"type": "command"}}),
+        serde_json::json!({"statusLine": {"type": "command", "command": "  "}}),
+        serde_json::json!({"statusLine": {"command": "status"}}),
+        serde_json::json!({"usage": {"providers": {"": "deepseek.py"}}}),
+        serde_json::json!({"defaultModel": null}),
+        serde_json::json!({"retry": {"provider": {"timeoutMs": null}}}),
+    ] {
+        check(settings, false);
+    }
+}
+
+#[test]
+fn runtime_settings_preserve_null_merging_but_validate_rpi_scopes() {
+    let (_schema, validator) = schema("settings.schema.json");
+    for settings in [
+        serde_json::json!({"theme": null}),
+        serde_json::json!({"queueMode": null}),
+        serde_json::json!({"packages": null}),
+        serde_json::json!({"retry": {"provider": {"timeoutMs": null}}}),
+    ] {
+        assert!(!validator.is_valid(&settings));
+        rpi::core::config_schemas::validate_runtime_settings_document(&settings)
+            .expect("raw merge value stays loadable");
+    }
+    for settings in [
+        serde_json::json!({"usage": null}),
+        serde_json::json!({"statusLine": null}),
+    ] {
+        assert!(rpi::core::config_schemas::validate_runtime_settings_document(&settings).is_err());
+    }
+}
+
+#[test]
+fn models_and_keybindings_schemas_enforce_their_typed_shapes() {
+    let (_models, models) = schema("models.schema.json");
+    let mut valid = serde_json::json!({"providers": {}});
+    valid["providers"]["custom"] = serde_json::json!({
+        "baseUrl": "https://example.test/v1",
+        "oauth": "radius",
+        "models": [{"id": "m1", "thinkingLevelMap": {"high": null}}],
+        "modelOverrides": {"m1": {"thinkingLevelMap": {"low": null}}}
+    });
+    let mut invalid = serde_json::json!({"providers": {}});
+    invalid["providers"]["custom"] = serde_json::json!({
+        "baseUrl": "https://example.test/v1",
+        "oauth": "other",
+        "models": [{"id": "m1"}]
+    });
+    assert!(models.is_valid(&valid));
+    assert!(!models.is_valid(&invalid));
+    valid["providers"]["custom"]["compat"] = serde_json::json!({
+        "supportsStore": true,
+        "chatTemplateKwargs": {"plain": null},
+        "openRouterRouting": {"sort": {"partition": null}}
+    });
+    assert!(models.is_valid(&valid));
+    for provider in [
+        serde_json::json!({"baseUrl": ""}),
+        serde_json::json!({"baseUrl": null}),
+        serde_json::json!({"models": [{"id": ""}]}),
+        serde_json::json!({"models": [{"id": "m", "contextWindow": 0}]}),
+        serde_json::json!({"modelOverrides": {"m": {"maxTokens": 0}}}),
+        serde_json::json!({"models": [{"id": "m", "promptCache": {"short": 0}}]}),
+        serde_json::json!({"models": [{"id": "m", "inputLimits": {"maxRequestBytes": 0}}]}),
+        serde_json::json!({"models": [{"id": "m", "inputLimits": {"images": {"maxPerMessage": 0}}}]}),
+        serde_json::json!({"compat": {"supportsStore": "yes"}}),
+    ] {
+        let candidate = serde_json::json!({"providers": {"custom": provider}});
+        assert!(!models.is_valid(&candidate), "accepted {candidate}");
+    }
+
+    let (_keybindings, keybindings) = schema("keybindings.schema.json");
+    assert!(keybindings.is_valid(&serde_json::json!({"tui.editor.cursorUp": ["ctrl+up", "up"]})));
+    assert!(!keybindings.is_valid(&serde_json::json!({"tui.editor.cursorUp": 42})));
 }

@@ -34,13 +34,6 @@
 //! - The `themeName ?? currentThemeName ?? getDefaultTheme()` fallback
 //!   (theme.ts:1023) drops the `currentThemeName` global (no theme globals
 //!   in rpi): `None` resolves straight to the terminal-detected default.
-//! - Upstream substitutes the viewer assets with JS
-//!   `String.prototype.replace(placeholder, string)`, whose string
-//!   replacement interprets `$$`, `$&`, `` $` `` and `$'`. rpi uses literal
-//!   `replacen`, so a `$${...}` template literal in `template.js` keeps its
-//!   literal dollar sign here while upstream's exported HTML drops it (for
-//!   example the cost line renders `$0.123` here instead of `0.123`). The
-//!   asset bytes stay identical; this is a deliberate output improvement.
 //! - Async upstream signatures are synchronous here (pure CPU + file IO).
 
 use std::path::{Path, PathBuf};
@@ -283,9 +276,41 @@ fn generate_theme_vars(theme_name: Option<&str>) -> String {
     lines.join("\n      ")
 }
 
+/// Replace the first placeholder with JavaScript `String.prototype.replace`
+/// replacement-string semantics. The string search value has no capture groups,
+/// so `$1`…`$99` and `$<name>` stay literal.
+fn js_replace(input: &str, placeholder: &str, replacement: &str) -> String {
+    let Some(index) = input.find(placeholder) else {
+        return input.to_string();
+    };
+    let before = &input[..index];
+    let after = &input[index + placeholder.len()..];
+    let mut output = String::with_capacity(input.len() + replacement.len());
+    output.push_str(before);
+    let mut chars = replacement.chars();
+    while let Some(character) = chars.next() {
+        if character != '$' {
+            output.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('$') => output.push('$'),
+            Some('&') => output.push_str(placeholder),
+            Some('`') => output.push_str(before),
+            Some('\'') => output.push_str(after),
+            Some(other) => {
+                output.push('$');
+                output.push(other);
+            }
+            None => output.push('$'),
+        }
+    }
+    output.push_str(after);
+    output
+}
+
 /// `generateHtml` (index.ts:143-175): substitute the placeholders in the
-/// same order as upstream (JS `String.replace` replaces the first
-/// occurrence; `replacen(…, 1)` matches).
+/// same order and with the same replacement patterns as upstream.
 fn generate_html(session_data: &SessionData, theme_name: Option<&str>) -> Result<String, RpiError> {
     let name = resolve_theme_name(theme_name);
     let theme_vars = generate_theme_vars(Some(&name));
@@ -307,19 +332,17 @@ fn generate_html(session_data: &SessionData, theme_name: Option<&str>) -> Result
     let session_data_base64 =
         base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(session_data)?);
 
-    let css = TEMPLATE_CSS
-        .replacen("{{THEME_VARS}}", &theme_vars, 1)
-        .replacen("{{BODY_BG}}", body_bg, 1)
-        .replacen("{{CONTAINER_BG}}", container_bg, 1)
-        .replacen("{{INFO_BG}}", info_bg, 1);
+    let css = js_replace(TEMPLATE_CSS, "{{THEME_VARS}}", &theme_vars);
+    let css = js_replace(&css, "{{BODY_BG}}", body_bg);
+    let css = js_replace(&css, "{{CONTAINER_BG}}", container_bg);
+    let css = js_replace(&css, "{{INFO_BG}}", info_bg);
 
-    Ok(TEMPLATE_HTML
-        .replacen("{{CSS}}", &css, 1)
-        .replacen("{{JS}}", TEMPLATE_JS, 1)
-        .replacen("{{SESSION_DATA}}", &session_data_base64, 1)
-        .replacen("{{MARKED_JS}}", MARKED_JS, 1)
-        .replacen("{{MARKED_CJK_FRIENDLY_JS}}", MARKED_CJK_FRIENDLY_JS, 1)
-        .replacen("{{HIGHLIGHT_JS}}", HIGHLIGHT_JS, 1))
+    let html = js_replace(TEMPLATE_HTML, "{{CSS}}", &css);
+    let html = js_replace(&html, "{{JS}}", TEMPLATE_JS);
+    let html = js_replace(&html, "{{SESSION_DATA}}", &session_data_base64);
+    let html = js_replace(&html, "{{MARKED_JS}}", MARKED_JS);
+    let html = js_replace(&html, "{{MARKED_CJK_FRIENDLY_JS}}", MARKED_CJK_FRIENDLY_JS);
+    Ok(js_replace(&html, "{{HIGHLIGHT_JS}}", HIGHLIGHT_JS))
 }
 
 /// `basename(path, ".jsonl")`: strip the `.jsonl` suffix only.
@@ -526,6 +549,25 @@ mod tests {
     // generateHtml structure (index.ts:143-175)
     // ---------------------------------------------------------------
 
+    #[test]
+    fn js_replace_matches_upstream_replacement_patterns() {
+        for (replacement, expected) in [
+            ("$$", "left$right"),
+            ("$&", "left{{JS}}right"),
+            ("$`", "leftleftright"),
+            ("$'", "leftrightright"),
+            ("$1", "left$1right"),
+            ("$01", "left$01right"),
+            ("$<x>", "left$<x>right"),
+        ] {
+            assert_eq!(
+                js_replace("left{{JS}}right", "{{JS}}", replacement),
+                expected
+            );
+        }
+        assert_eq!(js_replace("unchanged", "{{JS}}", "$$"), "unchanged");
+    }
+
     fn sample_session_data() -> SessionData {
         SessionData {
             header: serde_json::json!({"type": "session", "version": 3, "id": "s1",
@@ -559,7 +601,6 @@ mod tests {
             "{{SESSION_DATA}}",
             "{{MARKED_JS}}",
             "{{MARKED_CJK_FRIENDLY_JS}}",
-            "{{HIGHLIGHT_JS}}",
             "{{THEME_VARS}}",
             "{{BODY_BG}}",
             "{{CONTAINER_BG}}",
@@ -567,6 +608,11 @@ mod tests {
         ] {
             assert!(!html.contains(placeholder), "leftover {placeholder}");
         }
+        assert_eq!(
+            html.matches("{{HIGHLIGHT_JS}}").count(),
+            1,
+            "the highlight asset's regex character class re-inserts its placeholder once, as upstream"
+        );
         let mut remaining = html;
         while let Some(open) = remaining.find("{{") {
             let after_open = &remaining[open + 2..];
@@ -574,7 +620,8 @@ mod tests {
                 panic!("unclosed template marker");
             };
             let candidate = &after_open[..close];
-            if !candidate.is_empty()
+            if candidate != "HIGHLIGHT_JS"
+                && !candidate.is_empty()
                 && candidate
                     .chars()
                     .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
@@ -602,6 +649,8 @@ mod tests {
         // Theme export colors land in the CSS (dark theme explicit values).
         assert!(html.contains("--exportPageBg: #21252c;"));
         assert!(html.contains("--body-bg: #21252c;"), "body bg substituted");
+        assert!(html.contains("${totalCost.toFixed(3)}"));
+        assert!(!html.contains("$${totalCost.toFixed(3)}"));
     }
 
     #[test]

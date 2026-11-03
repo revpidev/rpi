@@ -1,774 +1,489 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://revpi.dev/schemas/settings.schema.json",
-  "$comment": "This file is generated from the pinned Pi v1.4.0 TypeScript source (4a080252f) by scripts/sync-config-schemas.py in the rpi repository. Do not edit it manually; run the script to refresh it.",
+  "title": "SettingsDocument",
   "type": "object",
   "properties": {
     "$schema": {
-      "type": "string",
-      "description": "JSON Schema reference."
+      "type": [
+        "string"
+      ],
+      "default": null
     },
     "lastChangelogVersion": {
-      "type": "string"
+      "type": [
+        "string"
+      ],
+      "default": null
     },
     "defaultProvider": {
-      "type": "string"
+      "type": [
+        "string"
+      ],
+      "default": null
     },
     "defaultModel": {
-      "type": "string"
+      "type": [
+        "string"
+      ],
+      "default": null
     },
     "defaultThinkingLevel": {
-      "$ref": "#/$defs/ModelThinkingLevel"
-    },
-    "modelThinkingLevels": {
-      "type": "object",
-      "patternProperties": {
-        "^.*$": {
+      "anyOf": [
+        {
           "$ref": "#/$defs/ModelThinkingLevel"
         }
+      ],
+      "default": null
+    },
+    "modelThinkingLevels": {
+      "type": [
+        "object"
+      ],
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelThinkingLevel"
       },
-      "description": "Per-model default thinking level overrides keyed by \"provider/modelId\"."
+      "default": null
     },
     "transport": {
       "anyOf": [
         {
-          "type": "string",
-          "const": "auto"
-        },
-        {
-          "type": "string",
-          "const": "sse"
-        },
-        {
-          "type": "string",
-          "const": "websocket"
-        },
-        {
-          "type": "string",
-          "const": "websocket-cached"
+          "$ref": "#/$defs/Transport"
         }
       ],
-      "default": "auto"
+      "default": null
     },
     "sessionShareDestination": {
+      "description": "Destination used by /share. \"auto\" and \"gist\" create a GitHub gist; \"radius\" is recognized but unsupported and fails explicitly.",
       "anyOf": [
         {
-          "type": "string",
-          "const": "auto"
-        },
-        {
-          "type": "string",
-          "const": "gist"
-        },
-        {
-          "type": "string",
-          "const": "radius"
+          "$ref": "#/$defs/SessionShareDestination"
         }
       ],
-      "description": "Destination used by /share. \"auto\" and \"gist\" create a GitHub gist; \"radius\" is recognized but unsupported and fails explicitly.",
-      "default": "auto"
+      "default": null
     },
     "steeringMode": {
       "anyOf": [
         {
-          "type": "string",
-          "const": "all"
-        },
-        {
-          "type": "string",
-          "const": "one-at-a-time"
+          "$ref": "#/$defs/QueueModeDocument"
         }
       ],
-      "default": "one-at-a-time"
+      "default": null
     },
     "followUpMode": {
       "anyOf": [
         {
-          "type": "string",
-          "const": "all"
-        },
-        {
-          "type": "string",
-          "const": "one-at-a-time"
+          "$ref": "#/$defs/QueueModeDocument"
         }
       ],
-      "default": "one-at-a-time"
+      "default": null
     },
     "theme": {
-      "type": "string"
+      "type": [
+        "string"
+      ],
+      "default": null
     },
     "compaction": {
-      "type": "object",
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "default": true
-        },
-        "reserveTokens": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991,
-          "default": 16384
-        },
-        "keepRecentTokens": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991,
-          "default": 20000
-        },
-        "modelOverrides": {
-          "type": "object",
-          "patternProperties": {
-            "^.*$": {
-              "type": "object",
-              "properties": {
-                "reserveTokens": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 9007199254740991
-                },
-                "keepRecentTokens": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 9007199254740991
-                }
-              }
-            }
-          },
-          "description": "Per-model overrides keyed by exact \"provider/modelId\" strings."
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CompactionSettings"
         }
-      }
+      ],
+      "default": null
     },
     "branchSummary": {
-      "type": "object",
-      "properties": {
-        "reserveTokens": {
-          "type": "number",
-          "description": "Tokens reserved for the prompt and LLM response.",
-          "default": 16384
-        },
-        "skipPrompt": {
-          "type": "boolean",
-          "description": "When true, skips the \"Summarize branch?\" prompt and defaults to no summary.",
-          "default": false
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BranchSummarySettings"
         }
-      }
+      ],
+      "default": null
     },
     "retry": {
-      "type": "object",
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "default": true
-        },
-        "maxRetries": {
-          "type": "number",
-          "default": 3
-        },
-        "baseDelayMs": {
-          "type": "number",
-          "description": "Exponential backoff base delay in milliseconds: 2s, 4s, 8s.",
-          "default": 2000
-        },
-        "maxAgentDelayMs": {
-          "type": "number",
-          "default": 60000
-        },
-        "provider": {
-          "type": "object",
-          "properties": {
-            "timeoutMs": {
-              "type": "number",
-              "description": "SDK or provider request timeout in milliseconds."
-            },
-            "maxRetries": {
-              "type": "number",
-              "description": "SDK or provider retry attempts."
-            },
-            "maxRetryDelayMs": {
-              "type": "number",
-              "description": "Maximum server-requested delay before failing.",
-              "default": 60000
-            }
-          }
-        },
-        "maxDelayMs": {
-          "type": "number",
-          "description": "Legacy retry delay setting. Use provider.maxRetryDelayMs instead.",
-          "deprecated": true
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RetrySettings"
         }
-      }
+      ],
+      "default": null
     },
     "hideThinkingBlock": {
-      "type": "boolean",
-      "default": false
+      "type": [
+        "boolean"
+      ],
+      "default": null
     },
     "showCacheMissNotices": {
-      "type": "boolean",
-      "description": "Show cache cost and provider recovery notices.",
-      "default": false
+      "type": [
+        "boolean"
+      ],
+      "default": null
     },
     "externalEditor": {
-      "type": "string",
-      "description": "Command for Ctrl+G external editor; takes precedence over VISUAL and EDITOR."
+      "type": [
+        "string"
+      ],
+      "default": null
     },
     "shellPath": {
-      "type": "string",
-      "description": "Custom shell path, for example for Cygwin on Windows, with support for leading ~ expansion."
+      "type": [
+        "string"
+      ],
+      "default": null
     },
     "quietStartup": {
       "anyOf": [
         {
-          "type": "boolean"
-        },
-        {
-          "type": "string",
-          "const": "header"
+          "$ref": "#/$defs/QuietStartupSetting"
         }
       ],
-      "description": "When true, hide all startup output. When \"header\", keep only the startup header.",
-      "default": false
+      "default": null
     },
     "defaultProjectTrust": {
       "anyOf": [
         {
-          "type": "string",
-          "const": "ask"
-        },
-        {
-          "type": "string",
-          "const": "always"
-        },
-        {
-          "type": "string",
-          "const": "never"
+          "$ref": "#/$defs/DefaultProjectTrust"
         }
       ],
-      "description": "Global setting only.",
-      "default": "ask"
+      "default": null
     },
     "shellCommandPrefix": {
-      "type": "string",
-      "description": "Prefix prepended to every bash command, for example to enable shell aliases."
+      "type": [
+        "string"
+      ],
+      "default": null
     },
     "npmCommand": {
-      "type": "array",
+      "type": [
+        "array"
+      ],
       "items": {
         "type": "string"
       },
-      "description": "Command used for npm package lookup and installation, in argv form such as [\"mise\", \"exec\", \"node@20\", \"--\", \"npm\"]."
+      "default": null
     },
     "collapseChangelog": {
-      "type": "boolean",
-      "description": "Show the condensed changelog after update; use /changelog for the full changelog.",
-      "default": false
+      "type": [
+        "boolean"
+      ],
+      "default": null
     },
     "enableInstallTelemetry": {
-      "type": "boolean",
-      "description": "Send an anonymous version and update ping after changelog-detected updates.",
-      "default": true
+      "type": [
+        "boolean"
+      ],
+      "default": null
     },
     "enableAnalytics": {
-      "type": "boolean",
-      "description": "Opt in to analytics data sharing.",
-      "default": false
+      "type": [
+        "boolean"
+      ],
+      "default": null
     },
     "trackingId": {
-      "type": "string",
-      "description": "Analytics tracking identifier, generated when analytics is enabled."
+      "type": [
+        "string"
+      ],
+      "default": null
     },
     "packages": {
-      "type": "array",
+      "type": [
+        "array"
+      ],
       "items": {
-        "anyOf": [
-          {
-            "type": "string",
-            "description": "Load all resources from the package."
-          },
-          {
-            "type": "object",
-            "required": [
-              "source"
-            ],
-            "properties": {
-              "source": {
-                "type": "string"
-              },
-              "autoload": {
-                "type": "boolean",
-                "description": "When false, start empty and only apply explicit resource patterns."
-              },
-              "extensions": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "skills": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "prompts": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "themes": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              }
-            }
-          }
-        ],
-        "description": "Package source for npm or git packages. Use the string form to load all resources or the object form to filter resources."
+        "$ref": "#/$defs/PackageSource"
       },
-      "description": "npm or git package sources, as strings or objects with resource filtering."
+      "default": null
     },
     "extensions": {
-      "type": "array",
+      "type": [
+        "array"
+      ],
       "items": {
         "type": "string"
       },
-      "description": "Local extension file paths or directories."
+      "default": null
     },
     "deviceId": {
-      "type": "string",
-      "description": "Stable installation UUID, generated when authentication first needs it. Global only."
+      "type": [
+        "string"
+      ],
+      "default": null
     },
     "skills": {
       "anyOf": [
         {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        {
-          "type": "object",
-          "properties": {
-            "enableSkillCommands": {
-              "type": "boolean"
-            },
-            "customDirectories": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          },
-          "deprecated": true
+          "$ref": "#/$defs/SkillsSetting"
         }
       ],
-      "description": "Local skill file paths or directories."
+      "default": null
     },
     "prompts": {
-      "type": "array",
+      "type": [
+        "array"
+      ],
       "items": {
         "type": "string"
       },
-      "description": "Local prompt template file paths or directories."
+      "default": null
     },
     "themes": {
-      "type": "array",
+      "type": [
+        "array"
+      ],
       "items": {
         "type": "string"
       },
-      "description": "Local theme file paths or directories."
+      "default": null
     },
     "enableSkillCommands": {
-      "type": "boolean",
-      "description": "Register skills as /skill:name commands.",
-      "default": true
+      "type": [
+        "boolean"
+      ],
+      "default": null
     },
     "terminal": {
-      "type": "object",
-      "properties": {
-        "showImages": {
-          "type": "boolean",
-          "description": "Show images when the terminal supports them.",
-          "default": true
-        },
-        "imageWidthCells": {
-          "type": "number",
-          "description": "Preferred inline image width in terminal cells.",
-          "default": 60
-        },
-        "clearOnShrink": {
-          "type": "boolean",
-          "description": "Clear empty rows when content shrinks.",
-          "default": false
-        },
-        "showTerminalProgress": {
-          "type": "boolean",
-          "description": "Show OSC 9;4 terminal progress indicators.",
-          "default": false
-        },
-        "hyperlinks": {
-          "anyOf": [
-            {
-              "type": "boolean"
-            },
-            {
-              "type": "string",
-              "const": "auto"
-            }
-          ]
-        },
-        "images": {
-          "anyOf": [
-            {
-              "type": "string",
-              "const": "kitty"
-            },
-            {
-              "type": "string",
-              "const": "iterm2"
-            },
-            {
-              "type": "string",
-              "const": "auto"
-            },
-            {
-              "type": "boolean",
-              "const": false
-            }
-          ]
-        },
-        "trueColor": {
-          "anyOf": [
-            {
-              "type": "boolean"
-            },
-            {
-              "type": "string",
-              "const": "auto"
-            }
-          ]
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TerminalSettings"
         }
-      }
+      ],
+      "default": null
     },
     "images": {
-      "type": "object",
-      "properties": {
-        "autoResize": {
-          "type": "boolean",
-          "description": "Resize images to 2000x2000 maximum for better model compatibility.",
-          "default": true
-        },
-        "blockImages": {
-          "type": "boolean",
-          "description": "When true, prevents all images from being sent to LLM providers.",
-          "default": false
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ImageSettings"
         }
-      }
+      ],
+      "default": null
     },
     "enabledModels": {
-      "type": "array",
+      "type": [
+        "array"
+      ],
       "items": {
         "type": "string"
       },
-      "description": "Model patterns for cycling, in the same format as the --models CLI flag."
+      "default": null
     },
     "defaultTools": {
-      "type": "array",
+      "type": [
+        "array"
+      ],
       "items": {
         "type": "string"
       },
-      "description": "Initial tool selection. Plain names replace the inherited selection; +name and -name entries add or remove tools."
+      "default": null
     },
     "doubleEscapeAction": {
       "anyOf": [
         {
-          "type": "string",
-          "const": "fork"
-        },
-        {
-          "type": "string",
-          "const": "tree"
-        },
-        {
-          "type": "string",
-          "const": "none"
+          "$ref": "#/$defs/DoubleEscapeAction"
         }
       ],
-      "description": "Action for double-escape with an empty editor.",
-      "default": "tree"
+      "default": null
     },
     "treeFilterMode": {
       "anyOf": [
         {
-          "type": "string",
-          "const": "default"
-        },
-        {
-          "type": "string",
-          "const": "no-tools"
-        },
-        {
-          "type": "string",
-          "const": "user-only"
-        },
-        {
-          "type": "string",
-          "const": "labeled-only"
-        },
-        {
-          "type": "string",
-          "const": "all"
+          "$ref": "#/$defs/TreeFilterMode"
         }
       ],
-      "description": "Default filter when opening /tree.",
-      "default": "default"
+      "default": null
     },
     "thinkingBudgets": {
-      "type": "object",
-      "properties": {
-        "minimal": {
-          "type": "number"
-        },
-        "low": {
-          "type": "number"
-        },
-        "medium": {
-          "type": "number"
-        },
-        "high": {
-          "type": "number"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThinkingBudgetsSettings"
         }
-      },
-      "description": "Custom token budgets for thinking levels."
+      ],
+      "default": null
     },
     "editorPaddingX": {
       "type": "number",
-      "description": "Horizontal padding for the input editor.",
-      "default": 0
+      "format": "uint64",
+      "minimum": 0,
+      "default": null
     },
     "outputPad": {
-      "anyOf": [
-        {
-          "type": "number",
-          "const": 0
-        },
-        {
-          "type": "number",
-          "const": 1
-        }
-      ],
-      "description": "Horizontal padding for transcript content.",
-      "default": 1
+      "type": "integer",
+      "enum": [
+        0,
+        1
+      ]
     },
     "autocompleteMaxVisible": {
       "type": "number",
-      "description": "Maximum visible items in the autocomplete dropdown.",
-      "default": 5
+      "format": "uint64",
+      "minimum": 0,
+      "default": null
     },
     "showHardwareCursor": {
-      "type": "boolean",
-      "description": "Show the terminal cursor while still positioning it for IME."
+      "type": [
+        "boolean"
+      ],
+      "default": null
     },
     "markdown": {
-      "type": "object",
-      "properties": {
-        "codeBlockIndent": {
-          "type": "string",
-          "default": "  "
-        },
-        "mermaid": {
-          "anyOf": [
-            {
-              "type": "string",
-              "const": "off"
-            },
-            {
-              "type": "string",
-              "const": "final"
-            },
-            {
-              "type": "string",
-              "const": "streaming"
-            }
-          ],
-          "default": "streaming"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MarkdownSettings"
         }
-      }
+      ],
+      "default": null
     },
     "warnings": {
-      "type": "object",
-      "properties": {
-        "anthropicExtraUsage": {
-          "type": "boolean",
-          "default": true
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WarningSettings"
         }
-      }
+      ],
+      "default": null
     },
     "codemode": {
-      "type": "object",
-      "properties": {
-        "mode": {
-          "anyOf": [
-            {
-              "type": "string",
-              "const": "on"
-            },
-            {
-              "type": "string",
-              "const": "only"
-            }
-          ],
-          "description": "How codemode presents tools. \"on\" keeps direct tools declared and annotates tools callable from scripts; codemode lists only tools without direct exposure. \"only\" lists every script-callable tool in codemode and does not declare active direct tools.",
-          "default": "on"
-        },
-        "inlineBudget": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Estimated tokens available for inline codemode tool declarations.",
-          "default": 3000
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CodemodeSettings"
         }
-      }
+      ],
+      "default": null
     },
     "sessionDir": {
-      "type": "string",
-      "description": "Custom session storage directory, in the same format as the --session-dir CLI flag."
+      "type": [
+        "string"
+      ],
+      "default": null
     },
     "httpProxy": {
-      "type": "string",
-      "description": "Proxy URL applied as HTTP_PROXY and HTTPS_PROXY for rpi-managed HTTP clients."
+      "type": [
+        "string"
+      ],
+      "default": null
     },
     "httpIdleTimeoutMs": {
       "anyOf": [
         {
-          "type": "number",
-          "minimum": 0
-        },
-        {
-          "type": "string",
-          "const": "disabled"
+          "$ref": "#/$defs/TimeoutSetting"
         }
       ],
-      "description": "HTTP header or body idle timeout in milliseconds; 0 or \"disabled\" disables it."
+      "default": null
     },
     "cacheWarming": {
       "anyOf": [
         {
-          "type": "string",
-          "const": "off"
-        },
-        {
-          "type": "string",
-          "const": "streaming"
-        },
-        {
-          "type": "string",
-          "const": "idle"
+          "$ref": "#/$defs/CacheWarmingMode"
         }
       ],
-      "description": "Cache-warming profile. \"idle\" also warms between agent runs. Global only because each refresh costs money.",
-      "default": "streaming"
+      "default": null
     },
     "websocketConnectTimeoutMs": {
       "anyOf": [
         {
-          "type": "number",
-          "minimum": 0
-        },
-        {
-          "type": "string",
-          "const": "disabled"
+          "$ref": "#/$defs/TimeoutSetting"
         }
       ],
-      "description": "WebSocket connect or open handshake timeout in milliseconds; 0 or \"disabled\" disables it."
+      "default": null
     },
     "tuiMode": {
       "anyOf": [
         {
-          "type": "string",
-          "const": "regular"
-        },
-        {
-          "type": "string",
-          "const": "fullscreen"
+          "$ref": "#/$defs/TuiModeDocument"
         }
       ],
-      "default": "fullscreen"
+      "default": null
     },
     "fullscreenExitOutput": {
       "anyOf": [
         {
-          "type": "string",
-          "const": "transcript"
-        },
-        {
-          "type": "string",
-          "const": "resume-hint"
+          "$ref": "#/$defs/FullscreenExitOutput"
         }
       ],
-      "description": "No effect in regular TUI mode.",
-      "default": "transcript"
+      "default": null
     },
     "fullscreenScrollbar": {
       "anyOf": [
         {
-          "type": "string",
-          "const": "auto"
-        },
-        {
-          "type": "string",
-          "const": "always"
-        },
-        {
-          "type": "string",
-          "const": "hidden"
+          "$ref": "#/$defs/ScrollbarModeDocument"
         }
       ],
-      "description": "No effect in regular TUI mode.",
-      "default": "auto"
+      "default": null
     },
     "fullscreenCopyOnSelect": {
-      "type": "boolean",
-      "description": "No effect in regular TUI mode.",
-      "default": true
+      "type": [
+        "boolean"
+      ],
+      "default": null
     },
     "fullscreenWheelScrollLines": {
       "anyOf": [
         {
-          "type": "number"
-        },
-        {
-          "type": "string",
-          "const": "auto"
+          "$ref": "#/$defs/WheelScrollLinesSetting"
         }
       ],
-      "description": "Lines scrolled per wheel event in fullscreen mode; numeric values are clamped from 1 to 100.",
-      "default": "auto"
+      "default": null
     },
     "queueMode": {
       "anyOf": [
         {
-          "type": "string",
-          "const": "all"
-        },
-        {
-          "type": "string",
-          "const": "one-at-a-time"
+          "$ref": "#/$defs/QueueModeDocument"
         }
       ],
-      "description": "Legacy setting migrated to steeringMode.",
-      "deprecated": true
+      "default": null
     },
     "websockets": {
-      "type": "boolean",
-      "description": "Legacy setting migrated to transport.",
-      "deprecated": true
+      "type": [
+        "boolean"
+      ],
+      "default": null
+    },
+    "usage": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UsageDocument"
+        }
+      ],
+      "default": null
+    },
+    "statusLine": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StatusLineDocument"
+        }
+      ],
+      "default": null
+    },
+    "versionCheckUrl": {
+      "type": [
+        "string"
+      ],
+      "default": null
+    },
+    "telemetryUrl": {
+      "type": [
+        "string"
+      ],
+      "default": null
+    },
+    "modelCatalogUrl": {
+      "type": [
+        "string"
+      ],
+      "default": null
+    },
+    "subagents": {
+      "type": [
+        "object"
+      ],
+      "additionalProperties": true,
+      "default": null
     }
   },
   "additionalProperties": true,
   "$defs": {
     "ModelThinkingLevel": {
+      "description": "`ModelThinkingLevel = \"off\" | ThinkingLevel`.\n\nThis is also the agent-side `ThinkingLevel` of `packages/agent` (which\nincludes \"off\"); `rpi-agent` re-exports it under that name.",
+      "type": "string",
       "enum": [
         "off",
         "minimal",
@@ -778,6 +493,833 @@
         "xhigh",
         "max"
       ]
+    },
+    "Transport": {
+      "description": "`Transport = \"sse\" | \"websocket\" | \"websocket-cached\" | \"auto\"`.",
+      "type": "string",
+      "enum": [
+        "sse",
+        "websocket",
+        "websocket-cached",
+        "auto"
+      ]
+    },
+    "SessionShareDestination": {
+      "description": "`SessionShareDestination = \"auto\" | \"gist\" | \"radius\"`\n(settings-manager.ts:804-817 @ cea257439). rpi supports the gist backend;\n`radius` is recognized but explicitly unsupported at the command entry.",
+      "type": "string",
+      "enum": [
+        "auto",
+        "gist",
+        "radius"
+      ]
+    },
+    "QueueModeDocument": {
+      "type": "string",
+      "enum": [
+        "all",
+        "one-at-a-time"
+      ]
+    },
+    "CompactionSettings": {
+      "description": "`CompactionSettings` (settings-manager.ts:18-21 @ 46bde88a1) — file\nshape; all fields optional, defaults live in the getters.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "default: true",
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        },
+        "reserveTokens": {
+          "description": "default: 16384",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null,
+          "maximum": 9007199254740991
+        },
+        "keepRecentTokens": {
+          "description": "default: 20000",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null,
+          "maximum": 9007199254740991
+        },
+        "modelOverrides": {
+          "description": "`modelOverrides` (46bde88a1): exact `\"provider/modelId\"` keys —\nthe same per-model key convention as the models.json `modelOverrides`\nface (V15-01 FR-E seam).",
+          "type": [
+            "object"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/CompactionModelOverride"
+          },
+          "default": null
+        }
+      }
+    },
+    "CompactionModelOverride": {
+      "description": "`CompactionModelOverride` (settings-manager.ts:13-16 @ 46bde88a1) —\nfile shape; per-model token budgets keyed by exact `\"provider/modelId\"`\nstrings under `compaction.modelOverrides` (#8133).",
+      "type": "object",
+      "properties": {
+        "reserveTokens": {
+          "description": "default: falls through to the ordinary `compaction.reserveTokens`",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null,
+          "maximum": 9007199254740991
+        },
+        "keepRecentTokens": {
+          "description": "default: falls through to the ordinary `compaction.keepRecentTokens`",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "BranchSummarySettings": {
+      "description": "`BranchSummarySettings` (settings-manager.ts:17-20) — file shape.",
+      "type": "object",
+      "properties": {
+        "reserveTokens": {
+          "description": "default: 16384 (tokens reserved for prompt + LLM response)",
+          "type": "number",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "skipPrompt": {
+          "description": "default: false — when true, skips \"Summarize branch?\" prompt and\ndefaults to no summary",
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        }
+      }
+    },
+    "RetrySettings": {
+      "description": "`RetrySettings` (settings-manager.ts:28-33) — file shape.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "default: true",
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        },
+        "maxRetries": {
+          "description": "default: 3",
+          "type": "number",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "baseDelayMs": {
+          "description": "default: 2000 (exponential backoff: 2s, 4s, 8s)",
+          "type": "number",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "maxAgentDelayMs": {
+          "type": "number",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "maxDelayMs": {
+          "type": "number",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderRetrySettings"
+            }
+          ],
+          "default": null
+        }
+      }
+    },
+    "ProviderRetrySettings": {
+      "description": "`ProviderRetrySettings` (settings-manager.ts:22-26) — file shape.",
+      "type": "object",
+      "properties": {
+        "timeoutMs": {
+          "description": "SDK/provider request timeout in milliseconds",
+          "type": "number",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "maxRetries": {
+          "description": "SDK/provider retry attempts",
+          "type": "number",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "maxRetryDelayMs": {
+          "description": "default: 60000 (max server-requested delay before failing)",
+          "type": "number",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        }
+      }
+    },
+    "QuietStartupSetting": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string",
+          "const": "header"
+        }
+      ]
+    },
+    "DefaultProjectTrust": {
+      "description": "`DefaultProjectTrust = \"ask\" | \"always\" | \"never\"` (settings-manager.ts:62).",
+      "type": "string",
+      "enum": [
+        "ask",
+        "always",
+        "never"
+      ]
+    },
+    "PackageSource": {
+      "description": "`PackageSource` (settings-manager.ts:72-81): string form loads all\nresources from the package; object form filters which resources to load.",
+      "anyOf": [
+        {
+          "description": "Load all resources from the package.",
+          "type": "string"
+        },
+        {
+          "description": "Filter which resources to load.",
+          "$ref": "#/$defs/PackageSourceFilter"
+        }
+      ]
+    },
+    "PackageSourceFilter": {
+      "description": "Object form of [`PackageSource`] (settings-manager.ts:74-80).",
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "default": ""
+        },
+        "autoload": {
+          "description": "autoload=false: start empty and only apply explicit resource patterns",
+          "type": [
+            "boolean"
+          ]
+        },
+        "extensions": {
+          "type": [
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "skills": {
+          "type": [
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "prompts": {
+          "type": [
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "themes": {
+          "type": [
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "SkillsSetting": {
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "$ref": "#/$defs/SkillsLegacySettings"
+        }
+      ]
+    },
+    "SkillsLegacySettings": {
+      "type": "object",
+      "properties": {
+        "enableSkillCommands": {
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        },
+        "customDirectories": {
+          "type": [
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null
+        }
+      }
+    },
+    "TerminalSettings": {
+      "description": "`TerminalSettings` (settings-manager.ts:35-40) — file shape.",
+      "type": "object",
+      "properties": {
+        "showImages": {
+          "description": "default: true (only relevant if terminal supports images)",
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        },
+        "imageWidthCells": {
+          "description": "default: 60 (preferred inline image width in terminal cells)",
+          "type": "number",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "clearOnShrink": {
+          "description": "default: false (clear empty rows when content shrinks)",
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        },
+        "showTerminalProgress": {
+          "description": "default: false (OSC 9;4 terminal progress indicators)",
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        },
+        "hyperlinks": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BoolOrAutoSetting"
+            }
+          ],
+          "default": null
+        },
+        "images": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalImagesSetting"
+            }
+          ],
+          "default": null
+        },
+        "trueColor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BoolOrAutoSetting"
+            }
+          ],
+          "default": null
+        }
+      }
+    },
+    "BoolOrAutoSetting": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string",
+          "const": "auto"
+        }
+      ]
+    },
+    "TerminalImagesSetting": {
+      "anyOf": [
+        {
+          "type": "string",
+          "const": "kitty"
+        },
+        {
+          "type": "string",
+          "const": "iterm2"
+        },
+        {
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "type": "boolean",
+          "const": false
+        }
+      ]
+    },
+    "ImageSettings": {
+      "description": "`ImageSettings` (settings-manager.ts:42-45) — file shape.",
+      "type": "object",
+      "properties": {
+        "autoResize": {
+          "description": "default: true (resize images to 2000x2000 max for better model\ncompatibility)",
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        },
+        "blockImages": {
+          "description": "default: false — when true, prevents all images from being sent to\nLLM providers",
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        }
+      }
+    },
+    "DoubleEscapeAction": {
+      "description": "`settings.doubleEscapeAction`: `\"fork\" | \"tree\" | \"none\"`\n(settings-manager.ts:116).",
+      "type": "string",
+      "enum": [
+        "fork",
+        "tree",
+        "none"
+      ]
+    },
+    "TreeFilterMode": {
+      "description": "`settings.treeFilterMode`: `\"default\" | \"no-tools\" | \"user-only\" |\n\"labeled-only\" | \"all\"` (settings-manager.ts:117).",
+      "type": "string",
+      "enum": [
+        "default",
+        "no-tools",
+        "user-only",
+        "labeled-only",
+        "all"
+      ]
+    },
+    "ThinkingBudgetsSettings": {
+      "description": "`ThinkingBudgetsSettings` (settings-manager.ts:47-52) — file shape.",
+      "type": "object",
+      "properties": {
+        "minimal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "low": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "medium": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "high": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        }
+      }
+    },
+    "MarkdownSettings": {
+      "description": "`MarkdownSettings` (settings-manager.ts:54-56) — file shape.",
+      "type": "object",
+      "properties": {
+        "codeBlockIndent": {
+          "description": "default: \"  \"",
+          "type": [
+            "string"
+          ],
+          "default": null
+        },
+        "mermaid": {
+          "description": "default: \"streaming\"",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MermaidRenderingMode"
+            }
+          ],
+          "default": null
+        }
+      }
+    },
+    "MermaidRenderingMode": {
+      "description": "`MermaidRenderingMode = \"off\" | \"final\" | \"streaming\"`\n(settings-manager.ts:56) — default `\"streaming\"`.",
+      "type": "string",
+      "enum": [
+        "off",
+        "final",
+        "streaming"
+      ]
+    },
+    "WarningSettings": {
+      "description": "`WarningSettings` (settings-manager.ts:58-60) — file shape.",
+      "type": "object",
+      "properties": {
+        "anthropicExtraUsage": {
+          "description": "default: true",
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        }
+      }
+    },
+    "CodemodeSettings": {
+      "description": "`CodemodeSettings` (settings-manager.ts:105-108).",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/CodemodeMode",
+          "default": "on"
+        },
+        "inlineBudget": {
+          "description": "Estimated tokens (characters / 4) the codemode description may spend\non tool declarations; `None` = unset (the consumer applies the 3000\ndefault).",
+          "type": "number",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        }
+      }
+    },
+    "CodemodeMode": {
+      "description": "`CodemodeMode = \"on\" | \"only\"` (settings-manager.ts:95-103 @ 8562bcf66):\nhow the codemode tool presents tools while it is active. The key\nregisters here (V16-13 FR-D R1); its presentation behavior is consumed\nby the codemode tool (V16-07).",
+      "type": "string",
+      "enum": [
+        "on",
+        "only"
+      ]
+    },
+    "TimeoutSetting": {
+      "anyOf": [
+        {
+          "type": "number",
+          "minimum": 0
+        },
+        {
+          "type": "string",
+          "const": "disabled"
+        }
+      ]
+    },
+    "CacheWarmingMode": {
+      "description": "`CacheWarmingMode = \"off\" | \"streaming\" | \"idle\"` (#9668,\nc596d09d9; settings-manager.ts:77-78) — default `\"streaming\"`. Global\nsetting only because each refresh costs money (settings-manager.ts:955).",
+      "type": "string",
+      "enum": [
+        "off",
+        "streaming",
+        "idle"
+      ]
+    },
+    "TuiModeDocument": {
+      "type": "string",
+      "enum": [
+        "regular",
+        "fullscreen"
+      ]
+    },
+    "FullscreenExitOutput": {
+      "description": "`FullscreenExitOutput = \"transcript\" | \"resume-hint\"`\n(settings-manager.ts:37, :137, :1140-1148 @ 5446cd754 @ 4181f66).\nDefault `\"transcript\"`.",
+      "type": "string",
+      "enum": [
+        "transcript",
+        "resume-hint"
+      ]
+    },
+    "ScrollbarModeDocument": {
+      "type": "string",
+      "enum": [
+        "hidden",
+        "auto",
+        "always"
+      ]
+    },
+    "WheelScrollLinesSetting": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "string",
+          "const": "auto"
+        }
+      ]
+    },
+    "UsageDocument": {
+      "type": "object",
+      "properties": {
+        "providers": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/UsageProviderSetting"
+          },
+          "default": {},
+          "propertyNames": {
+            "minLength": 1
+          }
+        },
+        "timeoutMs": {
+          "type": "number",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "enabled": {
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        },
+        "footer": {
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        },
+        "refreshMs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "percentage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsagePercentage"
+            }
+          ],
+          "default": null
+        },
+        "resetCountdown": {
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        }
+      }
+    },
+    "UsageProviderSetting": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "$ref": "#/$defs/UsageProviderConfig"
+        }
+      ]
+    },
+    "UsageProviderConfig": {
+      "description": "`UsageProviderConfig` (V16-05 FR-A; rpi-own): one explicit\n`usage.providers` entry. The string form is the script path shorthand;\nthe object form additionally declares the context fields the host\nforwards to the script (`baseUrl` / `apiKeyEnv` / `model`).",
+      "type": "object",
+      "properties": {
+        "script": {
+          "type": "string",
+          "minLength": 1,
+          "default": ""
+        },
+        "baseUrl": {
+          "type": [
+            "string"
+          ],
+          "default": null
+        },
+        "apiKeyEnv": {
+          "type": [
+            "string"
+          ],
+          "default": null
+        },
+        "model": {
+          "type": [
+            "string"
+          ],
+          "default": null
+        }
+      }
+    },
+    "UsagePercentage": {
+      "type": "string",
+      "enum": [
+        "used",
+        "remaining"
+      ]
+    },
+    "StatusLineDocument": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/StatusLineType"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "items": {
+          "type": [
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null
+        },
+        "placement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StatusLinePlacement"
+            }
+          ],
+          "default": null
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "padding": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "refreshMs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "liveTokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StatusLineLiveTokens"
+            }
+          ],
+          "default": null
+        },
+        "separator": {
+          "type": [
+            "string"
+          ],
+          "default": null
+        },
+        "refreshInterval": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "useColors": {
+          "type": [
+            "boolean"
+          ],
+          "default": null
+        },
+        "numberFormat": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StatusLineNumberFormat"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "anyOf": [
+        {
+          "properties": {
+            "type": {
+              "const": "command"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "items"
+            }
+          }
+        }
+      ]
+    },
+    "StatusLineType": {
+      "type": "string",
+      "enum": [
+        "command",
+        "items"
+      ]
+    },
+    "StatusLinePlacement": {
+      "type": "string",
+      "enum": [
+        "replace",
+        "widget",
+        "status"
+      ]
+    },
+    "StatusLineLiveTokens": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/StatusLineLiveTokensOptions"
+        }
+      ]
+    },
+    "StatusLineLiveTokensOptions": {
+      "type": "object",
+      "properties": {
+        "refreshMs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        }
+      }
+    },
+    "StatusLineNumberFormat": {
+      "type": "string",
+      "enum": [
+        "compact",
+        "exact"
+      ]
     }
-  }
+  },
+  "$id": "https://revpi.dev/schemas/settings.schema.json",
+  "$comment": "Generated from the rpi typed configuration models by scripts/sync-config-schemas.py. Do not edit it manually; run the script to regenerate."
 }

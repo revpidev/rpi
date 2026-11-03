@@ -28,6 +28,7 @@
 //!   `currentThemeName` / `onThemeChangeCallback`) is not ported — the TUI
 //!   runtime (T12) owns theme lifecycle.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -722,6 +723,30 @@ impl<'de> serde::Deserialize<'de> for ColorValue {
     }
 }
 
+impl schemars::JsonSchema for ColorValue {
+    fn schema_name() -> Cow<'static, str> {
+        "ColorValue".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "anyOf": [
+                {
+                    "type": "string",
+                    "description": "Hex color (#RGB or #RRGGBB), OKLCH or OKHSL color, variable reference, or empty string for terminal default"
+                },
+                {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 255,
+                    "description": "256-color palette index (0-255)"
+                }
+            ]
+        }))
+        .expect("color schema")
+    }
+}
+
 /// A resolved colour value after variable-reference resolution.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedColor {
@@ -820,8 +845,17 @@ pub struct AutoThemeSetting {
     pub dark_theme: String,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeAppearance {
+    Dark,
+    Light,
+}
+
 /// The `export` section of a theme JSON (theme.ts:96-102).
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ThemeExport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -836,13 +870,16 @@ pub struct ThemeExport {
 /// on the lenient path (upstream's unchecked cast leaves it `undefined`;
 /// both are only reachable without an installed validator — the validator
 /// requires the string).
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub struct ThemeJson {
+    #[serde(rename = "$schema", default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
     #[serde(default)]
     pub name: String,
     /// `appearance` (theme.ts:96-100 @ 4a080252f): the background the theme
     /// is designed for; detected from the theme colors when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "ThemeAppearance")]
     pub appearance: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub vars: HashMap<String, ColorValue>,
@@ -2703,6 +2740,7 @@ mod tests {
             ColorValue::Raw(RawColorValue::Bool(true)),
         );
         let theme_json = ThemeJson {
+            schema: None,
             name: "bool-color".to_string(),
             appearance: None,
             vars: HashMap::new(),
@@ -2730,6 +2768,7 @@ mod tests {
             ColorValue::Raw(RawColorValue::Number(300.0)),
         );
         let theme_json = ThemeJson {
+            schema: None,
             name: "wide-index".to_string(),
             appearance: None,
             vars: HashMap::new(),
@@ -2770,6 +2809,7 @@ mod tests {
             ColorValue::Str("#abcdef".to_string()),
         );
         let theme_json = ThemeJson {
+            schema: None,
             name: "test".to_string(),
             appearance: None,
             vars: HashMap::new(),
@@ -2792,6 +2832,7 @@ mod tests {
             .collect();
         let make_theme = |colors: HashMap<String, ColorValue>, name: &str| {
             let theme_json = ThemeJson {
+                schema: None,
                 name: name.to_string(),
                 appearance: None,
                 vars: HashMap::new(),
@@ -3058,6 +3099,7 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert("brand".to_string(), ColorValue::Str("#123456".to_string()));
         let json = ThemeJson {
+            schema: None,
             name: "extended".to_string(),
             appearance: None,
             vars,
@@ -3078,6 +3120,7 @@ mod tests {
         assert_eq!(theme.appearance(), TerminalTheme::Dark);
         // Explicit appearance wins over detection.
         let mut light_json = ThemeJson {
+            schema: None,
             name: "explicit-light".to_string(),
             appearance: Some("light".to_string()),
             vars: HashMap::new(),
@@ -3096,6 +3139,7 @@ mod tests {
         let mut colors = all_required_colors("#101010");
         colors.insert("accent".to_string(), ColorValue::Str("#010203".to_string()));
         let json = ThemeJson {
+            schema: None,
             name: "style".to_string(),
             appearance: Some("dark".to_string()),
             vars: HashMap::new(),

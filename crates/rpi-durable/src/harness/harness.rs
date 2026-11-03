@@ -160,12 +160,29 @@ impl HarnessImpl {
             ),
             None => None,
         };
+        let report_info: crate::harness::types::ReportInfoFn = {
+            let host = self.options.on_report_info.clone();
+            let telemetry = self.options.telemetry.clone().unwrap_or_default();
+            let context = context.clone();
+            Arc::new(move |info| {
+                if info.kind == crate::harness::types::ReportKind::ExtensionError {
+                    crate::harness::scheduler::emit_report_telemetry(
+                        &telemetry,
+                        &info,
+                        Some(&context),
+                    );
+                }
+                if let Some(host) = &host {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host(info)));
+                }
+            })
+        };
         Ok(resolve_agent(
             state.as_ref(),
             registry.as_ref(),
             &self.current_settings(),
             &self.report,
-            self.options.on_report_info.as_ref(),
+            Some(&report_info),
         ))
     }
 
@@ -1021,34 +1038,14 @@ pub async fn open_harness(
 /// publications.
 pub async fn open_harness_with_scheduler(
     storage: Arc<dyn Storage>,
-    mut options: HarnessOptions,
+    options: HarnessOptions,
     scheduler_factory: SchedulerFactory,
     context: &Context,
 ) -> SessionResult<Arc<HarnessImpl>> {
     // The scheduler emits telemetry for every report it makes itself, so its
-    // callback must only reach the host. Reports that bypass the scheduler
-    // (session failure, listener errors, direct extension errors) emit their
-    // fixed telemetry here (upstream `safeReport`). Split the two callbacks so
-    // each report is emitted exactly once.
+    // callback only reaches the host. Reports that bypass the scheduler emit
+    // their fixed telemetry at their own call sites (upstream `safeReport`).
     let scheduler_report_info = options.on_report_info.clone();
-    {
-        let host = options.on_report_info.clone();
-        let telemetry = options.telemetry.clone().unwrap_or_default();
-        options.on_report_info = Some(Arc::new(move |info: crate::harness::types::ReportInfo| {
-            if matches!(
-                info.kind,
-                crate::harness::types::ReportKind::SessionFailed
-                    | crate::harness::types::ReportKind::ListenerError
-                    | crate::harness::types::ReportKind::ExtensionError
-            ) {
-                crate::harness::scheduler::emit_report_telemetry(&telemetry, &info);
-            }
-            let Some(host) = host.as_ref() else {
-                return;
-            };
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host(info)));
-        }));
-    }
     if context
         .abort_signal()
         .is_some_and(|signal| signal.is_cancelled())
@@ -1090,6 +1087,7 @@ pub async fn open_harness_with_scheduler(
         })
     };
     let session = SessionImpl::new(Arc::clone(&storage), Some(Arc::clone(&now)));
+    session.set_document_timer(options.set_timer.clone(), Arc::clone(&report));
     session.set_conversation_created_hook(conversation_created_hook(
         options.conversation_created.clone(),
     ));
@@ -1122,24 +1120,30 @@ pub async fn open_harness_with_scheduler(
     session.set_failure_reporter(Arc::new({
         let report = Arc::clone(&report);
         let report_info = options.on_report_info.clone();
-        move |message| {
+        let telemetry = options.telemetry.clone().unwrap_or_default();
+        move |message, context| {
             report(message);
+            let info = crate::harness::types::ReportInfo::new(
+                crate::harness::types::ReportKind::SessionFailed,
+            );
+            crate::harness::scheduler::emit_report_telemetry(&telemetry, &info, context.as_ref());
             if let Some(report) = &report_info {
-                report(crate::harness::types::ReportInfo::new(
-                    crate::harness::types::ReportKind::SessionFailed,
-                ));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(info)));
             }
         }
     }));
     session.set_listener_reporter(Arc::new({
         let report = Arc::clone(&report);
         let report_info = options.on_report_info.clone();
-        move |message| {
+        let telemetry = options.telemetry.clone().unwrap_or_default();
+        move |message, context| {
             report(message);
+            let info = crate::harness::types::ReportInfo::new(
+                crate::harness::types::ReportKind::ListenerError,
+            );
+            crate::harness::scheduler::emit_report_telemetry(&telemetry, &info, context.as_ref());
             if let Some(report) = &report_info {
-                report(crate::harness::types::ReportInfo::new(
-                    crate::harness::types::ReportKind::ListenerError,
-                ));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(info)));
             }
         }
     }));

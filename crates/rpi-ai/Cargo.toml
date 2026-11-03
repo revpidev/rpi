@@ -22,6 +22,7 @@ reqwest.workspace = true
 http.workspace = true
 bytes.workspace = true
 jsonschema.workspace = true
+schemars.workspace = true
 regex.workspace = true
 url.workspace = true
 httpdate.workspace = true

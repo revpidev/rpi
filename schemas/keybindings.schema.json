@@ -1,11 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://revpi.dev/schemas/keybindings.schema.json",
-  "$comment": "This file is generated from the pinned Pi v1.4.0 TypeScript source (4a080252f) by scripts/sync-config-schemas.py in the rpi repository. Do not edit it manually; run the script to refresh it.",
   "type": "object",
   "properties": {
     "$schema": {
-      "type": "string"
+      "type": "string",
+      "description": "JSON Schema reference."
     },
     "tui.editor.cursorUp": {
       "$ref": "#/$defs/KeybindingValue",
@@ -101,7 +100,7 @@
     },
     "tui.input.newLine": {
       "$ref": "#/$defs/KeybindingValue",
-      "description": "Insert newline"
+      "description": "Insert new line"
     },
     "tui.input.submit": {
       "$ref": "#/$defs/KeybindingValue",
@@ -211,13 +210,13 @@
       "$ref": "#/$defs/KeybindingValue",
       "description": "Suspend to background"
     },
+    "app.mode.cycle": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Cycle permission mode"
+    },
     "app.thinking.cycle": {
       "$ref": "#/$defs/KeybindingValue",
       "description": "Cycle thinking level"
-    },
-    "app.thinking.save": {
-      "$ref": "#/$defs/KeybindingValue",
-      "description": "Save thinking level"
     },
     "app.model.cycleForward": {
       "$ref": "#/$defs/KeybindingValue",
@@ -249,7 +248,7 @@
     },
     "app.message.copy": {
       "$ref": "#/$defs/KeybindingValue",
-      "description": "Copy selection or last assistant message"
+      "description": "Copy message to clipboard"
     },
     "app.message.followUp": {
       "$ref": "#/$defs/KeybindingValue",
@@ -261,7 +260,7 @@
     },
     "app.clipboard.pasteImage": {
       "$ref": "#/$defs/KeybindingValue",
-      "description": "Paste files on macOS, images, or text from clipboard"
+      "description": "Paste image from clipboard (text fallback)"
     },
     "app.session.new": {
       "$ref": "#/$defs/KeybindingValue",
@@ -319,6 +318,10 @@
       "$ref": "#/$defs/KeybindingValue",
       "description": "Save model selection"
     },
+    "app.thinking.save": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Save thinking level"
+    },
     "app.models.enableAll": {
       "$ref": "#/$defs/KeybindingValue",
       "description": "Enable all models"
@@ -373,21 +376,22 @@
   },
   "$defs": {
     "KeybindingValue": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "KeyBindingValue",
+      "description": "A keybinding value: single key or array of keys.\n\nJSON serialises as `string` or `string[]` (matching upstream\n`KeyId | KeyId[]`).",
       "anyOf": [
         {
-          "type": "string",
-          "pattern": "^(?!.*(?:ctrl\\+.*ctrl\\+|shift\\+.*shift\\+|alt\\+.*alt\\+|super\\+.*super\\+))(?:(?:ctrl|shift|alt|super)\\+){0,4}(?:[a-z0-9]|escape|esc|enter|return|tab|space|backspace|delete|insert|clear|home|end|pageUp|pageDown|up|down|left|right|f1|f2|f3|f4|f5|f6|f7|f8|f9|f10|f11|f12|`|-|=|\\[|\\]|\\\\|;|'|,|\\.|/|!|@|#|\\$|%|\\^|&|\\*|\\(|\\)|_|\\+|\\||~|\\{|\\}|:|<|>|\\?)$",
-          "description": "Key identifier with optional ctrl, shift, alt, or super modifiers."
+          "type": "string"
         },
         {
           "type": "array",
           "items": {
-            "type": "string",
-            "pattern": "^(?!.*(?:ctrl\\+.*ctrl\\+|shift\\+.*shift\\+|alt\\+.*alt\\+|super\\+.*super\\+))(?:(?:ctrl|shift|alt|super)\\+){0,4}(?:[a-z0-9]|escape|esc|enter|return|tab|space|backspace|delete|insert|clear|home|end|pageUp|pageDown|up|down|left|right|f1|f2|f3|f4|f5|f6|f7|f8|f9|f10|f11|f12|`|-|=|\\[|\\]|\\\\|;|'|,|\\.|/|!|@|#|\\$|%|\\^|&|\\*|\\(|\\)|_|\\+|\\||~|\\{|\\}|:|<|>|\\?)$",
-            "description": "Key identifier with optional ctrl, shift, alt, or super modifiers."
+            "type": "string"
           }
         }
       ]
     }
-  }
+  },
+  "$id": "https://revpi.dev/schemas/keybindings.schema.json",
+  "$comment": "Generated from the rpi typed configuration models by scripts/sync-config-schemas.py. Do not edit it manually; run the script to regenerate."
 }

@@ -29,12 +29,10 @@
 //!   (unix) with a time/pid/counter-mix fallback — no `rand`/`uuid` crate in
 //!   the dependency baseline (appendix A). The fallback is not
 //!   cryptographically secure; collision resistance is what matters here.
-//! - Wrongly-typed values in settings.json (e.g. `steeringMode: 5`) fall back
-//!   to defaults in the typed getters instead of passing through raw as in
-//!   JS; valid files behave identically. The per-model compaction token
-//!   overrides (#8133) follow the same convention: upstream's safe-integer
-//!   and object checks throw on invalid values; here wrongly-typed override
-//!   fields/entries fall through to the next resolution tier.
+//! - Startup and reload validate the rpi-owned `usage` and `statusLine`
+//!   scopes with their shared typed definitions before migration; other values
+//!   retain upstream's raw null/deep-merge behavior. A scoped validation error
+//!   leaves that scope empty, and unknown keys still round-trip verbatim.
 //! - `parseHttpIdleTimeoutMs` number parsing uses Rust `f64` parsing; JS
 //!   `Number()` exotica (`"0x10"`, `"Infinity"`) parse differently. All
 //!   realistic values (decimal integers, `"disabled"`, `""`) match.
@@ -74,7 +72,7 @@ pub const DEFAULT_HTTP_IDLE_TIMEOUT_MS: u64 = 0;
 /// `CompactionModelOverride` (settings-manager.ts:13-16 @ 46bde88a1) —
 /// file shape; per-model token budgets keyed by exact `"provider/modelId"`
 /// strings under `compaction.modelOverrides` (#8133).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CompactionModelOverride {
     /// default: falls through to the ordinary `compaction.reserveTokens`
@@ -85,7 +83,7 @@ pub struct CompactionModelOverride {
 
 /// `CompactionSettings` (settings-manager.ts:18-21 @ 46bde88a1) — file
 /// shape; all fields optional, defaults live in the getters.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CompactionSettings {
     /// default: true
@@ -101,7 +99,7 @@ pub struct CompactionSettings {
 }
 
 /// `BranchSummarySettings` (settings-manager.ts:17-20) — file shape.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct BranchSummarySettings {
     /// default: 16384 (tokens reserved for prompt + LLM response)
@@ -112,7 +110,7 @@ pub struct BranchSummarySettings {
 }
 
 /// `ProviderRetrySettings` (settings-manager.ts:22-26) — file shape.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProviderRetrySettings {
     /// SDK/provider request timeout in milliseconds
@@ -124,7 +122,7 @@ pub struct ProviderRetrySettings {
 }
 
 /// `RetrySettings` (settings-manager.ts:28-33) — file shape.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RetrySettings {
     /// default: true
@@ -133,11 +131,13 @@ pub struct RetrySettings {
     pub max_retries: Option<u64>,
     /// default: 2000 (exponential backoff: 2s, 4s, 8s)
     pub base_delay_ms: Option<u64>,
+    pub max_agent_delay_ms: Option<u64>,
+    pub max_delay_ms: Option<u64>,
     pub provider: Option<ProviderRetrySettings>,
 }
 
 /// `TerminalSettings` (settings-manager.ts:35-40) — file shape.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TerminalSettings {
     /// default: true (only relevant if terminal supports images)
@@ -148,10 +148,13 @@ pub struct TerminalSettings {
     pub clear_on_shrink: Option<bool>,
     /// default: false (OSC 9;4 terminal progress indicators)
     pub show_terminal_progress: Option<bool>,
+    pub hyperlinks: Option<BoolOrAutoSetting>,
+    pub images: Option<TerminalImagesSetting>,
+    pub true_color: Option<BoolOrAutoSetting>,
 }
 
 /// `ImageSettings` (settings-manager.ts:42-45) — file shape.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ImageSettings {
     /// default: true (resize images to 2000x2000 max for better model
@@ -163,7 +166,7 @@ pub struct ImageSettings {
 }
 
 /// `ThinkingBudgetsSettings` (settings-manager.ts:47-52) — file shape.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ThinkingBudgetsSettings {
     pub minimal: Option<u64>,
@@ -173,7 +176,7 @@ pub struct ThinkingBudgetsSettings {
 }
 
 /// `MarkdownSettings` (settings-manager.ts:54-56) — file shape.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MarkdownSettings {
     /// default: "  "
@@ -184,7 +187,9 @@ pub struct MarkdownSettings {
 
 /// `MermaidRenderingMode = "off" | "final" | "streaming"`
 /// (settings-manager.ts:56) — default `"streaming"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub enum MermaidRenderingMode {
     #[serde(rename = "off")]
     Off,
@@ -209,7 +214,9 @@ impl MermaidRenderingMode {
 /// `CacheWarmingMode = "off" | "streaming" | "idle"` (#9668,
 /// c596d09d9; settings-manager.ts:77-78) — default `"streaming"`. Global
 /// setting only because each refresh costs money (settings-manager.ts:955).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub enum CacheWarmingMode {
     #[serde(rename = "off")]
     Off,
@@ -246,7 +253,7 @@ impl CacheWarmingMode {
 }
 
 /// `WarningSettings` (settings-manager.ts:58-60) — file shape.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WarningSettings {
     /// default: true
@@ -257,7 +264,10 @@ pub struct WarningSettings {
 /// how the codemode tool presents tools while it is active. The key
 /// registers here (V16-13 FR-D R1); its presentation behavior is consumed
 /// by the codemode tool (V16-07).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum CodemodeMode {
     #[default]
     On,
@@ -265,12 +275,14 @@ pub enum CodemodeMode {
 }
 
 /// `CodemodeSettings` (settings-manager.ts:105-108).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
 pub struct CodemodeSettings {
     pub mode: CodemodeMode,
     /// Estimated tokens (characters / 4) the codemode description may spend
     /// on tool declarations; `None` = unset (the consumer applies the 3000
     /// default).
+    #[serde(deserialize_with = "deserialize_u64_option")]
     pub inline_budget: Option<u64>,
 }
 
@@ -278,8 +290,10 @@ pub struct CodemodeSettings {
 /// `usage.providers` entry. The string form is the script path shorthand;
 /// the object form additionally declares the context fields the host
 /// forwards to the script (`baseUrl` / `apiKeyEnv` / `model`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
 pub struct UsageProviderConfig {
+    #[schemars(length(min = 1))]
     pub script: String,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
@@ -291,7 +305,8 @@ pub struct UsageProviderConfig {
 /// provider overrides and the execution timeout); the rpi-usage plugin
 /// reads its own `usage.enabled` / `usage.footer` / `usage.refreshMs` keys
 /// directly from settings.json (statusline precedent).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
 pub struct UsageSettings {
     /// Explicit provider → script overrides (highest resolution priority).
     pub providers: BTreeMap<String, UsageProviderConfig>,
@@ -300,8 +315,246 @@ pub struct UsageSettings {
     pub timeout_ms: Option<u64>,
 }
 
+macro_rules! impl_json_schema_for {
+    ($type:ty, $name:literal, $schema:tt) => {
+        impl schemars::JsonSchema for $type {
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                $name.into()
+            }
+
+            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                serde_json::from_value(serde_json::json!($schema))
+                    .expect(concat!($name, " JSON schema"))
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolOrAutoSetting {
+    Bool(bool),
+    Auto,
+}
+
+impl Serialize for BoolOrAutoSetting {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::Auto => serializer.serialize_str("auto"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BoolOrAutoSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Bool(value) => Ok(Self::Bool(value)),
+            Value::String(value) if value == "auto" => Ok(Self::Auto),
+            _ => Err(serde::de::Error::custom("expected a boolean or \"auto\"")),
+        }
+    }
+}
+
+impl_json_schema_for!(BoolOrAutoSetting, "BoolOrAutoSetting", {
+    "anyOf": [{"type": "boolean"}, {"type": "string", "const": "auto"}]
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalImagesSetting {
+    Kitty,
+    Iterm2,
+    Auto,
+    Disabled(bool),
+}
+
+impl Serialize for TerminalImagesSetting {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Kitty => serializer.serialize_str("kitty"),
+            Self::Iterm2 => serializer.serialize_str("iterm2"),
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Disabled(value) => serializer.serialize_bool(*value),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TerminalImagesSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::String(value) if value == "kitty" => Ok(Self::Kitty),
+            Value::String(value) if value == "iterm2" => Ok(Self::Iterm2),
+            Value::String(value) if value == "auto" => Ok(Self::Auto),
+            Value::Bool(value) => Ok(Self::Disabled(value)),
+            _ => Err(serde::de::Error::custom(
+                "expected \"kitty\", \"iterm2\", \"auto\", or a boolean",
+            )),
+        }
+    }
+}
+
+impl_json_schema_for!(TerminalImagesSetting, "TerminalImagesSetting", {
+    "anyOf": [
+        {"type": "string", "const": "kitty"},
+        {"type": "string", "const": "iterm2"},
+        {"type": "string", "const": "auto"},
+        {"type": "boolean", "const": false}
+    ]
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuietStartupSetting {
+    Bool(bool),
+    Header,
+}
+
+impl Serialize for QuietStartupSetting {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::Header => serializer.serialize_str("header"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for QuietStartupSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Bool(value) => Ok(Self::Bool(value)),
+            Value::String(value) if value == "header" => Ok(Self::Header),
+            _ => Err(serde::de::Error::custom("expected a boolean or \"header\"")),
+        }
+    }
+}
+
+impl_json_schema_for!(QuietStartupSetting, "QuietStartupSetting", {
+    "anyOf": [{"type": "boolean"}, {"type": "string", "const": "header"}]
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutSetting {
+    Milliseconds(u64),
+    Disabled,
+}
+
+impl Serialize for TimeoutSetting {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Milliseconds(value) => serializer.serialize_u64(*value),
+            Self::Disabled => serializer.serialize_str("disabled"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TimeoutSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Number(value) => {
+                let value = value.as_f64().unwrap_or(f64::NAN);
+                if value.is_finite() && value >= 0.0 {
+                    Ok(Self::Milliseconds(value.floor() as u64))
+                } else {
+                    Err(serde::de::Error::custom(
+                        "expected a non-negative finite number",
+                    ))
+                }
+            }
+            Value::String(value) if value == "disabled" => Ok(Self::Disabled),
+            _ => Err(serde::de::Error::custom(
+                "expected a non-negative finite number or \"disabled\"",
+            )),
+        }
+    }
+}
+
+impl_json_schema_for!(TimeoutSetting, "TimeoutSetting", {
+    "anyOf": [
+        {"type": "number", "minimum": 0},
+        {"type": "string", "const": "disabled"}
+    ]
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelScrollLinesSetting {
+    Lines(u64),
+    Auto,
+}
+
+impl Serialize for WheelScrollLinesSetting {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Lines(value) => serializer.serialize_u64(*value),
+            Self::Auto => serializer.serialize_str("auto"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WheelScrollLinesSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Number(value) => {
+                let value = value.as_f64().unwrap_or(f64::NAN);
+                if value.is_finite() {
+                    Ok(Self::Lines(value.floor() as u64))
+                } else {
+                    Err(serde::de::Error::custom("expected a finite number"))
+                }
+            }
+            Value::String(value) if value == "auto" => Ok(Self::Auto),
+            _ => Err(serde::de::Error::custom(
+                "expected a finite number or \"auto\"",
+            )),
+        }
+    }
+}
+
+impl_json_schema_for!(WheelScrollLinesSetting, "WheelScrollLinesSetting", {
+    "anyOf": [{"type": "number"}, {"type": "string", "const": "auto"}]
+});
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SkillsLegacySettings {
+    pub enable_skill_commands: Option<bool>,
+    pub custom_directories: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged, rename_all = "lowercase")]
+pub enum SkillsSetting {
+    Paths(Vec<String>),
+    Legacy(SkillsLegacySettings),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged, rename_all = "lowercase")]
+pub enum UsageProviderSetting {
+    Script(#[schemars(length(min = 1))] String),
+    Detailed(UsageProviderConfig),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UsageDocument {
+    pub providers: BTreeMap<String, UsageProviderSetting>,
+    #[serde(deserialize_with = "deserialize_u64_option")]
+    pub timeout_ms: Option<u64>,
+    pub enabled: Option<bool>,
+    pub footer: Option<bool>,
+    #[serde(deserialize_with = "deserialize_u64_option")]
+    pub refresh_ms: Option<u64>,
+    pub percentage: Option<UsagePercentage>,
+    pub reset_countdown: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsagePercentage {
+    Used,
+    Remaining,
+}
+
 /// `DefaultProjectTrust = "ask" | "always" | "never"` (settings-manager.ts:62).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum DefaultProjectTrust {
     #[serde(rename = "ask")]
     Ask,
@@ -341,7 +594,7 @@ impl QuietStartup {
 
 /// `settings.doubleEscapeAction`: `"fork" | "tree" | "none"`
 /// (settings-manager.ts:116).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum DoubleEscapeAction {
     #[serde(rename = "fork")]
     Fork,
@@ -354,7 +607,7 @@ pub enum DoubleEscapeAction {
 /// `FullscreenExitOutput = "transcript" | "resume-hint"`
 /// (settings-manager.ts:37, :137, :1140-1148 @ 5446cd754 @ 4181f66).
 /// Default `"transcript"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum FullscreenExitOutput {
     #[serde(rename = "transcript")]
     Transcript,
@@ -365,7 +618,9 @@ pub enum FullscreenExitOutput {
 /// `SessionShareDestination = "auto" | "gist" | "radius"`
 /// (settings-manager.ts:804-817 @ cea257439). rpi supports the gist backend;
 /// `radius` is recognized but explicitly unsupported at the command entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub enum SessionShareDestination {
     #[default]
     #[serde(rename = "auto")]
@@ -378,7 +633,7 @@ pub enum SessionShareDestination {
 
 /// `settings.treeFilterMode`: `"default" | "no-tools" | "user-only" |
 /// "labeled-only" | "all"` (settings-manager.ts:117).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum TreeFilterMode {
     #[serde(rename = "default")]
     Default,
@@ -394,8 +649,8 @@ pub enum TreeFilterMode {
 
 /// `PackageSource` (settings-manager.ts:72-81): string form loads all
 /// resources from the package; object form filters which resources to load.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged, rename_all = "lowercase")]
 pub enum PackageSource {
     /// Load all resources from the package.
     Source(String),
@@ -404,7 +659,7 @@ pub enum PackageSource {
 }
 
 /// Object form of [`PackageSource`] (settings-manager.ts:74-80).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PackageSourceFilter {
     pub source: String,
@@ -427,7 +682,7 @@ pub struct PackageSourceFilter {
 /// struct: upstream casts parsed JSON to `Settings`, so unknown keys survive
 /// loads, merges, and writes. Typed access goes through the
 /// [`SettingsManager`] getters, which apply the upstream defaults.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct Settings {
     fields: Map<String, Value>,
@@ -498,6 +753,20 @@ impl Settings {
 
     fn nested_bool(&self, key: &str, sub: &str) -> Option<bool> {
         self.nested(key, sub)?.as_bool()
+    }
+}
+
+fn deserialize_u64_option<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    match value {
+        Some(value) if value.is_finite() && value >= 0.0 => Ok(Some(value.floor() as u64)),
+        Some(_) => Err(serde::de::Error::custom(
+            "expected a non-negative finite number or null",
+        )),
+        None => Ok(None),
     }
 }
 
@@ -699,7 +968,19 @@ fn parse_timeout_setting(
 // ---------------------------------------------------------------------------
 
 /// `SettingsScope = "global" | "project"` (settings-manager.ts:173).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Ord,
+    PartialOrd,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 pub enum SettingsScope {
     #[serde(rename = "global")]
     Global,
@@ -1162,6 +1443,8 @@ impl SettingsManager {
             _ => return Ok(Settings::new()),
         };
         let value: Value = serde_json::from_str(&content)?;
+        crate::core::config_schemas::validate_runtime_settings_document(&value)
+            .map_err(RpiError::Settings)?;
         let mut fields = match value {
             Value::Object(map) => map,
             // Upstream throws a TypeError from `migrateSettings` on
@@ -3246,9 +3529,11 @@ mod tests {
             serde_json::json!({"defaultTools": "nope"}),
         );
         let manager = create(&dirs);
-        // A non-array value resolves like an empty list (settings files are
-        // not validated).
-        assert_eq!(manager.get_default_tools(), Some(Vec::new()));
+        assert!(manager.project_settings_load_error.is_some());
+        assert_eq!(
+            manager.get_default_tools(),
+            Some(vec!["read".to_string(), "bash".to_string()])
+        );
     }
 
     #[test]
@@ -3284,12 +3569,12 @@ mod tests {
         assert_eq!(settings.mode, CodemodeMode::Only);
         assert_eq!(settings.inline_budget, Some(12));
 
-        // Malformed values fall back to the upstream readers.
         write_json(
             &global_path(&dirs),
             json!({"codemode": {"mode": "weird", "inlineBudget": -1}}),
         );
         let manager = create(&dirs);
+        assert!(manager.global_settings_load_error.is_some());
         let settings = manager.get_codemode_settings();
         assert_eq!(settings.mode, CodemodeMode::On);
         assert_eq!(settings.inline_budget, None);
@@ -3338,16 +3623,14 @@ mod tests {
                             "baseUrl": "https://example.test",
                             "apiKeyEnv": "OBJ_KEY",
                             "model": "m1"
-                        },
-                        "empty": "",
-                        "missing-script": {"baseUrl": "https://x.test"},
-                        "bad": 42
+                        }
                     },
                     "timeoutMs": 1500.9
                 }
             }),
         );
         let manager = create(&dirs);
+        assert!(manager.global_settings_load_error.is_none());
         let settings = manager.get_usage_settings();
         assert_eq!(
             settings.providers.get("str-p"),
@@ -3365,19 +3648,39 @@ mod tests {
                 model: Some("m1".to_owned()),
             })
         );
-        // Malformed entries are skipped; unset fields stay absent.
-        assert!(!settings.providers.contains_key("empty"));
-        assert!(!settings.providers.contains_key("missing-script"));
-        assert!(!settings.providers.contains_key("bad"));
         assert_eq!(settings.timeout_ms, Some(1500));
 
-        // A non-object `usage` section (or unset) yields the defaults.
         write_json(&global_path(&dirs), json!({"usage": "nope"}));
         let manager = create(&dirs);
+        assert!(manager.global_settings_load_error.is_some());
         assert_eq!(manager.get_usage_settings(), UsageSettings::default());
         write_json(&global_path(&dirs), json!({}));
         let manager = create(&dirs);
         assert_eq!(manager.get_usage_settings(), UsageSettings::default());
+    }
+
+    #[test]
+    fn usage_settings_reject_malformed_provider_entries() {
+        for (name, entry) in [
+            ("empty", serde_json::json!("")),
+            (
+                "missing-script",
+                serde_json::json!({"baseUrl": "https://x.test"}),
+            ),
+            ("bad", serde_json::json!(42)),
+        ] {
+            let dirs = test_dirs();
+            write_json(
+                &global_path(&dirs),
+                serde_json::json!({"usage": {"providers": {name: entry}}}),
+            );
+            let manager = create(&dirs);
+            assert!(
+                manager.global_settings_load_error.is_some(),
+                "{name} must fail startup validation"
+            );
+            assert!(manager.get_usage_settings().providers.is_empty());
+        }
     }
 
     // V16-13 FR-D R6: `quietStartup` tri-state (settings-manager.ts:1089-1098
@@ -3916,16 +4219,11 @@ mod tests {
         let dirs = test_dirs();
         write_json(&global_path(&dirs), json!({"httpIdleTimeoutMs": -1}));
         let manager = create(&dirs);
-
-        match manager.get_http_idle_timeout_ms() {
-            Err(RpiError::Settings(message)) => {
-                assert!(
-                    message.contains("Invalid httpIdleTimeoutMs setting"),
-                    "{message}"
-                );
-            }
-            other => panic!("expected settings error, got {other:?}"),
-        }
+        assert!(manager.global_settings_load_error.is_some());
+        assert_eq!(
+            manager.get_http_idle_timeout_ms().unwrap(),
+            DEFAULT_HTTP_IDLE_TIMEOUT_MS
+        );
     }
 
     // =======================================================================
@@ -5036,15 +5334,8 @@ mod tests {
         );
     }
 
-    /// Invalid token values / malformed entries: upstream's #8133
-    /// safe-integer and object checks throw (settings-manager-compaction.
-    /// test.ts "reports invalid token values"); the port keeps the
-    /// module-level wrong-type deviation — wrongly-typed values fall
-    /// through to the next tier (override → ordinary → default) instead of
-    /// erroring, and malformed entries are ignored. Valid files behave
-    /// identically. Numbers keep the established `value_u64` coercion
-    /// (Math.floor semantics; negatives saturate to 0) — the same handling
-    /// the ordinary compaction settings had before #8133.
+    /// Invalid token values and malformed entries fail the shared typed
+    /// document validation, leaving the scope empty and the error recorded.
     #[test]
     fn test_compaction_model_overrides_invalid_values_fall_back() {
         let dirs = test_dirs();
@@ -5060,12 +5351,13 @@ mod tests {
         );
         let manager = create(&dirs);
         let model = model_ref("provider", "family/model");
-        // String override falls through to ordinary (8192); the negative
-        // number clamps to 0 (saturating cast, same as ordinary settings).
-        assert_eq!(manager.get_compaction_reserve_tokens(Some(model)), 8192);
-        assert_eq!(manager.get_compaction_keep_recent_tokens(Some(model)), 0);
+        assert!(manager.global_settings_load_error.is_some());
+        assert_eq!(manager.get_compaction_reserve_tokens(Some(model)), 16384);
+        assert_eq!(
+            manager.get_compaction_keep_recent_tokens(Some(model)),
+            20000
+        );
 
-        // Malformed entry (not an object) ignored entirely.
         write_json(
             &global_path(&dirs),
             json!({"compaction": {
@@ -5074,10 +5366,9 @@ mod tests {
             }}),
         );
         let manager = create(&dirs);
-        assert_eq!(manager.get_compaction_reserve_tokens(Some(model)), 8192);
+        assert!(manager.global_settings_load_error.is_some());
+        assert_eq!(manager.get_compaction_reserve_tokens(Some(model)), 16384);
 
-        // Invalid ordinary value + valid override → the override wins
-        // (upstream throws; the port's tiered fallback resolves forward).
         write_json(
             &global_path(&dirs),
             json!({"compaction": {
@@ -5086,7 +5377,8 @@ mod tests {
             }}),
         );
         let manager = create(&dirs);
-        assert_eq!(manager.get_compaction_reserve_tokens(Some(model)), 4096);
+        assert!(manager.global_settings_load_error.is_some());
+        assert_eq!(manager.get_compaction_reserve_tokens(Some(model)), 16384);
         assert_eq!(manager.get_compaction_reserve_tokens(None), 16384);
     }
 
@@ -5238,11 +5530,14 @@ mod tests {
             (json!("fast"), WheelScrollLines::Auto),
             (json!(null), WheelScrollLines::Auto),
         ] {
+            let invalid = value == "fast";
             write_json(
                 &global_path(&dirs),
                 json!({"fullscreenWheelScrollLines": value}),
             );
-            assert_eq!(create(&dirs).get_fullscreen_wheel_scroll_lines(), expected);
+            let manager = create(&dirs);
+            assert_eq!(manager.get_fullscreen_wheel_scroll_lines(), expected);
+            assert_eq!(manager.global_settings_load_error.is_some(), invalid);
         }
     }
 

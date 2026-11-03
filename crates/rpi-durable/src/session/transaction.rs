@@ -1231,6 +1231,9 @@ impl Transaction {
                     )));
                 }
             }
+            if !plan.retire {
+                self.host.touch(&plan.address_id);
+            }
             if plan.retire {
                 if committed {
                     self.host.evict(&plan.address_id, record.id);

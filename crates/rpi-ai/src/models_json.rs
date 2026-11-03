@@ -3,10 +3,10 @@
 //! scope split).
 //!
 //! Intentional differences (upstream deviations):
-//! - Schema validation uses serde plus a small manual pass, not TypeBox;
-//!   error wording and paths differ (registered as D-006), but the three
-//!   failure classes (load / parse / schema) and their message prefixes are
-//!   preserved verbatim.
+//! - Schema validation combines the generated typed JSON Schema with the
+//!   existing manual diagnostics instead of TypeBox. Error wording and paths
+//!   differ (registered as D-006), but the three failure classes (load / parse /
+//!   schema) and their message prefixes are preserved verbatim.
 //! - The upstream per-API compat union is validated as the flat
 //!   [`ModelCompat`] struct (the same merged struct the wire types use), which
 //!   is more permissive than the TypeBox union.
@@ -192,7 +192,7 @@ pub fn strip_json_comments(input: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// `ModelOverrideSchema.cost` — every rate optional (partial override).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelsJsonModelOverrideCost {
     pub input: Option<f64>,
@@ -204,19 +204,22 @@ pub struct ModelsJsonModelOverrideCost {
 
 /// `ModelPromptCacheSchema` (#9668, c596d09d9; model-config.ts:139-142):
 /// best-effort prompt cache lifetime in seconds per retention tier.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelsJsonPromptCache {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("exclusiveMinimum" = 0.0))]
     pub short: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("exclusiveMinimum" = 0.0))]
     pub long: Option<u32>,
 }
 
 /// `ModelOverrideSchema`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelsJsonModelOverride {
+    #[schemars(length(min = 1))]
     pub name: Option<String>,
     pub reasoning: Option<bool>,
     pub thinking_level_map: Option<ThinkingLevelMap>,
@@ -229,7 +232,9 @@ pub struct ModelsJsonModelOverride {
     /// `ModelOverrideSchema.promptCache` (#9668): merged per tier with the
     /// catalog value.
     pub prompt_cache: Option<ModelsJsonPromptCache>,
+    #[schemars(extend("exclusiveMinimum" = 0.0))]
     pub context_window: Option<f64>,
+    #[schemars(extend("exclusiveMinimum" = 0.0))]
     pub max_tokens: Option<f64>,
     /// 25a2c8dcf (#7568): default sampling parameters for this model.
     pub sampling_params: Option<serde_json::Map<String, Value>>,
@@ -241,12 +246,16 @@ pub struct ModelsJsonModelOverride {
 }
 
 /// `ModelDefinitionSchema`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelsJsonModel {
+    #[schemars(length(min = 1))]
     pub id: String,
+    #[schemars(length(min = 1))]
     pub name: Option<String>,
+    #[schemars(length(min = 1))]
     pub api: Option<String>,
+    #[schemars(length(min = 1))]
     pub base_url: Option<String>,
     pub reasoning: Option<bool>,
     pub thinking_level_map: Option<ThinkingLevelMap>,
@@ -258,7 +267,9 @@ pub struct ModelsJsonModel {
     /// `ModelDefinitionSchema.promptCache` (#9668): unset disables cache
     /// warming for the model.
     pub prompt_cache: Option<ModelsJsonPromptCache>,
+    #[schemars(extend("exclusiveMinimum" = 0.0))]
     pub context_window: Option<f64>,
+    #[schemars(extend("exclusiveMinimum" = 0.0))]
     pub max_tokens: Option<f64>,
     /// 25a2c8dcf (#7568): default sampling parameters for this model.
     pub sampling_params: Option<serde_json::Map<String, Value>>,
@@ -269,14 +280,25 @@ pub struct ModelsJsonModel {
     pub compat: Option<ModelCompat>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum ModelsJsonOAuth {
+    #[serde(rename = "radius")]
+    Radius,
+}
+
 /// `ProviderConfigSchema`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelsJsonProvider {
+    #[schemars(length(min = 1))]
     pub name: Option<String>,
+    #[schemars(length(min = 1))]
     pub base_url: Option<String>,
+    #[schemars(length(min = 1))]
     pub api_key: Option<String>,
+    #[schemars(length(min = 1))]
     pub api: Option<String>,
+    #[schemars(with = "Option<ModelsJsonOAuth>")]
     pub oauth: Option<String>,
     pub headers: Option<HashMap<String, String>>,
     pub compat: Option<ModelCompat>,
@@ -284,20 +306,68 @@ pub struct ModelsJsonProvider {
     pub models: Option<Vec<ModelsJsonModel>>,
     /// Insertion-ordered (upstream `Record<string, ModelOverrideSchema>` keeps
     /// key insertion order).
+    #[schemars(with = "Option<std::collections::BTreeMap<String, ModelsJsonModelOverride>>")]
     pub model_overrides: Option<OrderedMap<ModelsJsonModelOverride>>,
 }
 
 /// `ModelsConfigSchema`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ModelsJson {
+    #[serde(rename = "$schema", default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
     /// Insertion-ordered (upstream `Map` preserves key insertion order in
     /// `getProviderIds`).
+    #[schemars(with = "std::collections::BTreeMap<String, ModelsJsonProvider>")]
     pub providers: OrderedMap<ModelsJsonProvider>,
 }
 
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
+
+fn remove_nullable_options(value: &mut Value, path: &str) {
+    match value {
+        Value::Object(map) => {
+            let preserve = path.ends_with("/properties/thinkingLevelMap")
+                || path.contains("/properties/thinkingLevelMap/")
+                || path.ends_with("/properties/partition")
+                || path.ends_with("/$defs/ChatTemplateKwargValue");
+            if !preserve {
+                if let Some(Value::Array(options)) = map.get_mut("anyOf") {
+                    options.retain(|option| option["type"] != "null");
+                }
+                if let Some(Value::Array(types)) = map.get_mut("type") {
+                    types.retain(|kind| kind != "null");
+                }
+            }
+            for (key, child) in map {
+                remove_nullable_options(child, &format!("{path}/{key}"));
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter_mut().enumerate() {
+                remove_nullable_options(child, &format!("{path}/{index}"));
+            }
+        }
+        _ => {}
+    }
+}
+
+impl ModelsJson {
+    pub fn schema_document() -> Value {
+        let mut schema =
+            serde_json::to_value(schemars::schema_for!(Self)).expect("serialize models schema");
+        remove_nullable_options(&mut schema, "#");
+        schema
+    }
+
+    fn validator() -> &'static jsonschema::Validator {
+        static VALIDATOR: std::sync::OnceLock<jsonschema::Validator> = std::sync::OnceLock::new();
+        VALIDATOR.get_or_init(|| {
+            jsonschema::Validator::new(&Self::schema_document()).expect("models schema validator")
+        })
+    }
+}
 
 fn check_min_length(errors: &mut Vec<String>, path: &str, value: &Option<String>) {
     if let Some(value) = value
@@ -409,7 +479,7 @@ impl ModelConfig {
             &path.display().to_string(),
             &parsed,
         );
-        let config: ModelsJson = match serde_json::from_value(parsed) {
+        let config: ModelsJson = match serde_json::from_value(parsed.clone()) {
             Ok(config) => config,
             Err(error) => {
                 return Self::with_error(format!(
@@ -423,6 +493,12 @@ impl ModelConfig {
             return Self::with_error(format!(
                 "Invalid models.json schema:\n{}\n\nFile: {}",
                 errors.join("\n"),
+                path.display()
+            ));
+        }
+        if let Err(error) = ModelsJson::validator().validate(&parsed) {
+            return Self::with_error(format!(
+                "Invalid models.json schema:\n  - {error}\n\nFile: {}",
                 path.display()
             ));
         }
@@ -579,12 +655,13 @@ mod tests {
                         {
                             "id": "gpt-4o",
                             "reasoning": false,
+                            "thinkingLevelMap": {"high": null},
                             "input": ["text", "image"],
                             "cost": {"input": 2.5, "output": 10.0, "cacheRead": 1.25, "cacheWrite": 2.5},
                         }
                     ],
                     "modelOverrides": {
-                        "gpt-4o": {"contextWindow": 128000}
+                        "gpt-4o": {"contextWindow": 128000, "thinkingLevelMap": {"low": null}}
                     }
                 },
                 "anthropic": {"oauth": "radius"},
@@ -618,6 +695,34 @@ mod tests {
             Some("radius")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_load_rejects_zero_limits_and_invalid_compat_types() {
+        for (name, document) in [
+            (
+                "zero-context",
+                serde_json::json!({"providers": {"x": {"models": [{"id": "m", "contextWindow": 0}]}}}),
+            ),
+            (
+                "invalid-compat",
+                serde_json::json!({"providers": {"x": {"compat": {"supportsStore": "yes"}}}}),
+            ),
+            (
+                "zero-prompt-cache",
+                serde_json::json!({"providers": {"x": {"models": [{"id": "m", "promptCache": {"short": 0}}]}}}),
+            ),
+            (
+                "nullable-base-url",
+                serde_json::json!({"providers": {"x": {"baseUrl": null}}}),
+            ),
+        ] {
+            let path = temp_path(name);
+            std::fs::write(&path, serde_json::to_vec(&document).expect("json")).expect("write");
+            let config = ModelConfig::load(Some(&path)).await;
+            assert!(config.error().is_some(), "accepted {document}");
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[tokio::test]

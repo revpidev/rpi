@@ -231,6 +231,11 @@ mod tests {
         assert!(config.enabled, "bad enabled falls back to true");
         assert!(!config.footer, "valid key survives");
         assert_eq!(config.refresh_ms, DEFAULT_REFRESH_MS);
+        assert_eq!(
+            parse_settings(&json!({"usage": {"refreshMs": 200.9}})).refresh_ms,
+            DEFAULT_REFRESH_MS,
+            "fractional values are not silently floored by the consumer"
+        );
         assert_eq!(config.percentage, PercentageMode::Used);
         assert!(config.reset_countdown);
     }

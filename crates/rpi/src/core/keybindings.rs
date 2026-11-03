@@ -69,7 +69,8 @@ pub fn get_keybindings() -> &'static RwLock<KeybindingsManager> {
 ///
 /// JSON serialises as `string` or `string[]` (matching upstream
 /// `KeyId | KeyId[]`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
 pub enum KeyBindingValue {
     Single(String),
     Multiple(Vec<String>),
@@ -876,6 +877,7 @@ fn load_raw_config(path: &Path) -> Option<serde_json::Map<String, serde_json::Va
     // #8337: BOM stripped before parse (keybindings.ts:363).
     let parsed: serde_json::Value =
         serde_json::from_str(crate::tools::edit_diff::strip_bom(&content).1.as_str()).ok()?;
+    crate::core::config_schemas::validate_keybindings_document(&parsed).ok()?;
     parsed.as_object().cloned()
 }
 

@@ -207,16 +207,17 @@ fn display_items(outcome: &CodemodeOutcome) -> Vec<CodemodeTextItem> {
 }
 
 fn count_chars(text: &str) -> usize {
-    text.chars().count()
+    text.encode_utf16().count()
 }
 
 fn head_chars(text: &str, max: usize) -> String {
-    text.chars().take(max).collect()
+    let units: Vec<u16> = text.encode_utf16().take(max).collect();
+    String::from_utf16_lossy(&units)
 }
 
 fn tail_chars(text: &str, max: usize) -> String {
-    let count = text.chars().count();
-    text.chars().skip(count.saturating_sub(max)).collect()
+    let units: Vec<u16> = text.encode_utf16().collect();
+    String::from_utf16_lossy(&units[units.len().saturating_sub(max)..])
 }
 
 /// The first `max_lines` lines of the first `max_chars` characters, as
@@ -606,6 +607,28 @@ mod tests {
                 .map(|value| String::from_utf8_lossy(&value).contains(&"x".repeat(500)))
                 .unwrap_or(false)
         );
+    }
+
+    #[test]
+    fn utf16_length_and_slicing_match_javascript_strings() {
+        let text = "A😀B中";
+        assert_eq!(count_chars(text), 5);
+        assert_eq!(count_chars("e\u{301}"), 2);
+        assert_eq!(head_chars(text, 2), "A\u{fffd}");
+        assert_eq!(head_chars(text, 3), "A😀");
+        assert_eq!(tail_chars(text, 2), "B中");
+        assert_eq!(tail_chars(text, 3), "\u{fffd}B中");
+        assert_eq!(tail_chars(text, 4), "😀B中");
+    }
+
+    #[tokio::test]
+    async fn truncation_uses_utf16_token_counts() {
+        let formatted =
+            format_outcome(&CodemodeOutcome::output("😀😀😀"), 0.0, 1, None, &[], 0).await;
+        let text = rendered(&formatted);
+        assert!(formatted.truncated, "{text}");
+        assert!(text.contains("original token count: 2"), "{text}");
+        assert!(text.contains("1 tokens truncated"), "{text}");
     }
 
     fn rendered(formatted: &FormattedOutput) -> String {

@@ -18,6 +18,7 @@ use crate::documents::{
     DocScope, DocTarget, DocToken, check_record_scope_record, check_record_version_record,
     materialize_document, resolve_address,
 };
+use crate::harness::types::{ReportFn, SetTimer, TimerDisarm};
 use crate::ids::{ConversationId, DocumentId, EntryId, Seq};
 use crate::session::guarded::GuardedStorage;
 use crate::session::observation::{
@@ -28,10 +29,26 @@ use crate::session::{
     CommitChange, CommitPublication, DocOwner, SessionEnd, SessionError, SessionFuture,
     SessionResult, Subscription, doc_target, observed_operations,
 };
+use crate::timers::Timers;
 use crate::types::{ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, Storage};
 
 /// Wall clock used for task lifecycle times (upstream `Date.now`).
 pub type NowFn = Arc<dyn Fn() -> f64 + Send + Sync>;
+
+struct DocumentSweep {
+    id: u64,
+    at: f64,
+    disarm: Option<TimerDisarm>,
+}
+
+/// Loaded-document cache counts (upstream `documentCacheSizes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentCacheSizes {
+    pub cached: usize,
+    pub idle: usize,
+    pub attached: usize,
+    pub sweeps: u64,
+}
 
 /// A synchronous post-adoption commit listener. It must not throw, block, or
 /// call session operations (upstream `subscribeCommits`).
@@ -130,18 +147,23 @@ pub struct SessionImpl {
     failure_hooks: Mutex<Vec<FailureHook>>,
     /// Last use of each cached document, by address, for retention.
     idle_since: Mutex<HashMap<String, f64>>,
-    /// Addresses with attached watches/states and how many; never evicted while
-    /// the count is positive (upstream `#attachedDocuments`).
-    attached: Mutex<std::collections::HashMap<String, usize>>,
+    /// Incarnations with attached watches/states and how many; never evicted
+    /// while the count is positive (upstream `#attachedDocuments`).
+    attached: Mutex<std::collections::HashMap<DocumentId, usize>>,
     /// `settings.documentRetentionMs`, read at each use.
     document_retention_ms: Mutex<Option<DocumentRetentionReader>>,
+    document_timers: Mutex<Arc<Timers>>,
+    document_sweep: Mutex<Option<DocumentSweep>>,
+    next_sweep_id: AtomicU64,
+    sweep_jobs: AtomicU64,
+    document_timers_unavailable: AtomicBool,
 }
 
 /// Reads `settings.documentRetentionMs` at each use.
 pub type DocumentRetentionReader = Arc<dyn Fn() -> Option<f64> + Send + Sync>;
 
-/// Host reporter for the error that failed the Session.
-pub type FailureReporter = Arc<dyn Fn(String) + Send + Sync>;
+/// Host reporter for a Session failure or listener error and its optional telemetry context.
+pub type FailureReporter = Arc<dyn Fn(String, Option<Context>) + Send + Sync>;
 /// Callback run when the Session fails.
 pub type FailureHook = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -176,6 +198,11 @@ impl SessionImpl {
             idle_since: Mutex::new(HashMap::new()),
             attached: Mutex::new(std::collections::HashMap::new()),
             document_retention_ms: Mutex::new(None),
+            document_timers: Mutex::new(Timers::new(None, Arc::new(|_| {}))),
+            document_sweep: Mutex::new(None),
+            next_sweep_id: AtomicU64::new(1),
+            sweep_jobs: AtomicU64::new(0),
+            document_timers_unavailable: AtomicBool::new(false),
         });
         session.guarded_typed.attach(&session);
         session
@@ -222,6 +249,14 @@ impl SessionImpl {
     /// listeners run at once, and Storage closes in the background. Later
     /// calls and waits reject with `SessionFailed`.
     pub fn fail(self: &Arc<Self>, cause: impl Into<String>) {
+        self.fail_with_context(cause, None);
+    }
+
+    pub(crate) fn fail_with_context(
+        self: &Arc<Self>,
+        cause: impl Into<String>,
+        context: Option<&Context>,
+    ) {
         let cause = cause.into();
         {
             let Ok(mut failure) = self.failure.lock() else {
@@ -244,7 +279,7 @@ impl SessionImpl {
         if let Ok(reporter) = self.failure_reporter.lock()
             && let Some(reporter) = reporter.as_ref()
         {
-            reporter(cause.clone());
+            reporter(cause.clone(), context.cloned());
         }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let this = Arc::clone(self);
@@ -293,7 +328,7 @@ impl SessionImpl {
                 && let Ok(reporter) = self.listener_reporter.lock()
                 && let Some(reporter) = reporter.as_ref()
             {
-                reporter("A close listener panicked".to_string());
+                reporter("A close listener panicked".to_string(), None);
             }
         }
     }
@@ -310,8 +345,7 @@ impl SessionImpl {
         }
     }
 
-    pub(crate) fn cached(&self, address_id: &str) -> Option<Arc<LoadedDocument>> {
-        self.evict_idle();
+    pub(crate) fn cached(self: &Arc<Self>, address_id: &str) -> Option<Arc<LoadedDocument>> {
         let document = self
             .documents
             .lock()
@@ -330,82 +364,305 @@ impl SessionImpl {
         }
     }
 
-    fn touch(&self, address_id: &str) {
-        if let Ok(mut idle) = self.idle_since.lock() {
-            idle.insert(address_id.to_string(), (self.now)());
+    pub fn set_document_timer(&self, set_timer: Option<SetTimer>, report: ReportFn) {
+        if let Ok(mut timers) = self.document_timers.lock() {
+            *timers = Timers::new(set_timer, report);
         }
     }
 
-    /// Drop documents with no watch or state attached once they were not used
-    /// for `documentRetentionMs` (default ten minutes; `0` drops immediately,
-    /// `Infinity` keeps).
-    fn evict_idle(&self) {
-        let retention_reader = self
+    /// Cache counts for diagnostics and retention conformance.
+    pub fn document_cache_sizes(&self) -> DocumentCacheSizes {
+        DocumentCacheSizes {
+            cached: self
+                .documents
+                .lock()
+                .map(|documents| documents.len())
+                .unwrap_or(0),
+            idle: self.idle_since.lock().map(|idle| idle.len()).unwrap_or(0),
+            attached: self
+                .attached
+                .lock()
+                .map(|attached| attached.len())
+                .unwrap_or(0),
+            sweeps: self.sweep_jobs.load(Ordering::SeqCst),
+        }
+    }
+
+    fn document_retention(&self) -> f64 {
+        let reader = self
             .document_retention_ms
             .lock()
             .ok()
             .and_then(|slot| slot.clone());
-        // A non-negative number, `Infinity` to keep documents; anything else is
-        // the default (upstream `documentRetention`).
-        let retention = match retention_reader.as_ref().and_then(|reader| reader()) {
+        match reader.as_ref().and_then(|reader| reader()) {
             Some(ms) if ms == f64::INFINITY || (ms.is_finite() && ms >= 0.0) => ms,
             _ => 600_000.0,
+        }
+    }
+
+    pub(crate) fn touch(self: &Arc<Self>, address_id: &str) {
+        let Some(document) = self
+            .documents
+            .lock()
+            .ok()
+            .and_then(|documents| documents.get(address_id).cloned())
+        else {
+            return;
         };
+        if self
+            .attached
+            .lock()
+            .map(|attached| attached.contains_key(&document.record.id))
+            .unwrap_or(false)
+        {
+            if let Ok(mut idle) = self.idle_since.lock() {
+                idle.remove(address_id);
+            }
+            return;
+        }
         let now = (self.now)();
+        let retention = self.document_retention();
+        if let Ok(mut idle) = self.idle_since.lock() {
+            if idle
+                .get(address_id)
+                .is_some_and(|since| now - *since < (1_000.0_f64).min(retention / 10.0))
+            {
+                return;
+            }
+            idle.insert(address_id.to_string(), now);
+        }
+        self.schedule_eviction();
+    }
+
+    fn schedule_eviction(self: &Arc<Self>) {
+        if self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let retention = self.document_retention();
+        if !retention.is_finite() {
+            return;
+        }
         let attached = self
             .attached
             .lock()
-            .ok()
-            .map(|set| set.clone())
+            .map(|attached| attached.clone())
             .unwrap_or_default();
-        let idle = match self.idle_since.lock() {
-            Ok(idle) => idle,
-            Err(_) => return,
-        };
-        let expired: Vec<String> = idle
-            .iter()
-            .filter(|(address, since)| {
-                !attached.contains_key(*address) && now - **since >= retention
+        let documents: HashMap<String, DocumentId> = self
+            .documents
+            .lock()
+            .map(|documents| {
+                documents
+                    .iter()
+                    .map(|(address, document)| (address.clone(), document.record.id))
+                    .collect()
             })
-            .map(|(address, _)| address.clone())
-            .collect();
-        drop(idle);
-        if expired.is_empty() {
+            .unwrap_or_default();
+        let oldest = self.idle_since.lock().ok().and_then(|idle| {
+            idle.iter()
+                .filter(|(address, _)| {
+                    documents
+                        .get(*address)
+                        .is_some_and(|id| !attached.contains_key(id))
+                })
+                .min_by(|(left_address, left), (right_address, right)| {
+                    left.total_cmp(right)
+                        .then_with(|| left_address.cmp(right_address))
+                })
+                .map(|(address, since)| (address.clone(), *since))
+        });
+        let Some((_, since)) = oldest else {
+            return;
+        };
+        let at = since + retention;
+        {
+            let mut pending = match self.document_sweep.lock() {
+                Ok(pending) => pending,
+                Err(_) => return,
+            };
+            if pending.as_ref().is_some_and(|sweep| sweep.at <= at) {
+                return;
+            }
+            if let Some(sweep) = pending.as_mut()
+                && let Some(disarm) = sweep.disarm.take()
+            {
+                disarm();
+            }
+        }
+        let id = self.next_sweep_id.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut pending) = self.document_sweep.lock() {
+            *pending = Some(DocumentSweep {
+                id,
+                at,
+                disarm: None,
+            });
+        }
+        let delay = at - (self.now)();
+        let run: Arc<dyn Fn() + Send + Sync> = {
+            let this = Arc::clone(self);
+            Arc::new(move || {
+                let this = Arc::clone(&this);
+                this.sweep_jobs.fetch_add(1, Ordering::SeqCst);
+                let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                    if let Ok(mut pending) = this.document_sweep.lock()
+                        && pending.as_ref().is_some_and(|sweep| sweep.id == id)
+                    {
+                        *pending = None;
+                    }
+                    return;
+                };
+                handle.spawn(async move {
+                    let this_for_job = Arc::clone(&this);
+                    let result = this
+                        .read_on_line(move || {
+                            let this = Arc::clone(&this_for_job);
+                            Box::pin(async move {
+                                let current = this
+                                    .document_sweep
+                                    .lock()
+                                    .map(|mut pending| {
+                                        if pending.as_ref().is_some_and(|sweep| sweep.id == id) {
+                                            pending.take();
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                    .unwrap_or(false);
+                                if current && !this.closing.load(Ordering::SeqCst) {
+                                    this.evict_idle();
+                                }
+                                Ok(())
+                            })
+                        })
+                        .await;
+                    let _ = result;
+                });
+            })
+        };
+        if delay <= 0.0 {
+            run();
             return;
         }
-        if let Ok(mut documents) = self.documents.lock() {
-            for address in &expired {
-                documents.remove(address);
+        if self.document_timers_unavailable.load(Ordering::SeqCst) {
+            if let Ok(mut pending) = self.document_sweep.lock() {
+                *pending = None;
             }
+            return;
+        }
+        let disarm = self
+            .document_timers
+            .lock()
+            .map(|timers| timers.clone())
+            .unwrap_or_else(|_| Timers::new(None, Arc::new(|_| {})))
+            .background(run, delay);
+        match disarm {
+            Some(disarm) => {
+                if let Ok(mut pending) = self.document_sweep.lock()
+                    && let Some(sweep) = pending.as_mut()
+                    && sweep.id == id
+                {
+                    sweep.disarm = Some(disarm);
+                }
+            }
+            None => {
+                self.document_timers_unavailable
+                    .store(true, Ordering::SeqCst);
+                if let Ok(mut pending) = self.document_sweep.lock()
+                    && pending.as_ref().is_some_and(|sweep| sweep.id == id)
+                {
+                    *pending = None;
+                }
+            }
+        }
+    }
+
+    /// Drop expired unattached documents on the mutation line, then arm the next sweep.
+    fn evict_idle(self: &Arc<Self>) {
+        let retention = self.document_retention();
+        if retention.is_finite() {
+            let expired_at = (self.now)() - retention;
+            let attached = self
+                .attached
+                .lock()
+                .map(|attached| attached.clone())
+                .unwrap_or_default();
+            let documents: HashMap<String, DocumentId> = self
+                .documents
+                .lock()
+                .map(|documents| {
+                    documents
+                        .iter()
+                        .map(|(address, document)| (address.clone(), document.record.id))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut expired: Vec<(String, f64)> = self
+                .idle_since
+                .lock()
+                .map(|idle| {
+                    idle.iter()
+                        .filter(|(address, since)| {
+                            documents
+                                .get(*address)
+                                .is_some_and(|id| !attached.contains_key(id))
+                                && **since <= expired_at
+                        })
+                        .map(|(address, since)| (address.clone(), *since))
+                        .collect()
+                })
+                .unwrap_or_default();
+            expired.sort_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            if let Ok(mut documents) = self.documents.lock() {
+                for (address, _) in &expired {
+                    documents.remove(address);
+                }
+            }
+            if let Ok(mut idle) = self.idle_since.lock() {
+                for (address, _) in expired {
+                    idle.remove(&address);
+                }
+            }
+        }
+        self.schedule_eviction();
+    }
+
+    pub(crate) fn attach_document(self: &Arc<Self>, address_id: &str, record_id: DocumentId) {
+        if let Ok(mut attached) = self.attached.lock() {
+            *attached.entry(record_id).or_insert(0) += 1;
         }
         if let Ok(mut idle) = self.idle_since.lock() {
-            for address in expired {
-                idle.remove(&address);
-            }
+            idle.remove(address_id);
         }
     }
 
-    pub(crate) fn attach_document(&self, address_id: &str) {
-        if let Ok(mut attached) = self.attached.lock() {
-            *attached.entry(address_id.to_string()).or_insert(0) += 1;
-        }
-    }
-
-    pub(crate) fn detach_document(&self, address_id: &str) {
+    pub(crate) fn detach_document(self: &Arc<Self>, address_id: &str, record_id: DocumentId) {
+        let mut released = false;
         if let Ok(mut attached) = self.attached.lock()
-            && let Some(count) = attached.get_mut(address_id)
+            && let Some(count) = attached.get_mut(&record_id)
         {
             *count = count.saturating_sub(1);
-            // Only the last observer releases the address: another watch or
-            // state still keeps the document cached.
             if *count == 0 {
-                attached.remove(address_id);
+                attached.remove(&record_id);
+                released = true;
             }
         }
-        self.touch(address_id);
+        if released
+            && self
+                .documents
+                .lock()
+                .ok()
+                .and_then(|documents| documents.get(address_id).cloned())
+                .is_some_and(|document| document.record.id == record_id)
+        {
+            self.touch(address_id);
+        }
     }
 
-    pub(crate) fn install(&self, document: Arc<LoadedDocument>) {
+    pub(crate) fn install(self: &Arc<Self>, document: Arc<LoadedDocument>) {
         let address = document.address_id.clone();
         if let Ok(mut documents) = self.documents.lock() {
             documents.insert(address.clone(), document);
@@ -414,18 +671,29 @@ impl SessionImpl {
     }
 
     pub(crate) fn evict(&self, address_id: &str, record_id: DocumentId) {
-        if let Ok(mut documents) = self.documents.lock()
-            && documents
-                .get(address_id)
-                .map(|document| document.record.id == record_id)
-                .unwrap_or(false)
-        {
-            documents.remove(address_id);
+        let removed = self
+            .documents
+            .lock()
+            .map(|mut documents| {
+                if documents
+                    .get(address_id)
+                    .map(|document| document.record.id == record_id)
+                    .unwrap_or(false)
+                {
+                    documents.remove(address_id);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if removed && let Ok(mut idle) = self.idle_since.lock() {
+            idle.remove(address_id);
         }
     }
 
     pub(crate) async fn load_document(
-        &self,
+        self: &Arc<Self>,
         definition: &Arc<crate::documents::DocDefinition>,
         address_id: &str,
         address: &DocumentAddress,
@@ -544,6 +812,7 @@ impl SessionImpl {
             Ok(value) => value,
             Err(error) => {
                 tx.settle_failure().await;
+                self.evict_idle();
                 return Err(error);
             }
         };
@@ -551,11 +820,19 @@ impl SessionImpl {
         // Session, so this commit must not commit or report success.
         if let Err(error) = self.assert_healthy() {
             tx.settle_failure().await;
+            self.evict_idle();
             return Err(error);
         }
-        let writes = tx.settle_success().await?;
+        let writes = match tx.settle_success().await {
+            Ok(writes) => writes,
+            Err(error) => {
+                self.evict_idle();
+                return Err(error);
+            }
+        };
         if writes.is_empty() {
             tx.discard();
+            self.evict_idle();
             return Ok(result);
         }
         let seq = match self
@@ -578,6 +855,7 @@ impl SessionImpl {
             }
         };
         self.publish(seq, &writes, &documents, &context);
+        self.evict_idle();
         Ok(result)
     }
 
@@ -588,10 +866,6 @@ impl SessionImpl {
         documents: &[CommitChange],
         context: &Context,
     ) {
-        // A commit is also when documents past their retention leave the cache,
-        // so an idle Session frees them instead of waiting for the next access
-        // (upstream sweeps on a timer; the observable reload is the same).
-        self.evict_idle();
         let listeners: Vec<(CommitListener, bool)> = match self.commit_listeners.lock() {
             Ok(listeners) => listeners
                 .iter()
@@ -627,11 +901,17 @@ impl SessionImpl {
             if let Err(payload) = outcome {
                 let message = panic_message(payload);
                 if internal {
-                    self.fail(format!("A component commit listener failed: {message}"));
+                    self.fail_with_context(
+                        format!("A component commit listener failed: {message}"),
+                        Some(context),
+                    );
                 } else if let Ok(reporter) = self.listener_reporter.lock()
                     && let Some(reporter) = reporter.as_ref()
                 {
-                    reporter(format!("A commit listener failed: {message}"));
+                    reporter(
+                        format!("A commit listener failed: {message}"),
+                        Some(context.clone()),
+                    );
                 }
             }
         }
@@ -680,7 +960,7 @@ impl SessionImpl {
     }
 
     async fn snapshot_resolved(
-        &self,
+        self: &Arc<Self>,
         definition: &Arc<crate::documents::DocDefinition>,
         address_id: String,
         address: DocumentAddress,
@@ -775,14 +1055,14 @@ impl SessionImpl {
             let failure = weak.upgrade().and_then(|session| session.failure());
             source_close.close_session(failure);
         }));
-        self.attach_document(&address_id);
+        self.attach_document(&address_id, record_id);
         let weak = Arc::downgrade(self);
         let attached = address_id.clone();
         source.set_release(Box::new(move || {
             subscription_commit.unsubscribe();
             subscription_close.unsubscribe();
             if let Some(session) = weak.upgrade() {
-                session.detach_document(&attached);
+                session.detach_document(&attached, record_id);
             }
         }));
         Ok(Some(attach_state(&source)))
@@ -864,14 +1144,14 @@ impl SessionImpl {
             let failure = weak.upgrade().and_then(|session| session.failure());
             watch_close.close_session(failure);
         }));
-        self.attach_document(&address_id);
+        self.attach_document(&address_id, record_id);
         let weak = Arc::downgrade(self);
         let attached = address_id.clone();
         watch.set_detach(Box::new(move || {
             subscription_commit.unsubscribe();
             subscription_close.unsubscribe();
             if let Some(session) = weak.upgrade() {
-                session.detach_document(&attached);
+                session.detach_document(&attached, record_id);
             }
         }));
         if let Some(signal) = signal {
@@ -959,7 +1239,7 @@ impl SessionImpl {
     /// Current conversation document resolved on the line (upstream
     /// `conversationDocumentOnLine`).
     pub async fn conversation_document_on_line(
-        &self,
+        self: &Arc<Self>,
         token: &DocToken,
         conversation_id: ConversationId,
         context: &Context,
@@ -1023,6 +1303,12 @@ impl SessionImpl {
             // false so a later close can retry (the old code left the
             // session permanently "cleaned up" without a closed storage).
             let mut reset = ResetOnDrop::new(&this.cleanup_done);
+            if let Ok(mut pending) = this.document_sweep.lock()
+                && let Some(sweep) = pending.take()
+                && let Some(disarm) = sweep.disarm
+            {
+                disarm();
+            }
             if let Ok(mut documents) = this.documents.lock() {
                 documents.clear();
             }

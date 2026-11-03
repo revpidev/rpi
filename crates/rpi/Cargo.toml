@@ -24,6 +24,8 @@ anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
+jsonschema.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -69,8 +71,6 @@ libc.workspace = true
 
 [dev-dependencies]
 rpi-test-support.workspace = true
-# V18-02 R3.1.1: validate the published configuration schemas in tests.
-jsonschema.workspace = true
 rpi-test-env.workspace = true
 # V14-22 C2 tick tests: `#[tokio::test(start_paused = true)]` +
 # `tokio::time::advance` (deterministic host-timer assertions).

@@ -12768,6 +12768,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn c1_has_overlay_stacks_custom_components_across_extensions() {
+        use rpi_ext_host::api::UiBridge;
+        use rpi_ext_host::interactive_ui::{ComponentFrame, MountOptions, OverlayOptions};
+
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = ui_bridge::InteractiveUiBridge::new(&mode.ui_state);
+        let first = bridge
+            .mount_component("ext-a", MountOptions::default())
+            .await
+            .expect("first capturing overlay");
+        let error = bridge
+            .mount_component("ext-a", MountOptions::default())
+            .await
+            .expect_err("one active component per owner");
+        assert!(error.message.contains("componentAlreadyMounted"));
+        let second = bridge
+            .mount_component(
+                "ext-b",
+                MountOptions {
+                    overlay_options: Some(OverlayOptions {
+                        non_capturing: true,
+                        ..OverlayOptions::default()
+                    }),
+                    ..MountOptions::default()
+                },
+            )
+            .await
+            .expect("non-capturing overlay from another extension");
+        let third = bridge
+            .mount_component("ext-c", MountOptions::default())
+            .await
+            .expect("third capturing overlay");
+        assert_eq!(
+            bridge.has_overlay(),
+            rpi_ext_host::api::HasOverlayState {
+                visible: true,
+                capturing: true
+            }
+        );
+        assert_eq!(
+            mode.ui_state.component_registry.active_handle(),
+            Some(third)
+        );
+
+        bridge
+            .dispose_component("ext-a", first)
+            .expect("dispose first");
+        assert_eq!(
+            bridge.has_overlay(),
+            rpi_ext_host::api::HasOverlayState {
+                visible: true,
+                capturing: true
+            },
+            "the third overlay remains capturing after the first closes"
+        );
+        bridge
+            .render_component(
+                "ext-c",
+                third,
+                ComponentFrame::lines(vec!["done".to_owned()]).with_done(serde_json::Value::Null),
+            )
+            .expect("done closes only its own overlay");
+        assert_eq!(
+            bridge.has_overlay(),
+            rpi_ext_host::api::HasOverlayState {
+                visible: true,
+                capturing: false
+            },
+            "only the non-capturing overlay remains"
+        );
+        let terminal = bridge
+            .poll_component("ext-c", third)
+            .await
+            .expect_err("done is terminal");
+        assert!(terminal.message.contains("unknownHandle"));
+        bridge
+            .dispose_component("ext-b", second)
+            .expect("dispose second");
+        assert_eq!(bridge.has_overlay(), Default::default());
+        mode.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn c1_has_overlay_combines_a_host_dialog_with_a_non_capturing_overlay() {
+        use rpi_ext_host::api::UiBridge;
+        use rpi_ext_host::interactive_ui::{MountOptions, OverlayOptions};
+
+        async fn wait_until(mut cond: impl FnMut() -> bool) {
+            for _ in 0..200 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("condition not reached");
+        }
+
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = std::sync::Arc::new(ui_bridge::InteractiveUiBridge::new(&mode.ui_state));
+        let overlay = bridge
+            .mount_component(
+                "ext-hud",
+                MountOptions {
+                    overlay_options: Some(OverlayOptions {
+                        non_capturing: true,
+                        ..OverlayOptions::default()
+                    }),
+                    ..MountOptions::default()
+                },
+            )
+            .await
+            .expect("non-capturing overlay");
+        let task = {
+            let bridge = bridge.clone();
+            tokio::spawn(async move { bridge.select("host", &["ok".to_owned()], None).await })
+        };
+        wait_until(|| lock(&mode.ui_state.selector_stack).len() == 1).await;
+        assert_eq!(
+            bridge.has_overlay(),
+            rpi_ext_host::api::HasOverlayState {
+                visible: true,
+                capturing: true
+            }
+        );
+        let top = lock(&mode.ui_state.selector_stack)
+            .last()
+            .map(|frame| frame.entry.clone())
+            .expect("host dialog");
+        lock(&top).handle_input("\r");
+        assert_eq!(task.await.expect("join"), Some("ok".to_owned()));
+        assert_eq!(
+            bridge.has_overlay(),
+            rpi_ext_host::api::HasOverlayState {
+                visible: true,
+                capturing: false
+            }
+        );
+        bridge
+            .dispose_component("ext-hud", overlay)
+            .expect("dispose");
+        assert_eq!(bridge.has_overlay(), Default::default());
+        mode.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn w4_bridge_widget_footer_header_and_status() {
         use rpi_ext_host::api::{UiBridge, WidgetContent};
         let (mut mode, _terminal, _session) = mode_harness().await;

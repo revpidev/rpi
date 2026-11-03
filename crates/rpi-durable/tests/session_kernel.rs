@@ -29,6 +29,14 @@ fn object(value: JsonValue) -> JsonObject {
     value.as_object().cloned().unwrap_or_default()
 }
 
+async fn settle_line(session: &Arc<rpi_durable::session::SessionImpl>) {
+    tokio::task::yield_now().await;
+    session
+        .read_on_line(|| Box::pin(async { Ok(()) }))
+        .await
+        .expect("settle line");
+}
+
 fn conversation_doc(
     kind: &str,
     version: u64,
@@ -1971,7 +1979,7 @@ async fn host_commit_listener_panic_is_contained() {
     let sink = Arc::clone(&reported);
     harness
         .session
-        .set_listener_reporter(Arc::new(move |message| {
+        .set_listener_reporter(Arc::new(move |message, _context| {
             sink.lock().expect("reported").push(message);
         }));
     let _subscription = harness.session.subscribe_commits(Arc::new(|_, _| {
@@ -2012,7 +2020,7 @@ async fn host_close_listener_panic_is_contained() {
     let sink = Arc::clone(&reported);
     harness
         .session
-        .set_listener_reporter(Arc::new(move |message| {
+        .set_listener_reporter(Arc::new(move |message, _context| {
             sink.lock().expect("reported").push(message);
         }));
     let _subscription = harness.session.subscribe_close(Arc::new(|| {
@@ -2085,6 +2093,7 @@ async fn document_retention_reloads_an_unobserved_document() {
     harness
         .session
         .set_document_retention(Arc::new(|| Some(0.0)));
+    settle_line(&harness.session).await;
     let before = harness.storage.document_read_count.load(Ordering::SeqCst);
     harness
         .session
@@ -2095,6 +2104,7 @@ async fn document_retention_reloads_an_unobserved_document() {
         )
         .await
         .expect("first");
+    settle_line(&harness.session).await;
     harness
         .session
         .snapshot(
@@ -2104,6 +2114,16 @@ async fn document_retention_reloads_an_unobserved_document() {
         )
         .await
         .expect("second");
+    settle_line(&harness.session).await;
+    harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("third");
     let after = harness.storage.document_read_count.load(Ordering::SeqCst);
     assert!(
         after >= before + 2,
@@ -2272,7 +2292,8 @@ async fn document_retention_counts_each_observer() {
         "the second observer still pins the document"
     );
     second.stop().await;
-    // The last release unpins it, so retention 0 reloads on the next access.
+    // The last release unpins it, so the line sweep evicts before the next access.
+    settle_line(&harness.session).await;
     harness
         .session
         .snapshot(
@@ -2286,4 +2307,366 @@ async fn document_retention_counts_each_observer() {
         harness.storage.document_read_count.load(Ordering::SeqCst) > before,
         "the last detach releases the address"
     );
+}
+
+fn controlled_retention_session(
+    retention: f64,
+) -> (
+    Arc<rpi_durable::session::SessionImpl>,
+    Arc<session_support::ControlledStorage>,
+    Arc<AtomicU64>,
+) {
+    let storage = Arc::new(session_support::ControlledStorage::new());
+    let clock = Arc::new(AtomicU64::new(0));
+    let now = Arc::clone(&clock);
+    let session = rpi_durable::session::create_session(
+        Arc::clone(&storage) as Arc<dyn rpi_durable::types::Storage>,
+        Some(Arc::new(move || now.load(Ordering::SeqCst) as f64)),
+    );
+    session.set_document_retention(Arc::new(move || Some(retention)));
+    (session, storage, clock)
+}
+
+#[tokio::test]
+async fn document_retention_never_evicts_a_tracker_inside_its_transaction() {
+    let (session, _storage, clock) = controlled_retention_session(0.0);
+    let conversation = create_conversation(&session).await;
+    commit(&session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft
+                .write()?
+                .as_object_mut()
+                .unwrap()
+                .insert("message".into(), serde_json::json!(1));
+            Ok(())
+        })
+    })
+    .await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let committing = tokio::spawn({
+        let session = Arc::clone(&session);
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        async move {
+            session
+                .commit(
+                    commit_fn(move |tx| {
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        Box::pin(async move {
+                            let draft = tx
+                                .doc(live(), DocOwner::Conversation(conversation), None)
+                                .await?;
+                            entered.notify_one();
+                            release.notified().await;
+                            draft
+                                .write()?
+                                .as_object_mut()
+                                .unwrap()
+                                .insert("message".into(), serde_json::json!(11));
+                            Ok(())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    entered.notified().await;
+    clock.store(1_000_000, Ordering::SeqCst);
+    release.notify_waiters();
+    committing.await.expect("join").expect("commit");
+    settle_line(&session).await;
+    let value = session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("snapshot")
+        .expect("document");
+    assert_eq!(value["message"], 11);
+    commit(&session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft
+                .write()?
+                .as_object_mut()
+                .unwrap()
+                .insert("message".into(), serde_json::json!(12));
+            Ok(())
+        })
+    })
+    .await;
+    settle_line(&session).await;
+    let value = session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("snapshot")
+        .expect("document");
+    assert_eq!(value["message"], 12);
+}
+
+#[tokio::test]
+async fn document_retention_evicts_on_its_timer_without_a_commit() {
+    let (session, _storage, clock) = controlled_retention_session(20.0);
+    let conversation = create_conversation(&session).await;
+    commit(&session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft
+                .write()?
+                .as_object_mut()
+                .unwrap()
+                .insert("message".into(), serde_json::json!("kept"));
+            Ok(())
+        })
+    })
+    .await;
+    assert!(session.document_cache_sizes().cached > 0);
+    clock.store(20, Ordering::SeqCst);
+    for _ in 0..200 {
+        if session.document_cache_sizes().cached == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(session.document_cache_sizes().cached, 0);
+}
+
+#[tokio::test]
+async fn document_retention_falls_back_to_commit_sweeps_without_timers() {
+    let (session, _storage, clock) = controlled_retention_session(10.0);
+    session.set_document_timer(
+        Some(Arc::new(|_, _, _| None)),
+        Arc::new(|message| panic!("unexpected timer report: {message}")),
+    );
+    let conversation = create_conversation(&session).await;
+    commit(&session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft
+                .write()?
+                .as_object_mut()
+                .unwrap()
+                .insert("message".into(), serde_json::json!("kept"));
+            Ok(())
+        })
+    })
+    .await;
+    assert!(session.document_cache_sizes().cached > 0);
+    clock.store(10_000, Ordering::SeqCst);
+    commit(&session, |_tx| Box::pin(async { Ok(()) })).await;
+    assert_eq!(session.document_cache_sizes().cached, 0);
+}
+
+#[tokio::test]
+async fn document_retention_coalesces_sweeps_while_a_commit_holds_the_line() {
+    let (session, _storage, _clock) = controlled_retention_session(0.0);
+    let mut conversations = Vec::new();
+    for _ in 0..12 {
+        let conversation = create_conversation(&session).await;
+        commit(&session, move |tx| {
+            Box::pin(async move {
+                let draft = tx
+                    .doc(live(), DocOwner::Conversation(conversation), None)
+                    .await?;
+                draft
+                    .write()?
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("message".into(), serde_json::json!("kept"));
+                Ok(())
+            })
+        })
+        .await;
+        conversations.push(conversation);
+    }
+    settle_line(&session).await;
+    assert_eq!(session.document_cache_sizes().cached, 0);
+    let before = session.document_cache_sizes().sweeps;
+    let loading = Arc::new(conversations);
+    commit(&session, move |tx| {
+        let conversations = Arc::clone(&loading);
+        Box::pin(async move {
+            for conversation in conversations.iter().copied() {
+                tx.doc(live(), DocOwner::Conversation(conversation), None)
+                    .await?;
+                tokio::task::yield_now().await;
+            }
+            Ok(())
+        })
+    })
+    .await;
+    settle_line(&session).await;
+    let sizes = session.document_cache_sizes();
+    assert_eq!(sizes.cached, 0);
+    assert!(
+        sizes.sweeps - before <= 2,
+        "sweeps: {before} -> {}",
+        sizes.sweeps
+    );
+}
+
+#[tokio::test]
+async fn document_retention_does_not_pin_a_replacement_to_a_retired_observer() {
+    let (session, _storage, _clock) = controlled_retention_session(0.0);
+    let conversation = create_conversation(&session).await;
+    commit(&session, move |tx| {
+        Box::pin(async move {
+            tx.doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            Ok(())
+        })
+    })
+    .await;
+    let retired = session
+        .watch_doc(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("watch")
+        .expect("document");
+    commit(&session, move |tx| {
+        Box::pin(async move {
+            tx.retire_doc(live(), DocOwner::Conversation(conversation))
+                .await
+        })
+    })
+    .await;
+    commit(&session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft.write()?["message"] = serde_json::json!("replacement");
+            Ok(())
+        })
+    })
+    .await;
+    settle_line(&session).await;
+    assert_eq!(session.document_cache_sizes().cached, 0);
+    let value = session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("snapshot")
+        .expect("replacement");
+    assert_eq!(value["message"], "replacement");
+    retired.stop().await;
+}
+
+#[tokio::test]
+async fn document_retention_keeps_an_observed_incarnation_across_versions() {
+    let (session, storage, _clock) = controlled_retention_session(0.0);
+    let conversation = create_conversation(&session).await;
+    commit(&session, move |tx| {
+        Box::pin(async move {
+            tx.doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            Ok(())
+        })
+    })
+    .await;
+    let observed = session
+        .watch_doc(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("watch")
+        .expect("document");
+    commit(&session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft.write()?["message"] = serde_json::json!("new version");
+            Ok(())
+        })
+    })
+    .await;
+    settle_line(&session).await;
+    let reads = storage.document_read_count.load(Ordering::SeqCst);
+    assert_eq!(session.document_cache_sizes().cached, 1);
+    session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("snapshot");
+    assert_eq!(storage.document_read_count.load(Ordering::SeqCst), reads);
+    observed.stop().await;
+}
+
+#[tokio::test]
+async fn document_retention_touches_documents_after_slow_storage_commit() {
+    let (session, storage, clock) = controlled_retention_session(10.0);
+    let conversation = create_conversation(&session).await;
+    commit(&session, move |tx| {
+        Box::pin(async move {
+            tx.doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            Ok(())
+        })
+    })
+    .await;
+    let gate = storage.hold_commits();
+    let committing = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .commit(
+                    commit_fn(move |tx| {
+                        Box::pin(async move {
+                            let draft = tx
+                                .doc(live(), DocOwner::Conversation(conversation), None)
+                                .await?;
+                            draft.write()?["message"] = serde_json::json!("slow");
+                            Ok(())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    gate.entered().await;
+    clock.store(100, Ordering::SeqCst);
+    gate.release();
+    committing.await.expect("join").expect("commit");
+    assert!(session.document_cache_sizes().cached > 0);
+    let value = session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("snapshot")
+        .expect("document");
+    assert_eq!(value["message"], "slow");
 }

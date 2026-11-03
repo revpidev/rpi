@@ -26,7 +26,7 @@
 //! `Component::render(width)`/`handle_input(data)` mirror upstream
 //! `ctx.ui.custom()` (`types.ts:197-212`, `tui.ts:111-135` @ `9841914`).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -963,12 +963,11 @@ fn to_tui_size(value: WireSize) -> SizeValue {
 /// ADR-0043: host verdict callback for an inbound answer attempt.
 type AnswerVerdictSink = Arc<dyn Fn(&Value, Option<&str>, Option<&str>) + Send + Sync>;
 
-/// The registry: one active component at a time (the per-extension slot is
-/// subsumed — see the V14-21 §7 note), globally unique handles, fail-visible
-/// diagnostics.
+/// The registry: one active component per extension owner, globally unique
+/// handles, and a mount-ordered stack across owners.
 pub(crate) struct ComponentRegistry {
     next_handle: AtomicU64,
-    active: Mutex<Option<Arc<MountState>>>,
+    active: Mutex<BTreeMap<u64, Arc<MountState>>>,
     /// Handles that were closed through a registry call, for idempotent
     /// repeated `disposeComponent` (R-U6.4). Bounded.
     recently_closed: Mutex<VecDeque<u64>>,
@@ -996,7 +995,7 @@ impl ComponentRegistry {
     pub(crate) fn with_dispose_grace(dispose_grace: Duration) -> Self {
         Self {
             next_handle: AtomicU64::new(1),
-            active: Mutex::new(None),
+            active: Mutex::new(BTreeMap::new()),
             recently_closed: Mutex::new(VecDeque::new()),
             diagnostics: Arc::new(Mutex::new(VecDeque::new())),
             dispose_grace,
@@ -1032,7 +1031,7 @@ impl ComponentRegistry {
     /// ADR-0043: install the host verdict callback for answers that were
     /// delivered but never consumed (mount closed before the guest polled).
     pub(crate) fn set_answer_verdict_sink(&self, sink: AnswerVerdictSink) {
-        if let Some(state) = self.active_state() {
+        for state in self.states() {
             state.set_answer_verdict_sink(Arc::clone(&sink));
         }
         *self
@@ -1063,7 +1062,7 @@ impl ComponentRegistry {
         let Some(tool_call_id) = payload.get("toolCallId").and_then(Value::as_str) else {
             return Delivery::InvalidPayload;
         };
-        let Some(state) = self.active_state() else {
+        let Some(state) = self.active_open_state().or_else(|| self.active_state()) else {
             return Delivery::NotFound;
         };
         let Some(answerable) = state.options.answerable.as_ref() else {
@@ -1093,11 +1092,42 @@ impl ComponentRegistry {
         Delivery::Delivered
     }
 
+    fn states(&self) -> Vec<Arc<MountState>> {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
     fn active_state(&self) -> Option<Arc<MountState>> {
         self.active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .values()
+            .last()
+            .cloned()
+    }
+
+    fn active_open_state(&self) -> Option<Arc<MountState>> {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .rev()
+            .find(|state| !state.is_closed())
+            .cloned()
+    }
+
+    fn owner_open_state(&self, owner: &str) -> Option<Arc<MountState>> {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .rev()
+            .find(|state| state.owner == owner && !state.is_closed())
+            .cloned()
     }
 
     /// Resolve `handle` for `owner`; closed/foreign/unknown handles are
@@ -1111,12 +1141,8 @@ impl ComponentRegistry {
             .active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match active.as_ref() {
-            Some(state)
-                if state.handle == handle
-                    && state.owner == owner
-                    && !state.closed.load(Ordering::SeqCst) =>
-            {
+        match active.get(&handle.0) {
+            Some(state) if state.owner == owner && !state.closed.load(Ordering::SeqCst) => {
                 Ok(Arc::clone(state))
             }
             _ => Err(InteractiveUiError::unknown_handle(handle)),
@@ -1131,14 +1157,13 @@ impl ComponentRegistry {
         mount: Arc<dyn ComponentMountPoint>,
     ) -> Result<ComponentHandle, InteractiveUiError> {
         {
-            let active = self
+            let mut active = self
                 .active
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(state) = active.as_ref()
-                && !state.closed.load(Ordering::SeqCst)
-            {
-                // R-U1.6: never silently replace an active component.
+            active.retain(|_, state| !state.is_closed());
+            if active.values().any(|state| state.owner == owner) {
+                // R-U1.6: never silently replace an active component of this owner.
                 return Err(InteractiveUiError::component_already_mounted());
             }
         }
@@ -1234,10 +1259,10 @@ impl ComponentRegistry {
             Ordering::SeqCst,
         );
         state.log("mount", options.label.clone());
-        *self
-            .active
+        self.active
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&state));
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(handle.0, Arc::clone(&state));
         state.start_tick_task();
         state.start_lifecycle_timer(self.lifecycle_limit);
         mount.request_render();
@@ -1259,8 +1284,8 @@ impl ComponentRegistry {
                 .active
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match active.as_ref() {
-                Some(state) if state.handle == handle && state.owner == owner => Arc::clone(state),
+            match active.get(&handle.0) {
+                Some(state) if state.owner == owner => Arc::clone(state),
                 _ => return Err(InteractiveUiError::unknown_handle(handle)),
             }
         };
@@ -1324,10 +1349,7 @@ impl ComponentRegistry {
         owner: &str,
         reason: DisposeReason,
     ) -> Option<ComponentHandle> {
-        let state = self.active_state()?;
-        if state.owner != owner || state.is_closed() {
-            return None;
-        }
+        let state = self.owner_open_state(owner)?;
         state.log("error", Some(format!("carrierFailure:{}", reason.as_str())));
         state.close(None);
         self.remember_closed(state.handle);
@@ -1360,10 +1382,7 @@ impl ComponentRegistry {
     /// force-unmount after the grace. Wired to the full host matrix in C3;
     /// C1 exercises it through tests and `dispose_active`.
     pub(crate) fn dispose_active(&self, reason: DisposeReason) -> Option<ComponentHandle> {
-        let state = self.active_state()?;
-        if state.is_closed() {
-            return None;
-        }
+        let state = self.active_open_state()?;
         state.begin_dispose(reason);
         self.remember_closed(state.handle);
         Some(state.handle)
@@ -1378,10 +1397,7 @@ impl ComponentRegistry {
         owner: &str,
         reason: DisposeReason,
     ) -> Option<ComponentHandle> {
-        let state = self.active_state()?;
-        if state.owner != owner || state.is_closed() {
-            return None;
-        }
+        let state = self.owner_open_state(owner)?;
         state.begin_dispose(reason);
         // R-U6.4: a guest `disposeComponent` racing (or following) the
         // forced dispose must stay an idempotent no-op, not unknownHandle.
@@ -1391,20 +1407,22 @@ impl ComponentRegistry {
 
     /// Theme change broadcast (R-U3.4).
     pub(crate) fn notify_theme(&self, theme: Value) {
-        if let Some(state) = self.active_state() {
-            state.push_event(ComponentEvent::Theme { theme });
+        for state in self.states() {
+            state.push_event(ComponentEvent::Theme {
+                theme: theme.clone(),
+            });
         }
     }
 
     /// Host dialog opened/closed hooks (R-U2.2 / R-U10).
     pub(crate) fn dialog_opened(&self) {
-        if let Some(state) = self.active_state() {
+        for state in self.states() {
             state.dialog_opened();
         }
     }
 
     pub(crate) fn dialog_closed(&self) {
-        if let Some(state) = self.active_state() {
+        for state in self.states() {
             state.dialog_closed();
         }
     }
@@ -1414,29 +1432,30 @@ impl ComponentRegistry {
     /// counts; editor-region ("inline") components never do. `capturing`
     /// only reflects components mounted without `nonCapturing`.
     pub(crate) fn overlay_state(&self) -> (bool, bool) {
-        let Some(state) = self.active_state() else {
-            return (false, false);
-        };
-        if state.is_closed() || state.hidden.load(Ordering::SeqCst) {
-            return (false, false);
+        let mut visible = false;
+        let mut capturing = false;
+        for state in self.states() {
+            if state.is_closed() || state.hidden.load(Ordering::SeqCst) {
+                continue;
+            }
+            let is_overlay = state
+                .overlay
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some();
+            if !is_overlay {
+                continue;
+            }
+            visible = true;
+            capturing |= state.capturing;
         }
-        let is_overlay = state
-            .overlay
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some();
-        if !is_overlay {
-            return (false, false);
-        }
-        (true, state.capturing)
+        (visible, capturing)
     }
 
     /// The active handle, if any (diagnostics / lifecycle assertions).
     #[cfg(test)]
     pub(crate) fn active_handle(&self) -> Option<ComponentHandle> {
-        self.active_state()
-            .filter(|state| !state.is_closed())
-            .map(|state| state.handle)
+        self.active_open_state().map(|state| state.handle)
     }
 
     /// `(active, closed)` component counts for leak assertions.
@@ -1446,10 +1465,10 @@ impl ComponentRegistry {
             .active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match active.as_ref() {
-            Some(state) if !state.is_closed() => (1, 0),
-            _ => (0, 0),
-        }
+        (
+            active.values().filter(|state| !state.is_closed()).count(),
+            0,
+        )
     }
 
     /// Diagnostics snapshot (R-U12.1/R-U12.2 log assertions).
@@ -1467,12 +1486,12 @@ impl ComponentRegistry {
     /// active component's queue.
     #[cfg(test)]
     pub(crate) fn inject_event(&self, event: ComponentEvent) -> bool {
-        match self.active_state() {
-            Some(state) if !state.is_closed() => {
+        match self.active_open_state() {
+            Some(state) => {
                 state.push_event(event);
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 
@@ -1773,6 +1792,57 @@ mod interactive_component {
             Delivery::NotFound
         );
         let _ = unmounted;
+    }
+
+    #[test]
+    fn component_registry_restores_external_answer_routing_after_top_closes() {
+        use crate::modes::interactive::interactive_mode::answer_channel::Delivery;
+        use rpi_ext_host::interactive_ui::AnswerableOptions;
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let answerable = registry
+            .mount(
+                "ext",
+                MountOptions {
+                    answerable: Some(AnswerableOptions {
+                        tool_call_id: "call-a".to_owned(),
+                    }),
+                    ..MountOptions::default()
+                },
+                Arc::clone(&mount) as Arc<dyn ComponentMountPoint>,
+            )
+            .expect("answerable overlay");
+        let top = registry
+            .mount(
+                "ext-b",
+                MountOptions::default(),
+                Arc::clone(&mount) as Arc<dyn ComponentMountPoint>,
+            )
+            .expect("non-answerable top overlay");
+        assert_eq!(
+            registry.deliver_external_answer(&serde_json::json!({"toolCallId": "call-a"})),
+            Delivery::NotFound
+        );
+        registry
+            .render(
+                "ext-b",
+                top,
+                ComponentFrame::lines(vec!["done".to_owned()]).with_done(Value::Null),
+            )
+            .expect("close top");
+        let payload = serde_json::json!({"toolCallId": "call-a", "cancel": true});
+        assert_eq!(
+            registry.deliver_external_answer(&payload),
+            Delivery::Delivered
+        );
+        assert!(
+            drain_events(&registry, answerable)
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    ComponentEvent::ExternalAnswer { payload: queued } if *queued == payload
+                ))
+        );
     }
 
     #[test]

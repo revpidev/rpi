@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -77,6 +79,66 @@ class SyncExportHtmlAssetsTests(unittest.TestCase):
         with self.assertRaisesRegex(sync_assets.SyncError, "brand token missing"):
             sync_assets.sync(False)
         self.assertFalse((self.output / "template.html").exists())
+
+    def test_upstream_javascript_replacement_pipeline(self) -> None:
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for the upstream replacement parity check")
+        source = Path(__file__).resolve().parents[1] / "external/pi/packages/coding-agent/src/core/export-html"
+        script = r"""
+const fs = require("node:fs");
+const path = require("node:path");
+const root = process.argv[1];
+const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
+const css = read("template.css")
+    .replace("{{THEME_VARS}}", "theme-vars")
+    .replace("{{BODY_BG}}", "body")
+    .replace("{{CONTAINER_BG}}", "container")
+    .replace("{{INFO_BG}}", "info");
+const templateJs = read("template.js");
+const html = read("template.html")
+    .replace("{{CSS}}", css)
+    .replace("{{JS}}", templateJs)
+    .replace("{{SESSION_DATA}}", Buffer.from("{}").toString("base64"))
+    .replace("{{MARKED_JS}}", read("vendor/marked.min.js"))
+    .replace("{{MARKED_CJK_FRIENDLY_JS}}", read("vendor/marked-cjk-friendly.min.js"))
+    .replace("{{HIGHLIGHT_JS}}", read("vendor/highlight.min.js"));
+const matrix = {};
+for (const replacement of ["$$", "$&", "$`", "$'", "$1", "$01", "$<x>"]) {
+    matrix[replacement] = "left{{JS}}right".replace("{{JS}}", replacement);
+}
+process.stdout.write(JSON.stringify({
+    highlightCount: html.split("{{HIGHLIGHT_JS}}").length - 1,
+    costTemplate: html.includes('<span class="info-value">${totalCost.toFixed(3)}</span>'),
+    extraDollar: html.includes("$${totalCost"),
+    cssInjected: html.includes("theme-vars"),
+    sessionData: html.includes("e30="),
+    matrix,
+}));
+"""
+        result = subprocess.run(
+            [node, "-e", script, str(source)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        parity = json.loads(result.stdout)
+        self.assertEqual(parity["highlightCount"], 1)
+        self.assertTrue(parity["costTemplate"])
+        self.assertFalse(parity["extraDollar"])
+        self.assertTrue(parity["cssInjected"])
+        self.assertTrue(parity["sessionData"])
+        self.assertEqual(
+            parity["matrix"],
+            {
+                "$$": "left$right",
+                "$&": "left{{JS}}right",
+                "$`": "leftleftright",
+                "$'": "leftrightright",
+                "$1": "left$1right",
+                "$01": "left$01right",
+                "$<x>": "left$<x>right",
+            },
+        )
 
     def test_pin_check_requires_the_exact_checkout(self) -> None:
         subprocess.run(["git", "init", "-q"], cwd=self.upstream, check=True)

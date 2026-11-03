@@ -4609,10 +4609,10 @@ mod tests {
         );
     }
 
-    /// Explicit non-positive window/budgets are rejected
-    /// (provider-composer.ts:138-143).
+    /// Explicit non-positive window/budgets are rejected by the generated
+    /// schema before provider composition (provider-composer.ts:138-143).
     #[tokio::test]
-    async fn non_positive_window_or_budget_is_a_composition_error() {
+    async fn non_positive_window_or_budget_is_rejected_during_load() {
         let (_tmp, runtime) = runtime_with_models_json(
             r#"{"providers": {"custom": {
                 "baseUrl": "https://api.example.com/v1",
@@ -4622,9 +4622,10 @@ mod tests {
             }}}"#,
         )
         .await;
-        let error = runtime.get_error().expect("composition error");
+        let error = runtime.get_error().expect("schema error");
         assert!(
-            error.contains("invalid contextWindow"),
+            error.contains("Invalid models.json schema")
+                && error.contains("less than or equal to the minimum of 0.0"),
             "unexpected error: {error}"
         );
     }

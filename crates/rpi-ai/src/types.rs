@@ -141,7 +141,19 @@ pub enum ThinkingLevel {
 ///
 /// This is also the agent-side `ThinkingLevel` of `packages/agent` (which
 /// includes "off"); `rpi-agent` re-exports it under that name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 pub enum ModelThinkingLevel {
     #[serde(rename = "off")]
     Off,
@@ -223,7 +235,7 @@ impl ModelThinkingLevel {
 }
 
 /// `ChatTemplateKwargValue`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ChatTemplateKwargValue {
     /// `{ $var: "thinking.enabled" | "thinking.effort", omitWhenOff?: boolean }`
@@ -232,7 +244,7 @@ pub enum ChatTemplateKwargValue {
     Scalar(Value),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatTemplateKwargVar {
     #[serde(rename = "$var")]
@@ -241,7 +253,7 @@ pub struct ChatTemplateKwargVar {
     pub omit_when_off: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum ChatTemplateKwargVarKind {
     #[serde(rename = "thinking.enabled")]
     ThinkingEnabled,
@@ -282,7 +294,7 @@ pub enum CacheRetention {
 }
 
 /// `Transport = "sse" | "websocket" | "websocket-cached" | "auto"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum Transport {
     #[serde(rename = "sse")]
     Sse,
@@ -295,7 +307,7 @@ pub enum Transport {
 }
 
 /// `SessionAffinityFormat = "openai" | "openai-nosession" | "openrouter"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum SessionAffinityFormat {
     #[serde(rename = "openai")]
     Openai,
@@ -1589,7 +1601,7 @@ pub struct DiagnosticErrorInfo {
 
 /// JSON `number | string` union (used by diagnostic error codes and OpenRouter
 /// routing prices).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum NumberOrString {
     Number(f64),
@@ -1850,7 +1862,7 @@ pub enum StreamEvent {
 // ---------------------------------------------------------------------------
 
 /// `ModelCostRates` — $/million tokens.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCostRates {
     pub input: f64,
@@ -1860,7 +1872,7 @@ pub struct ModelCostRates {
 }
 
 /// `ModelCostTier extends ModelCostRates`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCostTier {
     #[serde(flatten)]
@@ -1870,7 +1882,7 @@ pub struct ModelCostTier {
 }
 
 /// `ModelCost extends ModelCostRates`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCost {
     #[serde(flatten)]
@@ -1882,7 +1894,7 @@ pub struct ModelCost {
 }
 
 /// `Model.input` entry: `"text" | "image"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum InputModality {
     #[serde(rename = "text")]
     Text,
@@ -1910,22 +1922,26 @@ pub struct ModelPromptCache {
 /// cache-safe resize profile applied before a new image enters conversation
 /// history. Every key is optional — unset keys keep the caller's defaults
 /// (rpi's historical global limits in `rpi::tools::image_process`).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelImageResizeOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub max_width: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub max_height: Option<u32>,
     /// Maximum base64-encoded payload size in bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub max_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
     pub jpeg_quality: Option<u32>,
 }
 
 /// `ModelImageInputLimits` (types.ts:966-972).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelImageInputLimits {
     /// Cache-safe resize profile applied before a new image enters history.
@@ -1933,9 +1949,11 @@ pub struct ModelImageInputLimits {
     pub resize: Option<ModelImageResizeOptions>,
     /// Maximum images accepted in one provider message.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub max_per_message: Option<u32>,
     /// Maximum images accepted across one provider request.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub max_per_request: Option<u32>,
 }
 
@@ -1943,11 +1961,12 @@ pub struct ModelImageInputLimits {
 /// cache-safe preprocessing metadata (#9631). Parsing is additive — unknown
 /// fields are ignored and a missing `inputLimits` yields `None` (models keep
 /// their historical behavior; zero-regression red line).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInputLimits {
     /// Maximum serialized provider request size in bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub max_request_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<ModelImageInputLimits>,
@@ -2211,7 +2230,7 @@ pub fn get_model_type(model: &AnyModel) -> ModelType {
 }
 
 /// `OpenAICompletionsCompat.maxTokensField`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum MaxTokensField {
     #[serde(rename = "max_completion_tokens")]
     MaxCompletionTokens,
@@ -2220,7 +2239,7 @@ pub enum MaxTokensField {
 }
 
 /// `OpenAICompletionsCompat.thinkingFormat` (11 values).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum ThinkingFormat {
     /// Uses `reasoning_effort`. Default.
     #[serde(rename = "openai")]
@@ -2260,7 +2279,7 @@ pub enum ThinkingFormat {
 }
 
 /// `OpenAICompletionsCompat.cacheControlFormat`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum CacheControlFormat {
     /// Anthropic-style `cache_control` markers on the system prompt, last tool
     /// definition, and last user/assistant/tool-result text content.
@@ -2270,7 +2289,7 @@ pub enum CacheControlFormat {
 
 /// `OpenAICompletionsCompat.thinkingTokenBudgetField` (b23741269/#8275):
 /// the top-level request field carrying the thinking budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum ThinkingTokenBudgetField {
     #[serde(rename = "thinking_token_budget")]
     ThinkingTokenBudget,
@@ -2292,7 +2311,7 @@ impl ThinkingTokenBudgetField {
 
 /// `SystemOneCompat.imageInput`: the wire representation used for classifier
 /// images (7f225f25d).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum SystemOneImageInput {
     #[serde(rename = "assets")]
     Assets,
@@ -2306,7 +2325,7 @@ pub enum SystemOneImageInput {
 /// Anthropic-messages / Bedrock / System One APIs (see file header note for
 /// why this is one flat struct). All fields optional; absent fields are
 /// omitted on the wire, matching upstream objects.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCompat {
     // --- OpenAICompletionsCompat ---
@@ -2490,9 +2509,11 @@ pub struct ModelCompat {
 
 /// `AnthropicAllowedFallbackModel` (types.ts:307-311): one server-side
 /// refusal-fallback target with its local pricing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AnthropicAllowedFallbackModel {
+    #[schemars(length(min = 1))]
     pub provider: String,
+    #[schemars(length(min = 1))]
     pub model: String,
     pub cost: ModelCost,
 }
@@ -2502,7 +2523,7 @@ pub struct AnthropicAllowedFallbackModel {
 // ---------------------------------------------------------------------------
 
 /// `OpenRouterRouting.data_collection`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum DataCollection {
     #[serde(rename = "deny")]
     Deny,
@@ -2511,14 +2532,14 @@ pub enum DataCollection {
 }
 
 /// `OpenRouterRouting.sort` — string or object form.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum OpenRouterSort {
     Name(String),
     Spec(OpenRouterSortSpec),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OpenRouterSortSpec {
     /// The sorting metric: "price", "throughput", "latency".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2529,7 +2550,7 @@ pub struct OpenRouterSortSpec {
 }
 
 /// `OpenRouterRouting.max_price` — prices per million tokens (USD).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OpenRouterMaxPrice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<NumberOrString>,
@@ -2544,7 +2565,7 @@ pub struct OpenRouterMaxPrice {
 }
 
 /// `OpenRouterRouting.preferred_min_throughput` — number or percentile object.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum OpenRouterThroughput {
     Value(f64),
@@ -2552,14 +2573,14 @@ pub enum OpenRouterThroughput {
 }
 
 /// `OpenRouterRouting.preferred_max_latency` — number or percentile object.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum OpenRouterLatency {
     Value(f64),
     Percentiles(OpenRouterPercentiles),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OpenRouterPercentiles {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p50: Option<f64>,
@@ -2575,7 +2596,7 @@ pub struct OpenRouterPercentiles {
 /// requests to. Sent as the `provider` field in the OpenRouter API request
 /// body. Field names are snake_case upstream (unlike the rest of the model
 /// catalog), so no rename rule is applied here.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OpenRouterRouting {
     /// Whether to allow backup providers to serve requests. Default: true.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2619,7 +2640,7 @@ pub struct OpenRouterRouting {
 }
 
 /// `VercelGatewayRouting` — routing preferences for Vercel AI Gateway.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct VercelGatewayRouting {
     /// Provider slugs to exclusively use (e.g. ["bedrock", "anthropic"]).
     #[serde(skip_serializing_if = "Option::is_none")]
