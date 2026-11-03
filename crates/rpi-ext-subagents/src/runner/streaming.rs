@@ -270,13 +270,27 @@ pub fn single_update_details(
     context: &str,
     now_ms: u64,
 ) -> (String, Value) {
+    single_update_details_with_control(state, meta, context, now_ms, &state.pending_control_events)
+}
+
+/// [`single_update_details`] with an explicit control-event list. Callers that
+/// drain `pending_control_events` under the state lock build the frame from the
+/// drained snapshot, so two concurrent frame builders can never both carry the
+/// same event (upstream drains atomically in `drainPendingControlEvents`).
+pub fn single_update_details_with_control(
+    state: &ChildRunState,
+    meta: &StreamMeta,
+    context: &str,
+    now_ms: u64,
+    control_events: &[super::control::ControlEvent],
+) -> (String, Value) {
     let progress = snapshot_progress(state, meta, now_ms);
     let result = snapshot_stream_result(state, meta, context, progress.clone());
     let details = json!({
         "mode": "single",
         "results": [result],
         "progress": [progress],
-        "controlEvents": state.pending_control_events,
+        "controlEvents": control_events,
     });
     (streaming_update_text(state), details)
 }

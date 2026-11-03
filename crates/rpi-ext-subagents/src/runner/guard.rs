@@ -177,7 +177,9 @@ fn first_written_file(command: &str) -> Option<String> {
             continue;
         }
         let is_tee = chars[i..].starts_with(&['t', 'e', 'e'])
-            && (i == 0 || matches!(chars[i - 1], ' ' | '\t' | '|' | ';' | '&' | '('))
+            && (i == 0
+                || chars[i - 1].is_whitespace()
+                || matches!(chars[i - 1], '|' | ';' | '&' | '('))
             && chars.get(i + 3).is_some_and(|c| c.is_whitespace());
         if ch != '>' && !is_tee {
             i += 1;
@@ -301,7 +303,14 @@ fn has_mutating_git_command(command: &str) -> bool {
     });
     static ECHO_PREFIX: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^(?:echo|printf)\b").expect("echo regex"));
-    for segment in unquoted_shell_text(command).split(['&', '|', ';', '(', ')', '\n']) {
+    // Upstream splits on `/(?:&&|\|\||[;|()\n])/` (`long-running-guard.ts:
+    // 172-182`): `&&` is a separator, but a single `&` is not. Splitting on
+    // every `&` (the previous shape) classified `git status & git add .` as a
+    // mutating call where upstream does not.
+    for segment in unquoted_shell_text(command)
+        .split("&&")
+        .flat_map(|segment| segment.split(['|', ';', '(', ')', '\n']))
+    {
         let trimmed = segment.trim();
         if trimmed.is_empty() || ECHO_PREFIX.is_match(trimmed) {
             continue;
@@ -456,9 +465,11 @@ mod tests {
     fn classifies_mutating_bash_commands() {
         for command in [
             "echo hi > out.txt",
+            "echo hi >/dev/nullish",
             "rm -rf build",
             "git -C repo commit -m x",
             "git add .",
+            "echo hi && git commit -m x",
             "sed -e s/a/b/ -i file",
             "tee run.log",
         ] {
@@ -467,9 +478,13 @@ mod tests {
         for command in [
             "echo hi",
             "cat file 2>&1",
+            "cat file 2>&2",
             "echo hi > /dev/null",
+            "cmd &>/dev/null",
             "echo 'a > b'",
             "git status",
+            // Upstream splits `&&`/`||` but not a single `&`.
+            "git status & git add .",
         ] {
             assert!(!is_mutating_bash_command(command), "{command}");
         }
@@ -521,6 +536,22 @@ mod tests {
         );
         assert_eq!(
             resolve_current_path(Some("bash"), Some(&json!({"command": "tee -a run.log"}))),
+            Some("run.log".to_string())
+        );
+        // `tee` after a newline still starts a command (upstream's predecessor
+        // class is `\s`, not just space/tab).
+        assert_eq!(
+            resolve_current_path(
+                Some("bash"),
+                Some(&json!({"command": "cat a\ntee /tmp/out.log"}))
+            ),
+            Some("/tmp/out.log".to_string())
+        );
+        assert_eq!(
+            resolve_current_path(
+                Some("bash"),
+                Some(&json!({"command": "tee /dev/null run.log"}))
+            ),
             Some("run.log".to_string())
         );
         assert_eq!(

@@ -11,6 +11,8 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+use super::display::preview_display_text;
+
 /// Activity state (`ActivityState`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,8 +93,16 @@ impl Default for ResolvedControlConfig {
     }
 }
 
+/// `parsePositiveInt` (`subagent-control.ts:29-34`): `Number.isInteger`
+/// accepts an integral float, so `60000.0` is a valid threshold. `as_u64`
+/// alone would drop it and silently disable thinking scaling.
 fn positive_int(value: Option<&Value>) -> Option<u64> {
-    value.and_then(Value::as_u64).filter(|value| *value >= 1)
+    let value = value?;
+    if let Some(value) = value.as_u64() {
+        return (value >= 1).then_some(value);
+    }
+    let float = value.as_f64()?;
+    (float.fract() == 0.0 && float >= 1.0 && float <= u64::MAX as f64).then_some(float as u64)
 }
 
 fn parse_list(value: Option<&Value>, allowed: &[&str]) -> Option<Vec<String>> {
@@ -135,7 +145,13 @@ pub fn resolve(global: Option<&Value>, override_value: Option<&Value>) -> Resolv
     let needs_attention_after_ms = override_needs
         .or(global_needs)
         .unwrap_or(default.needs_attention_after_ms);
-    let needs_attention_after_ms_is_explicit = override_needs.is_some() || global_needs.is_some();
+    // Upstream also reads the flag from an already-resolved global config
+    // (`subagent-control.ts:73-80`); fall back to "the value was present".
+    let global_explicit = global
+        .and_then(|value| value.get("needsAttentionAfterMsIsExplicit"))
+        .and_then(Value::as_bool);
+    let needs_attention_after_ms_is_explicit =
+        override_needs.is_some() || global_explicit.unwrap_or(global_needs.is_some());
     let active_notice_after_ms =
         positive_int(override_value.and_then(|value| value.get("activeNoticeAfterMs")))
             .or_else(|| positive_int(global.and_then(|value| value.get("activeNoticeAfterMs"))))
@@ -391,19 +407,9 @@ pub fn build_control_event(input: ControlEventInput) -> ControlEvent {
         current_path: input.current_path,
         elapsed_ms,
         recent_failure_summary: input.recent_failure_summary,
-        task_preview: input.task_preview.map(|task| preview_text(&task, 160)),
-    }
-}
-
-/// `previewDisplayText` subset: collapse whitespace and bound to `max`.
-fn preview_text(text: &str, max: usize) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() > max {
-        let mut out: String = collapsed.chars().take(max).collect();
-        out.push('…');
-        out
-    } else {
-        collapsed
+        task_preview: input
+            .task_preview
+            .map(|task| preview_display_text(&task, 160)),
     }
 }
 
@@ -452,7 +458,9 @@ pub fn claim_notification(
     seen.insert(key)
 }
 
-/// `formatControlNudge` (`subagent-control.ts:218-227`).
+/// `formatControlNudge` (`subagent-control.ts:218-227`). Every parameterized
+/// branch is sanitized and bounded to 160 chars by `previewDisplayText`, the
+/// same string the notification dedupe key hashes.
 pub fn format_control_nudge(event: &ControlEvent) -> String {
     let scope = event
         .task_preview
@@ -460,8 +468,11 @@ pub fn format_control_nudge(event: &ControlEvent) -> String {
         .map(|preview| format!(" for {preview}"))
         .unwrap_or_default();
     if let Some(summary) = &event.recent_failure_summary {
-        return format!(
-            "Resolve the recent failure{scope}: {summary}. Report the smallest next step or ask for a decision."
+        return preview_display_text(
+            &format!(
+                "Resolve the recent failure{scope}: {summary}. Report the smallest next step or ask for a decision."
+            ),
+            160,
         );
     }
     if event.current_tool.is_some() || event.current_path.is_some() {
@@ -479,12 +490,18 @@ pub fn format_control_nudge(event: &ControlEvent) -> String {
         .flatten()
         .collect::<Vec<_>>()
         .join(" at ");
-        return format!(
-            "Check {current}{scope}. Report the smallest next step or ask for a decision."
+        return preview_display_text(
+            &format!(
+                "Check {current}{scope}. Report the smallest next step or ask for a decision."
+            ),
+            160,
         );
     }
     if let Some(preview) = &event.task_preview {
-        return format!("Continue {preview}. Report the smallest next step or ask for a decision.");
+        return preview_display_text(
+            &format!("Continue {preview}. Report the smallest next step or ask for a decision."),
+            160,
+        );
     }
     "What are you blocked on? Reply with the smallest next step or ask for a decision.".to_string()
 }
@@ -681,6 +698,76 @@ mod tests {
         assert!(
             notice.contains("Continue Fix the parser regression."),
             "{notice}"
+        );
+    }
+
+    #[test]
+    fn integral_float_thresholds_and_the_explicit_flag_match_upstream() {
+        // `Number.isInteger(60000.0)` is true upstream: the threshold applies
+        // and thinking scaling is suppressed as explicit.
+        let config = resolve(Some(&json!({"needsAttentionAfterMs": 60000.0})), None);
+        assert_eq!(config.needs_attention_after_ms, 60_000);
+        assert!(config.needs_attention_after_ms_is_explicit);
+        assert_eq!(
+            derive_activity_state(&config, 0, Some(0), 1, None, Some("high"), 60_001),
+            Some(ActivityState::NeedsAttention)
+        );
+        // A value that is not integral is not a positive int (falls through).
+        let config = resolve(Some(&json!({"needsAttentionAfterMs": 60000.5})), None);
+        assert_eq!(config.needs_attention_after_ms, 60_000);
+        assert!(!config.needs_attention_after_ms_is_explicit);
+        // An already-resolved global config keeps its scaling decision.
+        let config = resolve(
+            Some(&json!({
+                "needsAttentionAfterMs": 60_000,
+                "needsAttentionAfterMsIsExplicit": false
+            })),
+            None,
+        );
+        assert!(!config.needs_attention_after_ms_is_explicit);
+        assert_eq!(
+            derive_activity_state(&config, 0, Some(0), 1, None, Some("high"), 299_999),
+            None,
+            "inherited resolved config still scales"
+        );
+    }
+
+    #[test]
+    fn control_nudges_are_sanitized_and_capped_at_160() {
+        let summary = (0..12)
+            .map(|index| format!("edit(src/file-{index}.rs): long failure \u{1b}[31mtext\u{1b}[0m"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let event = build_control_event(ControlEventInput {
+            to: Some(ActivityState::NeedsAttention),
+            run_id: "run-long".to_string(),
+            agent: "worker".to_string(),
+            ts: 1,
+            recent_failure_summary: Some(summary),
+            ..ControlEventInput::default()
+        });
+        let nudge = format_control_nudge(&event);
+        assert!(nudge.encode_utf16().count() <= 160, "{nudge}");
+        assert!(!nudge.contains('\u{1b}'), "{nudge}");
+
+        let event = build_control_event(ControlEventInput {
+            to: Some(ActivityState::ActiveLongRunning),
+            run_id: "run-scope".to_string(),
+            agent: "worker".to_string(),
+            ts: 1,
+            task_preview: Some("x".repeat(400)),
+            ..ControlEventInput::default()
+        });
+        assert!(
+            format_control_nudge(&event).encode_utf16().count() <= 160,
+            "composed scope must be bounded"
+        );
+        assert_eq!(
+            event
+                .task_preview
+                .as_deref()
+                .map(|preview| preview.encode_utf16().count()),
+            Some(160)
         );
     }
 }

@@ -807,6 +807,12 @@ fn aggregate_control(results: &[Value]) -> (Option<&'static str>, Vec<Value>) {
     } else {
         None
     };
+    // Each child already caps its own history at 64 events; a composite of
+    // many children must not multiply that into an unbounded tool payload.
+    let overflow = events.len().saturating_sub(64);
+    if overflow > 0 {
+        events.drain(..overflow);
+    }
     (activity, events)
 }
 
@@ -882,8 +888,12 @@ fn assemble_single_details(
         "mode": "single",
         "runId": run_id,
         "results": [single],
-        "controlEvents": result.control_events,
     });
+    // Upstream only sets `result.controlEvents` when at least one event was
+    // emitted (execution.ts:1674); the composite paths do the same.
+    if !result.control_events.is_empty() {
+        details["controlEvents"] = json!(result.control_events);
+    }
     let timeout = spec
         .timeout_ms
         .or(ctx.top_timeout_ms)
@@ -2008,5 +2018,18 @@ mod tests {
         assert_eq!(activity, Some("needs_attention"));
         assert_eq!(events.len(), 2);
         assert_eq!(events[1]["type"], json!("needs_attention"));
+    }
+
+    #[test]
+    fn aggregate_control_caps_the_concatenated_history() {
+        let events: Vec<Value> = (0..100)
+            .map(|index| json!({ "type": "active_long_running", "ts": index }))
+            .collect();
+        let results = vec![json!({ "index": 0, "controlEvents": events })];
+        let (activity, events) = aggregate_control(&results);
+        assert_eq!(activity, Some("active_long_running"));
+        assert_eq!(events.len(), 64);
+        assert_eq!(events.first().unwrap()["ts"], json!(36));
+        assert_eq!(events.last().unwrap()["ts"], json!(99));
     }
 }

@@ -2526,6 +2526,44 @@ mod tests {
     }
 
     #[test]
+    fn tool_end_keeps_the_first_error_line_and_caps_it_at_180_chars() {
+        let mut state = ChildRunState::default();
+        state.process_line(
+            r#"{"type":"tool_execution_start","toolCallId":"call-long","toolName":"edit","args":{"path":"a.ts"}}"#,
+            1,
+        );
+        let long = "X".repeat(400);
+        let payload = json!({
+            "type": "tool_execution_end",
+            "toolCallId": "call-long",
+            "toolName": "edit",
+            "result": {"content": [{"type": "text", "text": format!("\n  first line  \n{long}")}]},
+            "isError": true,
+        });
+        let outcome = state.process_line(&payload.to_string(), 2);
+        let signal = outcome.tool_end.expect("tool end signal");
+        assert_eq!(signal.error, "first line");
+
+        let mut state = ChildRunState::default();
+        state.process_line(
+            r#"{"type":"tool_execution_start","toolCallId":"call-180","toolName":"edit","args":{"path":"a.ts"}}"#,
+            1,
+        );
+        let payload = json!({
+            "type": "tool_execution_end",
+            "toolCallId": "call-180",
+            "toolName": "edit",
+            "result": {"content": [{"type": "text", "text": "E".repeat(400)}]},
+            "isError": true,
+        });
+        let outcome = state.process_line(&payload.to_string(), 2);
+        assert_eq!(
+            outcome.tool_end.expect("tool end").error.chars().count(),
+            180
+        );
+    }
+
+    #[test]
     fn live_tool_budget_reports_hard_reached_until_a_call_is_blocked() {
         let mut state = ChildRunState {
             // A block list narrower than the tools being called: the count

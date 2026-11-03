@@ -927,11 +927,17 @@ pub(crate) async fn finish_detached_with_result(
     handle: &Arc<AsyncRunHandle>,
     result: &crate::runner::foreground::ForegroundRunResult,
     notify: &AsyncNotify,
+    child_cwd: &Path,
 ) {
     record_step_result(handle, 0, result);
     // Detached runs are resumable like async single runs; keep the same
-    // terminal projections (the resume reader depends on `sessionFile`).
+    // terminal projections (the resume reader depends on `sessionFile` and
+    // the selected child's `cwd`).
+    update_status(handle, |status| {
+        status["cwd"] = json!(child_cwd.to_string_lossy());
+    });
     set_step_field(handle, 0, |step| {
+        step["cwd"] = json!(child_cwd.to_string_lossy());
         if let Some(session_file) = &result.session_file {
             step["sessionFile"] = json!(session_file.to_string_lossy());
         }
@@ -2072,8 +2078,27 @@ async fn finish_with_handoff(
 }
 
 async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &AsyncNotify) {
+    // A stop request wins over a child/launch failure, exactly like
+    // `finish_with_handoff`: the single/tasks Err paths must not record
+    // `failed` after the caller already stopped the run (upstream
+    // `stopRunner` outranks any child failure).
+    let stopped = handle.control.stop_requested();
+    let state = if stopped { STATE_STOPPED } else { STATE_FAILED };
+    let output = if stopped {
+        "Stopped before completion."
+    } else {
+        error
+    };
     update_status(handle, |status| {
-        status["state"] = json!(STATE_FAILED);
+        status["state"] = json!(state);
+        status["processTerminal"] = json!({
+            "kind": "runner-exit",
+            "at": iso8601(now_millis()),
+        });
+        if stopped {
+            status["stopped"] = json!(true);
+            status["stoppedReason"] = json!("stop-request");
+        }
         status["error"] = json!(error);
         if let Some(object) = status.as_object_mut() {
             object.remove("activityState");
@@ -2082,17 +2107,29 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
         // A failed chain leaves its last step with live activity fields
         // (currentTool/activityState); terminal steps must not keep them, or
         // `subagent_wait` can report attention for a dead run.
-        settle_unfinished_steps(status, "failed", error);
+        if stopped {
+            settle_unfinished_steps(status, "stopped", output);
+        } else {
+            settle_unfinished_steps(status, "failed", error);
+        }
         clear_steps_terminal(status);
     });
-    append_event(
-        handle.run_dir.as_path(),
-        "run.failed",
-        json!({ "runId": handle.run_id, "error": error }),
-    );
+    if stopped {
+        append_event(
+            handle.run_dir.as_path(),
+            "run.finished",
+            json!({ "runId": handle.run_id, "state": STATE_STOPPED }),
+        );
+    } else {
+        append_event(
+            handle.run_dir.as_path(),
+            "run.failed",
+            json!({ "runId": handle.run_id, "error": error }),
+        );
+    }
     flush_pending_status_write_failure(handle);
     crate::p1::supervisor::close_requests_for_run(&handle.run_id);
-    notify.send(handle, STATE_FAILED, error, None).await;
+    notify.send(handle, state, output, None).await;
     prune_terminal_runs();
 }
 
@@ -2628,10 +2665,10 @@ pub async fn wait_for_runs_with_session_asks(
                     continue;
                 }
                 let step_attention = status["steps"].as_array().and_then(|steps| {
-                    steps.iter().find_map(|step| {
+                    steps.iter().enumerate().find_map(|(position, step)| {
                         (step["activityState"].as_str() == Some("needs_attention")).then(|| {
                             json!({
-                                "index": step.get("index").and_then(Value::as_u64).unwrap_or(0),
+                                "index": position,
                                 "agent": step.get("agent").and_then(Value::as_str).unwrap_or(""),
                             })
                         })
@@ -3050,6 +3087,52 @@ pub(crate) mod tests {
         unregister_run("te51-wait-attention");
     }
 
+    /// The guard-attention wait must report the attention child's real index
+    /// (no async status writer stores an `index` field; the position is the
+    /// identity).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn wait_reports_the_attention_child_position() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let steps = crate::p1::chain::parse_steps(&json!([
+            {"agent": "scout", "task": "one"},
+            {"agent": "worker", "task": "two"}
+        ]))
+        .unwrap();
+        let handle = start_run(
+            "te51-wait-attention-child",
+            None,
+            &AsyncBody::Steps {
+                steps,
+                original_task: "chain task".to_string(),
+            },
+        );
+        update_status(&handle, |status| {
+            status["steps"][0]["status"] = json!("complete");
+            status["steps"][1]["status"] = json!("running");
+            status["steps"][1]["activityState"] = json!("needs_attention");
+            status["activityState"] = json!("needs_attention");
+        });
+        let waited = wait_for_runs_with_session_asks(
+            Some("te51-wait-attention-child"),
+            false,
+            5_000,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("attention wait");
+        assert_eq!(waited["attention"]["childIndex"], json!(1));
+        assert_eq!(waited["attention"]["agent"], json!("worker"));
+        unregister_run("te51-wait-attention-child");
+        remove_status_gate("te51-wait-attention-child");
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+    }
+
     /// TE51 re-review P1: `finish_failed` runs for a failed chain and must
     /// drop every step's live fields — a stale `activityState` would keep
     /// `subagent_wait` reporting attention for a dead run.
@@ -3105,6 +3188,44 @@ pub(crate) mod tests {
         }
         unregister_run("te51-chain-failed-cleanup");
         remove_status_gate("te51-chain-failed-cleanup");
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+    }
+
+    /// A stop request wins over a child/launch failure in `finish_failed`
+    /// (same precedence as `finish_with_handoff`, upstream `stopRunner`).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn finish_failed_honors_a_stop_request() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let steps = crate::p1::chain::parse_steps(&json!([
+            {"agent": "worker", "task": "one"}
+        ]))
+        .unwrap();
+        let handle = start_run(
+            "te51-finish-failed-stopped",
+            None,
+            &AsyncBody::Steps {
+                steps,
+                original_task: "chain task".to_string(),
+            },
+        );
+        update_status(&handle, |status| {
+            status["steps"][0]["status"] = json!("running");
+            status["steps"][0]["currentTool"] = json!("bash");
+        });
+        handle.control.request_stop();
+        finish_failed(&handle, "spawn failed", &AsyncNotify { calls: None }).await;
+        let status = status_snapshot(&handle);
+        assert_eq!(status["state"], json!(STATE_STOPPED));
+        assert_eq!(status["stopped"], json!(true));
+        assert_eq!(status["stoppedReason"], json!("stop-request"));
+        assert!(status.get("processTerminal").is_some(), "{status}");
+        assert_eq!(status["steps"][0]["status"], json!("stopped"));
+        assert!(status["steps"][0].get("currentTool").is_none());
+        unregister_run("te51-finish-failed-stopped");
+        remove_status_gate("te51-finish-failed-stopped");
         let _ = std::fs::remove_dir_all(&handle.run_dir);
     }
 
@@ -4269,13 +4390,21 @@ pub(crate) mod tests {
         let handle = gate_test_handle("detached-session");
         let mut result = foreground_result(0, None);
         result.session_file = Some(PathBuf::from("/tmp/detached-child.jsonl"));
-        finish_detached_with_result(&handle, &result, &AsyncNotify { calls: None }).await;
+        finish_detached_with_result(
+            &handle,
+            &result,
+            &AsyncNotify { calls: None },
+            Path::new("/tmp/detached-cwd"),
+        )
+        .await;
         let status = status_snapshot(&handle);
         assert_eq!(
             status["steps"][0]["sessionFile"],
             json!("/tmp/detached-child.jsonl")
         );
         assert_eq!(status["state"], json!(STATE_COMPLETE));
+        assert_eq!(status["cwd"], json!("/tmp/detached-cwd"));
+        assert_eq!(status["steps"][0]["cwd"], json!("/tmp/detached-cwd"));
         let _ = std::fs::remove_dir_all(&handle.run_dir);
         remove_status_gate(&handle.run_id);
     }

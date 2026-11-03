@@ -523,32 +523,45 @@ fn evaluate_control(
         state.activity_state = None;
     }
     // Pick the oldest open call that has not had its own threshold notice
-    // yet. Filtering before claiming is what lets a second/third parallel
-    // call get attention while the first remains open (upstream
-    // `attentionEmitted`, execution.ts:884-886).
+    // yet. Eligibility (including the timeout-exempt tools) is filtered in
+    // the same pass, exactly like upstream `openToolAttentionTarget`
+    // (execution.ts:884-886): an exempt `contact_supervisor`/`subagent_wait`
+    // call must not shadow a concurrent non-exempt tool. Filtering before
+    // claiming is what lets a second/third parallel call get attention while
+    // the first remains open.
     let pending_candidate = state
         .pending_tool_calls
         .iter()
-        .filter(|(_, pending)| !pending.attention_emitted)
+        .filter(|(_, pending)| {
+            !pending.attention_emitted
+                && crate::runner::control::should_emit_open_tool_attention(
+                    &guard.control,
+                    Some(pending.tool.as_str()),
+                    Some(pending.started_at),
+                    now,
+                )
+        })
         .min_by_key(|(_, pending)| pending.started_at)
         .map(|(id, pending)| (id.clone(), pending.clone()));
+    let current_tool_open = state.current_tool.is_some()
+        && !state.current_tool_attention_emitted
+        && crate::runner::control::should_emit_open_tool_attention(
+            &guard.control,
+            state.current_tool.as_deref(),
+            state.current_tool_started_at,
+            now,
+        );
     let open_tool = pending_candidate
         .as_ref()
         .map(|(_, pending)| pending.tool.as_str())
         .or(state.current_tool.as_deref());
-    let open_started = pending_candidate
-        .as_ref()
-        .map(|(_, pending)| pending.started_at)
-        .or(state.current_tool_started_at);
-    let can_emit_open_tool = pending_candidate.is_some() || !state.current_tool_attention_emitted;
-    if can_emit_open_tool
-        && crate::runner::control::should_emit_open_tool_attention(
-            &guard.control,
-            open_tool,
-            open_started,
-            now,
-        )
-    {
+    let can_emit_open_tool = pending_candidate.is_some() || current_tool_open;
+    if can_emit_open_tool {
+        let open_started = pending_candidate
+            .as_ref()
+            .map(|(_, pending)| pending.started_at)
+            .or(state.current_tool_started_at);
+        let duration_ms = open_started.map(|started| now.saturating_sub(started));
         let mut event = control_event_for(
             state,
             guard,
@@ -556,8 +569,10 @@ fn evaluate_control(
             crate::runner::control::ActivityState::NeedsAttention,
             "tool_open_threshold",
             Some(format!(
-                "{} has an open tool past the active-notice threshold",
-                guard.agent
+                "{} has had tool '{}' open for {}s",
+                guard.agent,
+                open_tool.unwrap_or("tool"),
+                duration_ms.unwrap_or(0) / 1000
             )),
             None,
         );
@@ -1146,7 +1161,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                 // reference; cloning `messages` per event is an O(n²) face
                 // it does not have). `messages` never leaves the lock: the
                 // frame builder walks it for the bounded summaries only.
-                let (outcome, status_fields, frame, control_events) = {
+                let (outcome, status_fields, frame, control_events, drained_control) = {
                     let mut state = stdout_state.lock().unwrap_or_else(|e| e.into_inner());
                     let outcome = state.process_line(trimmed, now_ms);
                     let control_events = outcome
@@ -1155,7 +1170,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                         .map(|signal| process_tool_end(&mut state, &stdout_guard, signal))
                         .unwrap_or_default();
                     if !outcome.progress_event {
-                        (outcome, None, None, control_events)
+                        (outcome, None, None, control_events, Vec::new())
                     } else {
                         let status_fields = step_status.as_ref().map(|_| {
                             json!({
@@ -1169,15 +1184,21 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                                 "lastActivityAt": state.last_activity_at,
                             })
                         });
+                        let drained = if frame_sink.is_some() {
+                            std::mem::take(&mut state.pending_control_events)
+                        } else {
+                            Vec::new()
+                        };
                         let frame = frame_sink.as_ref().map(|_| {
-                            streaming::single_update_details(
+                            streaming::single_update_details_with_control(
                                 &state,
                                 &stream_meta,
                                 &context_label,
                                 now_ms,
+                                &drained,
                             )
                         });
-                        (outcome, status_fields, frame, control_events)
+                        (outcome, status_fields, frame, control_events, drained)
                     }
                 };
                 for event in &control_events {
@@ -1217,12 +1238,15 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                     if must_push || heartbeat {
                         sink(&text, &details);
                         last_pushed = Some((signature, std::time::Instant::now()));
-                        // Only a delivered frame may drain the pending control
-                        // events; a signature-throttled frame must not lose
-                        // them from the next emitted snapshot.
-                        if let Ok(mut state) = stdout_state.lock() {
-                            state.pending_control_events.clear();
-                        }
+                        // The frame carried `drained_control`; a delivered
+                        // frame owns them. A signature-throttled frame puts
+                        // them back so the next emitted snapshot keeps them.
+                    } else if !drained_control.is_empty()
+                        && let Ok(mut state) = stdout_state.lock()
+                    {
+                        state
+                            .pending_control_events
+                            .splice(0..0, drained_control.iter().cloned());
                     }
                 }
             },
@@ -1390,12 +1414,21 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                                 "lastActivityAt": state.last_activity_at,
                             })
                         });
+                        // Drain under the same lock that builds the frame; the
+                        // ticker always pushes it, so the events cannot be
+                        // duplicated into a concurrent event-path frame.
+                        let drained = if ticker_has_frame {
+                            std::mem::take(&mut state.pending_control_events)
+                        } else {
+                            Vec::new()
+                        };
                         let frame = ticker_has_frame.then(|| {
-                            streaming::single_update_details(
+                            streaming::single_update_details_with_control(
                                 &state,
                                 &ticker_meta,
                                 &ticker_context,
                                 now_ms,
+                                &drained,
                             )
                         });
                         (frame, control_events, status_fields)
@@ -1412,9 +1445,6 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                     }
                     if let Some((text, details)) = frame {
                         ticker_sink(&text, &details);
-                        if let Ok(mut state) = ticker_state.lock() {
-                            state.pending_control_events.clear();
-                        }
                     }
                 }
             }
@@ -1783,7 +1813,8 @@ async fn finish_detached_child(
         persist_artifacts(&input, paths, &result, &input.task);
     }
     result.artifact_paths = artifact_paths;
-    crate::runner::background::finish_detached_with_result(&handle, &result, &notify).await;
+    crate::runner::background::finish_detached_with_result(&handle, &result, &notify, &input.cwd)
+        .await;
     if let Some(slot) = slot {
         crate::runner::background::ActiveAsyncCapacity::open(&ledger_session).release(&slot);
     }
@@ -2460,6 +2491,57 @@ mod terminal_classification_tests {
         assert_eq!(events[0].current_tool.as_deref(), Some("edit"));
         assert_eq!(events[0].tool_call_id.as_deref(), Some("b"));
         assert!(state.pending_tool_calls["b"].attention_emitted);
+    }
+
+    #[test]
+    fn open_tool_attention_skips_exempt_calls_and_reaches_a_concurrent_tool() {
+        // Upstream filters `!attentionEmitted && shouldEmitOpenToolAttention`
+        // together (execution.ts:884-886): a blocking supervisor ask must not
+        // shadow a concurrent non-exempt call.
+        let mut state = crate::runner::events::ChildRunState {
+            started_at_ms: Some(0),
+            last_activity_at: Some(90),
+            turns: 1,
+            current_tool: Some("contact_supervisor".to_string()),
+            current_tool_call_id: Some("sup".to_string()),
+            current_tool_started_at: Some(0),
+            ..crate::runner::events::ChildRunState::default()
+        };
+        state.pending_tool_calls.insert(
+            "sup".to_string(),
+            crate::runner::events::PendingToolCall {
+                tool: "contact_supervisor".to_string(),
+                started_at: 0,
+                ..crate::runner::events::PendingToolCall::default()
+            },
+        );
+        state.pending_tool_calls.insert(
+            "cmd".to_string(),
+            crate::runner::events::PendingToolCall {
+                tool: "bash".to_string(),
+                path: Some("build.log".to_string()),
+                mutates: false,
+                started_at: 50,
+                args: String::new(),
+                attention_emitted: false,
+            },
+        );
+        let open_guard = GuardContext {
+            control: crate::runner::control::ResolvedControlConfig {
+                active_notice_after_ms: 100,
+                ..guard_config()
+            },
+            ..guard()
+        };
+        let events = evaluate_control(&mut state, &open_guard, 1_250);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].reason.as_deref(), Some("tool_open_threshold"));
+        assert_eq!(events[0].current_tool.as_deref(), Some("bash"));
+        assert_eq!(events[0].tool_call_id.as_deref(), Some("cmd"));
+        assert_eq!(events[0].current_path.as_deref(), Some("build.log"));
+        assert_eq!(events[0].message, "worker has had tool 'bash' open for 1s");
+        assert!(state.pending_tool_calls["cmd"].attention_emitted);
+        assert!(!state.pending_tool_calls["sup"].attention_emitted);
     }
 
     fn test_input() -> ForegroundRunInput {

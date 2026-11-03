@@ -772,45 +772,7 @@ pub async fn run_chain_async_with_step_sink(
             .get("cost")
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
-        let mut details = json!({
-            "index": index,
-            "agent": outcome.agent_name,
-            "task": "[prompt redacted]",
-            "context": outcome.context.as_str(),
-            "exitCode": outcome.result.exit_code,
-            "usage": outcome.result.usage,
-            "timedOut": outcome.result.timed_out,
-        });
-        if let Some(error) = &outcome.result.error {
-            details["error"] = json!(error);
-        }
-        // #2653 (9bc8f2d1): unfinished streamed text recovered on timeout or
-        // a child error is labeled and marked partial.
-        if outcome.result.output_partial {
-            details["outputPartial"] = json!(true);
-        }
-        if let Some(signal) = &outcome.result.process_signal {
-            details["processSignal"] = json!(signal);
-        }
-        if let Some(thinking) = &outcome.result.thinking {
-            details["thinking"] = json!(thinking);
-        }
-        if let Some(paths) = &outcome.result.artifact_paths {
-            details["artifactPaths"] = paths.to_json();
-        }
-        if let Some(activity) = outcome.result.activity_state {
-            details["activityState"] = json!(activity.as_str());
-        }
-        if let Some(last_activity) = outcome.result.last_activity_at {
-            details["lastActivityAt"] = json!(last_activity);
-        }
-        if !outcome.result.control_events.is_empty() {
-            details["controlEvents"] = json!(outcome.result.control_events);
-        }
-        details["finalOutput"] = json!(outcome.result.final_output);
-        if let Some(saved) = &outcome.saved_output_path {
-            details["savedOutputPath"] = json!(saved.to_string_lossy());
-        }
+        let details = step_details(index, &outcome);
         let step_outcome = StepOutcome {
             result: outcome.result.clone(),
             index,
@@ -852,6 +814,68 @@ pub async fn run_chain_async_with_step_sink(
         completed.push(step_outcome);
     }
     Ok((completed, None))
+}
+
+/// One chain step's result details. The flat `activityState`/`lastActivityAt`/
+/// `controlEvents` fields let the synchronous `steps` result aggregate the
+/// guard state (TE51 §7.9) exactly like a child `single` detail.
+fn step_details(index: usize, outcome: &launch_child::ChildOutcome) -> Value {
+    let mut details = json!({
+        "index": index,
+        "agent": outcome.agent_name,
+        "task": "[prompt redacted]",
+        "context": outcome.context.as_str(),
+        "exitCode": outcome.result.exit_code,
+        "usage": outcome.result.usage,
+        "timedOut": outcome.result.timed_out,
+    });
+    if let Some(error) = &outcome.result.error {
+        details["error"] = json!(error);
+    }
+    // #2653 (9bc8f2d1): unfinished streamed text recovered on timeout or
+    // a child error is labeled and marked partial.
+    if outcome.result.output_partial {
+        details["outputPartial"] = json!(true);
+    }
+    if let Some(signal) = &outcome.result.process_signal {
+        details["processSignal"] = json!(signal);
+    }
+    if let Some(thinking) = &outcome.result.thinking {
+        details["thinking"] = json!(thinking);
+    }
+    if let Some(paths) = &outcome.result.artifact_paths {
+        details["artifactPaths"] = paths.to_json();
+    }
+    if let Some(activity) = outcome.result.activity_state {
+        details["activityState"] = json!(activity.as_str());
+    }
+    if let Some(last_activity) = outcome.result.last_activity_at {
+        details["lastActivityAt"] = json!(last_activity);
+    }
+    if !outcome.result.control_events.is_empty() {
+        details["controlEvents"] = json!(outcome.result.control_events);
+    }
+    details["finalOutput"] = json!(outcome.result.final_output);
+    if let Some(saved) = &outcome.saved_output_path {
+        details["savedOutputPath"] = json!(saved.to_string_lossy());
+    }
+    details
+}
+
+/// Build a settled child outcome for the detail-shape test.
+#[cfg(test)]
+fn test_outcome(
+    result: crate::runner::foreground::ForegroundRunResult,
+) -> launch_child::ChildOutcome {
+    launch_child::ChildOutcome {
+        agent_name: "worker".to_string(),
+        context: crate::agents::discover::ContextMode::Fresh,
+        result,
+        saved_output_path: None,
+        tool_budget: None,
+        session_name: None,
+        output_mode: "inline",
+    }
 }
 
 #[cfg(test)]
@@ -1194,5 +1218,58 @@ mod tests {
             "no child may spawn after budget exhaustion"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn step_details_carry_the_guard_control_state() {
+        let mut result = crate::runner::foreground::ForegroundRunResult {
+            exit_code: 0,
+            final_output: "done".to_string(),
+            activity_state: Some(crate::runner::control::ActivityState::NeedsAttention),
+            last_activity_at: Some(42),
+            ..crate::runner::foreground::ForegroundRunResult::default()
+        };
+        result.control_events = vec![crate::runner::control::ControlEvent {
+            event_type: crate::runner::control::ControlEventType::NeedsAttention,
+            from: None,
+            to: crate::runner::control::ActivityState::NeedsAttention,
+            ts: 42,
+            agent: "worker".to_string(),
+            index: Some(1),
+            run_id: "run-1".to_string(),
+            message: "worker needs attention".to_string(),
+            reason: Some("idle".to_string()),
+            turns: None,
+            tokens: None,
+            tool_count: None,
+            current_tool: None,
+            tool_call_id: None,
+            current_tool_duration_ms: None,
+            current_path: None,
+            elapsed_ms: None,
+            recent_failure_summary: None,
+            task_preview: None,
+        }];
+        let details = step_details(1, &test_outcome(result));
+        assert_eq!(details["index"], json!(1));
+        assert_eq!(details["agent"], json!("worker"));
+        assert_eq!(details["activityState"], json!("needs_attention"));
+        assert_eq!(details["lastActivityAt"], json!(42));
+        assert_eq!(
+            details["controlEvents"][0]["type"],
+            json!("needs_attention")
+        );
+
+        let clean = step_details(
+            0,
+            &test_outcome(crate::runner::foreground::ForegroundRunResult {
+                exit_code: 0,
+                final_output: "ok".to_string(),
+                ..crate::runner::foreground::ForegroundRunResult::default()
+            }),
+        );
+        for key in ["activityState", "lastActivityAt", "controlEvents"] {
+            assert!(clean.get(key).is_none(), "{key} leaked into {clean}");
+        }
     }
 }
