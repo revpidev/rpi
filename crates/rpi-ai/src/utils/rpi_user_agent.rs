@@ -23,24 +23,25 @@ pub fn get_rpi_user_agent() -> String {
     )
 }
 
-#[cfg(unix)]
 pub(crate) fn os_release() -> String {
-    // SAFETY: `utsname` is a plain C struct; zeroed is a valid initial state
-    // and `uname` writes NUL-terminated arrays on success.
-    unsafe {
-        let mut uts: libc::utsname = std::mem::zeroed();
-        if libc::uname(&mut uts) == 0 {
-            return std::ffi::CStr::from_ptr(uts.release.as_ptr())
-                .to_string_lossy()
-                .into_owned();
+    #[cfg(unix)]
+    {
+        // SAFETY: `utsname` is a plain C struct; zeroed is a valid initial
+        // state and `uname` writes NUL-terminated arrays on success.
+        unsafe {
+            let mut uts: libc::utsname = std::mem::zeroed();
+            if libc::uname(&mut uts) == 0 {
+                return std::ffi::CStr::from_ptr(uts.release.as_ptr())
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            String::new()
         }
+    }
+    #[cfg(not(unix))]
+    {
         String::new()
     }
-}
-
-#[cfg(not(unix))]
-fn os_release() -> String {
-    String::new()
 }
 
 #[cfg(test)]
