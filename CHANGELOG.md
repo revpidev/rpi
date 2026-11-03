@@ -23,7 +23,7 @@
 - **`rpi-ask-user-question` / `rpi-todo` → rpiv-mono v2.15.0** (TE51): the compact answer receipt, code-targeted external answers with first-answer-wins, integral JSON numbers, replay null/safe-integer guards and all-or-nothing batch creation.
 - **`rpi-statusline` items mode** (TE52, ADR-0040): the strict 21-field declarative mode without a shell, the `/statusline` editor (select/reorder/options/preview/reset), field-driven subscriptions from `ctx.sessionStats`, host-palette colors, and command stdout that wraps instead of truncating at eight lines.
 - **`rpi-usage` typed providers and footer** (TE53, ADR-0039): eight first-party provider scripts (four new), typed `windows[]`/`ledgers[]`/`balance[]`, the `/usage` grammar (`--cached`, `--json`, `--provider`, `list`, `help`), `ui.emitStructured` reports, a 60-second local typed-reset countdown without requests, `usage.percentage`/`usage.resetCountdown`, and the current-session local-token fallback for a provider without a quota script.
-- **Distribution**: the seven `.rpix` archives ride this Release (native carrier only; `minHostVersion` 0.1.8 injected at pack time); the retired `rpi-mcp-adapter` is not part of the set.
+- **Distribution**: the seven `.rpix` archives ride this Release (native carrier only; `minHostVersion` injected from the pack version — `0.1.8-rc.1` here, `0.1.8` at the stable fold); the retired `rpi-mcp-adapter` is not part of the set.
 
 ### Internal
 
