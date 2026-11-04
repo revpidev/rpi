@@ -1,0 +1,173 @@
+{
+  "formatVersion": 1,
+  "generatedBy": "scripts/gen-statusline-tokenizers.py",
+  "families": [
+    {
+      "id": "deepseek",
+      "display": "DeepSeek",
+      "patterns": [
+        "deepseek"
+      ],
+      "repo": "deepseek-ai/DeepSeek-V3.2",
+      "commit": "a7e62ac04ecb2c0a54d736dc46601c5606cf10a6",
+      "license": "MIT",
+      "licenseUrl": "https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/LICENSE",
+      "sources": [
+        {
+          "file": "tokenizer.json",
+          "sha256": "cd050be35cae877f8f0aa847f45aa87e23835a56ca32b29b28545597852784e5"
+        }
+      ],
+      "asset": "deepseek.tok.zst",
+      "assetSha256": "0a841b8a74ef9ff28f65308cd7d8e0f4bb2d40c06b7200e36fd3f4c6eae0ca4a",
+      "uncompressedBytes": 1563934,
+      "engine": "hf-bpe",
+      "ignoreMerges": false,
+      "normalizer": "none",
+      "pretokenizers": 3,
+      "addedTokens": 818,
+      "ranks": 127741
+    },
+    {
+      "id": "kimi",
+      "display": "Kimi",
+      "patterns": [
+        "kimi",
+        "moonshot"
+      ],
+      "repo": "moonshotai/Kimi-K2.7-Code",
+      "commit": "74797c9c62378b951a1f6fcf5c4631024e9b8bef",
+      "license": "Modified MIT",
+      "licenseUrl": "https://huggingface.co/moonshotai/Kimi-K2.7-Code/blob/main/LICENSE",
+      "sources": [
+        {
+          "file": "tiktoken.model",
+          "sha256": "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103"
+        },
+        {
+          "file": "tokenizer_config.json",
+          "sha256": "6dfafeacca3d44748fc4a2fcc6725be5ea616ecc5b95f5a8b4277077c06e7d9f"
+        },
+        {
+          "file": "tokenization_kimi.py",
+          "sha256": "88394687bd081f55928849b2d140e190c70297660d3fb8b7c54c0e5633b177e3"
+        }
+      ],
+      "asset": "kimi.tok.zst",
+      "assetSha256": "2e891512e402a9691b9f479fe3899867a54ea7ba516143bd7fe674bb8b2322f8",
+      "uncompressedBytes": 1768089,
+      "engine": "tiktoken-bpe",
+      "ignoreMerges": false,
+      "normalizer": "none",
+      "pretokenizers": 1,
+      "addedTokens": 256,
+      "ranks": 163584
+    },
+    {
+      "id": "glm",
+      "display": "GLM",
+      "patterns": [
+        "glm"
+      ],
+      "repo": "zai-org/GLM-5",
+      "commit": "c183ef8c61faee82855eca1ed9bb3a9a7ce3b0b2",
+      "license": "MIT",
+      "licenseUrl": "https://huggingface.co/zai-org/GLM-5",
+      "sources": [
+        {
+          "file": "tokenizer.json",
+          "sha256": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d"
+        }
+      ],
+      "asset": "glm.tok.zst",
+      "assetSha256": "74c678fac55d55608eced341959fc5162a5efa64819937e38379d3cf30b20371",
+      "uncompressedBytes": 5916972,
+      "engine": "hf-bpe",
+      "ignoreMerges": true,
+      "normalizer": "none",
+      "pretokenizers": 1,
+      "addedTokens": 36,
+      "ranks": 321649
+    },
+    {
+      "id": "qwen",
+      "display": "Qwen",
+      "patterns": [
+        "qwen",
+        "qwq"
+      ],
+      "repo": "Qwen/Qwen3.5-397B-A17B",
+      "commit": "8472618112abcbd45acbcdc58436aff4233c23f7",
+      "license": "Apache-2.0",
+      "licenseUrl": "https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/main/LICENSE",
+      "sources": [
+        {
+          "file": "tokenizer.json",
+          "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+        }
+      ],
+      "asset": "qwen.tok.zst",
+      "assetSha256": "0aa8ead224700823701b6cb20da6629147b8f076ac34e5e0468169e1b26c5f26",
+      "uncompressedBytes": 2972664,
+      "engine": "hf-bpe",
+      "ignoreMerges": false,
+      "normalizer": "nfc",
+      "pretokenizers": 1,
+      "addedTokens": 26,
+      "ranks": 247587
+    },
+    {
+      "id": "hunyuan",
+      "display": "Hunyuan",
+      "patterns": [
+        "hy3",
+        "hy4"
+      ],
+      "repo": "tencent/Hunyuan-A13B-Instruct",
+      "commit": "290ddb9a56ed23c2c83a1c8081533e58925df952",
+      "license": "Tencent Hunyuan Community License",
+      "licenseUrl": "https://huggingface.co/tencent/Hunyuan-A13B-Instruct/blob/main/LICENSE",
+      "sources": [
+        {
+          "file": "tokenizer.json",
+          "sha256": "4185389a69284fdd3ebf737c6120bbeee36cbed9763151fa5bac5986a39e05d4"
+        }
+      ],
+      "asset": "hunyuan.tok.zst",
+      "assetSha256": "8d9cea29e4bb118eb93460ef5c49d208085796377fa55acb49ff34edf3a86722",
+      "uncompressedBytes": 4760965,
+      "engine": "hf-bpe",
+      "ignoreMerges": true,
+      "normalizer": "none",
+      "pretokenizers": 1,
+      "addedTokens": 209,
+      "ranks": 264306
+    },
+    {
+      "id": "minimax",
+      "display": "MiniMax",
+      "patterns": [
+        "minimax"
+      ],
+      "repo": "MiniMaxAI/MiniMax-M2.7",
+      "commit": "0a6536713b0b03f3be97494e5cf8d22f668a3164",
+      "license": "MiniMax Non-Commercial License",
+      "licenseUrl": "https://huggingface.co/MiniMaxAI/MiniMax-M2.7/blob/main/LICENSE",
+      "sources": [
+        {
+          "file": "tokenizer.json",
+          "sha256": "757622126525aeeb131756849d93298070ff3f0319c455ec8c5bb0f6b1cebbe8"
+        }
+      ],
+      "asset": "minimax.tok.zst",
+      "assetSha256": "9a76f29e2e05cd461cfa0c0403bf7015663efca2f7b9a750a50190ca018747cb",
+      "uncompressedBytes": 2399177,
+      "engine": "hf-bpe",
+      "ignoreMerges": false,
+      "normalizer": "nfc",
+      "pretokenizers": 1,
+      "addedTokens": 54,
+      "ranks": 199744
+    }
+  ]
+}

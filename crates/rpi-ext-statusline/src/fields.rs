@@ -397,7 +397,7 @@ pub struct LiveView {
 impl LiveView {
     /// The output count for the current message: the provider's exact value
     /// while in flight or once the stream settles, otherwise the local
-    /// tokenizer/heuristic breakdown (R20 §4.3 + the 2026-11 realtime
+    /// bundled tokenizer/heuristic breakdown (R20 §4.3 + the 2026-11 realtime
     /// estimate extension).
     pub fn reported_output(self) -> Option<TokenBreakdown> {
         let estimated = self.tokens.unwrap_or_default();

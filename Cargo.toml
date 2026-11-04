@@ -75,6 +75,10 @@ bytes = "1"
 jsonschema = "0.33"
 schemars = "1"
 regex = "1"
+# Statusline pretokenizer patterns (HF `Split` + tiktoken `pat_str`) use
+# look-around and character-class intersection; fancy-regex is the same
+# backend HuggingFace tokenizers and tiktoken use for those patterns.
+fancy-regex = "0.16"
 url = "2"
 httpdate = "1"
 # V16-07 O-D: host timezone for the codemode `Date` surface. Already in the

@@ -1098,8 +1098,9 @@ cache-read-tokens, cache-write-tokens, streaming, live-output-tokens,\n\
 live-output-rate, live-text-tokens, live-thinking-tokens,\n\
 live-toolcall-tokens.\n\
 \n\
-Live tokens prefer provider usage, then the model tokenizer in\n\
-~/.rpi/agent/tokenizer, then a CJK-aware estimate (~ prefix).\n\
+Live tokens prefer provider usage, then the bundled tokenizer for the\n\
+model family (DeepSeek, Kimi, GLM, Qwen, Hunyuan, MiniMax), then a\n\
+CJK-aware estimate (~ prefix).\n\
 \n\
 Default items: live-output-tokens + live-output-rate only (all other\n\
 fields off); adjust them in the editor.\n\

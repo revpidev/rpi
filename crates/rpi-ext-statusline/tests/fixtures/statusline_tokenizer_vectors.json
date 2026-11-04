@@ -1,0 +1,834 @@
+{
+  "deepseek": [
+    {
+      "text": "",
+      "count": 0
+    },
+    {
+      "text": "hello world",
+      "count": 2
+    },
+    {
+      "text": "Hello, world!",
+      "count": 4
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "count": 10
+    },
+    {
+      "text": "你好，世界！",
+      "count": 4
+    },
+    {
+      "text": "这是一个测试句子。",
+      "count": 4
+    },
+    {
+      "text": "中文English混合123",
+      "count": 4
+    },
+    {
+      "text": "a   b",
+      "count": 3
+    },
+    {
+      "text": "a\t\tb",
+      "count": 3
+    },
+    {
+      "text": "a\n\nb",
+      "count": 3
+    },
+    {
+      "text": "  leading",
+      "count": 2
+    },
+    {
+      "text": "trailing   ",
+      "count": 3
+    },
+    {
+      "text": "   \t\n  ",
+      "count": 3
+    },
+    {
+      "text": "1 22 333 4444 55555",
+      "count": 11
+    },
+    {
+      "text": "don't stop believin'",
+      "count": 6
+    },
+    {
+      "text": "I'll've done it",
+      "count": 5
+    },
+    {
+      "text": "fn main() { println!(\"hi\"); }",
+      "count": 9
+    },
+    {
+      "text": "{\"key\": [1, 2, 3], \"ok\": true}",
+      "count": 17
+    },
+    {
+      "text": "https://example.com/path?q=1&x=2",
+      "count": 14
+    },
+    {
+      "text": "emoji 😀🚀🎉 test",
+      "count": 9
+    },
+    {
+      "text": "ёжик café naïve",
+      "count": 5
+    },
+    {
+      "text": "def foo(x: int) -> int:\n    return x + 1\n",
+      "count": 16
+    },
+    {
+      "text": "SELECT * FROM t WHERE id = 42;",
+      "count": 10
+    },
+    {
+      "text": "line1\nline2\r\nline3",
+      "count": 9
+    },
+    {
+      "text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "count": 13
+    },
+    {
+      "text": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中",
+      "count": 100
+    },
+    {
+      "text": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+      "count": 40
+    },
+    {
+      "text": "repeated repeated repeated repeated",
+      "count": 5
+    },
+    {
+      "text": "0.123456789e-10",
+      "count": 8
+    },
+    {
+      "text": "'s 't 're 've 'm 'll 'd",
+      "count": 13
+    },
+    {
+      "text": "<|im_start|>user hello<|im_end|>",
+      "count": 14
+    },
+    {
+      "text": "<|begin_of_sentence|>hi<|end_of_sentence|>",
+      "count": 17
+    },
+    {
+      "text": "<｜begin▁of▁sentence｜>hi<｜end▁of▁sentence｜>",
+      "count": 3
+    },
+    {
+      "text": "<｜▁pad▁｜>",
+      "count": 1
+    },
+    {
+      "text": "<｜tool▁sep｜><｜Assistant｜>",
+      "count": 2
+    }
+  ],
+  "kimi": [
+    {
+      "text": "",
+      "count": 0
+    },
+    {
+      "text": "hello world",
+      "count": 2
+    },
+    {
+      "text": "Hello, world!",
+      "count": 4
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "count": 10
+    },
+    {
+      "text": "你好，世界！",
+      "count": 4
+    },
+    {
+      "text": "这是一个测试句子。",
+      "count": 4
+    },
+    {
+      "text": "中文English混合123",
+      "count": 4
+    },
+    {
+      "text": "a   b",
+      "count": 3
+    },
+    {
+      "text": "a\t\tb",
+      "count": 3
+    },
+    {
+      "text": "a\n\nb",
+      "count": 3
+    },
+    {
+      "text": "  leading",
+      "count": 2
+    },
+    {
+      "text": "trailing   ",
+      "count": 3
+    },
+    {
+      "text": "   \t\n  ",
+      "count": 3
+    },
+    {
+      "text": "1 22 333 4444 55555",
+      "count": 11
+    },
+    {
+      "text": "don't stop believin'",
+      "count": 5
+    },
+    {
+      "text": "I'll've done it",
+      "count": 4
+    },
+    {
+      "text": "fn main() { println!(\"hi\"); }",
+      "count": 9
+    },
+    {
+      "text": "{\"key\": [1, 2, 3], \"ok\": true}",
+      "count": 17
+    },
+    {
+      "text": "https://example.com/path?q=1&x=2",
+      "count": 12
+    },
+    {
+      "text": "emoji 😀🚀🎉 test",
+      "count": 9
+    },
+    {
+      "text": "ёжик café naïve",
+      "count": 7
+    },
+    {
+      "text": "def foo(x: int) -> int:\n    return x + 1\n",
+      "count": 16
+    },
+    {
+      "text": "SELECT * FROM t WHERE id = 42;",
+      "count": 10
+    },
+    {
+      "text": "line1\nline2\r\nline3",
+      "count": 8
+    },
+    {
+      "text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "count": 13
+    },
+    {
+      "text": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中",
+      "count": 100
+    },
+    {
+      "text": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+      "count": 40
+    },
+    {
+      "text": "repeated repeated repeated repeated",
+      "count": 5
+    },
+    {
+      "text": "0.123456789e-10",
+      "count": 8
+    },
+    {
+      "text": "'s 't 're 've 'm 'll 'd",
+      "count": 13
+    },
+    {
+      "text": "<|im_start|>user hello<|im_end|>",
+      "count": 9
+    },
+    {
+      "text": "<|begin_of_sentence|>hi<|end_of_sentence|>",
+      "count": 15
+    },
+    {
+      "text": "[BOS]hello[EOS]",
+      "count": 3
+    },
+    {
+      "text": "<|im_end|>user<|im_user|>test",
+      "count": 4
+    }
+  ],
+  "glm": [
+    {
+      "text": "",
+      "count": 0
+    },
+    {
+      "text": "hello world",
+      "count": 2
+    },
+    {
+      "text": "Hello, world!",
+      "count": 4
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "count": 10
+    },
+    {
+      "text": "你好，世界！",
+      "count": 4
+    },
+    {
+      "text": "这是一个测试句子。",
+      "count": 4
+    },
+    {
+      "text": "中文English混合123",
+      "count": 4
+    },
+    {
+      "text": "a   b",
+      "count": 3
+    },
+    {
+      "text": "a\t\tb",
+      "count": 3
+    },
+    {
+      "text": "a\n\nb",
+      "count": 3
+    },
+    {
+      "text": "  leading",
+      "count": 2
+    },
+    {
+      "text": "trailing   ",
+      "count": 3
+    },
+    {
+      "text": "   \t\n  ",
+      "count": 3
+    },
+    {
+      "text": "1 22 333 4444 55555",
+      "count": 13
+    },
+    {
+      "text": "don't stop believin'",
+      "count": 6
+    },
+    {
+      "text": "I'll've done it",
+      "count": 5
+    },
+    {
+      "text": "fn main() { println!(\"hi\"); }",
+      "count": 9
+    },
+    {
+      "text": "{\"key\": [1, 2, 3], \"ok\": true}",
+      "count": 17
+    },
+    {
+      "text": "https://example.com/path?q=1&x=2",
+      "count": 12
+    },
+    {
+      "text": "emoji 😀🚀🎉 test",
+      "count": 7
+    },
+    {
+      "text": "ёжик café naïve",
+      "count": 5
+    },
+    {
+      "text": "def foo(x: int) -> int:\n    return x + 1\n",
+      "count": 16
+    },
+    {
+      "text": "SELECT * FROM t WHERE id = 42;",
+      "count": 10
+    },
+    {
+      "text": "line1\nline2\r\nline3",
+      "count": 8
+    },
+    {
+      "text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "count": 13
+    },
+    {
+      "text": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中",
+      "count": 100
+    },
+    {
+      "text": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+      "count": 20
+    },
+    {
+      "text": "repeated repeated repeated repeated",
+      "count": 5
+    },
+    {
+      "text": "0.123456789e-10",
+      "count": 10
+    },
+    {
+      "text": "'s 't 're 've 'm 'll 'd",
+      "count": 13
+    },
+    {
+      "text": "<|im_start|>user hello<|im_end|>",
+      "count": 14
+    },
+    {
+      "text": "<|begin_of_sentence|>hi<|end_of_sentence|>",
+      "count": 15
+    },
+    {
+      "text": "[gMASK]<sop><|user|>hello<|assistant|>",
+      "count": 5
+    },
+    {
+      "text": "[MASK][sMASK]",
+      "count": 2
+    }
+  ],
+  "qwen": [
+    {
+      "text": "",
+      "count": 0
+    },
+    {
+      "text": "hello world",
+      "count": 2
+    },
+    {
+      "text": "Hello, world!",
+      "count": 4
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "count": 10
+    },
+    {
+      "text": "你好，世界！",
+      "count": 4
+    },
+    {
+      "text": "这是一个测试句子。",
+      "count": 4
+    },
+    {
+      "text": "中文English混合123",
+      "count": 6
+    },
+    {
+      "text": "a   b",
+      "count": 3
+    },
+    {
+      "text": "a\t\tb",
+      "count": 3
+    },
+    {
+      "text": "a\n\nb",
+      "count": 3
+    },
+    {
+      "text": "  leading",
+      "count": 2
+    },
+    {
+      "text": "trailing   ",
+      "count": 3
+    },
+    {
+      "text": "   \t\n  ",
+      "count": 3
+    },
+    {
+      "text": "1 22 333 4444 55555",
+      "count": 19
+    },
+    {
+      "text": "don't stop believin'",
+      "count": 6
+    },
+    {
+      "text": "I'll've done it",
+      "count": 5
+    },
+    {
+      "text": "fn main() { println!(\"hi\"); }",
+      "count": 9
+    },
+    {
+      "text": "{\"key\": [1, 2, 3], \"ok\": true}",
+      "count": 17
+    },
+    {
+      "text": "https://example.com/path?q=1&x=2",
+      "count": 12
+    },
+    {
+      "text": "emoji 😀🚀🎉 test",
+      "count": 9
+    },
+    {
+      "text": "ёжик café naïve",
+      "count": 6
+    },
+    {
+      "text": "def foo(x: int) -> int:\n    return x + 1\n",
+      "count": 17
+    },
+    {
+      "text": "SELECT * FROM t WHERE id = 42;",
+      "count": 11
+    },
+    {
+      "text": "line1\nline2\r\nline3",
+      "count": 8
+    },
+    {
+      "text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "count": 13
+    },
+    {
+      "text": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中",
+      "count": 100
+    },
+    {
+      "text": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+      "count": 20
+    },
+    {
+      "text": "repeated repeated repeated repeated",
+      "count": 5
+    },
+    {
+      "text": "0.123456789e-10",
+      "count": 15
+    },
+    {
+      "text": "'s 't 're 've 'm 'll 'd",
+      "count": 13
+    },
+    {
+      "text": "<|im_start|>user hello<|im_end|>",
+      "count": 4
+    },
+    {
+      "text": "<|begin_of_sentence|>hi<|end_of_sentence|>",
+      "count": 15
+    },
+    {
+      "text": "<|im_start|>user hello<|im_end|>",
+      "count": 4
+    },
+    {
+      "text": "<|endoftext|>",
+      "count": 1
+    }
+  ],
+  "hunyuan": [
+    {
+      "text": "",
+      "count": 0
+    },
+    {
+      "text": "hello world",
+      "count": 2
+    },
+    {
+      "text": "Hello, world!",
+      "count": 4
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "count": 10
+    },
+    {
+      "text": "你好，世界！",
+      "count": 4
+    },
+    {
+      "text": "这是一个测试句子。",
+      "count": 4
+    },
+    {
+      "text": "中文English混合123",
+      "count": 6
+    },
+    {
+      "text": "a   b",
+      "count": 3
+    },
+    {
+      "text": "a\t\tb",
+      "count": 3
+    },
+    {
+      "text": "a\n\nb",
+      "count": 3
+    },
+    {
+      "text": "  leading",
+      "count": 2
+    },
+    {
+      "text": "trailing   ",
+      "count": 3
+    },
+    {
+      "text": "   \t\n  ",
+      "count": 3
+    },
+    {
+      "text": "1 22 333 4444 55555",
+      "count": 19
+    },
+    {
+      "text": "don't stop believin'",
+      "count": 6
+    },
+    {
+      "text": "I'll've done it",
+      "count": 5
+    },
+    {
+      "text": "fn main() { println!(\"hi\"); }",
+      "count": 9
+    },
+    {
+      "text": "{\"key\": [1, 2, 3], \"ok\": true}",
+      "count": 17
+    },
+    {
+      "text": "https://example.com/path?q=1&x=2",
+      "count": 12
+    },
+    {
+      "text": "emoji 😀🚀🎉 test",
+      "count": 9
+    },
+    {
+      "text": "ёжик café naïve",
+      "count": 6
+    },
+    {
+      "text": "def foo(x: int) -> int:\n    return x + 1\n",
+      "count": 16
+    },
+    {
+      "text": "SELECT * FROM t WHERE id = 42;",
+      "count": 11
+    },
+    {
+      "text": "line1\nline2\r\nline3",
+      "count": 8
+    },
+    {
+      "text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "count": 13
+    },
+    {
+      "text": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中",
+      "count": 100
+    },
+    {
+      "text": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+      "count": 40
+    },
+    {
+      "text": "repeated repeated repeated repeated",
+      "count": 5
+    },
+    {
+      "text": "0.123456789e-10",
+      "count": 15
+    },
+    {
+      "text": "'s 't 're 've 'm 'll 'd",
+      "count": 13
+    },
+    {
+      "text": "<|im_start|>user hello<|im_end|>",
+      "count": 14
+    },
+    {
+      "text": "<|begin_of_sentence|>hi<|end_of_sentence|>",
+      "count": 15
+    },
+    {
+      "text": "<|startoftext|>hello<|endoftext|>",
+      "count": 3
+    },
+    {
+      "text": "<|extra_0|>test<|extra_204|>",
+      "count": 11
+    }
+  ],
+  "minimax": [
+    {
+      "text": "",
+      "count": 0
+    },
+    {
+      "text": "hello world",
+      "count": 2
+    },
+    {
+      "text": "Hello, world!",
+      "count": 4
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "count": 10
+    },
+    {
+      "text": "你好，世界！",
+      "count": 3
+    },
+    {
+      "text": "这是一个测试句子。",
+      "count": 4
+    },
+    {
+      "text": "中文English混合123",
+      "count": 4
+    },
+    {
+      "text": "a   b",
+      "count": 3
+    },
+    {
+      "text": "a\t\tb",
+      "count": 3
+    },
+    {
+      "text": "a\n\nb",
+      "count": 3
+    },
+    {
+      "text": "  leading",
+      "count": 2
+    },
+    {
+      "text": "trailing   ",
+      "count": 3
+    },
+    {
+      "text": "   \t\n  ",
+      "count": 3
+    },
+    {
+      "text": "1 22 333 4444 55555",
+      "count": 11
+    },
+    {
+      "text": "don't stop believin'",
+      "count": 5
+    },
+    {
+      "text": "I'll've done it",
+      "count": 4
+    },
+    {
+      "text": "fn main() { println!(\"hi\"); }",
+      "count": 9
+    },
+    {
+      "text": "{\"key\": [1, 2, 3], \"ok\": true}",
+      "count": 17
+    },
+    {
+      "text": "https://example.com/path?q=1&x=2",
+      "count": 12
+    },
+    {
+      "text": "emoji 😀🚀🎉 test",
+      "count": 6
+    },
+    {
+      "text": "ёжик café naïve",
+      "count": 5
+    },
+    {
+      "text": "def foo(x: int) -> int:\n    return x + 1\n",
+      "count": 16
+    },
+    {
+      "text": "SELECT * FROM t WHERE id = 42;",
+      "count": 10
+    },
+    {
+      "text": "line1\nline2\r\nline3",
+      "count": 8
+    },
+    {
+      "text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "count": 4
+    },
+    {
+      "text": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中",
+      "count": 100
+    },
+    {
+      "text": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+      "count": 40
+    },
+    {
+      "text": "repeated repeated repeated repeated",
+      "count": 4
+    },
+    {
+      "text": "0.123456789e-10",
+      "count": 8
+    },
+    {
+      "text": "'s 't 're 've 'm 'll 'd",
+      "count": 13
+    },
+    {
+      "text": "<|im_start|>user hello<|im_end|>",
+      "count": 12
+    },
+    {
+      "text": "<|begin_of_sentence|>hi<|end_of_sentence|>",
+      "count": 15
+    },
+    {
+      "text": "]!p~[<fim_prefix>hello<fim_middle>",
+      "count": 4
+    },
+    {
+      "text": "<fim_suffix><fim_pad>",
+      "count": 2
+    }
+  ]
+}

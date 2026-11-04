@@ -24,9 +24,15 @@ chrono.workspace = true
 # hex, 256-index, oklch()/okhsl()). Reusing the host's parser keeps the
 # statusline palette byte-identical to the footer's color model.
 rpi-tui.workspace = true
-# Model-tokenizer registry: the zero-dependency byte-level BPE runner parses
-# the official tokenizer.json pretokenizer patterns with the regex crate.
+# Bundled model tokenizers: the pretokenizer patterns use look-around and
+# character-class intersection (HF `Split`/tiktoken `pat_str` semantics), so
+# they run on the same fancy-regex backend the upstream tokenizers use.
+fancy-regex.workspace = true
 regex.workspace = true
+# Embed the compact tokenizer tables as zstd blobs (scripts/gen-statusline-tokenizers.py).
+zstd.workspace = true
+# NFC normalization for the Qwen/MiniMax tokenizers.
+unicode-normalization.workspace = true
 # A+B settings coordination for the /statusline editor (same protocol as the
 # host and subagents writers; ADR-0040).
 fs2.workspace = true

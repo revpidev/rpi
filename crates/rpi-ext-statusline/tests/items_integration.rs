@@ -601,6 +601,69 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         last_widget_contains(records, "~") && last_widget_contains(records, "text")
     });
 
+    // ── 4c. A bundled model family counts exactly: `deepseek-chat` uses the
+    //        embedded DeepSeek tokenizer (`hello world` = 2 tokens) instead
+    //        of the CJK heuristic, so the row carries no estimate marker.
+    set_canned(
+        "ctx.model",
+        json!({"id": "deepseek-chat", "name": "DeepSeek", "contextWindow": 200_000}),
+    );
+    write_settings(json!({"statusLine": {
+        "type": "items",
+        "items": ["live-output-tokens"],
+        "liveTokens": {"refreshMs": 300},
+        "placement": "widget",
+        "useColors": false
+    }}));
+    let frames_before = widget_texts(&records()).len();
+    send_event("model_select", json!({"type": "model_select"}));
+    // The event path debounces; wait for the frame that carries the new
+    // model before starting the stream.
+    poll_until("bundled tokenizer settings applied", |records| {
+        widget_texts(records).len() > frames_before
+    });
+    send_event(
+        "message_start",
+        json!({"type": "message_start", "message": {"role": "assistant"}}),
+    );
+    send_event(
+        "message_update",
+        json!({
+            "type": "message_update",
+            "message": {"role": "assistant"},
+            "assistantMessageEvent": {
+                "type": "text_delta",
+                "contentIndex": 0,
+                "delta": "hello world"
+            },
+        }),
+    );
+    let now = poll_until("bundled tokenizer live row", |records| {
+        widget_texts(records).last().is_some_and(|text| text == "2")
+    });
+    assert_eq!(
+        widget_texts(&now).last().map(String::as_str),
+        Some("2"),
+        "the bundled DeepSeek tokenizer counts hello world as 2"
+    );
+    send_event(
+        "message_end",
+        json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "usage": {"output": 2}},
+        }),
+    );
+    poll_until("bundled tokenizer settled row", |records| {
+        widget_texts(records).last().is_some_and(|text| text == "2")
+    });
+
+    // Restore the generic test model for the remaining sections.
+    set_canned(
+        "ctx.model",
+        json!({"id": "test-model", "name": "Test Model", "contextWindow": 200_000}),
+    );
+    send_event("model_select", json!({"type": "model_select"}));
+
     // ── 5. Turning live off stops the events and clears the measurement.
     write_settings(json!({"statusLine": {
         "type": "items",

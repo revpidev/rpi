@@ -258,6 +258,7 @@ jobs:
             # checked-in manifest uses the .so name on every platform).
             cp "$LIB" "$TMP/$NATIVE"
             [ -f "crates/$CRATE/LICENSE" ] && cp "crates/$CRATE/LICENSE" "$TMP/"
+            [ -f "crates/$CRATE/NOTICE.md" ] && cp "crates/$CRATE/NOTICE.md" "$TMP/"
             # In-pack checksums: every file except SHA256SUMS itself (the glob
             # expands before the redirect target is created), coreutils format.
             (cd "$TMP" && $SHA256 * > SHA256SUMS)
@@ -304,6 +305,7 @@ jobs:
             # checked-in manifest uses the .so name on every platform).
             Copy-Item $LIB "$TMP\$NATIVE"
             if (Test-Path "crates\$CRATE\LICENSE") { Copy-Item "crates\$CRATE\LICENSE" $TMP }
+            if (Test-Path "crates\$CRATE\NOTICE.md") { Copy-Item "crates\$CRATE\NOTICE.md" $TMP }
             # In-pack checksums: enumerated before SHA256SUMS exists, so the
             # file excludes itself; coreutils format.
             $sums = Get-ChildItem $TMP -File | ForEach-Object {

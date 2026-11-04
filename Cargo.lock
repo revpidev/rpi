@@ -3336,6 +3336,7 @@ version = "0.1.8-rc.2"
 dependencies = [
  "abi_stable",
  "chrono",
+ "fancy-regex",
  "fs2",
  "regex",
  "rpi-ext-host",
@@ -3346,6 +3347,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "unicode-normalization",
+ "zstd",
 ]
 
 [[package]]
