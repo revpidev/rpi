@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -165,62 +165,109 @@ fn unregister_child(id: u64) {
         .remove(&id);
 }
 
-/// Signal every live child spawned for `run_id` (async stop): SIGTERM now,
-/// SIGKILL after the shutdown grace. Signals are pid-direct (ladder style of
-/// `kill_all_children_for_shutdown`); the shared 3s grace bounds how long a
-/// TERM-trapping child can outlive the stop request.
-pub fn request_stop_for_run(run_id: &str) {
-    let children: Vec<(u32, Arc<tokio::sync::Mutex<Child>>)> = {
-        LIVE_CHILDREN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .filter(|(_, child_run, _, _)| child_run == run_id)
-            .map(|(pid, _, _, child)| (*pid, child.clone()))
+/// Whether the child behind `pid` is still running. The run task usually
+/// holds the child across `wait()`; when the mutex is free, `try_wait` both
+/// checks and reaps an exited child (the run's later `wait()` still returns
+/// the cached status). Otherwise probe the pid directly on Unix.
+fn child_alive(pid: u32, child: &Arc<tokio::sync::Mutex<Child>>) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // `Child::try_wait` needs a Tokio reactor (pidfd reaper on Linux). The
+    // session_shutdown harvest runs inside `block_on`, but the `stop` action
+    // can call the ladder straight from the host dispatch thread — there the
+    // pid probe below is the only safe check.
+    if tokio::runtime::Handle::try_current().is_ok()
+        && let Ok(mut guard) = child.try_lock()
+    {
+        return match guard.try_wait() {
+            Ok(Some(_)) => false,
+            Ok(None) => true,
+            // Already reaped (or the handle is unusable): treat as gone so
+            // the shutdown ladder cannot spin until the deadline.
+            Err(_) => false,
+        };
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 only probes process existence; it never delivers
+        // a signal. ESRCH = gone, EPERM = alive under another owner.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        // No pid probe without the guard; the shared deadline still bounds
+        // the stop.
+        true
+    }
+}
+
+/// Shared stop ladder: SIGTERM every matched child, poll for actual exit,
+/// and SIGKILL only the survivors at one shared deadline. Returns immediately
+/// when nothing matches — terminal/finished runs keep their registry entry but
+/// have no live children, so they must never pay the grace.
+fn stop_matching_children(matches: impl Fn(&LiveChildEntry) -> bool) {
+    let children: Vec<LiveChildEntry> = {
+        let live = LIVE_CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
+        live.values()
+            .filter(|entry| matches(entry))
+            .cloned()
             .collect()
     };
-    let term = std::time::Instant::now();
-    for (pid, _) in &children {
+    if children.is_empty() {
+        return;
+    }
+    for (pid, ..) in &children {
         signal_pid(*pid, Signal::Term);
     }
-    let elapsed = term.elapsed();
-    if elapsed < Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS) {
-        std::thread::sleep(Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS) - elapsed);
+    let deadline = Instant::now() + Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS);
+    loop {
+        if children
+            .iter()
+            .all(|(pid, _, _, child)| !child_alive(*pid, child))
+        {
+            return;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(25)));
     }
-    for (pid, _) in children {
-        signal_pid(pid, Signal::Kill);
+    for (pid, _, _, child) in &children {
+        if child_alive(*pid, child) {
+            signal_pid(*pid, Signal::Kill);
+        }
     }
+}
+
+/// Signal every live child spawned for `run_id` (async stop): SIGTERM now,
+/// SIGKILL for survivors after the shared shutdown grace. Returns immediately
+/// when the run has no live children (the common `session_shutdown` case:
+/// finished async runs stay registered for `status`/`wait`).
+pub fn request_stop_for_run(run_id: &str) {
+    stop_matching_children(|entry| entry.1 == run_id);
+}
+
+/// Stop the live children of several runs under one shared grace (the
+/// `session_shutdown` harvest path): total stall is one grace, not one per
+/// run, and it is skipped entirely when no run has a live child.
+pub fn request_stop_for_runs(run_ids: &[String]) {
+    let ids: std::collections::HashSet<&str> = run_ids.iter().map(String::as_str).collect();
+    stop_matching_children(|entry| ids.contains(entry.1.as_str()));
 }
 
 /// Signal only the live children of one child index within `run_id`
 /// (#1367/#1603 child-scoped stop — the model-attempt loop re-spawns under
 /// the same index, so every live pid of that index is signalled; siblings
-/// keep running). SIGTERM now, SIGKILL after the shutdown grace.
+/// keep running). SIGTERM now, SIGKILL for survivors after the shared grace.
 pub fn request_stop_for_run_child(run_id: &str, child_index: u32) {
-    let children: Vec<(u32, Arc<tokio::sync::Mutex<Child>>)> = {
-        LIVE_CHILDREN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .filter(|(_, child_run, index, _)| child_run == run_id && *index == child_index)
-            .map(|(pid, _, _, child)| (*pid, child.clone()))
-            .collect()
-    };
-    let term = std::time::Instant::now();
-    for (pid, _) in &children {
-        signal_pid(*pid, Signal::Term);
-    }
-    let elapsed = term.elapsed();
-    if elapsed < Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS) {
-        std::thread::sleep(Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS) - elapsed);
-    }
-    for (pid, _) in children {
-        signal_pid(pid, Signal::Kill);
-    }
+    stop_matching_children(|entry| entry.1 == run_id && entry.2 == child_index);
 }
 
-/// Kill every live child (SIGTERM → 3s → SIGKILL). Called from the
-/// `session_shutdown` event handler; runs on the plugin runtime.
+/// Kill every live child (SIGTERM → shared grace → SIGKILL). Called from the
+/// `session_shutdown` event handler; runs on the plugin runtime. Returns
+/// immediately when no child is live.
 pub async fn kill_all_children_for_shutdown() {
     let children: Vec<LiveChildEntry> = {
         LIVE_CHILDREN
@@ -230,11 +277,30 @@ pub async fn kill_all_children_for_shutdown() {
             .cloned()
             .collect()
     };
-    for (pid, _, _, child) in children {
-        signal_pid(pid, Signal::Term);
-        tokio::time::sleep(Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS)).await;
-        signal_pid(pid, Signal::Kill);
-        let _ = child.lock().await.wait().await;
+    if children.is_empty() {
+        return;
+    }
+    for (pid, ..) in &children {
+        signal_pid(*pid, Signal::Term);
+    }
+    let deadline = Instant::now() + Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS);
+    loop {
+        if children
+            .iter()
+            .all(|(pid, _, _, child)| !child_alive(*pid, child))
+        {
+            return;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(25))).await;
+    }
+    for (pid, _, _, child) in &children {
+        if child_alive(*pid, child) {
+            signal_pid(*pid, Signal::Kill);
+        }
     }
 }
 
@@ -2915,6 +2981,96 @@ mod terminal_classification_tests {
         assert_eq!(
             result.error.as_deref(),
             Some("Subagent missing required tool: edit")
+        );
+    }
+}
+
+/// Shutdown-ladder timing regressions: a stop request with no live child must
+/// not pay the SIGTERM→SIGKILL grace. This was the background-subagent exit
+/// stall (every finished async run retained in `ASYNC_RUNS` cost 3s).
+#[cfg(test)]
+mod shutdown_ladder_tests {
+    use super::*;
+
+    /// Serializes the tests that touch the process-global live-child registry.
+    static LIVE_CHILDREN_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn stop_with_no_live_child_returns_immediately() {
+        let _guard = LIVE_CHILDREN_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let started = Instant::now();
+        request_stop_for_run("shutdown-tests-no-such-run");
+        request_stop_for_runs(&["shutdown-tests-no-such-run".to_string()]);
+        request_stop_for_run_child("shutdown-tests-no-such-run", 0);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "empty stop ladder paid the grace: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_returns_when_the_termed_child_exits() {
+        let _guard = LIVE_CHILDREN_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep child");
+        let (id, _pid, handle) = register_child(child, "shutdown-tests-live", 0);
+        // The production run task owns the child and reaps it; simulate that
+        // so the pid probe observes the process leaving.
+        tokio::spawn(async move {
+            let mut guard = handle.lock().await;
+            let _ = guard.wait().await;
+        });
+        let started = Instant::now();
+        // Sync ladder: blocks the test thread, the reaper runs on a worker.
+        request_stop_for_run("shutdown-tests-live");
+        let elapsed = started.elapsed();
+        unregister_child(id);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "SIGTERM-ed child still waited the full grace: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // process-global registry guard, same as the registry tests
+    async fn kill_all_returns_when_the_termed_children_exit() {
+        let _guard = LIVE_CHILDREN_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let first = Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn first sleep child");
+        let second = Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn second sleep child");
+        let (first_id, _first_pid, _first_handle) = register_child(first, "shutdown-tests-all", 0);
+        let (second_id, _second_pid, _second_handle) =
+            register_child(second, "shutdown-tests-all", 1);
+        let started = Instant::now();
+        kill_all_children_for_shutdown().await;
+        let elapsed = started.elapsed();
+        unregister_child(first_id);
+        unregister_child(second_id);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "two SIGTERM-ed children waited the serial grace: {elapsed:?}"
         );
     }
 }

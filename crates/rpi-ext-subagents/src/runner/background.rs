@@ -2384,9 +2384,14 @@ pub async fn harvest_for_shutdown() {
         let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         runs.values().cloned().collect()
     };
+    // One shared signal ladder for every live child of every run. Runs that
+    // already finished stay in the registry (status/wait retention) but have
+    // no live children, so this is a no-op — it must not pay the 3s grace per
+    // retained run (a background-work session could carry dozens).
+    let run_ids: Vec<String> = handles.iter().map(|handle| handle.run_id.clone()).collect();
+    crate::runner::foreground::request_stop_for_runs(&run_ids);
     for handle in &handles {
         handle.control.request_stop();
-        crate::runner::foreground::request_stop_for_run(&handle.run_id);
         update_status(handle, |status| {
             if status["state"].as_str() == Some(STATE_RUNNING)
                 || status["state"].as_str() == Some(STATE_QUEUED)
@@ -4946,6 +4951,31 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&channel);
         unregister_run(&run_id);
         let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    /// Regression for the interactive-exit stall: finished async runs stay in
+    /// `ASYNC_RUNS` (status/wait retention), and `harvest_for_shutdown` used
+    /// to call the stop ladder per run. With no live child the ladder must be
+    /// a no-op, so harvesting several terminal runs returns immediately.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // process-global registry guard, same as the other registry tests
+    async fn harvest_terminal_runs_does_not_pay_the_stop_grace() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        for index in 0..3 {
+            terminal_test_run(&format!("tmp-harvest-terminal-{index}"));
+        }
+        let started = std::time::Instant::now();
+        harvest_for_shutdown().await;
+        let elapsed = started.elapsed();
+        let remaining = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert_eq!(remaining, 0, "terminal runs must be harvested");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "three terminal runs paid the shutdown grace: {elapsed:?}"
+        );
     }
 
     #[test]

@@ -1331,7 +1331,10 @@ fn dispatch_message(message: &Value) -> Value {
                     // here is the point: `dispose` waits for this dispatch to
                     // return, so a fire-and-forget spawn would be cancelled by
                     // process exit before the signal ladder ran. The ladder is
-                    // bounded (3s grace), so interactive exit is not stalled.
+                    // one shared 3s grace for all children and returns
+                    // immediately when nothing is live; finished runs retained
+                    // in the registry (status/wait) carry no children and no
+                    // longer stall every interactive exit.
                     state.runtime.block_on(async_runner_shutdown());
                     Value::Null
                 }
