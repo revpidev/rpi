@@ -507,13 +507,17 @@ pub fn value(id: FieldId, data: &FieldData) -> Option<FieldValue> {
     // `live` is `Some` only while the measurement is armed (`liveTokens`
     // enabled AND at least one live field selected): a disabled or
     // unselected live field stays hidden instead of showing a stale dash.
-    data.live.as_ref()?;
+    let live = data.live.as_ref()?;
     // Hold the last rendered value while this frame has no fresh one — the
-    // gap between two assistant messages (measurement reset, no delta yet),
-    // the rate window before it is stable, or a tier the current message has
-    // not produced. `streaming` is never held: during a real gap it must not
+    // gap between two assistant messages (measurement reset, no delta yet)
+    // and the rate window before it is stable. The hold is STREAMING-ONLY:
+    // once a message settles, its frozen measurements are authoritative, so
+    // a missing value must render the placeholder instead of leaking the
+    // previous message's number (a short reply used to keep the old rate
+    // forever). `streaming` is never held: during a real gap it must not
     // claim a stream is running.
     if id != FieldId::Streaming
+        && live.streaming
         && let Some((_, held)) = data.live_held.iter().find(|(held, _)| *held == id)
     {
         return Some(held.clone());
@@ -687,7 +691,16 @@ fn raw_value(id: FieldId, data: &FieldData) -> Option<FieldValue> {
         FieldId::LiveOutputRate => {
             let live = data.live?;
             let tokens = live.reported_output()?;
-            if live.decode_ms < MIN_RATE_DECODE_MS {
+            // While streaming, keep the reference 0.5 s guard: the decode
+            // window is still growing and a not-yet-stable denominator must
+            // not make the row jump. Once the message settled, `decode_ms`
+            // is the FROZEN first-delta→end window, so any positive value
+            // yields the final measured rate — a short reply must refresh
+            // its own rate instead of holding the previous message's.
+            if live.streaming && live.decode_ms < MIN_RATE_DECODE_MS {
+                return None;
+            }
+            if live.decode_ms == 0 {
                 return None;
             }
             let rate = tokens.total as f64 * 1000.0 / live.decode_ms as f64;
@@ -738,8 +751,10 @@ fn raw_value(id: FieldId, data: &FieldData) -> Option<FieldValue> {
     }
 }
 
-/// The rate is hidden until the decode window is long enough to be stable
-/// (same 0.5 s guard as the reference statusline script).
+/// While streaming, the rate is hidden until the decode window is long
+/// enough to be stable (same 0.5 s guard as the reference statusline
+/// script). A settled message ignores the guard: its window is frozen and
+/// the final rate is the accurate value for that message.
 const MIN_RATE_DECODE_MS: u128 = 500;
 
 fn reasoning_text(data: &FieldData) -> Option<String> {
@@ -1309,6 +1324,60 @@ mod tests {
         let mut off = gap.clone();
         off.live = None;
         assert_eq!(value(FieldId::LiveOutputTokens, &off), None);
+    }
+
+    /// A settled message is authoritative: its frozen decode window gives the
+    /// final rate even below the streaming 0.5 s guard, and the previous
+    /// message's held values are never reused after the stream ends.
+    #[test]
+    fn settled_messages_refresh_their_own_final_rate() {
+        let held = vec![
+            (
+                FieldId::LiveOutputTokens,
+                FieldValue::new("500", Tone::Success),
+            ),
+            (
+                FieldId::LiveOutputRate,
+                FieldValue::new("125.0 tok/s", Tone::Success),
+            ),
+        ];
+
+        // Short reply: 3 exact output tokens over a frozen 150 ms window.
+        let mut short = FieldData {
+            live: Some(LiveView {
+                streaming: false,
+                output_tokens: None,
+                output_tokens_exact: Some(3),
+                decode_ms: 150,
+                tokens: Some(TokenBreakdown::from_tiers(2, 1, 0, TokenSource::Estimated)),
+            }),
+            ..data()
+        };
+        short.live_held = held.clone();
+        assert_eq!(value(FieldId::LiveOutputTokens, &short).unwrap().text, "3");
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &short).unwrap().text,
+            "20.0 tok/s",
+            "the frozen final window replaces the previous rate"
+        );
+
+        // The same short window while STREAMING still holds the previous
+        // rate: the guard only protects unstable in-flight measurements.
+        let mut early = short.clone();
+        early.live.as_mut().unwrap().streaming = true;
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &early).unwrap().text,
+            "125.0 tok/s"
+        );
+
+        // Settled without a decode window: the placeholder, never the old
+        // rate (the hold is streaming-only).
+        let mut empty = short.clone();
+        empty.live.as_mut().unwrap().decode_ms = 0;
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &empty).unwrap().text,
+            "- tok/s"
+        );
     }
 
     #[test]

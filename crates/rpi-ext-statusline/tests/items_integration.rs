@@ -381,6 +381,52 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         "statusline must never call ctx.usage.*"
     );
 
+    // ── 2c. A SHORT reply (decode window below the streaming 0.5 s guard)
+    //        settles with its OWN frozen rate instead of holding the previous
+    //        message's number, and the settled frame never reuses old rows.
+    let long_text = status_texts(&records()).last().cloned().unwrap_or_default();
+    send_event(
+        "message_start",
+        json!({"type": "message_start", "message": {"role": "assistant"}}),
+    );
+    send_event(
+        "message_update",
+        json!({
+            "type": "message_update",
+            "message": {"role": "assistant", "usage": {"output": 1}},
+            "assistantMessageEvent": {
+                "type": "text_delta",
+                "contentIndex": 0,
+                "delta": "hi"
+            },
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    send_event(
+        "message_end",
+        json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "usage": {"output": 1}},
+        }),
+    );
+    let now = poll_until("short settled frame with its own rate", |records| {
+        status_texts(records).last().is_some_and(|text| {
+            text.starts_with("1 · ") && text.contains("tok/s") && !text.contains("- tok/s")
+        })
+    });
+    let short_text = status_texts(&now).last().cloned().unwrap_or_default();
+    assert_ne!(
+        short_text, long_text,
+        "the settled frame must not reuse the previous message's rows"
+    );
+    assert!(
+        short_text
+            .split(" · ")
+            .nth(1)
+            .is_some_and(|rate| rate != long_text.split(" · ").nth(1).unwrap_or_default()),
+        "the short message refreshes its rate: {short_text:?} (previous {long_text:?})"
+    );
+
     // ── 3. Field selection reconciles the extra subscriptions and renders
     //        the strict 26-field values (aliases + unknown id skipped).
     write_settings(json!({"statusLine": {

@@ -130,7 +130,7 @@ pub struct LiveSnapshot {
     pub delta_ms: u128,
     pub elapsed_ms: u128,
     pub output_tokens_exact: Option<u64>,
-    /// Tiered token count (provider exact or local tokenizer/heuristic).
+    /// Tiered token count (provider exact or bundled tokenizer/heuristic).
     /// Filled by the caller after the engine lock is released; `None` until
     /// the first snapshot with text data.
     pub tokens: Option<crate::tokens::TokenBreakdown>,
@@ -537,13 +537,18 @@ impl EngineState {
     /// with an actual measurement are stored, so a row keeps the last value
     /// it really had: the gap between two assistant messages (the measurement
     /// resets at `message_start` and has no delta yet), the rate window
-    /// before 0.5 s, or a tier the current message has not produced. Without
-    /// this the footer flips to `-`/`- tok/s` and back, visibly jumping.
+    /// before 0.5 s, or a tier the current message has not produced. A
+    /// SETTLED frame (message_end) replaces the whole cache first: its frozen
+    /// measurements are authoritative, so a row the finished message could
+    /// not produce must not keep an older message's number.
     ///
     /// `streaming` is deliberately not stored: during a real gap it must not
     /// keep claiming a stream is running (its dash placeholder is the
     /// truthful state, and the fresh value covers the in-flight window).
     pub fn record_live_values(&mut self, data: &crate::fields::FieldData) {
+        if data.live.is_some_and(|live| !live.streaming) {
+            self.last_live_values.clear();
+        }
         for id in crate::fields::ALL_FIELDS
             .iter()
             .copied()
@@ -1288,5 +1293,61 @@ mod tests {
         assert!(!state.live_held_values().is_empty());
         state.on_session_start(Some("new"));
         assert!(state.live_held_values().is_empty());
+    }
+
+    /// A settled frame replaces the hold cache: a row the finished message
+    /// could not produce must not keep an older message's number into the
+    /// next gap.
+    #[test]
+    fn settled_frame_resets_the_hold_cache() {
+        use crate::fields::{FieldData, LiveView};
+        use crate::tokens::{TokenBreakdown, TokenSource};
+
+        let frame = |live: LiveView| FieldData {
+            live: Some(live),
+            ..FieldData::default()
+        };
+        let mut state = EngineState::default();
+        state.set_live_measure(true);
+
+        // A long message settles with a rate.
+        state.record_live_values(&frame(LiveView {
+            streaming: false,
+            output_tokens: None,
+            output_tokens_exact: Some(500),
+            decode_ms: 4_000,
+            tokens: Some(TokenBreakdown::from_tiers(
+                500,
+                0,
+                0,
+                TokenSource::Estimated,
+            )),
+        }));
+        assert!(
+            state
+                .live_held_values()
+                .iter()
+                .any(|(id, _)| *id == FieldId::LiveOutputRate)
+        );
+
+        // A short message settles without a usable rate window: the previous
+        // rate must not survive the settle.
+        state.record_live_values(&frame(LiveView {
+            streaming: false,
+            output_tokens: None,
+            output_tokens_exact: Some(1),
+            decode_ms: 0,
+            tokens: Some(TokenBreakdown::from_tiers(1, 0, 0, TokenSource::Estimated)),
+        }));
+        let held = state.live_held_values();
+        assert!(
+            held.iter()
+                .any(|(id, value)| *id == FieldId::LiveOutputTokens && value.text == "1"),
+            "the settled total is recorded: {held:?}"
+        );
+        assert!(
+            held.iter().all(|(id, _)| *id != FieldId::LiveOutputRate),
+            "the previous rate is not held across the settle: {held:?}"
+        );
     }
 }
