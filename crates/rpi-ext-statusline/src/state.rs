@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::Placement;
-use crate::fields::LiveView;
+use crate::fields::{FieldId, FieldValue, LiveView};
 use crate::git::GitCache;
 use crate::paths::{find_latest_session_file, resolve_session_dir, session_id_from_path};
 use crate::session_stats::SessionStatsCache;
@@ -476,6 +476,11 @@ pub struct EngineState {
     pub session_stats: SessionStatsCache,
     /// Local Git probe cache for project-name/git-branch (TE52 R20 §4.4).
     pub git: GitCache,
+    /// Items-mode last rendered value of every live row. Between two
+    /// assistant messages the fresh measurement carries no data yet, and the
+    /// rows keep these values instead of flickering to the dash placeholders
+    /// ([`Self::record_live_values`] / [`Self::live_held_values`]).
+    last_live_values: Vec<(FieldId, FieldValue)>,
 }
 
 /// Mtime tolerance below the session-start wall clock: the host creates
@@ -497,6 +502,7 @@ impl Default for EngineState {
             mounted: None,
             session_stats: SessionStatsCache::default(),
             git: GitCache::default(),
+            last_live_values: Vec::new(),
         }
     }
 }
@@ -509,12 +515,51 @@ impl EngineState {
     }
 
     /// Items mode: dynamic live membership. Disabling clears the measurement
-    /// immediately (R20 §4.4) so a later re-enable cannot show stale tokens.
+    /// immediately (R20 §4.4) so a later re-enable cannot show stale tokens —
+    /// the held between-messages view is dropped for the same reason.
     pub fn set_live_measure(&mut self, enabled: bool) {
         if enabled {
             self.live.get_or_insert_with(LiveMeasure::default);
         } else {
             self.live = None;
+            self.last_live_values.clear();
+        }
+    }
+
+    /// Items mode: the values the previous frame rendered for the live rows,
+    /// attached to every frame so [`crate::fields::value`] can hold a row
+    /// that has no fresh reading yet.
+    pub fn live_held_values(&self) -> Vec<(FieldId, FieldValue)> {
+        self.last_live_values.clone()
+    }
+
+    /// Items mode: remember this frame's fresh live readings. Only fields
+    /// with an actual measurement are stored, so a row keeps the last value
+    /// it really had: the gap between two assistant messages (the measurement
+    /// resets at `message_start` and has no delta yet), the rate window
+    /// before 0.5 s, or a tier the current message has not produced. Without
+    /// this the footer flips to `-`/`- tok/s` and back, visibly jumping.
+    ///
+    /// `streaming` is deliberately not stored: during a real gap it must not
+    /// keep claiming a stream is running (its dash placeholder is the
+    /// truthful state, and the fresh value covers the in-flight window).
+    pub fn record_live_values(&mut self, data: &crate::fields::FieldData) {
+        for id in crate::fields::ALL_FIELDS
+            .iter()
+            .copied()
+            .filter(|id| id.is_live() && *id != FieldId::Streaming)
+        {
+            let Some(value) = crate::fields::fresh_value(id, data) else {
+                continue;
+            };
+            match self
+                .last_live_values
+                .iter_mut()
+                .find(|(held, _): &&mut (FieldId, FieldValue)| *held == id)
+            {
+                Some(entry) => entry.1 = value,
+                None => self.last_live_values.push((id, value)),
+            }
         }
     }
 
@@ -551,6 +596,8 @@ impl EngineState {
         // every case (reload included: identity is re-checked on the next
         // reply; the snapshot is never re-added).
         self.session_stats.begin_session(reason);
+        // The held live footer belongs to the previous session's messages.
+        self.last_live_values.clear();
         match reason {
             Some("reload") => {
                 self.transcript = None;
@@ -1141,5 +1188,105 @@ mod tests {
         assert_eq!(state.transcript_path(), Some(current.as_path()));
         rpi_test_env::remove_var("RPI_CODING_AGENT_SESSION_DIR");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `record_live_values` / `live_held_values`: every live row keeps the
+    /// last value it actually measured, so the gap between two assistant
+    /// messages (measurement reset, no delta yet) and the rate window do not
+    /// flip the footer to the dash placeholders. `streaming` is not held.
+    #[test]
+    fn items_live_rows_keep_the_last_measured_value() {
+        use crate::fields::{FieldData, LiveView};
+        use crate::tokens::{TokenBreakdown, TokenSource};
+
+        let frame = |live: LiveView| FieldData {
+            live: Some(live),
+            ..FieldData::default()
+        };
+        let mut state = EngineState::default();
+        state.set_live_measure(true);
+
+        // First message settles with exact numbers.
+        state.record_live_values(&frame(LiveView {
+            streaming: false,
+            output_tokens: None,
+            output_tokens_exact: Some(500),
+            decode_ms: 4_000,
+            tokens: Some(TokenBreakdown::from_tiers(
+                480,
+                0,
+                0,
+                TokenSource::Estimated,
+            )),
+        }));
+        let held = state.live_held_values();
+        let held_output = held
+            .iter()
+            .find(|(id, _)| *id == FieldId::LiveOutputTokens)
+            .map(|(_, value)| value.text.clone());
+        assert_eq!(held_output.as_deref(), Some("500"));
+        assert!(
+            held.iter().all(|(id, _)| *id != FieldId::Streaming),
+            "`streaming` is never held"
+        );
+
+        // Next `message_start`, before its first delta: the measurement is
+        // empty, but the frame still renders the held values.
+        let gap = frame(LiveView {
+            streaming: true,
+            ..LiveView::default()
+        });
+        let mut gap_with_held = gap.clone();
+        gap_with_held.live_held = state.live_held_values();
+        assert!(
+            crate::fields::value(FieldId::LiveOutputTokens, &gap_with_held)
+                .is_some_and(|value| value.text == "500"),
+            "the gap keeps the previous total"
+        );
+        assert!(
+            crate::fields::value(FieldId::LiveOutputRate, &gap_with_held)
+                .is_some_and(|value| value.text.contains("tok/s")),
+            "the gap keeps the previous rate"
+        );
+
+        // The new message's first delta refreshes the total (the recorded
+        // value moves); the not-yet-stable rate keeps its previous text.
+        state.record_live_values(&frame(LiveView {
+            streaming: true,
+            output_tokens: Some(7),
+            output_tokens_exact: None,
+            decode_ms: 300,
+            tokens: Some(TokenBreakdown::from_tiers(7, 0, 0, TokenSource::Estimated)),
+        }));
+        let refreshed = state.live_held_values();
+        assert!(
+            refreshed
+                .iter()
+                .any(|(id, value)| *id == FieldId::LiveOutputTokens && value.text == "7"),
+            "fresh data replaces the held total: {refreshed:?}"
+        );
+
+        // Disabling the measurement drops the cache; a re-enable starts from
+        // the dash placeholders.
+        state.set_live_measure(false);
+        assert!(state.live_held_values().is_empty());
+        state.set_live_measure(true);
+        let mut after = frame(LiveView::default());
+        after.live_held = state.live_held_values();
+        assert!(
+            crate::fields::value(FieldId::LiveOutputTokens, &after).is_some_and(|v| v.text == "-")
+        );
+
+        // A new session drops the held rows as well.
+        state.record_live_values(&frame(LiveView {
+            streaming: false,
+            output_tokens: None,
+            output_tokens_exact: Some(9),
+            decode_ms: 1_000,
+            tokens: Some(TokenBreakdown::from_tiers(9, 0, 0, TokenSource::Estimated)),
+        }));
+        assert!(!state.live_held_values().is_empty());
+        state.on_session_start(Some("new"));
+        assert!(state.live_held_values().is_empty());
     }
 }

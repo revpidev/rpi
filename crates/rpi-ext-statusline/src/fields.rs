@@ -17,7 +17,10 @@
 //! - Live values come from [`LiveView`]: the provider's exact output usage
 //!   when available, otherwise the model tokenizer / CJK-aware estimate from
 //!   [`crate::tokens`]. Estimates are marked with `~`; they are never
-//!   presented as provider-exact.
+//!   presented as provider-exact. While the live measurement is armed a live
+//!   field with no value yet renders its dash placeholder
+//!   ([`FieldId::placeholder`]) in the field's own tone so the line keeps its
+//!   width and color; every other missing field is omitted.
 //! - Values are sanitized (control characters, data ANSI SGR stripped) and
 //!   colors are generated only from the host theme palette.
 
@@ -191,6 +194,28 @@ impl FieldId {
     /// Whether the field needs the local Git probe.
     pub const fn needs_git(self) -> bool {
         matches!(self, Self::ProjectName | Self::GitBranch)
+    }
+
+    /// Placeholder text **and its tone** for a live field whose value is
+    /// temporarily absent (before the first delta, while the rate window is
+    /// still too short, or for a tier that is still empty).
+    ///
+    /// Live rows keep their slot with this text instead of disappearing, so a
+    /// refreshing status line does not reflow while a stream is measured. The
+    /// tone is the field's own (the live rows are all success-toned): a dash
+    /// in the muted gray reads as "disabled" and visibly loses the color the
+    /// surrounding numbers have. Non-live fields keep the "missing data is
+    /// omitted" contract and return `None` here.
+    pub const fn placeholder(self) -> Option<(&'static str, Tone)> {
+        match self {
+            Self::Streaming => Some(("-", Tone::Success)),
+            Self::LiveOutputTokens => Some(("-", Tone::Success)),
+            Self::LiveOutputRate => Some(("- tok/s", Tone::Success)),
+            Self::LiveTextTokens => Some(("- text", Tone::Success)),
+            Self::LiveThinkingTokens => Some(("- think", Tone::Success)),
+            Self::LiveToolcallTokens => Some(("- tool", Tone::Success)),
+            _ => None,
+        }
     }
 }
 
@@ -425,6 +450,11 @@ pub struct FieldData {
     pub session_name: Option<String>,
     pub stats: Option<SessionStats>,
     pub live: Option<LiveView>,
+    /// Last rendered value of every live row (items mode): a row with no
+    /// fresh value in this frame (the gap between two assistant messages, the
+    /// rate window before 0.5 s, a tier the new message has not produced yet)
+    /// keeps this value instead of flickering to its dash placeholder.
+    pub live_held: Vec<(FieldId, FieldValue)>,
     pub git: Option<GitInfo>,
     /// Frame clock (session-duration).
     pub now: Option<DateTime<Utc>>,
@@ -458,12 +488,44 @@ pub fn placeholder(id: FieldId) -> String {
 
 /// Evaluate one field. `None` = the field has no data for this frame and is
 /// omitted (never replaced by a zero, a guess or an estimate).
+///
+/// Two deliberate exceptions keep a slot instead of dropping it:
+/// - the editor preview renders every missing field as `(id)`;
+/// - a live field renders [`FieldId::placeholder`] while the live
+///   measurement is armed, so its row does not vanish when a stream starts
+///   or the rate window opens. The placeholder keeps the field's tone, not
+///   the muted one.
 pub fn value(id: FieldId, data: &FieldData) -> Option<FieldValue> {
     let value = raw_value(id, data);
-    if value.is_none() && data.preview {
+    if value.is_some() {
+        return value;
+    }
+    if data.preview {
         return Some(FieldValue::new(placeholder(id), Tone::Muted));
     }
-    value
+    let (text, tone) = id.placeholder()?;
+    // `live` is `Some` only while the measurement is armed (`liveTokens`
+    // enabled AND at least one live field selected): a disabled or
+    // unselected live field stays hidden instead of showing a stale dash.
+    data.live.as_ref()?;
+    // Hold the last rendered value while this frame has no fresh one — the
+    // gap between two assistant messages (measurement reset, no delta yet),
+    // the rate window before it is stable, or a tier the current message has
+    // not produced. `streaming` is never held: during a real gap it must not
+    // claim a stream is running.
+    if id != FieldId::Streaming
+        && let Some((_, held)) = data.live_held.iter().find(|(held, _)| *held == id)
+    {
+        return Some(held.clone());
+    }
+    Some(FieldValue::new(text, tone))
+}
+
+/// This frame's own reading for a field, without the preview placeholder and
+/// without the [`FieldData::live_held`] fallback. The items refresh uses it
+/// to record what the next frame may hold.
+pub fn fresh_value(id: FieldId, data: &FieldData) -> Option<FieldValue> {
+    raw_value(id, data)
 }
 
 fn raw_value(id: FieldId, data: &FieldData) -> Option<FieldValue> {
@@ -928,6 +990,7 @@ mod tests {
                     TokenSource::Estimated,
                 )),
             }),
+            live_held: Vec::new(),
             git: Some(GitInfo {
                 root: Some("/work/project".into()),
                 branch: Some("v0.1.8-baseline".into()),
@@ -1141,11 +1204,16 @@ mod tests {
             value(FieldId::LiveOutputRate, &estimated).unwrap().text,
             "~49.2 tok/s"
         );
-        // Too-short decode window → rate omitted (stable display guard).
+        // Too-short decode window → the rate row keeps its slot as a
+        // placeholder instead of disappearing (stable display guard).
         let mut no_decode = data.clone();
         no_decode.live.as_mut().unwrap().decode_ms = 0;
-        assert_eq!(value(FieldId::LiveOutputRate, &no_decode), None);
-        // Streaming stopped: exact takes over; streaming field omitted.
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &no_decode).unwrap().text,
+            "- tok/s"
+        );
+        // Streaming stopped: exact takes over; the streaming row falls back
+        // to its placeholder.
         let stopped = FieldData {
             live: Some(LiveView {
                 streaming: false,
@@ -1161,7 +1229,7 @@ mod tests {
             }),
             ..data.clone()
         };
-        assert_eq!(value(FieldId::Streaming, &stopped), None);
+        assert_eq!(value(FieldId::Streaming, &stopped).unwrap().text, "-");
         assert_eq!(
             value(FieldId::LiveOutputTokens, &stopped).unwrap().text,
             "500"
@@ -1189,6 +1257,146 @@ mod tests {
         assert_eq!(value(FieldId::LiveOutputRate, &disabled), None);
     }
 
+    /// `live_held`: a live row with no fresh value this frame keeps the last
+    /// value the footer actually measured (the gap between two assistant
+    /// messages, the rate window, a tier the message has not produced yet).
+    /// A fresh value always wins; `streaming` is never held.
+    #[test]
+    fn live_rows_keep_the_last_measured_value_until_refreshed() {
+        let previous = FieldValue::new("500", Tone::Success);
+        let previous_rate = FieldValue::new("125.0 tok/s", Tone::Success);
+        let mut gap = FieldData {
+            live: Some(LiveView {
+                streaming: true,
+                ..LiveView::default()
+            }),
+            ..data()
+        };
+        gap.live_held = vec![
+            (FieldId::LiveOutputTokens, previous.clone()),
+            (FieldId::LiveOutputRate, previous_rate.clone()),
+        ];
+        let total = value(FieldId::LiveOutputTokens, &gap).unwrap();
+        assert_eq!((total.text.as_str(), total.tone), ("500", Tone::Success));
+        let rate = value(FieldId::LiveOutputRate, &gap).unwrap();
+        assert_eq!(rate.text, "125.0 tok/s");
+
+        // Fresh data refreshes the row (the held copy never shadows it).
+        let mut fresh = gap.clone();
+        fresh.live = Some(LiveView {
+            streaming: true,
+            output_tokens: Some(7),
+            output_tokens_exact: None,
+            decode_ms: 1_200,
+            tokens: Some(TokenBreakdown::from_tiers(7, 0, 0, TokenSource::Estimated)),
+        });
+        assert_eq!(value(FieldId::LiveOutputTokens, &fresh).unwrap().text, "7");
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &fresh).unwrap().text,
+            "5.8 tok/s"
+        );
+
+        // `streaming` is never held: an idle gap reports the placeholder.
+        let mut idle = gap.clone();
+        idle.live = Some(LiveView::default());
+        idle.live_held.push((
+            FieldId::Streaming,
+            FieldValue::new("streaming", Tone::Success),
+        ));
+        assert_eq!(value(FieldId::Streaming, &idle).unwrap().text, "-");
+
+        // Disarmed measurement: held values are not rendered (hidden fields).
+        let mut off = gap.clone();
+        off.live = None;
+        assert_eq!(value(FieldId::LiveOutputTokens, &off), None);
+    }
+
+    #[test]
+    fn live_rows_keep_dash_placeholders_while_armed() {
+        // Armed but idle (no assistant message yet): every live row keeps its
+        // slot with a dash placeholder, so the status line does not reflow
+        // when a stream starts. The dash keeps the field's own tone — a muted
+        // dash reads as "disabled" and loses the color of the numbers it
+        // stands in for.
+        use crate::items::ItemEntry;
+        let idle = FieldData {
+            live: Some(LiveView::default()),
+            ..data()
+        };
+        for (field, text) in [
+            (FieldId::Streaming, "-"),
+            (FieldId::LiveOutputTokens, "-"),
+            (FieldId::LiveOutputRate, "- tok/s"),
+            (FieldId::LiveTextTokens, "- text"),
+            (FieldId::LiveThinkingTokens, "- think"),
+            (FieldId::LiveToolcallTokens, "- tool"),
+        ] {
+            let value = value(field, &idle).unwrap();
+            assert_eq!(value.text, text);
+            assert_eq!(
+                value.tone,
+                Tone::Success,
+                "the placeholder keeps the live success tone"
+            );
+        }
+        // The colored render path emits the success SGR, not the muted one.
+        let mut themed = idle.clone();
+        themed.palette = Some(Palette::from_theme(&json!({
+            "colors": {"success": "green", "muted": "#112233"}
+        })));
+        let entries = vec![ItemEntry {
+            raw: "live-output-tokens".into(),
+            field: Some(FieldId::LiveOutputTokens),
+        }];
+        let colored = render_line(&entries, " · ", true, &themed).unwrap();
+        assert!(
+            colored.contains("\x1b[32m-\x1b[0m"),
+            "placeholder must keep the success color: {colored:?}"
+        );
+        assert!(
+            !colored.contains("38;2;17;34;51"),
+            "placeholder must not fall back to the muted color: {colored:?}"
+        );
+        // Placeholders join like real values (no empty separator slots).
+        let joined = vec![
+            ItemEntry {
+                raw: "model".into(),
+                field: Some(FieldId::Model),
+            },
+            ItemEntry {
+                raw: "live-output-rate".into(),
+                field: Some(FieldId::LiveOutputRate),
+            },
+        ];
+        assert_eq!(
+            render_line(&joined, " · ", false, &idle).unwrap(),
+            "GLM-5.1 · - tok/s"
+        );
+        // Disarmed (`liveTokens` off / no live field selected) → hidden, so a
+        // disabled plugin never renders a stale dash.
+        let off = FieldData {
+            live: None,
+            ..data()
+        };
+        for field in [
+            FieldId::Streaming,
+            FieldId::LiveOutputTokens,
+            FieldId::LiveOutputRate,
+            FieldId::LiveTextTokens,
+            FieldId::LiveThinkingTokens,
+            FieldId::LiveToolcallTokens,
+        ] {
+            assert_eq!(value(field, &off), None);
+        }
+        // Non-live fields keep the omission contract while live is armed.
+        let empty = FieldData {
+            live: Some(LiveView::default()),
+            ..FieldData::default()
+        };
+        assert_eq!(value(FieldId::Model, &empty), None);
+        assert_eq!(value(FieldId::SessionCost, &empty), None);
+    }
+
     #[test]
     fn number_format_only_affects_token_and_window_numbers() {
         let mut exact = data();
@@ -1211,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_data_renders_placeholders_only_in_preview() {
+    fn missing_data_omits_or_uses_the_preview_placeholder() {
         let empty = FieldData::default();
         assert_eq!(value(FieldId::Model, &empty), None);
         let preview = FieldData {

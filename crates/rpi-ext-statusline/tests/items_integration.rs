@@ -255,16 +255,18 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         );
     }
 
-    // ── 2. Default frame: idle = no custom output; a stream then shows the
-    //        estimated token/rate pair live, and the exact provider count on
-    //        message_end. No shell, no command.
-    std::thread::sleep(Duration::from_millis(1200));
-    assert!(
-        widget_texts(&records())
+    // ── 2. Default frame: idle keeps both live rows as dash placeholders so
+    //        the status line never reflows when a stream starts; a stream
+    //        then shows the estimated token/rate pair live, and the exact
+    //        provider count on message_end. No shell, no command.
+    let idle = poll_until("idle live placeholders", |records| {
+        status_texts(records)
             .last()
-            .is_none_or(|text| text.is_empty()),
-        "idle default frame has no live values: {:?}",
-        widget_texts(&records()).last()
+            .is_some_and(|text| text == "- · - tok/s")
+    });
+    assert!(
+        calls_of(&idle, "ui.setWidget").is_empty(),
+        "status placement never mounts a widget"
     );
     send_event(
         "message_start",
@@ -308,6 +310,67 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         !text.contains('~'),
         "exact count drops the marker: {text:?}"
     );
+
+    // ── 2b. Between two assistant messages the live rows hold the last
+    //        numbers: the next `message_start` has no delta yet, and the
+    //        footer must not flip to the dash placeholders (which would
+    //        visibly jump while the model thinks).
+    let exact_text = text.clone();
+    let frames_before = status_texts(&records()).len();
+    send_event(
+        "message_start",
+        json!({"type": "message_start", "message": {"role": "assistant"}}),
+    );
+    // Wait for the frame this event actually publishes (the event path
+    // debounces, so sleeping a fixed amount races the refresh loop), then
+    // assert it still carries the previous message's numbers.
+    let gap = poll_until("message_start frame", |records| {
+        status_texts(records).len() > frames_before
+    });
+    let gap_text = status_texts(&gap).last().cloned().unwrap_or_default();
+    assert_eq!(
+        gap_text, exact_text,
+        "the gap before the next delta must hold the previous live numbers"
+    );
+    assert!(
+        !gap_text.contains("- tok/s"),
+        "the gap must not fall back to the dash placeholders: {gap_text:?}"
+    );
+    // The first delta of the new message refreshes the rows.
+    send_event(
+        "message_update",
+        json!({
+            "type": "message_update",
+            "message": {"role": "assistant"},
+            "assistantMessageEvent": {
+                "type": "text_delta",
+                "contentIndex": 0,
+                "delta": "second message body"
+            },
+        }),
+    );
+    let now = poll_until("second message refreshes the rows", |records| {
+        status_texts(records)
+            .last()
+            .is_some_and(|text| text != &exact_text && text.contains("tok/s"))
+    });
+    assert!(
+        status_texts(&now)
+            .last()
+            .is_some_and(|text| text.contains('~')),
+        "the second message re-estimates: {:?}",
+        status_texts(&now).last()
+    );
+    send_event(
+        "message_end",
+        json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "usage": {"output": 43}},
+        }),
+    );
+    poll_until("second exact token rows", |records| {
+        last_status_contains(records, "43") && last_status_contains(records, "tok/s")
+    });
     assert!(
         !records()
             .iter()

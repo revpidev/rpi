@@ -6726,8 +6726,7 @@ impl InteractiveMode {
         // is now reachable via the live runner).
         if self.session.is_compacting() {
             if is_extension_command(&self.session.extension_runner(), &text) {
-                self.prompt_or_shutdown(&text, PromptOptions::default())
-                    .await;
+                self.spawn_prompt(text, PromptOptions::default());
                 return;
             }
             self.ui_state
@@ -6745,7 +6744,7 @@ impl InteractiveMode {
         } else {
             PromptOptions::default()
         };
-        self.prompt_or_shutdown(&text, options).await;
+        self.spawn_prompt(text, options);
         self.ui_state.update_pending_messages_display();
         self.ui_state.render_handle.request_render();
     }
@@ -6910,8 +6909,7 @@ impl InteractiveMode {
         if self.session.is_compacting() {
             if is_extension_command(&self.session.extension_runner(), &text) {
                 lock(&self.ui_state.editor).set_text("");
-                self.prompt_or_shutdown(&text, PromptOptions::default())
-                    .await;
+                self.spawn_prompt(text, PromptOptions::default());
                 return;
             }
             self.ui_state
@@ -6920,14 +6918,13 @@ impl InteractiveMode {
         }
         if self.session.is_streaming() {
             // streamingBehavior: "followUp" (interactive-mode.ts:3745-3750).
-            self.prompt_or_shutdown(
-                &text,
+            self.spawn_prompt(
+                text,
                 PromptOptions {
                     streaming_behavior: Some(StreamingBehavior::FollowUp),
                     ..Default::default()
                 },
-            )
-            .await;
+            );
             self.ui_state.update_pending_messages_display();
             self.ui_state.render_handle.request_render();
         } else {
@@ -6935,6 +6932,40 @@ impl InteractiveMode {
             // (interactive-mode.ts:3752-3756).
             self.handle_submit(text).await;
         }
+    }
+
+    /// Run one prompt off the run loop.
+    ///
+    /// Upstream runs `session.prompt` from the editor submit callback
+    /// (interactive-mode.ts:3319-3340 @ 4a080252f), so its run loop
+    /// (`getUserInput` → `prompt`, 1255-1262) never blocks and keeps
+    /// dispatching submits while a run is active — a message typed then is
+    /// queued as a steer and its `Steering:` row appears immediately. The
+    /// port dispatches submits on the run loop, so awaiting the prompt there
+    /// held the loop inside `handle_submit` for the whole run: a submit typed
+    /// during streaming sat unread in `input_rx` (no steer, no pending row,
+    /// nothing visible) until the run ended. Spawning restores the upstream
+    /// shape; the shutdown race is the run loop's (`next_command`) plus the
+    /// select below.
+    fn spawn_prompt(&self, text: String, options: PromptOptions) {
+        let session = self.session.clone();
+        let ui = Arc::clone(&self.ui_state);
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        commands_selectors::spawn_async(async move {
+            tokio::select! {
+                result = session.prompt(&text, options) => {
+                    if let Err(error) = result {
+                        ui.show_error(&error.raw_message());
+                    }
+                }
+                _ = shutdown_rx.changed() => {}
+            }
+            // A steer/follow-up queued above is already in the session
+            // queue: surface its `Steering:`/`Follow-up:` row now instead of
+            // at the end of the run.
+            ui.update_pending_messages_display();
+            ui.render_handle.request_render();
+        });
     }
 
     /// `session.prompt` bounded by the shutdown signal: the initial messages
@@ -7583,8 +7614,8 @@ mod tests {
 
     use super::*;
     use crate::modes::interactive::test_support::{
-        TempDir, TestSession, TestTerminal, build_switchable_test_session, build_test_session,
-        build_test_session_with, build_test_session_with_manager,
+        TempDir, TestSession, TestTerminal, build_faux_test_session, build_switchable_test_session,
+        build_test_session, build_test_session_with, build_test_session_with_manager,
         build_test_session_with_model_runtime, build_test_session_with_settings,
         install_noop_product_transports,
     };
@@ -7694,6 +7725,76 @@ mod tests {
         // swap the production transports for no-op ones before `init()`.
         install_noop_product_transports(&mode);
         (mode, terminal, harness.session)
+    }
+
+    /// Regression (streaming submits): while the model streams, a submit must
+    /// be handled immediately as a steer — the `Steering:` row appears above
+    /// the editor before the run ends.
+    ///
+    /// The port used to await `session.prompt` on the run loop, so the run
+    /// loop sat inside the previous `handle_submit` for the whole run and the
+    /// new submit stayed unread in `input_rx`: nothing was queued or drawn
+    /// until the stream finished. Upstream runs the prompt from the editor
+    /// submit callback, so its run loop keeps dispatching submits.
+    #[tokio::test]
+    async fn submit_while_streaming_queues_the_steer_before_the_run_ends() {
+        install_global_keybindings();
+        let harness = build_faux_test_session(&"tok ".repeat(200), 5.0).await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mut mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        install_noop_product_transports(&mode);
+        let ui = Arc::clone(&mode.ui_state);
+
+        // The first submit returns without awaiting the run.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            mode.handle_submit("first message".to_owned()),
+        )
+        .await
+        .expect("the run loop must not await the model run");
+        for _ in 0..200 {
+            if mode.session.is_streaming() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            mode.session.is_streaming(),
+            "the paced faux stream should still be in flight"
+        );
+
+        // A submit during the run is accepted right away (steer), not after
+        // the stream.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            mode.handle_submit("steer text".to_owned()),
+        )
+        .await
+        .expect("a submit during streaming must not block on the run");
+        for _ in 0..200 {
+            if !mode.session.get_steering_messages().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            mode.session.get_steering_messages(),
+            vec!["steer text".to_string()],
+            "the streaming submit is queued as a steer"
+        );
+        let pending = lock(&ui.pending_messages_container).render(80).join("\n");
+        assert!(
+            pending.contains("Steering: steer text"),
+            "the queued row must be on screen while the model still streams: {pending:?}"
+        );
+        assert!(
+            pending.contains("to edit all queued messages"),
+            "the dequeue hint follows the row: {pending:?}"
+        );
     }
 
     /// [`mode_harness`] over a caller-provided model runtime (V17-07 #67:
@@ -10157,9 +10258,18 @@ mod tests {
         let (mut mode, _terminal, _session) = mode_harness().await;
         mode.init().await;
         // `/nosuchcommand` is not a built-in; the session prompt rejects it
-        // (no auth configured in the test session) and shows an error.
+        // (no auth configured in the test session) and shows an error. The
+        // prompt runs spawned (the run loop must stay free for streaming
+        // submits), so poll for the error instead of asserting immediately.
         mode.handle_submit("/nosuchcommand".to_string()).await;
-        let rendered = lock(&mode.ui_state.chat_container).render(60).join("\n");
+        let mut rendered = String::new();
+        for _ in 0..200 {
+            rendered = lock(&mode.ui_state.chat_container).render(60).join("\n");
+            if rendered.contains("Error:") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(rendered.contains("Error:"), "rendered: {rendered}");
     }
 

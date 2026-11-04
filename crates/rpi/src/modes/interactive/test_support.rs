@@ -31,6 +31,106 @@ use crate::sdk::{CreateAgentSessionOptions, NoTools, create_agent_session};
 /// the process environment is shared by all tests running in parallel.
 pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Session fixture over the scripted faux provider with paced streaming
+/// (`tokens_per_second`): the agent run stays in flight long enough for a test
+/// to submit into it.
+pub(crate) async fn build_faux_test_session(text: &str, tokens_per_second: f64) -> TestSession {
+    use rpi_test_support::faux::{
+        FauxAiProvider, FauxAssistantOptions, FauxModelDefinition, FauxProvider,
+        FauxProviderOptions, FauxTokenSize, faux_assistant_message,
+    };
+
+    let tmp = TempDir::new();
+    let cwd = tmp.path().join("cwd");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd dir");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+    let provider = FauxProvider::new(FauxProviderOptions {
+        tokens_per_second: Some(tokens_per_second),
+        token_size: Some(FauxTokenSize {
+            min: Some(5),
+            max: Some(8),
+        }),
+        models: Some(vec![FauxModelDefinition {
+            id: "faux-1".to_owned(),
+            name: Some("Faux One".to_owned()),
+            reasoning: Some(false),
+            input: None,
+            input_limits: None,
+            cost: None,
+            context_window: Some(200_000),
+            max_tokens: Some(8192),
+        }]),
+        ..Default::default()
+    });
+    provider.set_responses(vec![
+        faux_assistant_message(text, FauxAssistantOptions::default()).into(),
+    ]);
+    let model = provider.get_model(None).expect("faux model");
+
+    let model_runtime = crate::core::model_runtime::ModelRuntime::create(
+        crate::core::model_runtime::CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: Some(agent_dir.join("auth.json")),
+            models_path: crate::core::model_runtime::ModelsPathInput::Path(
+                agent_dir.join("models.json"),
+            ),
+            ..Default::default()
+        },
+    )
+    .await;
+    model_runtime
+        .register_native_provider(Arc::new(FauxAiProvider::new(provider)))
+        .await
+        .expect("register faux provider");
+
+    let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+        cwd: cwd.clone(),
+        agent_dir: Some(agent_dir),
+        settings_manager: None,
+        model_runtime: Some(model_runtime.clone()),
+        extension_flag_values: Vec::new(),
+        resource_loader_options: None,
+    })
+    .await
+    .expect("create services");
+
+    let created = create_agent_session(CreateAgentSessionOptions {
+        cwd: Some(cwd.clone()),
+        model_runtime: Some(model_runtime),
+        model: Some(model),
+        no_tools: Some(NoTools::All),
+        services: Some(services.clone()),
+        session_manager: Some(Arc::new(Mutex::new(
+            SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
+                .expect("in-memory session"),
+        ))),
+        ..Default::default()
+    })
+    .await
+    .expect("create faux session");
+
+    let runtime = AgentSessionRuntime::new(
+        created.session.clone(),
+        services.clone(),
+        Arc::new(move |_options| {
+            Box::pin(async {
+                unreachable!("session creation is not exercised by interactive tests")
+            })
+        }),
+        Vec::new(),
+        None,
+    );
+
+    TestSession {
+        _tmp: tmp,
+        runtime,
+        session: created.session,
+        cwd,
+    }
+}
+
 /// Temp dir with unique name (same pattern as model_runtime tests).
 pub(crate) struct TempDir(PathBuf);
 

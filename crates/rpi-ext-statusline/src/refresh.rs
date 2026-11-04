@@ -887,6 +887,7 @@ fn build_field_data(items: &ItemsConfig, ctx: &CtxData) -> FieldData {
     });
     let model_id = model.as_ref().map(|model| model.id.as_str());
     let live = live_peek.map(|peek| peek.into_view(model_id));
+    let live_held = with_engine(|engine| engine.live_held_values());
     FieldData {
         cwd: Some(ctx.cwd.clone()).filter(|cwd| !cwd.is_empty()),
         model,
@@ -897,6 +898,7 @@ fn build_field_data(items: &ItemsConfig, ctx: &CtxData) -> FieldData {
         session_name: ctx.session_name.clone(),
         stats,
         live,
+        live_held,
         git,
         now: Some(Utc::now()),
         number_format: items.number_format,
@@ -930,6 +932,7 @@ fn publish_items_from_cache(
         )
     });
     data.live = live_peek.map(|peek| peek.into_view(model_id.as_deref()));
+    data.live_held = with_engine(|engine| engine.live_held_values());
     data.git = git;
     data.now = Some(Utc::now());
     data.number_format = items.number_format;
@@ -939,6 +942,10 @@ fn publish_items_from_cache(
 fn publish_items_from_data(calls: &AsyncHostCalls, items: &ItemsConfig, data: &FieldData) {
     let line = fields::render_line(&items.entries, &items.separator, items.use_colors, data);
     publish_line(calls, line.as_deref(), items.placement, items.padding);
+    // Remember this frame's fresh live readings for the next frame's hold
+    // (the gap between two assistant messages, the rate window, a tier the
+    // current message has not produced yet).
+    with_engine(|engine| engine.record_live_values(data));
 }
 
 /// Publish one items frame into the configured channel. Empty output clears

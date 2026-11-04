@@ -70,7 +70,10 @@
 //!   fallback (`process.stdout.columns` is `undefined` off-tty), so the
 //!   default query ([`default_query_size`]) only runs the ioctl when stdout
 //!   is a terminal and otherwise fails fast into the COLUMNS/LINES/default
-//!   chain of `columns()`/`rows()`.
+//!   chain of `columns()`/`rows()`. The ioctl targets STDOUT itself, like
+//!   upstream `process.stdout.columns/rows`, not crossterm's `/dev/tty`
+//!   resolution: a stdout pty that is not the controlling terminal (nested
+//!   pty harnesses) otherwise sizes the frame for the wrong screen.
 //! - Windows `ENABLE_VIRTUAL_TERMINAL_INPUT`: upstream loads a native Node
 //!   helper (`win32-console-mode.node`, terminal.ts:338-366); the port
 //!   implements the flag itself through the Windows console API
@@ -461,15 +464,55 @@ static STDIN_SLOT: Mutex<Option<mpsc::Sender<TerminalEvent>>> = Mutex::new(None)
 static STDIN_READER_ONCE: Once = Once::new();
 
 /// The default terminal size query (upstream `get columns()` / `get rows()`
-/// read `process.stdout.columns` / `process.stdout.rows`): crossterm's
-/// ioctl, but only when stdout is a terminal. See the header note for why
-/// crossterm 0.29's no-tty `tput` subprocess fallback must not run.
+/// read `process.stdout.columns` / `process.stdout.rows`): the winsize of
+/// **stdout**, and only when stdout is a terminal. See the header note for
+/// why crossterm 0.29's no-tty `tput` subprocess fallback must not run, and
+/// why crossterm's own `terminal::size()` is not used here.
 fn default_query_size() -> io::Result<(u16, u16)> {
     if io::stdout().is_terminal() {
-        crossterm::terminal::size()
+        stdout_winsize()
     } else {
         Err(io::Error::other("not a tty"))
     }
+}
+
+/// `process.stdout.columns/rows` (terminal.ts:553-559): `TIOCGWINSZ` on fd 1.
+///
+/// Deliberately NOT `crossterm::terminal::size()`: crossterm opens
+/// `/dev/tty` first (crossterm 0.29 `terminal/sys/unix.rs:69-76`, falling
+/// back to `STDOUT_FILENO` only when `/dev/tty` cannot be opened) and
+/// therefore reports the CONTROLLING terminal. When stdout is a pty that is
+/// not this process's controlling terminal — a nested pty harness, a wrapper
+/// that allocates a pty without `setsid`+`TIOCSCTTY`, some IDE/CI terminals —
+/// that is a different screen: the renderer lays out a frame for the wrong
+/// height, the transcript eats the dock rows and the editor's content row
+/// (where typed characters appear) is pushed off-screen. Upstream reads the
+/// stdout tty; this does the same.
+#[cfg(unix)]
+fn stdout_winsize() -> io::Result<(u16, u16)> {
+    winsize_of(libc::STDOUT_FILENO)
+}
+
+/// `ioctl(TIOCGWINSZ)` on one descriptor (the shared tail of
+/// [`stdout_winsize`], split out so the fd targeting is testable).
+#[cfg(unix)]
+fn winsize_of(fd: i32) -> io::Result<(u16, u16)> {
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: `TIOCGWINSZ` fills the `winsize` struct we own.
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) };
+    if rc == 0 && size.ws_col > 0 && size.ws_row > 0 {
+        Ok((size.ws_col, size.ws_row))
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Windows: crossterm's console query already targets the stdout console
+/// buffer (`GetConsoleScreenBufferInfo` on the current output handle), and
+/// there is no `/dev/tty` indirection to avoid.
+#[cfg(not(unix))]
+fn stdout_winsize() -> io::Result<(u16, u16)> {
+    crossterm::terminal::size()
 }
 
 /// `ENABLE_VIRTUAL_TERMINAL_INPUT` (wincon.h, 0x0200; terminal.ts:420-427
@@ -2065,6 +2108,60 @@ mod tests {
             (terminal.query_size)().is_err(),
             "off-tty size query must fail fast into the COLUMNS/LINES/default chain"
         );
+    }
+
+    /// Regression (nested-pty harness): the default query must read STDOUT's
+    /// winsize, not `/dev/tty`. crossterm's `terminal::size()` opens
+    /// `/dev/tty` first, so a stdout pty that is not the controlling terminal
+    /// reports the OUTER terminal's size — the fullscreen frame then lays out
+    /// for the wrong height and pushes the editor content row (typed input)
+    /// off-screen. Red/green: pointing `default_query_size` back at
+    /// `crossterm::terminal::size()` fails this assertion under any pty
+    /// harness that did not make the pty the controlling terminal.
+    #[cfg(unix)]
+    #[test]
+    fn default_size_query_reads_stdout_fd_not_dev_tty() {
+        if !io::stdout().is_terminal() {
+            let terminal = ProcessTerminal::with_writer(SharedWriter::default());
+            assert!((terminal.query_size)().is_err());
+            return;
+        }
+        let expected = winsize_of(libc::STDOUT_FILENO).expect("stdout is a tty");
+        assert_eq!(
+            default_query_size().ok(),
+            Some(expected),
+            "the size query must resolve through stdout (fd 1)"
+        );
+    }
+
+    /// `winsize_of` targets the descriptor it is given (the unit under the
+    /// stdout assertion above): a pty pair reports the size set on either end.
+    #[cfg(unix)]
+    #[test]
+    fn winsize_of_reads_the_requested_descriptor() {
+        // SAFETY: plain libc pty setup; every fd is checked and closed below.
+        let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(master >= 0, "posix_openpt failed");
+        assert_eq!(unsafe { libc::grantpt(master) }, 0, "grantpt failed");
+        assert_eq!(unsafe { libc::unlockpt(master) }, 0, "unlockpt failed");
+        let name = unsafe { libc::ptsname(master) };
+        assert!(!name.is_null(), "ptsname failed");
+        let slave = unsafe { libc::open(name, libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(slave >= 0, "open(slave) failed");
+
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        size.ws_col = 91;
+        size.ws_row = 27;
+        let rc = unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &size) };
+        assert_eq!(rc, 0, "TIOCSWINSZ failed");
+
+        assert_eq!(winsize_of(master).ok(), Some((91, 27)), "master end");
+        assert_eq!(winsize_of(slave).ok(), Some((91, 27)), "slave end");
+
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
     }
 
     /// Regression (v0.1.6-rc.5): an injected-writer terminal must not manage

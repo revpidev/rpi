@@ -928,6 +928,9 @@ fn fetch_data(
         session_name: value("getSessionName").and_then(|value| value.as_str().map(str::to_owned)),
         stats,
         live,
+        // The editor preview renders placeholders for missing values; it never
+        // shows the footer's held live values.
+        live_held: Vec::new(),
         git: engine_git,
         now: Some(Utc::now()),
         number_format: fields::NumberFormat::Compact,

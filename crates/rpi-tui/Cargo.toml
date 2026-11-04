@@ -25,3 +25,8 @@ rpi-test-env.workspace = true
 [target.'cfg(windows)'.dependencies]
 # V17-10 #69: ENABLE_VIRTUAL_TERMINAL_INPUT via GetConsoleMode/SetConsoleMode.
 windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# `TIOCGWINSZ` on STDOUT_FILENO for the upstream `process.stdout.columns/rows`
+# size query (crossterm's own `terminal::size()` resolves through `/dev/tty`).
+libc.workspace = true
