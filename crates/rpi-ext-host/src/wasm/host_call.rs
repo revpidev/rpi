@@ -2195,6 +2195,8 @@ mod session_stats_tests {
                 session_file: None,
                 started_at: "2026-10-27T10:00:00Z".to_owned(),
                 entry_count: 9,
+                user_messages: 4,
+                assistant_messages: 5,
                 tokens: SessionTokenStats {
                     input: 10,
                     output: 20,
@@ -2216,6 +2218,8 @@ mod session_stats_tests {
                 "sessionId": "s1",
                 "startedAt": "2026-10-27T10:00:00Z",
                 "entryCount": 9,
+                "userMessages": 4,
+                "assistantMessages": 5,
                 "tokens": {
                     "input": 10,
                     "output": 20,
@@ -2237,6 +2241,8 @@ mod session_stats_tests {
                 session_file: Some("/tmp/s2.jsonl".to_owned()),
                 started_at: "2026-10-27T10:00:00Z".to_owned(),
                 entry_count: 0,
+                user_messages: 0,
+                assistant_messages: 0,
                 tokens: SessionTokenStats::default(),
                 cost: 0.0,
             }),

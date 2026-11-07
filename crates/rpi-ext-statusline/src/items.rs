@@ -2,7 +2,7 @@
 //!
 //! Two modes share the `statusLine` object:
 //! - `type:"command"` keeps the TE12 script contract unchanged;
-//! - `type:"items"` renders the strict 26-field whitelist without starting a
+//! - `type:"items"` renders the strict 29-field whitelist without starting a
 //!   shell.
 //!
 //! The parser canonicalizes aliases, keeps the first occurrence of a
@@ -109,7 +109,8 @@ impl ItemsConfig {
     }
 
     /// Any field that reads the absolute `ctx.sessionStats` snapshot:
-    /// session totals plus `session-duration` (its `startedAt` anchor).
+    /// session totals/counts plus `session-duration` (its `startedAt`
+    /// anchor).
     pub fn needs_session_stats(&self) -> bool {
         self.has_session_total() || self.needs_duration()
     }

@@ -7,7 +7,7 @@
 //!
 //! | capability | events |
 //! |---|---|
-//! | session totals | `turn_end`, `agent_settled` |
+//! | session totals/counts | `turn_end`, `agent_settled` |
 //! | run-state | `agent_start`, `agent_settled` |
 //! | permission-mode | `mode_change` |
 //! | live fields + liveTokens | `message_start`, `message_update`, `message_end` |
@@ -238,6 +238,19 @@ mod tests {
         assert!(totals.contains("agent_settled"));
         assert!(totals.contains("session_compact"));
         assert!(!totals.contains("message_end"));
+
+        for field in [FieldId::TotalTokens, FieldId::TurnCount, FieldId::StepCount] {
+            let desired = desired_events(Some(&items(&[field], false)), false);
+            assert!(desired.contains("turn_end"), "{field:?} adds turn_end");
+            assert!(
+                desired.contains("agent_settled"),
+                "{field:?} adds agent_settled"
+            );
+            assert!(
+                desired.contains("session_compact"),
+                "{field:?} adds session_compact"
+            );
+        }
 
         let run_state = desired_events(Some(&items(&[FieldId::RunState], false)), false);
         assert!(run_state.contains("agent_start"));

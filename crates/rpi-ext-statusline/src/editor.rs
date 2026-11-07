@@ -1230,6 +1230,8 @@ mod tests {
                     session_file: None,
                     started_at: "2026-10-27T10:00:00Z".into(),
                     entry_count: 1,
+                    user_messages: 0,
+                    assistant_messages: 0,
                     tokens: Default::default(),
                     cost: 0.0,
                 }),
@@ -1276,7 +1278,7 @@ mod tests {
         let mut editor = editor();
         // Rows: selected duration, selected live-output, unknown, then the
         // remaining fields in registry order.
-        assert_eq!(editor.rows().len(), 26 + 1);
+        assert_eq!(editor.rows().len(), 29 + 1);
         // Select `model` (cursor at its row).
         let model_row = editor
             .rows()

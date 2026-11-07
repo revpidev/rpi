@@ -92,6 +92,8 @@ fn install_fake_ctx() {
             "sessionId": "s1",
             "startedAt": "2020-01-01T00:00:00Z",
             "entryCount": 4,
+            "userMessages": 2,
+            "assistantMessages": 3,
             "tokens": {"input": 10, "output": 20, "cacheRead": 30, "cacheWrite": 40},
             "cost": 0.0123
         }),
@@ -428,7 +430,7 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
     );
 
     // ── 3. Field selection reconciles the extra subscriptions and renders
-    //        the strict 26-field values (aliases + unknown id skipped).
+    //        the strict 29-field values (aliases + unknown id skipped).
     write_settings(json!({"statusLine": {
         "type": "items",
         "items": [
@@ -436,6 +438,9 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
             "thread-name",
             "context-used",
             "used-tokens",
+            "total-tokens",
+            "turn-count",
+            "step-count",
             "total-input-tokens",
             "cache-read-tokens",
             "cache-write-tokens",
@@ -454,6 +459,12 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
     assert!(text.contains("te52"), "{text:?}");
     assert!(text.contains("Context 6% used"), "{text:?}");
     assert!(text.contains("70"), "used = 10 + 40 + 20: {text:?}");
+    assert!(
+        text.contains("100"),
+        "total = input + output + cacheRead + cacheWrite: {text:?}"
+    );
+    assert!(text.contains("2 turns"), "{text:?}");
+    assert!(text.contains("3 steps"), "{text:?}");
     assert!(
         text.contains("80 in"),
         "input + cacheRead + cacheWrite: {text:?}"

@@ -1,7 +1,7 @@
 {
   "name": "rpi-statusline",
   "version": "0.1.0",
-  "description": "Claude Code-compatible statusline: a script command (CC stdin JSON contract) or declarative items (26 fields incl. tiered token stats, /statusline editor), rendered as footer/widget/status with event-driven and live refresh",
+  "description": "Claude Code-compatible statusline: a script command (CC stdin JSON contract) or declarative items (29 fields incl. session totals, turns/steps and tiered live token stats, /statusline editor), rendered as footer/widget/status with event-driven and live refresh",
   "native": "librpi_ext_statusline.so",
   "capabilities": [
     "commands",

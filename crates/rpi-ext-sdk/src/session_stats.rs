@@ -22,7 +22,9 @@ use crate::interactive_ui::{HostCall, InteractiveUiError};
 /// `ctx.sessionStats` — the additive host-call of ADR-0040.
 pub const METHOD_SESSION_STATS: &str = "ctx.sessionStats";
 
-/// One absolute session snapshot (ADR-0040 frozen shape).
+/// One absolute session snapshot (ADR-0040 frozen shape; the
+/// `user_messages`/`assistant_messages` counts are the 2026-11 additive
+/// extension).
 ///
 /// The native mirror is `rpi_ext_host::types::SessionStatsSnapshot`; the two
 /// serialize byte-identically (same camelCase field names, `sessionFile`
@@ -38,6 +40,12 @@ pub struct SessionStats {
     /// `get_entries().len()` at snapshot time, header excluded and not
     /// branch-filtered.
     pub entry_count: u64,
+    /// Persisted user messages (conversation turns).
+    #[serde(default)]
+    pub user_messages: u64,
+    /// Persisted assistant messages (model outputs/steps).
+    #[serde(default)]
+    pub assistant_messages: u64,
     pub tokens: SessionTokenStats,
     pub cost: f64,
 }
@@ -115,6 +123,8 @@ mod tests {
             "sessionFile": "/tmp/s1.jsonl",
             "startedAt": "2026-10-27T10:00:00Z",
             "entryCount": 12,
+            "userMessages": 4,
+            "assistantMessages": 7,
             "tokens": {
                 "input": 10,
                 "output": 20,
@@ -128,6 +138,8 @@ mod tests {
         assert_eq!(stats.session_file.as_deref(), Some("/tmp/s1.jsonl"));
         assert_eq!(stats.started_at, "2026-10-27T10:00:00Z");
         assert_eq!(stats.entry_count, 12);
+        assert_eq!(stats.user_messages, 4);
+        assert_eq!(stats.assistant_messages, 7);
         assert_eq!(stats.tokens.input, 10);
         assert_eq!(stats.tokens.output, 20);
         assert_eq!(stats.tokens.cache_read, 30);
@@ -145,11 +157,27 @@ mod tests {
             "sessionId": "s2",
             "startedAt": "2026-10-27T10:00:00Z",
             "entryCount": 0,
+            "userMessages": 0,
+            "assistantMessages": 0,
             "tokens": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
             "cost": 0.0
         })));
         let stats = session_stats(&host).expect("snapshot").expect("bound");
         assert!(stats.session_file.is_none());
+    }
+
+    #[test]
+    fn counts_are_additive_for_older_hosts() {
+        let host = host(Ok(json!({
+            "sessionId": "s3",
+            "startedAt": "2026-10-27T10:00:00Z",
+            "entryCount": 5,
+            "tokens": {"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4},
+            "cost": 0.0
+        })));
+        let stats = session_stats(&host).expect("snapshot").expect("bound");
+        assert_eq!(stats.user_messages, 0);
+        assert_eq!(stats.assistant_messages, 0);
     }
 
     #[test]

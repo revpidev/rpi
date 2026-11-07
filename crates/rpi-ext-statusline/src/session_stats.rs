@@ -2,8 +2,9 @@
 //!
 //! The plugin never parses the transcript and never accumulates entries by
 //! message id. `ctx.sessionStats` is the host-authoritative absolute
-//! snapshot: identity, RFC3339 `startedAt`, `entryCount`, the four token
-//! components and cost, all read under one `SessionManager` lock.
+//! snapshot: identity, RFC3339 `startedAt`, `entryCount`, the persisted
+//! user/assistant message counts, the four token components and cost, all
+//! read under one `SessionManager` lock.
 //!
 //! Guards (frozen by ADR-0040):
 //! - every session lifecycle event bumps the session generation, so a reply
@@ -44,6 +45,12 @@ pub struct SessionStats {
     pub started_at: String,
     #[serde(default)]
     pub entry_count: u64,
+    /// Persisted user messages (one per conversation turn).
+    #[serde(default)]
+    pub user_messages: u64,
+    /// Persisted assistant messages (one per model output/step).
+    #[serde(default)]
+    pub assistant_messages: u64,
     #[serde(default)]
     pub tokens: TokenStats,
     #[serde(default)]
@@ -144,9 +151,11 @@ impl SessionStatsCache {
         match &self.snapshot {
             None => "none".to_owned(),
             Some(stats) => format!(
-                "{}|{}|{}|{}|{}|{}|{}|{:?}",
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}",
                 stats.session_id,
                 stats.entry_count,
+                stats.user_messages,
+                stats.assistant_messages,
                 stats.tokens.input,
                 stats.tokens.output,
                 stats.tokens.cache_read,
@@ -168,6 +177,8 @@ mod tests {
             session_file: Some("/sessions/s1.jsonl".into()),
             started_at: "2026-10-27T10:00:00Z".into(),
             entry_count,
+            user_messages: 2,
+            assistant_messages: 3,
             tokens: TokenStats {
                 input: 10,
                 output: 20,
@@ -261,6 +272,8 @@ mod tests {
             "sessionFile": "/sessions/s1.jsonl",
             "startedAt": "2026-10-27T10:00:00Z",
             "entryCount": 12,
+            "userMessages": 4,
+            "assistantMessages": 7,
             "tokens": {"input": 10, "output": 20, "cacheRead": 30, "cacheWrite": 40},
             "cost": 1.25
         }))
@@ -268,6 +281,8 @@ mod tests {
         assert_eq!(parsed.session_id, "s1");
         assert_eq!(parsed.session_file.as_deref(), Some("/sessions/s1.jsonl"));
         assert_eq!(parsed.entry_count, 12);
+        assert_eq!(parsed.user_messages, 4);
+        assert_eq!(parsed.assistant_messages, 7);
         assert_eq!(parsed.tokens.cache_read, 30);
         assert_eq!(parsed.tokens.cache_write, 40);
         assert_eq!(parsed.cost, 1.25);
@@ -281,5 +296,17 @@ mod tests {
         }))
         .expect("in-memory shape");
         assert_eq!(in_memory.session_file, None);
+        // Older hosts predate the count keys: they default to zero instead
+        // of failing the whole snapshot.
+        let legacy: SessionStats = serde_json::from_value(serde_json::json!({
+            "sessionId": "s3",
+            "startedAt": "2026-10-27T10:00:00Z",
+            "entryCount": 5,
+            "tokens": {"input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4},
+            "cost": 0.0
+        }))
+        .expect("legacy shape");
+        assert_eq!(legacy.user_messages, 0);
+        assert_eq!(legacy.assistant_messages, 0);
     }
 }

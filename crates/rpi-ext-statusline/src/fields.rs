@@ -1,4 +1,4 @@
-//! The strict 26-field registry for `statusLine.type:"items"` (TE52 /
+//! The strict 29-field registry for `statusLine.type:"items"` (TE52 /
 //! ADR-0040 R20 §4.2–§4.3).
 //!
 //! One static descriptor table describes every field: its canonical id, an
@@ -8,10 +8,12 @@
 //! never invented).
 //!
 //! Semantics frozen by ADR-0040:
-//! - Session totals come exclusively from the host's absolute
+//! - Session totals and counts come exclusively from the host's absolute
 //!   `ctx.sessionStats()` snapshot; this module only derives display values
 //!   (`used = input + cacheWrite + output`,
-//!   `total-input = input + cacheRead + cacheWrite`, `total-output = output`).
+//!   `total-input = input + cacheRead + cacheWrite`, `total-output = output`,
+//!   `total = input + output + cacheRead + cacheWrite`,
+//!   `turns = userMessages`, `steps = assistantMessages`).
 //! - Context values come from `ctx.getContextUsage()` (the active context),
 //!   not from the session totals.
 //! - Live values come from [`LiveView`]: the provider's exact output usage
@@ -49,7 +51,7 @@ impl NumberFormat {
     }
 }
 
-/// The 26 whitelisted fields, in the canonical registry order.
+/// The 29 whitelisted fields, in the canonical registry order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldId {
     // Model & mode (5)
@@ -67,13 +69,16 @@ pub enum FieldId {
     ContextRemaining,
     ContextWindowSize,
     ContextTokens,
-    // Session & tokens (8)
+    // Session & tokens (11)
     SessionName,
     SessionCost,
     SessionDuration,
     UsedTokens,
     TotalInputTokens,
     TotalOutputTokens,
+    TotalTokens,
+    TurnCount,
+    StepCount,
     CacheReadTokens,
     CacheWriteTokens,
     // Live (6)
@@ -85,8 +90,8 @@ pub enum FieldId {
     LiveToolcallTokens,
 }
 
-/// All 26 fields in registry order.
-pub const ALL_FIELDS: [FieldId; 26] = [
+/// All 29 fields in registry order.
+pub const ALL_FIELDS: [FieldId; 29] = [
     FieldId::Model,
     FieldId::ModelWithReasoning,
     FieldId::Reasoning,
@@ -105,6 +110,9 @@ pub const ALL_FIELDS: [FieldId; 26] = [
     FieldId::UsedTokens,
     FieldId::TotalInputTokens,
     FieldId::TotalOutputTokens,
+    FieldId::TotalTokens,
+    FieldId::TurnCount,
+    FieldId::StepCount,
     FieldId::CacheReadTokens,
     FieldId::CacheWriteTokens,
     FieldId::Streaming,
@@ -137,6 +145,9 @@ impl FieldId {
             Self::UsedTokens => "used-tokens",
             Self::TotalInputTokens => "total-input-tokens",
             Self::TotalOutputTokens => "total-output-tokens",
+            Self::TotalTokens => "total-tokens",
+            Self::TurnCount => "turn-count",
+            Self::StepCount => "step-count",
             Self::CacheReadTokens => "cache-read-tokens",
             Self::CacheWriteTokens => "cache-write-tokens",
             Self::Streaming => "streaming",
@@ -178,7 +189,7 @@ impl FieldId {
         )
     }
 
-    /// Whether the field belongs to the session-totals group.
+    /// Whether the field reads the session snapshot (totals and counts).
     pub const fn is_session_total(self) -> bool {
         matches!(
             self,
@@ -186,6 +197,9 @@ impl FieldId {
                 | Self::UsedTokens
                 | Self::TotalInputTokens
                 | Self::TotalOutputTokens
+                | Self::TotalTokens
+                | Self::TurnCount
+                | Self::StepCount
                 | Self::CacheReadTokens
                 | Self::CacheWriteTokens
         )
@@ -652,6 +666,26 @@ fn raw_value(id: FieldId, data: &FieldData) -> Option<FieldValue> {
                 Tone::Muted,
             ))
         }
+        FieldId::TotalTokens => {
+            let tokens = data.stats.as_ref()?.tokens;
+            let total = tokens
+                .input
+                .saturating_add(tokens.output)
+                .saturating_add(tokens.cache_read)
+                .saturating_add(tokens.cache_write);
+            Some(FieldValue::new(
+                format_tokens(total, data.number_format),
+                Tone::Plain,
+            ))
+        }
+        FieldId::TurnCount => {
+            let turns = data.stats.as_ref()?.user_messages;
+            Some(FieldValue::new(format!("{turns} turns"), Tone::Muted))
+        }
+        FieldId::StepCount => {
+            let steps = data.stats.as_ref()?.assistant_messages;
+            Some(FieldValue::new(format!("{steps} steps"), Tone::Muted))
+        }
         FieldId::CacheReadTokens => {
             let tokens = data.stats.as_ref()?.tokens;
             Some(FieldValue::new(
@@ -966,6 +1000,8 @@ mod tests {
             session_file: None,
             started_at: "2026-10-27T10:00:00Z".into(),
             entry_count: 3,
+            user_messages: 2,
+            assistant_messages: 3,
             tokens: TokenStats {
                 input: 10,
                 output: 20,
@@ -1022,12 +1058,12 @@ mod tests {
     }
 
     #[test]
-    fn registry_is_exactly_26_unique_fields() {
-        assert_eq!(ALL_FIELDS.len(), 26);
+    fn registry_is_exactly_29_unique_fields() {
+        assert_eq!(ALL_FIELDS.len(), 29);
         let mut ids: Vec<&str> = ALL_FIELDS.iter().map(|id| id.id()).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 26);
+        assert_eq!(ids.len(), 29);
         for id in ALL_FIELDS {
             assert_eq!(FieldId::parse(id.id()), Some(id));
         }
@@ -1060,6 +1096,10 @@ mod tests {
             value(FieldId::TotalOutputTokens, &data).unwrap().text,
             "20 out"
         );
+        // input + output + cacheRead + cacheWrite.
+        assert_eq!(value(FieldId::TotalTokens, &data).unwrap().text, "100");
+        assert_eq!(value(FieldId::TurnCount, &data).unwrap().text, "2 turns");
+        assert_eq!(value(FieldId::StepCount, &data).unwrap().text, "3 steps");
         assert_eq!(
             value(FieldId::CacheReadTokens, &data).unwrap().text,
             "30 cache-read"

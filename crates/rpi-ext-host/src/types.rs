@@ -1004,7 +1004,9 @@ pub struct SessionFileInfo {
 /// (RFC3339), and `entryCount` excludes the header without branch
 /// filtering. The four token components are accumulated directly from the
 /// five usage-bearing entry kinds; the raw provider `totalTokens` is never
-/// read or returned.
+/// read or returned. `userMessages` / `assistantMessages` count the
+/// persisted message entries (conversation turns / model outputs) under
+/// the same lock.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStatsSnapshot {
@@ -1013,6 +1015,10 @@ pub struct SessionStatsSnapshot {
     pub session_file: Option<String>,
     pub started_at: String,
     pub entry_count: u64,
+    #[serde(default)]
+    pub user_messages: u64,
+    #[serde(default)]
+    pub assistant_messages: u64,
     pub tokens: SessionTokenStats,
     pub cost: f64,
 }

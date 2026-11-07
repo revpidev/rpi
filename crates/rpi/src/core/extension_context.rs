@@ -7,6 +7,8 @@
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
+use rpi_agent::messages::AgentMessage;
+use rpi_agent::session::SessionEntry;
 use rpi_ext_host::api::{
     CommandContextActions, CompactOptions, ContextActions, ContextUsage, NavigateTreeOptions,
     ReplacedSessionContext, WithSessionFn,
@@ -249,7 +251,9 @@ impl ContextActions for SessionContextActions {
     /// the header and is not branch-filtered; `startedAt` comes from the
     /// session header timestamp; the four token components and cost are
     /// accumulated from the same five usage-bearing entry kinds as the
-    /// built-in footer. The raw provider `totalTokens` is never read.
+    /// built-in footer, and the user/assistant message counts mirror
+    /// `AgentSession::get_session_stats`. The raw provider `totalTokens` is
+    /// never read.
     ///
     /// The snapshot is O(entries) under the session lock (it clones the entry
     /// list to aggregate); callers such as the statusline must refresh at
@@ -261,6 +265,17 @@ impl ContextActions for SessionContextActions {
         let header = manager.get_header()?;
         let entries = manager.get_entries();
         let totals = usage_totals_from_entries(&entries);
+        let mut user_messages = 0u64;
+        let mut assistant_messages = 0u64;
+        for entry in &entries {
+            if let Some(SessionEntry::Message(message_entry)) = entry.known() {
+                match &message_entry.message {
+                    AgentMessage::User(_) => user_messages += 1,
+                    AgentMessage::Assistant(_) => assistant_messages += 1,
+                    _ => {}
+                }
+            }
+        }
         Some(rpi_ext_host::types::SessionStatsSnapshot {
             session_id: manager.get_session_id().to_owned(),
             session_file: manager
@@ -268,6 +283,8 @@ impl ContextActions for SessionContextActions {
                 .map(|path| path.to_string_lossy().into_owned()),
             started_at: header.timestamp.clone(),
             entry_count: entries.len() as u64,
+            user_messages,
+            assistant_messages,
             tokens: rpi_ext_host::types::SessionTokenStats {
                 input: totals.input,
                 output: totals.output,
@@ -562,7 +579,8 @@ mod tests {
     use rpi_agent::messages::AgentMessage;
     use rpi_ai::types::{
         ApiKind, AssistantContent, AssistantMessage, AssistantRole, StopReason, TextContent,
-        ToolResultContent, ToolResultMessage, ToolResultRole, Usage, UsageCost,
+        ToolResultContent, ToolResultMessage, ToolResultRole, Usage, UsageCost, UserContent,
+        UserMessage, UserRole,
     };
 
     use crate::core::agent_session::AgentSession;
@@ -593,6 +611,14 @@ mod tests {
                 total: cost,
             },
         }
+    }
+
+    fn user_message(text: &str) -> AgentMessage {
+        AgentMessage::User(UserMessage {
+            role: UserRole::User,
+            content: UserContent::Text(text.to_owned()),
+            timestamp: 1_700_000_000_000,
+        })
     }
 
     fn assistant_message(usage: Usage) -> AgentMessage {
@@ -664,6 +690,7 @@ mod tests {
         {
             let manager = fixture.session.session_manager();
             let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            manager.append_message(user_message("hello")).expect("user");
             manager
                 .append_message(assistant_message(usage(1, 2, 3, 4, 0.1, 999_999)))
                 .expect("assistant");
@@ -706,7 +733,7 @@ mod tests {
         assert_eq!(stats.session_id, fixture.session.session_id());
         assert_eq!(stats.session_file, None, "in-memory sessions omit the file");
         assert_eq!(stats.started_at, started_at);
-        assert_eq!(stats.entry_count, (base_entries + 5) as u64);
+        assert_eq!(stats.entry_count, (base_entries + 6) as u64);
         assert_eq!(stats.tokens.input, 11_111);
         assert_eq!(stats.tokens.output, 22_222);
         assert_eq!(stats.tokens.cache_read, 33_333);
@@ -722,6 +749,10 @@ mod tests {
         assert_eq!(stats.tokens.cache_read, footer_stats.tokens.cache_read);
         assert_eq!(stats.tokens.cache_write, footer_stats.tokens.cache_write);
         assert_eq!(stats.cost, footer_stats.cost);
+        assert_eq!(stats.user_messages, footer_stats.user_messages);
+        assert_eq!(stats.assistant_messages, footer_stats.assistant_messages);
+        assert_eq!(stats.user_messages, 1, "appended user message");
+        assert_eq!(stats.assistant_messages, 1, "appended assistant message");
     }
 
     /// A fresh session has zeroed components, `entryCount = 0` and the
@@ -743,6 +774,8 @@ mod tests {
         assert_eq!(stats.tokens.cache_read, 0);
         assert_eq!(stats.tokens.cache_write, 0);
         assert_eq!(stats.cost, 0.0);
+        assert_eq!(stats.user_messages, 0);
+        assert_eq!(stats.assistant_messages, 0);
         assert!(stats.session_file.is_none());
         assert!(!stats.started_at.is_empty());
     }

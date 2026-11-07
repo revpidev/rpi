@@ -18,6 +18,8 @@ fn native_snapshot() -> SessionStatsSnapshot {
         session_file: Some("/tmp/s1.jsonl".to_owned()),
         started_at: "2026-10-27T10:00:00Z".to_owned(),
         entry_count: 12,
+        user_messages: 4,
+        assistant_messages: 7,
         tokens: SessionTokenStats {
             input: 10,
             output: 20,
@@ -34,6 +36,8 @@ fn sdk_snapshot() -> SessionStats {
         session_file: Some("/tmp/s1.jsonl".to_owned()),
         started_at: "2026-10-27T10:00:00Z".to_owned(),
         entry_count: 12,
+        user_messages: 4,
+        assistant_messages: 7,
         tokens: rpi_ext_sdk::session_stats::SessionTokenStats {
             input: 10,
             output: 20,
@@ -54,6 +58,8 @@ fn session_stats_wire_shape_is_identical() {
     assert!(native["tokens"].get("total").is_none());
     assert_eq!(native["startedAt"], "2026-10-27T10:00:00Z");
     assert_eq!(native["entryCount"], 12);
+    assert_eq!(native["userMessages"], 4);
+    assert_eq!(native["assistantMessages"], 7);
 }
 
 #[test]

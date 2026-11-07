@@ -560,6 +560,8 @@ mod tests {
             session_file: None,
             started_at: "2026-10-31T00:00:00Z".to_owned(),
             entry_count: 3,
+            user_messages: 1,
+            assistant_messages: 2,
             tokens: crate::types::SessionTokenStats {
                 input: 10,
                 output: 5,
