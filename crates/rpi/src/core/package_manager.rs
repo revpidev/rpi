@@ -62,12 +62,15 @@ use sha2::Digest;
 
 use crate::config;
 use crate::core::deprecated_extensions;
+use crate::core::download::{DownloadEvent, DownloadObserver, NoopDownloadObserver};
 use crate::core::extension_registry::{
     self, ExtensionInstallInfo, ExtensionKind, GithubReleaseSource, IntegrityLevel, RegistryIndex,
     RegistrySource, RegistryTransport,
 };
 use crate::core::git_url::{GitSource, parse_git_url};
-use crate::core::self_update::{parse_sha256_sidecar, sha256_hex};
+use crate::core::self_update::parse_sha256_sidecar;
+#[cfg(test)]
+use crate::core::self_update::sha256_hex;
 use crate::core::settings_manager::{
     PackageSource, PackageSourceFilter, Settings, SettingsManager,
 };
@@ -507,6 +510,80 @@ pub struct ProgressEvent {
 }
 
 type ProgressCallback = Box<dyn Fn(&ProgressEvent) + Send + Sync>;
+
+// ---------------------------------------------------------------------------
+// Two-phase update plan (V18-12 FR-D, rpi-own)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdatePlanAction {
+    Update,
+    UpToDate,
+    /// Local source: present but not managed by `update`.
+    Local,
+    /// Discovered install without a settings entry.
+    Untracked,
+    /// Deliberately skipped (pinned npm, deprecated extension, ...).
+    Skipped,
+    /// Resolution failed; the run continues with the other sources.
+    Error,
+}
+
+/// One resolved update-plan row. `resolved` caches the registry/`github:`
+/// artifact lookup so [`DefaultPackageManager::apply_update_plan`] does not
+/// repeat the index/release request.
+#[derive(Debug, Clone)]
+pub struct UpdatePlanEntry {
+    pub source: String,
+    pub current: Option<String>,
+    pub target: Option<String>,
+    pub kind: &'static str,
+    pub action: UpdatePlanAction,
+    pub note: Option<String>,
+    /// An exact `--version` pin (downgrade/reinstall allowed).
+    pub pinned: bool,
+    scope: SourceScope,
+    npm: Option<NpmUpdateTarget>,
+    git: Option<GitUpdateEntry>,
+    resolved: Option<ResolvedArtifactInstall>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UpdatePlan {
+    pub entries: Vec<UpdatePlanEntry>,
+}
+
+impl UpdatePlan {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let mut updates = 0;
+        let mut up_to_date = 0;
+        let mut skipped = 0;
+        for entry in &self.entries {
+            match entry.action {
+                UpdatePlanAction::Update => updates += 1,
+                UpdatePlanAction::UpToDate => up_to_date += 1,
+                UpdatePlanAction::Local
+                | UpdatePlanAction::Untracked
+                | UpdatePlanAction::Skipped => skipped += 1,
+                UpdatePlanAction::Error => {}
+            }
+        }
+        (updates, up_to_date, skipped)
+    }
+}
+
+/// Result counts for the post-update summary (R3.10.9).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateApplySummary {
+    pub updated: usize,
+    pub up_to_date: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
 
 // ---------------------------------------------------------------------------
 // Package sources (package-manager.ts:127-141, parseSource :1435-1460)
@@ -1110,6 +1187,8 @@ pub struct DefaultPackageManager {
     registry_base_url: Option<String>,
     registry_transport: Arc<dyn RegistryTransport>,
     install_confirm: Option<InstallConfirmCallback>,
+    /// V18-12 FR-B: progress/retry observer shared with the download engine.
+    download_observer: Option<Arc<dyn DownloadObserver>>,
     /// Built-in extension names (`builtin:<name>` resources,
     /// package-manager.ts:825).
     builtin_extensions: Vec<String>,
@@ -1170,6 +1249,7 @@ impl DefaultPackageManager {
             registry_base_url,
             registry_transport,
             install_confirm: None,
+            download_observer: None,
             builtin_extensions: options.builtin_extensions,
         }
     }
@@ -1177,6 +1257,39 @@ impl DefaultPackageManager {
     /// `setProgressCallback` (package-manager.ts:809-811).
     pub fn set_progress_callback(&mut self, callback: Option<ProgressCallback>) {
         self.progress = callback;
+    }
+
+    /// V18-12 FR-B: attach the CLI progress renderer to artifact
+    /// downloads. `None` keeps the no-op observer.
+    pub fn set_download_observer(&mut self, observer: Option<Arc<dyn DownloadObserver>>) {
+        self.download_observer = observer;
+    }
+
+    fn download_observer(&self) -> &dyn DownloadObserver {
+        self.download_observer
+            .as_deref()
+            .unwrap_or(&NoopDownloadObserver)
+    }
+
+    /// Download staging root (resumable `.part` files live here, separate
+    /// from installed extension directories).
+    fn download_staging_dir(&self) -> PathBuf {
+        self.agent_dir.join("tmp").join("downloads")
+    }
+
+    /// Read a verified download into memory and remove the staging file.
+    fn take_downloaded(
+        &self,
+        outcome: crate::core::download::DownloadOutcome,
+    ) -> Result<Vec<u8>, String> {
+        let bytes = std::fs::read(&outcome.path).map_err(|error| {
+            format!(
+                "Could not read the downloaded artifact {}: {error}",
+                outcome.path.display()
+            )
+        })?;
+        let _ = std::fs::remove_file(&outcome.path);
+        Ok(bytes)
     }
 
     /// Rpi-specific (extension-distribution design §7.2 step 5): the
@@ -2370,6 +2483,32 @@ impl DefaultPackageManager {
         ))
     }
 
+    /// V18-12 FR-H: resolve an exact `github:` version as a tag, trying
+    /// the release convention `v<ver>` first and the bare `<ver>` second.
+    /// Any 404/ABI/minHost/yanked error from the winning tag is returned
+    /// unchanged (no fallback to another version).
+    fn resolve_github_exact(
+        &self,
+        source: &GithubReleaseSource,
+        exact: &str,
+    ) -> Result<(ResolvedArtifactInstall, String), String> {
+        let mut last_error: Option<String> = None;
+        for tag in [format!("v{exact}"), exact.to_string()] {
+            let mut candidate = source.clone();
+            candidate.tag = Some(tag);
+            match self.resolve_github_install(&candidate) {
+                Ok(resolved) => return Ok(resolved),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            format!(
+                "Could not resolve github:{}/{} at version {exact}",
+                source.owner, source.repo
+            )
+        }))
+    }
+
     /// The install-info table (design §7.2 step 5): name / version /
     /// author / capabilities in full, plus kind and integrity level; L0
     /// gets the prominent trust warning (pi-mcp-adapter R8).
@@ -2432,9 +2571,13 @@ impl DefaultPackageManager {
                 }
             }
             None => Err(format!(
-                "\"{}\" is a native (L0) extension and needs explicit confirmation; re-run \
-                 with --yes or from an interactive terminal",
-                info.name
+                "\"{}\" is a native (L0) extension and needs explicit confirmation. Re-run \
+                 with --yes (for example: {APP_NAME} update {} --yes, or {APP_NAME} install {} --yes) \
+                 or from an interactive terminal",
+                info.name,
+                info.name,
+                info.name,
+                APP_NAME = config::APP_NAME,
             )),
         }
     }
@@ -2454,27 +2597,29 @@ impl DefaultPackageManager {
             .index_sha256
             .as_deref()
             .ok_or_else(|| "registry install without an index sha256".to_string())?;
-        let (_url, bytes) = extension_registry::download_with_fallback(
+        let file_name = format!("{}-{}.rpix", resolved.info.name, resolved.info.version);
+        let (_url, outcome) = extension_registry::download_with_fallback_observed(
             self.registry_transport.as_ref(),
             &resolved.download_urls,
-            extension_registry::RPIX_DOWNLOAD_TIMEOUT,
+            &self.download_staging_dir(),
+            &file_name,
+            &resolved.info.version,
+            Some(expected),
+            self.download_observer(),
         )
         .map_err(|error| {
             format!(
-                "Could not download {} {}: {error}. The release artifact may have been pulled \
+                "Could not download {} {}: {}. The release artifact may have been pulled \
                  by its author",
-                resolved.info.name, resolved.info.version
+                resolved.info.name, resolved.info.version, error.message
             )
         })?;
-        let actual = sha256_hex(&bytes);
-        if actual != expected {
-            return Err(format!(
-                "Integrity check failed for {} {}: expected sha256 {expected}, got {actual}. \
-                 The download was discarded.",
-                resolved.info.name, resolved.info.version
-            ));
-        }
+        let bytes = self.take_downloaded(outcome)?;
         let root = self.get_registry_install_root(scope)?;
+        self.download_observer()
+            .on_download_event(&DownloadEvent::Installing {
+                target: root.join(&resolved.info.name),
+            });
         extension_registry::materialize_rpix(
             &bytes,
             &root,
@@ -2494,29 +2639,43 @@ impl DefaultPackageManager {
         scope: SourceScope,
         source_string: &str,
     ) -> Result<(), String> {
-        let (_url, bytes) = extension_registry::download_with_fallback(
+        let staging = self.download_staging_dir();
+        let artifact_name = format!("{}-{}.rpix", resolved.info.name, resolved.info.version);
+        let (_url, outcome) = extension_registry::download_with_fallback_observed(
             self.registry_transport.as_ref(),
             &resolved.download_urls,
-            extension_registry::RPIX_DOWNLOAD_TIMEOUT,
+            &staging,
+            &artifact_name,
+            &resolved.info.version,
+            None,
+            self.download_observer(),
         )
         .map_err(|error| {
             format!(
-                "Could not download {} {}: {error}",
-                resolved.info.name, resolved.info.version
+                "Could not download {} {}: {}",
+                resolved.info.name, resolved.info.version, error.message
             )
         })?;
-        let (_url, sidecar) = extension_registry::download_with_fallback(
+        let actual = outcome.sha256.clone();
+        let bytes = self.take_downloaded(outcome)?;
+        let sidecar_name = format!("{artifact_name}.sha256");
+        let (_url, sidecar_outcome) = extension_registry::download_with_fallback_observed(
             self.registry_transport.as_ref(),
             &resolved.sidecar_urls,
-            extension_registry::REGISTRY_REQUEST_TIMEOUT,
+            &staging,
+            &sidecar_name,
+            &resolved.info.version,
+            None,
+            self.download_observer(),
         )
         .map_err(|error| {
             format!(
-                "Could not fetch the sha256 sidecar for {}: {error}. Without it the download \
+                "Could not fetch the sha256 sidecar for {}: {}. Without it the download \
                  cannot be verified; aborting",
-                resolved.download_urls[0]
+                resolved.download_urls[0], error.message
             )
         })?;
+        let sidecar = self.take_downloaded(sidecar_outcome)?;
         let expected =
             parse_sha256_sidecar(&String::from_utf8_lossy(&sidecar)).ok_or_else(|| {
                 format!(
@@ -2524,8 +2683,7 @@ impl DefaultPackageManager {
                     resolved.info.name
                 )
             })?;
-        let actual = sha256_hex(&bytes);
-        if actual != expected {
+        if !actual.eq_ignore_ascii_case(&expected) {
             return Err(format!(
                 "Integrity check failed for {} {}: expected sha256 {expected}, got {actual}. \
                  The download was discarded.",
@@ -2575,6 +2733,10 @@ impl DefaultPackageManager {
             extracted.cleanup();
             return Err(error);
         }
+        self.download_observer()
+            .on_download_event(&DownloadEvent::Installing {
+                target: root.join(&resolved.info.name),
+            });
         extension_registry::activate_rpix(
             extracted,
             &root,
@@ -2684,11 +2846,18 @@ impl DefaultPackageManager {
         scope: SourceScope,
         untracked: bool,
         channel: UpdateChannel,
+        exact_version: Option<&str>,
     ) -> Result<(), String> {
         match parse_source(source) {
             ParsedSource::Registry(registry) => {
-                let resolved = match self.resolve_registry_install_with_channel(&registry, channel)
-                {
+                let exact_registry = exact_version.map(|exact| RegistrySource {
+                    name: registry.name.clone(),
+                    range: Some(exact.to_string()),
+                });
+                let resolved = match self.resolve_registry_install_with_channel(
+                    exact_registry.as_ref().unwrap_or(&registry),
+                    channel,
+                ) {
                     Ok(resolved) => resolved,
                     Err(error) if untracked && Self::is_registry_not_found(&error) => {
                         self.emit_progress(&ProgressEvent {
@@ -2733,9 +2902,11 @@ impl DefaultPackageManager {
                     .ok()
                     .map(|root| root.join(&resolved.info.name))
                     .and_then(|dir| extension_registry::installed_extension_version(&dir));
-                if installed.as_deref().is_some_and(|installed| {
-                    !is_newer_package_version(&resolved.info.version, installed)
-                }) {
+                if exact_version.is_none()
+                    && installed.as_deref().is_some_and(|installed| {
+                        !is_newer_package_version(&resolved.info.version, installed)
+                    })
+                {
                     self.emit_progress(&ProgressEvent {
                         kind: ProgressKind::Start,
                         action: ProgressAction::Update,
@@ -2755,14 +2926,20 @@ impl DefaultPackageManager {
                 )
             }
             ParsedSource::GithubRelease(github) => {
-                let (resolved, _tag) = self.resolve_github_install(&github)?;
+                let (resolved, _tag) = match exact_version {
+                    Some(exact) => self.resolve_github_exact(&github, exact)?,
+                    None => self.resolve_github_install(&github)?,
+                };
                 let installed = self
                     .find_github_install_dir(&github, scope)
                     .and_then(|dir| extension_registry::installed_extension_version(&dir));
-                // Same no-downgrade rule as the registry arm (R6.1.3).
-                if installed.as_deref().is_some_and(|installed| {
-                    !is_newer_package_version(&resolved.info.version, installed)
-                }) {
+                // Same no-downgrade rule as the registry arm (R6.1.3),
+                // except an explicit --version pin.
+                if exact_version.is_none()
+                    && installed.as_deref().is_some_and(|installed| {
+                        !is_newer_package_version(&resolved.info.version, installed)
+                    })
+                {
                     self.emit_progress(&ProgressEvent {
                         kind: ProgressKind::Start,
                         action: ProgressAction::Update,
@@ -3026,30 +3203,34 @@ impl DefaultPackageManager {
     // Update orchestration (package-manager.ts:1048-1238, 1385-1416)
     // -------------------------------------------------------------------
 
-    /// `update` (package-manager.ts:1048-1078): update every configured
-    /// package, or only the one whose identity matches `source`.
-    ///
-    /// Rpi-specific (extension-distribution design §3.3, loader parity):
-    /// the extension loader discovers *every* manifest-carrying directory
-    /// under the registry install roots, regardless of settings. A full
-    /// update (`rpi update --extensions`) therefore also re-resolves
-    /// installed-but-untracked extensions (older installs, hand-copied
-    /// dev builds, orphaned `github:` directories); a single-source
-    /// update matches them by identity too.
-    pub fn update(&self, source: Option<&str>) -> Result<(), String> {
-        self.update_with_channel(source, UpdateChannel::Stable)
+    /// V18-12 FR-H: npm/git/local sources keep their native `@version`/
+    /// `@ref` grammar; `--version` is only meaningful for registry and
+    /// `github:` sources whose target is resolved by the host.
+    pub fn exact_version_source_error(source: &str) -> Option<String> {
+        match parse_source(source) {
+            ParsedSource::Registry(_) | ParsedSource::GithubRelease(_) => None,
+            ParsedSource::Npm(_) => Some(format!(
+                "The npm source \"{source}\" already pins versions with @<version>; use \
+                 \"rpi update {source_without_version}@<version>\" instead of --version",
+                source_without_version = source.split('@').next().unwrap_or(source)
+            )),
+            ParsedSource::Git(_) => Some(format!(
+                "The git source \"{source}\" already pins refs with @<ref>; use \
+                 \"rpi update {source}@<ref>\" instead of --version"
+            )),
+            ParsedSource::Local(_) => Some(format!(
+                "Local sources have no versions; \"{source}\" cannot be pinned with --version"
+            )),
+        }
     }
 
-    /// [`Self::update`] 带 V14-19 更新通道（rpi 自有，无上游对照）：
-    /// [`UpdateChannel::PreRelease`]（`rpi update --extensions --rc`）让
-    /// 预发布版本参与 registry 最高版本竞选；缺省 [`UpdateChannel::Stable`]
-    /// 与旧行为一致（预发布被 [`extension_registry::select_registry_version`]
-    /// 过滤）。`github:`/npm/git 源不感知通道（R6.3.4）。
-    pub fn update_with_channel(
+    /// Shared source collection for `update` and the V18-12 two-phase
+    /// plan: configured packages (global first), matching the requested
+    /// identity, plus untracked registry/`github:` installs.
+    fn collect_update_sources(
         &self,
         source: Option<&str>,
-        channel: UpdateChannel,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<ConfiguredUpdateSource>, String> {
         let global_settings = self.settings_manager.get_global_settings();
         let project_settings = self.settings_manager.get_project_settings();
         let identity = source.map(|source| self.get_package_identity(source, None));
@@ -3102,8 +3283,323 @@ impl DefaultPackageManager {
             configured.extend(Self::packages_of(&project_settings));
             return Err(self.build_no_matching_package_message(source, &configured));
         }
+        Ok(update_sources)
+    }
 
-        self.update_configured_sources(&update_sources, channel)
+    /// `update` (package-manager.ts:1048-1078): update every configured
+    /// package, or only the one whose identity matches `source`.
+    ///
+    /// Rpi-specific (extension-distribution design §3.3, loader parity):
+    /// the extension loader discovers *every* manifest-carrying directory
+    /// under the registry install roots, regardless of settings. A full
+    /// update (`rpi update --extensions`) therefore also re-resolves
+    /// installed-but-untracked extensions (older installs, hand-copied
+    /// dev builds, orphaned `github:` directories); a single-source
+    /// update matches them by identity too.
+    pub fn update(&self, source: Option<&str>) -> Result<(), String> {
+        self.update_with_channel(source, UpdateChannel::Stable)
+    }
+
+    /// [`Self::update`] 带 V14-19 更新通道（rpi 自有，无上游对照）：
+    /// [`UpdateChannel::PreRelease`]（`rpi update --extensions --rc`）让
+    /// 预发布版本参与 registry 最高版本竞选；缺省 [`UpdateChannel::Stable`]
+    /// 与旧行为一致（预发布被 [`extension_registry::select_registry_version`]
+    /// 过滤）。`github:`/npm/git 源不感知通道（R6.3.4）。
+    pub fn update_with_channel(
+        &self,
+        source: Option<&str>,
+        channel: UpdateChannel,
+    ) -> Result<(), String> {
+        self.update_with_channel_exact(source, channel, None)
+    }
+
+    /// V18-12 FR-H: update with an optional exact version pin (single
+    /// source only; the CLI enforces the arity/conflict rules).
+    pub fn update_with_channel_exact(
+        &self,
+        source: Option<&str>,
+        channel: UpdateChannel,
+        exact_version: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(exact) = exact_version {
+            if let Some(source) = source
+                && let Some(error) = Self::exact_version_source_error(source)
+            {
+                return Err(error);
+            }
+            let _ = exact;
+        }
+        let update_sources = self.collect_update_sources(source)?;
+        self.update_configured_sources(&update_sources, channel, exact_version)
+    }
+
+    /// V18-12 FR-D: resolve every source into a plan row before any
+    /// download or confirmation. Per-source resolution failures become
+    /// `Error` rows so the remaining sources still run.
+    pub fn plan_updates(
+        &self,
+        source: Option<&str>,
+        channel: UpdateChannel,
+        exact_version: Option<&str>,
+    ) -> Result<UpdatePlan, String> {
+        let update_sources = self.collect_update_sources(source)?;
+        let mut plan = UpdatePlan::default();
+        if self.offline || update_sources.is_empty() {
+            return Ok(plan);
+        }
+        for entry in update_sources {
+            if let Some((extension, removal_source)) = self.deprecated_update_source(&entry) {
+                plan.entries.push(UpdatePlanEntry {
+                    source: entry.source.clone(),
+                    current: None,
+                    target: None,
+                    kind: "deprecated",
+                    action: UpdatePlanAction::Skipped,
+                    note: Some(deprecated_extensions::update_skip_message(
+                        extension,
+                        &entry.source,
+                        &removal_source,
+                        entry.scope == SourceScope::Project,
+                    )),
+                    pinned: false,
+                    scope: entry.scope,
+                    npm: None,
+                    git: None,
+                    resolved: None,
+                });
+                continue;
+            }
+            let mut row = UpdatePlanEntry {
+                source: entry.source.clone(),
+                current: None,
+                target: None,
+                kind: "unknown",
+                action: UpdatePlanAction::Skipped,
+                note: None,
+                pinned: exact_version.is_some(),
+                scope: entry.scope,
+                npm: None,
+                git: None,
+                resolved: None,
+            };
+            match parse_source(&entry.source) {
+                ParsedSource::Npm(parsed) if parsed.pinned => {
+                    row.kind = "npm";
+                    row.action = UpdatePlanAction::Skipped;
+                    row.current = self
+                        .get_managed_npm_install_path(&parsed, entry.scope)
+                        .ok()
+                        .and_then(|path| self.get_installed_npm_version(&path));
+                    row.note = Some(format!(
+                        "pinned npm version ({}) is not changed by update",
+                        parsed.version.as_deref().unwrap_or(&parsed.spec)
+                    ));
+                }
+                ParsedSource::Npm(parsed) => {
+                    row.kind = "npm";
+                    let path = self.get_managed_npm_install_path(&parsed, entry.scope).ok();
+                    row.current = path
+                        .as_deref()
+                        .and_then(|path| self.get_installed_npm_version(path));
+                    match self.get_latest_npm_version(&parsed.name, parsed.range.as_deref()) {
+                        Ok(target) => {
+                            row.target = Some(target.clone());
+                            row.action = if row.current.as_deref() == Some(target.as_str()) {
+                                UpdatePlanAction::UpToDate
+                            } else {
+                                UpdatePlanAction::Update
+                            };
+                        }
+                        Err(error) => {
+                            row.action = UpdatePlanAction::Error;
+                            row.note = Some(error);
+                        }
+                    }
+                    row.npm = Some(NpmUpdateTarget {
+                        source: entry.source.clone(),
+                        scope: entry.scope,
+                        parsed,
+                    });
+                }
+                ParsedSource::Git(parsed) => {
+                    row.kind = "git";
+                    row.current = self
+                        .get_git_install_path(&parsed, entry.scope)
+                        .ok()
+                        .and_then(|path| extension_registry::installed_extension_version(&path));
+                    row.target = parsed.ref_.clone().or_else(|| Some("latest".to_string()));
+                    row.action = UpdatePlanAction::Update;
+                    row.git = Some(GitUpdateEntry {
+                        source: entry.source.clone(),
+                        scope: entry.scope,
+                        parsed,
+                    });
+                }
+                ParsedSource::Registry(registry) => {
+                    row.kind = "registry";
+                    let exact_registry = exact_version.map(|exact| RegistrySource {
+                        name: registry.name.clone(),
+                        range: Some(exact.to_string()),
+                    });
+                    match self.resolve_registry_install_with_channel(
+                        exact_registry.as_ref().unwrap_or(&registry),
+                        channel,
+                    ) {
+                        Ok(resolved) => {
+                            row.current = self
+                                .get_registry_install_root(entry.scope)
+                                .ok()
+                                .map(|root| root.join(&resolved.info.name))
+                                .and_then(|dir| {
+                                    extension_registry::installed_extension_version(&dir)
+                                });
+                            row.target = Some(resolved.info.version.clone());
+                            row.action = if exact_version.is_some()
+                                || row.current.as_deref().is_none_or(|current| {
+                                    is_newer_package_version(&resolved.info.version, current)
+                                }) {
+                                UpdatePlanAction::Update
+                            } else {
+                                UpdatePlanAction::UpToDate
+                            };
+                            row.resolved = Some(resolved);
+                        }
+                        Err(error) if !entry.tracked && Self::is_registry_not_found(&error) => {
+                            row.action = UpdatePlanAction::Untracked;
+                            row.note = Some(format!(
+                                "not in the registry (untracked install; use \"{APP_NAME} install {}\" \
+                                 or remove the directory to manage it)",
+                                entry.source,
+                                APP_NAME = config::APP_NAME,
+                            ));
+                        }
+                        Err(error) => {
+                            row.action = UpdatePlanAction::Error;
+                            row.note = Some(error);
+                        }
+                    }
+                }
+                ParsedSource::GithubRelease(github) => {
+                    row.kind = "github";
+                    let resolved = match exact_version {
+                        Some(exact) => self.resolve_github_exact(&github, exact),
+                        None => self.resolve_github_install(&github),
+                    };
+                    match resolved {
+                        Ok((resolved, _tag)) => {
+                            row.current =
+                                self.find_github_install_dir(&github, entry.scope).and_then(
+                                    |dir| extension_registry::installed_extension_version(&dir),
+                                );
+                            row.target = Some(resolved.info.version.clone());
+                            row.action = if exact_version.is_some()
+                                || row.current.as_deref().is_none_or(|current| {
+                                    is_newer_package_version(&resolved.info.version, current)
+                                }) {
+                                UpdatePlanAction::Update
+                            } else {
+                                UpdatePlanAction::UpToDate
+                            };
+                            row.resolved = Some(resolved);
+                        }
+                        Err(error) => {
+                            row.action = UpdatePlanAction::Error;
+                            row.note = Some(error);
+                        }
+                    }
+                }
+                ParsedSource::Local(_) => {
+                    row.kind = "local";
+                    row.action = UpdatePlanAction::Local;
+                    row.note = Some("local (not managed by update)".to_string());
+                }
+            }
+            plan.entries.push(row);
+        }
+        Ok(plan)
+    }
+
+    /// V18-12 FR-D: execute a plan produced by [`Self::plan_updates`].
+    /// Registry/`github:` rows reuse the cached resolution; npm/git rows
+    /// still go through the command runner. One failing source does not
+    /// stop the rest; the first error is returned after the loop.
+    pub fn apply_update_plan(&self, plan: &UpdatePlan) -> (UpdateApplySummary, Option<String>) {
+        let mut summary = UpdateApplySummary::default();
+        let mut first_error: Option<String> = None;
+        for entry in &plan.entries {
+            match entry.action {
+                UpdatePlanAction::UpToDate => summary.up_to_date += 1,
+                UpdatePlanAction::Local
+                | UpdatePlanAction::Untracked
+                | UpdatePlanAction::Skipped => summary.skipped += 1,
+                UpdatePlanAction::Error => {
+                    summary.failed += 1;
+                    if first_error.is_none() {
+                        first_error = entry
+                            .note
+                            .clone()
+                            .or_else(|| Some(format!("Could not update {}", entry.source)));
+                    }
+                }
+                UpdatePlanAction::Update => {
+                    let result = if let Some(npm) = &entry.npm {
+                        let spec = match &npm.parsed.version {
+                            Some(_) => npm.parsed.spec.clone(),
+                            None => format!("{}@latest", npm.parsed.name),
+                        };
+                        self.with_progress(
+                            ProgressAction::Update,
+                            &entry.source,
+                            &format!("Updating {}...", entry.source),
+                            || self.install_npm_batch(&[spec], npm.scope),
+                        )
+                    } else if let Some(git) = &entry.git {
+                        self.with_progress(
+                            ProgressAction::Update,
+                            &entry.source,
+                            &format!("Updating {}...", entry.source),
+                            || self.update_git(&git.parsed, git.scope),
+                        )
+                    } else if let Some(resolved) = &entry.resolved {
+                        match parse_source(&entry.source) {
+                            ParsedSource::GithubRelease(_) => self.with_progress(
+                                ProgressAction::Update,
+                                &entry.source,
+                                &format!("Updating {}...", entry.source),
+                                || self.run_github_install(resolved, entry.scope, &entry.source),
+                            ),
+                            _ => self.with_progress(
+                                ProgressAction::Update,
+                                &entry.source,
+                                &format!("Updating {}...", entry.source),
+                                || self.run_registry_install(resolved, entry.scope),
+                            ),
+                        }
+                    } else {
+                        Err(format!(
+                            "No resolved artifact for update plan row {}",
+                            entry.source
+                        ))
+                    };
+                    match result {
+                        Ok(()) => summary.updated += 1,
+                        Err(error) => {
+                            summary.failed += 1;
+                            self.emit_progress(&ProgressEvent {
+                                kind: ProgressKind::Error,
+                                action: ProgressAction::Update,
+                                source: entry.source.clone(),
+                                message: Some(error.clone()),
+                            });
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (summary, first_error)
     }
 
     /// Installed-but-untracked extension sources (rpi-specific; design
@@ -3223,6 +3719,7 @@ impl DefaultPackageManager {
         &self,
         sources: &[ConfiguredUpdateSource],
         channel: UpdateChannel,
+        exact_version: Option<&str>,
     ) -> Result<(), String> {
         if self.offline || sources.is_empty() {
             return Ok(());
@@ -3354,6 +3851,7 @@ impl DefaultPackageManager {
                             entry.scope,
                             !entry.tracked,
                             channel,
+                            exact_version,
                         ) && first_error.is_none()
                         {
                             first_error = Some(error);
@@ -8525,6 +9023,92 @@ mod registry_tests {
         );
     }
 
+    /// V18-12 FR-H: an exact `--version` overrides the source range and
+    /// the up-only rule, allowing an RC install and a downgrade while
+    /// still running the ABI/minHost precheck and leaving settings alone.
+    #[test]
+    fn test_update_exact_version_overrides_range_and_allows_downgrade() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let target = config::build_target().unwrap();
+        let name = "ext-exact";
+        let stable = "0.1.9";
+        let rc = "0.2.0-rc.1";
+        let stable_archive = build_rpix(name, stable, true, &[]);
+        let rc_archive = build_rpix(name, rc, true, &[]);
+        let artifact = |version: &str, archive: &[u8]| {
+            serde_json::json!({
+                "version": version,
+                "rpiAbi": 1,
+                "capabilities": ["tools"],
+                "artifacts": [{
+                    "target": target,
+                    "file": format!("{name}-{version}-{target}.rpix"),
+                    "sha256": sha256_hex(archive),
+                    "release": format!("v{version}"),
+                }]
+            })
+        };
+        let index = serde_json::json!({
+            "schemaVersion": 1,
+            "name": name,
+            "repository": format!("acme/{name}"),
+            "author": "acme",
+            "kind": "native",
+            "versions": [artifact(stable, &stable_archive), artifact(rc, &rc_archive)]
+        })
+        .to_string();
+        transport.insert(
+            &extension_registry::registry_index_url(REGISTRY_BASE, name),
+            index.into_bytes(),
+        );
+        for (version, archive) in [(stable, stable_archive), (rc, rc_archive)] {
+            let file = format!("{name}-{version}-{target}.rpix");
+            let url = extension_registry::github_download_url(
+                "acme",
+                name,
+                &format!("v{version}"),
+                &file,
+            );
+            transport.insert(&url, archive);
+        }
+
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist(name, false).unwrap();
+        let installed = || {
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join(format!("extensions/{name}")),
+            )
+        };
+        assert_eq!(installed().as_deref(), Some(stable));
+        let before_settings = settings_packages(&dirs);
+
+        // Stable source range `*`, but the exact pin installs the RC.
+        manager
+            .update_with_channel_exact(Some(name), UpdateChannel::Stable, Some(rc))
+            .unwrap();
+        assert_eq!(installed().as_deref(), Some(rc));
+        // Settings ranges are never rewritten by a one-shot pin.
+        assert_eq!(settings_packages(&dirs), before_settings);
+
+        // And the exact pin may downgrade back to stable.
+        manager
+            .update_with_channel_exact(Some(name), UpdateChannel::Stable, Some(stable))
+            .unwrap();
+        assert_eq!(installed().as_deref(), Some(stable));
+    }
+
+    #[test]
+    fn test_exact_version_rejects_npm_git_and_local_sources() {
+        for source in ["npm:foo", "git:https://example.test/x.git", "./local-ext"] {
+            let error = DefaultPackageManager::exact_version_source_error(source)
+                .unwrap_or_else(|| panic!("{source} must reject --version"));
+            assert!(error.contains("--version"), "{source}: {error}");
+        }
+        assert!(DefaultPackageManager::exact_version_source_error("subagents").is_none());
+        assert!(DefaultPackageManager::exact_version_source_error("github:acme/tools").is_none());
+    }
+
     /// V14-19 增补（R6.7，`rpi install <name> --rc`，2026-09-12 用户拍板）：
     /// 安装通道选择器——rc 窗口安装尚无 stable 版本的第一方插件
     /// （rpi-ask-user-question 的 registry 索引在 0.1.4 stable 前只有
@@ -8943,6 +9527,142 @@ mod registry_tests {
             Some("0.2.0"),
             "a failing tracked extension must not block the others"
         );
+    }
+
+    /// V18-12 FR-D: plan rows are resolved before any download; apply
+    /// reuses the cached resolution and summarizes counts. A failing
+    /// source becomes an Error row and the rest still updates.
+    #[test]
+    fn test_plan_updates_reports_actions_and_apply_summary() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-a", "0.1.0", true);
+        serve_registry_extension(&transport, "ext-b", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("ext-a", false).unwrap();
+        manager.install_and_persist("ext-b", false).unwrap();
+
+        // ext-a moves to 0.2.0, ext-b stays current.
+        serve_registry_extension(&transport, "ext-a", "0.2.0", true);
+        let plan = manager
+            .plan_updates(None, UpdateChannel::Stable, None)
+            .unwrap();
+        let row = |source: &str| {
+            plan.entries
+                .iter()
+                .find(|entry| entry.source == source)
+                .unwrap()
+        };
+        assert_eq!(row("ext-a").action, UpdatePlanAction::Update);
+        assert_eq!(row("ext-a").current.as_deref(), Some("0.1.0"));
+        assert_eq!(row("ext-a").target.as_deref(), Some("0.2.0"));
+        assert_eq!(row("ext-b").action, UpdatePlanAction::UpToDate);
+        assert_eq!(plan.counts(), (1, 1, 0));
+
+        let (summary, error) = manager.apply_update_plan(&plan);
+        assert_eq!(error, None);
+        assert_eq!(summary.updated, 1);
+        assert_eq!(summary.up_to_date, 1);
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-a")
+            )
+            .as_deref(),
+            Some("0.2.0")
+        );
+
+        // ext-b disappears from the registry: the plan records the error
+        // and apply still moves ext-a forward (publish 0.3.0).
+        transport.remove(&extension_registry::registry_index_url(
+            REGISTRY_BASE,
+            "ext-b",
+        ));
+        serve_registry_extension(&transport, "ext-a", "0.3.0", true);
+        let plan = manager
+            .plan_updates(None, UpdateChannel::Stable, None)
+            .unwrap();
+        assert_eq!(
+            plan.entries
+                .iter()
+                .find(|entry| entry.source == "ext-b")
+                .map(|entry| entry.action),
+            Some(UpdatePlanAction::Error)
+        );
+        let (summary, error) = manager.apply_update_plan(&plan);
+        assert!(error.unwrap().contains("ext-b"));
+        assert_eq!(summary.updated, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-a")
+            )
+            .as_deref(),
+            Some("0.3.0")
+        );
+    }
+
+    /// V18-12 FR-H: `github:` exact versions are resolved as tags,
+    /// preferring the release convention `v<ver>`.
+    #[test]
+    fn test_plan_and_apply_github_exact_tag() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let name = "gh-exact";
+        let version = "0.2.0-rc.1";
+        let archive = build_rpix(name, version, true, &[]);
+        let target = config::build_target().unwrap();
+        let file = format!("{name}-{version}-{target}.rpix");
+        let tag = format!("v{version}");
+        let download = extension_registry::github_download_url("acme", name, &tag, &file);
+        let release = serde_json::json!({
+            "tag_name": tag,
+            "assets": [{"name": file}],
+        })
+        .to_string();
+        transport.insert(
+            &extension_registry::github_release_api_url("acme", name, Some(&tag)),
+            release.into_bytes(),
+        );
+        transport.insert(&download, archive.clone());
+        transport.insert(
+            &format!("{download}.sha256"),
+            format!("{}  {file}\n", sha256_hex(&archive)).into_bytes(),
+        );
+
+        let source = format!("github:acme/{name}");
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.settings_manager.set_packages(vec![
+            crate::core::settings_manager::PackageSource::Source(source.clone()),
+        ]);
+        let plan = manager
+            .plan_updates(Some(&source), UpdateChannel::Stable, Some(version))
+            .unwrap();
+        let row = &plan.entries[0];
+        assert_eq!(row.action, UpdatePlanAction::Update);
+        assert!(row.pinned);
+        assert_eq!(row.target.as_deref(), Some(version));
+        let (summary, error) = manager.apply_update_plan(&plan);
+        assert_eq!(error, None);
+        assert_eq!(summary.updated, 1);
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join(format!("extensions/{name}"))
+            )
+            .as_deref(),
+            Some(version)
+        );
+    }
+
+    #[test]
+    fn test_plan_updates_is_empty_when_offline() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-a", "0.1.0", true);
+        let manager = registry_manager(&dirs, transport, Some(Box::new(|_| true)), true, true);
+        let plan = manager
+            .plan_updates(None, UpdateChannel::Stable, None)
+            .unwrap();
+        assert!(plan.is_empty());
     }
 
     #[test]

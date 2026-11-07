@@ -24,6 +24,11 @@ use crate::config::{
     APP_NAME, InstallManifest, SELF_UPDATE_DOWNLOAD_URL, VERSION, build_target,
     write_install_manifest_for,
 };
+use crate::core::download::{
+    DownloadAssetKind, DownloadError, DownloadHttpRequest, DownloadObserver, DownloadPolicy,
+    DownloadSpec, DownloadStreamEvent, DownloadTransport, Downloader, NoopDownloadObserver,
+    ReqwestDownloadTransport,
+};
 use crate::core::session_manager::now_iso8601;
 use crate::core::version_check::rpi_user_agent;
 
@@ -127,6 +132,8 @@ pub enum ReplaceErrorKind {
     PermissionDenied,
     /// EROFS — the executable lives on a read-only mount.
     ReadOnlyFilesystem,
+    /// ENOSPC / ERROR_DISK_FULL — no space left for the temp binary.
+    DiskFull,
     Other,
 }
 
@@ -136,14 +143,23 @@ pub fn classify_replace_error(error: &std::io::Error) -> ReplaceErrorKind {
     {
         match error.raw_os_error() {
             Some(code) if code == libc::EROFS => return ReplaceErrorKind::ReadOnlyFilesystem,
+            Some(code) if code == libc::ENOSPC => return ReplaceErrorKind::DiskFull,
             Some(code) if code == libc::EPERM || code == libc::EACCES => {
                 return ReplaceErrorKind::PermissionDenied;
             }
             _ => {}
         }
     }
+    #[cfg(windows)]
+    {
+        // ERROR_DISK_FULL (112) / ERROR_HANDLE_DISK_FULL (39).
+        if matches!(error.raw_os_error(), Some(39 | 112)) {
+            return ReplaceErrorKind::DiskFull;
+        }
+    }
     match error.kind() {
         std::io::ErrorKind::PermissionDenied => ReplaceErrorKind::PermissionDenied,
+        std::io::ErrorKind::StorageFull => ReplaceErrorKind::DiskFull,
         _ => ReplaceErrorKind::Other,
     }
 }
@@ -177,6 +193,11 @@ pub fn replace_failure_guidance(
         ),
         ReplaceErrorKind::ReadOnlyFilesystem => format!(
             "{} is on a read-only filesystem and cannot be replaced in place. To update, {manual}.",
+            exe_path.display(),
+        ),
+        ReplaceErrorKind::DiskFull => format!(
+            "Not enough disk space to write the new {APP_NAME} binary next to {}. Free some space \
+             and retry (`{APP_NAME} update --self`), or {manual}.",
             exe_path.display(),
         ),
         ReplaceErrorKind::Other => format!("To update manually, {manual}."),
@@ -222,6 +243,42 @@ pub trait BinaryDownloadTransport: Send + Sync {
         url: &'a str,
         timeout: Duration,
     ) -> BoxFuture<'a, Result<Vec<u8>, String>>;
+
+    /// V18-12 FR-B: stream one request through the shared download engine.
+    /// The default adapts the legacy whole-body method (test fakes keep
+    /// working unchanged); the production transport streams chunks.
+    fn stream(
+        &self,
+        request: &DownloadHttpRequest,
+        sink: &mut (dyn FnMut(DownloadStreamEvent<'_>) -> Result<(), DownloadError> + Send),
+    ) -> Result<(), DownloadError> {
+        let bytes =
+            futures::executor::block_on(self.download(&request.url, SELF_UPDATE_DOWNLOAD_TIMEOUT))
+                .map_err(|error| super::download::classify_legacy_error(&error))?;
+        let head = super::download::DownloadResponseHead {
+            status: 200,
+            content_length: Some(bytes.len() as u64),
+            ..Default::default()
+        };
+        sink(DownloadStreamEvent::Head(&head))?;
+        if !bytes.is_empty() {
+            sink(DownloadStreamEvent::Chunk(&bytes))?;
+        }
+        Ok(())
+    }
+}
+
+/// Adapter from the legacy async binary seam to the shared engine.
+pub struct BinaryDownloadAdapter<'a>(pub &'a dyn BinaryDownloadTransport);
+
+impl DownloadTransport for BinaryDownloadAdapter<'_> {
+    fn stream(
+        &self,
+        request: &DownloadHttpRequest,
+        sink: &mut (dyn FnMut(DownloadStreamEvent<'_>) -> Result<(), DownloadError> + Send),
+    ) -> Result<(), DownloadError> {
+        self.0.stream(request, sink)
+    }
 }
 
 /// Production transport: reqwest with rustls (same trust model as the
@@ -229,6 +286,14 @@ pub trait BinaryDownloadTransport: Send + Sync {
 pub struct ReqwestBinaryDownloadTransport;
 
 impl BinaryDownloadTransport for ReqwestBinaryDownloadTransport {
+    fn stream(
+        &self,
+        request: &DownloadHttpRequest,
+        sink: &mut (dyn FnMut(DownloadStreamEvent<'_>) -> Result<(), DownloadError> + Send),
+    ) -> Result<(), DownloadError> {
+        ReqwestDownloadTransport.stream(request, sink)
+    }
+
     fn download<'a>(
         &'a self,
         url: &'a str,
@@ -325,6 +390,17 @@ pub async fn run_binary_self_update(
     transport: &dyn BinaryDownloadTransport,
     base_urls: &[String],
 ) -> Result<SelfUpdateOutcome, String> {
+    run_binary_self_update_observed(request, transport, base_urls, &NoopDownloadObserver).await
+}
+
+/// Observed variant used by the CLI: the same flow, reporting connection,
+/// progress and retry events to the renderer (V18-12 FR-B).
+pub async fn run_binary_self_update_observed(
+    request: &BinarySelfUpdateRequest<'_>,
+    transport: &dyn BinaryDownloadTransport,
+    base_urls: &[String],
+    observer: &dyn DownloadObserver,
+) -> Result<SelfUpdateOutcome, String> {
     let Some(target) = request.target else {
         return Err(format!(
             "This build does not know its target triple, so the correct release asset cannot be determined. To update, {}.",
@@ -332,29 +408,57 @@ pub async fn run_binary_self_update(
         ));
     };
     let asset_name = asset_file_name(request.version, target);
+    // Resume state is scoped to the executable path: parallel test/test
+    // installs and two rpi installations never share a .part file.
+    let install_key = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        request.exe_path.hash(&mut hasher);
+        hasher.finish()
+    };
+    let download_dir =
+        std::env::temp_dir().join(format!("{APP_NAME}-self-update-{install_key:016x}"));
+    let adapter = BinaryDownloadAdapter(transport);
+    let policy = if cfg!(test) {
+        DownloadPolicy::for_tests()
+    } else {
+        DownloadPolicy::default()
+    };
+    let downloader = Downloader::new(&adapter, policy, observer);
 
     let mut download_failures: Vec<String> = Vec::new();
     let mut verified: Option<(String, Vec<u8>, String)> = None;
     for base_url in base_urls {
         let candidate_url = asset_url(base_url, request.version, target);
         let sidecar_url = sha256_sidecar_url(&candidate_url);
-        let tarball = match transport
-            .download(&candidate_url, SELF_UPDATE_DOWNLOAD_TIMEOUT)
-            .await
-        {
-            Ok(bytes) => bytes,
+        let mut asset_spec = DownloadSpec::new(&candidate_url, &download_dir, &asset_name);
+        asset_spec.version = request.version.to_string();
+        let outcome = match downloader.download(&asset_spec) {
+            Ok(outcome) => outcome,
             Err(error) => {
-                download_failures.push(format!("{candidate_url}: {error}"));
+                download_failures.push(format!("{candidate_url}: {}", error.message));
                 continue;
             }
         };
-        let sidecar = match transport
-            .download(&sidecar_url, SELF_UPDATE_DOWNLOAD_TIMEOUT)
-            .await
-        {
-            Ok(bytes) => bytes,
+        let mut sidecar_spec =
+            DownloadSpec::new(&sidecar_url, &download_dir, format!("{asset_name}.sha256"));
+        sidecar_spec.version = request.version.to_string();
+        sidecar_spec.kind = DownloadAssetKind::Sidecar;
+        let sidecar = match downloader.download(&sidecar_spec) {
+            Ok(sidecar) => match std::fs::read(&sidecar.path) {
+                Ok(bytes) => {
+                    let _ = std::fs::remove_file(&sidecar.path);
+                    bytes
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&outcome.path);
+                    download_failures.push(format!("{sidecar_url}: {error}"));
+                    continue;
+                }
+            },
             Err(error) => {
-                download_failures.push(format!("{sidecar_url}: {error}"));
+                let _ = std::fs::remove_file(&outcome.path);
+                download_failures.push(format!("{sidecar_url}: {}", error.message));
                 continue;
             }
         };
@@ -362,13 +466,21 @@ pub async fn run_binary_self_update(
             parse_sha256_sidecar(&String::from_utf8_lossy(&sidecar)).ok_or_else(|| {
                 format!("The sha256 sidecar for {asset_name} is malformed; aborting the update.")
             })?;
-        let actual = sha256_hex(&tarball);
-        if actual != expected {
-            // Nothing has been written yet: the abort leaves no residue.
+        let actual = outcome.sha256;
+        if !actual.eq_ignore_ascii_case(&expected) {
+            // Integrity failures never switch mirrors (ADR-0011).
+            let _ = std::fs::remove_file(&outcome.path);
             return Err(format!(
                 "Integrity check failed for {asset_name}: expected sha256 {expected}, got {actual}. The download was discarded."
             ));
         }
+        let tarball = std::fs::read(&outcome.path).map_err(|error| {
+            format!(
+                "Could not read the downloaded asset {}: {error}",
+                outcome.path.display()
+            )
+        })?;
+        let _ = std::fs::remove_file(&outcome.path);
         verified = Some((candidate_url, tarball, actual));
         break;
     }
@@ -380,6 +492,9 @@ pub async fn run_binary_self_update(
     };
 
     let binary = extract_rpi_binary(&tarball)?;
+    observer.on_download_event(&crate::core::download::DownloadEvent::Installing {
+        target: request.exe_path.to_path_buf(),
+    });
     install_binary(request.exe_path, &binary).map_err(|error| {
         let kind = classify_replace_error(&error);
         format!(
@@ -998,6 +1113,27 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_disk_full_and_guidance() {
+        #[cfg(unix)]
+        let error = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        #[cfg(not(unix))]
+        let error = std::io::Error::from(std::io::ErrorKind::Other);
+        #[cfg(unix)]
+        {
+            assert_eq!(classify_replace_error(&error), ReplaceErrorKind::DiskFull);
+            let guidance = replace_failure_guidance(
+                ReplaceErrorKind::DiskFull,
+                Path::new("/usr/local/bin/rpi"),
+                "1.2.3",
+                Some("x86_64-unknown-linux-gnu"),
+            );
+            assert!(guidance.contains("disk space"), "{guidance}");
+            assert!(guidance.contains("update --self"), "{guidance}");
+        }
+        let _ = error;
+    }
+
+    #[test]
     fn test_replace_failure_guidance_permission_vs_readonly() {
         let exe = Path::new("/usr/local/bin/rpi");
         let target = Some("x86_64-unknown-linux-gnu");
@@ -1323,7 +1459,9 @@ mod tests {
 
     /// End-to-end through the production reqwest transport against a
     /// loopback fake release server (axum; no real network).
-    #[tokio::test]
+    // Multi-threaded: the sync download engine blocks the caller worker,
+    // so the loopback axum server needs another worker to serve it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_self_update_e2e_against_loopback_release_server() {
         let dir = TestDir::new();
         let exe = dir.path().join("rpi");

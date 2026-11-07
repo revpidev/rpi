@@ -11,5 +11,6 @@ pub mod initial_message;
 pub mod list_models;
 pub mod mcp_command;
 pub mod package_command;
+pub mod progress;
 pub mod run_auth;
 pub mod session_picker;

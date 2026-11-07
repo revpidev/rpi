@@ -4350,6 +4350,51 @@ impl InteractiveUi {
         self.render_handle.request_render();
     }
 
+    /// V18-12 FR-A: keep at most `max` markdown list items and summarize the
+    /// rest as `and N more in the changelog`. Notes without list items pass
+    /// through unchanged (the changelog link is added by the caller).
+    pub(crate) fn truncate_update_note(note: &str, max: usize) -> String {
+        let lines: Vec<&str> = note.lines().collect();
+        let is_item = |line: &str| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("- ")
+                || trimmed.starts_with("* ")
+                || trimmed.starts_with("+ ")
+                || trimmed.split_once('.').is_some_and(|(number, rest)| {
+                    !number.is_empty()
+                        && number.chars().all(|c| c.is_ascii_digit())
+                        && rest.starts_with(' ')
+                })
+        };
+        let item_count = lines.iter().filter(|line| is_item(line)).count();
+        if item_count <= max {
+            return note.to_owned();
+        }
+        let mut out: Vec<&str> = Vec::new();
+        let mut kept = 0;
+        let mut skipping = false;
+        for line in &lines {
+            if is_item(line) {
+                if kept == max {
+                    skipping = true;
+                    continue;
+                }
+                kept += 1;
+                out.push(line);
+            } else if !skipping {
+                out.push(line);
+            }
+        }
+        out.push("");
+        out.push("");
+        let mut text = out.join("\n").trim_end().to_owned();
+        text.push_str(&format!(
+            "\n\nand {} more in the changelog",
+            item_count - max
+        ));
+        text
+    }
+
     /// `showNewVersionNotification` (interactive-mode.ts:3885-3912): bordered
     /// "Update Available" block with the run-prompt line, an optional
     /// Markdown note, and the changelog link (OSC 8 when the terminal
@@ -4359,9 +4404,26 @@ impl InteractiveUi {
         release: &crate::core::version_check::LatestRpiRelease,
     ) {
         let theme = Arc::clone(&lock(&self.theme));
-        let warning_border = |theme: &Arc<crate::core::themes::Theme>| {
+        let note_text = release
+            .note
+            .as_deref()
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+            .map(str::to_owned);
+        let is_pre_release = crate::core::version_check::is_prerelease_version(&release.version);
+        let is_security = note_text
+            .as_deref()
+            .is_some_and(|note| note.to_ascii_lowercase().contains("security"));
+        // V18-12 FR-A: accent for a normal update, warning kept for RC and
+        // security notes (never the error surface).
+        let emphasis_color = if is_pre_release || is_security {
+            "warning"
+        } else {
+            "accent"
+        };
+        let emphasis_border = |theme: &Arc<crate::core::themes::Theme>| {
             let theme = Arc::clone(theme);
-            Box::new(move |text: &str| theme.fg("warning", text))
+            Box::new(move |text: &str| theme.fg(emphasis_color, text))
                 as rpi_tui::components::text::ColorFn
         };
         // T18 (ADR-0011 §6): the action matches self-update availability —
@@ -4372,19 +4434,15 @@ impl InteractiveUi {
         // V14-19（rpi 自有，R6.4.1）：预发布版本的横幅标注 pre-release，
         // 动作指引同步换 `rpi update --rc`（RC 端点的候选版本只有经
         // `--rc` 才能拉到）；stable 版本文案不变。
-        let is_pre_release = crate::core::version_check::is_prerelease_version(&release.version);
         let instruction = if is_pre_release {
             format!("Run {APP_NAME} update --rc")
         } else {
             crate::config::self_update_instruction()
         };
         let action = theme.fg("accent", &instruction);
-        let availability_line = if is_pre_release {
-            format!("New pre-release version {} is available. ", release.version)
-        } else {
-            format!("New version {} is available. ", release.version)
-        };
-        let update_instruction = theme.fg("muted", &availability_line) + &action;
+        let channel = crate::core::version_check::release_channel_label(&release.version);
+        let transition = crate::core::version_check::version_transition(VERSION, &release.version);
+        let version_line = theme.fg("muted", &format!("{transition} · {channel}")) + "\n" + &action;
         let changelog_url = "https://revpi.dev/changelog";
         let styled_url = theme.fg("accent", changelog_url);
         let changelog_link = if rpi_tui::terminal_image::get_capabilities().hyperlinks {
@@ -4393,18 +4451,14 @@ impl InteractiveUi {
             styled_url
         };
         let changelog_line = theme.fg("muted", "Changelog: ") + &changelog_link;
-        let heading = crate::core::themes::Theme::bold(&theme.fg("warning", "Update Available"));
-        let note = release
-            .note
-            .as_deref()
-            .map(str::trim)
-            .filter(|note| !note.is_empty())
-            .map(str::to_owned);
+        let heading =
+            crate::core::themes::Theme::bold(&theme.fg(emphasis_color, "Update Available"));
+        let note = note_text.map(|note| Self::truncate_update_note(&note, 3));
 
         self.add_chat_child(Box::new(Spacer::new(1)));
-        self.add_chat_child(Box::new(DynamicBorder::new(warning_border(&theme))));
+        self.add_chat_child(Box::new(DynamicBorder::new(emphasis_border(&theme))));
         self.add_chat_child(Box::new(Text::new(
-            format!("{heading}\n{update_instruction}"),
+            format!("{heading}\n{version_line}"),
             1,
             0,
             None,
@@ -4430,7 +4484,7 @@ impl InteractiveUi {
             self.add_chat_child(Box::new(Spacer::new(1)));
         }
         self.add_chat_child(Box::new(Text::new(changelog_line, 1, 0, None)));
-        self.add_chat_child(Box::new(DynamicBorder::new(warning_border(&theme))));
+        self.add_chat_child(Box::new(DynamicBorder::new(emphasis_border(&theme))));
         self.render_handle.request_render();
     }
 
@@ -6204,6 +6258,7 @@ impl InteractiveMode {
             self.session.settings_manager(|settings| {
                 crate::core::changelog::changelog_for_display(
                     settings.get_last_changelog_version().as_deref(),
+                    VERSION,
                 )
             })
         };
@@ -9113,13 +9168,13 @@ mod tests {
             rendered.contains("Update Available"),
             "rendered: {rendered}"
         );
-        // T18 (ADR-0011 §6): the action is the self-update command; the
-        // muted/accent split puts an ANSI boundary between the lead-in and
-        // the action, so assert the two segments separately.
+        // V18-12 FR-A: current → target + channel, then the action. The
+        // muted/accent split puts an ANSI boundary between them.
         assert!(
-            rendered.contains("New version 99.0.0 is available."),
+            rendered.contains(&format!("rpi {VERSION} → 99.0.0")),
             "rendered: {rendered}"
         );
+        assert!(rendered.contains("stable"), "rendered: {rendered}");
         assert!(
             rendered.contains("Run rpi update --self"),
             "rendered: {rendered}"
@@ -9149,15 +9204,18 @@ mod tests {
         ui.drain_events();
         let rendered = lock(&ui.chat_container).render(80).join("\n");
         assert!(
-            rendered.contains("New pre-release version 99.1.0-rc.2 is available."),
+            rendered.contains(&format!("rpi {VERSION} → 99.1.0-rc.2")),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("pre-release (RC)"),
             "rendered: {rendered}"
         );
         assert!(
             rendered.contains("Run rpi update --rc"),
             "rendered: {rendered}"
         );
-        // stable 文案不在场（避免两条版本线混淆）。
-        assert!(!rendered.contains("New version "), "rendered: {rendered}");
+        // The stable action is not present (avoid mixing the two lines).
         assert!(!rendered.contains("--self"), "rendered: {rendered}");
     }
 
@@ -9176,6 +9234,41 @@ mod tests {
         ui.drain_events();
         // Spacer + border + heading + changelog + border.
         assert_eq!(chat_children(ui) - before, 5);
+    }
+
+    #[tokio::test]
+    async fn new_version_note_is_capped_to_three_items() {
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.push(UiCommand::NewVersionAvailable(
+            crate::core::version_check::LatestRpiRelease {
+                version: "99.0.0".to_string(),
+                package_name: None,
+                note: Some("- first\n- second\n- third\n- fourth\n- fifth".to_string()),
+            },
+        ));
+        ui.drain_events();
+        let rendered = lock(&ui.chat_container).render(100).join("\n");
+        assert!(rendered.contains("first"), "rendered: {rendered}");
+        assert!(rendered.contains("third"), "rendered: {rendered}");
+        assert!(!rendered.contains("fourth"), "rendered: {rendered}");
+        assert!(
+            rendered.contains("and 2 more in the changelog"),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn truncate_update_note_handles_numbered_items_and_plain_notes() {
+        let numbered = "**Highlights**\n1. one\n2. two\n3. three\n4. four";
+        let trimmed = InteractiveUi::truncate_update_note(numbered, 3);
+        assert!(trimmed.contains("three"), "{trimmed}");
+        assert!(!trimmed.contains("four"), "{trimmed}");
+        assert!(trimmed.contains("and 1 more"), "{trimmed}");
+        assert_eq!(
+            InteractiveUi::truncate_update_note("plain note", 3),
+            "plain note"
+        );
     }
 
     /// V14-01 FR-G (836aee6d3): compaction / branch-summary usage renders
@@ -11650,6 +11743,38 @@ mod tests {
 
         let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
         assert!(rendered.contains("What's New"), "rendered: {rendered}");
+    }
+
+    /// V18-12 FR-E: a prerelease `lastChangelogVersion` (e.g. the previous
+    /// RC) must not suppress the block. Same-base RC/RC and RC/stable folds
+    /// fall back to the current version's section once.
+    #[tokio::test]
+    async fn startup_notices_show_whats_new_for_rc_to_rc_on_the_same_base() {
+        let (mut mode, _terminal, session) = mode_harness().await;
+        let base = VERSION.split('-').next().unwrap_or(VERSION);
+        session.settings_manager(|settings| {
+            settings.set_last_changelog_version(&format!("{base}-rc.1"));
+        });
+        mode.init().await;
+
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert!(rendered.contains("What's New"), "rendered: {rendered}");
+        assert_eq!(rendered.matches("What's New").count(), 1);
+    }
+
+    /// A downgrade (last version newer than the running build) shows no
+    /// What's New block.
+    #[tokio::test]
+    async fn startup_notices_skip_downgrades() {
+        let (mut mode, _terminal, session) = mode_harness().await;
+        session.settings_manager(|settings| {
+            settings.set_last_changelog_version("999.0.0");
+        });
+        mode.init().await;
+
+        let rendered = lock(&mode.ui_state.chat_container).render(120).join("\n");
+        assert!(!rendered.contains("What's New"), "rendered: {rendered}");
+        assert!(!rendered.contains("Updated to v"), "rendered: {rendered}");
     }
 
     /// `collapseChangelog = true` → condensed single line with the version

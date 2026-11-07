@@ -43,6 +43,10 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 
 use crate::config;
+use crate::core::download::{
+    DownloadError, DownloadHttpRequest, DownloadObserver, DownloadPolicy, DownloadSpec,
+    DownloadStreamEvent, DownloadTransport, Downloader, ReqwestDownloadTransport,
+};
 use crate::core::self_update::sha256_hex;
 use crate::core::version_check::{UpdateChannel, rpi_user_agent};
 
@@ -521,6 +525,42 @@ pub fn mirror_download_url(
 /// tests.
 pub trait RegistryTransport: Send + Sync {
     fn get(&self, url: &str, timeout: Duration) -> Result<Vec<u8>, String>;
+
+    /// V18-12 FR-B: stream one request through the shared download engine.
+    /// The default adapts the legacy whole-body method (test fakes need no
+    /// change); the production transport streams chunks.
+    fn stream(
+        &self,
+        request: &DownloadHttpRequest,
+        sink: &mut (dyn FnMut(DownloadStreamEvent<'_>) -> Result<(), DownloadError> + Send),
+    ) -> Result<(), DownloadError> {
+        let bytes = self
+            .get(&request.url, RPIX_DOWNLOAD_TIMEOUT)
+            .map_err(|error| crate::core::download::classify_legacy_error(&error))?;
+        let head = crate::core::download::DownloadResponseHead {
+            status: 200,
+            content_length: Some(bytes.len() as u64),
+            ..Default::default()
+        };
+        sink(DownloadStreamEvent::Head(&head))?;
+        if !bytes.is_empty() {
+            sink(DownloadStreamEvent::Chunk(&bytes))?;
+        }
+        Ok(())
+    }
+}
+
+/// Adapter from the synchronous registry seam to the shared engine.
+pub struct RegistryDownloadAdapter<'a>(pub &'a dyn RegistryTransport);
+
+impl DownloadTransport for RegistryDownloadAdapter<'_> {
+    fn stream(
+        &self,
+        request: &DownloadHttpRequest,
+        sink: &mut (dyn FnMut(DownloadStreamEvent<'_>) -> Result<(), DownloadError> + Send),
+    ) -> Result<(), DownloadError> {
+        self.0.stream(request, sink)
+    }
 }
 
 /// Production transport: reqwest with rustls (the project's HTTP stack,
@@ -531,6 +571,14 @@ pub trait RegistryTransport: Send + Sync {
 pub struct ReqwestRegistryTransport;
 
 impl RegistryTransport for ReqwestRegistryTransport {
+    fn stream(
+        &self,
+        request: &DownloadHttpRequest,
+        sink: &mut (dyn FnMut(DownloadStreamEvent<'_>) -> Result<(), DownloadError> + Send),
+    ) -> Result<(), DownloadError> {
+        ReqwestDownloadTransport.stream(request, sink)
+    }
+
     fn get(&self, url: &str, timeout: Duration) -> Result<Vec<u8>, String> {
         let url = url.to_string();
         std::thread::spawn(move || {
@@ -584,6 +632,36 @@ pub fn download_with_fallback(
         "Could not download from any source: {}",
         failures.join("; ")
     ))
+}
+
+/// V18-12 FR-B: download one artifact through the shared engine (resume,
+/// retries, progress). The final file is removed by the caller after the
+/// bytes are read into the install path.
+pub fn download_with_fallback_observed(
+    transport: &dyn RegistryTransport,
+    urls: &[String],
+    dest_dir: &std::path::Path,
+    file_name: &str,
+    version: &str,
+    expected_sha256: Option<&str>,
+    observer: &dyn DownloadObserver,
+) -> Result<(String, crate::core::download::DownloadOutcome), DownloadError> {
+    let adapter = RegistryDownloadAdapter(transport);
+    let policy = if cfg!(test) {
+        DownloadPolicy::for_tests()
+    } else {
+        DownloadPolicy::default()
+    };
+    let downloader = Downloader::new(&adapter, policy, observer);
+    let mut spec = DownloadSpec::new(
+        urls.first().cloned().unwrap_or_default(),
+        dest_dir,
+        file_name,
+    );
+    spec.version = version.to_string();
+    spec.expected_sha256 = expected_sha256.map(str::to_string);
+    let outcome = crate::core::download::download_from_sources(&downloader, &spec, urls)?;
+    Ok((outcome.url.clone(), outcome))
 }
 
 // ---------------------------------------------------------------------------

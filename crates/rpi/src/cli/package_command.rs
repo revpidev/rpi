@@ -36,7 +36,7 @@ use crate::core::model_runtime::{
 };
 use crate::core::package_manager::{
     ConfiguredPackage, DefaultPackageManager, InstallConfirmCallback, PackageCommandRunner,
-    SystemPackageCommandRunner,
+    SystemPackageCommandRunner, UpdateApplySummary, UpdatePlan, UpdatePlanAction,
 };
 use crate::core::self_update::{BinarySelfUpdateRequest, BinarySelfUpdateSeam};
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
@@ -46,9 +46,9 @@ use crate::core::trust_manager::{
     resolve_project_trusted,
 };
 use crate::core::version_check::{
-    DEFAULT_VERSION_CHECK_TIMEOUT, LatestVersionTransport, ReqwestLatestVersionTransport,
+    DEFAULT_UPDATE_VERSION_CHECK_TIMEOUT, LatestVersionTransport, ReqwestLatestVersionTransport,
     UpdateChannel, channel_probe_url, get_latest_rpi_release_with, is_newer_package_version,
-    version_check_endpoint,
+    release_channel_label, version_check_endpoint, version_transition,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -57,7 +57,17 @@ use std::sync::Arc;
 /// literal `rpi` mirrors `APP_NAME` (config.rs); the
 /// `usage_lines_start_with_app_name` test binds the two so a rename cannot
 /// silently leave the help text stale (T14 review N-1).
-pub const UPDATE_USAGE: &str = "rpi update [source|self|rpi] [--self|--extensions|--models|--all] [--extension <source>] [--rc] [--approve|--no-approve] [--force] [--yes]";
+pub const UPDATE_USAGE: &str = "rpi update [source|self|rpi] [--self|--extensions|--models|--all] [--extension <source>] [--version <ver>] [--rc] [--approve|--no-approve] [--force] [--yes]";
+
+/// V18-12 exact version grammar: a full semver version, optional leading
+/// `v`, no range operators. Returns the canonical string without the `v`.
+pub fn parse_exact_version(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let trimmed = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    semver::Version::parse(trimmed)
+        .ok()
+        .map(|parsed| parsed.to_string())
+}
 
 /// `UpdateTarget` (package-manager-cli.ts:35).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +87,9 @@ pub struct ParsedUpdate {
     pub invalid_argument: Option<String>,
     pub missing_option_value: Option<String>,
     pub conflicting_options: Option<String>,
+    /// V18-12 FR-G/FR-H: exact version pin (`--version <ver>`).
+    pub version: Option<String>,
+    pub invalid_version: Option<String>,
     pub target: Option<UpdateTarget>,
     /// `--force` — reinstall rpi even when the current version is latest
     /// (self target only; inert for the models target, see module docs).
@@ -107,6 +120,8 @@ pub fn parse_update_args(args: &[String]) -> ParsedUpdate {
     let mut models_flag = false;
     let mut all_flag = false;
     let mut extension_flag_source: Option<String> = None;
+    let mut version_flag: Option<String> = None;
+    let mut version_seen = false;
 
     let mut index = 0;
     while index < rest.len() {
@@ -141,6 +156,30 @@ pub fn parse_update_args(args: &[String]) -> ParsedUpdate {
             // self and extensions targets; orthogonal to every target
             // flag — no new conflicts (FR-A R1).
             parsed.rc = true;
+        } else if arg == "--version" {
+            // V18-12 FR-G/FR-H: exact version pin; consumes one value.
+            if version_seen {
+                parsed
+                    .conflicting_options
+                    .get_or_insert_with(|| "--version can only be provided once".to_owned());
+            }
+            version_seen = true;
+            match rest.get(index + 1) {
+                Some(value) if !value.starts_with('-') => {
+                    match parse_exact_version(value) {
+                        Some(version) => version_flag = Some(version),
+                        None => {
+                            parsed.invalid_version.get_or_insert_with(|| value.clone());
+                        }
+                    }
+                    index += 1;
+                }
+                _ => {
+                    parsed
+                        .missing_option_value
+                        .get_or_insert_with(|| arg.clone());
+                }
+            }
         } else if arg == "--extension" {
             let value = rest.get(index + 1);
             match value {
@@ -168,6 +207,34 @@ pub fn parse_update_args(args: &[String]) -> ParsedUpdate {
             parsed.invalid_argument.get_or_insert_with(|| arg.clone());
         }
         index += 1;
+    }
+
+    // V18-12: `--version` conflicts are resolved before any network call.
+    parsed.version = version_flag;
+    if parsed.version.is_some() {
+        if parsed.rc {
+            parsed.conflicting_options.get_or_insert_with(|| {
+                "--version cannot be combined with --rc (a prerelease version already selects the RC channel)"
+                    .to_owned()
+            });
+        }
+        if all_flag {
+            parsed.conflicting_options.get_or_insert_with(|| {
+                "--version cannot be combined with --all; pin rpi or one extension at a time"
+                    .to_owned()
+            });
+        }
+        if extensions_flag {
+            parsed.conflicting_options.get_or_insert_with(|| {
+                "--version cannot be combined with --extensions; name one extension source"
+                    .to_owned()
+            });
+        }
+        if models_flag {
+            parsed
+                .conflicting_options
+                .get_or_insert_with(|| "--version cannot be combined with --models".to_owned());
+        }
     }
 
     // Update target resolution + conflicts (package-manager-cli.ts:320-370).
@@ -257,6 +324,9 @@ Options:
   --models                Refresh model catalogs only
   --all                   Update rpi and installed packages
   --extension <source>    Update one package only
+  --version <ver>         Install an exact rpi or single-extension version
+                          (stable or RC; allows downgrade/reinstall; conflicts
+                          with --rc/--all/--extensions/--models)
   --rc                    Update to the latest pre-release (RC) version;
                           applies to --self/--extensions/--all, no effect on
                           --models
@@ -273,6 +343,12 @@ Short forms:
   {APP_NAME} update --models       Refresh model catalogs only
   {APP_NAME} update <source>       Update one package
   {APP_NAME} update rpi            Update rpi only (self works as alias to rpi)
+  {APP_NAME} update --version 0.1.8-rc.3
+                                   Reinstall/pin rpi to an exact version
+  {APP_NAME} update subagents --version 0.1.8-rc.3
+                                   Install one extension at an exact version
+                                   (npm/git/local sources use their own
+                                   @version/@ref syntax instead)
 "#
     )
 }
@@ -350,7 +426,7 @@ async fn get_self_update_plan(
         VERSION,
         transport,
         &url,
-        DEFAULT_VERSION_CHECK_TIMEOUT,
+        DEFAULT_UPDATE_VERSION_CHECK_TIMEOUT,
         crate::core::package_manager::is_offline_mode_enabled(),
         // The update path retries (package-manager-cli.ts:479 passes
         // `{ retry: true }`), unlike the startup check.
@@ -377,14 +453,12 @@ async fn get_self_update_plan(
         });
     }
 
-    match channel {
-        UpdateChannel::Stable => println!("{APP_NAME} is already up to date (v{VERSION})"),
-        // V14-19 (FR-B R2): RC 通道 no-op 文案追加通道标注；stable 路径
-        // 文案逐字节不变（零回归红线）。
-        UpdateChannel::PreRelease => {
-            println!("{APP_NAME} is already up to date (v{VERSION}) (pre-release channel)")
-        }
-    }
+    // V18-12 FR-C: the no-op line carries the current version and the
+    // target release's channel (R3.10.8).
+    println!(
+        "{APP_NAME} {VERSION} is up to date ({})",
+        release_channel_label(&latest_release.version)
+    );
     Ok(SelfUpdatePlan {
         package_name,
         version: latest_release.version,
@@ -403,6 +477,9 @@ async fn get_self_update_plan(
 async fn run_binary_self_update_branch(
     plan: &SelfUpdatePlan,
     seam: Option<BinarySelfUpdateSeam>,
+    observer: &dyn crate::core::download::DownloadObserver,
+    all_targets: bool,
+    extensions_skipped: bool,
 ) -> i32 {
     let seam = match seam {
         Some(seam) => seam,
@@ -436,23 +513,44 @@ async fn run_binary_self_update_branch(
         return 1;
     }
     let target = crate::config::build_target();
-    match target {
-        Some(target) => println!(
-            "Updating {APP_NAME} to v{} ({})...",
-            plan.version,
-            crate::core::self_update::asset_file_name(&plan.version, target),
-        ),
-        None => println!("Updating {APP_NAME} to v{}...", plan.version),
+    let channel = release_channel_label(&plan.version);
+    let mut plan_line = format!("{} · {channel}", version_transition(VERSION, &plan.version));
+    if extensions_skipped {
+        plan_line.push_str(" · plugins skipped (use --all)");
+    }
+    println!("{plan_line}");
+    if crate::core::version_check::is_newer_package_version(VERSION, &plan.version) {
+        eprintln!(
+            "Warning: downgrading {APP_NAME} from {VERSION} to {}. Newer sessions/settings may \
+             not be understood after the downgrade.",
+            plan.version
+        );
+    }
+    if !crate::core::version_check::is_prerelease_version(&plan.version)
+        && crate::core::version_check::is_prerelease_version(VERSION)
+    {
+        eprintln!(
+            "Warning: moving from a pre-release build ({VERSION}) to {channel} {}; settings and \
+             extension ABIs are checked on the next start.",
+            plan.version
+        );
+    }
+    if let Some(target) = target {
+        println!(
+            "Asset: {}",
+            crate::core::self_update::asset_file_name(&plan.version, target)
+        );
     }
     let request = BinarySelfUpdateRequest {
         exe_path: &seam.exe_path,
         version: &plan.version,
         target,
     };
-    match crate::core::self_update::run_binary_self_update(
+    match crate::core::self_update::run_binary_self_update_observed(
         &request,
         seam.transport.as_ref(),
         &seam.base_urls,
+        observer,
     )
     .await
     {
@@ -465,13 +563,40 @@ async fn run_binary_self_update_branch(
             if let Some(note) = &plan.note {
                 print_self_update_note(note);
             }
-            println!("Updated {APP_NAME} from {VERSION} to {}", plan.version);
+            println!("{}", success_line(&plan.version));
+            println!("Installed: {}", seam.exe_path.display());
+            println!("Restart {APP_NAME} to use the new version.");
+            println!("Changelog: https://revpi.dev/changelog");
             0
         }
         Err(message) => {
             eprintln!("Error: {message}");
+            eprintln!("{}", failure_line(all_targets));
+            eprintln!("Retry: {APP_NAME} update --self");
+            eprintln!(
+                "Manual: {}",
+                crate::core::self_update::manual_download_instruction(&plan.version, target)
+            );
             1
         }
+    }
+}
+
+/// V18-12 FR-C: success line shared by the CLI and tests.
+pub(crate) fn success_line(target: &str) -> String {
+    format!("Updated {}", version_transition(VERSION, target))
+}
+
+/// V18-12 FR-C R2: an `--all` failure must not claim extension work was
+/// untouched; a self-only failure states that nothing changed.
+pub(crate) fn failure_line(all_targets: bool) -> String {
+    if all_targets {
+        format!(
+            "Nothing changed for {APP_NAME} — {APP_NAME} {VERSION} is still installed. \
+             Extension updates above (if any) remain applied."
+        )
+    } else {
+        format!("Nothing changed — {APP_NAME} {VERSION} is still installed.")
     }
 }
 
@@ -531,7 +656,8 @@ pub fn print_self_update_note(note: &str) {
 fn confirm_native_extension_install(info: &ExtensionInstallInfo) -> bool {
     use std::io::Write;
     print!(
-        "Install native extension \"{}\" {} (no sandbox, full OS permissions)? [y/N] ",
+        "Install native extension \"{}\" {} (no sandbox, full OS permissions)? [y/N] \
+         (use --yes to skip this prompt in non-interactive runs) ",
         info.name, info.version
     );
     let _ = std::io::stdout().flush();
@@ -566,6 +692,74 @@ pub async fn run_update(args: &[String]) -> i32 {
     run_update_in(args, &cwd, &agent_dir, None, None, None).await
 }
 
+/// V18-12 FR-D: plan table printed before any download/confirmation.
+fn print_update_plan(plan: &UpdatePlan) {
+    if plan.is_empty() {
+        return;
+    }
+    println!("Extension updates:");
+    for entry in &plan.entries {
+        let pinned = if entry.pinned { ", pinned" } else { "" };
+        match entry.action {
+            UpdatePlanAction::Update => {
+                let current = entry.current.as_deref().unwrap_or("not installed");
+                let target = entry.target.as_deref().unwrap_or("latest");
+                println!(
+                    "  {current} → {target}  {source} ({kind}{pinned})",
+                    source = entry.source,
+                    kind = entry.kind
+                );
+                if let (Some(current), Some(target)) = (&entry.current, &entry.target)
+                    && crate::core::version_check::is_newer_package_version(current, target)
+                {
+                    eprintln!(
+                        "Warning: {source} will be downgraded from {current} to {target}{pinned}.",
+                        source = entry.source
+                    );
+                }
+            }
+            UpdatePlanAction::UpToDate => {
+                println!("  {} - up to date ({})", entry.source, entry.kind)
+            }
+            UpdatePlanAction::Local => println!(
+                "  {} - {}",
+                entry.source,
+                entry.note.as_deref().unwrap_or("local (not managed)")
+            ),
+            UpdatePlanAction::Untracked => println!(
+                "  {} - {}",
+                entry.source,
+                entry.note.as_deref().unwrap_or("untracked")
+            ),
+            UpdatePlanAction::Skipped => println!(
+                "  {} - skipped: {}",
+                entry.source,
+                entry.note.as_deref().unwrap_or("not updated")
+            ),
+            UpdatePlanAction::Error => println!(
+                "  {} - resolution failed: {}",
+                entry.source,
+                entry.note.as_deref().unwrap_or("unknown error")
+            ),
+        }
+    }
+}
+
+/// V18-12 FR-D: closing counts (R3.10.9).
+fn print_update_summary(summary: &UpdateApplySummary) {
+    let mut line = format!(
+        "Updated {} extensions · {} up to date · {} skipped",
+        summary.updated, summary.up_to_date, summary.skipped
+    );
+    if summary.failed > 0 {
+        line.push_str(&format!(" · {} failed", summary.failed));
+    }
+    println!("{line}");
+    if summary.updated > 0 {
+        println!("restart {APP_NAME} to load them");
+    }
+}
+
 /// [`run_update`] against explicit directories with injectable command
 /// runner, release transport, and binary self-update seam (tests inject
 /// fakes so no real `~/.rpi`, process, network, or running executable is
@@ -590,6 +784,13 @@ pub async fn run_update_in(
     }
     if let Some(option) = &parsed.missing_option_value {
         eprintln!("Missing value for {option}.");
+        eprintln!("Usage: {UPDATE_USAGE}");
+        return 1;
+    }
+    if let Some(version) = &parsed.invalid_version {
+        eprintln!(
+            "Invalid version \"{version}\" for --version; expected a full semver version such as 0.1.8 or 0.1.8-rc.3."
+        );
         eprintln!("Usage: {UPDATE_USAGE}");
         return 1;
     }
@@ -665,12 +866,12 @@ pub async fn run_update_in(
 
     let runner = runner.unwrap_or_else(|| Arc::new(SystemPackageCommandRunner));
     let transport = transport.unwrap_or_else(|| Arc::new(ReqwestLatestVersionTransport));
-
-    if parsed.show_extensions_skipped_note {
-        println!(
-            "Extensions are skipped. Run {APP_NAME} update --extensions to update extensions."
-        );
-    }
+    #[cfg(test)]
+    let progress: Arc<dyn crate::core::download::DownloadObserver> =
+        Arc::new(crate::core::download::NoopDownloadObserver);
+    #[cfg(not(test))]
+    let progress: Arc<dyn crate::core::download::DownloadObserver> =
+        Arc::new(crate::cli::progress::ProgressRenderer::new());
 
     if matches!(target, UpdateTarget::All | UpdateTarget::Extensions { .. }) {
         let update_source = match &target {
@@ -706,30 +907,82 @@ pub async fn run_update_in(
             }
         })));
         manager.set_install_confirm_callback(build_install_confirm(parsed.yes));
-        if let Err(message) = manager.update_with_channel(update_source.as_deref(), update_channel)
+        manager.set_download_observer(Some(progress.clone()));
+        if let (Some(version), Some(extension_source)) = (&parsed.version, &update_source)
+            && let Some(error) = DefaultPackageManager::exact_version_source_error(extension_source)
         {
-            eprintln!("Error: {message}");
+            let _ = version;
+            eprintln!("Error: {error}");
             return 1;
         }
-        match &update_source {
-            Some(source) => println!("Updated {source}"),
-            None => println!("Updated packages"),
-        }
-    }
-
-    if matches!(target, UpdateTarget::All | UpdateTarget::Self_) {
-        let plan = match get_self_update_plan(
-            parsed.force,
-            transport.as_ref(),
-            version_check_endpoint.as_deref(),
+        let plan = match manager.plan_updates(
+            update_source.as_deref(),
             update_channel,
-        )
-        .await
-        {
+            parsed.version.as_deref(),
+        ) {
             Ok(plan) => plan,
             Err(message) => {
                 eprintln!("Error: {message}");
                 return 1;
+            }
+        };
+        print_update_plan(&plan);
+        let (summary, error) = manager.apply_update_plan(&plan);
+        print_update_summary(&summary);
+        if let Some(message) = error {
+            eprintln!("Error: {message}");
+            return 1;
+        }
+    }
+
+    if matches!(target, UpdateTarget::All | UpdateTarget::Self_) {
+        // V18-12 FR-G: a pinned version bypasses the version endpoint
+        // entirely (endpoint `off`/offline detection still applies to the
+        // network download itself).
+        let plan = if let Some(version) = &parsed.version {
+            if crate::core::package_manager::is_offline_mode_enabled() {
+                eprintln!(
+                    "Error: Cannot update in offline mode (RPI_OFFLINE is set). Unset it to \
+                     install {APP_NAME} {version}."
+                );
+                return 1;
+            }
+            SelfUpdatePlan {
+                package_name: PACKAGE_NAME.to_string(),
+                version: version.clone(),
+                should_run: true,
+                note: None,
+            }
+        } else {
+            if crate::core::package_manager::is_offline_mode_enabled() {
+                eprintln!(
+                    "Error: Cannot check for updates in offline mode (RPI_OFFLINE is set). \
+                     Use `{APP_NAME} update --version <ver>` to install a known version, or unset \
+                     RPI_OFFLINE."
+                );
+                return 1;
+            }
+            if version_check_endpoint.is_none() {
+                eprintln!(
+                    "Error: The version check endpoint is disabled (versionCheckUrl/RPI_VERSION_CHECK_URL=off), \
+                     so the latest version cannot be determined. Use `{APP_NAME} update --version <ver>` \
+                     to install a specific version."
+                );
+                return 1;
+            }
+            match get_self_update_plan(
+                parsed.force,
+                transport.as_ref(),
+                version_check_endpoint.as_deref(),
+                update_channel,
+            )
+            .await
+            {
+                Ok(plan) => plan,
+                Err(message) => {
+                    eprintln!("Error: {message}");
+                    return 1;
+                }
             }
         };
         if !plan.should_run {
@@ -740,7 +993,14 @@ pub async fn run_update_in(
         // gone. The install method is always Binary (D-055): rpi is
         // distributed only as a GitHub Releases binary, so there is no
         // package-manager branch and no Windows npm/pnpm gate.
-        return run_binary_self_update_branch(&plan, binary_seam).await;
+        return run_binary_self_update_branch(
+            &plan,
+            binary_seam,
+            progress.as_ref(),
+            target == UpdateTarget::All,
+            parsed.show_extensions_skipped_note,
+        )
+        .await;
     }
     0
 }
@@ -1454,6 +1714,103 @@ mod tests {
         let help = update_help();
         assert!(help.contains("--models                Refresh model catalogs only"));
         assert!(help.contains("rpi update --models       Refresh model catalogs only"));
+    }
+
+    // ---- V18-12 FR-G/FR-H: --version parsing and conflicts ----
+
+    #[test]
+    fn update_version_accepts_stable_rc_and_bare_v() {
+        assert_eq!(
+            parse(&["update", "--version", "0.1.8"]).version.as_deref(),
+            Some("0.1.8")
+        );
+        assert_eq!(
+            parse(&["update", "--version", "0.1.8-rc.3"])
+                .version
+                .as_deref(),
+            Some("0.1.8-rc.3")
+        );
+        assert_eq!(
+            parse(&["update", "--version", "v0.1.8"]).version.as_deref(),
+            Some("0.1.8")
+        );
+        let parsed = parse(&["update", "subagents", "--version", "0.1.8"]);
+        assert_eq!(
+            parsed.target,
+            Some(UpdateTarget::Extensions {
+                source: Some("subagents".to_string())
+            })
+        );
+        assert_eq!(parsed.version.as_deref(), Some("0.1.8"));
+        let parsed = parse(&["update", "--extension", "subagents", "--version", "0.1.8"]);
+        assert_eq!(
+            parsed.target,
+            Some(UpdateTarget::Extensions {
+                source: Some("subagents".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn update_version_rejects_invalid_missing_and_duplicate_values() {
+        assert_eq!(
+            parse(&["update", "--version", "not-a-version"])
+                .invalid_version
+                .as_deref(),
+            Some("not-a-version")
+        );
+        assert_eq!(
+            parse(&["update", "--version"])
+                .missing_option_value
+                .as_deref(),
+            Some("--version")
+        );
+        let parsed = parse(&["update", "--version", "0.1.8", "--version", "0.1.9"]);
+        assert_eq!(
+            parsed.conflicting_options.as_deref(),
+            Some("--version can only be provided once")
+        );
+    }
+
+    #[test]
+    fn update_version_conflicts_are_zero_network_parse_errors() {
+        for (input, expected) in [
+            (
+                vec!["update", "--rc", "--version", "0.1.8-rc.3"],
+                "--version cannot be combined with --rc (a prerelease version already selects the RC channel)",
+            ),
+            (
+                vec!["update", "--all", "--version", "0.1.8"],
+                "--version cannot be combined with --all; pin rpi or one extension at a time",
+            ),
+            (
+                vec!["update", "--extensions", "--version", "0.1.8"],
+                "--version cannot be combined with --extensions; name one extension source",
+            ),
+            (
+                vec!["update", "--models", "--version", "0.1.8"],
+                "--version cannot be combined with --models",
+            ),
+        ] {
+            let parsed = parse(&input);
+            assert_eq!(
+                parsed.conflicting_options.as_deref(),
+                Some(expected),
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_help_documents_exact_versions() {
+        let help = update_help();
+        assert!(help.contains("--version <ver>"), "{help}");
+        assert!(help.contains("rpi update --version 0.1.8-rc.3"), "{help}");
+        assert!(
+            help.contains("rpi update subagents --version 0.1.8-rc.3"),
+            "{help}"
+        );
+        assert!(UPDATE_USAGE.contains("--version <ver>"));
     }
 
     // ---- self-uninstall parsing (T18, ADR-0011 §5) ----
@@ -2535,6 +2892,77 @@ mod update_cli_tests {
         let manifest = crate::config::read_install_manifest_for(&exe).unwrap();
         assert_eq!(manifest.version, "99.0.0");
         assert_eq!(manifest.method, "binary");
+    }
+
+    /// V18-12 FR-G: `--version` bypasses the endpoint entirely, installs
+    /// the pinned RC/stable version (even a downgrade), and writes the
+    /// manifest.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn update_self_pinned_version_skips_the_endpoint() {
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
+        let dirs = TestDirs::new();
+        let transport = StubTransport::responds(Err("the endpoint must not be probed".into()));
+        let (exe, seam) = binary_seam(&dirs, "0.1.8-rc.4", b"pinned-binary");
+        let code = run_update_in(
+            &args(&["update", "--version", "0.1.8-rc.4"]),
+            &dirs.cwd,
+            &dirs.agent_dir,
+            Some(FakeRunner::npm_view_latest()),
+            Some(transport.clone()),
+            Some(seam),
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(
+            transport.call_count(),
+            0,
+            "a pinned self update must not touch the version endpoint"
+        );
+        assert_eq!(std::fs::read(&exe).unwrap(), b"pinned-binary");
+        let manifest = crate::config::read_install_manifest_for(&exe).unwrap();
+        assert_eq!(manifest.version, "0.1.8-rc.4");
+    }
+
+    /// V18-12 FR-G: `--version` still honors the offline gate.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn update_self_pinned_version_respects_offline_mode() {
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            Some("1"),
+        )]);
+        let dirs = TestDirs::new();
+        let transport = StubTransport::responds(Err("offline".into()));
+        let (exe, seam) = binary_seam(&dirs, "0.1.8-rc.4", b"pinned-binary");
+        let code = run_update_in(
+            &args(&["update", "--version", "0.1.8-rc.4"]),
+            &dirs.cwd,
+            &dirs.agent_dir,
+            Some(FakeRunner::npm_view_latest()),
+            Some(transport),
+            Some(seam),
+        )
+        .await;
+        assert_eq!(code, 1);
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old-binary");
+    }
+
+    #[test]
+    fn success_and_failure_lines_carry_current_and_target() {
+        let success = success_line("99.0.0");
+        assert!(
+            success.contains(&format!("{APP_NAME} {VERSION} → 99.0.0")),
+            "{success}"
+        );
+        let failure = failure_line(false);
+        assert!(failure.contains("Nothing changed"), "{failure}");
+        assert!(failure.contains(VERSION), "{failure}");
+        let all = failure_line(true);
+        assert!(all.contains("Extension updates"), "{all}");
     }
 
     #[tokio::test]

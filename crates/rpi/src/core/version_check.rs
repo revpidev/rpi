@@ -26,6 +26,9 @@ pub const LATEST_VERSION_URL: &str = "https://revpi.dev/api/latest-version";
 
 /// `DEFAULT_VERSION_CHECK_TIMEOUT_MS` (version-check.ts:5).
 pub const DEFAULT_VERSION_CHECK_TIMEOUT: Duration = Duration::from_millis(10_000);
+/// V18-12 FR-B: the `rpi update` probe gets a larger per-attempt budget
+/// (R3.10.7; startup keeps the 10s above).
+pub const DEFAULT_UPDATE_VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `LatestPiRelease` (version-check.ts:7-11).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +117,24 @@ pub fn channel_of_version(version: &str) -> UpdateChannel {
 /// 预发布段）启动探测 RC 端点，stable 构建维持 stable 端点。
 fn running_channel() -> UpdateChannel {
     channel_of_version(crate::config::VERSION)
+}
+
+/// Human channel label shared by the TUI banner and CLI plan/result lines
+/// (V18-12 FR-A/FR-C). A prerelease target is always labelled RC.
+pub fn release_channel_label(version: &str) -> &'static str {
+    if is_prerelease_version(version) {
+        "pre-release (RC)"
+    } else {
+        "stable"
+    }
+}
+
+/// `rpi <current> → <target>` used by every update notice (R3.10.1).
+pub fn version_transition(current: &str, target: &str) -> String {
+    format!(
+        "{APP_NAME} {current} → {target}",
+        APP_NAME = crate::config::APP_NAME
+    )
 }
 
 /// `comparePackageVersions` (version-check.ts:13-20): strict semver

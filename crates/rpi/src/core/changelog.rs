@@ -102,24 +102,18 @@ fn finish_entry(major: u32, minor: u32, patch: u32, lines: &[&str]) -> Changelog
     }
 }
 
-/// `getNewEntries` (changelog.ts:182-198): entries strictly newer than
-/// `last_version` (`x.y.z` string). An unparsable `last_version` yields no
-/// entries (upstream's `parts.some(Number.isNaN)` guard).
-pub fn get_new_entries(entries: &[ChangelogEntry], last_version: &str) -> Vec<ChangelogEntry> {
-    let Some(last) = parse_version_string(last_version) else {
-        return Vec::new();
-    };
-    entries
-        .iter()
-        .filter(|entry| entry.version_tuple() > last)
-        .cloned()
-        .collect()
-}
-
-/// `getNewEntries`'s `lastVersion` parsing (`v.split(".").map(Number)`,
-/// NaN-guarded).
-fn parse_version_string(version: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = version.split('.');
+/// Normalize a release version for section comparisons (V18-12 FR-E):
+/// strip an optional `v` prefix, the `-<prerelease>` suffix and the
+/// `+<build>` metadata, then parse the first three dot-separated segments.
+///
+/// `lastChangelogVersion` stores the exact build version (for example
+/// `0.1.8-rc.3`), but CHANGELOG.md headings only carry `x.y.z`; comparing
+/// the normalized tuple keeps RC/RC and RC/stable folds on the same base.
+pub fn normalize_version(version: &str) -> Option<(u32, u32, u32)> {
+    let version = version.trim();
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let core = version.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
     let tuple = (
         parts.next()?.parse().ok()?,
         parts.next()?.parse().ok()?,
@@ -131,24 +125,78 @@ fn parse_version_string(version: &str) -> Option<(u32, u32, u32)> {
     Some(tuple)
 }
 
+/// `getNewEntries` (changelog.ts:182-198): entries strictly newer than
+/// `last_version`, compared on the normalized `x.y.z` tuple. An unparsable
+/// `last_version` yields no entries (upstream's `parts.some(Number.isNaN)`
+/// guard).
+pub fn get_new_entries(entries: &[ChangelogEntry], last_version: &str) -> Vec<ChangelogEntry> {
+    let Some(last) = normalize_version(last_version) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|entry| entry.version_tuple() > last)
+        .cloned()
+        .collect()
+}
+
 /// The display half of `getChangelogForDisplay` (interactive-mode.ts
 /// :1171-1196) WITHOUT the recording/telemetry side effects (those live in
-/// `prepare_install_report`, D-046): given the PREVIOUS `last_version`,
-/// returns the joined new-entry markdown, or `None` when there is nothing
-/// new to show.
-pub fn changelog_for_display(last_version: Option<&str>) -> Option<String> {
+/// `prepare_install_report`, D-046): given the PREVIOUS `last_version` and
+/// the running `current_version`, returns the markdown to show, or `None`
+/// when there is nothing new.
+///
+/// V18-12 FR-E: sections are compared on the normalized tuple. When the
+/// normalized version did not move (RC→RC on the same base, or the RC→stable
+/// fold), the exact version still changed, so the current version's section
+/// is shown once instead of an empty block.
+pub fn changelog_for_display(last_version: Option<&str>, current_version: &str) -> Option<String> {
+    changelog_for_display_from(
+        &parse_changelog(CHANGELOG_MD),
+        last_version,
+        current_version,
+    )
+}
+
+fn changelog_for_display_from(
+    entries: &[ChangelogEntry],
+    last_version: Option<&str>,
+    current_version: &str,
+) -> Option<String> {
     let last_version = last_version?;
-    let new_entries = get_new_entries(&parse_changelog(CHANGELOG_MD), last_version);
-    if new_entries.is_empty() {
+    let last = normalize_version(last_version)?;
+    let current = normalize_version(current_version)?;
+    // A downgrade never shows a changelog block.
+    if current < last {
         return None;
     }
-    Some(
-        new_entries
-            .iter()
-            .map(|entry| entry.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-    )
+    // Exact `lastChangelogVersion` is the dedupe key: the same build (or a
+    // `+build`-only change) shows nothing, even when the embedded changelog
+    // already contains newer unreleased sections.
+    if last_version.trim() == current_version.trim() {
+        return None;
+    }
+    let new_entries: Vec<&ChangelogEntry> = entries
+        .iter()
+        .filter(|entry| entry.version_tuple() > last)
+        .collect();
+    if !new_entries.is_empty() {
+        return Some(join_entries(&new_entries));
+    }
+    // A different exact version on the same normalized base (rc.1→rc.3,
+    // rc.3→stable, `+build`) falls back to the current section once.
+    entries
+        .iter()
+        .find(|entry| entry.version_tuple() == current)
+        .map(|entry| entry.content.clone())
+}
+
+fn join_entries(entries: &[&ChangelogEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| entry.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 #[cfg(test)]
@@ -191,6 +239,72 @@ mod tests {
         assert!(get_new_entries(&entries, "not-a-version").is_empty());
     }
 
+    /// V18-12 FR-E: prerelease/build suffixes are stripped for section
+    /// comparison while `lastChangelogVersion` keeps the exact string.
+    #[test]
+    fn normalize_version_strips_prerelease_and_build_metadata() {
+        assert_eq!(normalize_version("0.1.8-rc.3"), Some((0, 1, 8)));
+        assert_eq!(normalize_version("0.1.8+build.7"), Some((0, 1, 8)));
+        assert_eq!(normalize_version("v0.1.8"), Some((0, 1, 8)));
+        assert_eq!(normalize_version("0.1.8-rc.3+sha.abc"), Some((0, 1, 8)));
+        assert_eq!(normalize_version("not-a-version"), None);
+        assert_eq!(normalize_version("1.2"), None);
+        assert_eq!(normalize_version("1.2.3.4"), None);
+    }
+
+    /// V18-12 FR-E migration matrix: every version change that moved the
+    /// normalized tuple shows the newer sections; a same-base RC/RC or
+    /// RC/stable fold falls back to the current section once; downgrade and
+    /// exact-version reruns show nothing.
+    #[test]
+    fn changelog_display_matrix_covers_rc_and_build_transitions() {
+        let entries =
+            parse_changelog("## [0.1.7]\n\nold\n\n## [0.1.8]\n\nmid\n\n## [0.1.9]\n\nnewer\n");
+        let fold_entries = parse_changelog("## [0.1.7]\n\nold\n\n## [0.1.8]\n\nmid\n");
+        let show =
+            |last: &str, current: &str| changelog_for_display_from(&entries, Some(last), current);
+
+        // stable→stable: sections above the last stable version.
+        let text = show("0.1.7", "0.1.9").expect("new stable sections");
+        assert!(text.contains("newer") && text.contains("mid"));
+        // stable→RC on the next base shows the new sections.
+        let text = show("0.1.7", "0.1.8-rc.2").expect("stable to RC");
+        assert!(text.contains("mid"));
+        // RC→RC on the same base (current is the top release) falls back to
+        // the current section once.
+        let text = changelog_for_display_from(&fold_entries, Some("0.1.8-rc.1"), "0.1.8-rc.3")
+            .expect("rc to rc fallback");
+        assert_eq!(text.matches("## [0.1.8]").count(), 1);
+        // RC→stable fold on the same base.
+        let text = changelog_for_display_from(&fold_entries, Some("0.1.8-rc.3"), "0.1.8")
+            .expect("rc to stable fold");
+        assert_eq!(text.matches("## [0.1.8]").count(), 1);
+        // Exact-version rerun shows nothing.
+        assert_eq!(
+            changelog_for_display_from(&fold_entries, Some("0.1.8"), "0.1.8"),
+            None
+        );
+        // A +build-only exact-version change falls back to the current
+        // section once.
+        let text = changelog_for_display_from(&fold_entries, Some("0.1.8+build.1"), "0.1.8")
+            .expect("build suffix fallback");
+        assert_eq!(text.matches("## [0.1.8]").count(), 1);
+        // Downgrade shows nothing.
+        assert_eq!(show("0.1.9", "0.1.8"), None);
+        // Same exact version with a prerelease suffix is deduped.
+        assert_eq!(show("0.1.8-rc.3", "0.1.8-rc.3"), None);
+        // Unparsable last version yields nothing.
+        assert_eq!(show("nope", "0.1.9"), None);
+    }
+
+    /// RC suffixes no longer break `getNewEntries` (the V18-12 root cause).
+    #[test]
+    fn new_entries_accept_prerelease_last_version() {
+        let entries = parse_changelog("## [0.1.7]\na\n\n## [0.1.8]\nb\n");
+        assert_eq!(get_new_entries(&entries, "0.1.7-rc.1").len(), 1);
+        assert!(get_new_entries(&entries, "0.1.8-rc.3").is_empty());
+    }
+
     /// The embedded asset parses and its top section matches VERSION
     /// (the display path is only useful while the asset tracks releases).
     /// V14-19：预发布构建（`0.1.4-rc.1`）比对**基线版本**——CHANGELOG.md
@@ -202,7 +316,7 @@ mod tests {
         let version = crate::config::VERSION;
         let base = version.split('-').next().unwrap_or(version);
         let parsed =
-            parse_version_string(base).unwrap_or_else(|| panic!("VERSION is x.y.z: {version}"));
+            normalize_version(base).unwrap_or_else(|| panic!("VERSION is x.y.z: {version}"));
         assert_eq!(
             entries[0].version_tuple(),
             parsed,

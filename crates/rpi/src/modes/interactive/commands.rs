@@ -1619,7 +1619,7 @@ mod tests {
         let (mode, _terminal) = mode_harness().await;
         let ui = &mode.ui_state;
         *lock(&ui.changelog_markdown) =
-            crate::core::changelog::changelog_for_display(Some("0.1.0"));
+            crate::core::changelog::changelog_for_display(Some("0.1.0"), crate::config::VERSION);
         assert!(
             lock(&ui.changelog_markdown).is_some(),
             "a version behind VERSION yields new entries"
