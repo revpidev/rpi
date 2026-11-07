@@ -971,7 +971,8 @@ pub fn installed_extension_name(dir: &Path) -> Option<String> {
 /// `rpi-extension.json` (extension-distribution §4 additive field). The
 /// package manager merges these top-level keys into the global settings only
 /// when absent, so a fresh install can ship a working default (e.g.
-/// rpi-statusline's realtime token rows) without overwriting user config.
+/// rpi-statusline's session-total and live-rate rows) without overwriting
+/// user config.
 pub fn installed_extension_default_settings(dir: &Path) -> Option<Map<String, Value>> {
     let content = std::fs::read_to_string(dir.join("rpi-extension.json")).ok()?;
     let raw: Value = serde_json::from_str(&content).ok()?;

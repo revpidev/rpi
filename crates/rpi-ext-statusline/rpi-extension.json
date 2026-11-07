@@ -14,7 +14,7 @@
     "statusLine": {
       "type": "items",
       "items": [
-        "live-output-tokens",
+        "total-tokens",
         "live-output-rate"
       ],
       "separator": " · ",

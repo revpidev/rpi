@@ -217,9 +217,9 @@ mod tests {
     }
 
     #[test]
-    fn items_defaults_subscribe_no_extra_collection() {
-        // Default items: session-duration + pending live-output-tokens with
-        // liveTokens=false → duration is a local tick, no extra event.
+    fn items_duration_only_subscribes_no_extra_collection() {
+        // `session-duration` alone is a local tick; no message, totals or Git
+        // events are needed.
         let desired = desired_events(Some(&items(&[FieldId::SessionDuration], false)), false);
         assert_eq!(desired, BASE_EVENTS.iter().copied().collect());
         assert!(!desired.contains("message_end"));
@@ -228,6 +228,32 @@ mod tests {
         assert!(!desired.contains("session_compact"));
         assert!(!desired.contains("mode_change"));
         assert!(!desired.contains("agent_start"));
+    }
+
+    #[test]
+    fn items_default_preset_subscribes_session_totals_and_live_rate() {
+        // The shipped fresh-install preset is `total-tokens` +
+        // `live-output-rate` with liveTokens on: totals need the session-stats
+        // triggers, the rate needs the live streaming pair, and nothing else
+        // (no Git/mode/run-state) is collected.
+        let defaults = ItemsConfig::default();
+        assert_eq!(
+            defaults.fields().map(FieldId::id).collect::<Vec<_>>(),
+            vec!["total-tokens", "live-output-rate"]
+        );
+        let desired = desired_events(Some(&StatusLine::Items(defaults)), false);
+        for event in ["turn_end", "agent_settled", "session_compact"] {
+            assert!(desired.contains(event), "default totals add {event}");
+        }
+        for event in LIVE_EVENTS {
+            assert!(desired.contains(event), "default rate adds {event}");
+        }
+        for event in ["tool_execution_end", "mode_change", "agent_start"] {
+            assert!(
+                !desired.contains(event),
+                "default preset must not subscribe {event}"
+            );
+        }
     }
 
     #[test]

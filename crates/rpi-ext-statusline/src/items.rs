@@ -55,13 +55,14 @@ pub struct ItemsConfig {
 
 impl Default for ItemsConfig {
     fn default() -> Self {
-        // Default install: realtime token statistics only. Every other field
-        // (model/session/context/cost/Git/...) stays off until the user
-        // enables it through `/statusline`. `liveTokens` is on so the two
-        // live rows actually render while a response streams.
+        // Default install: the session's absolute token total plus the live
+        // output rate. Every other field (model/session/context/cost/Git/...)
+        // stays off until the user enables it through `/statusline`.
+        // `liveTokens` is on so the rate row actually renders while a
+        // response streams.
         Self {
             entries: vec![
-                ItemEntry::known(FieldId::LiveOutputTokens),
+                ItemEntry::known(FieldId::TotalTokens),
                 ItemEntry::known(FieldId::LiveOutputRate),
             ],
             unknown: Vec::new(),
@@ -278,23 +279,21 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_the_realtime_token_rows_with_display_defaults() {
+    fn defaults_are_the_session_token_total_and_live_rate_with_display_defaults() {
         let config = parse(json!({"type": "items"}));
         let fields: Vec<FieldId> = config.fields().collect();
-        assert_eq!(
-            fields,
-            vec![FieldId::LiveOutputTokens, FieldId::LiveOutputRate]
-        );
+        assert_eq!(fields, vec![FieldId::TotalTokens, FieldId::LiveOutputRate]);
         assert_eq!(config.separator, " · ");
         assert_eq!(config.padding, 0);
         assert_eq!(config.placement, Placement::Status);
         assert_eq!(config.refresh_interval_secs, 5);
         assert!(config.use_colors);
         assert_eq!(config.number_format, NumberFormat::Compact);
-        // Default install: realtime token statistics are the only enabled
-        // fields, and the live switch is on.
+        // Default install: the session total plus the live rate are the only
+        // enabled fields, and the live switch is on.
         assert!(config.live_tokens.enabled);
         assert!(config.live_enabled());
+        assert!(config.needs_session_stats());
         assert!(!config.needs_duration());
     }
 
@@ -355,12 +354,9 @@ mod tests {
             "numberFormat": "weird",
             "liveTokens": "yes"
         }));
-        // Non-array items → default realtime-token preset.
+        // Non-array items → default preset (session total + live rate).
         let fields: Vec<FieldId> = config.fields().collect();
-        assert_eq!(
-            fields,
-            vec![FieldId::LiveOutputTokens, FieldId::LiveOutputRate]
-        );
+        assert_eq!(fields, vec![FieldId::TotalTokens, FieldId::LiveOutputRate]);
         assert_eq!(config.separator, DEFAULT_SEPARATOR);
         assert_eq!(config.padding, crate::config::MAX_PADDING);
         assert_eq!(config.placement, Placement::Status);
@@ -434,10 +430,7 @@ mod tests {
         };
         let object = config.to_settings_object();
         assert_eq!(object["type"], json!("items"));
-        assert_eq!(
-            object["items"],
-            json!(["live-output-tokens", "live-output-rate"])
-        );
+        assert_eq!(object["items"], json!(["total-tokens", "live-output-rate"]));
         assert_eq!(object["separator"], json!(" · "));
         assert_eq!(object["placement"], json!("status"));
         assert_eq!(object["refreshInterval"], json!(5));

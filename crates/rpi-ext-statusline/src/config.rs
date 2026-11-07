@@ -239,16 +239,16 @@ fn parse_command(object: &serde_json::Map<String, Value>) -> Option<StatusLineCo
 /// §1.5: `true` = on with defaults; an object may override `refreshMs`
 /// (clamped 300..5000, out-of-range/invalid falls back to the default);
 /// `false` = off. The missing/wrong-type default is caller-specific: command
-/// mode defaults to off, while the items default install enables the realtime
-/// token rows (see [`parse_live_tokens_with_default`]). Both modes reconcile
-/// the subscription set dynamically.
+/// mode defaults to off, while the items default install enables the session
+/// token total plus the live rate row (see [`parse_live_tokens_with_default`]).
+/// Both modes reconcile the subscription set dynamically.
 pub(crate) fn parse_live_tokens(value: Option<&Value>) -> LiveTokens {
     parse_live_tokens_with_default(value, false)
 }
 
 /// Parse `liveTokens` with an explicit missing/malformed default. Command
 /// mode defaults to off; items mode defaults to on (the default install is
-/// the realtime token rows only).
+/// the session token total plus the live rate row).
 pub(crate) fn parse_live_tokens_with_default(
     value: Option<&Value>,
     default_enabled: bool,

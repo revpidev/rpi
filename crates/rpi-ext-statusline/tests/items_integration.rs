@@ -216,9 +216,14 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
     std::fs::create_dir_all(&agent).expect("mkdir");
     rpi_test_env::set_var("RPI_CODING_AGENT_DIR", &agent);
 
-    // Default install: realtime token statistics only (live-output-tokens +
-    // live-output-rate, liveTokens on); every other field is off.
-    write_settings(json!({"statusLine": {"type": "items"}}));
+    // Explicit live pair: this scenario exercises the tiered live token and
+    // rate rows, so it pins them rather than relying on the install preset.
+    // The shipped fresh-install preset (`total-tokens` + `live-output-rate`)
+    // is covered by `items_defaults_integration.rs`.
+    write_settings(json!({"statusLine": {
+        "type": "items",
+        "items": ["live-output-tokens", "live-output-rate"]
+    }}));
     install_fake_ctx();
     let receipt = rpi_ext_statusline::install_for_test(
         RpiHostCalls {
@@ -253,11 +258,11 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
     ] {
         assert!(
             !at_install.iter().any(|s| s == event),
-            "default items must not subscribe {event}"
+            "the live pair must not subscribe {event}"
         );
     }
 
-    // ── 2. Default frame: idle keeps both live rows as dash placeholders so
+    // ── 2. Live frame: idle keeps both live rows as dash placeholders so
     //        the status line never reflows when a stream starts; a stream
     //        then shows the estimated token/rate pair live, and the exact
     //        provider count on message_end. No shell, no command.
@@ -287,7 +292,7 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         }),
     );
     std::thread::sleep(Duration::from_millis(650));
-    let now = poll_until("default estimated token rows", |records| {
+    let now = poll_until("estimated token rows", |records| {
         last_status_contains(records, "~") && last_status_contains(records, "tok/s")
     });
     let text = status_texts(&now).last().cloned().unwrap_or_default();
@@ -304,7 +309,7 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
             "message": {"role": "assistant", "usage": {"output": 42}},
         }),
     );
-    let now = poll_until("default exact token rows", |records| {
+    let now = poll_until("exact token rows", |records| {
         last_status_contains(records, "42") && last_status_contains(records, "tok/s")
     });
     let text = status_texts(&now).last().cloned().unwrap_or_default();

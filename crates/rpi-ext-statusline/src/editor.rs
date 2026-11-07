@@ -1120,7 +1120,7 @@ Live tokens prefer provider usage, then the bundled tokenizer for the\n\
 model family (DeepSeek, Kimi, GLM, Qwen, Hunyuan, MiniMax), then a\n\
 CJK-aware estimate (~ prefix).\n\
 \n\
-Default items: live-output-tokens + live-output-rate only (all other\n\
+Default items: total-tokens + live-output-rate only (all other\n\
 fields off); adjust them in the editor.\n\
 \n\
 Editor keys: ↑/↓ move · space toggle · K/J reorder · tab page · s save · r reset · q cancel.";
@@ -1148,7 +1148,7 @@ pub fn handle_command(calls: &AsyncHostCalls, args: &str) -> Value {
                     "ui.confirm",
                     json!({
                         "title": "Reset status line?",
-                        "message": "Restore the default realtime-token items (live-output-tokens, live-output-rate) and display options. Other settings are untouched.",
+                        "message": "Restore the default session-total + token-rate items (total-tokens, live-output-rate) and display options. Other settings are untouched.",
                     }),
                 )
                 .ok()
@@ -1315,10 +1315,7 @@ mod tests {
         // Reset restores the default two but preserves unknown ids.
         editor.reset();
         let fields: Vec<FieldId> = editor.draft.fields().collect();
-        assert_eq!(
-            fields,
-            vec![FieldId::LiveOutputTokens, FieldId::LiveOutputRate]
-        );
+        assert_eq!(fields, vec![FieldId::TotalTokens, FieldId::LiveOutputRate]);
         assert_eq!(editor.draft.unknown, vec!["legacy-id"]);
         assert_eq!(editor.draft.placement, Placement::Status);
     }
@@ -1469,7 +1466,7 @@ mod tests {
         assert!(!editor.draft.has_field(FieldId::SessionDuration));
         editor.handle_input("r");
         assert!(!editor.reset_armed);
-        assert!(editor.draft.has_field(FieldId::LiveOutputTokens));
+        assert!(editor.draft.has_field(FieldId::TotalTokens));
         assert!(editor.draft.has_field(FieldId::LiveOutputRate));
     }
 
@@ -1512,7 +1509,7 @@ mod tests {
 
     /// Issue #2: a fresh install has no `statusLine`; opening the editor
     /// shows the default draft, and a plain save (no reset) must write it and
-    /// enable the live token rows.
+    /// enable the default session-total + live-rate rows.
     #[test]
     fn saving_an_unconfigured_settings_enables_default_items() {
         let dir = std::env::temp_dir().join(format!(
@@ -1539,7 +1536,7 @@ mod tests {
         assert_eq!(parsed["statusLine"]["type"], "items");
         assert_eq!(
             parsed["statusLine"]["items"],
-            json!(["live-output-tokens", "live-output-rate"])
+            json!(["total-tokens", "live-output-rate"])
         );
         assert_eq!(parsed["statusLine"]["liveTokens"], true);
         assert_eq!(parsed["statusLine"]["placement"], "status");
@@ -1610,7 +1607,7 @@ mod tests {
         };
         let text = config_text(&items);
         assert!(text.contains("items (Status)"));
-        assert!(text.contains("live-output-tokens"));
+        assert!(text.contains("total-tokens"));
         assert!(text.contains("live-output-rate"));
         assert!(text.contains("liveTokens: on"));
         let command = config::SettingsSnapshot {
