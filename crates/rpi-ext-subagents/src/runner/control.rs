@@ -535,23 +535,17 @@ fn format_long_running_facts(event: &ControlEvent) -> Option<String> {
 
 /// `formatControlNoticeMessage` (`subagent-control.ts:229-281`), adapted to
 /// the rpi action surface (`interrupt`/`status`/`steer`).
+///
+/// The bash `tool_open_threshold` branch (`subagent-control.ts:255-265`) keeps
+/// upstream's inspect-first guidance verbatim: elapsed time alone does not
+/// prove a `bash` call is stuck, and a queued steer does not cancel it. Its
+/// `Command`/`Yield`/`Cancel` lines are [N/A-struct] because rpi has no native
+/// command controller (`event.hasCommandController`), and the transcript
+/// selector rides rpi's top-level `view`/`index` arguments instead of
+/// `options: { ... }`.
 pub fn format_control_notice(event: &ControlEvent) -> String {
-    let nudge = format_control_nudge(event);
-    let steer = format!(
-        "subagent({{ action: \"steer\", id: \"{}\"{}, message: {} }})",
-        event.run_id,
-        event
-            .index
-            .map(|index| format!(", index: {index}"))
-            .unwrap_or_default(),
-        serde_json::to_string(&nudge).unwrap_or_else(|_| "\"\"".to_string())
-    );
     let status = format!(
         "Status: subagent({{ action: \"status\", id: \"{}\" }})",
-        event.run_id
-    );
-    let interrupt = format!(
-        "Interrupt: subagent({{ action: \"interrupt\", id: \"{}\" }})",
         event.run_id
     );
     let mut lines = vec![
@@ -577,6 +571,40 @@ pub fn format_control_notice(event: &ControlEvent) -> String {
     if let Some(facts) = format_long_running_facts(event) {
         lines.push(format!("Facts: {facts}"));
     }
+    if event.reason.as_deref() == Some("tool_open_threshold")
+        && event.current_tool.as_deref() == Some("bash")
+    {
+        lines.push(
+            "Hint: Inspect the running command and recent output before nudging. A queued steer does not cancel an in-flight bash call. A dev server or watch command may intentionally never return. Elapsed time alone does not prove the command is stuck.".to_string(),
+        );
+        lines.push(
+            "Recovery: For a local Pi child explicitly granted subagent_command, yield a needed persistent command or cancel the exact incorrect command, then steer the child. Query command.status to confirm the result. If command controls are unavailable, inspect partial changes and interruption scope before interrupt/resume; interrupt is run-scoped and may affect siblings.".to_string(),
+        );
+        lines.push(status);
+        lines.push(format!(
+            "Transcript: subagent({{ action: \"status\", id: \"{}\", view: \"transcript\"{} }})",
+            event.run_id,
+            event
+                .index
+                .map(|index| format!(", index: {index}"))
+                .unwrap_or_default()
+        ));
+        return lines.join("\n");
+    }
+    let nudge = format_control_nudge(event);
+    let steer = format!(
+        "subagent({{ action: \"steer\", id: \"{}\"{}, message: {} }})",
+        event.run_id,
+        event
+            .index
+            .map(|index| format!(", index: {index}"))
+            .unwrap_or_default(),
+        serde_json::to_string(&nudge).unwrap_or_else(|_| "\"\"".to_string())
+    );
+    let interrupt = format!(
+        "Interrupt: subagent({{ action: \"interrupt\", id: \"{}\" }})",
+        event.run_id
+    );
     if let Some(summary) = &event.recent_failure_summary {
         lines.push(format!("Recent failures: {summary}"));
     }
@@ -730,6 +758,76 @@ mod tests {
             None,
             "inherited resolved config still scales"
         );
+    }
+
+    #[test]
+    fn bash_open_tool_notice_keeps_upstream_inspect_first_guidance() {
+        let event = build_control_event(ControlEventInput {
+            to: Some(ActivityState::NeedsAttention),
+            run_id: "run-bash".to_string(),
+            agent: "worker".to_string(),
+            index: Some(1),
+            ts: 240_000,
+            last_activity_at: Some(0),
+            message: Some("worker has had tool 'bash' open for 240s".to_string()),
+            reason: Some("tool_open_threshold".to_string()),
+            current_tool: Some("bash".to_string()),
+            tool_call_id: Some("call-1".to_string()),
+            current_path: Some("/tmp/t10r3/full.log".to_string()),
+            current_tool_duration_ms: Some(240_000),
+            ..ControlEventInput::default()
+        });
+        let notice = format_control_notice(&event);
+        assert!(
+            notice.contains("Subagent needs attention: worker"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("Signal: worker has had tool 'bash' open for 240s"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("Elapsed time alone does not prove the command is stuck."),
+            "{notice}"
+        );
+        assert!(
+            notice.contains(
+                "Transcript: subagent({ action: \"status\", id: \"run-bash\", view: \"transcript\", index: 1 })"
+            ),
+            "{notice}"
+        );
+        // The bash branch never suggests a steer or an interrupt command:
+        // nudging a healthy long call is exactly what upstream warns against.
+        assert!(!notice.contains("Top-level live async nudge"), "{notice}");
+        assert!(!notice.contains("Interrupt:"), "{notice}");
+
+        // Any other open tool (or a bash event without the open-tool reason)
+        // keeps the generic nudge + steer/interrupt surface.
+        let other = build_control_event(ControlEventInput {
+            to: Some(ActivityState::NeedsAttention),
+            run_id: "run-edit".to_string(),
+            agent: "worker".to_string(),
+            ts: 240_000,
+            reason: Some("tool_open_threshold".to_string()),
+            current_tool: Some("edit".to_string()),
+            ..ControlEventInput::default()
+        });
+        let notice = format_control_notice(&other);
+        assert!(notice.contains("Top-level live async nudge"), "{notice}");
+        assert!(notice.contains("Interrupt:"), "{notice}");
+        assert!(!notice.contains("Transcript:"), "{notice}");
+
+        let bash_without_open_reason = build_control_event(ControlEventInput {
+            to: Some(ActivityState::NeedsAttention),
+            run_id: "run-idle".to_string(),
+            agent: "worker".to_string(),
+            ts: 61_000,
+            last_activity_at: Some(1_000),
+            current_tool: Some("bash".to_string()),
+            ..ControlEventInput::default()
+        });
+        let notice = format_control_notice(&bash_without_open_reason);
+        assert!(notice.contains("Top-level live async nudge"), "{notice}");
     }
 
     #[test]
