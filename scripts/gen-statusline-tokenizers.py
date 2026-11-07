@@ -107,7 +107,7 @@ SOURCES = {
     },
     "kimi": {
         "display": "Kimi",
-        "patterns": ["kimi", "moonshot"],
+        "patterns": ["kimi", "moonshot", "k3"],
         "repo": "moonshotai/Kimi-K2.7-Code",
         "commit": "74797c9c62378b951a1f6fcf5c4631024e9b8bef",
         "license": "Modified MIT",

@@ -239,7 +239,7 @@ const BUILTINS: &[BuiltinTokenizer] = &[
     },
     BuiltinTokenizer {
         id: "kimi",
-        patterns: &["kimi", "moonshot"],
+        patterns: &["kimi", "moonshot", "k3"],
         asset: include_bytes!("../assets/tokenizers/kimi.tok.zst"),
     },
     BuiltinTokenizer {
@@ -896,6 +896,15 @@ mod tests {
             builtin_for_model("kimi-k3.1-pro").map(|builtin| builtin.id),
             Some("kimi")
         );
+        // The `kimi-coding` provider uses bare K3 ids (`k3`, `k3.1-pro`),
+        // so the family keyword must also match without a provider prefix.
+        for model_id in ["k3", "k3-256k", "k3.1-pro", "k3.1-pro-highspeed"] {
+            assert_eq!(
+                builtin_for_model(model_id).map(|builtin| builtin.id),
+                Some("kimi"),
+                "{model_id}"
+            );
+        }
         assert_eq!(
             builtin_for_model("zai-coding-cn/glm-5.3").map(|builtin| builtin.id),
             Some("glm")
@@ -925,6 +934,12 @@ mod tests {
         assert_eq!(deepseek.source, TokenSource::ExactTokenizer);
         assert_eq!(deepseek.total, 2);
         assert_eq!(deepseek.total_marker(), "");
+
+        // The Kimi coding provider reports bare K3 ids; these must use the
+        // bundled Kimi table instead of the `~` heuristic.
+        let kimi = count_breakdown(Some("k3.1-pro"), "hello world", "", "");
+        assert_eq!(kimi.source, TokenSource::ExactTokenizer);
+        assert_eq!(kimi.total_marker(), "");
     }
 
     #[derive(Deserialize)]
