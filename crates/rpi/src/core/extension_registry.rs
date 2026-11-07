@@ -612,28 +612,6 @@ impl RegistryTransport for ReqwestRegistryTransport {
     }
 }
 
-/// Download the first URL that succeeds (design §6: GitHub direct, then
-/// the official-site mirror). Returns the winning URL plus the body; when
-/// every URL fails the error keeps each one's failure reason (same shape
-/// as the binary self-update).
-pub fn download_with_fallback(
-    transport: &dyn RegistryTransport,
-    urls: &[String],
-    timeout: Duration,
-) -> Result<(String, Vec<u8>), String> {
-    let mut failures: Vec<String> = Vec::new();
-    for url in urls {
-        match transport.get(url, timeout) {
-            Ok(bytes) => return Ok((url.clone(), bytes)),
-            Err(error) => failures.push(format!("{url}: {error}")),
-        }
-    }
-    Err(format!(
-        "Could not download from any source: {}",
-        failures.join("; ")
-    ))
-}
-
 /// V18-12 FR-B: download one artifact through the shared engine (resume,
 /// retries, progress). The final file is removed by the caller after the
 /// bytes are read into the install path.

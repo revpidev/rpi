@@ -117,29 +117,17 @@ impl ProgressRenderer {
             .filter(|total| *total > 0)
             .map(|total| (downloaded as f64 / total as f64).clamp(0.0, 1.0));
         if !self.options.tty {
-            let percent = ratio.map(|ratio| (ratio * 100.0) as u64);
-            let milestone = percent
-                .map(|percent| percent / 25 * 25)
-                .filter(|milestone| *milestone > 0);
-            let crossed = milestone.is_some() && milestone != inner.last_percent;
-            let timed_out = now.duration_since(inner.last_non_tty) >= NON_TTY_INTERVAL;
-            if crossed || timed_out || percent == Some(100) {
-                inner.last_percent = milestone.or(percent);
+            let elapsed = now.duration_since(inner.last_non_tty);
+            if let Some((text, milestone)) =
+                non_tty_checkpoint(downloaded, total, ratio, inner.last_percent, elapsed)
+            {
+                inner.last_percent = milestone;
                 inner.last_non_tty = now;
-                let text = match total {
-                    Some(total) => format!(
-                        "Downloading {} / {} ({:.0}%)",
-                        format_bytes(downloaded as f64),
-                        format_bytes(total as f64),
-                        ratio.unwrap_or(0.0) * 100.0
-                    ),
-                    None => format!("Downloading {}", format_bytes(downloaded as f64)),
-                };
                 self.write_line(&text);
             }
             return;
         }
-        if now.duration_since(inner.last_render) < THROTTLE && ratio != Some(1.0) {
+        if !tty_should_render(now.duration_since(inner.last_render), ratio) {
             return;
         }
         inner.last_render = now;
@@ -169,6 +157,40 @@ impl ProgressRenderer {
         let _ = write!(stderr, "\r\x1b[2K{line}");
         let _ = stderr.flush();
     }
+}
+
+/// Non-TTY checkpoints: 25/50/75/100% or a 5s heartbeat. Returns the line
+/// and the milestone to remember (None for unknown totals).
+pub(crate) fn non_tty_checkpoint(
+    downloaded: u64,
+    total: Option<u64>,
+    ratio: Option<f64>,
+    last_percent: Option<u64>,
+    elapsed: Duration,
+) -> Option<(String, Option<u64>)> {
+    let percent = ratio.map(|ratio| (ratio * 100.0) as u64);
+    let milestone = percent
+        .map(|percent| percent / 25 * 25)
+        .filter(|milestone| *milestone > 0);
+    let crossed = milestone.is_some() && milestone != last_percent;
+    let timed_out = elapsed >= NON_TTY_INTERVAL;
+    if !(crossed || timed_out || percent == Some(100)) {
+        return None;
+    }
+    let text = match total {
+        Some(total) => format!(
+            "Downloading {} / {} ({:.0}%)",
+            format_bytes(downloaded as f64),
+            format_bytes(total as f64),
+            ratio.unwrap_or(0.0) * 100.0
+        ),
+        None => format!("Downloading {}", format_bytes(downloaded as f64)),
+    };
+    Some((text, milestone.or(percent)))
+}
+
+fn tty_should_render(elapsed: Duration, ratio: Option<f64>) -> bool {
+    elapsed >= THROTTLE || ratio == Some(1.0)
 }
 
 impl DownloadObserver for ProgressRenderer {
@@ -206,6 +228,18 @@ impl DownloadObserver for ProgressRenderer {
                     } else {
                         format!(" — waiting {:.1}s", delay.as_secs_f64())
                     }
+                ));
+            }
+            DownloadEvent::Switching {
+                from,
+                to,
+                reason,
+                kept_bytes,
+            } => {
+                self.clear_line(&mut inner);
+                self.write_line(&format!(
+                    "Switching from {from} to {to} (kept {}): {reason}",
+                    format_bytes(*kept_bytes as f64)
                 ));
             }
             DownloadEvent::Verifying { file } => {
@@ -314,5 +348,39 @@ mod tests {
         let unknown_total = render_line(100, 300, None, None, 0.0, 4, false);
         assert!(unknown_total.contains("300 B"), "{unknown_total}");
         assert!(unknown_total.contains('?'), "{unknown_total}");
+    }
+
+    #[test]
+    fn non_tty_checkpoints_are_quarterly_or_five_seconds() {
+        let start = Duration::ZERO;
+        assert!(non_tty_checkpoint(0, Some(1024), Some(0.0), None, start).is_none());
+        assert!(
+            non_tty_checkpoint(256, Some(1024), Some(0.25), None, start)
+                .unwrap()
+                .0
+                .contains("25%")
+        );
+        // Same milestone again: no line unless the heartbeat elapsed.
+        assert!(non_tty_checkpoint(300, Some(1024), Some(0.29), Some(25), start).is_none());
+        assert!(
+            non_tty_checkpoint(300, Some(1024), Some(0.29), Some(25), NON_TTY_INTERVAL).is_some()
+        );
+        assert!(
+            non_tty_checkpoint(1024, Some(1024), Some(1.0), Some(75), start)
+                .unwrap()
+                .0
+                .contains("100%")
+        );
+        let unknown = non_tty_checkpoint(300, None, None, None, NON_TTY_INTERVAL)
+            .expect("heartbeat for unknown totals")
+            .0;
+        assert!(unknown.contains("300 B"), "{unknown}");
+    }
+
+    #[test]
+    fn tty_throttle_allows_completion_but_not_spam() {
+        assert!(!tty_should_render(Duration::from_millis(10), Some(0.5)));
+        assert!(tty_should_render(THROTTLE, Some(0.5)));
+        assert!(tty_should_render(Duration::ZERO, Some(1.0)));
     }
 }

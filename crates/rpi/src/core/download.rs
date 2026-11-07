@@ -167,6 +167,12 @@ pub enum DownloadEvent {
         downloaded: u64,
         delay: Duration,
     },
+    Switching {
+        from: String,
+        to: String,
+        reason: String,
+        kept_bytes: u64,
+    },
     Verifying {
         file: PathBuf,
     },
@@ -329,6 +335,72 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// A per-artifact lock (`create_new`) so two concurrent `rpi update`
+/// processes cannot interleave appends. A lock older than an hour is
+/// considered abandoned and replaced.
+struct PartialLock {
+    path: PathBuf,
+}
+
+impl PartialLock {
+    fn acquire(path: &Path) -> Result<Self, DownloadError> {
+        for _ in 0..2 {
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(path) {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "{}", std::process::id());
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age >= Duration::from_secs(3600));
+                    if stale {
+                        let _ = std::fs::remove_file(path);
+                        continue;
+                    }
+                    return Err(DownloadError::policy(format!(
+                        "another download for {} is already running (lock: {})",
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("artifact"),
+                        path.display()
+                    )));
+                }
+                Err(error) => {
+                    return Err(DownloadError::new(
+                        DownloadErrorKind::Io,
+                        format!(
+                            "could not create the download lock {}: {error}",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        Err(DownloadError::policy(format!(
+            "could not acquire the download lock {}",
+            path.display()
+        )))
+    }
+}
+
+impl Drop for PartialLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Resumable download engine. Owns the policy/observer; `sleep` is
 /// injectable so tests never wait on backoff.
 pub struct Downloader<'a> {
@@ -362,6 +434,10 @@ impl<'a> Downloader<'a> {
         &self.policy
     }
 
+    pub fn observer(&self) -> &dyn DownloadObserver {
+        self.observer
+    }
+
     /// Download one URL, resuming `<file>.part` when possible. The final
     /// file is only created after the complete sha256 matches.
     pub fn download(&self, spec: &DownloadSpec) -> Result<DownloadOutcome, DownloadError> {
@@ -374,6 +450,9 @@ impl<'a> Downloader<'a> {
                 ),
             ));
         }
+        gc_stale_partials(&spec.dest_dir, self.policy.partial_max_age);
+        let _download_lock =
+            PartialLock::acquire(&spec.dest_dir.join(format!("{}.part.lock", spec.file_name)))?;
         let final_path = spec.dest_dir.join(&spec.file_name);
         let partial_path = spec.dest_dir.join(format!("{}.part", spec.file_name));
         let metadata_path = spec.dest_dir.join(format!("{}.part.json", spec.file_name));
@@ -688,13 +767,6 @@ impl<'a> Downloader<'a> {
     }
 }
 
-/// Clean partial files for a destination before starting a different
-/// version (version changes invalidate resume data, R3.10.6).
-pub fn clear_partials(dest_dir: &Path, file_name: &str) {
-    let _ = std::fs::remove_file(dest_dir.join(format!("{file_name}.part")));
-    let _ = std::fs::remove_file(dest_dir.join(format!("{file_name}.part.json")));
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenMode {
     Truncate,
@@ -871,6 +943,36 @@ fn retry_after_for(head: &DownloadResponseHead) -> Option<Duration> {
     head.retry_after
 }
 
+/// Remove abandoned partials (older than `max_age`) in a staging directory
+/// (R3.10.6). Superseded artifact names are never requested again, so the
+/// per-download check alone cannot expire them.
+pub fn gc_stale_partials(dir: &Path, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = unix_now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".part.json") else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_str::<PartialMetadata>(&text) else {
+            continue;
+        };
+        if now.saturating_sub(metadata.created_at) <= max_age.as_secs() {
+            continue;
+        }
+        let _ = std::fs::remove_file(dir.join(format!("{stem}.part")));
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// Loops over mirror URLs. A transport/integrity failure ends that URL;
 /// integrity failures abort the whole transfer (never switch mirrors).
 pub fn download_from_sources(
@@ -879,7 +981,7 @@ pub fn download_from_sources(
     urls: &[String],
 ) -> Result<DownloadOutcome, DownloadError> {
     let mut failures: Vec<String> = Vec::new();
-    for url in urls {
+    for (index, url) in urls.iter().enumerate() {
         let mut candidate = spec.clone();
         candidate.url = url.clone();
         match downloader.download(&candidate) {
@@ -887,6 +989,20 @@ pub fn download_from_sources(
             Err(error) => {
                 if error.kind == DownloadErrorKind::Integrity {
                     return Err(error);
+                }
+                let kept_bytes =
+                    std::fs::metadata(spec.dest_dir.join(format!("{}.part", spec.file_name)))
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
+                if let Some(next) = urls.get(index + 1) {
+                    downloader
+                        .observer()
+                        .on_download_event(&DownloadEvent::Switching {
+                            from: url.clone(),
+                            to: next.clone(),
+                            reason: error.message.clone(),
+                            kept_bytes,
+                        });
                 }
                 failures.push(format!("{url}: {}", error.message));
             }
@@ -1051,6 +1167,7 @@ mod tests {
         status: u16,
         content_length: Option<u64>,
         content_range_total: Option<u64>,
+        retry_after: Option<Duration>,
         chunks: Vec<Result<Vec<u8>, DownloadError>>,
     }
 
@@ -1060,6 +1177,7 @@ mod tests {
                 status: 200,
                 content_length: Some(bytes.len() as u64),
                 content_range_total: None,
+                retry_after: None,
                 chunks: vec![Ok(bytes.to_vec())],
             }
         }
@@ -1103,6 +1221,7 @@ mod tests {
                 status: response.status,
                 content_length: response.content_length,
                 content_range_total: response.content_range_total,
+                retry_after: response.retry_after,
                 ..Default::default()
             };
             sink(DownloadStreamEvent::Head(&head))?;
@@ -1217,6 +1336,7 @@ mod tests {
                 status: 200,
                 content_length: Some(bytes.len() as u64),
                 content_range_total: None,
+                retry_after: None,
                 chunks: vec![Err(DownloadError::new(
                     DownloadErrorKind::Reset,
                     "connection reset",
@@ -1236,12 +1356,56 @@ mod tests {
     }
 
     #[test]
+    fn retry_exhaustion_returns_policy_and_keeps_partial() {
+        let dir = TempDir::new("exhausted");
+        let transport = FakeTransport::new(vec![
+            FakeResponse {
+                status: 200,
+                content_length: Some(4),
+                content_range_total: None,
+                retry_after: None,
+                chunks: vec![Err(DownloadError::new(
+                    DownloadErrorKind::Reset,
+                    "connection reset",
+                ))],
+            },
+            FakeResponse {
+                status: 200,
+                content_length: Some(4),
+                content_range_total: None,
+                retry_after: None,
+                chunks: vec![Err(DownloadError::new(
+                    DownloadErrorKind::Reset,
+                    "connection reset again",
+                ))],
+            },
+        ]);
+        let observer = RecordingObserver::default();
+        let policy = DownloadPolicy {
+            max_attempts: 2,
+            ..DownloadPolicy::for_tests()
+        };
+        let downloader = Downloader::new(&transport, policy, &observer).with_sleeper(|_| {});
+        let error = downloader
+            .download(&spec(dir.path(), None))
+            .expect_err("two resets exhaust the policy");
+        assert_eq!(error.kind, DownloadErrorKind::Policy);
+        assert!(
+            error.message.contains("after 2 attempts"),
+            "{}",
+            error.message
+        );
+        assert_eq!(transport.calls().len(), 2);
+    }
+
+    #[test]
     fn non_retryable_http_status_stops_immediately() {
         let dir = TempDir::new("404");
         let transport = FakeTransport::new(vec![FakeResponse {
             status: 404,
             content_length: Some(0),
             content_range_total: None,
+            retry_after: None,
             chunks: Vec::new(),
         }]);
         let observer = RecordingObserver::default();
@@ -1276,6 +1440,7 @@ mod tests {
                 status: 200,
                 content_length: Some(11),
                 content_range_total: None,
+                retry_after: None,
                 chunks: vec![
                     Ok(b"hello ".to_vec()),
                     Err(DownloadError::new(
@@ -1288,6 +1453,7 @@ mod tests {
                 status: 206,
                 content_length: Some(5),
                 content_range_total: Some(11),
+                retry_after: None,
                 chunks: vec![Ok(b"world".to_vec())],
             },
         ]);
@@ -1315,6 +1481,7 @@ mod tests {
                 status: 200,
                 content_length: Some(11),
                 content_range_total: None,
+                retry_after: None,
                 chunks: vec![
                     Ok(b"hello ".to_vec()),
                     Err(DownloadError::new(
@@ -1355,6 +1522,7 @@ mod tests {
             status: 416,
             content_length: Some(0),
             content_range_total: Some(bytes.len() as u64),
+            retry_after: None,
             chunks: Vec::new(),
         }]);
         let observer = RecordingObserver::default();
@@ -1405,6 +1573,7 @@ mod tests {
                 status: 404,
                 content_length: Some(0),
                 content_range_total: None,
+                retry_after: None,
                 chunks: Vec::new(),
             },
             FakeResponse::ok(bytes),
@@ -1420,6 +1589,14 @@ mod tests {
         let outcome = download_from_sources(&downloader, &spec, &urls).expect("mirror");
         assert_eq!(outcome.url, "https://mirror.test/a.rpix");
         assert_eq!(std::fs::read(&outcome.path).unwrap(), bytes);
+        assert!(
+            observer.events.lock().unwrap().iter().any(|event| matches!(
+                event,
+                DownloadEvent::Switching { from, to, .. }
+                    if from.contains("github.test") && to.contains("mirror.test")
+            )),
+            "fallback must emit a Switching event"
+        );
     }
 
     #[test]
@@ -1438,6 +1615,85 @@ mod tests {
         let error = download_from_sources(&downloader, &spec, &urls).unwrap_err();
         assert_eq!(error.kind, DownloadErrorKind::Integrity);
         assert_eq!(transport.calls().len(), 1);
+    }
+
+    #[test]
+    fn retry_after_overrides_the_exponential_delay() {
+        let dir = TempDir::new("retry-after");
+        let bytes = b"after wait";
+        let transport = FakeTransport::new(vec![
+            FakeResponse {
+                status: 429,
+                content_length: Some(0),
+                content_range_total: None,
+                retry_after: Some(Duration::from_secs(2)),
+                chunks: Vec::new(),
+            },
+            FakeResponse::ok(bytes),
+        ]);
+        let observer = RecordingObserver::default();
+        let slept = Mutex::new(Vec::new());
+        let downloader = Downloader::new(&transport, DownloadPolicy::for_tests(), &observer)
+            .with_sleeper(|delay| slept.lock().unwrap().push(delay));
+        let outcome = downloader
+            .download(&spec(dir.path(), Some(&hex(bytes))))
+            .expect("429 then success");
+        assert_eq!(outcome.attempts, 2);
+        assert_eq!(*slept.lock().unwrap(), vec![Duration::from_secs(2)]);
+    }
+
+    #[test]
+    fn a_concurrent_download_lock_blocks_a_second_writer() {
+        let dir = TempDir::new("lock");
+        let lock = dir.path().join("a.rpix.part.lock");
+        std::fs::write(&lock, b"123").unwrap();
+        let transport = FakeTransport::new(vec![FakeResponse::ok(b"body")]);
+        let observer = RecordingObserver::default();
+        let error = downloader(&transport, &observer)
+            .download(&spec(dir.path(), None))
+            .unwrap_err();
+        assert_eq!(error.kind, DownloadErrorKind::Policy);
+        assert!(
+            error.message.contains("already running"),
+            "{}",
+            error.message
+        );
+        assert_eq!(transport.calls().len(), 0);
+
+        // An abandoned lock is replaced.
+        let modified = std::time::SystemTime::now() - Duration::from_secs(7200);
+        let file = std::fs::File::options().write(true).open(&lock).unwrap();
+        file.set_modified(modified).unwrap();
+        let transport = FakeTransport::new(vec![FakeResponse::ok(b"body")]);
+        let observer = RecordingObserver::default();
+        let outcome = downloader(&transport, &observer)
+            .download(&spec(dir.path(), None))
+            .expect("stale lock replaced");
+        assert_eq!(std::fs::read(outcome.path).unwrap(), b"body");
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn stale_gc_removes_abandoned_version_partials() {
+        let dir = TempDir::new("gc");
+        let stale = PartialMetadata {
+            url: "https://example.test/old.rpix".to_owned(),
+            version: "0.0.1".to_owned(),
+            file_name: "old.rpix".to_owned(),
+            etag: None,
+            last_modified: None,
+            total: None,
+            created_at: unix_now().saturating_sub(DEFAULT_PARTIAL_MAX_AGE.as_secs() + 1),
+        };
+        std::fs::write(dir.path().join("old.rpix.part"), b"old").unwrap();
+        std::fs::write(
+            dir.path().join("old.rpix.part.json"),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+        gc_stale_partials(dir.path(), DEFAULT_PARTIAL_MAX_AGE);
+        assert!(!dir.path().join("old.rpix.part").exists());
+        assert!(!dir.path().join("old.rpix.part.json").exists());
     }
 
     #[test]
