@@ -474,6 +474,11 @@ pub struct EngineState {
     pub mounted: Option<Placement>,
     /// Absolute `ctx.sessionStats` cache (items mode; TE52 R20 §4.2).
     pub session_stats: SessionStatsCache,
+    /// Exact output tokens of assistant messages that ended after the last
+    /// applied snapshot (items `live-total-tokens`; cleared by the next
+    /// applied `ctx.sessionStats` reply, so it never double counts a
+    /// committed message).
+    pending_output: u64,
     /// Local Git probe cache for project-name/git-branch (TE52 R20 §4.4).
     pub git: GitCache,
     /// Items-mode last rendered value of every live row. Between two
@@ -501,6 +506,7 @@ impl Default for EngineState {
             live: None,
             mounted: None,
             session_stats: SessionStatsCache::default(),
+            pending_output: 0,
             git: GitCache::default(),
             last_live_values: Vec::new(),
         }
@@ -575,6 +581,40 @@ impl EngineState {
         self.live.as_ref().map(|live| live.peek(now))
     }
 
+    /// Exact output tokens accumulated since the last applied session
+    /// snapshot (`live-total-tokens`).
+    pub fn pending_output(&self) -> u64 {
+        self.pending_output
+    }
+
+    /// Drop the pending live total: the next applied snapshot already counts
+    /// these messages, or an old session's numbers must not leak into a new
+    /// one.
+    pub fn clear_pending_output(&mut self) {
+        self.pending_output = 0;
+    }
+
+    /// `message_end`: freeze the live measurement and accumulate the
+    /// assistant's exact output for the live session total. An aborted or
+    /// usage-less message contributes nothing here; its local estimate is
+    /// dropped when the stream settles instead of inflating the committed
+    /// total.
+    pub fn on_message_end(&mut self, message: &Value) {
+        if let Some(live) = self.live.as_mut() {
+            live.on_message_end(message);
+        }
+        // Only assistant output feeds the live session total; other message
+        // kinds may carry usage-shaped fields but are not model output.
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            return;
+        }
+        if let Some(output) = message.pointer("/usage/output").and_then(Value::as_u64)
+            && output > 0
+        {
+            self.pending_output = self.pending_output.saturating_add(output);
+        }
+    }
+
     /// `message_end`: accumulate `message.usage` when present (assistant
     /// messages). Returns whether anything changed (drives the refresh).
     pub fn accumulate_usage(&mut self, message: &Value) -> bool {
@@ -601,6 +641,7 @@ impl EngineState {
         // every case (reload included: identity is re-checked on the next
         // reply; the snapshot is never re-added).
         self.session_stats.begin_session(reason);
+        self.pending_output = 0;
         // The held live footer belongs to the previous session's messages.
         self.last_live_values.clear();
         match reason {
@@ -1104,6 +1145,24 @@ mod tests {
         assert_eq!(state.last_usage().map(|t| t.input), Some(50));
         // No usage (e.g. a user message) → no change.
         assert!(!state.accumulate_usage(&json!({"role": "user"})));
+    }
+
+    #[test]
+    fn message_end_accumulates_and_clears_the_pending_live_total() {
+        let mut state = EngineState::default();
+        state.on_message_end(&json!({"role": "assistant", "usage": {"output": 42}}));
+        assert_eq!(state.pending_output(), 42);
+        // Aborted/usage-less messages add nothing: the local estimate is not
+        // promoted into the committed total.
+        state.on_message_end(&json!({"role": "assistant", "usage": {"output": 0}}));
+        state.on_message_end(&json!({"role": "assistant"}));
+        assert_eq!(state.pending_output(), 42);
+        state.clear_pending_output();
+        assert_eq!(state.pending_output(), 0);
+        // A new session drops the previous session's pending part.
+        state.on_message_end(&json!({"role": "assistant", "usage": {"output": 7}}));
+        state.on_session_start(Some("new"));
+        assert_eq!(state.pending_output(), 0);
     }
 
     #[test]

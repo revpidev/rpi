@@ -218,8 +218,8 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
 
     // Explicit live pair: this scenario exercises the tiered live token and
     // rate rows, so it pins them rather than relying on the install preset.
-    // The shipped fresh-install preset (`total-tokens` + `live-output-rate`)
-    // is covered by `items_defaults_integration.rs`.
+    // The shipped fresh-install preset (`live-total-tokens` +
+    // `live-output-rate`) is covered by `items_defaults_integration.rs`.
     write_settings(json!({"statusLine": {
         "type": "items",
         "items": ["live-output-tokens", "live-output-rate"]
@@ -435,7 +435,7 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
     );
 
     // ── 3. Field selection reconciles the extra subscriptions and renders
-    //        the strict 29-field values (aliases + unknown id skipped).
+    //        the strict 30-field values (aliases + unknown id skipped).
     write_settings(json!({"statusLine": {
         "type": "items",
         "items": [

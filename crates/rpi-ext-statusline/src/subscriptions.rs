@@ -232,14 +232,14 @@ mod tests {
 
     #[test]
     fn items_default_preset_subscribes_session_totals_and_live_rate() {
-        // The shipped fresh-install preset is `total-tokens` +
+        // The shipped fresh-install preset is `live-total-tokens` +
         // `live-output-rate` with liveTokens on: totals need the session-stats
         // triggers, the rate needs the live streaming pair, and nothing else
         // (no Git/mode/run-state) is collected.
         let defaults = ItemsConfig::default();
         assert_eq!(
             defaults.fields().map(FieldId::id).collect::<Vec<_>>(),
-            vec!["total-tokens", "live-output-rate"]
+            vec!["live-total-tokens", "live-output-rate"]
         );
         let desired = desired_events(Some(&StatusLine::Items(defaults)), false);
         for event in ["turn_end", "agent_settled", "session_compact"] {

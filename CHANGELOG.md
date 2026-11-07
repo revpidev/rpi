@@ -28,7 +28,7 @@
 ### Fixed
 
 - **Terminal color queries and exit restore** (rpi#77, ADR-0045): a zero-reply DA1 no longer closes the startup OSC color query empty; a background-less first report retries once, the deadline is SSH-aware (100ms local / 500ms SSH, `RPI_TUI_COLOR_TIMEOUT` override), the panic/signal restore starts with `?2026l`, SIGINT restores instead of dying mid-reprint, and shutdown drains queued replies before stop. This fixes `system` losing all panel backgrounds on the first launch after a fullscreen Ctrl+C exit.
-- **Fresh statusline install defaults** (rpi#2, ADR-0046): extension manifests may declare `defaultSettings`; `rpi install` seeds only absent global keys after persisting `packages`. `rpi-statusline` ships the session token total plus the live rate (`total-tokens`, `live-output-rate`), so a fresh install shows the session total and rate rows immediately; existing values and project-local installs are untouched, and the `/statusline` editor now labels an unconfigured draft.
+- **Fresh statusline install defaults** (rpi#2, ADR-0046): extension manifests may declare `defaultSettings`; `rpi install` seeds only absent global keys after persisting `packages`. `rpi-statusline` ships the live session total plus the live rate (`live-total-tokens`, `live-output-rate`), so a fresh install shows the growing session total and rate rows immediately; existing values and project-local installs are untouched, and the `/statusline` editor now labels an unconfigured draft.
 
 ### Internal
 

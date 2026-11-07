@@ -258,10 +258,9 @@ fn handle_dispatch(message: &Value) -> Value {
             let message = payload.get("message").cloned().unwrap_or(Value::Null);
             with_engine(|engine| {
                 engine.accumulate_usage(&message);
-                // FR-C/FR-D: exact output tokens + streaming=false.
-                if let Some(live) = engine.live.as_mut() {
-                    live.on_message_end(&message);
-                }
+                // FR-C/FR-D: exact output tokens + streaming=false; also
+                // accumulates the live session-total contribution.
+                engine.on_message_end(&message);
             });
             Trigger::Event("message_end")
         }

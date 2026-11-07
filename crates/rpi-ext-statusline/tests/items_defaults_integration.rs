@@ -2,11 +2,11 @@
 //!
 //! A separate test binary (own process, own `OnceLock` install) so the
 //! scenario can start with the shared `ItemsConfig::default()` preset and
-//! verify the shipped default end to end: `total-tokens` (the session's
-//! absolute token total from `ctx.sessionStats`) plus `live-output-rate`
-//! (the live tok/s placeholder while idle), with `liveTokens` on. The tiered
-//! live-token behavior lives in `items_integration.rs`, which pins an
-//! explicit live pair.
+//! verify the shipped default end to end: `live-total-tokens` (the session
+//! snapshot total plus the not-yet-committed assistant output) plus
+//! `live-output-rate` (the live tok/s placeholder while idle), with
+//! `liveTokens` on. The tiered live-token behavior lives in
+//! `items_integration.rs`, which pins an explicit live pair.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -193,7 +193,7 @@ fn last_status_contains(records: &[(String, Value)], needle: &str) -> bool {
 }
 
 #[test]
-fn fresh_install_preset_is_session_total_tokens_plus_live_rate() {
+fn fresh_install_preset_is_live_session_total_plus_rate() {
     let agent =
         std::env::temp_dir().join(format!("rpi-statusline-defaults-{}", std::process::id()));
     std::fs::create_dir_all(&agent).expect("mkdir");
@@ -211,7 +211,7 @@ fn fresh_install_preset_is_session_total_tokens_plus_live_rate() {
     assert!(receipt.get("error").is_none(), "install: {receipt:#?}");
 
     // ── 1. Field-driven subscriptions at install: the base lifecycle, the
-    //        session-stats triggers for `total-tokens`, and the live pair
+    //        session-stats triggers for `live-total-tokens`, and the live pair
     //        for `live-output-rate`; nothing else is collected.
     let at_install = subscribed(&records());
     for event in [
@@ -265,8 +265,9 @@ fn fresh_install_preset_is_session_total_tokens_plus_live_rate() {
         "the total row is the new snapshot: {text:?}"
     );
 
-    // ── 4. Live behavior still applies to the rate row: a stream produces a
-    //        tok/s value next to the unchanged absolute total.
+    // ── 4. While a response streams the total grows by the current live
+    //        output: the local estimate is marked with `~` and the rate row
+    //        is live.
     send_event(
         "message_start",
         json!({"type": "message_start", "message": {"role": "assistant"}}),
@@ -284,15 +285,55 @@ fn fresh_install_preset_is_session_total_tokens_plus_live_rate() {
         }),
     );
     std::thread::sleep(Duration::from_millis(650));
-    let streaming = poll_until("default rate row while streaming", |records| {
+    let streaming = poll_until("live total and rate while streaming", |records| {
         status_texts(records).last().is_some_and(|text| {
-            text.starts_with("120 · ") && text.contains("tok/s") && !text.contains("- tok/s")
+            text.starts_with('~')
+                && text.contains("tok/s")
+                && !text.contains("- tok/s")
+                && !text.starts_with("120 · ")
         })
     });
     let text = status_texts(&streaming).last().cloned().unwrap_or_default();
     assert!(
-        text.starts_with("120 · "),
-        "the absolute total stays put while the rate streams: {text:?}"
+        text.starts_with('~'),
+        "the streaming contribution is an estimate: {text:?}"
+    );
+
+    // ── 5. `message_end` reports the exact output (42): the pending part
+    //        keeps the total at snapshot + 42 (= 162) until the next
+    //        snapshot, and the estimate marker is gone.
+    send_event(
+        "message_end",
+        json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "usage": {"output": 42}},
+        }),
+    );
+    let settled = poll_until("pending live total after message_end", |records| {
+        status_texts(records)
+            .last()
+            .is_some_and(|text| text.starts_with("162 · "))
+    });
+    let text = status_texts(&settled).last().cloned().unwrap_or_default();
+    assert!(
+        !text.contains('~'),
+        "the provider-exact pending part drops the marker: {text:?}"
+    );
+
+    // ── 6. The committed snapshot (input 20 + output 62 + cacheRead 30 +
+    //        cacheWrite 50 = 162) replaces the pending part on `turn_end`:
+    //        the row stays at 162 instead of double counting to 204.
+    set_canned("ctx.sessionStats", session_stats(20, 62, 30, 50));
+    send_event("turn_end", json!({"type": "turn_end"}));
+    let committed = poll_until("committed total after snapshot refresh", |records| {
+        status_texts(records)
+            .last()
+            .is_some_and(|text| text.starts_with("162 · "))
+    });
+    let text = status_texts(&committed).last().cloned().unwrap_or_default();
+    assert!(
+        !text.contains("204"),
+        "pending must not double count: {text:?}"
     );
 
     let _ = std::fs::remove_dir_all(&agent);

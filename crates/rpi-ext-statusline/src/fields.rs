@@ -1,4 +1,4 @@
-//! The strict 29-field registry for `statusLine.type:"items"` (TE52 /
+//! The strict 30-field registry for `statusLine.type:"items"` (TE52 /
 //! ADR-0040 R20 §4.2–§4.3).
 //!
 //! One static descriptor table describes every field: its canonical id, an
@@ -69,7 +69,7 @@ pub enum FieldId {
     ContextRemaining,
     ContextWindowSize,
     ContextTokens,
-    // Session & tokens (11)
+    // Session & tokens (12)
     SessionName,
     SessionCost,
     SessionDuration,
@@ -77,6 +77,9 @@ pub enum FieldId {
     TotalInputTokens,
     TotalOutputTokens,
     TotalTokens,
+    /// Session snapshot total plus the in-flight assistant output
+    /// (`liveTotal = snapshot + pendingExact + currentLive`).
+    LiveTotalTokens,
     TurnCount,
     StepCount,
     CacheReadTokens,
@@ -90,8 +93,8 @@ pub enum FieldId {
     LiveToolcallTokens,
 }
 
-/// All 29 fields in registry order.
-pub const ALL_FIELDS: [FieldId; 29] = [
+/// All 30 fields in registry order.
+pub const ALL_FIELDS: [FieldId; 30] = [
     FieldId::Model,
     FieldId::ModelWithReasoning,
     FieldId::Reasoning,
@@ -111,6 +114,7 @@ pub const ALL_FIELDS: [FieldId; 29] = [
     FieldId::TotalInputTokens,
     FieldId::TotalOutputTokens,
     FieldId::TotalTokens,
+    FieldId::LiveTotalTokens,
     FieldId::TurnCount,
     FieldId::StepCount,
     FieldId::CacheReadTokens,
@@ -146,6 +150,7 @@ impl FieldId {
             Self::TotalInputTokens => "total-input-tokens",
             Self::TotalOutputTokens => "total-output-tokens",
             Self::TotalTokens => "total-tokens",
+            Self::LiveTotalTokens => "live-total-tokens",
             Self::TurnCount => "turn-count",
             Self::StepCount => "step-count",
             Self::CacheReadTokens => "cache-read-tokens",
@@ -186,6 +191,7 @@ impl FieldId {
                 | Self::LiveTextTokens
                 | Self::LiveThinkingTokens
                 | Self::LiveToolcallTokens
+                | Self::LiveTotalTokens
         )
     }
 
@@ -198,6 +204,7 @@ impl FieldId {
                 | Self::TotalInputTokens
                 | Self::TotalOutputTokens
                 | Self::TotalTokens
+                | Self::LiveTotalTokens
                 | Self::TurnCount
                 | Self::StepCount
                 | Self::CacheReadTokens
@@ -463,6 +470,9 @@ pub struct FieldData {
     pub context: Option<ContextInfo>,
     pub session_name: Option<String>,
     pub stats: Option<SessionStats>,
+    /// Exact output tokens of assistant messages that ended after the last
+    /// applied `ctx.sessionStats` snapshot (`live-total-tokens` only).
+    pub pending_output: u64,
     pub live: Option<LiveView>,
     /// Last rendered value of every live row (items mode): a row with no
     /// fresh value in this frame (the gap between two assistant messages, the
@@ -675,6 +685,34 @@ fn raw_value(id: FieldId, data: &FieldData) -> Option<FieldValue> {
                 .saturating_add(tokens.cache_write);
             Some(FieldValue::new(
                 format_tokens(total, data.number_format),
+                Tone::Plain,
+            ))
+        }
+        FieldId::LiveTotalTokens => {
+            // The snapshot total plus the not-yet-committed assistant output:
+            // the exact output of messages that ended since the last applied
+            // snapshot (`pending_output`), plus the current message's live
+            // output while it streams. Estimates keep the `~` marker; the
+            // snapshot handoff clears the pending part, so the row never
+            // double counts a committed message.
+            let tokens = data.stats.as_ref()?.tokens;
+            let mut total = tokens
+                .input
+                .saturating_add(tokens.output)
+                .saturating_add(tokens.cache_read)
+                .saturating_add(tokens.cache_write)
+                .saturating_add(data.pending_output);
+            let mut marker = "";
+            if let Some(output) = data
+                .live
+                .filter(|live| live.streaming)
+                .and_then(LiveView::reported_output)
+            {
+                total = total.saturating_add(output.total);
+                marker = output.total_marker();
+            }
+            Some(FieldValue::new(
+                format!("{marker}{}", format_tokens(total, data.number_format)),
                 Tone::Plain,
             ))
         }
@@ -1029,6 +1067,7 @@ mod tests {
             }),
             session_name: Some("te52".into()),
             stats: Some(stats()),
+            pending_output: 0,
             live: Some(LiveView {
                 streaming: true,
                 output_tokens: Some(123),
@@ -1058,12 +1097,12 @@ mod tests {
     }
 
     #[test]
-    fn registry_is_exactly_29_unique_fields() {
-        assert_eq!(ALL_FIELDS.len(), 29);
+    fn registry_is_exactly_30_unique_fields() {
+        assert_eq!(ALL_FIELDS.len(), 30);
         let mut ids: Vec<&str> = ALL_FIELDS.iter().map(|id| id.id()).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 29);
+        assert_eq!(ids.len(), 30);
         for id in ALL_FIELDS {
             assert_eq!(FieldId::parse(id.id()), Some(id));
         }
@@ -1114,6 +1153,50 @@ mod tests {
             value(FieldId::SessionDuration, &data).unwrap().text,
             "2h 34m"
         );
+    }
+
+    #[test]
+    fn live_total_adds_pending_and_streaming_output() {
+        // Snapshot total = 10 + 20 + 30 + 40 = 100.
+        let mut data = data();
+        data.pending_output = 7;
+        // Streaming with a provider exact output (123): no estimate marker.
+        assert_eq!(value(FieldId::LiveTotalTokens, &data).unwrap().text, "230");
+        // Only the local estimate is available while streaming: keep the
+        // `~` marker on the whole live total.
+        let mut estimated = data.clone();
+        estimated.live = Some(LiveView {
+            streaming: true,
+            output_tokens: None,
+            output_tokens_exact: None,
+            decode_ms: 1_000,
+            tokens: Some(TokenBreakdown::from_tiers(2, 0, 0, TokenSource::Estimated)),
+        });
+        assert_eq!(
+            value(FieldId::LiveTotalTokens, &estimated).unwrap().text,
+            "~109"
+        );
+        // Settled: the frozen output is already in the pending/snapshot sum,
+        // so the live part is not added again.
+        let mut settled = data.clone();
+        settled.live = Some(LiveView {
+            streaming: false,
+            ..data.live.expect("fixture live view")
+        });
+        assert_eq!(
+            value(FieldId::LiveTotalTokens, &settled).unwrap().text,
+            "107"
+        );
+        // Live disarmed: the row still renders the snapshot + pending total.
+        let mut disarmed = data.clone();
+        disarmed.live = None;
+        assert_eq!(
+            value(FieldId::LiveTotalTokens, &disarmed).unwrap().text,
+            "107"
+        );
+        // No snapshot (old host): omitted, like the other session totals.
+        disarmed.stats = None;
+        assert_eq!(value(FieldId::LiveTotalTokens, &disarmed), None);
     }
 
     #[test]

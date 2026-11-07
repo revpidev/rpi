@@ -927,6 +927,7 @@ fn fetch_data(
         .then(|| value("ui.theme"))
         .flatten()
         .map(|theme| Palette::from_theme(&theme));
+    let pending_output = crate::with_engine(|engine| engine.pending_output());
     FieldData {
         cwd: value("ctx.cwd").and_then(|value| value.as_str().map(str::to_owned)),
         model,
@@ -936,6 +937,7 @@ fn fetch_data(
         context,
         session_name: value("getSessionName").and_then(|value| value.as_str().map(str::to_owned)),
         stats,
+        pending_output,
         live,
         // The editor preview renders placeholders for missing values; it never
         // shows the footer's held live values.
@@ -1112,15 +1114,15 @@ Fields: model, model-with-reasoning, reasoning, permission-mode, run-state,\n\
 current-dir, project-name, git-branch, context-used, context-remaining,\n\
 context-window-size, context-tokens, session-name, session-cost,\n\
 session-duration, used-tokens, total-input-tokens, total-output-tokens,\n\
-cache-read-tokens, cache-write-tokens, streaming, live-output-tokens,\n\
-live-output-rate, live-text-tokens, live-thinking-tokens,\n\
-live-toolcall-tokens.\n\
+total-tokens, live-total-tokens, cache-read-tokens, cache-write-tokens,\n\
+streaming, live-output-tokens, live-output-rate, live-text-tokens,\n\
+live-thinking-tokens, live-toolcall-tokens.\n\
 \n\
 Live tokens prefer provider usage, then the bundled tokenizer for the\n\
 model family (DeepSeek, Kimi, GLM, Qwen, Hunyuan, MiniMax), then a\n\
 CJK-aware estimate (~ prefix).\n\
 \n\
-Default items: total-tokens + live-output-rate only (all other\n\
+Default items: live-total-tokens + live-output-rate only (all other\n\
 fields off); adjust them in the editor.\n\
 \n\
 Editor keys: ↑/↓ move · space toggle · K/J reorder · tab page · s save · r reset · q cancel.";
@@ -1148,7 +1150,7 @@ pub fn handle_command(calls: &AsyncHostCalls, args: &str) -> Value {
                     "ui.confirm",
                     json!({
                         "title": "Reset status line?",
-                        "message": "Restore the default session-total + token-rate items (total-tokens, live-output-rate) and display options. Other settings are untouched.",
+                        "message": "Restore the default live-total + token-rate items (live-total-tokens, live-output-rate) and display options. Other settings are untouched.",
                     }),
                 )
                 .ok()
@@ -1278,7 +1280,7 @@ mod tests {
         let mut editor = editor();
         // Rows: selected duration, selected live-output, unknown, then the
         // remaining fields in registry order.
-        assert_eq!(editor.rows().len(), 29 + 1);
+        assert_eq!(editor.rows().len(), 30 + 1);
         // Select `model` (cursor at its row).
         let model_row = editor
             .rows()
@@ -1315,7 +1317,10 @@ mod tests {
         // Reset restores the default two but preserves unknown ids.
         editor.reset();
         let fields: Vec<FieldId> = editor.draft.fields().collect();
-        assert_eq!(fields, vec![FieldId::TotalTokens, FieldId::LiveOutputRate]);
+        assert_eq!(
+            fields,
+            vec![FieldId::LiveTotalTokens, FieldId::LiveOutputRate]
+        );
         assert_eq!(editor.draft.unknown, vec!["legacy-id"]);
         assert_eq!(editor.draft.placement, Placement::Status);
     }
@@ -1466,7 +1471,7 @@ mod tests {
         assert!(!editor.draft.has_field(FieldId::SessionDuration));
         editor.handle_input("r");
         assert!(!editor.reset_armed);
-        assert!(editor.draft.has_field(FieldId::TotalTokens));
+        assert!(editor.draft.has_field(FieldId::LiveTotalTokens));
         assert!(editor.draft.has_field(FieldId::LiveOutputRate));
     }
 
@@ -1536,7 +1541,7 @@ mod tests {
         assert_eq!(parsed["statusLine"]["type"], "items");
         assert_eq!(
             parsed["statusLine"]["items"],
-            json!(["total-tokens", "live-output-rate"])
+            json!(["live-total-tokens", "live-output-rate"])
         );
         assert_eq!(parsed["statusLine"]["liveTokens"], true);
         assert_eq!(parsed["statusLine"]["placement"], "status");
@@ -1607,7 +1612,7 @@ mod tests {
         };
         let text = config_text(&items);
         assert!(text.contains("items (Status)"));
-        assert!(text.contains("total-tokens"));
+        assert!(text.contains("live-total-tokens"));
         assert!(text.contains("live-output-rate"));
         assert!(text.contains("liveTokens: on"));
         let command = config::SettingsSnapshot {

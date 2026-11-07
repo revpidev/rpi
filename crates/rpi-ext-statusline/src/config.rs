@@ -123,7 +123,7 @@ pub struct StatusLineConfig {
 pub enum StatusLine {
     /// TE12 script mode — unchanged stdin/timeout/failure semantics.
     Command(StatusLineConfig),
-    /// Declarative 29-field mode (TE52 / ADR-0040).
+    /// Declarative 30-field mode (TE52 / ADR-0040).
     Items(ItemsConfig),
 }
 

@@ -810,7 +810,14 @@ fn refresh_items(
         let token = with_engine(|engine| engine.session_stats.begin_request());
         match fetch_session_stats(calls) {
             Some(stats) => {
-                with_engine(|engine| engine.session_stats.apply(token, stats));
+                with_engine(|engine| {
+                    if engine.session_stats.apply(token, stats) {
+                        // The snapshot now counts every committed message:
+                        // drop the live-total pending contribution so it is
+                        // not added twice.
+                        engine.clear_pending_output();
+                    }
+                });
             }
             None => warn_missing_session_stats_once(),
         }
@@ -875,9 +882,10 @@ fn build_field_data(items: &ItemsConfig, ctx: &CtxData) -> FieldData {
         percent: usage.get("percent").and_then(Value::as_f64),
     });
     let now = Instant::now();
-    let (stats, live_peek, git) = with_engine(|engine| {
+    let (stats, pending_output, live_peek, git) = with_engine(|engine| {
         (
             engine.session_stats.snapshot().cloned(),
+            engine.pending_output(),
             items
                 .live_enabled()
                 .then(|| engine.live_peek(now))
@@ -897,6 +905,7 @@ fn build_field_data(items: &ItemsConfig, ctx: &CtxData) -> FieldData {
         context,
         session_name: ctx.session_name.clone(),
         stats,
+        pending_output,
         live,
         live_held,
         git,
@@ -922,16 +931,18 @@ fn publish_items_from_cache(
     };
     let now = Instant::now();
     let model_id = data.model.as_ref().map(|model| model.id.clone());
-    let (live_peek, git) = with_engine(|engine| {
+    let (live_peek, pending_output, git) = with_engine(|engine| {
         (
             items
                 .live_enabled()
                 .then(|| engine.live_peek(now))
                 .flatten(),
+            engine.pending_output(),
             engine.git.info().cloned(),
         )
     });
     data.live = live_peek.map(|peek| peek.into_view(model_id.as_deref()));
+    data.pending_output = pending_output;
     data.live_held = with_engine(|engine| engine.live_held_values());
     data.git = git;
     data.now = Some(Utc::now());
