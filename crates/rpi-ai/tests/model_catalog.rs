@@ -203,9 +203,9 @@ fn test_catalog_field_by_field_roundtrip() {
             total += 1;
         }
     }
-    // v1.4.0 generator @ 4a080252f, snapshot 2026-10-27T01:36:18.091Z:
-    // 1602 chat + 63 image + 53 classifier entries.
-    assert_eq!(total, 1718);
+    // v1.4.0 generator @ 4a080252f, snapshot 2026-11-07T06:35:18.361Z:
+    // 1615 chat + 66 image + 60 classifier entries.
+    assert_eq!(total, 1741);
 }
 
 /// FR-E R2 (V14-09): every `compat` key present in the vendored JSON must
@@ -259,15 +259,15 @@ fn test_catalog_accessors_and_generated_at() {
         }
     }
     // Pinned to the vendored .manifest.json generatedAt
-    // (2026-10-27T01:36:18.091Z); update on catalog refresh.
+    // (2026-11-07T06:35:18.361Z); update on catalog refresh.
     assert_eq!(
         get_builtin_model_data_generated_at(),
-        Some(1_793_064_978_091)
+        Some(1_794_033_318_361)
     );
 }
 
 /// V18-01 R2.1: required v1.4.0 catalog walk. Values come from the
-/// 2026-10-27 snapshot produced by the pinned generator, not hand-edited JSON.
+/// 2026-11-07 snapshot produced by the pinned generator, not hand-edited JSON.
 #[test]
 fn test_v18_required_catalog_walk() {
     let copilot = get_model("github-copilot", "gpt-6.1-sol");
@@ -426,11 +426,11 @@ fn test_baseten_env_key_resolution() {
 #[test]
 fn test_baseten_deprecated_models_filtered() {
     let models = get_builtin_models("baseten");
-    // 14 models remain after deprecated filtering in the 2026-10-27 snapshot.
+    // 15 models remain after deprecated filtering in the 2026-11-07 snapshot.
     assert_eq!(
         models.len(),
-        14,
-        "Baseten should have 14 non-deprecated models"
+        15,
+        "Baseten should have 15 non-deprecated models"
     );
     // No model name or id contains "deprecated".
     for model in models.iter() {

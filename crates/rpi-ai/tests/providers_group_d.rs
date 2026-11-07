@@ -120,7 +120,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://integrate.api.nvidia.com/v1",
         "NVIDIA API key",
         "NVIDIA_API_KEY",
-        22, // 2026-10-27 snapshot: 85 live NVIDIA NIM ids after filtering
+        20, // 2026-11-07 snapshot: 84 live NVIDIA NIM ids after filtering
     ),
     spec(
         together_provider,
@@ -129,7 +129,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.together.ai/v1",
         "Together API key",
         "TOGETHER_API_KEY",
-        15, // 2026-10-27 snapshot: 15 non-deprecated tool-capable models
+        16, // 2026-11-07 snapshot: 16 non-deprecated tool-capable models
     ),
     spec(
         xai_provider,

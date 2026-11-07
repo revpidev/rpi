@@ -303,8 +303,8 @@ mod tests {
             .map(|provider| catalog.models(provider).len())
             .sum();
         // Schema v6 regen with the v1.4.0 generator @ 4a080252f; public
-        // catalog snapshot 2026-10-27T01:36:18.091Z.
-        assert_eq!(total, 1602);
+        // catalog snapshot 2026-11-07T06:35:18.361Z.
+        assert_eq!(total, 1615);
         let images: usize = catalog
             .providers()
             .iter()
@@ -315,8 +315,8 @@ mod tests {
             .iter()
             .map(|provider| catalog.classifier_models(provider).len())
             .sum();
-        assert_eq!(images, 63);
-        assert_eq!(classifiers, 53);
+        assert_eq!(images, 66);
+        assert_eq!(classifiers, 60);
         // Radius ships its static public catalog since 4d38031fb; the
         // gateway overlay lives in `providers::radius`.
         assert!(catalog.providers().contains(&"radius"));
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn test_v6_type_faces() {
-        // OpenRouter carries the `openrouter-images` api group (61 image
+        // OpenRouter carries the `openrouter-images` api group (66 image
         // models) and `typesafe-system-one` classifiers.
         let openrouter = builtin_catalog().expect("catalog");
         assert!(
