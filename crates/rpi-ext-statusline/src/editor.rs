@@ -83,6 +83,9 @@ struct Editor {
     draft: ItemsConfig,
     /// `type:"command"` at open → the save hint warns about the switch.
     command_mode: bool,
+    /// No usable `statusLine` at open (missing/invalid type): the default
+    /// draft is a preview, not the running config. Saving enables it.
+    unconfigured: bool,
     data: FieldData,
     page: Page,
     cursor: usize,
@@ -211,6 +214,7 @@ impl Editor {
         ) {
             Ok(()) => {
                 self.state = State::Applied;
+                self.unconfigured = false;
                 self.message = Some("saved".to_owned());
                 crate::request_refresh("config_saved");
                 self.done = Some(json!({"action": "saved"}));
@@ -364,6 +368,11 @@ impl Editor {
         ];
         if self.command_mode {
             parts.push("saving switches type:command → items".to_owned());
+        }
+        if self.unconfigured {
+            parts.push(
+                "not configured — the default items are a preview; press s to enable".to_owned(),
+            );
         }
         if let Some(message) = &self.message {
             parts.push(message.clone());
@@ -957,6 +966,14 @@ fn open_editor(calls: &AsyncHostCalls, reset_defaults: bool) -> Value {
     let status_line = root.get("statusLine").cloned().unwrap_or(Value::Null);
     let opened = status_line.as_object().cloned().unwrap_or_default();
     let command_mode = opened.get("type").and_then(Value::as_str) == Some("command");
+    let unconfigured = match opened.get("type").and_then(Value::as_str) {
+        Some("items") => false,
+        Some("command") => opened
+            .get("command")
+            .and_then(Value::as_str)
+            .is_none_or(|command| command.trim().is_empty()),
+        _ => true,
+    };
     let mut draft = parse_draft(&opened);
     if reset_defaults {
         draft = ItemsConfig {
@@ -973,6 +990,7 @@ fn open_editor(calls: &AsyncHostCalls, reset_defaults: bool) -> Value {
         fingerprint,
         draft,
         command_mode,
+        unconfigured,
         data,
         page: Page::Fields,
         cursor: 0,
@@ -1199,6 +1217,7 @@ mod tests {
             fingerprint: "fp".into(),
             draft: parse_draft(&opened),
             command_mode: false,
+            unconfigured: false,
             data: FieldData {
                 cwd: Some("/work/project".into()),
                 model: Some(ModelInfo {
@@ -1487,6 +1506,55 @@ mod tests {
         assert_eq!(parsed["statusLine"]["command"], "echo old");
         assert_eq!(parsed["statusLine"]["unknownKey"], 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #2: a fresh install has no `statusLine`; opening the editor
+    /// shows the default draft, and a plain save (no reset) must write it and
+    /// enable the live token rows.
+    #[test]
+    fn saving_an_unconfigured_settings_enables_default_items() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-statusline-editor-unconfigured-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{\"defaultModel\":\"x\"}").expect("write");
+        let (_, fingerprint) = settings_write::read_status_line(&path).expect("read");
+        let mut editor = editor();
+        editor.path = path.clone();
+        editor.opened = Map::new();
+        editor.draft = ItemsConfig::default();
+        editor.fingerprint = fingerprint;
+        editor.unconfigured = true;
+        editor.save();
+        assert_eq!(editor.state, State::Applied);
+        assert!(!editor.unconfigured);
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(parsed["defaultModel"], "x", "unrelated key preserved");
+        assert_eq!(parsed["statusLine"]["type"], "items");
+        assert_eq!(
+            parsed["statusLine"]["items"],
+            json!(["live-output-tokens", "live-output-rate"])
+        );
+        assert_eq!(parsed["statusLine"]["liveTokens"], true);
+        assert_eq!(parsed["statusLine"]["placement"], "status");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unconfigured_draft_is_labelled_in_the_status_line() {
+        let mut editor = editor();
+        editor.unconfigured = true;
+        let lines = editor.render(80);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("not configured") && line.contains("press s")),
+            "the preview must say saving is required: {lines:#?}"
+        );
     }
 
     #[test]

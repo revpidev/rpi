@@ -9,5 +9,21 @@
     "session",
     "events"
   ],
-  "rpiAbi": 1
+  "rpiAbi": 1,
+  "defaultSettings": {
+    "statusLine": {
+      "type": "items",
+      "items": [
+        "live-output-tokens",
+        "live-output-rate"
+      ],
+      "separator": " · ",
+      "padding": 0,
+      "placement": "status",
+      "refreshInterval": 5,
+      "useColors": true,
+      "numberFormat": "compact",
+      "liveTokens": true
+    }
+  }
 }

@@ -2509,6 +2509,65 @@ impl SettingsManager {
             .unwrap_or_default()
     }
 
+    /// Merge extension-provided defaults into the global settings.
+    ///
+    /// Only top-level keys that are ABSENT are inserted; an existing value
+    /// (including an explicit `null` or command-mode `statusLine`) is never
+    /// overwritten. The read-modify-write runs under the shared A+B settings
+    /// locks and the in-memory view is reloaded on success. Returns whether
+    /// anything was written.
+    pub fn apply_global_defaults(
+        &mut self,
+        defaults: &Map<String, Value>,
+    ) -> Result<bool, RpiError> {
+        if defaults.is_empty() {
+            return Ok(false);
+        }
+        if let Some(error) = &self.global_settings_load_error {
+            return Err(RpiError::Settings(format!(
+                "Cannot apply extension defaults while settings.json has load errors: {error}"
+            )));
+        }
+        let mut applied = false;
+        self.storage
+            .with_lock(SettingsScope::Global, &mut |current| {
+                let mut root = match current {
+                    Some(content) if !content.is_empty() => {
+                        let value: Value = serde_json::from_str(content)?;
+                        match value {
+                            Value::Object(map) => map,
+                            _ => {
+                                return Err(RpiError::Settings(
+                                    "Failed to parse settings: top level is not a JSON object"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    _ => Map::new(),
+                };
+                migrate_settings(&mut root);
+                let mut changed = false;
+                for (key, value) in defaults {
+                    if !root.contains_key(key) {
+                        root.insert(key.clone(), value.clone());
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    return Ok(None);
+                }
+                applied = true;
+                serde_json::to_string_pretty(&Value::Object(root))
+                    .map(Some)
+                    .map_err(RpiError::Json)
+            })?;
+        if applied {
+            self.reload();
+        }
+        Ok(applied)
+    }
+
     /// `setPackages` (settings-manager.ts:973-977).
     pub fn set_packages(&mut self, packages: Vec<PackageSource>) {
         let array = packages.iter().map(json_value).collect();

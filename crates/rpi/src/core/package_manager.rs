@@ -2884,6 +2884,38 @@ impl DefaultPackageManager {
     ) -> Result<(), String> {
         self.install_with_channel(source, local, channel)?;
         self.add_source_to_settings(source, local)?;
+        let scope = if local {
+            SourceScope::Project
+        } else {
+            SourceScope::User
+        };
+        self.apply_installed_default_settings(source, scope)?;
+        Ok(())
+    }
+
+    /// Apply a freshly installed extension's manifest `defaultSettings`
+    /// (extension-distribution §4) to the global settings. Only absent
+    /// top-level keys are written; user/project-scoped values win and a
+    /// project-local install never touches global config.
+    fn apply_installed_default_settings(
+        &mut self,
+        source: &str,
+        scope: SourceScope,
+    ) -> Result<(), String> {
+        if scope != SourceScope::User {
+            return Ok(());
+        }
+        let Some(dir) = self.get_installed_path(source, scope) else {
+            return Ok(());
+        };
+        let Some(defaults) = extension_registry::installed_extension_default_settings(&dir) else {
+            return Ok(());
+        };
+        self.settings_manager
+            .apply_global_defaults(&defaults)
+            .map_err(|error| {
+                format!("Installed {source}, but could not apply its default settings: {error}")
+            })?;
         Ok(())
     }
 
@@ -7865,13 +7897,25 @@ mod registry_tests {
 
     /// Build a `.rpix` (gzipped tar, flat root, coreutils SHA256SUMS).
     fn build_rpix(name: &str, version: &str, native: bool, files: &[(&str, &[u8])]) -> Vec<u8> {
+        build_rpix_with_manifest(name, version, native, files, "")
+    }
+
+    /// [`build_rpix`] with extra manifest members (e.g. `defaultSettings`).
+    /// `manifest_extra` must start with a comma when non-empty.
+    fn build_rpix_with_manifest(
+        name: &str,
+        version: &str,
+        native: bool,
+        files: &[(&str, &[u8])],
+        manifest_extra: &str,
+    ) -> Vec<u8> {
         let carrier = if native {
             format!(r#","native":"lib{name}.so""#)
         } else {
             format!(r#","wasm":"dist/{name}.wasm""#)
         };
         let manifest = format!(
-            r#"{{"name":"{name}","version":"{version}"{carrier},"capabilities":["tools"],"rpiAbi":1}}"#
+            r#"{{"name":"{name}","version":"{version}"{carrier},"capabilities":["tools"],"rpiAbi":1{manifest_extra}}}"#
         );
         let mut all: Vec<(String, Vec<u8>)> =
             vec![("rpi-extension.json".to_string(), manifest.into_bytes())];
@@ -7950,6 +7994,17 @@ mod registry_tests {
         version: &str,
         native: bool,
     ) -> (Vec<u8>, String) {
+        let archive = build_rpix(name, version, native, &[]);
+        serve_registry_archive(transport, name, version, archive, native)
+    }
+
+    fn serve_registry_archive(
+        transport: &MapTransport,
+        name: &str,
+        version: &str,
+        archive: Vec<u8>,
+        native: bool,
+    ) -> (Vec<u8>, String) {
         let repo = format!("acme/{name}");
         let target = config::build_target().unwrap();
         let file = if native {
@@ -7957,7 +8012,6 @@ mod registry_tests {
         } else {
             format!("{name}-{version}.rpix")
         };
-        let archive = build_rpix(name, version, native, &[]);
         let index = if native {
             native_index_json(name, &repo, version, &sha256_hex(&archive))
         } else {
@@ -8107,6 +8161,54 @@ mod registry_tests {
             manager.get_installed_path("subagents", SourceScope::User),
             Some(dir)
         );
+    }
+
+    /// Extension-distribution §4 `defaultSettings`: a fresh install seeds
+    /// absent top-level settings keys (issue #2) while preserving unrelated
+    /// and user-provided values.
+    #[test]
+    fn test_install_applies_manifest_default_settings() {
+        let defaults = r#","defaultSettings":{"statusLine":{"type":"items","items":["live-output-tokens"]},"extensionOwned":{"enabled":true}}"#;
+        let archive = build_rpix_with_manifest("ext-defaults", "0.1.0", true, &[], defaults);
+
+        // Fresh environment: both keys are inserted.
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_archive(&transport, "ext-defaults", "0.1.0", archive.clone(), true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("ext-defaults", false).unwrap();
+        let installed: Value =
+            serde_json::from_str(&settings_packages(&dirs)).expect("settings json");
+        assert_eq!(installed["statusLine"]["type"], "items");
+        assert_eq!(
+            installed["statusLine"]["items"],
+            serde_json::json!(["live-output-tokens"])
+        );
+        assert_eq!(installed["extensionOwned"]["enabled"], true);
+        assert!(
+            installed["packages"]
+                .as_array()
+                .is_some_and(|packages| packages.iter().any(|pkg| pkg == "ext-defaults")),
+            "package source still persisted"
+        );
+
+        // Existing user values win untouched.
+        let dirs = TestDirs::new();
+        std::fs::write(
+            dirs.agent_dir.join("settings.json"),
+            r#"{"statusLine":{"type":"command","command":"echo hi"},"extensionOwned":{"enabled":false},"keep":1}"#,
+        )
+        .unwrap();
+        let transport = MapTransport::new();
+        serve_registry_archive(&transport, "ext-defaults", "0.1.0", archive, true);
+        let mut manager = manager_ok(&dirs, transport);
+        manager.install_and_persist("ext-defaults", false).unwrap();
+        let installed: Value =
+            serde_json::from_str(&settings_packages(&dirs)).expect("settings json");
+        assert_eq!(installed["statusLine"]["type"], "command");
+        assert_eq!(installed["statusLine"]["command"], "echo hi");
+        assert_eq!(installed["extensionOwned"]["enabled"], false);
+        assert_eq!(installed["keep"], 1);
     }
 
     #[test]

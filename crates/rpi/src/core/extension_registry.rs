@@ -40,7 +40,7 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::config;
 use crate::core::self_update::sha256_hex;
@@ -909,6 +909,17 @@ pub fn installed_extension_name(dir: &Path) -> Option<String> {
     let content = std::fs::read_to_string(dir.join("rpi-extension.json")).ok()?;
     let raw: Value = serde_json::from_str(&content).ok()?;
     raw.get("name").and_then(Value::as_str).map(str::to_string)
+}
+
+/// Optional `defaultSettings` object from an installed extension's
+/// `rpi-extension.json` (extension-distribution §4 additive field). The
+/// package manager merges these top-level keys into the global settings only
+/// when absent, so a fresh install can ship a working default (e.g.
+/// rpi-statusline's realtime token rows) without overwriting user config.
+pub fn installed_extension_default_settings(dir: &Path) -> Option<Map<String, Value>> {
+    let content = std::fs::read_to_string(dir.join("rpi-extension.json")).ok()?;
+    let raw: Value = serde_json::from_str(&content).ok()?;
+    raw.get("defaultSettings")?.as_object().cloned()
 }
 
 /// A verified, still-temporary extraction awaiting activation.
