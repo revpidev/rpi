@@ -630,6 +630,12 @@ impl TuiMainScreen {
         receiver
     }
 
+    /// Rust addition (issue #77 retry): cancel in-flight color queries before
+    /// a retry so the fresh query owns the next replies.
+    pub fn cancel_terminal_color_queries(&self) {
+        self.run_or_queue(|inner| inner.cancel_terminal_color_queries());
+    }
+
     // --- settings ---------------------------------------------------------
 
     /// Upstream `get fullRedraws` (tui.ts:338). Returns 0 on lock contention.
@@ -5586,7 +5592,7 @@ mod tests {
     fn terminal_colors_query_resolves_on_da1_with_replies_in_query_order() {
         let (terminal, tui, _component, _listeners) = colors_test_setup();
         let first = query_colors(&tui, Duration::from_millis(1000));
-        let second = query_colors(&tui, Duration::from_millis(1000));
+        let mut second = query_colors(&tui, Duration::from_millis(1000));
 
         send_input(&terminal, &tui, "\x1b]11;#000000\x07");
         // An incomplete palette is dropped.
@@ -5594,16 +5600,100 @@ mod tests {
             send_input(&terminal, &tui, &reply);
         }
         send_input(&terminal, &tui, "\x1b[?62;22c");
-        send_input(&terminal, &tui, "\x1b[?62;22c");
 
         let first = first.blocking_recv().expect("first query sender");
         assert_eq!(first.foreground, None);
         assert_eq!(first.background, Some(RgbColor { r: 0, g: 0, b: 0 }));
         assert_eq!(first.palette, None);
+
+        // A DA1 before any color reply is a stale/early sentinel (issue
+        // #77): it must not resolve the second query with an empty report.
+        send_input(&terminal, &tui, "\x1b[?62;22c");
+        assert!(
+            second.try_recv().is_err(),
+            "zero-reply DA1 must leave the query pending"
+        );
+        send_input(&terminal, &tui, "\x1b]11;#ffffff\x07");
+        send_input(&terminal, &tui, "\x1b[?62;22c");
         let second = second.blocking_recv().expect("second query sender");
         assert_eq!(second.foreground, None);
-        assert_eq!(second.background, None);
+        assert_eq!(
+            second.background,
+            Some(RgbColor {
+                r: 255,
+                g: 255,
+                b: 255
+            })
+        );
         assert_eq!(second.palette, None);
+        tui.stop(TuiStopOptions::default());
+    }
+
+    /// Issue #77: a DA1 that arrives before every OSC reply (stale reply
+    /// from the previous process, forwarded keyboard sentinel, slow SSH pty)
+    /// is kept as an early terminator rather than closing the query empty.
+    /// The color replies still attach and the query completes with them.
+    #[test]
+    fn terminal_colors_query_keeps_late_colors_after_an_early_da1() {
+        let (terminal, tui, component_h, listeners) = colors_test_setup();
+        let mut query = query_colors(&tui, Duration::from_millis(1000));
+        send_input(&terminal, &tui, "\x1b[?62;22c");
+        assert!(
+            query.try_recv().is_err(),
+            "an early DA1 must not resolve the query empty"
+        );
+        send_input(&terminal, &tui, "\x1b]11;rgb:1010/1111/2222\x07");
+        for reply in palette_replies() {
+            send_input(&terminal, &tui, &reply);
+        }
+        // The terminal's real trailing DA1 (the first one was the early
+        // sentinel) closes the query with the colors that arrived.
+        send_input(&terminal, &tui, "\x1b[?62;22c");
+        let colors = query.blocking_recv().expect("query sender");
+        assert_eq!(
+            colors.background,
+            Some(RgbColor {
+                r: 0x10,
+                g: 0x11,
+                b: 0x22
+            })
+        );
+        assert_eq!(colors.palette.map(|palette| palette.len()), Some(16));
+        // The early DA1 was consumed, no color reply leaked as keyboard input.
+        assert_eq!(component_h.inputs(), Vec::<String>::new());
+        assert_eq!(*lock_shared(&listeners), Vec::<String>::new());
+        // The completed query was popped without waiting for a second DA1.
+        assert!(
+            tui.lock_inner()
+                .base
+                .pending_terminal_color_queries
+                .is_empty()
+        );
+        tui.stop(TuiStopOptions::default());
+    }
+
+    /// A terminal that answers only DA1 (no OSC support) must still settle
+    /// after the grace deadline: empty result delivered once, entry reaped so
+    /// it cannot swallow a later query's replies.
+    #[test]
+    fn terminal_colors_query_da1_only_settles_at_the_grace_deadline() {
+        let (terminal, tui, component_h, _listeners) = colors_test_setup();
+        let mut query = query_colors(&tui, Duration::from_millis(1000));
+        send_input(&terminal, &tui, "\x1b[?62;22c");
+        assert!(query.try_recv().is_err(), "early DA1 keeps it pending");
+        tui.tick(Instant::now() + Duration::from_secs(10));
+        let colors = query.try_recv().expect("grace deadline resolves it");
+        assert_eq!(colors, crate::terminal_colors::TerminalColors::default());
+        assert!(
+            tui.lock_inner()
+                .base
+                .pending_terminal_color_queries
+                .is_empty(),
+            "a da1-only query is reaped at the deadline"
+        );
+        // A later DA1 is ordinary input again.
+        send_input(&terminal, &tui, "\x1b[?62;22c");
+        assert_eq!(component_h.inputs(), vec!["\x1b[?62;22c"]);
         tui.stop(TuiStopOptions::default());
     }
 

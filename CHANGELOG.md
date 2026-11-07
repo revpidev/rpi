@@ -25,6 +25,10 @@
 - **`rpi-usage` typed providers and footer** (TE53, ADR-0039): eight first-party provider scripts (four new), typed `windows[]`/`ledgers[]`/`balance[]`, the `/usage` grammar (`--cached`, `--json`, `--provider`, `list`, `help`), `ui.emitStructured` reports, a 60-second local typed-reset countdown without requests, `usage.percentage`/`usage.resetCountdown`, and the current-session local-token fallback for a provider without a quota script.
 - **Distribution**: the seven `.rpix` archives ride this Release (native carrier only; `minHostVersion` injected from the pack version — `0.1.8-rc.3` here, `0.1.8` at the stable fold); the retired `rpi-mcp-adapter` is not part of the set.
 
+### Fixed
+
+- **Terminal color queries and exit restore** (rpi#77, ADR-0045): a zero-reply DA1 no longer closes the startup OSC color query empty; a background-less first report retries once, the deadline is SSH-aware (100ms local / 500ms SSH, `RPI_TUI_COLOR_TIMEOUT` override), the panic/signal restore starts with `?2026l`, SIGINT restores instead of dying mid-reprint, and shutdown drains queued replies before stop. This fixes `system` losing all panel backgrounds on the first launch after a fullscreen Ctrl+C exit.
+
 ### Internal
 
 - Workspace version is `0.1.8-rc.3` (the `0.1.8` candidate; `Cargo.lock` synced and the seven lockstep crates follow `version.workspace`); this top section uses the base version `0.1.8`, matching the embedded-changelog contract for pre-release builds.

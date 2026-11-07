@@ -168,6 +168,7 @@ rpi auth check|print-api-key|print-bearer-token ...  # 查看 provider 凭据
 | `RPI_CODING_AGENT_SESSION_DIR` | `~/.rpi/agent/sessions` | 会话存储目录 |
 | `RPI_PACKAGE_DIR` | 可执行文件目录 | 覆盖 package 根目录（Nix/Guix store 路径） |
 | `RPI_PROGRAM_STATUS` | 自动探测 | `1`/`0` 强制开启/关闭 OSC 7501 程序状态上报 |
+| `RPI_TUI_COLOR_TIMEOUT` | 本地 100ms / SSH 500ms | 终端颜色查询超时（毫秒；issue #77 调优入口） |
 | `RPI_CLIPBOARD_OSC52` | — | 设为 `1` 时复制内容同时走 OSC 52，适用于没有 SSH 标记的远程客户端（多路复用器接入、IDE 守护进程） |
 | `RPI_HYPERLINKS` / `RPI_IMAGE_PROTOCOL` / `RPI_TRUE_COLOR` | 自动探测 | 终端能力覆盖 |
 

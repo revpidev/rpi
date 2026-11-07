@@ -161,6 +161,8 @@ impl Drop for TempDir {
     }
 }
 
+type DrainCallLog = Arc<Mutex<Vec<(Option<u64>, Option<u64>)>>>;
+
 /// In-memory terminal for mode tests: captures writes, remembers the input
 /// handler for `feed`, reports a fixed 80x24 size.
 #[derive(Clone)]
@@ -171,6 +173,7 @@ pub(crate) struct TestTerminal {
     title: Arc<Mutex<String>>,
     progress: Arc<Mutex<bool>>,
     program_status: Arc<Mutex<Vec<rpi_tui::program_status::ProgramStatus>>>,
+    drain_calls: DrainCallLog,
 }
 
 impl TestTerminal {
@@ -182,6 +185,7 @@ impl TestTerminal {
             title: Arc::new(Mutex::new(String::new())),
             progress: Arc::new(Mutex::new(false)),
             program_status: Arc::new(Mutex::new(Vec::new())),
+            drain_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -222,6 +226,15 @@ impl TestTerminal {
             .clone()
     }
 
+    /// Blocking-drain invocations recorded by shutdown tests.
+    #[allow(dead_code)]
+    pub(crate) fn drain_calls(&self) -> Vec<(Option<u64>, Option<u64>)> {
+        self.drain_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Whether `start` was called (input handler installed).
     pub(crate) fn is_started(&self) -> bool {
         self.input_handler
@@ -250,6 +263,13 @@ impl Terminal for TestTerminal {
         _idle_ms: Option<u64>,
     ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
+    }
+
+    fn drain_input_blocking(&mut self, max_ms: Option<u64>, idle_ms: Option<u64>) {
+        self.drain_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((max_ms, idle_ms));
     }
 
     fn write(&mut self, data: &str) {

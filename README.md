@@ -168,6 +168,7 @@ Configuration lives in `~/.rpi/agent/` (or `RPI_CODING_AGENT_DIR`); project-loca
 | `RPI_CODING_AGENT_SESSION_DIR` | `~/.rpi/agent/sessions` | Session storage directory |
 | `RPI_PACKAGE_DIR` | executable directory | Override the package root (Nix/Guix store paths) |
 | `RPI_PROGRAM_STATUS` | auto-detect | `1`/`0` forces OSC 7501 program-status reporting on/off |
+| `RPI_TUI_COLOR_TIMEOUT` | 100ms local / 500ms SSH | Terminal color-query deadline in milliseconds (issue #77 escape hatch) |
 | `RPI_CLIPBOARD_OSC52` | — | `1` also sends copies through OSC 52, for remote clients that leave no SSH markers (multiplexer attaches, IDE daemons) |
 | `RPI_HYPERLINKS` / `RPI_IMAGE_PROTOCOL` / `RPI_TRUE_COLOR` | auto-detect | Terminal capability overrides |
 

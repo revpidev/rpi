@@ -45,21 +45,39 @@ use crate::tui_main_screen::TuiMainScreen;
 /// `ProcessTerminal::stop` (tui.ts:689-714, terminal.ts:396-449) in the same
 /// order, minus the state-dependent parts the fallback cannot know
 /// (progress keepalive clear, cursor repositioning):
-/// 0. `\x1b[?1049l` — exit alternate screen (T32: the panic hook may fire
+/// 0. `\x1b[?2026l` — end synchronized output first: a render writes
+///    `?2026h`…`?2026l` as one buffer, so a signal/panic in the middle can
+///    leave the terminal buffering every later write until this terminator
+///    arrives
+/// 1. `\x1b[?1049l` — exit alternate screen (T32: the panic hook may fire
 ///    while the fullscreen renderer is active; this restores the main screen)
-/// 1. `\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l` — mouse
+/// 2. `\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l` — mouse
 ///    tracking and focus reporting off (upstream `getExitRestorePrefix`
 ///    disables mouse unconditionally on the crash path, #11170)
-/// 2. `\x1b[?7h` — autowrap back on (upstream `ENABLE_AUTOWRAP`)
-/// 3. `\x1b[?2031l` — color scheme notifications off (`TuiMainScreen::stop_internal`)
-/// 4. `\x1b[?2004l` — bracketed paste off
-/// 5. `\x1b[<u` — pop Kitty keyboard protocol
-/// 6. `\x1b[>4;0m` — modifyOtherKeys off
-/// 7. `\x1b[?25h` — show cursor
+/// 3. `\x1b[?7h` — autowrap back on (upstream `ENABLE_AUTOWRAP`)
+/// 4. `\x1b[?2031l` — color scheme notifications off (`TuiMainScreen::stop_internal`)
+/// 5. `\x1b[?2004l` — bracketed paste off
+/// 6. `\x1b[<u` — pop Kitty keyboard protocol
+/// 7. `\x1b[>4;0m` — modifyOtherKeys off
+/// 8. `\x1b[?25h` — show cursor
 ///
 /// Raw mode restore (`crossterm::terminal::disable_raw_mode`) is a syscall,
 /// not part of this byte sequence.
-const MINIMAL_RESTORE_SEQUENCE: &str = "\x1b[?1049l\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[?2031l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[?25h";
+const MINIMAL_RESTORE_SEQUENCE: &str = "\x1b[?2026l\x1b[?1049l\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[?2031l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[?25h";
+
+/// Emergency restore for signal paths that cannot take the TUI locks
+/// (SIGINT while a transcript-exit reprint is still writing): end any
+/// synchronized-output block, restore every mode the mutable sequence owns,
+/// reset raw mode, and return. Never panics.
+///
+/// A normal `TuiHandle::stop` already writes the structured restore; this is
+/// the last-resort path for a process that is about to `exit`.
+pub fn emergency_restore() {
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(MINIMAL_RESTORE_SEQUENCE.as_bytes());
+    let _ = stdout.flush();
+    let _ = crossterm::terminal::disable_raw_mode();
+}
 
 /// Restore the terminal via `tui.stop()`; fall back to a fixed restore
 /// sequence + raw-mode reset when the `TuiMainScreen` lock is held by the panicking
@@ -341,9 +359,16 @@ mod tests {
 
     /// The fixed fallback sequence covers every protocol/state flag the
     /// engine can enable (locked-TuiMainScreen fallback of `restore_terminal`).
+    /// `?2026l` must come first: an interrupted render can leave the terminal
+    /// buffering all output until synchronized output is closed.
     #[test]
     fn minimal_restore_sequence_covers_terminal_state() {
+        assert!(
+            MINIMAL_RESTORE_SEQUENCE.starts_with("\x1b[?2026l"),
+            "synchronized output must be closed before the remaining restore"
+        );
         for sequence in [
+            "\x1b[?2026l",
             "\x1b[?1006l",
             "\x1b[?1004l",
             "\x1b[?1003l",

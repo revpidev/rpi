@@ -1270,6 +1270,12 @@ impl TuiAltScreen {
         receiver
     }
 
+    /// Rust addition (issue #77 retry): cancel in-flight color queries before
+    /// a retry so the fresh query owns the next replies.
+    pub fn cancel_terminal_color_queries(&self) {
+        self.run_or_queue(|inner| inner.cancel_terminal_color_queries());
+    }
+
     /// Upstream `get fullRedraws` (tui.ts:338). 0 on lock contention.
     pub fn full_redraws(&self) -> u64 {
         self.try_read(|inner| inner.full_redraw_count).unwrap_or(0)

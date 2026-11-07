@@ -135,6 +135,12 @@ pub(crate) struct PendingTerminalColorQuery {
     /// 2 + index = palette index (upstream's `Set<string>`).
     pub(crate) replied: [bool; TERMINAL_COLOR_REPLY_COUNT],
     pub(crate) replied_count: usize,
+    /// A DA1 has been seen. A DA1 arriving before any color reply is not a
+    /// reliable terminator (stale reply from a prior process, interleaved
+    /// keyboard query, slow SSH): the query stays pending for a grace window
+    /// so the OSC replies can still land. Once set, completion also pops the
+    /// entry because no second DA1 will arrive.
+    pub(crate) da1_seen: bool,
     /// Receives the result: the promise's resolve until the timeout, then
     /// `onLateReply`. Unset once the query completed; later replies are
     /// ignored.
@@ -1301,21 +1307,38 @@ impl TuiBase {
     /// Timeouts fire regardless of stopped, like upstream's `setTimeout`
     /// (tui.ts:1678-1686, 1715).
     pub(crate) fn fire_expired_queries(&mut self, now: Instant) {
-        for query in &mut self.pending_terminal_color_queries {
-            if !query.deadline.is_some_and(|deadline| now >= deadline) {
+        let mut index = 0;
+        while index < self.pending_terminal_color_queries.len() {
+            let expired = self.pending_terminal_color_queries[index]
+                .deadline
+                .is_some_and(|deadline| now >= deadline);
+            if !expired {
+                index += 1;
                 continue;
             }
-            query.deadline = None;
+            let da1_seen = self.pending_terminal_color_queries[index].da1_seen;
+            self.pending_terminal_color_queries[index].deadline = None;
             // Resolve the promise with the replies so far, and keep
             // collecting late replies for `onLateReply` (tui.ts:1481-1484).
-            let colors = terminal_color_query_result(query);
-            if let Some(TerminalColorQueryDelivery::Resolve(sender)) = query.delivery.take() {
+            let colors = terminal_color_query_result(&self.pending_terminal_color_queries[index]);
+            if let Some(TerminalColorQueryDelivery::Resolve(sender)) =
+                self.pending_terminal_color_queries[index].delivery.take()
+            {
                 let _ = sender.send(colors);
             }
-            query.delivery = query
+            if da1_seen {
+                // The terminal already sent its DA1 before the colors; no
+                // second terminator is coming, and keeping the entry would
+                // misroute a later query's replies.
+                self.pending_terminal_color_queries.remove(index);
+                continue;
+            }
+            self.pending_terminal_color_queries[index].delivery = self
+                .pending_terminal_color_queries[index]
                 .on_late_reply
                 .take()
                 .map(TerminalColorQueryDelivery::Late);
+            index += 1;
         }
     }
 
@@ -1454,7 +1477,28 @@ impl TuiBase {
         }
         if is_device_attributes_response(data) {
             // Terminals answer in order; the DA1 reply closes the oldest
-            // query (tui.ts:1133-1136).
+            // query (tui.ts:1133-1136). A DA1 before ANY color reply is not a
+            // reliable terminator on a slow/stale pty (issue #77): it can be
+            // a leftover reply from the previous process, or the keyboard
+            // query's sentinel forwarded after its own counter hit zero. Keep
+            // the query pending for a fresh grace window so the OSC replies
+            // still reach it; a later DA1 (or the grace deadline) closes it.
+            let early_da1 = self
+                .pending_terminal_color_queries
+                .front()
+                .is_some_and(|query| query.replied_count == 0 && query.deadline.is_some());
+            if early_da1 {
+                if let Some(query) = self.pending_terminal_color_queries.front_mut()
+                    && !query.da1_seen
+                {
+                    query.da1_seen = true;
+                    let grace =
+                        Instant::now() + crate::terminal::resolve_terminal_color_timeout_ms();
+                    query.deadline =
+                        Some(query.deadline.map_or(grace, |deadline| deadline.max(grace)));
+                }
+                return true;
+            }
             let Some(mut query) = self.pending_terminal_color_queries.pop_front() else {
                 return false;
             };
@@ -1492,10 +1536,17 @@ impl TuiBase {
             OscColorTarget::Background => query.background = response.rgb,
             OscColorTarget::Palette(index) => query.palette[index as usize] = response.rgb,
         }
+        let mut pop_after_complete = false;
         if query.replied_count == TERMINAL_COLOR_REPLY_COUNT {
-            // All colors arrived: complete, but keep the entry so the trailing
-            // DA1 reply still pops the right query (tui.ts:1152-1154).
+            // All colors arrived: complete, but normally keep the entry so
+            // the trailing DA1 reply still pops the right query
+            // (tui.ts:1152-1154). With an early DA1 already consumed there
+            // is no trailing reply, so pop immediately.
             complete_terminal_color_query(query);
+            pop_after_complete = query.da1_seen;
+        }
+        if pop_after_complete {
+            self.pending_terminal_color_queries.pop_front();
         }
         true
     }
@@ -1710,11 +1761,20 @@ impl TuiBase {
                 palette: [None; TERMINAL_PALETTE_SIZE],
                 replied: [false; TERMINAL_COLOR_REPLY_COUNT],
                 replied_count: 0,
+                da1_seen: false,
                 delivery: Some(TerminalColorQueryDelivery::Resolve(sender)),
                 on_late_reply,
                 deadline: Some(deadline),
             });
         self.terminal().write(TERMINAL_COLOR_QUERY);
+    }
+
+    /// Rust addition (issue #77 retry): drop in-flight color queries before
+    /// submitting a fresh one. A terminal that never answered (no DA1, no
+    /// colors) would otherwise leave the old entry at the FIFO head and
+    /// steal the retry query's replies.
+    pub(crate) fn cancel_terminal_color_queries(&mut self) {
+        self.pending_terminal_color_queries.clear();
     }
 
     /// Earliest deadline among unsettled introspection queries. Their

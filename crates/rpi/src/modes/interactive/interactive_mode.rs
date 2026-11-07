@@ -54,11 +54,9 @@
 //!   `None`: session switching rebinds the UI explicitly via
 //!   `InteractiveMode::rebind_session_ui` (called from each command handler)
 //!   instead of the runtime callback (interactive-mode.ts:455-457).
-//! - Terminal input draining before exit (`terminal.drainInput(1000)`,
-//!   interactive-mode.ts:3572-3583) has no port: the trait method returns a
-//!   future borrowing the terminal, which the mode cannot poll through
-//!   `Tui::with_terminal`. Documented gap (Kitty key-release leaks over slow
-//!   SSH); the terminal is restored by `Tui::stop` as usual.
+//! - Terminal input draining before exit uses `Terminal::drain_input_blocking`
+//!   (the async future cannot be polled while holding the terminal lock); it
+//!   discards late DA/Kitty replies before `Tui::stop` clears the channel.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
@@ -138,12 +136,19 @@ const APP_TITLE: &str = "rpi";
 /// the event loop is always awake; here the driver polls with this cap).
 const DRIVER_PUMP_CAP: Duration = Duration::from_millis(50);
 
-/// `TERMINAL_QUERY_TIMEOUT_MS` (theme-controller.ts:25 @ 4a080252f): how long
-/// the system theme stays grayscale before falling back to palette indices.
-const TERMINAL_QUERY_TIMEOUT_MS: u64 = 100;
-/// Tokio backstop for the first color result; the Tui's own deadline is the
-/// real timeout, this only covers tests without a pump.
-const TERMINAL_QUERY_BACKSTOP_MS: u64 = 150;
+/// Extra wait on top of the terminal-color query deadline. The Tui's own
+/// deadline is the real timeout; this backstop only covers tests without a
+/// pump. The deadline itself is SSH-aware
+/// (`rpi_tui::terminal::resolve_terminal_color_timeout_ms`, ADR-0045).
+const TERMINAL_QUERY_BACKSTOP_MARGIN_MS: u64 = 50;
+
+/// A first color report without a background cannot generate the system
+/// theme's panel backgrounds. Treat it as unsettled and retry once (issue
+/// #77) instead of committing to the indexed/no-panel tier for the whole
+/// session.
+fn terminal_color_report_needs_retry(colors: &rpi_tui::terminal_colors::TerminalColors) -> bool {
+    colors.background.is_none()
+}
 
 /// Double-press window for Ctrl+C exit / double-Escape
 /// (interactive-mode.ts:3533-3541, 2573-2588).
@@ -292,6 +297,32 @@ fn format_resume_command(session: &AgentSession) -> Option<String> {
     Some(args.join(" "))
 }
 
+/// SIGINT last-resort restore: in raw mode Ctrl+C is an editor key and never
+/// reaches this handler, but the fullscreen `transcript` exit path restores
+/// cooked mode before reprinting the transcript, so a second/third Ctrl+C in
+/// that window is a real signal. The renderer writes each frame as one
+/// `?2026h…?2026l` buffer; dying mid-write can leave synchronized output open
+/// and the next process's startup color query buffered/unanswered. Restore
+/// the fixed sequence (which starts with `?2026l`) and exit immediately.
+#[cfg(unix)]
+fn register_sigint_restore() {
+    use tokio::signal::unix::{SignalKind, signal};
+    if let Ok(mut stream) = signal(SignalKind::interrupt()) {
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(runtime) = runtime {
+                runtime.block_on(async move {
+                    stream.recv().await;
+                });
+            }
+            rpi_tui::recovery::emergency_restore();
+            std::process::exit(130);
+        });
+    }
+}
+
 /// `registerSignalHandlers` (interactive-mode.ts:3643-3681): SIGTERM/SIGHUP
 /// trigger a graceful shutdown (SIGHUP no longer hard-exits — the terminal
 /// restore is attempted and a genuinely dead terminal surfaces on the
@@ -350,6 +381,7 @@ pub async fn run_interactive_mode(
     // first-time-setup UI installs its own below while it is live).
     rpi_tui::recovery::install_panic_hook_for_handle(&mode.ui);
     register_signal_handlers(mode.shutdown_sender());
+    register_sigint_restore();
     mode.run().await;
     0
 }
@@ -4953,12 +4985,36 @@ impl InteractiveUi {
         let late_ui = Arc::clone(self);
         self.ui
             .query_terminal_colors(rpi_tui::tui::TerminalColorQueryOptions {
-                timeout: Duration::from_millis(TERMINAL_QUERY_TIMEOUT_MS),
+                timeout: rpi_tui::terminal::resolve_terminal_color_timeout_ms(),
                 on_late_reply: Some(Box::new(move |colors| {
                     late_ui.push(UiCommand::ApplyTerminalColors(colors));
                     late_ui.render_handle.request_render();
                 })),
             })
+    }
+
+    /// One retry after an empty/background-less first report (issue #77).
+    /// The first query may have been closed by a stale DA1 or timed out on a
+    /// slow SSH pty; the retry starts from a clean FIFO and gets a full
+    /// SSH-aware deadline. The late-reply hook stays installed, so a delayed
+    /// first report still wins if it arrives sooner.
+    pub(crate) fn retry_terminal_colors_async(self: &Arc<Self>) {
+        let ui = Arc::clone(self);
+        commands_selectors::spawn_async(async move {
+            // Let a just-arriving DA1/deadline settle before replacing the
+            // pending entry; the retry then owns the next replies.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ui.ui.cancel_terminal_color_queries();
+            let timeout = rpi_tui::terminal::resolve_terminal_color_timeout_ms();
+            let receiver = ui.submit_terminal_color_query();
+            let backstop = timeout + Duration::from_millis(TERMINAL_QUERY_BACKSTOP_MARGIN_MS);
+            if let Ok(Ok(colors)) = tokio::time::timeout(backstop, receiver).await {
+                // Even an empty second report is final: it falls back to the
+                // indexed tier exactly once.
+                ui.push(UiCommand::ApplyTerminalColors(colors));
+                ui.render_handle.request_render();
+            }
+        });
     }
 
     /// Fire-and-forget variant used by runtime paths that do not await the
@@ -4971,10 +5027,9 @@ impl InteractiveUi {
         commands_selectors::spawn_async(async move {
             // The Tui's own deadline resolves the oneshot; the tokio timeout
             // is a backstop for tests without a pump.
-            if let Ok(Ok(colors)) =
-                tokio::time::timeout(Duration::from_millis(TERMINAL_QUERY_BACKSTOP_MS), receiver)
-                    .await
-            {
+            let backstop = rpi_tui::terminal::resolve_terminal_color_timeout_ms()
+                + Duration::from_millis(TERMINAL_QUERY_BACKSTOP_MARGIN_MS);
+            if let Ok(Ok(colors)) = tokio::time::timeout(backstop, receiver).await {
                 first_ui.push(UiCommand::ApplyTerminalColors(colors));
                 first_ui.render_handle.request_render();
             }
@@ -6622,10 +6677,18 @@ impl InteractiveMode {
         // the reported colors when the terminal answers; late replies still
         // route through the drain.
         let receiver = self.ui_state.submit_terminal_color_query();
-        if let Ok(Ok(colors)) =
-            tokio::time::timeout(Duration::from_millis(TERMINAL_QUERY_BACKSTOP_MS), receiver).await
-        {
-            self.ui_state.apply_terminal_colors(colors);
+        let backstop = rpi_tui::terminal::resolve_terminal_color_timeout_ms()
+            + Duration::from_millis(TERMINAL_QUERY_BACKSTOP_MARGIN_MS);
+        match tokio::time::timeout(backstop, receiver).await {
+            Ok(Ok(colors)) if !terminal_color_report_needs_retry(&colors) => {
+                self.ui_state.apply_terminal_colors(colors);
+            }
+            _ => {
+                // Empty/background-less report or a missing first result:
+                // keep the pending/grayscale theme and try once more rather
+                // than committing to the no-panel tier for the session.
+                self.ui_state.retry_terminal_colors_async();
+            }
         }
     }
 
@@ -7473,16 +7536,20 @@ impl InteractiveMode {
             unsubscribe();
         }
 
+        // Drain in-flight replies before stop clears the event channel
+        // (interactive-mode.ts:3572-3583 `terminal.drainInput(1000)`): a late
+        // DA1 / Kitty release left in the pty must not be re-read by the
+        // next process (issue #77). The driver is already joined, so the
+        // blocking form can take the terminal lock safely.
+        self.ui
+            .with_terminal(|terminal| terminal.drain_input_blocking(Some(1000), Some(50)));
+
         // T32: stopInteractiveTui applies the fullscreen exit-output logic
         // (interactive-mode.ts:6393-6396, 779-786 @ ac4ac9eaf).
         let exit_output = self
             .session
             .settings_manager(|s| s.get_fullscreen_exit_output());
         self.stop_interactive_tui(exit_output);
-
-        // TODO: drain terminal input before exit (upstream
-        // terminal.drainInput(1000), interactive-mode.ts:3572-3583) — the
-        // trait's drain future cannot be polled through Tui::with_terminal.
 
         self.runtime.dispose().await;
 
@@ -14270,6 +14337,20 @@ mod tests {
             mode.ui.mode(),
             TuiMode::Regular,
             "transcript exit switches to regular"
+        );
+    }
+
+    /// Issue #77: the shutdown must drain queued terminal replies BEFORE
+    /// `stop` clears the event channel (upstream `drainInput(1000)`).
+    #[tokio::test]
+    async fn shutdown_drains_terminal_input_before_stop() {
+        let (mut mode, terminal, _session) = mode_harness().await;
+        mode.init().await;
+        mode.shutdown().await;
+        assert_eq!(
+            terminal.drain_calls(),
+            vec![(Some(1000), Some(50))],
+            "drain must run once, with the upstream defaults"
         );
     }
 

@@ -239,6 +239,50 @@ pub fn resolve_escape_timeout_ms() -> Duration {
     resolve_escape_timeout_ms_with(|key| std::env::var(key).ok())
 }
 
+/// Default terminal-color query timeout for local terminals
+/// (theme-controller.ts:25 `TERMINAL_QUERY_TIMEOUT_MS`).
+const DEFAULT_COLOR_TIMEOUT: Duration = Duration::from_millis(100);
+/// SSH color-query timeout: the same high-latency transport that needs the
+/// 100ms SSH escape window also needs a longer OSC 10/11/4 + DA1 round trip
+/// (issue #77: a 100ms deadline on a slow pty committed the empty report and
+/// dropped every panel background for the whole session).
+const DEFAULT_SSH_COLOR_TIMEOUT: Duration = Duration::from_millis(500);
+/// Bounds for the environment override: the deadline is added to `Instant`,
+/// so an absurd JavaScript-style magnitude must not overflow it.
+const MIN_COLOR_TIMEOUT: Duration = Duration::from_millis(10);
+const MAX_COLOR_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait for the terminal's color report before treating it as
+/// absent. `RPI_TUI_COLOR_TIMEOUT` (milliseconds, JS `Number()` semantics,
+/// clamped to 10..5000ms) wins; otherwise SSH (`SSH_CONNECTION`/`SSH_TTY`)
+/// gets 500ms and local terminals 100ms.
+///
+/// The default query timeout is a deliberate rpi extension: upstream
+/// (`theme-controller.ts:25 @ 4a080252f`) uses 100ms everywhere, which is too
+/// short for a high-latency SSH pty. See ADR-0045.
+pub fn resolve_terminal_color_timeout_ms_with(getenv: impl Fn(&str) -> Option<String>) -> Duration {
+    let configured =
+        getenv("RPI_TUI_COLOR_TIMEOUT").and_then(|value| value.trim().parse::<f64>().ok());
+    if let Some(configured) = configured
+        && configured.is_finite()
+        && configured > 0.0
+    {
+        let parsed = Duration::try_from_secs_f64(configured / 1000.0)
+            .unwrap_or(MAX_COLOR_TIMEOUT)
+            .clamp(MIN_COLOR_TIMEOUT, MAX_COLOR_TIMEOUT);
+        return parsed;
+    }
+    if getenv("SSH_CONNECTION").is_some() || getenv("SSH_TTY").is_some() {
+        return DEFAULT_SSH_COLOR_TIMEOUT;
+    }
+    DEFAULT_COLOR_TIMEOUT
+}
+
+/// [`resolve_terminal_color_timeout_ms_with`] using the real environment.
+pub fn resolve_terminal_color_timeout_ms() -> Duration {
+    resolve_terminal_color_timeout_ms_with(|key| std::env::var(key).ok())
+}
+
 /// `normalizeNativeShiftEnterInput` (terminal.ts:44-51 @ 4181f66, 73dd066ee).
 pub fn normalize_native_shift_enter_input<'a>(
     data: &'a str,
@@ -294,6 +338,14 @@ pub trait Terminal {
         max_ms: Option<u64>,
         idle_ms: Option<u64>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    /// Blocking [`Terminal::drain_input`] for shutdown paths that cannot
+    /// await a future while holding the terminal lock (the interactive
+    /// mode calls this before `stop` to discard stale DA/Kitty replies).
+    ///
+    /// Default no-op for test terminals; the process terminal implements the
+    /// same loop with `std::thread::sleep`.
+    fn drain_input_blocking(&mut self, _max_ms: Option<u64>, _idle_ms: Option<u64>) {}
 
     /// Write output to the terminal (upstream `write(data)`).
     fn write(&mut self, data: &str);
@@ -1279,6 +1331,40 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
         })
     }
 
+    fn drain_input_blocking(&mut self, max_ms: Option<u64>, idle_ms: Option<u64>) {
+        // Upstream defaults: `drainInput(maxMs = 1000, idleMs = 50)`.
+        let max = Duration::from_millis(max_ms.unwrap_or(1000));
+        let idle = Duration::from_millis(idle_ms.unwrap_or(50));
+        let should_disable_kitty_protocol =
+            self.keyboard_protocol_pushed || self.kitty_protocol_active;
+        self.clear_keyboard_protocol_negotiation_buffer();
+        if should_disable_kitty_protocol {
+            self.write_direct("\x1b[<u");
+            self.keyboard_protocol_pushed = false;
+            self.kitty_protocol_active = false;
+            set_kitty_protocol_active(false);
+        }
+        self.disable_modify_other_keys();
+
+        let previous_handler = self.input_handler.take();
+        let mut last_data_time = Instant::now();
+        let end_time = Instant::now() + max;
+        loop {
+            if let Some(rx) = &self.event_rx {
+                while rx.try_recv().is_some() {
+                    last_data_time = Instant::now();
+                }
+            }
+            let now = Instant::now();
+            let time_left = end_time.saturating_duration_since(now);
+            if time_left.is_zero() || now.duration_since(last_data_time) >= idle {
+                break;
+            }
+            std::thread::sleep(time_left.min(idle));
+        }
+        self.input_handler = previous_handler;
+    }
+
     fn write(&mut self, data: &str) {
         self.write_direct(data);
         if let Some(path) = &self.write_log_path {
@@ -1673,6 +1759,57 @@ mod tests {
                 Duration::from_millis(100),
                 "SSH indicator {key} must raise the timeout"
             );
+        }
+    }
+
+    // --- resolveTerminalColorTimeoutMs (rpi extension, ADR-0045) ---
+
+    #[test]
+    fn resolve_terminal_color_timeout_defaults_by_transport() {
+        assert_eq!(
+            resolve_terminal_color_timeout_ms_with(|_| None),
+            Duration::from_millis(100)
+        );
+        for key in ["SSH_CONNECTION", "SSH_TTY"] {
+            let pairs = [(key, "value")];
+            let env = env_map(&pairs);
+            assert_eq!(
+                resolve_terminal_color_timeout_ms_with(env),
+                Duration::from_millis(500),
+                "SSH indicator {key} must raise the color timeout"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_terminal_color_timeout_env_wins() {
+        let pairs = [
+            ("RPI_TUI_COLOR_TIMEOUT", " 250.5 "),
+            ("SSH_CONNECTION", "10.0.0.1 5555 10.0.0.2 22"),
+        ];
+        let env = env_map(&pairs);
+        assert_eq!(
+            resolve_terminal_color_timeout_ms_with(env),
+            Duration::from_micros(250_500)
+        );
+        for value in ["", "0", "-5", "soon"] {
+            let pairs = [("RPI_TUI_COLOR_TIMEOUT", value)];
+            let env = env_map(&pairs);
+            assert_eq!(
+                resolve_terminal_color_timeout_ms_with(env),
+                Duration::from_millis(100),
+                "{value:?}"
+            );
+        }
+        // The deadline is added to `Instant`: clamp absurd/fractional values
+        // instead of overflowing.
+        for (value, expected) in [
+            ("0.1", Duration::from_millis(10)),
+            ("1e30", Duration::from_secs(5)),
+        ] {
+            let pairs = [("RPI_TUI_COLOR_TIMEOUT", value)];
+            let env = env_map(&pairs);
+            assert_eq!(resolve_terminal_color_timeout_ms_with(env), expected);
         }
     }
 

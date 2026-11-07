@@ -447,6 +447,15 @@ impl TuiHandle {
         }
     }
 
+    /// Rust addition (issue #77 retry): drop any pending color queries on the
+    /// live renderer before submitting a fresh one.
+    pub fn cancel_terminal_color_queries(&self) {
+        match self.renderer_clone() {
+            RendererClone::Main(tui) => tui.cancel_terminal_color_queries(),
+            RendererClone::Alt(tui) => tui.cancel_terminal_color_queries(),
+        }
+    }
+
     // --- handle / introspection (Rust additions) --------------------------
 
     /// Access the terminal (upstream `public terminal`, tui.ts:296).
