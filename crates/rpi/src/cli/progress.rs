@@ -235,11 +235,22 @@ impl DownloadObserver for ProgressRenderer {
                 to,
                 reason,
                 kept_bytes,
+                attempt,
             } => {
                 self.clear_line(&mut inner);
                 self.write_line(&format!(
-                    "Switching from {from} to {to} (kept {}): {reason}",
+                    "Switching from {from} to {to} (attempt {attempt}, kept {}): {reason}",
                     format_bytes(*kept_bytes as f64)
+                ));
+            }
+            DownloadEvent::Restarting {
+                url,
+                discarded_bytes,
+            } => {
+                self.clear_line(&mut inner);
+                self.write_line(&format!(
+                    "The server ignored the resume range for {url}; restarting from zero (discarded {})",
+                    format_bytes(*discarded_bytes as f64)
                 ));
             }
             DownloadEvent::Verifying { file } => {

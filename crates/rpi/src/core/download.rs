@@ -172,6 +172,11 @@ pub enum DownloadEvent {
         to: String,
         reason: String,
         kept_bytes: u64,
+        attempt: u32,
+    },
+    Restarting {
+        url: String,
+        discarded_bytes: u64,
     },
     Verifying {
         file: PathBuf,
@@ -324,7 +329,10 @@ impl PartialMetadata {
     }
 
     fn matches(&self, spec: &DownloadSpec) -> bool {
-        self.url == spec.url && self.version == spec.version && self.file_name == spec.file_name
+        // Mirrors serve the same artifact: version/file identity is enough
+        // to resume across a fallback. `If-Range` protects against a
+        // changed object and the final sha256 remains authoritative.
+        self.version == spec.version && self.file_name == spec.file_name
     }
 }
 
@@ -519,6 +527,12 @@ impl<'a> Downloader<'a> {
                         mode = Some(open_mode);
                         downloaded = resume_offset;
                         open_partial(partial_path_ref, open_mode)?;
+                        if response.status == 200 && existing > 0 {
+                            observer.on_download_event(&DownloadEvent::Restarting {
+                                url: spec_snapshot.url.clone(),
+                                discarded_bytes: existing,
+                            });
+                        }
                         if response.status != 416 {
                             // Persist resume metadata with the first bytes:
                             // the partial must be resumable even when this
@@ -951,6 +965,7 @@ pub fn gc_stale_partials(dir: &Path, max_age: Duration) {
         return;
     };
     let now = unix_now();
+    let mut seen_stems: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -959,6 +974,7 @@ pub fn gc_stale_partials(dir: &Path, max_age: Duration) {
         let Some(stem) = name.strip_suffix(".part.json") else {
             continue;
         };
+        seen_stems.push(stem.to_string());
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -970,6 +986,31 @@ pub fn gc_stale_partials(dir: &Path, max_age: Duration) {
         }
         let _ = std::fs::remove_file(dir.join(format!("{stem}.part")));
         let _ = std::fs::remove_file(&path);
+    }
+    // Orphan `.part` files without metadata cannot resume; remove them once
+    // they are older than the retention window.
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".part") else {
+            continue;
+        };
+        if seen_stems.iter().any(|seen| seen == stem) {
+            continue;
+        }
+        let old = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age.as_secs() > max_age.as_secs());
+        if old {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -1002,6 +1043,7 @@ pub fn download_from_sources(
                             to: next.clone(),
                             reason: error.message.clone(),
                             kept_bytes,
+                            attempt: (index + 1) as u32,
                         });
                 }
                 failures.push(format!("{url}: {}", error.message));
@@ -1364,10 +1406,13 @@ mod tests {
                 content_length: Some(4),
                 content_range_total: None,
                 retry_after: None,
-                chunks: vec![Err(DownloadError::new(
-                    DownloadErrorKind::Reset,
-                    "connection reset",
-                ))],
+                chunks: vec![
+                    Ok(b"part".to_vec()),
+                    Err(DownloadError::new(
+                        DownloadErrorKind::Reset,
+                        "connection reset",
+                    )),
+                ],
             },
             FakeResponse {
                 status: 200,
@@ -1497,6 +1542,146 @@ mod tests {
             .download(&spec(dir.path(), Some(&hex(b"hello world"))))
             .expect("restart succeeds");
         assert_eq!(std::fs::read(&outcome.path).unwrap(), b"hello world");
+        assert!(
+            observer
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, DownloadEvent::Restarting { .. })),
+            "a 200 after a partial must announce the restart"
+        );
+    }
+
+    #[test]
+    fn cross_mirror_fallback_resumes_the_same_partial() {
+        let dir = TempDir::new("cross-mirror-resume");
+        let transport = FakeTransport::new(vec![
+            FakeResponse {
+                status: 200,
+                content_length: Some(11),
+                content_range_total: None,
+                retry_after: None,
+                chunks: vec![
+                    Ok(b"hello ".to_vec()),
+                    Err(DownloadError::new(
+                        DownloadErrorKind::Reset,
+                        "connection reset",
+                    )),
+                ],
+            },
+            FakeResponse {
+                status: 206,
+                content_length: Some(5),
+                content_range_total: Some(11),
+                retry_after: None,
+                chunks: vec![Ok(b"world".to_vec())],
+            },
+        ]);
+        let observer = RecordingObserver::default();
+        let downloader = downloader(&transport, &observer);
+        let bytes = b"hello world";
+        let mut spec = spec(dir.path(), Some(&hex(bytes)));
+        spec.url = "https://github.test/a.rpix".to_owned();
+        let urls = vec![
+            "https://github.test/a.rpix".to_owned(),
+            "https://mirror.test/a.rpix".to_owned(),
+        ];
+        let outcome = download_from_sources(&downloader, &spec, &urls).expect("mirror resume");
+        assert_eq!(std::fs::read(&outcome.path).unwrap(), bytes);
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[1]
+                .1
+                .iter()
+                .any(|(name, value)| name == "Range" && value == "bytes=6-"),
+            "cross-mirror range: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn cross_mirror_resume_sends_if_range() {
+        let dir = TempDir::new("if-range");
+        let bytes = b"hello world";
+        std::fs::write(dir.path().join("a.rpix.part"), b"hello ").unwrap();
+        let metadata = PartialMetadata {
+            url: "https://github.test/a.rpix".to_owned(),
+            version: "1.2.3".to_owned(),
+            file_name: "a.rpix".to_owned(),
+            etag: Some("\"abc\"".to_owned()),
+            last_modified: None,
+            total: Some(bytes.len() as u64),
+            created_at: unix_now(),
+        };
+        std::fs::write(
+            dir.path().join("a.rpix.part.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let transport = FakeTransport::new(vec![FakeResponse {
+            status: 206,
+            content_length: Some(5),
+            content_range_total: Some(bytes.len() as u64),
+            retry_after: None,
+            chunks: vec![Ok(b"world".to_vec())],
+        }]);
+        let observer = RecordingObserver::default();
+        let mut spec = spec(dir.path(), Some(&hex(bytes)));
+        spec.url = "https://mirror.test/a.rpix".to_owned();
+        downloader(&transport, &observer)
+            .download(&spec)
+            .expect("resume from another mirror");
+        let calls = transport.calls();
+        assert!(
+            calls[0]
+                .1
+                .iter()
+                .any(|(name, value)| name == "If-Range" && value == "\"abc\""),
+            "if-range header: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_switched_source_that_404s_keeps_the_partial() {
+        let dir = TempDir::new("switch-404");
+        let transport = FakeTransport::new(vec![
+            FakeResponse {
+                status: 200,
+                content_length: Some(11),
+                content_range_total: None,
+                retry_after: None,
+                chunks: vec![
+                    Ok(b"hello ".to_vec()),
+                    Err(DownloadError::new(
+                        DownloadErrorKind::Reset,
+                        "connection reset",
+                    )),
+                ],
+            },
+            FakeResponse {
+                status: 404,
+                content_length: Some(0),
+                content_range_total: None,
+                retry_after: None,
+                chunks: Vec::new(),
+            },
+        ]);
+        let observer = RecordingObserver::default();
+        let downloader = downloader(&transport, &observer);
+        let mut spec = spec(dir.path(), Some(&hex(b"hello world")));
+        spec.url = "https://github.test/a.rpix".to_owned();
+        let urls = vec![
+            "https://github.test/a.rpix".to_owned(),
+            "https://mirror.test/a.rpix".to_owned(),
+        ];
+        let error = download_from_sources(&downloader, &spec, &urls).unwrap_err();
+        assert_eq!(error.kind, DownloadErrorKind::Policy);
+        assert_eq!(
+            std::fs::read(dir.path().join("a.rpix.part")).unwrap(),
+            b"hello "
+        );
+        assert!(dir.path().join("a.rpix.part.json").exists());
     }
 
     #[test]
@@ -1694,6 +1879,19 @@ mod tests {
         gc_stale_partials(dir.path(), DEFAULT_PARTIAL_MAX_AGE);
         assert!(!dir.path().join("old.rpix.part").exists());
         assert!(!dir.path().join("old.rpix.part.json").exists());
+
+        // Orphan `.part` without metadata is also expired by mtime.
+        let orphan = dir.path().join("orphan.rpix.part");
+        std::fs::write(&orphan, b"orphan").unwrap();
+        let old = std::time::SystemTime::now() - DEFAULT_PARTIAL_MAX_AGE - Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        gc_stale_partials(dir.path(), DEFAULT_PARTIAL_MAX_AGE);
+        assert!(!orphan.exists());
     }
 
     #[test]

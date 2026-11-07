@@ -14,7 +14,7 @@
 //! Update orchestration (`update`, `checkForAvailableUpdates`,
 //! `updateConfiguredSources`, concurrency-4 scheduling) lands in W3; the
 //! per-package update machinery (`update_git` / `ensure_git_ref` reconcile,
-//! `should_update_npm_source`, `get_latest_npm_version` with
+//! `get_latest_npm_version` with
 //! maxSatisfying) is implemented here already.
 //!
 //! Intentional differences:
@@ -86,8 +86,6 @@ use crate::tools::path_utils::resolve_path;
 pub const NETWORK_TIMEOUT: Duration = Duration::from_millis(10_000);
 /// `UPDATE_CHECK_CONCURRENCY` (package-manager.ts:39) — consumed by W3.
 pub const UPDATE_CHECK_CONCURRENCY: usize = 4;
-/// `GIT_UPDATE_CONCURRENCY` (package-manager.ts:40) — consumed by W3.
-pub const GIT_UPDATE_CONCURRENCY: usize = 4;
 
 /// A fully resolved registry/`github:` install (design §7.2 steps 1–4 for
 /// the registry channel, release enumeration for `github:`), ready for the
@@ -577,9 +575,9 @@ impl UpdatePlanEntry {
                 self.note.as_deref().unwrap_or("untracked")
             ),
             UpdatePlanAction::Skipped => format!(
-                "  {} - skipped: {}",
+                "  {} - {}",
                 self.source,
-                self.note.as_deref().unwrap_or("not updated")
+                self.note.as_deref().unwrap_or("skipped")
             ),
             UpdatePlanAction::Error => format!(
                 "  {} - resolution failed: {}",
@@ -1328,6 +1326,20 @@ impl DefaultPackageManager {
         self.download_observer
             .as_deref()
             .unwrap_or(&NoopDownloadObserver)
+    }
+
+    /// True resume hint only when a `.part` actually survived (an
+    /// integrity failure deletes it; a fresh 404 leaves nothing).
+    fn partial_resume_hint(&self, file_name: &str) -> &'static str {
+        if self
+            .download_staging_dir()
+            .join(format!("{file_name}.part"))
+            .exists()
+        {
+            " Partial downloads are kept; re-run to resume."
+        } else {
+            ""
+        }
     }
 
     /// Download staging root (resumable `.part` files live here, separate
@@ -2673,11 +2685,7 @@ impl DefaultPackageManager {
                 resolved.info.name,
                 resolved.info.version,
                 error.message,
-                if error.kind == crate::core::download::DownloadErrorKind::Integrity {
-                    ""
-                } else {
-                    " Partial downloads are kept; re-run to resume."
-                },
+                self.partial_resume_hint(&file_name),
             )
         })?;
         let bytes = self.take_downloaded(outcome)?;
@@ -2722,11 +2730,7 @@ impl DefaultPackageManager {
                 resolved.info.name,
                 resolved.info.version,
                 error.message,
-                if error.kind == crate::core::download::DownloadErrorKind::Integrity {
-                    ""
-                } else {
-                    " Partial downloads are kept; re-run to resume."
-                },
+                self.partial_resume_hint(&artifact_name),
             )
         })?;
         let actual = outcome.sha256.clone();
@@ -2744,8 +2748,10 @@ impl DefaultPackageManager {
         .map_err(|error| {
             format!(
                 "Could not fetch the sha256 sidecar for {}: {}. Without it the download \
-                 cannot be verified; aborting",
-                resolved.download_urls[0], error.message
+                 cannot be verified; aborting.{}",
+                resolved.download_urls[0],
+                error.message,
+                self.partial_resume_hint(&sidecar_name)
             )
         })?;
         let sidecar = self.take_downloaded(sidecar_outcome)?;
@@ -3366,8 +3372,14 @@ impl DefaultPackageManager {
                             };
                         }
                         Err(error) => {
-                            row.action = UpdatePlanAction::Error;
-                            row.note = Some(error);
+                            // Legacy parity: a version lookup failure must
+                            // still attempt `npm install` (the install
+                            // itself reports the real failure), not turn
+                            // the source into a plan error.
+                            row.action = UpdatePlanAction::Update;
+                            row.note = Some(format!(
+                                "version lookup failed ({error}); attempting npm install"
+                            ));
                         }
                     }
                     row.npm = Some(NpmUpdateTarget {
@@ -3924,33 +3936,6 @@ impl DefaultPackageManager {
         match &source.range {
             Some(range) => npm_satisfies(&installed_version, range),
             None => true,
-        }
-    }
-
-    /// `shouldUpdateNpmSource` (package-manager.ts:1139-1153) — W3 update
-    /// check entry point.
-    pub fn should_update_npm_source(
-        &self,
-        source: &NpmSource,
-        scope: SourceScope,
-    ) -> Result<bool, String> {
-        let installed_path = self.get_managed_npm_install_path(source, scope)?;
-        let installed_version = if installed_path.exists() {
-            self.get_installed_npm_version(&installed_path)
-        } else {
-            None
-        };
-        let Some(installed_version) = installed_version else {
-            return Ok(true);
-        };
-        let spec = match &source.version {
-            Some(_) => source.spec.clone(),
-            None => source.name.clone(),
-        };
-        match self.get_latest_npm_version(&spec, source.range.as_deref()) {
-            Ok(target_version) => Ok(target_version != installed_version),
-            // Preserve existing update behavior when version lookup fails.
-            Err(_) => Ok(true),
         }
     }
 
@@ -7227,26 +7212,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_update_npm_source_compares_versions() {
-        let dirs = TestDirs::new();
-        let package_dir = dirs.agent_dir.join("npm/node_modules/left-pad");
-        write_file(
-            &package_dir.join("package.json"),
-            r#"{"name": "left-pad", "version": "1.0.0"}"#,
-        );
-        let runner = FakeRunner::new(|_| Ok(r#"["1.0.0", "1.1.0"]"#.to_string()));
-        let manager = test_manager(&dirs, runner);
-        let ParsedSource::Npm(npm) = parse_source("npm:left-pad") else {
-            panic!("expected npm source");
-        };
-        assert!(
-            manager
-                .should_update_npm_source(&npm, SourceScope::User)
-                .unwrap()
-        );
-    }
-
-    #[test]
     fn test_semver_range_translation() {
         assert!(npm_satisfies("1.2.3", "^1.0.0"));
         assert!(!npm_satisfies("2.0.0", "^1.0.0"));
@@ -7565,6 +7530,29 @@ mod update_tests {
         // Versioned (range) sources reinstall the configured spec, not
         // `name@latest` (package-manager.ts:1162).
         assert!(installs[0].args.contains(&"foo@^1.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_update_npm_version_lookup_failure_still_installs() {
+        let dirs = TestDirs::new();
+        let runner = FakeRunner::new(|request| {
+            if request.args.first().map(String::as_str) == Some("view") {
+                return Err("registry unavailable".to_string());
+            }
+            Ok(String::new())
+        });
+        let mut manager = manager(&dirs, runner.clone());
+        manager
+            .settings_manager
+            .set_packages(vec![PackageSource::Source("npm:foo@^1.0".to_string())]);
+        manager.update(None).unwrap();
+        let installs = install_calls(&runner);
+        assert_eq!(
+            installs.len(),
+            1,
+            "lookup failure must still attempt install"
+        );
+        assert!(installs[0].args.contains(&"foo@^1.0".to_string()));
     }
 
     #[test]
@@ -8885,6 +8873,56 @@ mod registry_tests {
             .update_with_channel_exact(Some(name), UpdateChannel::Stable, Some(stable))
             .unwrap();
         assert_eq!(installed().as_deref(), Some(stable));
+    }
+
+    #[test]
+    fn test_plan_line_covers_every_action_variant() {
+        let entry = |action, note: Option<&str>| UpdatePlanEntry {
+            source: "ext".to_string(),
+            current: Some("0.1.0".to_string()),
+            target: Some("0.2.0".to_string()),
+            kind: "registry",
+            action,
+            note: note.map(str::to_string),
+            pinned: false,
+            scope: SourceScope::User,
+            npm: None,
+            git: None,
+            resolved: None,
+        };
+        assert!(
+            entry(UpdatePlanAction::Local, Some("local (not managed)"))
+                .plan_line()
+                .contains("local (not managed)")
+        );
+        assert!(
+            entry(UpdatePlanAction::Untracked, Some("not in the registry"))
+                .plan_line()
+                .contains("not in the registry")
+        );
+        let skipped = entry(UpdatePlanAction::Skipped, Some("pinned npm version"));
+        assert!(
+            !skipped.plan_line().contains("skipped: Skipping"),
+            "{}",
+            skipped.plan_line()
+        );
+        assert!(skipped.plan_line().contains("pinned npm version"));
+        assert!(
+            entry(UpdatePlanAction::Error, Some("boom"))
+                .plan_line()
+                .contains("resolution failed: boom")
+        );
+    }
+
+    #[test]
+    fn test_partial_resume_hint_requires_a_retained_partial() {
+        let dirs = TestDirs::new();
+        let manager = manager_ok(&dirs, MapTransport::new());
+        assert_eq!(manager.partial_resume_hint("x.rpix"), "");
+        let staging = manager.download_staging_dir();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("x.rpix.part"), b"partial").unwrap();
+        assert!(manager.partial_resume_hint("x.rpix").contains("resume"));
     }
 
     #[test]

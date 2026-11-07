@@ -25,9 +25,9 @@ use crate::config::{
     write_install_manifest_for,
 };
 use crate::core::download::{
-    DownloadAssetKind, DownloadError, DownloadHttpRequest, DownloadObserver, DownloadPolicy,
-    DownloadSpec, DownloadStreamEvent, DownloadTransport, Downloader, NoopDownloadObserver,
-    ReqwestDownloadTransport,
+    DownloadAssetKind, DownloadError, DownloadEvent, DownloadHttpRequest, DownloadObserver,
+    DownloadPolicy, DownloadSpec, DownloadStreamEvent, DownloadTransport, Downloader,
+    NoopDownloadObserver, ReqwestDownloadTransport,
 };
 use crate::core::session_manager::now_iso8601;
 use crate::core::version_check::rpi_user_agent;
@@ -428,14 +428,33 @@ pub async fn run_binary_self_update_observed(
 
     let mut download_failures: Vec<String> = Vec::new();
     let mut verified: Option<(String, Vec<u8>, String)> = None;
-    for base_url in base_urls {
+    for (index, base_url) in base_urls.iter().enumerate() {
         let candidate_url = asset_url(base_url, request.version, target);
         let sidecar_url = sha256_sidecar_url(&candidate_url);
+        let next_asset = base_urls
+            .get(index + 1)
+            .map(|next| asset_url(next, request.version, target));
+        let emit_switch = |from: &str, reason: &str| {
+            let Some(to) = &next_asset else {
+                return;
+            };
+            let kept_bytes = std::fs::metadata(download_dir.join(format!("{asset_name}.part")))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            observer.on_download_event(&DownloadEvent::Switching {
+                from: from.to_string(),
+                to: to.clone(),
+                reason: reason.to_string(),
+                kept_bytes,
+                attempt: (index + 1) as u32,
+            });
+        };
         let mut asset_spec = DownloadSpec::new(&candidate_url, &download_dir, &asset_name);
         asset_spec.version = request.version.to_string();
         let outcome = match downloader.download(&asset_spec) {
             Ok(outcome) => outcome,
             Err(error) => {
+                emit_switch(&candidate_url, &error.message);
                 download_failures.push(format!("{candidate_url}: {}", error.message));
                 continue;
             }
@@ -452,12 +471,14 @@ pub async fn run_binary_self_update_observed(
                 }
                 Err(error) => {
                     let _ = std::fs::remove_file(&outcome.path);
+                    emit_switch(&sidecar_url, &error.to_string());
                     download_failures.push(format!("{sidecar_url}: {error}"));
                     continue;
                 }
             },
             Err(error) => {
                 let _ = std::fs::remove_file(&outcome.path);
+                emit_switch(&sidecar_url, &error.message);
                 download_failures.push(format!("{sidecar_url}: {}", error.message));
                 continue;
             }
@@ -956,6 +977,15 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct EventObserver(Mutex<Vec<DownloadEvent>>);
+
+    impl DownloadObserver for EventObserver {
+        fn on_download_event(&self, event: &DownloadEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
     /// Build a release asset pair (`tar.gz` bytes + `sha256sum`-format
     /// sidecar) with `binary` as the `rpi` entry.
     fn fake_release(binary: &[u8]) -> (Vec<u8>, String) {
@@ -1284,7 +1314,8 @@ mod tests {
             (sha256_sidecar_url(&mirror_url), Ok(sidecar.into_bytes())),
         ]));
 
-        let outcome = run_binary_self_update(
+        let observer = EventObserver::default();
+        let outcome = run_binary_self_update_observed(
             &BinarySelfUpdateRequest {
                 exe_path: &exe,
                 version: "9.9.9",
@@ -1295,10 +1326,20 @@ mod tests {
                 "https://github.test".to_string(),
                 "https://site.test".to_string(),
             ],
+            &observer,
         )
         .await
         .unwrap();
         assert_eq!(outcome.source_url, mirror_url);
+        assert!(
+            observer.0.lock().unwrap().iter().any(|event| matches!(
+                event,
+                DownloadEvent::Switching { from, to, .. }
+                    if from.contains("github.test") && to.contains("site.test")
+            )),
+            "self-update mirror fallback must emit Switching: {:?}",
+            observer.0.lock().unwrap()
+        );
         assert_eq!(std::fs::read(&exe).unwrap(), b"mirror-binary");
         // GitHub was tried first (and 404'd) before the mirror.
         let calls = transport.calls.lock().unwrap();

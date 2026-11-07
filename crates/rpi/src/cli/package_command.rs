@@ -573,7 +573,9 @@ async fn run_binary_self_update_branch(
             eprintln!("Error: {message}");
             eprintln!("{}", failure_line(all_targets));
             eprintln!("Retry: {APP_NAME} update --self");
-            eprintln!("Partial downloads are kept; re-running resumes where possible.");
+            if let Some(hint) = partial_resume_hint(&message) {
+                eprintln!("{hint}");
+            }
             eprintln!(
                 "Manual: {}",
                 crate::core::self_update::manual_download_instruction(&plan.version, target)
@@ -581,6 +583,16 @@ async fn run_binary_self_update_branch(
             eprintln!("Releases: {}", crate::config::SELF_UPDATE_DOWNLOAD_URL);
             1
         }
+    }
+}
+
+/// V18-12 B2: only advertise resume when the error did not discard the
+/// download (integrity failures delete it and say so).
+pub(crate) fn partial_resume_hint(error: &str) -> Option<&'static str> {
+    if error.contains("Integrity check failed") || error.contains("discarded") {
+        None
+    } else {
+        Some("Partial downloads are kept; re-running resumes where possible.")
     }
 }
 
@@ -2928,6 +2940,13 @@ mod update_cli_tests {
         .await;
         assert_eq!(code, 1);
         assert_eq!(std::fs::read(&exe).unwrap(), b"old-binary");
+    }
+
+    #[test]
+    fn partial_resume_hint_is_suppressed_for_integrity_failures() {
+        assert!(partial_resume_hint("connection reset").is_some());
+        assert!(partial_resume_hint("Integrity check failed for x").is_none());
+        assert!(partial_resume_hint("The download was discarded").is_none());
     }
 
     #[test]
