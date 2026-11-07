@@ -556,12 +556,13 @@ impl<'a> Downloader<'a> {
                     if let Some(expected) = &spec.expected_sha256
                         && !actual.eq_ignore_ascii_case(expected)
                     {
+                        // A poisoned partial must not survive: a
+                        // Range-capable server would answer 416 "complete"
+                        // and reproduce the same mismatch forever.
+                        self.reset_partial(&partial_path, &metadata_path);
                         let error = DownloadError::integrity(format!(
-                            "Integrity check failed for {}: expected sha256 {}, got {}. The download was kept at {}; re-run to retry from scratch.",
-                            spec.file_name,
-                            expected,
-                            actual,
-                            partial_path.display()
+                            "Integrity check failed for {}: expected sha256 {}, got {}. The download was discarded; re-run to download it again.",
+                            spec.file_name, expected, actual,
                         ));
                         self.observer.on_download_event(&DownloadEvent::Failed {
                             message: error.message.clone(),
@@ -934,7 +935,18 @@ impl DownloadTransport for ReqwestDownloadTransport {
                     for (name, value) in &request.headers {
                         builder = builder.header(name, value);
                     }
-                    let response = builder.send().await.map_err(classify_reqwest)?;
+                    let response = tokio::time::timeout(request.stall_timeout, builder.send())
+                        .await
+                        .map_err(|_| {
+                            DownloadError::new(
+                                DownloadErrorKind::Timeout,
+                                format!(
+                                    "the server sent no response headers for {}s",
+                                    request.stall_timeout.as_secs()
+                                ),
+                            )
+                        })?
+                        .map_err(classify_reqwest)?;
                     let status = response.status().as_u16();
                     let header = |name: reqwest::header::HeaderName| {
                         response
@@ -1241,7 +1253,7 @@ mod tests {
     }
 
     #[test]
-    fn integrity_mismatch_keeps_partial_and_never_creates_final() {
+    fn integrity_mismatch_discards_partial_and_never_creates_final() {
         let dir = TempDir::new("integrity");
         let bytes = b"tampered";
         let transport = FakeTransport::new(vec![FakeResponse::ok(bytes)]);
@@ -1251,8 +1263,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind, DownloadErrorKind::Integrity);
         assert!(!dir.path().join("a.rpix").exists());
-        assert!(dir.path().join("a.rpix.part").exists());
-        assert!(dir.path().join("a.rpix.part.json").exists());
+        assert!(!dir.path().join("a.rpix.part").exists());
+        assert!(!dir.path().join("a.rpix.part.json").exists());
         assert_eq!(transport.calls().len(), 1);
     }
 

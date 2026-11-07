@@ -548,6 +548,66 @@ pub struct UpdatePlanEntry {
     resolved: Option<ResolvedArtifactInstall>,
 }
 
+impl UpdatePlanEntry {
+    /// One plan-table line (R3.10.9). Pure so the CLI and tests share the
+    /// exact wording.
+    pub fn plan_line(&self) -> String {
+        let pinned = if self.pinned { ", pinned" } else { "" };
+        match self.action {
+            UpdatePlanAction::Update => {
+                let current = self.current.as_deref().unwrap_or("not installed");
+                let target = self.target.as_deref().unwrap_or("latest");
+                format!(
+                    "  {current} → {target}  {} ({}{pinned})",
+                    self.source, self.kind
+                )
+            }
+            UpdatePlanAction::UpToDate => {
+                format!("  {} - up to date ({})", self.source, self.kind)
+            }
+            UpdatePlanAction::Local => format!(
+                "  {} - {}",
+                self.source,
+                self.note.as_deref().unwrap_or("local (not managed)")
+            ),
+            UpdatePlanAction::Untracked => format!(
+                "  {} - {}",
+                self.source,
+                self.note.as_deref().unwrap_or("untracked")
+            ),
+            UpdatePlanAction::Skipped => format!(
+                "  {} - skipped: {}",
+                self.source,
+                self.note.as_deref().unwrap_or("not updated")
+            ),
+            UpdatePlanAction::Error => format!(
+                "  {} - resolution failed: {}",
+                self.source,
+                self.note.as_deref().unwrap_or("unknown error")
+            ),
+        }
+    }
+
+    /// Downgrade warning text, if this row moves backwards (an exact pin).
+    pub fn downgrade_warning(&self) -> Option<String> {
+        if self.action != UpdatePlanAction::Update {
+            return None;
+        }
+        let (Some(current), Some(target)) = (&self.current, &self.target) else {
+            return None;
+        };
+        if is_newer_package_version(current, target) {
+            Some(format!(
+                "Warning: {} will be downgraded from {current} to {target}{}.",
+                self.source,
+                if self.pinned { " (pinned)" } else { "" }
+            ))
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UpdatePlan {
     pub entries: Vec<UpdatePlanEntry>,
@@ -3209,11 +3269,21 @@ impl DefaultPackageManager {
     pub fn exact_version_source_error(source: &str) -> Option<String> {
         match parse_source(source) {
             ParsedSource::Registry(_) | ParsedSource::GithubRelease(_) => None,
-            ParsedSource::Npm(_) => Some(format!(
-                "The npm source \"{source}\" already pins versions with @<version>; use \
-                 \"rpi update {source_without_version}@<version>\" instead of --version",
-                source_without_version = source.split('@').next().unwrap_or(source)
-            )),
+            ParsedSource::Npm(_) => {
+                let source_without_version = source
+                    .rsplit_once('@')
+                    .filter(|(prefix, suffix)| {
+                        !prefix.ends_with(':')
+                            && (parse_npm_version(suffix).is_some()
+                                || get_npm_version_range(Some(suffix)).is_some())
+                    })
+                    .map(|(prefix, _)| prefix.to_string())
+                    .unwrap_or_else(|| source.to_string());
+                Some(format!(
+                    "The npm source \"{source}\" already pins versions with @<version>; use \
+                     \"rpi update {source_without_version}@<version>\" instead of --version"
+                ))
+            }
             ParsedSource::Git(_) => Some(format!(
                 "The git source \"{source}\" already pins refs with @<ref>; use \
                  \"rpi update {source}@<ref>\" instead of --version"
@@ -3472,6 +3542,18 @@ impl DefaultPackageManager {
                                 entry.source,
                                 APP_NAME = config::APP_NAME,
                             ));
+                        }
+                        // P2-7 parity: an RC channel over a stable-only
+                        // index is "already up to date", not a failure.
+                        Err(error)
+                            if channel == UpdateChannel::PreRelease
+                                && Self::is_registry_no_installable_version(&error) =>
+                        {
+                            row.action = UpdatePlanAction::UpToDate;
+                            row.note = Some(
+                                "already up to date (no pre-release versions published)"
+                                    .to_string(),
+                            );
                         }
                         Err(error) => {
                             row.action = UpdatePlanAction::Error;
@@ -9105,6 +9187,10 @@ mod registry_tests {
                 .unwrap_or_else(|| panic!("{source} must reject --version"));
             assert!(error.contains("--version"), "{source}: {error}");
         }
+        let scoped = DefaultPackageManager::exact_version_source_error("npm:@scope/pkg@1.0.0")
+            .expect("scoped npm source rejects --version");
+        assert!(scoped.contains("npm:@scope/pkg@<version>"), "{scoped}");
+        assert!(!scoped.contains("npm:@<version>"), "{scoped}");
         assert!(DefaultPackageManager::exact_version_source_error("subagents").is_none());
         assert!(DefaultPackageManager::exact_version_source_error("github:acme/tools").is_none());
     }
@@ -9558,6 +9644,10 @@ mod registry_tests {
         assert_eq!(row("ext-a").target.as_deref(), Some("0.2.0"));
         assert_eq!(row("ext-b").action, UpdatePlanAction::UpToDate);
         assert_eq!(plan.counts(), (1, 1, 0));
+        let line = row("ext-a").plan_line();
+        assert!(line.contains("0.1.0 → 0.2.0"), "{line}");
+        assert!(line.contains("(registry)"), "{line}");
+        assert!(row("ext-b").plan_line().contains("up to date"));
 
         let (summary, error) = manager.apply_update_plan(&plan);
         assert_eq!(error, None);
@@ -9651,6 +9741,33 @@ mod registry_tests {
             .as_deref(),
             Some(version)
         );
+    }
+
+    /// P1 parity: the plan path keeps the legacy RC degradation — a
+    /// stable-only index is "up to date" on the pre-release channel, not a
+    /// hard error.
+    #[test]
+    fn test_plan_updates_rc_channel_stable_only_is_up_to_date() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-stable", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("ext-stable", false).unwrap();
+        let plan = manager
+            .plan_updates(None, UpdateChannel::PreRelease, None)
+            .unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].action, UpdatePlanAction::UpToDate);
+        assert!(
+            plan.entries[0]
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("no pre-release"))
+        );
+        let (summary, error) = manager.apply_update_plan(&plan);
+        assert_eq!(error, None);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.up_to_date, 1);
     }
 
     #[test]

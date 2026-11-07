@@ -36,7 +36,7 @@ use crate::core::model_runtime::{
 };
 use crate::core::package_manager::{
     ConfiguredPackage, DefaultPackageManager, InstallConfirmCallback, PackageCommandRunner,
-    SystemPackageCommandRunner, UpdateApplySummary, UpdatePlan, UpdatePlanAction,
+    SystemPackageCommandRunner, UpdateApplySummary, UpdatePlan,
 };
 use crate::core::self_update::{BinarySelfUpdateRequest, BinarySelfUpdateSeam};
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
@@ -573,10 +573,12 @@ async fn run_binary_self_update_branch(
             eprintln!("Error: {message}");
             eprintln!("{}", failure_line(all_targets));
             eprintln!("Retry: {APP_NAME} update --self");
+            eprintln!("Partial downloads are kept; re-running resumes where possible.");
             eprintln!(
                 "Manual: {}",
                 crate::core::self_update::manual_download_instruction(&plan.version, target)
             );
+            eprintln!("Releases: {}", crate::config::SELF_UPDATE_DOWNLOAD_URL);
             1
         }
     }
@@ -699,48 +701,9 @@ fn print_update_plan(plan: &UpdatePlan) {
     }
     println!("Extension updates:");
     for entry in &plan.entries {
-        let pinned = if entry.pinned { ", pinned" } else { "" };
-        match entry.action {
-            UpdatePlanAction::Update => {
-                let current = entry.current.as_deref().unwrap_or("not installed");
-                let target = entry.target.as_deref().unwrap_or("latest");
-                println!(
-                    "  {current} → {target}  {source} ({kind}{pinned})",
-                    source = entry.source,
-                    kind = entry.kind
-                );
-                if let (Some(current), Some(target)) = (&entry.current, &entry.target)
-                    && crate::core::version_check::is_newer_package_version(current, target)
-                {
-                    eprintln!(
-                        "Warning: {source} will be downgraded from {current} to {target}{pinned}.",
-                        source = entry.source
-                    );
-                }
-            }
-            UpdatePlanAction::UpToDate => {
-                println!("  {} - up to date ({})", entry.source, entry.kind)
-            }
-            UpdatePlanAction::Local => println!(
-                "  {} - {}",
-                entry.source,
-                entry.note.as_deref().unwrap_or("local (not managed)")
-            ),
-            UpdatePlanAction::Untracked => println!(
-                "  {} - {}",
-                entry.source,
-                entry.note.as_deref().unwrap_or("untracked")
-            ),
-            UpdatePlanAction::Skipped => println!(
-                "  {} - skipped: {}",
-                entry.source,
-                entry.note.as_deref().unwrap_or("not updated")
-            ),
-            UpdatePlanAction::Error => println!(
-                "  {} - resolution failed: {}",
-                entry.source,
-                entry.note.as_deref().unwrap_or("unknown error")
-            ),
+        println!("{}", entry.plan_line());
+        if let Some(warning) = entry.downgrade_warning() {
+            eprintln!("{warning}");
         }
     }
 }
@@ -926,6 +889,12 @@ pub async fn run_update_in(
                 return 1;
             }
         };
+        if plan.is_empty() {
+            if crate::core::package_manager::is_offline_mode_enabled() {
+                println!("No extensions updated (offline mode).");
+            }
+            return 0;
+        }
         print_update_plan(&plan);
         let (summary, error) = manager.apply_update_plan(&plan);
         print_update_summary(&summary);
@@ -986,6 +955,9 @@ pub async fn run_update_in(
             }
         };
         if !plan.should_run {
+            if parsed.show_extensions_skipped_note {
+                println!("plugins skipped (use --all)");
+            }
             return 0;
         }
         // T18 (ADR-0011 §4/§7, D-054): a binary install self-updates for
@@ -1586,6 +1558,13 @@ pub fn run_package_command_in(
         }
     })));
     manager.set_install_confirm_callback(build_install_confirm(parsed.yes));
+    #[cfg(test)]
+    let install_progress: Arc<dyn crate::core::download::DownloadObserver> =
+        Arc::new(crate::core::download::NoopDownloadObserver);
+    #[cfg(not(test))]
+    let install_progress: Arc<dyn crate::core::download::DownloadObserver> =
+        Arc::new(crate::cli::progress::ProgressRenderer::new());
+    manager.set_download_observer(Some(install_progress));
 
     execute_package_command(parsed, &mut manager)
 }

@@ -166,9 +166,27 @@ fn changelog_for_display_from(
     let last_version = last_version?;
     let last = normalize_version(last_version)?;
     let current = normalize_version(current_version)?;
-    // A downgrade never shows a changelog block.
-    if current < last {
-        return None;
+    // A downgrade never shows a changelog block. Compare the full semver
+    // (including the pre-release suffix) first: same-base `rc.3 → rc.2`
+    // and `stable → rc` must not fall into the same-section fallback.
+    let parse_without_build = |version: &str| {
+        semver::Version::parse(version.trim().trim_start_matches('v')).map(|mut parsed| {
+            parsed.build = semver::BuildMetadata::EMPTY;
+            parsed
+        })
+    };
+    let last_semver = parse_without_build(last_version);
+    let current_semver = parse_without_build(current_version);
+    match (last_semver, current_semver) {
+        // Build metadata has no precedence: a `+build`-only change is not
+        // a downgrade and still gets the current-section fallback.
+        (Ok(last_semver), Ok(current_semver)) => {
+            if current_semver < last_semver {
+                return None;
+            }
+        }
+        _ if current < last => return None,
+        _ => {}
     }
     // Exact `lastChangelogVersion` is the dedupe key: the same build (or a
     // `+build`-only change) shows nothing, even when the embedded changelog
@@ -289,8 +307,11 @@ mod tests {
         let text = changelog_for_display_from(&fold_entries, Some("0.1.8+build.1"), "0.1.8")
             .expect("build suffix fallback");
         assert_eq!(text.matches("## [0.1.8]").count(), 1);
-        // Downgrade shows nothing.
+        // Downgrade shows nothing, including same-base RC reruns and
+        // stable → RC downgrades.
         assert_eq!(show("0.1.9", "0.1.8"), None);
+        assert_eq!(show("0.1.8-rc.3", "0.1.8-rc.2"), None);
+        assert_eq!(show("0.1.8", "0.1.8-rc.3"), None);
         // Same exact version with a prerelease suffix is deduped.
         assert_eq!(show("0.1.8-rc.3", "0.1.8-rc.3"), None);
         // Unparsable last version yields nothing.
