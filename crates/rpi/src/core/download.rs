@@ -1579,7 +1579,11 @@ mod tests {
             },
         ]);
         let observer = RecordingObserver::default();
-        let downloader = downloader(&transport, &observer);
+        let policy = DownloadPolicy {
+            max_attempts: 1,
+            ..DownloadPolicy::for_tests()
+        };
+        let downloader = Downloader::new(&transport, policy, &observer).with_sleeper(|_| {});
         let bytes = b"hello world";
         let mut spec = spec(dir.path(), Some(&hex(bytes)));
         spec.url = "https://github.test/a.rpix".to_owned();
@@ -1668,7 +1672,11 @@ mod tests {
             },
         ]);
         let observer = RecordingObserver::default();
-        let downloader = downloader(&transport, &observer);
+        let policy = DownloadPolicy {
+            max_attempts: 1,
+            ..DownloadPolicy::for_tests()
+        };
+        let downloader = Downloader::new(&transport, policy, &observer).with_sleeper(|_| {});
         let mut spec = spec(dir.path(), Some(&hex(b"hello world")));
         spec.url = "https://github.test/a.rpix".to_owned();
         let urls = vec![

@@ -374,6 +374,16 @@ fn install_binary(exe_path: &Path, binary: &[u8]) -> Result<(), std::io::Error> 
     result
 }
 
+/// Resume staging directory for one installed executable. Public so the
+/// CLI can report whether a partial actually survived a failure.
+pub fn self_update_download_dir(exe_path: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    exe_path.hash(&mut hasher);
+    let install_key = hasher.finish();
+    std::env::temp_dir().join(format!("{APP_NAME}-self-update-{install_key:016x}"))
+}
+
 /// Run the real binary self-update (ADR-0011 §4): download the release
 /// asset and its sha256 sidecar, verify the checksum (integrity check — a
 /// mismatch aborts with no residue), extract the `rpi` binary, atomically
@@ -410,14 +420,7 @@ pub async fn run_binary_self_update_observed(
     let asset_name = asset_file_name(request.version, target);
     // Resume state is scoped to the executable path: parallel test/test
     // installs and two rpi installations never share a .part file.
-    let install_key = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        request.exe_path.hash(&mut hasher);
-        hasher.finish()
-    };
-    let download_dir =
-        std::env::temp_dir().join(format!("{APP_NAME}-self-update-{install_key:016x}"));
+    let download_dir = self_update_download_dir(request.exe_path);
     let adapter = BinaryDownloadAdapter(transport);
     let policy = if cfg!(test) {
         DownloadPolicy::for_tests()
