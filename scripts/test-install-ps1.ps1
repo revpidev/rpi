@@ -133,6 +133,7 @@ try {
     # ---- Add-UserPathEntry ---------------------------------------------------
 
     $script:UserPathVariable = 'C:\Windows;C:\Users\me\AppData\Local\Programs\rpi;%USERPROFILE%\bin;C:\Tools\rpi'
+    $savedProcessPath = $env:PATH
     $env:PATH = 'C:\Windows;C:\Users\me\AppData\Local\Programs\rpi'
     $script:WrittenPath = $null
     Add-UserPathEntry 'C:\Users\me\AppData\Local\Programs\rpi\' -Prepend
@@ -228,21 +229,58 @@ try {
 
     $PathAction = 'prompt'
     function Test-InstallerInteractiveInput { return $true }
-    function Read-Host { param($Prompt) return 'n' }
+    function Read-HostWithTimeout { param($Prompt, $TimeoutSeconds) return 'n' }
     $script:WrittenPath = '<untouched>'
     Update-RpiPath 'C:\Users\me\bin\rpi.exe' 'C:\Users\me\bin' 6>$null
     Check-Equal '<untouched>' $script:WrittenPath 'prompt "n" never writes PATH'
 
-    function Read-Host { param($Prompt) return 'No' }
+    function Read-HostWithTimeout { param($Prompt, $TimeoutSeconds) return 'No' }
     $script:WrittenPath = '<untouched>'
     Update-RpiPath 'C:\Users\me\bin\rpi.exe' 'C:\Users\me\bin' 6>$null
     Check-Equal '<untouched>' $script:WrittenPath 'prompt "No" never writes PATH'
 
-    function Read-Host { param($Prompt) return 'y' }
+    function Read-HostWithTimeout { param($Prompt, $TimeoutSeconds) return 'y' }
     $script:UserPathVariable = 'C:\Windows'
     $script:WrittenPath = $null
     Update-RpiPath 'C:\Users\me\bin\rpi.exe' 'C:\Users\me\bin' 6>$null
     Check-Equal 'C:\Users\me\bin;C:\Windows' $script:WrittenPath 'prompt "y" writes PATH'
+
+    # Timeout and unreadable answers must never be treated as the default Yes.
+    function Read-HostWithTimeout { param($Prompt, $TimeoutSeconds) return '__timeout__' }
+    $script:WrittenPath = '<untouched>'
+    Update-RpiPath 'C:\Users\me\bin\rpi.exe' 'C:\Users\me\bin' 6>$null 3>$null
+    Check-Equal '<untouched>' $script:WrittenPath 'prompt timeout never writes PATH'
+
+    function Read-HostWithTimeout { param($Prompt, $TimeoutSeconds) return '__unavailable__' }
+    $script:WrittenPath = '<untouched>'
+    Update-RpiPath 'C:\Users\me\bin\rpi.exe' 'C:\Users\me\bin' 6>$null 3>$null
+    Check-Equal '<untouched>' $script:WrittenPath 'unreadable prompt answer never writes PATH'
+
+    function Read-HostWithTimeout { param($Prompt, $TimeoutSeconds) return $null }
+    $script:WrittenPath = '<untouched>'
+    Update-RpiPath 'C:\Users\me\bin\rpi.exe' 'C:\Users\me\bin' 6>$null 3>$null
+    Check-Equal '<untouched>' $script:WrittenPath 'null prompt answer never writes PATH'
+
+    function Read-HostWithTimeout { param($Prompt, $TimeoutSeconds) return '' }
+    $script:UserPathVariable = 'C:\Windows'
+    $script:WrittenPath = $null
+    Update-RpiPath 'C:\Users\me\bin\rpi.exe' 'C:\Users\me\bin' 6>$null 3>$null
+    Check-Equal 'C:\Users\me\bin;C:\Windows' $script:WrittenPath 'empty (Enter) answer keeps the yes default'
+
+    # A redirected console must yield the explicit no-answer sentinel instead of
+    # blocking in Read-Host. Only the read path is tested (the probe is mocked).
+    if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
+        # Earlier PATH cases mock Read-HostWithTimeout itself; reload the real
+        # implementation before probing it.
+        $realReader = $functions | Where-Object { $_.Name -eq 'Read-HostWithTimeout' } | Select-Object -First 1
+        . ([ScriptBlock]::Create($realReader.Extent.Text))
+        function Test-InstallerInteractiveInput { return $true }
+        $sentinel = Read-HostWithTimeout -Prompt 'probe ' -TimeoutSeconds 1
+        Check-True ($sentinel -eq '__unavailable__' -or $sentinel -eq '__timeout__') `
+            'redirected console returns a no-answer sentinel instead of blocking'
+    } else {
+        Write-Host 'ok - redirected console sentinel # SKIP (interactive console)'
+    }
 
     $PathAction = 'prompt'
     function Test-InstallerInteractiveInput { return $false }
@@ -262,6 +300,7 @@ try {
     Check-Equal '<untouched>' $script:WrittenPath 'already-active rpi is left alone'
 
     Remove-Item Function:\Get-Command -ErrorAction SilentlyContinue
+    $env:PATH = $savedProcessPath
 
     # ---- install profiles: lists, consent, semver, index --------------------
 
@@ -296,6 +335,30 @@ try {
     Check-Equal 'invalid' (Compare-SemverVersion -Left '1.0' -Right '0.1.0') 'short version invalid'
     Check-Equal 'invalid' (Compare-SemverVersion -Left '01.0.0' -Right '0.1.0') 'leading zero invalid'
     Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0-01' -Right '0.1.0') 'numeric prerelease leading zero invalid'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0' -Right '0.1.0-01') 'invalid right is not treated as higher'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0-01' -Right '0.1.0-rc.1') 'invalid left against prerelease'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0-rc.1' -Right '0.1.0-01') 'invalid right against prerelease'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0-rc.01' -Right '0.1.0-rc.1') 'numeric prerelease leading zero in the middle'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0-rc.1' -Right '0.1.0-rc.01') 'numeric prerelease leading zero on the right'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0-' -Right '0.1.0') 'empty prerelease invalid'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0+' -Right '0.1.0') 'empty build metadata invalid'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0-a..b' -Right '0.1.0-a') 'empty prerelease identifier invalid'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0-a_b' -Right '0.1.0-a') 'invalid prerelease character'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0+build_1' -Right '0.1.0') 'invalid build metadata character'
+    Check-Equal 'eq' (Compare-SemverVersion -Left '0.1.0+build.01' -Right '0.1.0') 'numeric build metadata may keep leading zeros'
+    Check-Equal 'gt' (Compare-SemverVersion -Left '99999999999999999999.0.0' -Right '1.0.0') 'semver core does not overflow int64'
+    Check-Equal 'lt' (Compare-SemverVersion -Left '1.0.0' -Right '99999999999999999999.0.0') 'semver core overflow on the right'
+    Check-Equal 'lt' (Compare-SemverVersion -Left '0.1.0-rc.99999999999999999999' -Right '0.1.0-rc.100000000000000000000') 'prerelease numeric does not overflow int64'
+
+    # .NET $ matches before a trailing LF; every surrounding control character
+    # must instead make the value invalid (SemVer is a whole-string grammar).
+    foreach ($suffix in @("`n", "`r", "`t", ' ')) {
+        $label = [int][char]$suffix
+        Check-Equal 'invalid' (Compare-SemverVersion -Left ('0.1.0' + $suffix) -Right '0.1.0') "left semver with trailing byte $label is invalid"
+        Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0' -Right ('0.1.0' + $suffix)) "right semver with trailing byte $label is invalid"
+    }
+    Check-Equal 'eq' (Compare-SemverVersion -Left '0.1.0' -Right '0.1.0') 'exact semver still compares equal'
+    Check-Equal 'eq' (Compare-SemverVersion -Left '0.1.0+meta' -Right '0.1.0+meta') 'exact semver with build metadata compares equal'
 
     $asset = 'rpi-0.1.0-x86_64-pc-windows-msvc-standard.zip'
     $sha = ('a' * 64)
@@ -333,6 +396,59 @@ try {
 
     $index = ConvertFrom-ProfileIndex -Text 'not json' -Version '0.1.0' -AssetName $asset
     Check-True (-not $index.Ok) 'invalid JSON rejected'
+
+    $index = ConvertFrom-ProfileIndex -Text $goodIndex.Replace('"schemaVersion": 1', '"schemaVersion": "1"') -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'schemaVersion string is rejected'
+    # JSON escapes are case-sensitive: \u is the only legal lowercase form.
+    foreach ($escape in @('\U0061', '\N', '\B', '\F', '\R', '\T')) {
+        $escaped = $goodIndex.Replace('"assets"', '"' + $escape + 'ssets"')
+        $index = ConvertFrom-ProfileIndex -Text $escaped -Version '0.1.0' -AssetName $asset
+        Check-True (-not $index.Ok) "uppercase JSON escape $escape is rejected"
+        Check-True ($index.Error -like '*invalid escape*') "uppercase JSON escape $escape reports an invalid escape"
+    }
+    $legal = $goodIndex.Replace('"assets"', '"\u0061ssets"')
+    $index = ConvertFrom-ProfileIndex -Text $legal -Version '0.1.0' -AssetName $asset
+    Check-True $index.Ok 'legal \u escape is still accepted'
+    $dupSchema = $goodIndex.Replace('"schemaVersion": 1,', '"schemaVersion": 1, "schemaVersion": 1,')
+    $index = ConvertFrom-ProfileIndex -Text $dupSchema -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'duplicate schemaVersion key rejected'
+    $dupAssets = $goodIndex.Replace('"assets": {', '"assets": {}, "assets": {')
+    $index = ConvertFrom-ProfileIndex -Text $dupAssets -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'duplicate assets key rejected'
+    $outside = @"
+{ "schemaVersion": 1, "version": "0.1.0", "assets": {}, "extra": { "$asset": "$sha" } }
+"@
+    $index = ConvertFrom-ProfileIndex -Text $outside -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'asset outside the flat assets object rejected'
+    $nested = @"
+{ "schemaVersion": 1, "version": "0.1.0", "assets": { "nested": { "$asset": "$sha" } } }
+"@
+    $index = ConvertFrom-ProfileIndex -Text $nested -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'nested asset value rejected'
+    $arrayAssets = $goodIndex.Replace('"assets": {', '"assets": [').Replace('"assets": [', '"assets": [')
+    $index = ConvertFrom-ProfileIndex -Text ($goodIndex -replace '"assets": \{[^}]*\}', '"assets": []') -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'array assets rejected'
+    $index = ConvertFrom-ProfileIndex -Text ($goodIndex + ' trailing') -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'trailing data rejected'
+    $withSizes = @"
+{ "schemaVersion": 1, "version": "0.1.0", "assets": { "$asset": "$sha" }, "sizes": { "$asset": 123 } }
+"@
+    $index = ConvertFrom-ProfileIndex -Text $withSizes -Version '0.1.0' -AssetName $asset
+    Check-True $index.Ok 'flat sizes map accepted'
+    $badSize = $withSizes.Replace(('"' + $asset + '": 123'), ('"' + $asset + '": "123"'))
+    $index = ConvertFrom-ProfileIndex -Text $badSize -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'string size rejected'
+    $badSize = $withSizes.Replace(('"' + $asset + '": 123'), ('"' + $asset + '": 1.5'))
+    $index = ConvertFrom-ProfileIndex -Text $badSize -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'floating-point size rejected'
+    $badSize = $withSizes.Replace(('"' + $asset + '": 123'), ('"other.zip": 123'))
+    $index = ConvertFrom-ProfileIndex -Text $badSize -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'size for an unknown asset rejected'
+
+    $largeIndex = '{' + (' ' * 262145)
+    $index = ConvertFrom-ProfileIndex -Text $largeIndex -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'profile index larger than 256 KiB rejected'
+    Check-True ($index.Error -like '*too large*') 'oversized index reports the byte limit'
 
     # ---- outer bundle member allowlist ---------------------------------------
 
@@ -459,8 +575,27 @@ try {
     Check-Equal 'restart' (Get-RangeResumeDecision -Status 200 -CachedValidator '"a"' -ResponseValidator '"a"' -HasPartial $true) '200 with a partial restarts'
     Check-Equal 'append' (Get-RangeResumeDecision -Status 206 -CachedValidator '"a"' -ResponseValidator '"a"' -HasPartial $true) 'matching 206 appends'
     Check-Equal 'restart' (Get-RangeResumeDecision -Status 206 -CachedValidator '"a"' -ResponseValidator '"b"' -HasPartial $true) 'validator change restarts'
+    Check-Equal 'restart' (Get-RangeResumeDecision -Status 206 -CachedValidator '"a"' -ResponseValidator '' -HasPartial $true) '206 without a response validator restarts'
+    Check-Equal 'restart' (Get-RangeResumeDecision -Status 206 -CachedValidator '' -ResponseValidator '"a"' -HasPartial $true) '206 without a cached validator restarts'
     Check-Equal 'verify-or-restart' (Get-RangeResumeDecision -Status 416 -CachedValidator '"a"' -ResponseValidator '' -HasPartial $true) '416 verifies or restarts'
     Check-Equal 'retry' (Get-RangeResumeDecision -Status 500 -CachedValidator '"a"' -ResponseValidator '' -HasPartial $true) '5xx retries'
+
+    # ---- Retry-After / jitter ----------------------------------------------
+
+    Check-Equal '7' (Get-RetryAfterSeconds -Value '7') 'Retry-After delta seconds'
+    Check-Equal '60' (Get-RetryAfterSeconds -Value '999') 'Retry-After is capped at 60s'
+    Check-Equal '0' (Get-RetryAfterSeconds -Value '0') 'Retry-After zero is immediate'
+    Check-True ($null -eq (Get-RetryAfterSeconds -Value 'not-a-date')) 'invalid Retry-After is ignored'
+    $retryDate = [DateTimeOffset]::UtcNow.AddSeconds(10).ToString('R')
+    $retrySeconds = Get-RetryAfterSeconds -Value $retryDate
+    Check-True ($retrySeconds -ge 8 -and $retrySeconds -le 10) 'Retry-After HTTP-date is parsed'
+    Check-Equal '5' (Get-RetryDelaySeconds -Attempt 1 -RetryAfter '5') 'Retry-After wins over backoff'
+    $delay1 = Get-RetryDelaySeconds -Attempt 1 -RetryAfter ''
+    Check-True ($delay1 -ge 0.8 -and $delay1 -le 1.2) 'first backoff has +/-20% jitter'
+    $delay4 = Get-RetryDelaySeconds -Attempt 4 -RetryAfter ''
+    Check-True ($delay4 -ge 6.4 -and $delay4 -le 9.6) 'fourth backoff is 8s with jitter'
+    $delayCap = Get-RetryDelaySeconds -Attempt 9 -RetryAfter ''
+    Check-True ($delayCap -ge 6.4 -and $delayCap -le 9.6) 'later attempts stay capped at 8s (with jitter)'
 
     # ---- safe tar archive (only when tar.exe is available) -------------------
 
@@ -474,6 +609,185 @@ try {
     } else {
         Write-Host 'ok - safe tar archive accepted # SKIP (tar.exe unavailable)'
     }
+
+    # ---- settings seeding ---------------------------------------------------
+
+    $seedRoot = Join-Path $tempRoot 'seed'
+    New-Item -ItemType Directory -Force -Path $seedRoot | Out-Null
+    $seedDefaults = Join-Path $seedRoot 'settings.defaults.json'
+    $seedAgent = Join-Path $seedRoot 'agent'
+    $seedSettings = Join-Path $seedAgent 'settings.json'
+    [IO.File]::WriteAllText($seedDefaults, '{"packages":["rpi-todo"]}')
+    Check-True (Seed-DefaultSettings -DefaultsPath $seedDefaults -SettingsPath $seedSettings -AgentDir $seedAgent) 'settings seeding succeeds on a fresh agent dir'
+    Check-Equal '{"packages":["rpi-todo"]}' (Get-Content -LiteralPath $seedSettings -Raw) 'settings seeding copies the defaults byte-for-byte'
+    Check-True (-not (Test-Path -LiteralPath "$seedSettings.stage-$PID")) 'settings seeding removes its stage file'
+
+    $badAgent = Join-Path $seedRoot 'agent-is-a-file'
+    [IO.File]::WriteAllText($badAgent, 'not a directory')
+    $badSettings = Join-Path $badAgent 'settings.json'
+    $seedOk = $true
+    try {
+        $seedOk = Seed-DefaultSettings -DefaultsPath $seedDefaults -SettingsPath $badSettings -AgentDir $badAgent
+    } catch {
+        $seedOk = $false
+    }
+    Check-True (-not $seedOk) 'settings seeding failure returns false instead of throwing'
+    Check-Equal 'not a directory' (Get-Content -LiteralPath $badAgent -Raw) 'settings seeding failure leaves the agent path untouched'
+    Check-True (-not (Test-Path -LiteralPath $badSettings)) 'settings seeding failure writes no settings file'
+
+    # The finally block must not revive the failure when the stage parent is
+    # itself inaccessible (Test-Path throws under ErrorActionPreference=Stop).
+    $deniedAgent = Join-Path $seedRoot 'agent-denied'
+    New-Item -ItemType Directory -Force -Path $deniedAgent | Out-Null
+    if ($env:OS -ne 'Windows_NT' -and (Get-Command chmod -ErrorAction SilentlyContinue)) {
+        & chmod 000 $deniedAgent 2>$null | Out-Null
+        $deniedThrew = $false
+        $deniedOk = $true
+        try {
+            $deniedOk = Seed-DefaultSettings -DefaultsPath $seedDefaults `
+                -SettingsPath (Join-Path $deniedAgent 'settings.json') -AgentDir $deniedAgent 3>$null
+        } catch {
+            $deniedThrew = $true
+        }
+        & chmod 755 $deniedAgent 2>$null | Out-Null
+        Check-True (-not $deniedThrew) 'settings seeding finally never throws on an inaccessible stage parent'
+        Check-True (-not $deniedOk) 'settings seeding reports failure for an inaccessible agent dir'
+        Check-True (-not (Test-Path -LiteralPath (Join-Path $deniedAgent 'settings.json'))) 'inaccessible agent dir gets no settings file'
+    } elseif ($env:OS -ne 'Windows_NT') {
+        Write-Host 'ok - settings seeding finally never throws # SKIP (chmod unavailable)'
+    }
+
+    # Windows PowerShell 5.1: deny write access to the agent dir instead.
+    if ($env:OS -eq 'Windows_NT' -and (Get-Command icacls -ErrorAction SilentlyContinue)) {
+        $aclAgent = Join-Path $seedRoot 'agent-acl'
+        New-Item -ItemType Directory -Force -Path $aclAgent | Out-Null
+        $who = "$env:USERNAME"
+        & icacls $aclAgent /deny "${who}:(OI)(CI)(W)" 2>$null | Out-Null
+        $aclBlocked = $false
+        try {
+            [IO.File]::WriteAllText((Join-Path $aclAgent 'probe-write'), 'x')
+            Remove-Item -LiteralPath (Join-Path $aclAgent 'probe-write') -Force -ErrorAction SilentlyContinue
+        } catch {
+            $aclBlocked = $true
+        }
+        if ($aclBlocked) {
+            $aclThrew = $false
+            $aclOk = $true
+            try {
+                $aclOk = Seed-DefaultSettings -DefaultsPath $seedDefaults `
+                    -SettingsPath (Join-Path $aclAgent 'settings.json') -AgentDir $aclAgent 3>$null
+            } catch {
+                $aclThrew = $true
+            }
+            Check-True (-not $aclThrew) 'settings seeding never throws when write access is denied (Windows ACL)'
+            Check-True (-not $aclOk) 'settings seeding reports failure when write access is denied (Windows ACL)'
+        } else {
+            Write-Host 'ok - settings seeding Windows ACL case # SKIP (deny ACL did not take effect)'
+        }
+        & icacls $aclAgent /remove:d $who 2>$null | Out-Null
+    }
+
+    # ---- seven-day cache GC ------------------------------------------------
+
+    $gcDir = Join-Path $tempRoot 'cache-gc'
+    New-Item -ItemType Directory -Force -Path $gcDir | Out-Null
+    $gcOld = Join-Path $gcDir 'old.part'
+    $gcNew = Join-Path $gcDir 'new.part'
+    $gcLocked = Join-Path $gcDir 'locked.part'
+    $gcLock = Join-Path $gcDir 'locked.part.lock'
+    [IO.File]::WriteAllText($gcOld, 'old')
+    [IO.File]::WriteAllText($gcNew, 'new')
+    [IO.File]::WriteAllText($gcLocked, 'locked')
+    [IO.File]::WriteAllText($gcLock, '')
+    (Get-Item -LiteralPath $gcOld).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-8)
+    (Get-Item -LiteralPath $gcNew).LastWriteTimeUtc = [DateTime]::UtcNow
+    (Get-Item -LiteralPath $gcLocked).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-8)
+    (Get-Item -LiteralPath $gcLock).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-8)
+    Invoke-CacheGc -PartsDir $gcDir
+    Check-True (-not (Test-Path -LiteralPath $gcOld)) 'cache GC removes an old unlocked part'
+    Check-True (Test-Path -LiteralPath $gcNew) 'cache GC keeps a recent part'
+    Check-True (Test-Path -LiteralPath $gcLocked) 'cache GC keeps a part with an active lock'
+    # The active lock is <asset>.lock, so <asset>.meta must probe that lock
+    # instead of a non-existent <asset>.meta.lock.
+    $gcLockedMeta = Join-Path $gcDir 'locked.part.meta'
+    [IO.File]::WriteAllText($gcLockedMeta, 'sha=x')
+    (Get-Item -LiteralPath $gcLockedMeta).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-8)
+    Invoke-CacheGc -PartsDir $gcDir
+    Check-True (Test-Path -LiteralPath $gcLockedMeta) 'cache GC keeps the meta of an actively locked asset'
+    $gcStale = Join-Path $gcDir 'stale.part'
+    $gcStaleMeta = Join-Path $gcDir 'stale.part.meta'
+    [IO.File]::WriteAllText($gcStale, 'stale')
+    [IO.File]::WriteAllText($gcStaleMeta, 'sha=y')
+    (Get-Item -LiteralPath $gcStale).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-8)
+    (Get-Item -LiteralPath $gcStaleMeta).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-8)
+    Invoke-CacheGc -PartsDir $gcDir
+    Check-True (-not (Test-Path -LiteralPath $gcStale)) 'cache GC removes an old unlocked part'
+    Check-True (-not (Test-Path -LiteralPath $gcStaleMeta)) 'cache GC removes the meta of an old unlocked part'
+    [IO.File]::WriteAllText($gcOld, 'old')
+    Invoke-CacheGc -PartsDir $gcDir -Disabled
+    Check-True (Test-Path -LiteralPath $gcOld) 'disabled cache GC leaves old parts'
+
+    # ---- transactional binary/manifest commit -------------------------------
+
+    $commitRoot = Join-Path $tempRoot 'commit'
+    New-Item -ItemType Directory -Force -Path $commitRoot | Out-Null
+    $commitOldBin = Join-Path $commitRoot 'rpi.exe'
+    $commitOldManifest = Join-Path $commitRoot 'rpi.install.json'
+    $commitStageBin = Join-Path $commitRoot '.rpi.stage-test.exe'
+    $commitStageManifest = Join-Path $commitRoot 'rpi.install.json.stage-test'
+    [IO.File]::WriteAllText($commitOldBin, 'OLD-BINARY')
+    [IO.File]::WriteAllText($commitOldManifest, '{"version":"0.1.8"}')
+    [IO.File]::WriteAllText($commitStageBin, 'NEW-BINARY')
+    [IO.File]::WriteAllText($commitStageManifest, '{"version":"0.1.8-rc.4"}')
+    Commit-InstallFiles -StageBin $commitStageBin -InstallPath $commitOldBin `
+        -StageManifest $commitStageManifest -ManifestPath $commitOldManifest
+    Check-Equal 'NEW-BINARY' (Get-Content -LiteralPath $commitOldBin -Raw) 'commit replaces the binary'
+    Check-Equal '{"version":"0.1.8-rc.4"}' (Get-Content -LiteralPath $commitOldManifest -Raw) 'commit replaces the manifest'
+    Check-True (-not (Test-Path -LiteralPath "$commitOldBin.backup-$PID")) 'commit removes the binary backup'
+    Check-True (-not (Test-Path -LiteralPath "$commitOldManifest.backup-$PID")) 'commit removes the manifest backup'
+
+    $failRoot = Join-Path $tempRoot 'commit-fail-upgrade'
+    New-Item -ItemType Directory -Force -Path $failRoot | Out-Null
+    $failBin = Join-Path $failRoot 'rpi.exe'
+    $failManifestDir = Join-Path $failRoot 'rpi.install.json'
+    $failStageBin = Join-Path $failRoot '.rpi.stage-fail.exe'
+    $failStageManifest = Join-Path $failRoot 'rpi.install.json.stage-fail'
+    [IO.File]::WriteAllText($failBin, 'OLD-BINARY')
+    New-Item -ItemType Directory -Force -Path $failManifestDir | Out-Null
+    [IO.File]::WriteAllText($failStageBin, 'NEW-BINARY')
+    [IO.File]::WriteAllText($failStageManifest, '{"version":"0.1.8-rc.4"}')
+    $failThrew = $false
+    try {
+        Commit-InstallFiles -StageBin $failStageBin -InstallPath $failBin `
+            -StageManifest $failStageManifest -ManifestPath $failManifestDir
+    } catch {
+        $failThrew = $true
+    }
+    Check-True $failThrew 'commit fails when the manifest replace fails'
+    Check-Equal 'OLD-BINARY' (Get-Content -LiteralPath $failBin -Raw) 'failed commit restores the old binary'
+    Check-True (Test-Path -LiteralPath $failManifestDir -PathType Container) 'failed commit leaves the old manifest path untouched'
+    Check-True (-not (Test-Path -LiteralPath "$failBin.backup-$PID")) 'failed commit removes the restored binary backup'
+    Check-True (-not (Test-Path -LiteralPath $failStageManifest)) 'failed commit removes the unused stage manifest'
+
+    $firstRoot = Join-Path $tempRoot 'commit-fail-first'
+    New-Item -ItemType Directory -Force -Path $firstRoot | Out-Null
+    $firstBin = Join-Path $firstRoot 'rpi.exe'
+    $firstManifestDir = Join-Path $firstRoot 'rpi.install.json'
+    $firstStageBin = Join-Path $firstRoot '.rpi.stage-first.exe'
+    $firstStageManifest = Join-Path $firstRoot 'rpi.install.json.stage-first'
+    New-Item -ItemType Directory -Force -Path $firstManifestDir | Out-Null
+    [IO.File]::WriteAllText($firstStageBin, 'NEW-BINARY')
+    [IO.File]::WriteAllText($firstStageManifest, '{"version":"0.1.8-rc.4"}')
+    $firstThrew = $false
+    try {
+        Commit-InstallFiles -StageBin $firstStageBin -InstallPath $firstBin `
+            -StageManifest $firstStageManifest -ManifestPath $firstManifestDir
+    } catch {
+        $firstThrew = $true
+    }
+    Check-True $firstThrew 'first install fails when the manifest replace fails'
+    Check-True (-not (Test-Path -LiteralPath $firstBin)) 'failed first install leaves no new binary'
+    Check-True (-not (Test-Path -LiteralPath $firstStageManifest)) 'failed first install removes the unused stage manifest'
 
     # ---- non-interactive environment ---------------------------------------
 

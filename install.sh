@@ -136,6 +136,8 @@ IS_STATIC=0
 AGENT_DIR=""
 PLUGIN_DIR=""
 SETTINGS_FILE=""
+SETTINGS_SEEDED=0
+SETTINGS_EXISTING=0
 ASSET_NAME=""
 CANDIDATES=""
 INDEX_SHA=""
@@ -376,9 +378,12 @@ sha256_file() { # sha256_file <file> -> hex
 fetch_meta() { # fetch_meta <url> <output-file>
     if [ "$DL_TOOL" = curl ]; then
         curl -fsSL --connect-timeout "$CONNECT_TIMEOUT" --max-time 30 \
-            --retry 2 -o "$2" "$1"
+            --max-filesize 262144 --retry 2 -o "$2" "$1"
     else
-        wget -q --timeout=10 --tries=2 -O "$2" "$1"
+        # wget has no portable max-filesize flag; cap the stream at 256 KiB
+        # plus one byte so the caller's size check fails closed. A network
+        # error leaves a partial file that the JSON parser rejects.
+        wget -q --timeout=10 --tries=2 -O - "$1" | head -c 262145 >"$2"
     fi
 }
 
@@ -924,29 +929,198 @@ Fix/retry the site index, or install without plugins with --profile mini."
     [ -s "$_file" ] || die "profile index is empty: $_url"
     _size=$(wc -c <"$_file" | tr -d ' ')
     [ "$_size" -le 262144 ] || die "profile index too large ($_size bytes): $_url"
-    head -c 1 "$_file" | grep -q '{' ||
-        die "profile index is not a JSON object: $_url (use --profile mini if the site is broken)"
 
-    _schema_count=$(grep -c '"schemaVersion"' "$_file" || true)
-    [ "$_schema_count" = 1 ] || die "profile index must contain schemaVersion exactly once (found $_schema_count)"
-    _schema=$(sed -n 's/.*"schemaVersion"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_file" | head -n 1)
-    [ "$_schema" = 1 ] || die "unsupported profile index schemaVersion: ${_schema:-missing}"
-
-    _version_count=$(grep -c '"version"' "$_file" || true)
-    [ "$_version_count" = 1 ] || die "profile index must contain version exactly once (found $_version_count)"
-    _index_version=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_file" | head -n 1)
-    [ "$_index_version" = "$1" ] ||
-        die "profile index version mismatch: index=$_index_version expected=$1"
-
-    grep -q '"assets"[[:space:]]*:[[:space:]]*{' "$_file" ||
-        die "profile index has no assets object"
-
-    _asset_count=$(grep -F "\"$2\"" "$_file" | grep -c '"[0-9a-fA-F]\{64\}"' || true)
-    [ "$_asset_count" = 1 ] ||
-        die "profile index asset entry missing/duplicated for $2 (found $_asset_count)"
-    _sha=$(grep -F "\"$2\"" "$_file" |
-        sed -n 's/^[[:space:]]*"'"$2"'"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)"[[:space:]]*,\{0,1\}[[:space:]]*$/\1/p')
-    [ -n "$_sha" ] || die "profile index entry for $2 is not a 64-hex sha256"
+    # Strict, dependency-free JSON parser: detects duplicate keys at every
+    # object level and validates the flat schema/types before returning the
+    # target hash. grep/sed line counting cannot do either safely.
+    _sha=$(awk -v expected_version="$1" -v target_asset="$2" '
+function fail(msg) {
+    printf "profile index: %s\n", msg > "/dev/stderr"
+    exit 1
+}
+function skipws() {
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (c == " " || c == "\t" || c == "\n" || c == "\r") i++
+        else break
+    }
+}
+function peek() {
+    skipws()
+    if (i > n) fail("unexpected end of JSON")
+    return substr(s, i, 1)
+}
+function expect(ch) {
+    if (peek() != ch) fail("expected " ch " at offset " i)
+    i++
+}
+function hexval(h,   j, d, v) {
+    v = 0
+    for (j = 1; j <= length(h); j++) {
+        d = index("0123456789abcdef", tolower(substr(h, j, 1))) - 1
+        if (d < 0) return -1
+        v = v * 16 + d
+    }
+    return v
+}
+function parse_string(   out, ch, esc, hex, code) {
+    skipws()
+    if (i > n || substr(s, i, 1) != "\"") fail("expected a string at offset " i)
+    i++
+    out = ""
+    while (i <= n) {
+        ch = substr(s, i, 1)
+        i++
+        if (ch == "\"") return out
+        if (ch ~ /[[:cntrl:]]/) fail("control character in a string at offset " i)
+        if (ch != "\\") {
+            out = out ch
+            continue
+        }
+        if (i > n) fail("unterminated escape at offset " i)
+        esc = substr(s, i, 1)
+        i++
+        if (esc == "\"" || esc == "\\" || esc == "/") out = out esc
+        else if (esc == "b") out = out sprintf("%c", 8)
+        else if (esc == "f") out = out sprintf("%c", 12)
+        else if (esc == "n") out = out sprintf("%c", 10)
+        else if (esc == "r") out = out sprintf("%c", 13)
+        else if (esc == "t") out = out sprintf("%c", 9)
+        else if (esc == "u") {
+            hex = substr(s, i, 4)
+            if (length(hex) != 4 || hex !~ /^[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]$/) {
+                fail("invalid unicode escape at offset " i)
+            }
+            i += 4
+            code = hexval(hex)
+            if (code < 32 || code > 127) fail("invalid unicode escape in the profile index")
+            out = out sprintf("%c", code)
+        } else fail("invalid escape at offset " i)
+    }
+    fail("unterminated string")
+}
+function parse_number(   start, ch) {
+    skipws()
+    start = i
+    if (substr(s, i, 1) == "-") i++
+    ch = substr(s, i, 1)
+    if (ch !~ /[0-9]/) fail("invalid number at offset " start)
+    if (ch == "0") {
+        i++
+        if (substr(s, i, 1) ~ /[0-9]/) fail("leading zero in a number at offset " start)
+    } else {
+        while (substr(s, i, 1) ~ /[0-9]/) i++
+    }
+    if (substr(s, i, 1) == ".") {
+        i++
+        if (substr(s, i, 1) !~ /[0-9]/) fail("invalid fraction at offset " start)
+        while (substr(s, i, 1) ~ /[0-9]/) i++
+    }
+    ch = substr(s, i, 1)
+    if (ch == "e" || ch == "E") {
+        i++
+        ch = substr(s, i, 1)
+        if (ch == "+" || ch == "-") i++
+        if (substr(s, i, 1) !~ /[0-9]/) fail("invalid exponent at offset " start)
+        while (substr(s, i, 1) ~ /[0-9]/) i++
+    }
+    return substr(s, start, i - start)
+}
+function is_hex64(value) {
+    return (length(value) == 64 && value ~ /^[0-9A-Fa-f]+$/)
+}
+function parse_assets(   key, value, ch) {
+    expect("{")
+    skipws()
+    if (substr(s, i, 1) == "}") { i++; return }
+    while (1) {
+        key = parse_string()
+        if (key !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/) fail("invalid asset name: " key)
+        if (key in aseen) fail("duplicate asset key: " key)
+        aseen[key] = 1
+        expect(":")
+        value = parse_string()
+        if (!is_hex64(value)) fail("asset " key " is not a 64-hex sha256")
+        if (key == target_asset) { target_found++; target_sha = tolower(value) }
+        skipws()
+        ch = substr(s, i, 1)
+        if (ch == ",") { i++; continue }
+        if (ch == "}") { i++; return }
+        fail("expected comma or } in assets at offset " i)
+    }
+}
+function parse_sizes(   key, value, ch) {
+    expect("{")
+    skipws()
+    if (substr(s, i, 1) == "}") { i++; return }
+    while (1) {
+        key = parse_string()
+        if (key in sseen) fail("duplicate size key: " key)
+        sseen[key] = 1
+        expect(":")
+        value = parse_number()
+        if (value !~ /^[0-9]+$/ || (length(value) > 1 && substr(value, 1, 1) == "0")) {
+            fail("size for " key " is not a non-negative integer")
+        }
+        skipws()
+        ch = substr(s, i, 1)
+        if (ch == ",") { i++; continue }
+        if (ch == "}") { i++; return }
+        fail("expected comma or } in sizes at offset " i)
+    }
+}
+{
+    s = s $0 "\n"
+}
+END {
+    n = length(s)
+    i = 1
+    expect("{")
+    skipws()
+    if (substr(s, i, 1) == "}") fail("profile index is empty")
+    while (1) {
+        key = parse_string()
+        if (key == "schemaVersion") {
+            if (seen_schema++) fail("duplicate key: schemaVersion")
+            expect(":")
+            raw = parse_number()
+            if (raw != "1") fail("unsupported schemaVersion: " raw)
+        } else if (key == "version") {
+            if (seen_version++) fail("duplicate key: version")
+            expect(":")
+            value = parse_string()
+            if (value != expected_version) {
+                fail("version mismatch: index=" value " expected=" expected_version)
+            }
+        } else if (key == "assets") {
+            if (seen_assets++) fail("duplicate key: assets")
+            expect(":")
+            parse_assets()
+        } else if (key == "sizes") {
+            if (seen_sizes++) fail("duplicate key: sizes")
+            expect(":")
+            parse_sizes()
+        } else {
+            fail("unexpected key: " key)
+        }
+        skipws()
+        ch = substr(s, i, 1)
+        if (ch == ",") { i++; continue }
+        if (ch == "}") { i++; break }
+        fail("expected comma or } at offset " i)
+    }
+    skipws()
+    if (i <= n) fail("trailing data at offset " i)
+    if (!seen_schema || !seen_version || !seen_assets) fail("missing required key")
+    for (key in sseen) {
+        if (!(key in aseen)) fail("size for unknown asset: " key)
+    }
+    if (!target_found) fail("asset entry missing: " target_asset)
+    if (target_found > 1) fail("duplicate asset entry: " target_asset)
+    print target_sha
+}
+' "$_file") || die "profile index invalid for v$1: $_url (use --profile mini if the site is broken)"
+    [ -n "$_sha" ] || die "profile index entry for $2 is missing or not a 64-hex sha256"
     INDEX_SHA=$(printf '%s' "$_sha" | tr '[:upper:]' '[:lower:]')
 }
 
@@ -1019,10 +1193,14 @@ gc_cache() {
     for _f in "$CACHE_PARTS"/*; do
         [ -e "$_f" ] || continue
         _base=${_f##*/}
+        # The active-transfer lock is <asset>.lock, so an auxiliary file
+        # (<asset>.meta) must probe the lock of the asset it belongs to.
         case $_base in
             *.lock) continue ;;
+            *.meta) _gc_lock=${_base%.meta} ;;
+            *) _gc_lock=$_base ;;
         esac
-        if [ -f "$CACHE_PARTS/$_base.lock" ]; then
+        if [ -f "$CACHE_PARTS/$_gc_lock.lock" ]; then
             continue
         fi
         _mt=$(mtime_of "$_f" 2>/dev/null || echo "$_now")
@@ -1169,6 +1347,32 @@ transfer_once() { # transfer_once <url> <part> <headers> <offset> <validator>
         --speed-limit 1024 --speed-time "$STALL_TIMEOUT" "$_url"
 }
 
+# Exponential backoff with +/-20% jitter (install-packaging.md section 7).
+# awk keeps this portable: the installer also runs under dash and busybox sh,
+# neither of which guarantees $RANDOM. Seeding with the PID decorrelates
+# concurrent installers; successive attempts use different bases (1/2/4/8).
+backoff_seconds() { # backoff_seconds <base-seconds> -> jittered delay
+    awk -v b="$1" -v s="$$" 'BEGIN { srand(s); printf "%.2f", b * (0.8 + rand() * 0.4) }'
+}
+
+# Jitter produces fractional seconds; most sleep implementations accept them.
+# Probe once and fall back to whole seconds where they do not.
+SLEEP_FRACTIONAL=''
+sleep_seconds() { # sleep_seconds <seconds>
+    if [ -z "$SLEEP_FRACTIONAL" ]; then
+        if sleep 0.01 2>/dev/null; then
+            SLEEP_FRACTIONAL=1
+        else
+            SLEEP_FRACTIONAL=0
+        fi
+    fi
+    if [ "$SLEEP_FRACTIONAL" = 1 ]; then
+        sleep "$1"
+    else
+        sleep "$(printf '%.0f' "$1")"
+    fi
+}
+
 # Download one asset with resume, progress, retries and mirror fallback.
 # Sets DOWNLOADED_FROM or dies (integrity failures are fatal).
 download_asset() { # download_asset <asset> <candidates-newline-list> <expected-sha>
@@ -1241,16 +1445,26 @@ download_asset() { # download_asset <asset> <candidates-newline-list> <expected-
                 # post-transfer write still leaves a resumable partial.
                 if [ "$_validators_saved" = 0 ] && [ "$_now_size" -gt 0 ]; then
                     _hstatus=$(response_code "$_hdr")
+                    _hetag=$(response_header "$_hdr" ETag)
+                    _hlast=$(response_header "$_hdr" Last-Modified)
+                    _hresp=$_hetag
+                    [ -n "$_hresp" ] || _hresp=$_hlast
                     # A dropped Range request can briefly answer 200 before
                     # curl truncates the old partial; only trust validators
-                    # for a fresh transfer or a confirmed 206 append.
-                    if [ "$_hstatus" = 206 ] || { [ "$_hstatus" = 200 ] && [ "$_offset" -eq 0 ]; }; then
-                        _hetag=$(response_header "$_hdr" ETag)
-                        _hlast=$(response_header "$_hdr" Last-Modified)
-                        if [ -n "$_hetag" ] || [ -n "$_hlast" ]; then
-                            write_asset_meta "$_meta" "$_expected" "$_asset" "$_hetag" "$_hlast" "$_url"
-                            _validators_saved=1
+                    # for a fresh transfer or a confirmed 206 append with the
+                    # same validator the partial was requested with.
+                    _save_meta=0
+                    if [ "$_hstatus" = 200 ] && [ "$_offset" -eq 0 ]; then
+                        _save_meta=1
+                    elif [ "$_hstatus" = 206 ]; then
+                        if [ "$_offset" -eq 0 ] ||
+                            { [ -n "$_validator" ] && [ -n "$_hresp" ] && [ "$_validator" = "$_hresp" ]; }; then
+                            _save_meta=1
                         fi
+                    fi
+                    if [ "$_save_meta" = 1 ] && { [ -n "$_hetag" ] || [ -n "$_hlast" ]; }; then
+                        write_asset_meta "$_meta" "$_expected" "$_asset" "$_hetag" "$_hlast" "$_url"
+                        _validators_saved=1
                     fi
                 fi
                 sleep 1
@@ -1261,10 +1475,23 @@ download_asset() { # download_asset <asset> <candidates-newline-list> <expected-
             _status=$(response_code "$_hdr")
             _etag=$(response_header "$_hdr" ETag)
             _lastmod=$(response_header "$_hdr" Last-Modified)
+            _resp_validator=$_etag
+            [ -n "$_resp_validator" ] || _resp_validator=$_lastmod
             # Keep the validators with any bytes we already have so an
-            # interrupted transfer resumes on the next attempt/mirror.
-            if { [ "$_status" = 200 ] || [ "$_status" = 206 ]; } &&
-                [ -f "$_part" ] && [ -s "$_part" ]; then
+            # interrupted transfer resumes on the next attempt/mirror. A 206
+            # whose response validator is missing or differs from the cached
+            # one must not refresh the meta: the bytes are not a provable
+            # prefix and the restart path below discards them.
+            _save_meta=0
+            if [ "$_status" = 200 ] && [ "$_offset" -eq 0 ]; then
+                _save_meta=1
+            elif [ "$_status" = 206 ]; then
+                if [ "$_offset" -eq 0 ] ||
+                    { [ -n "$_validator" ] && [ -n "$_resp_validator" ] && [ "$_validator" = "$_resp_validator" ]; }; then
+                    _save_meta=1
+                fi
+            fi
+            if [ "$_save_meta" = 1 ] && [ -f "$_part" ] && [ -s "$_part" ]; then
                 write_asset_meta "$_meta" "$_expected" "$_asset" "$_etag" "$_lastmod" "$_url"
             fi
 
@@ -1275,10 +1502,13 @@ download_asset() { # download_asset <asset> <candidates-newline-list> <expected-
                 continue
             fi
             if [ "$_status" = 206 ] && [ "$_offset" -gt 0 ]; then
-                _resp_validator=$_etag
-                [ -n "$_resp_validator" ] || _resp_validator=$_lastmod
-                if [ -n "$_validator" ] && [ -n "$_resp_validator" ] &&
-                    [ "$_validator" != "$_resp_validator" ]; then
+                if [ -z "$_validator" ] || [ -z "$_resp_validator" ]; then
+                    warn "resume validator missing; restarting from zero"
+                    rm -f "$_part" "$_meta"
+                    _attempt=$((_attempt + 1))
+                    continue
+                fi
+                if [ "$_validator" != "$_resp_validator" ]; then
                     warn "resume validator changed; restarting from zero"
                     rm -f "$_part" "$_meta"
                     _attempt=$((_attempt + 1))
@@ -1315,22 +1545,29 @@ download_asset() { # download_asset <asset> <candidates-newline-list> <expected-
                 429 | 503)
                     _retry_after=$(response_header "$_hdr" Retry-After)
                     case $_retry_after in
-                        '' | *[!0-9]*) _sleep=$((1 << (_attempt - 1))) ;;
-                        *) _sleep=$_retry_after ;;
+                        '' | *[!0-9]*)
+                            _backoff=$((1 << (_attempt - 1)))
+                            [ "$_backoff" -gt 8 ] && _backoff=8
+                            _sleep=$(backoff_seconds "$_backoff")
+                            ;;
+                        *)
+                            _sleep=$_retry_after
+                            [ "$_sleep" -gt 60 ] && _sleep=60
+                            ;;
                     esac
-                    [ "$_sleep" -gt 60 ] && _sleep=60
                     warn "HTTP $_status; retrying in ${_sleep}s"
-                    sleep "$_sleep"
+                    sleep_seconds "$_sleep"
                     ;;
                 *)
                     if [ "$_attempt" -ge "$MAX_ATTEMPTS" ]; then
                         warn "download failed from $_url after $_attempt attempts; trying the next mirror"
                         break
                     fi
-                    _sleep=$((1 << (_attempt - 1)))
-                    [ "$_sleep" -gt 8 ] && _sleep=8
+                    _backoff=$((1 << (_attempt - 1)))
+                    [ "$_backoff" -gt 8 ] && _backoff=8
+                    _sleep=$(backoff_seconds "$_backoff")
                     warn "download failed from $_url (HTTP ${_status:-?}); retrying in ${_sleep}s"
-                    sleep "$_sleep"
+                    sleep_seconds "$_sleep"
                     ;;
             esac
             _attempt=$((_attempt + 1))
@@ -1452,6 +1689,77 @@ extract_outer_archive() { # extract_outer_archive <archive> <dir>
 
 # ---- atomic binary install --------------------------------------------------
 
+# Restore the pre-commit binary/manifest after a failed second rename. The
+# backups are same-directory copies so a restore is another atomic rename;
+# when a restore fails they are left in place and named for manual recovery.
+_restore_install_files() {
+    _ri_failed=0
+    if [ "$_ci_had_bin" = 1 ]; then
+        mv -f "$_ci_backup_bin" "$_ci_install_path" 2>/dev/null || _ri_failed=1
+    elif [ "$_ci_bin_moved" = 1 ]; then
+        rm -f "$_ci_install_path" 2>/dev/null || _ri_failed=1
+    fi
+    if [ "$_ci_had_manifest" = 1 ]; then
+        mv -f "$_ci_backup_manifest" "$_ci_manifest" 2>/dev/null || _ri_failed=1
+    elif [ "$_ci_manifest_moved" = 1 ]; then
+        rm -f "$_ci_manifest" 2>/dev/null || _ri_failed=1
+    fi
+    if [ "$_ri_failed" = 0 ]; then
+        rm -f "$_ci_backup_bin" "$_ci_backup_manifest" \
+            "$_ci_stage_bin" "$_ci_stage_manifest" 2>/dev/null || true
+    else
+        warn "automatic rollback failed; the old files are preserved at:"
+        [ ! -e "$_ci_backup_bin" ] && [ ! -L "$_ci_backup_bin" ] || warn "  $_ci_backup_bin"
+        [ ! -e "$_ci_backup_manifest" ] && [ ! -L "$_ci_backup_manifest" ] || warn "  $_ci_backup_manifest"
+        warn "restore them manually before retrying"
+    fi
+}
+
+# Commit two staged files as one install transaction. Both stages already live
+# in the destination directory. Either both are replaced or the old pair is
+# restored; a first install removes the new binary/manifest when the second
+# rename fails.
+commit_install() { # commit_install <stage-bin> <install-path> <stage-manifest> <manifest>
+    _ci_stage_bin=$1
+    _ci_install_path=$2
+    _ci_stage_manifest=$3
+    _ci_manifest=$4
+    _ci_backup_bin=$_ci_install_path.backup-$$
+    _ci_backup_manifest=$_ci_manifest.backup-$$
+    _ci_had_bin=0
+    _ci_had_manifest=0
+    _ci_bin_moved=0
+    _ci_manifest_moved=0
+
+    if [ -f "$_ci_install_path" ] || [ -L "$_ci_install_path" ]; then
+        cp -pP "$_ci_install_path" "$_ci_backup_bin" ||
+            die "failed to back up $_ci_install_path; nothing was replaced"
+        _ci_had_bin=1
+    fi
+    if [ -f "$_ci_manifest" ] || [ -L "$_ci_manifest" ]; then
+        if ! cp -pP "$_ci_manifest" "$_ci_backup_manifest"; then
+            rm -f "$_ci_backup_bin" 2>/dev/null || true
+            die "failed to back up $_ci_manifest; nothing was replaced"
+        fi
+        _ci_had_manifest=1
+    fi
+
+    if ! mv -f "$_ci_stage_bin" "$_ci_install_path"; then
+        _restore_install_files
+        die "failed to replace $_ci_install_path"
+    fi
+    _ci_bin_moved=1
+    STAGE_BIN=""
+
+    if ! mv -f "$_ci_stage_manifest" "$_ci_manifest"; then
+        _restore_install_files
+        die "failed to replace $_ci_manifest"
+    fi
+    _ci_manifest_moved=1
+    STAGE_MANIFEST=""
+    rm -f "$_ci_backup_bin" "$_ci_backup_manifest" 2>/dev/null || true
+}
+
 install_binary() { # install_binary <extracted-dir> <binary-name>
     _src=$1/$2
     [ -f "$_src" ] || die "archive did not contain $_src"
@@ -1468,6 +1776,18 @@ install_binary() { # install_binary <extracted-dir> <binary-name>
     PREFIX_ABS=$(cd "$PREFIX" && pwd)
     INSTALL_PATH=$PREFIX_ABS/rpi
     MANIFEST=$PREFIX_ABS/rpi.install.json
+
+    # Refuse to replace directories, devices, sockets or other non-regular
+    # destinations before staging anything. Symlinks are allowed because the
+    # rename replaces the link itself (never its target).
+    if [ -d "$INSTALL_PATH" ] ||
+        { [ -e "$INSTALL_PATH" ] && [ ! -f "$INSTALL_PATH" ] && [ ! -L "$INSTALL_PATH" ]; }; then
+        die "refusing to replace non-regular path: $INSTALL_PATH"
+    fi
+    if [ -d "$MANIFEST" ] ||
+        { [ -e "$MANIFEST" ] && [ ! -f "$MANIFEST" ] && [ ! -L "$MANIFEST" ]; }; then
+        die "refusing to replace non-regular path: $MANIFEST"
+    fi
 
     # Upgrade messaging: read the existing manifest (if any) before replacing
     # anything, and keep the old binary/manifest untouched on any earlier fatal.
@@ -1497,13 +1817,10 @@ install_binary() { # install_binary <extracted-dir> <binary-name>
         printf '}\n'
     } >"$_stage_manifest" || die "failed to write the staged manifest"
 
-    # Both files are staged in the target directory; the two renames are the
-    # only mutations of an existing install (a fatal failure earlier leaves
-    # the old binary and manifest untouched).
-    mv -f "$_stage_bin" "$INSTALL_PATH" || die "failed to replace $INSTALL_PATH"
-    STAGE_BIN=""
-    mv -f "$_stage_manifest" "$MANIFEST" || die "failed to replace $MANIFEST"
-    STAGE_MANIFEST=""
+    # Both files are staged in the target directory; commit_install is the
+    # only mutation of an existing install and rolls both files back if the
+    # second rename fails (a fatal failure earlier leaves them untouched).
+    commit_install "$_stage_bin" "$INSTALL_PATH" "$_stage_manifest" "$MANIFEST"
 }
 
 json_escape() {
@@ -1852,6 +2169,7 @@ seed_settings() { # seed_settings <bundle-dir>
         return 0
     fi
     if [ -f "$SETTINGS_FILE" ]; then
+        SETTINGS_EXISTING=1
         info ""
         info "existing settings left untouched: $SETTINGS_FILE"
         if ! grep -q '"packages"' "$SETTINGS_FILE"; then
@@ -1871,6 +2189,7 @@ seed_settings() { # seed_settings <bundle-dir>
     cp "$_defaults" "$_tmp" || { warn "cannot stage settings.json"; rm -f "$_tmp"; return 0; }
     chmod 600 "$_tmp" 2>/dev/null || true
     mv -f "$_tmp" "$SETTINGS_FILE" || { warn "cannot install settings.json"; rm -f "$_tmp"; return 0; }
+    SETTINGS_SEEDED=1
     info "seeded default settings: $SETTINGS_FILE"
 }
 
@@ -2238,6 +2557,8 @@ extract_outer_archive "$CACHE_PARTS/$ASSET_NAME" "$TMPDIR_RPI/x"
 AGENT_DIR=${RPI_CODING_AGENT_DIR:-}
 PLUGIN_DIR=""
 SETTINGS_FILE=""
+SETTINGS_SEEDED=0
+SETTINGS_EXISTING=0
 if [ "$PROFILE_EFFECTIVE" != mini ]; then
     if [ -z "$AGENT_DIR" ]; then
         [ -n "${HOME:-}" ] || die "\$HOME is not set and RPI_CODING_AGENT_DIR is unset; cannot locate the agent directory"
@@ -2280,8 +2601,12 @@ elif [ "$PROFILE" != mini ]; then
     done
     info "  plugins:  ${_names% · }"
     info "            $PLUGINS_INSTALLED/$PLUGINS_TOTAL installed"
-    if [ -f "$SETTINGS_FILE" ]; then
-        info "            registered in $SETTINGS_FILE"
+    if [ "$SETTINGS_SEEDED" = 1 ]; then
+        info "            settings seeded: $SETTINGS_FILE"
+    elif [ "$SETTINGS_EXISTING" = 1 ]; then
+        info "            existing settings left untouched: $SETTINGS_FILE"
+    else
+        info "            plugins installed in: $PLUGIN_DIR"
     fi
 fi
 

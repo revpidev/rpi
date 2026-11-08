@@ -408,9 +408,50 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 end = min(end, len(data) - 1)
                 status = 206
         body = data[start : end + 1]
+        omit_validators = False
+        no_validator_marker = os.environ.get("RPI_TEST_206_NO_VALIDATOR_MARKER")
+        if (
+            range_header
+            and no_validator_marker
+            and self.path.endswith(".tar.gz")
+            and os.path.exists(no_validator_marker)
+        ):
+            os.unlink(no_validator_marker)
+            omit_validators = True
+            status = 206
+            # A wrong entity makes an append fail the final sha256 check; the
+            # installer must discard the partial because the 206 carries no
+            # validator to prove it is the same entity.
+            body = b"X" * len(body)
         truncate = False
         stall = False
         stall_marker = os.environ.get("RPI_TEST_STALL_MARKER")
+        # One-shot retryable failures: 500 (ordinary retry) and 429 with an
+        # unparseable Retry-After (must fall back to jittered exponential
+        # backoff instead of a fixed delay).
+        fail_status = 0
+        fail_retry_after = None
+        for marker_name, code, retry_after in (
+            ("RPI_TEST_500_MARKER", 500, None),
+            ("RPI_TEST_429_BAD_MARKER", 429, "not-a-date"),
+        ):
+            marker_path = os.environ.get(marker_name)
+            if (
+                marker_path
+                and self.path.endswith(".tar.gz")
+                and os.path.exists(marker_path)
+            ):
+                os.unlink(marker_path)
+                fail_status = code
+                fail_retry_after = retry_after
+                break
+        if fail_status:
+            self.send_response(fail_status)
+            if fail_retry_after:
+                self.send_header("Retry-After", fail_retry_after)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if (
             stall_marker
             and self.path.endswith(".tar.gz")
@@ -432,8 +473,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         else:
             self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("ETag", etag)
-        self.send_header("Last-Modified", last_modified)
+        if not omit_validators:
+            self.send_header("ETag", etag)
+            self.send_header("Last-Modified", last_modified)
         self.send_header("Accept-Ranges", "bytes")
         if status == 206:
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, len(data)))
@@ -474,7 +516,7 @@ PYEOF
 
 if command -v python3 >/dev/null 2>&1; then
     # -u: unbuffered, so the "Serving HTTP on ... port N" line hits the log
-    (cd "$WWW" && RPI_TEST_TRUNCATE_MARKER="$TMP/truncate-once" RPI_TEST_STALL_MARKER="$TMP/stall-once" exec python3 -u "$TMP/serve.py") >"$TMP/server.log" 2>&1 &
+    (cd "$WWW" && RPI_TEST_TRUNCATE_MARKER="$TMP/truncate-once" RPI_TEST_STALL_MARKER="$TMP/stall-once" RPI_TEST_206_NO_VALIDATOR_MARKER="$TMP/no-validator-once" RPI_TEST_500_MARKER="$TMP/fail-500-once" RPI_TEST_429_BAD_MARKER="$TMP/fail-429-once" exec python3 -u "$TMP/serve.py") >"$TMP/server.log" 2>&1 &
     SERVER_PID=$!
     PORT=""
     i=0
@@ -1038,6 +1080,7 @@ check "standard manifest target" \
 check "standard manifest sourceUrl names the bundle" \
     grep -q "rpi-$VERSION-$HOST_TARGET-standard.tar.gz" "$H31/.local/bin/rpi.install.json"
 check "standard output reports 6/6 plugins" grep -q '6/6 installed' "$TMP/last-out"
+check "standard output reports seeded settings" grep -q 'settings seeded:' "$TMP/last-out"
 check "standard installs six plugin directories" \
     test "$(find "$H31/.rpi/agent/extensions" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = 6
 check "standard settings packages entry lists six plugins" \
@@ -1110,13 +1153,13 @@ reset_test_overrides
 H37=$TMP/home37
 RPI_TEST_SITE=$BASE/bad-sites/missing
 expect_fail "missing index asset entry fails" run_install "$H37" --profile standard --yes
-check "missing entry is reported" grep -q 'asset entry missing/duplicated' "$TMP/last-out"
+check "missing entry is reported" grep -q 'asset entry missing' "$TMP/last-out"
 reset_test_overrides
 
 H38=$TMP/home38
 RPI_TEST_SITE=$BASE/bad-sites/hash
 expect_fail "malformed index hash fails" run_install "$H38" --profile standard --yes
-check "malformed hash is reported" grep -q 'asset entry missing/duplicated' "$TMP/last-out"
+check "malformed hash is reported" grep -q 'not a 64-hex sha256' "$TMP/last-out"
 reset_test_overrides
 
 # 11.7 Sidecar/index disagreement is fatal (no fallback to a different source).
@@ -1208,6 +1251,8 @@ _settings_before=$(sha_of "$H43/.rpi/agent" settings.json)
 expect_ok "existing settings install still materializes plugins" run_install "$H43" --profile standard --yes
 check "existing settings are byte-identical" \
     test "$(sha_of "$H43/.rpi/agent" settings.json)" = "$_settings_before"
+check "existing settings summary is not misreported as registered" \
+    grep -q 'existing settings left untouched:' "$TMP/last-out"
 check "existing settings are reported as untouched" grep -q 'left untouched' "$TMP/last-out"
 expect_ok "second standard install succeeds" run_install "$H43" --profile standard --yes
 check "second install keeps settings byte-identical" \
@@ -1321,6 +1366,25 @@ check "stale validator warns about the restart" grep -q 'ignored the range reque
 check "stale-validator download still verifies" test -x "$H48/.local/bin/rpi"
 reset_test_overrides
 
+# 11.14b A 206 without a response validator must discard the partial and
+# restart from zero, even if the cached validator still matches. The fixture
+# returns wrong bytes so appending would fail the final sha256 check.
+: >"$TMP/no-validator-once"
+CACHE48B=$TMP/cache48b
+seed_partial_cache "$CACHE48B" "$_etag"
+H48B=$TMP/home48b
+RPI_TEST_CACHE=$CACHE48B
+before=$(log_mark)
+expect_ok "206 without a response validator restarts and succeeds" run_install "$H48B" --profile mini
+delta=$(log_since "$before")
+check "206 without a validator warns about the missing validator" \
+    grep -q 'resume validator missing' "$TMP/last-out"
+check "206 without a validator restart made a clean 200 request" \
+    sh -c 'printf "%s\n" "$1" | grep -q " 200 "' _ "$delta"
+check "206 without a validator installed a verified binary" test -x "$H48B/.local/bin/rpi"
+check "206 no-validator fixture was consumed" test ! -e "$TMP/no-validator-once"
+reset_test_overrides
+
 # A first download interrupted mid-body must keep its bytes and resume with a
 # 206 on the next attempt (validators are persisted before success).
 : >"$TMP/truncate-once"
@@ -1357,7 +1421,7 @@ echo "DEBUG before-kill marker=$(test -e "$TMP/stall-once" && echo yes || echo n
 ls -la "$CACHE49B/parts" | sed 's/^/  DBG /'
 grep STALL "$TMP/server.log" | tail -3 | sed 's/^/  DBG /'
 ps -ef | grep -E "curl|install.sh" | grep -v grep | head -8 | sed 's/^/  DBG /'
-ps aux | grep -E "curl.*tar.gz|install.sh" | grep -v grep | head -5 | sed 's/^/  DBG /' 
+ps aux | grep -E "curl.*tar.gz|install.sh" | grep -v grep | head -5 | sed 's/^/  DBG /'
 cat "$TMP/stall-out" | tail -5 | sed 's/^/  DBG /'
 kill -INT "$_installer_pid" 2>/dev/null || true
 sleep 1
@@ -1494,6 +1558,204 @@ if ( set --
 else
     fail "semver comparison vectors and asset size parsing"
 fi
+
+# ---- 12. transactional binary/manifest replacement --------------------------------
+
+# Source the helper definitions without running main, then exercise
+# install_binary with a fault-injected `mv` that fails only for the manifest
+# rename. This is the same failure shape that used to leave a new binary next
+# to an old manifest.
+if ( set --
+    RPI_INSTALL_TEST_SOURCE=1 . "$INSTALL_SH"
+    set +e
+    TR=$(mktemp -d "${TMPDIR:-/tmp}/rpi-commit.XXXXXX")
+    PREFIX=$TR/prefix
+    SRC=$TR/src
+    FAKEBIN=$TR/bin
+    mkdir -p "$PREFIX" "$SRC" "$FAKEBIN"
+    printf 'NEW-BINARY\n' >"$SRC/rpi"
+    cat >"$FAKEBIN/mv" <<'EOM'
+#!/bin/sh
+if [ "${FAIL_MANIFEST_MV:-0}" = 1 ]; then
+    _src=''
+    _dst=''
+    for _arg in "$@"; do
+        case $_arg in
+            *.stage-*) _src=$_arg ;;
+            */rpi.install.json) _dst=$_arg ;;
+        esac
+    done
+    [ -z "$_src" ] || [ -z "$_dst" ] || {
+        echo 'injected manifest rename failure' >&2
+        exit 1
+    }
+fi
+exec /bin/mv "$@"
+EOM
+    chmod 755 "$FAKEBIN/mv"
+    VERSION=0.1.8-rc.4
+    TARGET=x86_64-unknown-linux-gnu
+    IS_STATIC=0
+    ARCHIVE_URL=https://example.invalid/bundle.tar.gz
+    EXPECTED_SHA=deadbeef
+    STAGE_BIN=""
+    STAGE_MANIFEST=""
+    printf 'OLD-BINARY\n' >"$PREFIX/rpi"
+    printf '{"version":"0.1.8-rc.3"}\n' >"$PREFIX/rpi.install.json"
+    old_bin_sha=$(sha256_file "$PREFIX/rpi")
+    old_manifest_sha=$(sha256_file "$PREFIX/rpi.install.json")
+    ( PATH="$FAKEBIN:$PATH" FAIL_MANIFEST_MV=1 install_binary "$SRC" rpi ) >/dev/null 2>&1
+    upgrade_rc=$?
+    upgrade_ok=1
+    [ "$upgrade_rc" -ne 0 ] || upgrade_ok=0
+    [ "$(sha256_file "$PREFIX/rpi")" = "$old_bin_sha" ] || upgrade_ok=0
+    [ "$(sha256_file "$PREFIX/rpi.install.json")" = "$old_manifest_sha" ] || upgrade_ok=0
+    [ -z "$(find "$PREFIX" -maxdepth 1 \( -name '*.stage-*' -o -name '*.backup-*' \) -print -quit)" ] || upgrade_ok=0
+
+    mkdir -p "$TR/first"
+    first_prefix=$TR/first
+    ( PATH="$FAKEBIN:$PATH" FAIL_MANIFEST_MV=1 PREFIX=$first_prefix install_binary "$SRC" rpi ) >/dev/null 2>&1
+    first_rc=$?
+    first_ok=1
+    [ "$first_rc" -ne 0 ] || first_ok=0
+    [ ! -e "$first_prefix/rpi" ] || first_ok=0
+    [ ! -e "$first_prefix/rpi.install.json" ] || first_ok=0
+    [ -z "$(find "$first_prefix" -maxdepth 1 \( -name '*.stage-*' -o -name '*.backup-*' \) -print -quit)" ] || first_ok=0
+
+    ( PATH="$FAKEBIN:$PATH" FAIL_MANIFEST_MV=0 install_binary "$SRC" rpi ) >/dev/null 2>&1
+    success_rc=$?
+    success_ok=1
+    [ "$success_rc" -eq 0 ] || success_ok=0
+    [ "$(cat "$PREFIX/rpi")" = 'NEW-BINARY' ] || success_ok=0
+    grep -q '"version": "0.1.8-rc.4"' "$PREFIX/rpi.install.json" || success_ok=0
+
+    rm -rf "$TR"
+    [ "$upgrade_ok" = 1 ] && [ "$first_ok" = 1 ] && [ "$success_ok" = 1 ]
+); then
+    pass "transactional replacement preserves the old pair on manifest failure"
+else
+    fail "transactional replacement preserves the old pair on manifest failure"
+fi
+
+# ---- 13. strict profile-index parser ------------------------------------------------
+
+# Exercise read_profile_index directly (source mode) with malformed fixtures.
+# The installer's normal profile tests cover the happy path; these cases prove
+# duplicate keys, JSON type coercion, nested/flat schema violations and trailing
+# data all fail before any artifact is downloaded.
+if ( set --
+    RPI_INSTALL_TEST_SOURCE=1 . "$INSTALL_SH"
+    set +e
+    TD=$(mktemp -d "${TMPDIR:-/tmp}/rpi-index.XXXXXX")
+    TMPDIR_RPI=$TD
+    SITE_BASE_URL=http://example.invalid
+    INDEX_SHA=""
+    A=rpi-0.1.8-rc.4-x86_64-unknown-linux-musl-standard.tar.gz
+    V=0.1.8-rc.4
+    S=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    FIXTURE=""
+    fetch_meta() { cp "$FIXTURE" "$2"; }
+    parse_case() { # parse_case <file> -> stdout sha, rc
+        FIXTURE=$1
+        ( read_profile_index "$V" "$A" && printf '%s' "$INDEX_SHA" ) 2>/dev/null
+    }
+    good='{"assets":{"'"$A"'":"'"$S"'"},"version":"'"$V"'","schemaVersion":1}'
+    printf '%s\n' "$good" >"$TD/good.json"
+    sha=$(parse_case "$TD/good.json") || { rm -rf "$TD"; exit 1; }
+    [ "$sha" = "$S" ] || { rm -rf "$TD"; exit 1; }
+
+    dup_schema='{ "schemaVersion": 1, "schemaVersion": 1, "version": "'"$V"'", "assets": { "'"$A"'": "'"$S"'" } }'
+    str_schema='{ "schemaVersion": "1", "version": "'"$V"'", "assets": { "'"$A"'": "'"$S"'" } }'
+    outside='{ "schemaVersion": 1, "version": "'"$V"'", "assets": {}, "extra": { "'"$A"'": "'"$S"'" } }'
+    nested='{ "schemaVersion": 1, "version": "'"$V"'", "assets": { "nested": { "'"$A"'": "'"$S"'" } } }'
+    trailing='{ "schemaVersion": 1, "version": "'"$V"'", "assets": { "'"$A"'": "'"$S"'" } } trailing'
+    dup_asset='{ "schemaVersion": 1, "version": "'"$V"'", "assets": { "'"$A"'": "'"$S"'", "'"$A"'": "'"$S"'" } }'
+    float_size='{ "schemaVersion": 1, "version": "'"$V"'", "assets": { "'"$A"'": "'"$S"'" }, "sizes": { "'"$A"'": 1.5 } }'
+    ok=1
+    for name in dup_schema str_schema outside nested trailing dup_asset float_size; do
+        eval "content=\$$name"
+        printf '%s\n' "$content" >"$TD/$name.json"
+        if parse_case "$TD/$name.json"; then ok=0; fi
+    done
+    head -c 262145 /dev/zero | tr '\000' ' ' >"$TD/large.json"
+    if parse_case "$TD/large.json"; then ok=0; fi
+    rm -rf "$TD"
+    [ "$ok" = 1 ]
+); then
+    pass "strict profile-index parser rejects duplicate/coerced/nested/trailing input"
+else
+    fail "strict profile-index parser rejects duplicate/coerced/nested/trailing input"
+fi
+
+# ---- 14. cache GC lock mapping + retry backoff jitter -------------------------------
+
+# The GC must map <asset>.meta back to the active <asset>.lock; otherwise an
+# in-flight resume loses its validators. The jitter checks pin the 1/2/4/8s
+# schedule to +/-20% and prove distinct processes do not share one factor.
+if ( set --
+    RPI_INSTALL_TEST_SOURCE=1 . "$INSTALL_SH"
+    set +e
+    TD=$(mktemp -d "${TMPDIR:-/tmp}/rpi-gc.XXXXXX")
+    ok=1
+
+    CACHE_PARTS=$TD
+    NO_CACHE_FLAG=0
+    LOCKED=locked-asset
+    printf 'part' >"$TD/$LOCKED"
+    printf 'sha=x\n' >"$TD/$LOCKED.meta"
+    : >"$TD/$LOCKED.lock"
+    printf 'part' >"$TD/stale-asset"
+    printf 'sha=y\n' >"$TD/stale-asset.meta"
+    touch -t 202001010000 "$TD/$LOCKED" "$TD/$LOCKED.meta" "$TD/$LOCKED.lock" \
+        "$TD/stale-asset" "$TD/stale-asset.meta"
+    gc_cache
+    [ -f "$TD/$LOCKED" ] || ok=0
+    [ -f "$TD/$LOCKED.meta" ] || ok=0
+    [ ! -e "$TD/stale-asset" ] || ok=0
+    [ ! -e "$TD/stale-asset.meta" ] || ok=0
+
+    for base in 1 2 4 8; do
+        for _ in 1 2 3; do
+            value=$(backoff_seconds "$base")
+            awk -v v="$value" -v b="$base" \
+                'BEGIN { exit !(v + 0 >= b * 0.8 - 0.005 && v + 0 <= b * 1.2 + 0.005) }' || ok=0
+        done
+    done
+    distinct=$(for _ in 1 2 3 4 5 6; do
+        sh -c 'p=$1; set --; RPI_INSTALL_TEST_SOURCE=1 . "$p"; backoff_seconds 8; echo' _ "$INSTALL_SH"
+    done | sort -u | wc -l | tr -d ' ')
+    [ "$distinct" -ge 2 ] || ok=0
+
+    SLEEP_LOG=$TD/sleep.log
+    sleep() { printf '%s\n' "$1" >>"$SLEEP_LOG"; }
+    SLEEP_FRACTIONAL=1
+    sleep_seconds 0.83
+    [ "$(cat "$SLEEP_LOG")" = "0.83" ] || ok=0
+
+    rm -rf "$TD"
+    [ "$ok" = 1 ]
+); then
+    pass "cache GC honours the base asset lock and retry delays carry real jitter"
+else
+    fail "cache GC honours the base asset lock and retry delays carry real jitter"
+fi
+
+# Ordinary 5xx retries and an unparseable Retry-After must sleep a jittered
+# fractional delay (the old code slept a flat 1/2/4/8s with no jitter).
+for mode in 500 429bad; do
+    case $mode in
+        500) MARK=$TMP/fail-500-once ;;
+        *) MARK=$TMP/fail-429-once ;;
+    esac
+    : >"$MARK"
+    H51=$TMP/home51-$mode
+    RPI_TEST_CACHE=$TMP/cache51-$mode
+    expect_ok "$mode retry with jittered backoff succeeds" run_install "$H51" --profile mini
+    check "$mode retry logged a fractional jittered delay" \
+        grep -Eq 'retrying in [0-9]+\.[0-9]{2}s' "$TMP/last-out"
+    check "$mode retry fixture was consumed" test ! -e "$MARK"
+    reset_test_overrides
+done
 
 # ---- summary ------------------------------------------------------------------------
 

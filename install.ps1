@@ -81,6 +81,10 @@
       RPI_INSTALL_REQUIRE_PLUGINS  1 = exit 1 when any plugin fails
       RPI_INSTALL_NO_CACHE   1 = disable the download cache
       RPI_INSTALL_CACHE_DIR  cache root (default: %LOCALAPPDATA%\rpi\install)
+      RPI_INSTALL_ATTEMPTS   attempts per source (default 5, 1-20)
+      RPI_INSTALL_STALL_TIMEOUT  body read stall timeout seconds (default 30)
+      RPI_INSTALL_CONNECT_TIMEOUT  connect/response-header timeout seconds (default 10)
+      RPI_INSTALL_PROMPT_TIMEOUT  interactive prompt timeout seconds (default 60)
       RPI_CODING_AGENT_DIR   agent dir (settings/extensions root)
 
     Download fallback order (ADR-0011 revision, for networks where GitHub is
@@ -115,6 +119,26 @@ $VersionCheckUrl = if ($env:RPI_VERSION_CHECK_URL) { $env:RPI_VERSION_CHECK_URL 
 $ReleaseBaseUrl = if ($env:RPI_RELEASE_BASE_URL) { $env:RPI_RELEASE_BASE_URL } else { "https://github.com/$Repo/releases" }
 $SiteBaseUrl = if ($env:RPI_SITE_BASE_URL) { $env:RPI_SITE_BASE_URL } else { 'https://revpi.dev' }
 $Target = 'x86_64-pc-windows-msvc'
+
+# Download tuning mirrors install.sh (install-packaging.md section 7). Invalid
+# or out-of-range values warn and fall back to the contract defaults instead
+# of turning into an unbounded wait.
+function Get-InstallEnvInt {
+    param([string]$Name, [int]$Default, [int]$Minimum, [int]$Maximum)
+    $raw = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $Default }
+    $value = 0
+    if (-not [int]::TryParse($raw.Trim(), [ref]$value) -or $value -lt $Minimum -or $value -gt $Maximum) {
+        Write-Warning "invalid $Name=$raw; using $Default"
+        return $Default
+    }
+    return $value
+}
+
+$MaxAttempts = Get-InstallEnvInt -Name 'RPI_INSTALL_ATTEMPTS' -Default 5 -Minimum 1 -Maximum 20
+$StallTimeout = Get-InstallEnvInt -Name 'RPI_INSTALL_STALL_TIMEOUT' -Default 30 -Minimum 1 -Maximum 3600
+$ConnectTimeout = Get-InstallEnvInt -Name 'RPI_INSTALL_CONNECT_TIMEOUT' -Default 10 -Minimum 1 -Maximum 300
+$PromptTimeout = Get-InstallEnvInt -Name 'RPI_INSTALL_PROMPT_TIMEOUT' -Default 60 -Minimum 1 -Maximum 3600
 
 function Fail([string]$Message) {
     Write-Host "error: $Message" -ForegroundColor Red
@@ -178,6 +202,59 @@ function Test-InstallerInteractiveInput {
 # Strip trailing separators, but keep a drive root ("C:\") a root: turning it
 # into "C:" would make the PATH entry refer to the process's current directory
 # on that drive.
+# Read a line with a deadline. The shell installer uses `read -t`; PowerShell
+# has no built-in timeout, so poll the console keys directly. Two sentinels are
+# returned instead of a blocking read: __timeout__ on deadline and
+# __unavailable__ when the host cannot poll the console at all. Callers must
+# treat both (and $null) as "no answer" and refuse consent.
+function Read-HostWithTimeout {
+    param([string]$Prompt, [int]$TimeoutSeconds = 60)
+    if (-not (Test-InstallerInteractiveInput)) { return $null }
+    if ($TimeoutSeconds -le 0) { $TimeoutSeconds = 60 }
+    try {
+        # Callers only reach this after Test-InstallerInteractiveInput, but a
+        # host/test harness can mock that probe while redirecting the console.
+        # Never fall back to Read-Host: it has no deadline, so an unanswered
+        # prompt would block forever, and a caller that maps an empty result to
+        # the default answer would then accept on the user's behalf. Report an
+        # explicit "no answer" sentinel instead.
+        if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
+            return '__unavailable__'
+        }
+        [Console]::Write($Prompt)
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        $builder = New-Object System.Text.StringBuilder
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if (-not [Console]::KeyAvailable) {
+                Start-Sleep -Milliseconds 100
+                continue
+            }
+            $key = [Console]::ReadKey($true)
+            if ($key.Key -eq [ConsoleKey]::Enter) {
+                [Console]::WriteLine()
+                return $builder.ToString()
+            }
+            if ($key.Key -eq [ConsoleKey]::Backspace) {
+                if ($builder.Length -gt 0) {
+                    $builder.Length = $builder.Length - 1
+                    [Console]::Write("`b `b")
+                }
+                continue
+            }
+            if ($key.KeyChar -and -not [char]::IsControl($key.KeyChar)) {
+                [void]$builder.Append($key.KeyChar)
+                [Console]::Write($key.KeyChar)
+            }
+        }
+        [Console]::WriteLine()
+        return '__timeout__'
+    } catch {
+        # ISE and other non-console hosts cannot poll keys. Return the sentinel
+        # so callers refuse instead of degrading to an unbounded Read-Host.
+        return '__unavailable__'
+    }
+}
+
 function Remove-TrailingSeparators {
     param([string]$Value)
 
@@ -526,17 +603,22 @@ function Update-RpiPath {
                 return
             }
             try {
-                $answer = Read-Host "Add $dir to your user PATH now? [Y/n]"
+                $answer = Read-HostWithTimeout -Prompt "Add $dir to your user PATH now? [Y/n] " -TimeoutSeconds $PromptTimeout
             } catch {
+                $answer = '__unavailable__'
+            }
+            if ($null -eq $answer -or $answer -eq '__unavailable__') {
+                Write-Warning 'could not read an answer for the PATH prompt; leaving the user PATH unchanged'
                 Write-ManualPathNote $dir
                 return
             }
-            if ($null -eq $answer) {
-                $answer = ''
-            } else {
-                $answer = ([string]$answer).Trim()
+            if ($answer -eq '__timeout__') {
+                Write-Warning "PATH prompt timed out after ${PromptTimeout}s; leaving the user PATH unchanged"
+                Write-ManualPathNote $dir
+                return
             }
-            if (-not $answer -or $answer -notmatch '^(n|no)$') {
+            $answer = ([string]$answer).Trim()
+            if (-not $answer -or $answer -notmatch '^(n|no)\z') {
                 Add-RpiToUserPath $dir
             } else {
                 Write-ManualPathNote $dir
@@ -603,6 +685,82 @@ function Get-FileSha256 {
     }
 }
 
+# Commit the staged binary and manifest as one transaction. Both stages live in
+# the destination directory, so each replace is a same-volume atomic rename.
+# The old files are copied to same-directory backups first; if the second
+# replace fails, both old files are restored. A first install removes the new
+# binary when the manifest replace fails. On a failed restore the backups are
+# kept and named in the error so the user can recover manually.
+function Commit-InstallFiles {
+    param(
+        [string]$StageBin,
+        [string]$InstallPath,
+        [string]$StageManifest,
+        [string]$ManifestPath
+    )
+    $backupBin = "$InstallPath.backup-$PID"
+    $backupManifest = "$ManifestPath.backup-$PID"
+    $hadBin = Test-Path -LiteralPath $InstallPath -PathType Leaf
+    $hadManifest = Test-Path -LiteralPath $ManifestPath -PathType Leaf
+    $binMoved = $false
+    $manifestMoved = $false
+    Remove-Item -LiteralPath $backupBin, $backupManifest -Force -ErrorAction SilentlyContinue
+
+    try {
+        # File.Replace writes the previous destination to the third argument,
+        # so the backup is created by the same atomic operation that installs
+        # the new file. The null overload is not portable (it rejects an empty
+        # path on .NET Core/Linux).
+        if ($hadBin) {
+            [IO.File]::Replace($StageBin, $InstallPath, $backupBin)
+        } else {
+            [IO.File]::Move($StageBin, $InstallPath)
+        }
+        $binMoved = $true
+
+        if ($hadManifest) {
+            [IO.File]::Replace($StageManifest, $ManifestPath, $backupManifest)
+        } else {
+            [IO.File]::Move($StageManifest, $ManifestPath)
+        }
+        $manifestMoved = $true
+    } catch {
+        $original = $_.Exception.Message
+        $rollbackError = $null
+        try {
+            if ($hadBin) {
+                # If Replace failed before swapping the destination, the old
+                # file is still in place and there is no backup to restore.
+                if (Test-Path -LiteralPath $backupBin -PathType Leaf) {
+                    Move-Item -LiteralPath $backupBin -Destination $InstallPath -Force -ErrorAction Stop
+                } elseif (-not (Test-Path -LiteralPath $InstallPath -PathType Leaf)) {
+                    throw "the old binary and its backup are both missing"
+                }
+            } elseif ($binMoved -or (Test-Path -LiteralPath $InstallPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $InstallPath -Force -ErrorAction Stop
+            }
+            if ($hadManifest) {
+                if (Test-Path -LiteralPath $backupManifest -PathType Leaf) {
+                    Move-Item -LiteralPath $backupManifest -Destination $ManifestPath -Force -ErrorAction Stop
+                } elseif (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+                    throw "the old manifest and its backup are both missing"
+                }
+            } elseif ($manifestMoved -or (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $ManifestPath -Force -ErrorAction Stop
+            }
+        } catch {
+            $rollbackError = $_.Exception.Message
+        }
+        if ($null -ne $rollbackError) {
+            throw "install replace failed ($original); automatic rollback also failed ($rollbackError). Old files are preserved at $backupBin and $backupManifest"
+        }
+        Remove-Item -LiteralPath $backupBin, $backupManifest, $StageBin, $StageManifest -Force -ErrorAction SilentlyContinue
+        throw "install replace failed ($original); the previous binary and manifest were restored"
+    }
+
+    Remove-Item -LiteralPath $backupBin, $backupManifest -Force -ErrorAction SilentlyContinue
+}
+
 # Safe-archive member rules shared by the zip and tar paths: reject absolute
 # paths, drive letters, NUL and any '..' component. Links are rejected by the
 # callers (a tar type check / the zip external-attributes check).
@@ -617,26 +775,82 @@ function Test-SafeArchiveMemberName {
     return $true
 }
 
+# Numeric identifiers are compared by length and then ordinal order, so a
+# semver component is never cast to a fixed-width integer (a 20-digit major
+# would otherwise throw instead of comparing). Leading zeros are rejected by
+# the parser, so length order is numeric order here.
+function Compare-SemverNumericIdentifier {
+    param([string]$Left, [string]$Right)
+    if ($Left.Length -lt $Right.Length) { return -1 }
+    if ($Left.Length -gt $Right.Length) { return 1 }
+    return [string]::CompareOrdinal($Left, $Right)
+}
+
+# Parse and fully validate one semver value before any ordering decision.
+# Returns $null for anything that is not a complete SemVer 2.0.0 string
+# (including an empty prerelease/build identifier or a numeric prerelease
+# identifier with a leading zero). Build metadata is validated but ignored
+# for ordering.
+function ConvertTo-SemverParts {
+    param([string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) { return $null }
+    # \z (not $) so a trailing LF cannot satisfy the anchor; the explicit
+    # length check keeps the contract even if the pattern is edited later.
+    $pattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?\z'
+    $match = [regex]::Match($Value, $pattern)
+    if (-not $match.Success -or $match.Length -ne $Value.Length) { return $null }
+
+    $pre = @()
+    if ($match.Groups[4].Success) {
+        $pre = @($match.Groups[4].Value.Split('.'))
+        if ($pre.Count -eq 0) { return $null }
+        foreach ($id in $pre) {
+            if ([string]::IsNullOrEmpty($id)) { return $null }
+            if ($id -notmatch '^[0-9A-Za-z-]+$') { return $null }
+            if ($id -match '^[0-9]+$' -and $id.Length -gt 1 -and $id.StartsWith('0')) { return $null }
+        }
+    }
+
+    if ($match.Groups[5].Success) {
+        $build = @($match.Groups[5].Value.Split('.'))
+        if ($build.Count -eq 0) { return $null }
+        foreach ($id in $build) {
+            if ([string]::IsNullOrEmpty($id)) { return $null }
+            if ($id -notmatch '^[0-9A-Za-z-]+$') { return $null }
+        }
+    }
+
+    return @{
+        Major = $match.Groups[1].Value
+        Minor = $match.Groups[2].Value
+        Patch = $match.Groups[3].Value
+        Pre   = $pre
+    }
+}
+
 function Compare-SemverVersion {
     param([string]$Left, [string]$Right)
-    $pattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$'
-    if (-not ($Left -match $pattern)) { return 'invalid' }
-    $l = @{ major = [int64]$Matches[1]; minor = [int64]$Matches[2]; patch = [int64]$Matches[3]; pre = $Matches[4] }
-    if (-not ($Right -match $pattern)) { return 'invalid' }
-    $r = @{ major = [int64]$Matches[1]; minor = [int64]$Matches[2]; patch = [int64]$Matches[3]; pre = $Matches[4] }
-    foreach ($field in @('major', 'minor', 'patch')) {
-        if ($l[$field] -lt $r[$field]) { return 'lt' }
-        if ($l[$field] -gt $r[$field]) { return 'gt' }
+    # Both sides must be valid before either can be declared lower/higher.
+    # The previous implementation returned 'lt'/'gt' for a stable-vs-prerelease
+    # pair before validating the prerelease identifiers, so '0.1.0-01' was
+    # treated as a compatible lower version instead of invalid.
+    $l = ConvertTo-SemverParts -Value $Left
+    if ($null -eq $l) { return 'invalid' }
+    $r = ConvertTo-SemverParts -Value $Right
+    if ($null -eq $r) { return 'invalid' }
+
+    foreach ($field in @('Major', 'Minor', 'Patch')) {
+        $cmp = Compare-SemverNumericIdentifier -Left $l[$field] -Right $r[$field]
+        if ($cmp -lt 0) { return 'lt' }
+        if ($cmp -gt 0) { return 'gt' }
     }
-    if (-not $l.pre -and -not $r.pre) { return 'eq' }
-    if (-not $l.pre) { return 'gt' }
-    if (-not $r.pre) { return 'lt' }
-    $leftIds = $l.pre.Split('.')
-    $rightIds = $r.pre.Split('.')
-    foreach ($id in @($leftIds + $rightIds)) {
-        if ($id -notmatch '^[0-9A-Za-z-]+$') { return 'invalid' }
-        if ($id -match '^[0-9]+$' -and $id.Length -gt 1 -and $id.StartsWith('0')) { return 'invalid' }
-    }
+
+    $leftIds = @($l.Pre)
+    $rightIds = @($r.Pre)
+    if ($leftIds.Count -eq 0 -and $rightIds.Count -eq 0) { return 'eq' }
+    if ($leftIds.Count -eq 0) { return 'gt' }
+    if ($rightIds.Count -eq 0) { return 'lt' }
+
     $count = [Math]::Max($leftIds.Count, $rightIds.Count)
     for ($i = 0; $i -lt $count; $i++) {
         if ($i -ge $leftIds.Count) { return 'lt' }
@@ -646,8 +860,9 @@ function Compare-SemverVersion {
         $aNumeric = $a -match '^[0-9]+$'
         $bNumeric = $b -match '^[0-9]+$'
         if ($aNumeric -and $bNumeric) {
-            if ([int64]$a -lt [int64]$b) { return 'lt' }
-            if ([int64]$a -gt [int64]$b) { return 'gt' }
+            $cmp = Compare-SemverNumericIdentifier -Left $a -Right $b
+            if ($cmp -lt 0) { return 'lt' }
+            if ($cmp -gt 0) { return 'gt' }
         } elseif ($aNumeric) {
             return 'lt'
         } elseif ($bNumeric) {
@@ -661,9 +876,192 @@ function Compare-SemverVersion {
     return 'eq'
 }
 
+# Minimal JSON tokenizer/parser for the flat profile index. It deliberately
+# does not use ConvertFrom-Json: PowerShell 5.1 has no duplicate-key mode, and
+# ConvertFrom-Json coerces `"schemaVersion": "1"` to an integer. This parser
+# keeps JSON types explicit, rejects duplicate keys at every object level, and
+# is then validated against the flat schema.
+function Test-JsonDigit {
+    param([char]$Ch)
+    $code = [int]$Ch
+    return (($code -ge 48) -and ($code -le 57))
+}
+
+function Skip-JsonWhitespace {
+    param($State)
+    while ($State.Pos -lt $State.Length) {
+        $code = [int]$State.Text[$State.Pos]
+        if ($code -eq 32 -or $code -eq 9 -or $code -eq 10 -or $code -eq 13) {
+            $State.Pos++
+        } else {
+            break
+        }
+    }
+}
+
+function Expect-JsonChar {
+    param($State, [char]$Expected)
+    Skip-JsonWhitespace -State $State
+    if ($State.Pos -ge $State.Length -or $State.Text[$State.Pos] -ne $Expected) {
+        throw "expected '$Expected' at offset $($State.Pos)"
+    }
+    $State.Pos++
+}
+
+function Read-JsonString {
+    param($State)
+    Skip-JsonWhitespace -State $State
+    if ($State.Pos -ge $State.Length -or $State.Text[$State.Pos] -ne '"') {
+        throw "expected a string at offset $($State.Pos)"
+    }
+    $State.Pos++
+    $builder = New-Object System.Text.StringBuilder
+    while ($State.Pos -lt $State.Length) {
+        $ch = $State.Text[$State.Pos]
+        $State.Pos++
+        if ($ch -eq '"') { return $builder.ToString() }
+        if ([int]$ch -lt 0x20) { throw "control character in a string at offset $($State.Pos)" }
+        if ([int]$ch -ne 92) {
+            [void]$builder.Append($ch)
+            continue
+        }
+        if ($State.Pos -ge $State.Length) { throw "unterminated escape at offset $($State.Pos)" }
+        $esc = [string]$State.Text[$State.Pos]
+        $State.Pos++
+        switch -CaseSensitive ($esc) {
+            '"' { [void]$builder.Append('"') }
+            '\' { [void]$builder.Append('\') }
+            '/' { [void]$builder.Append('/') }
+            'b' { [void]$builder.Append([char]0x08) }
+            'f' { [void]$builder.Append([char]0x0C) }
+            'n' { [void]$builder.Append([char]0x0A) }
+            'r' { [void]$builder.Append([char]0x0D) }
+            't' { [void]$builder.Append([char]0x09) }
+            'u' {
+                if ($State.Pos + 4 -gt $State.Length) { throw "short unicode escape at offset $($State.Pos)" }
+                $hex = $State.Text.Substring($State.Pos, 4)
+                $State.Pos += 4
+                if ($hex -notmatch '^[0-9A-Fa-f]{4}$') { throw "invalid unicode escape at offset $($State.Pos)" }
+                $code = [Convert]::ToInt32($hex, 16)
+                if ($code -gt 0x7F) {
+                    throw "non-ASCII unicode escape is not allowed in the profile index"
+                }
+                [void]$builder.Append([char]$code)
+            }
+            default { throw "invalid escape '\\$esc' at offset $($State.Pos)" }
+        }
+    }
+    throw "unterminated string at offset $($State.Pos)"
+}
+
+function Read-JsonNumber {
+    param($State)
+    Skip-JsonWhitespace -State $State
+    $start = $State.Pos
+    if ($State.Pos -lt $State.Length -and $State.Text[$State.Pos] -eq '-') { $State.Pos++ }
+    if ($State.Pos -ge $State.Length -or -not (Test-JsonDigit -Ch $State.Text[$State.Pos])) {
+        throw "invalid number at offset $start"
+    }
+    if ($State.Text[$State.Pos] -eq '0') {
+        $State.Pos++
+        if ($State.Pos -lt $State.Length -and (Test-JsonDigit -Ch $State.Text[$State.Pos])) {
+            throw "leading zero in a number at offset $start"
+        }
+    } else {
+        while ($State.Pos -lt $State.Length -and (Test-JsonDigit -Ch $State.Text[$State.Pos])) {
+            $State.Pos++
+        }
+    }
+    if ($State.Pos -lt $State.Length -and $State.Text[$State.Pos] -eq '.') {
+        $State.Pos++
+        if ($State.Pos -ge $State.Length -or -not (Test-JsonDigit -Ch $State.Text[$State.Pos])) {
+            throw "invalid fraction at offset $start"
+        }
+        while ($State.Pos -lt $State.Length -and (Test-JsonDigit -Ch $State.Text[$State.Pos])) {
+            $State.Pos++
+        }
+    }
+    if ($State.Pos -lt $State.Length -and
+        ($State.Text[$State.Pos] -eq 'e' -or $State.Text[$State.Pos] -eq 'E')) {
+        $State.Pos++
+        if ($State.Pos -lt $State.Length -and
+            ($State.Text[$State.Pos] -eq '+' -or $State.Text[$State.Pos] -eq '-')) {
+            $State.Pos++
+        }
+        if ($State.Pos -ge $State.Length -or -not (Test-JsonDigit -Ch $State.Text[$State.Pos])) {
+            throw "invalid exponent at offset $start"
+        }
+        while ($State.Pos -lt $State.Length -and (Test-JsonDigit -Ch $State.Text[$State.Pos])) {
+            $State.Pos++
+        }
+    }
+    return $State.Text.Substring($start, $State.Pos - $start)
+}
+
+function Read-JsonLiteral {
+    param($State, [string]$Literal, $Value)
+    Skip-JsonWhitespace -State $State
+    if ($State.Pos + $Literal.Length -gt $State.Length -or
+        $State.Text.Substring($State.Pos, $Literal.Length) -cne $Literal) {
+        throw "invalid JSON literal at offset $($State.Pos)"
+    }
+    $State.Pos += $Literal.Length
+    return $Value
+}
+
+function Read-JsonObject {
+    param($State, [int]$Depth)
+    Expect-JsonChar -State $State -Expected '{'
+    $object = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
+    Skip-JsonWhitespace -State $State
+    if ($State.Pos -lt $State.Length -and $State.Text[$State.Pos] -eq '}') {
+        $State.Pos++
+        return $object
+    }
+    while ($true) {
+        $key = Read-JsonString -State $State
+        if ($object.ContainsKey($key)) { throw "duplicate key '$key' at offset $($State.Pos)" }
+        Expect-JsonChar -State $State -Expected ':'
+        $value = Read-JsonValue -State $State -Depth ($Depth + 1)
+        $object[$key] = $value
+        Skip-JsonWhitespace -State $State
+        if ($State.Pos -ge $State.Length) { throw "unterminated object at offset $($State.Pos)" }
+        if ($State.Text[$State.Pos] -eq ',') {
+            $State.Pos++
+            continue
+        }
+        if ($State.Text[$State.Pos] -eq '}') {
+            $State.Pos++
+            return $object
+        }
+        throw "expected ',' or '}' at offset $($State.Pos)"
+    }
+}
+
+function Read-JsonValue {
+    param($State, [int]$Depth)
+    if ($Depth -gt 8) { throw "JSON nesting is too deep" }
+    Skip-JsonWhitespace -State $State
+    if ($State.Pos -ge $State.Length) { throw "unexpected end of JSON" }
+    $ch = $State.Text[$State.Pos]
+    if ($ch -eq '{') { return Read-JsonObject -State $State -Depth $Depth }
+    if ($ch -eq '[') { throw "arrays are not allowed in the profile index" }
+    if ($ch -eq '"') {
+        return [pscustomobject]@{ Kind = 'string'; Value = (Read-JsonString -State $State) }
+    }
+    if ($ch -eq 't') { return Read-JsonLiteral -State $State -Literal 'true' -Value ([pscustomobject]@{ Kind = 'bool'; Value = $true }) }
+    if ($ch -eq 'f') { return Read-JsonLiteral -State $State -Literal 'false' -Value ([pscustomobject]@{ Kind = 'bool'; Value = $false }) }
+    if ($ch -eq 'n') { return Read-JsonLiteral -State $State -Literal 'null' -Value ([pscustomobject]@{ Kind = 'null'; Value = $null }) }
+    if ($ch -eq '-' -or (Test-JsonDigit -Ch $ch)) {
+        return [pscustomobject]@{ Kind = 'number'; Raw = (Read-JsonNumber -State $State) }
+    }
+    throw "unexpected character at offset $($State.Pos)"
+}
+
 # Validate and read the flat rpi-pages profile index
-# (install-packaging.md section 3). Duplicate keys are detected in the raw
-# text because ConvertFrom-Json would silently keep the last one.
+# (install-packaging.md section 3). The parser above rejects duplicate keys at
+# every object level; this function enforces the exact flat schema and JSON
+# types (schemaVersion must be the number 1, not the string "1").
 function ConvertFrom-ProfileIndex {
     param([string]$Text, [string]$Version, [string]$AssetName)
     $result = [pscustomobject]@{ Ok = $false; Sha = $null; Error = '' }
@@ -671,54 +1069,112 @@ function ConvertFrom-ProfileIndex {
         $result.Error = 'empty profile index'
         return $result
     }
-    if ($Text.Length -gt 262144) {
+    try {
+        $byteCount = [System.Text.Encoding]::UTF8.GetByteCount($Text)
+    } catch {
+        $result.Error = 'profile index is not valid UTF-8'
+        return $result
+    }
+    if ($byteCount -gt 262144) {
         $result.Error = 'profile index is too large'
         return $result
     }
-    $schemaCount = ([regex]::Matches($Text, '"schemaVersion"\s*:')).Count
-    if ($schemaCount -ne 1) {
-        $result.Error = "profile index must contain schemaVersion exactly once (found $schemaCount)"
-        return $result
-    }
-    $versionCount = ([regex]::Matches($Text, '"version"\s*:')).Count
-    if ($versionCount -ne 1) {
-        $result.Error = "profile index must contain version exactly once (found $versionCount)"
-        return $result
-    }
-    $assetPattern = '"' + [regex]::Escape($AssetName) + '"\s*:'
-    $assetCount = ([regex]::Matches($Text, $assetPattern)).Count
-    if ($assetCount -ne 1) {
-        $result.Error = "asset entry missing or duplicated for $AssetName (found $assetCount)"
-        return $result
-    }
+
+    $state = [pscustomobject]@{ Text = $Text; Pos = 0; Length = $Text.Length }
     try {
-        $doc = $Text | ConvertFrom-Json
+        Skip-JsonWhitespace -State $state
+        $root = Read-JsonValue -State $state -Depth 0
+        Skip-JsonWhitespace -State $state
+        if ($state.Pos -ne $state.Length) { throw "trailing data at offset $($state.Pos)" }
     } catch {
         $result.Error = "profile index is not valid JSON: $($_.Exception.Message)"
         return $result
     }
-    if ([int]$doc.schemaVersion -ne 1) {
-        $result.Error = "unsupported profile index schemaVersion: $($doc.schemaVersion)"
+
+    if (-not ($root -is [System.Collections.Generic.Dictionary[string,object]])) {
+        $result.Error = 'profile index must be a JSON object'
         return $result
     }
-    if ([string]$doc.version -ne $Version) {
-        $result.Error = "profile index version mismatch: index=$($doc.version) expected=$Version"
+    foreach ($key in $root.Keys) {
+        if ($key -cne 'schemaVersion' -and $key -cne 'version' -and
+            $key -cne 'assets' -and $key -cne 'sizes') {
+            $result.Error = "unexpected profile index key: $key"
+            return $result
+        }
+    }
+    if (-not $root.ContainsKey('schemaVersion')) {
+        $result.Error = 'profile index is missing schemaVersion'
         return $result
     }
-    $property = $doc.assets.PSObject.Properties |
-        Where-Object { $_.Name -eq $AssetName } |
-        Select-Object -First 1
-    if (-not $property) {
+    $schema = $root['schemaVersion']
+    if (-not ($schema -is [pscustomobject]) -or $schema.Kind -ne 'number' -or $schema.Raw -cne '1') {
+        $result.Error = 'unsupported profile index schemaVersion: expected numeric 1'
+        return $result
+    }
+    if (-not $root.ContainsKey('version')) {
+        $result.Error = 'profile index is missing version'
+        return $result
+    }
+    $indexVersion = $root['version']
+    if (-not ($indexVersion -is [pscustomobject]) -or $indexVersion.Kind -ne 'string') {
+        $result.Error = 'profile index version must be a JSON string'
+        return $result
+    }
+    if ($indexVersion.Value -cne $Version) {
+        $result.Error = "profile index version mismatch: index=$($indexVersion.Value) expected=$Version"
+        return $result
+    }
+    if (-not $root.ContainsKey('assets')) {
+        $result.Error = 'profile index has no assets object'
+        return $result
+    }
+    $assets = $root['assets']
+    if (-not ($assets -is [System.Collections.Generic.Dictionary[string,object]])) {
+        $result.Error = 'profile index assets must be a flat JSON object'
+        return $result
+    }
+    $targetSha = $null
+    foreach ($asset in $assets.Keys) {
+        if ($asset -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*\z') {
+            $result.Error = "profile index has an invalid asset name: $asset"
+            return $result
+        }
+        $value = $assets[$asset]
+        if (-not ($value -is [pscustomobject]) -or $value.Kind -ne 'string') {
+            $result.Error = "profile index entry for $asset is not a JSON string"
+            return $result
+        }
+        if ($value.Value -cnotmatch '^[0-9a-fA-F]{64}\z') {
+            $result.Error = "profile index entry for $asset is not a 64-hex sha256"
+            return $result
+        }
+        if ($asset -ceq $AssetName) { $targetSha = $value.Value.ToLowerInvariant() }
+    }
+    if ($null -eq $targetSha) {
         $result.Error = "asset entry missing from the profile index: $AssetName"
         return $result
     }
-    $sha = [string]$property.Value
-    if ($sha -notmatch '^[0-9a-fA-F]{64}$') {
-        $result.Error = "profile index entry for $AssetName is not a 64-hex sha256"
-        return $result
+    if ($root.ContainsKey('sizes')) {
+        $sizes = $root['sizes']
+        if (-not ($sizes -is [System.Collections.Generic.Dictionary[string,object]])) {
+            $result.Error = 'profile index sizes must be a flat JSON object'
+            return $result
+        }
+        foreach ($asset in $sizes.Keys) {
+            if (-not $assets.ContainsKey($asset)) {
+                $result.Error = "profile index sizes has an entry for an unknown asset: $asset"
+                return $result
+            }
+            $value = $sizes[$asset]
+            if (-not ($value -is [pscustomobject]) -or $value.Kind -ne 'number' -or
+                $value.Raw -cnotmatch '^(0|[1-9][0-9]*)\z') {
+                $result.Error = "profile index size for $asset is not a non-negative integer"
+                return $result
+            }
+        }
     }
     $result.Ok = $true
-    $result.Sha = $sha.ToLowerInvariant()
+    $result.Sha = $targetSha
     return $result
 }
 
@@ -754,10 +1210,14 @@ function Get-RangeResumeDecision {
     if ($Status -eq 200) { return 'restart' }
     if ($Status -eq 416) { return 'verify-or-restart' }
     if ($Status -eq 206) {
-        if ($CachedValidator -and $ResponseValidator -and ($CachedValidator -ne $ResponseValidator)) {
-            return 'restart'
+        # A 206 may only be appended when this response carries a validator
+        # and it equals the validator the partial was requested with. A
+        # missing validator is not proof that the bytes belong to the same
+        # entity, so it takes the same restart path as a changed one.
+        if ($CachedValidator -and $ResponseValidator -and ($CachedValidator -eq $ResponseValidator)) {
+            return 'append'
         }
-        return 'append'
+        return 'restart'
     }
     return 'retry'
 }
@@ -768,28 +1228,80 @@ function Invoke-MetadataRequest {
         [int]$TimeoutSeconds = 30,
         [int]$MaxBytes = 262144
     )
+    if ($TimeoutSeconds -le 0) { $TimeoutSeconds = 30 }
+    if ($MaxBytes -le 0) { $MaxBytes = 262144 }
     $request = [System.Net.HttpWebRequest]::Create($Url)
     $request.Method = 'GET'
     $request.UserAgent = 'rpi-installer'
     $request.Timeout = $TimeoutSeconds * 1000
     $request.ReadWriteTimeout = $TimeoutSeconds * 1000
     $response = $null
+    $stream = $null
+    $memory = $null
     try {
         $response = $request.GetResponse()
+        if ($response.ContentLength -gt $MaxBytes) {
+            throw "response is too large ($($response.ContentLength) bytes; limit $MaxBytes)"
+        }
         $stream = $response.GetResponseStream()
-        $reader = New-Object System.IO.StreamReader($stream)
+        $memory = New-Object System.IO.MemoryStream
+        $buffer = New-Object byte[] 16384
+        $total = 0
+        while ($true) {
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { break }
+            $total += $read
+            if ($total -gt $MaxBytes) {
+                throw "response is too large (> $MaxBytes bytes)"
+            }
+            $memory.Write($buffer, 0, $read)
+        }
+        $bytes = $memory.ToArray()
+        # The metadata is UTF-8 JSON; reject invalid byte sequences instead of
+        # silently replacing them (the strict parser would fail later anyway).
+        $utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false, $true
         try {
-            $text = $reader.ReadToEnd()
-        } finally {
-            $reader.Dispose()
+            return $utf8.GetString($bytes)
+        } catch {
+            throw 'response is not valid UTF-8'
         }
-        if ($text.Length -gt $MaxBytes) {
-            throw "response is too large ($($text.Length) bytes)"
-        }
-        return $text
     } finally {
+        if ($memory) { $memory.Dispose() }
+        if ($stream) { $stream.Dispose() }
         if ($response) { $response.Close() }
     }
+}
+
+# Parse Retry-After as delta-seconds or an HTTP-date (RFC 7231). Returns $null
+# when absent/unparseable; values are capped at 60s per install-packaging.md.
+function Get-RetryAfterSeconds {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $seconds = 0
+    if ([int]::TryParse($Value.Trim(), [ref]$seconds)) {
+        if ($seconds -lt 0) { return 0 }
+        return [Math]::Min(60, $seconds)
+    }
+    $when = [DateTimeOffset]::MinValue
+    $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor
+        [Globalization.DateTimeStyles]::AllowWhiteSpaces
+    if ([DateTimeOffset]::TryParse($Value.Trim(), [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$when)) {
+        $delta = ($when - [DateTimeOffset]::UtcNow).TotalSeconds
+        if ($delta -lt 0) { return 0 }
+        return [Math]::Min(60, [int][Math]::Ceiling($delta))
+    }
+    return $null
+}
+
+# Retry-After wins when present; otherwise exponential backoff (1/2/4/8s) with
+# the contract's +/-20% jitter.
+function Get-RetryDelaySeconds {
+    param([int]$Attempt, [string]$RetryAfter)
+    $retry = Get-RetryAfterSeconds -Value $RetryAfter
+    if ($null -ne $retry) { return [double]$retry }
+    $base = [Math]::Min(8.0, [Math]::Pow(2, [Math]::Max(0, $Attempt - 1)))
+    $jitter = 0.8 + ((Get-Random -Minimum 0 -Maximum 1000) / 2500.0)
+    return [Math]::Round($base * $jitter, 2)
 }
 
 # One HTTP transfer. Appends to an existing partial only when a validator was
@@ -802,14 +1314,19 @@ function Invoke-HttpTransfer {
         [long]$Offset,
         [string]$Validator,
         [int]$StallTimeout,
+        [int]$ConnectTimeout = 10,
         [string]$LockPath,
         [switch]$NoProgress
     )
+    if ($ConnectTimeout -le 0) { $ConnectTimeout = 10 }
+    if ($StallTimeout -le 0) { $StallTimeout = 30 }
     $request = [System.Net.HttpWebRequest]::Create($Url)
     $request.Method = 'GET'
     $request.UserAgent = 'rpi-installer'
     $request.AllowAutoRedirect = $true
-    $request.Timeout = -1
+    # Timeout bounds DNS/connect/response headers; the body is bounded by
+    # ReadWriteTimeout (the stall timeout) and has no total timeout.
+    $request.Timeout = $ConnectTimeout * 1000
     $request.ReadWriteTimeout = $StallTimeout * 1000
     if ($Offset -gt 0 -and $Validator) {
         $request.AddRange($Offset)
@@ -824,23 +1341,39 @@ function Invoke-HttpTransfer {
             $webResponse = $_.Exception.Response
             if (-not $webResponse) { throw }
             $status = [int]$webResponse.StatusCode
+            $retryAfter = ''
+            try { $retryAfter = [string]$webResponse.Headers['Retry-After'] } catch { }
             $webResponse.Close()
-            return [pscustomobject]@{ Status = $status; ETag = $null; LastModified = $null; Truncated = $false }
+            return [pscustomobject]@{ Status = $status; ETag = $null; LastModified = $null; Truncated = $false; RetryAfter = $retryAfter }
         }
         $status = [int]$response.StatusCode
         $etag = [string]$response.Headers['ETag']
         $lastModified = [string]$response.Headers['Last-Modified']
-        if (($status -eq 200 -or $status -eq 206) -and ($etag -or $lastModified)) {
+        $responseValidator = if ($etag) { $etag } else { $lastModified }
+        $appendAllowed = $true
+        if ($status -eq 206 -and $Offset -gt 0) {
+            if (-not $Validator -or -not $responseValidator -or ($Validator -ne $responseValidator)) {
+                $appendAllowed = $false
+            }
+        }
+        if ($appendAllowed -and (($status -eq 200 -and $Offset -eq 0) -or $status -eq 206) -and
+            ($etag -or $lastModified)) {
             $script:LastTransferValidators = [pscustomobject]@{
                 ETag = $etag
                 LastModified = $lastModified
             }
         }
         if ($status -eq 200 -and $Offset -gt 0) {
-            return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified; Truncated = $false }
+            return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified; Truncated = $false; RetryAfter = '' }
         }
         if ($status -eq 416) {
-            return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified; Truncated = $false }
+            return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified; Truncated = $false; RetryAfter = '' }
+        }
+        if (-not $appendAllowed) {
+            # Do not consume the body: the caller will discard the partial and
+            # restart from zero. This also keeps a truncated/mixed partial from
+            # being persisted with the new response validator.
+            return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified; Truncated = $false; RetryAfter = '' }
         }
         $fileMode = [System.IO.FileMode]::Create
         if ($Offset -gt 0 -and $status -eq 206) { $fileMode = [System.IO.FileMode]::Append }
@@ -885,9 +1418,32 @@ function Invoke-HttpTransfer {
             $file.Dispose()
         }
         $truncated = ($total -gt 0 -and $written -lt $total)
-        return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified; Truncated = $truncated }
+        return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified; Truncated = $truncated; RetryAfter = '' }
     } finally {
         if ($response) { $response.Close() }
+    }
+}
+
+# Seven-day cache GC (install-packaging.md section 7). An active transfer holds
+# a fresh .lock; anything with that sibling is skipped. A missing part simply
+# re-downloads, so deleting old bytes is safe.
+function Invoke-CacheGc {
+    param([string]$PartsDir, [switch]$Disabled)
+    if ($Disabled) { return }
+    if (-not (Test-Path -LiteralPath $PartsDir -PathType Container)) { return }
+    $cutoff = [DateTime]::UtcNow.AddDays(-7)
+    foreach ($file in @(Get-ChildItem -LiteralPath $PartsDir -File -ErrorAction SilentlyContinue)) {
+        if ($file.Name.EndsWith('.lock')) { continue }
+        # The active-transfer lock is <asset>.lock, not <asset>.meta.lock, so an
+        # auxiliary file must probe the lock of the asset it belongs to.
+        $lockProbe = $file.FullName
+        if ($file.Name.EndsWith('.meta')) {
+            $lockProbe = $lockProbe.Substring(0, $lockProbe.Length - 5)
+        }
+        if (Test-Path -LiteralPath ($lockProbe + '.lock')) { continue }
+        if ($file.LastWriteTimeUtc -lt $cutoff) {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -901,8 +1457,12 @@ function Invoke-AssetDownload {
         [string]$ExpectedSha,
         [string]$PartsDir,
         [int]$MaxAttempts = 5,
-        [int]$StallTimeout = 30
+        [int]$StallTimeout = 30,
+        [int]$ConnectTimeout = 10
     )
+    if ($MaxAttempts -le 0) { $MaxAttempts = 5 }
+    if ($StallTimeout -le 0) { $StallTimeout = 30 }
+    if ($ConnectTimeout -le 0) { $ConnectTimeout = 10 }
     $part = Join-Path $PartsDir $Asset
     $meta = "$part.meta"
     $lock = "$part.lock"
@@ -970,7 +1530,7 @@ function Invoke-AssetDownload {
                 Write-Host "downloading $url (attempt $attempt/$MaxAttempts)"
                 try {
                     $transfer = Invoke-HttpTransfer -Url $url -PartPath $part -Offset $offset `
-                        -Validator $validator -StallTimeout $StallTimeout -LockPath $lock
+                        -Validator $validator -StallTimeout $StallTimeout -ConnectTimeout $ConnectTimeout -LockPath $lock
                 } catch {
                     Write-Warning "download failed from ${url}: $($_.Exception.Message)"
                     # .NET raises on a premature close when Content-Length is
@@ -983,7 +1543,9 @@ function Invoke-AssetDownload {
                             -LastModified $script:LastTransferValidators.LastModified -Url $url
                     }
                     if ($attempt -ge $MaxAttempts) { break }
-                    Start-Sleep -Seconds ([Math]::Min(8, [Math]::Pow(2, $attempt - 1)))
+                    $delay = Get-RetryDelaySeconds -Attempt $attempt -RetryAfter ''
+                    Write-Warning "download failed from ${url}; retrying in $($delay.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture))s"
+                    Start-Sleep -Seconds $delay
                     continue
                 }
                 if ($transfer.Status -eq 403 -or $transfer.Status -eq 404) {
@@ -993,19 +1555,6 @@ function Invoke-AssetDownload {
                 if ($transfer.Status -eq 416 -and $offset -eq 0) {
                     Write-Warning 'server rejected the range request; restarting from zero'
                     Remove-Item -Force $part, $meta -ErrorAction SilentlyContinue
-                    continue
-                }
-                if ($transfer.Truncated) {
-                    if (Test-Path -LiteralPath $part) {
-                        Write-AssetMetaFile -Path $meta -Sha $ExpectedSha -Asset $Asset -Version $Version `
-                            -ETag $transfer.ETag -LastModified $transfer.LastModified -Url $url
-                    }
-                    if ($attempt -ge $MaxAttempts) {
-                        Write-Warning "download truncated from $url after $attempt attempts; trying the next mirror"
-                        break
-                    }
-                    Write-Warning 'download truncated; retrying with a resume request'
-                    Start-Sleep -Seconds 1
                     continue
                 }
                 $hasPartial = ($offset -gt 0)
@@ -1037,9 +1586,31 @@ function Invoke-AssetDownload {
                             Write-Warning "download failed from $url after $attempt attempts; trying the next mirror"
                             break
                         }
-                        Start-Sleep -Seconds ([Math]::Min(8, [Math]::Pow(2, $attempt - 1)))
+                        $delay = Get-RetryDelaySeconds -Attempt $attempt -RetryAfter $transfer.RetryAfter
+                        Write-Warning "download failed from ${url}; retrying in $($delay.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture))s"
+                        Start-Sleep -Seconds $delay
                         continue
                     }
+                }
+                if ($transfer.Truncated) {
+                    # The decision above already guaranteed a fresh 200 or a
+                    # 206 with the same validator, so these bytes are a
+                    # resumable prefix and may be persisted.
+                    if (Test-Path -LiteralPath $part) {
+                        Write-AssetMetaFile -Path $meta -Sha $ExpectedSha -Asset $Asset -Version $Version `
+                            -ETag $transfer.ETag -LastModified $transfer.LastModified -Url $url
+                    }
+                    if ($attempt -ge $MaxAttempts) {
+                        Write-Warning "download truncated from $url after $attempt attempts; trying the next mirror"
+                        break
+                    }
+                    # Same jittered 1/2/4/8s schedule as every other retry; a
+                    # flat pause would defeat the backoff contract.
+                    $delay = Get-RetryDelaySeconds -Attempt $attempt -RetryAfter ''
+                    Write-Warning "download truncated; retrying in $($delay.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture))s with a resume request"
+                    Start-Sleep -Seconds $delay
+                    continue
+                    continue
                 }
                 if ($transfer.Status -eq 206 -or $transfer.Status -eq 200) {
                     if (-not (Test-Path -LiteralPath $part) -or (Get-Item -LiteralPath $part).Length -eq 0) {
@@ -1059,7 +1630,7 @@ function Invoke-AssetDownload {
                     return $part
                 }
                 if ($attempt -ge $MaxAttempts) { break }
-                Start-Sleep -Seconds ([Math]::Min(8, [Math]::Pow(2, $attempt - 1)))
+                Start-Sleep -Seconds (Get-RetryDelaySeconds -Attempt $attempt -RetryAfter $transfer.RetryAfter)
             }
         }
         throw "all download candidates failed for $Asset (tried: $($Urls -join ', '))"
@@ -1194,6 +1765,39 @@ function Test-RpixSums {
         if (-not $listed.Contains($relative)) { return $false }
     }
     return $true
+}
+
+# Seed settings.json from the bundle's settings.defaults.json. This is a
+# convenience after a successful binary/plugin install: any directory,
+# permission or lock error is a warning and returns $false, never a fatal
+# installer exit. The caller still reports the successful install.
+function Seed-DefaultSettings {
+    param(
+        [string]$DefaultsPath,
+        [string]$SettingsPath,
+        [string]$AgentDir
+    )
+    $stageSettings = "$SettingsPath.stage-$PID"
+    try {
+        New-Item -ItemType Directory -Force -Path $AgentDir -ErrorAction Stop | Out-Null
+        Copy-Item -LiteralPath $DefaultsPath -Destination $stageSettings -Force -ErrorAction Stop
+        Move-Item -LiteralPath $stageSettings -Destination $SettingsPath -Force -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Warning "could not seed default settings at ${SettingsPath}: $($_.Exception.Message)"
+        Write-Warning 'the binary and plugins are installed; create settings.json manually or rerun the installer'
+        return $false
+    } finally {
+        # Cleanup must never throw: the caller's contract is "seeding is only a
+        # warning". Test-Path throws under $ErrorActionPreference='Stop' when
+        # the stage parent is itself inaccessible, so silence both calls.
+        try {
+            if (Test-Path -LiteralPath $stageSettings -ErrorAction SilentlyContinue) {
+                Remove-Item -LiteralPath $stageSettings -Force -ErrorAction SilentlyContinue
+            }
+        } catch {
+        }
+    }
 }
 
 function Install-ProfilePlugins {
@@ -1371,8 +1975,18 @@ if ($ProfileValue) {
             Write-Host "  - $plugin"
         }
         Write-Host 'Official plugins are native (L0) and run unsandboxed with your permissions.'
-        $answer = Read-Host "Install these native plugins with profile '$ProfileValue'? [y/N]"
-        $Consent = [bool]($answer -and $answer.Trim() -match '^(y|yes)$')
+        $answer = Read-HostWithTimeout -Prompt "Install these native plugins with profile '$ProfileValue'? [y/N] " -TimeoutSeconds $PromptTimeout
+        if ($answer -eq '__timeout__') {
+            $Consent = $false
+            $ProfileSource = 'timeout'
+            Write-Warning "profile prompt timed out after ${PromptTimeout}s; native plugins were not consented"
+        } elseif ($null -eq $answer -or $answer -eq '__unavailable__') {
+            $Consent = $false
+            $ProfileSource = 'unavailable'
+            Write-Warning 'could not read an answer for the native plugin prompt; native plugins were not consented'
+        } else {
+            $Consent = [bool]($answer -and $answer.Trim() -match '^(y|yes)\z')
+        }
     }
 } else {
     if (Test-InstallerInteractiveInput) {
@@ -1394,8 +2008,16 @@ if ($ProfileValue) {
         Write-Host 'later with `rpi remove <name>`.'
         $validChoice = $false
         while (-not $validChoice) {
-            $choice = Read-Host 'Profile [1/2/3, Enter = standard]'
-            if ($null -eq $choice) { $choice = '' }
+            $choice = Read-HostWithTimeout -Prompt 'Profile [1/2/3, Enter = standard] ' -TimeoutSeconds $PromptTimeout
+            if ($null -eq $choice -or $choice -eq '__unavailable__') { $choice = '__timeout__' }
+            if ($choice -eq '__timeout__') {
+                $ProfileValue = 'standard'
+                $Consent = $false
+                $ProfileSource = 'timeout'
+                Write-Warning "profile prompt timed out after ${PromptTimeout}s; native plugins were not consented"
+                $validChoice = $true
+                continue
+            }
             switch ($choice.Trim().ToLowerInvariant()) {
                 '' { $ProfileValue = 'standard'; $Consent = $true; $validChoice = $true }
                 '1' { $ProfileValue = 'mini'; $Consent = $false; $validChoice = $true }
@@ -1453,6 +2075,11 @@ if ($ProfileValue -ne 'mini') {
 
 $TmpDir = Join-Path ([IO.Path]::GetTempPath()) ("rpi-install-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+# Staging files live in the install prefix, not in TmpDir. Track them so every
+# failure path (Fail calls exit, which still runs this finally) removes them
+# instead of leaving .rpi.stage-<pid> residue next to the installed binary.
+$stageBin = $null
+$stageManifest = $null
 
 try {
     if ($NoCacheFlag) {
@@ -1466,6 +2093,7 @@ try {
     }
     $partsDir = Join-Path $cacheRoot 'parts'
     New-Item -ItemType Directory -Force -Path $partsDir | Out-Null
+    Invoke-CacheGc -PartsDir $partsDir -Disabled:$NoCacheFlag
 
     $candidates = New-Object System.Collections.Generic.List[string]
     $apiAsset = $ReleaseAssets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
@@ -1481,7 +2109,8 @@ try {
     $sidecarCandidates = @($candidates | ForEach-Object { "$_" + '.sha256' })
     try {
         $sidecarPath = Invoke-AssetDownload -Asset "$AssetName.sha256" -Urls $sidecarCandidates `
-            -ExpectedSha '' -PartsDir $partsDir
+            -ExpectedSha '' -PartsDir $partsDir -MaxAttempts $MaxAttempts `
+            -StallTimeout $StallTimeout -ConnectTimeout $ConnectTimeout
     } catch {
         Fail "download failed for $AssetName.sha256: $($_.Exception.Message)"
     }
@@ -1496,7 +2125,8 @@ try {
     $script:LastDownloadUrl = ''
     try {
         $archivePath = Invoke-AssetDownload -Asset $AssetName -Urls @($candidates) `
-            -ExpectedSha $expectedSha -PartsDir $partsDir
+            -ExpectedSha $expectedSha -PartsDir $partsDir -MaxAttempts $MaxAttempts `
+            -StallTimeout $StallTimeout -ConnectTimeout $ConnectTimeout
     } catch {
         Fail $_.Exception.Message
     }
@@ -1525,18 +2155,29 @@ try {
     try {
         New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
         $probe = Join-Path $Prefix ('.rpi-write-test-' + [Guid]::NewGuid().ToString('N'))
-        New-Item -ItemType File -Path $probe | Out-Null
-        Remove-Item $probe
+        New-Item -ItemType File -Path $probe -ErrorAction Stop | Out-Null
+        # Linux pwsh treats dotfiles as hidden and refuses Remove-Item without
+        # -Force; the write probe must not turn a writable directory into a
+        # false "not writable" failure.
+        Remove-Item -LiteralPath $probe -Force -ErrorAction Stop
     } catch {
         Fail "install directory $Prefix is not writable - re-run from an elevated PowerShell (Run as administrator)"
     }
 
     $InstallPath = Join-Path $Prefix 'rpi.exe'
-    $stageBin = Join-Path $Prefix ".rpi.stage-$PID.exe"
-    Copy-Item $extracted $stageBin -Force
     $PrefixAbs = (Resolve-Path $Prefix).Path
     $InstallPath = Join-Path $PrefixAbs 'rpi.exe'
     $existingManifestPath = Join-Path $PrefixAbs 'rpi.install.json'
+    foreach ($installTarget in @($InstallPath, $existingManifestPath)) {
+        $item = Get-Item -LiteralPath $installTarget -Force -ErrorAction SilentlyContinue
+        if ($item -and $item.PSIsContainer) {
+            Fail "refusing to replace non-file path: $installTarget"
+        }
+    }
+    # Stage only after the target precheck passes: a Fail above must not leave
+    # a staging file behind in the install prefix.
+    $stageBin = Join-Path $PrefixAbs ".rpi.stage-$PID.exe"
+    Copy-Item $extracted $stageBin -Force
     if (Test-Path -LiteralPath $existingManifestPath) {
         try {
             $existingManifest = Get-Content -LiteralPath $existingManifestPath -Raw | ConvertFrom-Json
@@ -1565,10 +2206,13 @@ try {
     $ManifestPath = Join-Path $PrefixAbs 'rpi.install.json'
     $stageManifest = "$ManifestPath.stage-$PID"
     [IO.File]::WriteAllText($stageManifest, ($manifest | ConvertTo-Json), (New-Object System.Text.UTF8Encoding $false))
-    Move-Item -LiteralPath $stageBin -Destination $InstallPath -Force
-    Move-Item -LiteralPath $stageManifest -Destination $ManifestPath -Force
+    Commit-InstallFiles -StageBin $stageBin -InstallPath $InstallPath `
+        -StageManifest $stageManifest -ManifestPath $ManifestPath
 
     $pluginResult = $null
+    # Settings outcome is a three-way state: seeded, existing and failed must
+    # not share a message (a failed fresh seed has no settings.json at all).
+    $settingsState = 'skipped'
     if ($ProfileValue -ne 'mini') {
         $AgentDir = if ($env:RPI_CODING_AGENT_DIR) { $env:RPI_CODING_AGENT_DIR } else { Join-Path $env:USERPROFILE '.rpi\agent' }
         $pluginResult = Install-ProfilePlugins -BundleDir $extractDir -Version $Version `
@@ -1577,13 +2221,15 @@ try {
         if ($pluginResult.Failed -eq 0 -and -not (Test-Path -LiteralPath $settingsPath)) {
             $defaults = Join-Path $extractDir 'settings.defaults.json'
             if (Test-Path -LiteralPath $defaults -PathType Leaf) {
-                New-Item -ItemType Directory -Force -Path $AgentDir | Out-Null
-                $stageSettings = "$settingsPath.stage-$PID"
-                Copy-Item -LiteralPath $defaults -Destination $stageSettings -Force
-                Move-Item -LiteralPath $stageSettings -Destination $settingsPath -Force
-                Write-Host "seeded default settings: $settingsPath"
+                if (Seed-DefaultSettings -DefaultsPath $defaults -SettingsPath $settingsPath -AgentDir $AgentDir) {
+                    $settingsState = 'seeded'
+                    Write-Host "seeded default settings: $settingsPath"
+                } else {
+                    $settingsState = 'failed'
+                }
             }
         } elseif (Test-Path -LiteralPath $settingsPath) {
+            $settingsState = 'existing'
             Write-Host ''
             Write-Host "existing settings left untouched: $settingsPath"
         } else {
@@ -1603,7 +2249,22 @@ try {
         Write-Host "  plugins:  $pluginsText"
         Write-Host "            $($pluginResult.Installed)/$($pluginResult.Total) installed"
         if ($pluginResult.Failed -eq 0) {
-            Write-Host "            registered in $(Join-Path $AgentDir 'settings.json')"
+            switch ($settingsState) {
+                'seeded' {
+                    Write-Host "            settings seeded: $(Join-Path $AgentDir 'settings.json')"
+                }
+                'existing' {
+                    Write-Host "            plugins installed in: $(Join-Path $AgentDir 'extensions')"
+                    Write-Host '            existing settings were not rewritten; run rpi install <name> to track an untracked plugin.'
+                }
+                'failed' {
+                    Write-Host "            plugins installed in: $(Join-Path $AgentDir 'extensions')"
+                    Write-Host "            settings were NOT created; add one manually at $(Join-Path $AgentDir 'settings.json') or rerun the installer."
+                }
+                default {
+                    Write-Host "            plugins installed in: $(Join-Path $AgentDir 'extensions')"
+                }
+            }
         }
     }
     if ($pluginResult -and $pluginResult.Failed -gt 0) {
@@ -1630,5 +2291,10 @@ try {
 
     Update-RpiPath $InstallPath $PrefixAbs
 } finally {
+    foreach ($leftover in @($stageBin, $stageManifest)) {
+        if ($leftover) {
+            Remove-Item -LiteralPath $leftover -Force -ErrorAction SilentlyContinue
+        }
+    }
     Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
 }
