@@ -1146,6 +1146,17 @@ if [ "$host_os" = Linux ] && [ "$MUSL_TARGET" != "$HOST_TARGET" ]; then
     check "native precheck does not delete the plugin" \
         test -f "$H45/.rpi/agent/extensions/existing/libexisting.so"
     check "native precheck leaves no binary" test ! -e "$H45/.local/bin/rpi"
+
+    H45B=$TMP/home45b
+    mkdir -p "$H45B/.rpi/agent" "$TMP/settings-native"
+    printf 'so\n' >"$TMP/settings-native/libfromsettings.so"
+    printf '{\n  "extensions": ["%s"]\n}\n' "$TMP/settings-native/libfromsettings.so" \
+        >"$H45B/.rpi/agent/settings.json"
+    expect_fail "static fallback refuses native plugin files listed in settings" \
+        run_install "$H45B" --musl --static-fallback
+    check "settings-listed native file is reported" grep -q 'existing native plugins' "$TMP/last-out"
+    check "settings-listed native file is not deleted" \
+        test -f "$TMP/settings-native/libfromsettings.so"
 else
     skip "static fallback native-plugin precheck (needs a glibc host with --musl)"
 fi

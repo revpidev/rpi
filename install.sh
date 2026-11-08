@@ -728,6 +728,15 @@ settings_extension_paths() { # settings_extension_paths <settings.json> <base-di
         done
 }
 
+# A settings `extensions` entry may name a file directly; a native carrier
+# there is just as loadable as one inside a plugin directory.
+path_is_native_extension_file() { # path_is_native_extension_file <path>
+    case $1 in
+        *.so | *.dylib | *.dll) return 0 ;;
+    esac
+    return 1
+}
+
 # A directory is native if one of its plugin entries resolves a `native`
 # carrier and no `wasm` carrier wins (docs/extension-abi.md §5: wasm wins).
 dir_has_native_extension() { # dir_has_native_extension <dir> -> prints path
@@ -781,7 +790,14 @@ precheck_existing_native_plugins() {
         [ -n "$_root" ] || continue
         if [ -e "$_root" ] && [ ! -r "$_root" ]; then
             IFS=$_old_ifs
-            die "cannot read extension directory $_root while checking for native plugins; refusing the static fallback"
+            die "cannot read extension path $_root while checking for native plugins; refusing the static fallback"
+        fi
+        if [ -f "$_root" ]; then
+            if path_is_native_extension_file "$_root"; then
+                _found_lines="$_found_lines$_root
+"
+            fi
+            continue
         fi
         if _hit=$(dir_has_native_extension "$_root"); then
             _found_lines="$_found_lines$_hit
