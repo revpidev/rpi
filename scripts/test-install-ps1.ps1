@@ -367,7 +367,9 @@ try {
     $metaPath = Join-Path $tempRoot 'asset.meta'
     Write-AssetMetaFile -Path $metaPath -Sha ('b' * 64) -Asset 'asset.tar.gz' `
         -Version '0.1.0' -ETag '"etag"' -LastModified '' -Url 'https://example/asset.tar.gz'
-    $metaText = Get-Content -LiteralPath $metaPath -Raw
+    # Set-Content writes CRLF on Windows PowerShell 5.1; strip CR so the
+    # multiline anchors work on both PS editions.
+    $metaText = (Get-Content -LiteralPath $metaPath -Raw) -replace "`r", ''
     Check-True ($metaText -match '(?m)^sha=b{64}$') 'asset meta records the sha'
     Check-True ($metaText -match '(?m)^etag="etag"$') 'asset meta records the etag'
     Check-True ($metaText -match '(?m)^url=https://example/asset.tar.gz$') 'asset meta records the url'

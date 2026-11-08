@@ -116,7 +116,18 @@ make_fake_archive() { # make_fake_archive <version> <target> [corrupt-sha]
     corrupt=${3:-}
     stage=$TMP/stage-$fv-$ft
     mkdir -p "$stage"
-    printf '#!/bin/sh\necho "rpi fake %s %s"\n' "$fv" "$ft" >"$stage/rpi"
+    # Pad the fake binary to ~40 KiB so a stalled transfer produces a
+    # meaningful partial body (curl flushes small buffers only at EOF, which
+    # would make the resume/interrupt tests vacuous).
+    {
+        printf '#!/bin/sh\necho "rpi fake %s %s"\n' "$fv" "$ft"
+        _pad=0
+        while [ "$_pad" -lt 1200 ]; do
+            printf '# padding line %s for resumable-download tests\n' "$_pad"
+            _pad=$((_pad + 1))
+        done
+        printf 'exit 0\n'
+    } >"$stage/rpi"
     chmod 755 "$stage/rpi"
     out=$WWW/releases/download/v$fv
     [ -z "$corrupt" ] || out=$WWW/bad-releases/download/v$fv
@@ -366,6 +377,7 @@ import http.server
 import os
 import re
 import sys
+import time
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -397,6 +409,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 status = 206
         body = data[start : end + 1]
         truncate = False
+        stall = False
+        stall_marker = os.environ.get("RPI_TEST_STALL_MARKER")
+        if (
+            stall_marker
+            and self.path.endswith(".tar.gz")
+            and os.path.exists(stall_marker)
+        ):
+            os.unlink(stall_marker)
+            stall = True
         marker = os.environ.get("RPI_TEST_TRUNCATE_MARKER")
         if (
             marker
@@ -421,6 +442,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Cache-Control", "public, max-age=3600")
         self.end_headers()
         if not head_only:
+            if stall:
+                # Send headers and only part of the body, then hold the
+                # connection so the installer's parent loop has to persist
+                # validators while the transfer is still running.
+                prefix = max(1, len(body) // 2)
+                self.wfile.write(body[:prefix])
+                self.wfile.flush()
+                time.sleep(30)
+                return
             if truncate:
                 # Advertise the full length, then close after half the body so
                 # the client retries and resumes with Range + If-Range.
@@ -444,7 +474,7 @@ PYEOF
 
 if command -v python3 >/dev/null 2>&1; then
     # -u: unbuffered, so the "Serving HTTP on ... port N" line hits the log
-    (cd "$WWW" && RPI_TEST_TRUNCATE_MARKER="$TMP/truncate-once" exec python3 -u "$TMP/serve.py") >"$TMP/server.log" 2>&1 &
+    (cd "$WWW" && RPI_TEST_TRUNCATE_MARKER="$TMP/truncate-once" RPI_TEST_STALL_MARKER="$TMP/stall-once" exec python3 -u "$TMP/serve.py") >"$TMP/server.log" 2>&1 &
     SERVER_PID=$!
     PORT=""
     i=0
@@ -1309,6 +1339,35 @@ check "interrupted download did not restart from zero" \
 check "truncated fixture was consumed" test ! -e "$TMP/truncate-once"
 check "resumed interrupted install produced a binary" test -x "$H49/.local/bin/rpi"
 reset_test_overrides
+
+# SIGINT while the transfer is still running: the parent progress loop must
+# have persisted the validators, so the partial stays resumable.
+: >"$TMP/stall-once"
+CACHE49B=$TMP/cache49b
+H49B=$TMP/home49b
+(
+    env HOME="$H49B" RPI_GITHUB_API_URL="$API_URL" RPI_VERSION_CHECK_URL="$ENDPOINT_URL" \
+        RPI_RELEASE_BASE_URL="$BASE/releases" RPI_SITE_BASE_URL="$BASE" \
+        RPI_INSTALL_CACHE_DIR="$CACHE49B" RPI_INSTALL_ADD_PATH=0 \
+        sh "$INSTALL_SH" --profile mini >"$TMP/stall-out" 2>&1
+) &
+_installer_pid=$!
+sleep 6
+echo "DEBUG before-kill marker=$(test -e "$TMP/stall-once" && echo yes || echo no) part=$(wc -c <"$CACHE49B/parts/$HOST_ARCHIVE" 2>/dev/null || echo 0) meta=$(test -e "$CACHE49B/parts/$HOST_ARCHIVE.meta" && echo yes || echo no)"
+ls -la "$CACHE49B/parts" | sed 's/^/  DBG /'
+grep STALL "$TMP/server.log" | tail -3 | sed 's/^/  DBG /'
+ps -ef | grep -E "curl|install.sh" | grep -v grep | head -8 | sed 's/^/  DBG /'
+ps aux | grep -E "curl.*tar.gz|install.sh" | grep -v grep | head -5 | sed 's/^/  DBG /' 
+cat "$TMP/stall-out" | tail -5 | sed 's/^/  DBG /'
+kill -INT "$_installer_pid" 2>/dev/null || true
+sleep 1
+kill -KILL "$_installer_pid" 2>/dev/null || true
+wait "$_installer_pid" 2>/dev/null || true
+check "interrupt during transfer leaves a partial" \
+    test -s "$CACHE49B/parts/$HOST_ARCHIVE"
+check "interrupt during transfer persisted validators" \
+    grep -q -E '^(etag|last_modified)=.' "$CACHE49B/parts/$HOST_ARCHIVE.meta"
+check "interrupt during transfer did not install a binary" test ! -e "$H49B/.local/bin/rpi"
 
 # A verified cached archive is reused without a network transfer.
 H50=$TMP/home50

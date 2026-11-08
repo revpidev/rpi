@@ -1158,13 +1158,13 @@ transfer_once() { # transfer_once <url> <part> <headers> <offset> <validator>
         return $?
     fi
     if [ "$_offset" -gt 0 ] && [ -n "$_validator" ]; then
-        curl -fsSL -C - -D "$_headers" -o "$_part" \
+        curl -fsSLN -C - -D "$_headers" -o "$_part" \
             --connect-timeout "$CONNECT_TIMEOUT" \
             --speed-limit 1024 --speed-time "$STALL_TIMEOUT" \
             -H "If-Range: $_validator" "$_url"
         return $?
     fi
-    curl -fsSL -D "$_headers" -o "$_part" \
+    curl -fsSLN -D "$_headers" -o "$_part" \
         --connect-timeout "$CONNECT_TIMEOUT" \
         --speed-limit 1024 --speed-time "$STALL_TIMEOUT" "$_url"
 }
@@ -1241,7 +1241,10 @@ download_asset() { # download_asset <asset> <candidates-newline-list> <expected-
                 # post-transfer write still leaves a resumable partial.
                 if [ "$_validators_saved" = 0 ] && [ "$_now_size" -gt 0 ]; then
                     _hstatus=$(response_code "$_hdr")
-                    if [ "$_hstatus" = 200 ] || [ "$_hstatus" = 206 ]; then
+                    # A dropped Range request can briefly answer 200 before
+                    # curl truncates the old partial; only trust validators
+                    # for a fresh transfer or a confirmed 206 append.
+                    if [ "$_hstatus" = 206 ] || { [ "$_hstatus" = 200 ] && [ "$_offset" -eq 0 ]; }; then
                         _hetag=$(response_header "$_hdr" ETag)
                         _hlast=$(response_header "$_hdr" Last-Modified)
                         if [ -n "$_hetag" ] || [ -n "$_hlast" ]; then
