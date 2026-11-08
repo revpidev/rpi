@@ -262,6 +262,156 @@ try {
 
     Remove-Item Function:\Get-Command -ErrorAction SilentlyContinue
 
+    # ---- install profiles: lists, consent, semver, index --------------------
+
+    $standard = @(Get-StandardPluginList)
+    $full = @(Get-ProfilePluginList -ProfileName 'full')
+    Check-Equal '6' ([string]$standard.Count) 'standard profile has six plugins'
+    Check-Equal '7' ([string]$full.Count) 'full profile has seven plugins'
+    Check-Equal 'rpi-usage' $full[$full.Count - 1] 'full appends rpi-usage'
+    Check-Equal '0' ([string](@(Get-ProfilePluginList -ProfileName 'mini')).Count) 'mini has no plugins'
+    Check-True ((@(Get-ProfilePluginList -ProfileName 'standard') -join ' ') -eq ($standard -join ' ')) 'standard list is stable'
+    Check-True ((@(Get-ProfilePluginList -ProfileName 'bogus')).Count -eq 0) 'unknown profile has no plugins'
+
+    Check-True (Test-TruthyValue '1') 'truthy 1'
+    Check-True (Test-TruthyValue 'YES') 'truthy YES'
+    Check-True (-not (Test-TruthyValue '0')) 'falsy 0'
+    Check-True (-not (Test-TruthyValue $null)) 'falsy null'
+
+    Check-True (Get-L0ConsentDecision -ProfileName 'mini' -InteractiveChoice $false -Yes $false) 'mini needs no consent'
+    Check-True (Get-L0ConsentDecision -ProfileName 'standard' -InteractiveChoice $true -Yes $false) 'interactive choice consents'
+    Check-True (Get-L0ConsentDecision -ProfileName 'full' -InteractiveChoice $false -Yes $true) '-Yes consents non-interactively'
+    Check-True (-not (Get-L0ConsentDecision -ProfileName 'standard' -InteractiveChoice $false -Yes $false)) 'flag/env alone does not consent'
+
+    Check-Equal 'eq' (Compare-SemverVersion -Left '0.1.0' -Right '0.1.0') 'semver equal'
+    Check-Equal 'lt' (Compare-SemverVersion -Left '0.1.0-rc.1' -Right '0.1.0') 'prerelease is below release'
+    Check-Equal 'gt' (Compare-SemverVersion -Left '0.1.0' -Right '0.1.0-rc.1') 'release is above prerelease'
+    Check-Equal 'lt' (Compare-SemverVersion -Left '0.1.0-rc.2' -Right '0.1.0-rc.10') 'numeric prerelease compares numerically'
+    Check-Equal 'lt' (Compare-SemverVersion -Left '0.1.0-alpha' -Right '0.1.0-alpha.1') 'shorter prerelease prefix is lower'
+    Check-Equal 'gt' (Compare-SemverVersion -Left '0.1.0-alpha.1' -Right '0.1.0-alpha') 'longer prerelease prefix is higher'
+    Check-Equal 'eq' (Compare-SemverVersion -Left '0.1.0+build.1' -Right '0.1.0') 'build metadata ignored'
+    Check-Equal 'gt' (Compare-SemverVersion -Left '1.0.0' -Right '0.9.9') 'major wins'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left 'bad' -Right '0.1.0') 'invalid left'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '1.0' -Right '0.1.0') 'short version invalid'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '01.0.0' -Right '0.1.0') 'leading zero invalid'
+    Check-Equal 'invalid' (Compare-SemverVersion -Left '0.1.0-01' -Right '0.1.0') 'numeric prerelease leading zero invalid'
+
+    $asset = 'rpi-0.1.0-x86_64-pc-windows-msvc-standard.zip'
+    $sha = ('a' * 64)
+    $goodIndex = @"
+{
+  "schemaVersion": 1,
+  "version": "0.1.0",
+  "assets": {
+    "$asset": "$sha"
+  }
+}
+"@
+    $index = ConvertFrom-ProfileIndex -Text $goodIndex -Version '0.1.0' -AssetName $asset
+    Check-True $index.Ok 'valid profile index accepted'
+    Check-Equal $sha $index.Sha 'valid index returns the sha'
+
+    $index = ConvertFrom-ProfileIndex -Text $goodIndex -Version '9.9.9' -AssetName $asset
+    Check-True (-not $index.Ok) 'index version mismatch rejected'
+    Check-True ($index.Error -like '*version mismatch*') 'version mismatch message'
+
+    $index = ConvertFrom-ProfileIndex -Text $goodIndex -Version '0.1.0' -AssetName 'other.zip'
+    Check-True (-not $index.Ok) 'missing asset entry rejected'
+
+    $duplicate = $goodIndex -replace ('"' + $asset + '":'), ('"' + $asset + '": "' + $sha + '", "' + $asset + '":')
+    $index = ConvertFrom-ProfileIndex -Text $duplicate -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'duplicate asset key rejected'
+
+    $badHash = $goodIndex.Replace($sha, 'not-a-hash')
+    $index = ConvertFrom-ProfileIndex -Text $badHash -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'malformed index hash rejected'
+
+    $badSchema = $goodIndex.Replace('"schemaVersion": 1', '"schemaVersion": 2')
+    $index = ConvertFrom-ProfileIndex -Text $badSchema -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'unsupported schemaVersion rejected'
+
+    $index = ConvertFrom-ProfileIndex -Text 'not json' -Version '0.1.0' -AssetName $asset
+    Check-True (-not $index.Ok) 'invalid JSON rejected'
+
+    # ---- safe archive members / zip extraction -------------------------------
+
+    Check-True (Test-SafeArchiveMemberName -Name 'extensions/rpi-todo-0.1.0-x86_64-pc-windows-msvc.rpix') 'safe relative member'
+    Check-True (-not (Test-SafeArchiveMemberName -Name '../evil')) 'parent traversal rejected'
+    Check-True (-not (Test-SafeArchiveMemberName -Name '/etc/passwd')) 'absolute path rejected'
+    Check-True (-not (Test-SafeArchiveMemberName -Name 'C:/windows/system32/x')) 'drive path rejected'
+    Check-True (-not (Test-SafeArchiveMemberName -Name 'a/../../b')) 'nested traversal rejected'
+    Check-True (-not (Test-SafeArchiveMemberName -Name '')) 'empty member rejected'
+
+    $zipPath = Join-Path $tempRoot 'unsafe.zip'
+    $zipStream = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::Create)
+    $zipArchive = New-Object System.IO.Compression.ZipArchive($zipStream, [System.IO.Compression.ZipArchiveMode]::Create)
+    $entry = $zipArchive.CreateEntry('../evil.txt')
+    $writer = New-Object System.IO.StreamWriter($entry.Open())
+    $writer.Write('escape')
+    $writer.Dispose()
+    $zipArchive.Dispose()
+    $zipStream.Dispose()
+    $threw = $false
+    try {
+        Expand-SafeZipArchive -Path $zipPath -Destination (Join-Path $tempRoot 'unsafe-out')
+    } catch {
+        $threw = $true
+    }
+    Check-True $threw 'unsafe zip member rejected'
+    Check-True (-not (Test-Path -LiteralPath (Join-Path $tempRoot 'evil.txt'))) 'unsafe zip wrote nothing outside'
+
+    $goodZip = Join-Path $tempRoot 'good.zip'
+    $zipStream = [System.IO.File]::Open($goodZip, [System.IO.FileMode]::Create)
+    $zipArchive = New-Object System.IO.Compression.ZipArchive($zipStream, [System.IO.Compression.ZipArchiveMode]::Create)
+    $entry = $zipArchive.CreateEntry('extensions/rpi-todo-0.1.0.rpix')
+    $writer = New-Object System.IO.StreamWriter($entry.Open())
+    $writer.Write('payload')
+    $writer.Dispose()
+    $zipArchive.Dispose()
+    $zipStream.Dispose()
+    $goodOut = Join-Path $tempRoot 'good-out'
+    Expand-SafeZipArchive -Path $goodZip -Destination $goodOut
+    Check-True (Test-Path -LiteralPath (Join-Path (Join-Path $goodOut 'extensions') 'rpi-todo-0.1.0.rpix')) 'safe zip extracts'
+
+    # ---- rpix SHA256SUMS coverage -------------------------------------------
+
+    $sumsDir = Join-Path $tempRoot 'sums'
+    New-Item -ItemType Directory -Force -Path $sumsDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $sumsDir 'libtest.so') -Value 'cdylib' -NoNewline
+    Set-Content -LiteralPath (Join-Path $sumsDir 'rpi-extension.json') -Value '{}' -NoNewline
+    $libHash = (Get-FileSha256 (Join-Path $sumsDir 'libtest.so'))
+    $jsonHash = (Get-FileSha256 (Join-Path $sumsDir 'rpi-extension.json'))
+    @("$libHash  libtest.so", "$jsonHash  rpi-extension.json") |
+        Set-Content -LiteralPath (Join-Path $sumsDir 'SHA256SUMS')
+    Check-True (Test-RpixSums -Directory $sumsDir) 'exact SHA256SUMS coverage accepted'
+    Set-Content -LiteralPath (Join-Path $sumsDir 'extra.txt') -Value 'unlisted'
+    Check-True (-not (Test-RpixSums -Directory $sumsDir)) 'unlisted file rejected'
+    Remove-Item -LiteralPath (Join-Path $sumsDir 'extra.txt')
+    Remove-Item -LiteralPath (Join-Path $sumsDir 'libtest.so')
+    Check-True (-not (Test-RpixSums -Directory $sumsDir)) 'missing listed file rejected'
+
+    # ---- Range resume decision matrix ---------------------------------------
+
+    Check-Equal 'fresh' (Get-RangeResumeDecision -Status 200 -CachedValidator '' -ResponseValidator '' -HasPartial $false) 'fresh download'
+    Check-Equal 'restart' (Get-RangeResumeDecision -Status 200 -CachedValidator '"a"' -ResponseValidator '"a"' -HasPartial $true) '200 with a partial restarts'
+    Check-Equal 'append' (Get-RangeResumeDecision -Status 206 -CachedValidator '"a"' -ResponseValidator '"a"' -HasPartial $true) 'matching 206 appends'
+    Check-Equal 'restart' (Get-RangeResumeDecision -Status 206 -CachedValidator '"a"' -ResponseValidator '"b"' -HasPartial $true) 'validator change restarts'
+    Check-Equal 'verify-or-restart' (Get-RangeResumeDecision -Status 416 -CachedValidator '"a"' -ResponseValidator '' -HasPartial $true) '416 verifies or restarts'
+    Check-Equal 'retry' (Get-RangeResumeDecision -Status 500 -CachedValidator '"a"' -ResponseValidator '' -HasPartial $true) '5xx retries'
+
+    # ---- safe tar archive (only when tar.exe is available) -------------------
+
+    if (Get-Command tar -ErrorAction SilentlyContinue) {
+        $tarStage = Join-Path $tempRoot 'tar-stage'
+        New-Item -ItemType Directory -Force -Path $tarStage | Out-Null
+        Set-Content -LiteralPath (Join-Path $tarStage 'rpi-extension.json') -Value '{}'
+        $tarPath = Join-Path $tempRoot 'safe-rpix.tgz'
+        & tar -czf $tarPath -C $tarStage rpi-extension.json
+        Check-True (Test-SafeTarArchive -Path $tarPath) 'safe tar archive accepted'
+    } else {
+        Write-Host 'ok - safe tar archive accepted # SKIP (tar.exe unavailable)'
+    }
+
     # ---- non-interactive environment ---------------------------------------
 
     $env:CI = ''
