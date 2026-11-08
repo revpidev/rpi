@@ -1430,6 +1430,22 @@ try {
     Copy-Item $extracted $stageBin -Force
     $PrefixAbs = (Resolve-Path $Prefix).Path
     $InstallPath = Join-Path $PrefixAbs 'rpi.exe'
+    $existingManifestPath = Join-Path $PrefixAbs 'rpi.install.json'
+    if (Test-Path -LiteralPath $existingManifestPath) {
+        try {
+            $existingManifest = Get-Content -LiteralPath $existingManifestPath -Raw | ConvertFrom-Json
+            $currentVersion = [string]$existingManifest.version
+            if ($currentVersion -eq $Version) {
+                Write-Host ''
+                Write-Host "rpi $currentVersion already installed; reinstalling"
+            } elseif ($currentVersion) {
+                Write-Host ''
+                Write-Host "Upgrading rpi $currentVersion -> $Version (stable)"
+            }
+        } catch {
+            Write-Warning "cannot read the existing install manifest; continuing anyway"
+        }
+    }
     $InstalledAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     $manifest = [ordered]@{
         version     = $Version

@@ -118,6 +118,8 @@ PATH_ACTION=prompt
 ADD_PATH_FLAG=0
 NO_ADD_PATH_FLAG=0
 TMPDIR_RPI=""
+STAGE_BIN=""
+STAGE_MANIFEST=""
 READ_TIMEOUT_SUPPORTED=0
 PROMPT_TIMEOUT=${RPI_INSTALL_PROMPT_TIMEOUT:-60}
 CONNECT_TIMEOUT=${RPI_INSTALL_CONNECT_TIMEOUT:-10}
@@ -335,6 +337,8 @@ fi
 cleanup() {
     [ -z "$HEARTBEAT_PID" ] || kill "$HEARTBEAT_PID" 2>/dev/null || true
     [ -z "$LOCK_PATH" ] || rm -f "$LOCK_PATH" 2>/dev/null || true
+    [ -z "$STAGE_BIN" ] || rm -f "$STAGE_BIN" 2>/dev/null || true
+    [ -z "$STAGE_MANIFEST" ] || rm -f "$STAGE_MANIFEST" 2>/dev/null || true
     [ -z "$TMPDIR_RPI" ] || rm -rf "$TMPDIR_RPI"
 }
 trap cleanup EXIT
@@ -1405,12 +1409,27 @@ install_binary() { # install_binary <extracted-dir> <binary-name>
 
     _stage_bin=$PREFIX/.rpi.stage-$$
     _stage_manifest=$PREFIX/.rpi.install.json.stage-$$
+    STAGE_BIN=$_stage_bin
+    STAGE_MANIFEST=$_stage_manifest
     cp "$_src" "$_stage_bin" || { rm -f "$_stage_bin"; sudo_hint; }
     chmod 755 "$_stage_bin" || die "failed to chmod 755 $_stage_bin"
 
     PREFIX_ABS=$(cd "$PREFIX" && pwd)
     INSTALL_PATH=$PREFIX_ABS/rpi
     MANIFEST=$PREFIX_ABS/rpi.install.json
+
+    # Upgrade messaging: read the existing manifest (if any) before replacing
+    # anything, and keep the old binary/manifest untouched on any earlier fatal.
+    if [ -f "$MANIFEST" ]; then
+        _current=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MANIFEST" | head -n 1)
+        if [ -n "$_current" ] && [ "$_current" = "$VERSION" ]; then
+            info ""
+            info "rpi $_current already installed; reinstalling"
+        elif [ -n "$_current" ]; then
+            info ""
+            info "Upgrading rpi $_current -> $VERSION (stable)"
+        fi
+    fi
 
     _installed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     _manifest_target=$TARGET
@@ -1431,7 +1450,9 @@ install_binary() { # install_binary <extracted-dir> <binary-name>
     # only mutations of an existing install (a fatal failure earlier leaves
     # the old binary and manifest untouched).
     mv -f "$_stage_bin" "$INSTALL_PATH" || die "failed to replace $INSTALL_PATH"
+    STAGE_BIN=""
     mv -f "$_stage_manifest" "$MANIFEST" || die "failed to replace $MANIFEST"
+    STAGE_MANIFEST=""
 }
 
 json_escape() {

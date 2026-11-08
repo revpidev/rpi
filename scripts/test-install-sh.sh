@@ -1130,6 +1130,18 @@ check "failed upgrade keeps the old binary" \
     test "$(sha_of "$H44/.local/bin" rpi)" = "$_bin_before"
 check "failed upgrade keeps the old manifest" \
     test "$(sha_of "$H44/.local/bin" rpi.install.json)" = "$_manifest_before"
+
+# Same-version reinstall messaging, then a real version change.
+expect_ok "same-version reinstall succeeds" run_install "$H44" --profile mini
+check "same-version reinstall says reinstalling" grep -q 'already installed; reinstalling' "$TMP/last-out"
+if sed -i.bak 's/"version": "[^"]*"/"version": "0.0.9"/' "$H44/.local/bin/rpi.install.json" 2>/dev/null; then
+    rm -f "$H44/.local/bin/rpi.install.json.bak"
+else
+    sed 's/"version": "[^"]*"/"version": "0.0.9"/' "$H44/.local/bin/rpi.install.json" >"$TMP/m.tmp"
+    mv "$TMP/m.tmp" "$H44/.local/bin/rpi.install.json"
+fi
+expect_ok "upgrade from an older manifest succeeds" run_install "$H44" --profile mini
+check "upgrade prints the current -> target line" grep -q 'Upgrading rpi 0.0.9 -> 0.1.0' "$TMP/last-out"
 reset_test_overrides
 
 # 11.12 Static fallback refuses to replace a binary that has existing native
