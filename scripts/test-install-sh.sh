@@ -883,6 +883,38 @@ EOF
         fi
         check "pty timeout leaves the profile untouched" test ! -e "$H27/.profile"
         check "pty timeout prints guidance" grep -q 'not the active rpi on PATH' "$TMP/pty-timeout-out"
+
+        # ---- interactive profile prompt + L0 consent ---------------------
+        H28=$TMP/home28
+        if printf '\n' | timeout 90 script -qec "env HOME=$H28 SHELL=/bin/bash CI= TERM=xterm RPI_INSTALL_ADD_PATH=0 RPI_INSTALL_PROFILE= RPI_NONINTERACTIVE= RPI_GITHUB_API_URL=$API_URL RPI_VERSION_CHECK_URL=$ENDPOINT_URL RPI_RELEASE_BASE_URL=$BASE/releases RPI_SITE_BASE_URL=$BASE sh $TMP/pty-install-sh.sh" /dev/null >"$TMP/pty-profile-default-out" 2>&1; then
+            pass "pty Enter accepts the standard default"
+        else
+            fail "pty Enter accepts the standard default"
+            sed 's/^/    | /' "$TMP/pty-profile-default-out"
+        fi
+        check "profile prompt lists the three profiles" grep -q 'Choose an install profile' "$TMP/pty-profile-default-out"
+        check "Enter installs standard with 6/6 plugins" grep -q '6/6 installed' "$TMP/pty-profile-default-out"
+        check "Enter seeds settings" test -f "$H28/.rpi/agent/settings.json"
+
+        H29=$TMP/home29
+        if printf '1\n' | timeout 90 script -qec "env HOME=$H29 SHELL=/bin/bash CI= TERM=xterm RPI_INSTALL_ADD_PATH=0 RPI_INSTALL_PROFILE= RPI_NONINTERACTIVE= RPI_GITHUB_API_URL=$API_URL RPI_VERSION_CHECK_URL=$ENDPOINT_URL RPI_RELEASE_BASE_URL=$BASE/releases RPI_SITE_BASE_URL=$BASE sh $TMP/pty-install-sh.sh" /dev/null >"$TMP/pty-profile-mini-out" 2>&1; then
+            pass "pty choice 1 installs mini"
+        else
+            fail "pty choice 1 installs mini"
+            sed 's/^/    | /' "$TMP/pty-profile-mini-out"
+        fi
+        check "pty mini install writes no settings" test ! -e "$H29/.rpi/agent/settings.json"
+        check "pty mini output names the mini profile" grep -q 'profile mini' "$TMP/pty-profile-mini-out"
+
+        H30=$TMP/home30-pty
+        if (sleep 5) | timeout 30 script -qec "env HOME=$H30 SHELL=/bin/bash CI= TERM=xterm RPI_INSTALL_ADD_PATH=0 RPI_INSTALL_PROFILE= RPI_NONINTERACTIVE= RPI_INSTALL_PROMPT_TIMEOUT=1 RPI_GITHUB_API_URL=$API_URL RPI_VERSION_CHECK_URL=$ENDPOINT_URL RPI_RELEASE_BASE_URL=$BASE/releases RPI_SITE_BASE_URL=$BASE bash $TMP/pty-install-bash.sh" /dev/null >"$TMP/pty-profile-timeout-out" 2>&1; then
+            fail "pty profile timeout is refused (unexpected success)"
+        else
+            pass "pty profile timeout is refused"
+        fi
+        check "profile timeout is announced" grep -q 'profile prompt timed out' "$TMP/pty-profile-timeout-out"
+        check "profile timeout refuses native plugins" grep -q 'refusing to install native plugins' "$TMP/pty-profile-timeout-out"
+        check "profile timeout installs nothing" test ! -e "$H30/.local/bin/rpi"
     else
         skip "pty prompt tests (script -e/timeout/bash unavailable)"
     fi
