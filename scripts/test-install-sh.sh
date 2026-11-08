@@ -396,6 +396,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 end = min(end, len(data) - 1)
                 status = 206
         body = data[start : end + 1]
+        truncate = False
+        marker = os.environ.get("RPI_TEST_TRUNCATE_MARKER")
+        if (
+            marker
+            and self.path.endswith(".tar.gz")
+            and os.path.exists(marker)
+        ):
+            os.unlink(marker)
+            truncate = True
         self.send_response(status)
         if path.endswith(".sha256"):
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -412,7 +421,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Cache-Control", "public, max-age=3600")
         self.end_headers()
         if not head_only:
-            self.wfile.write(body)
+            if truncate:
+                # Advertise the full length, then close after half the body so
+                # the client retries and resumes with Range + If-Range.
+                self.wfile.write(body[: max(1, len(body) // 2)])
+                self.wfile.flush()
+                self.close_connection = True
+            else:
+                self.wfile.write(body)
 
     def do_GET(self):
         self.send_file(False)
@@ -428,7 +444,7 @@ PYEOF
 
 if command -v python3 >/dev/null 2>&1; then
     # -u: unbuffered, so the "Serving HTTP on ... port N" line hits the log
-    (cd "$WWW" && exec python3 -u "$TMP/serve.py") >"$TMP/server.log" 2>&1 &
+    (cd "$WWW" && RPI_TEST_TRUNCATE_MARKER="$TMP/truncate-once" exec python3 -u "$TMP/serve.py") >"$TMP/server.log" 2>&1 &
     SERVER_PID=$!
     PORT=""
     i=0
@@ -929,12 +945,14 @@ RPI_TEST_RELEASE=""
 RPI_TEST_SITE=""
 RPI_TEST_AGENT=""
 RPI_TEST_CACHE=""
+RPI_TEST_MARKER=""
 reset_test_overrides() {
     RPI_TEST_API=""
     RPI_TEST_RELEASE=""
     RPI_TEST_SITE=""
     RPI_TEST_AGENT=""
     RPI_TEST_CACHE=""
+    RPI_TEST_MARKER=""
 }
 run_install() { # run_install <home> <install.sh args...>
     _home=$1
@@ -946,6 +964,7 @@ run_install() { # run_install <home> <install.sh args...>
         RPI_SITE_BASE_URL="${RPI_TEST_SITE:-$BASE}" \
         RPI_CODING_AGENT_DIR="${RPI_TEST_AGENT:-}" \
         RPI_INSTALL_CACHE_DIR="${RPI_TEST_CACHE:-}" \
+        RPI_TEST_TRUNCATE_MARKER="${RPI_TEST_MARKER:-$TMP/truncate-once}" \
         sh "$INSTALL_SH" "$@"
 }
 
@@ -1257,6 +1276,89 @@ RPI_TEST_CACHE=$CACHE48
 expect_ok "stale-validator resume restarts and succeeds" run_install "$H48" --profile mini
 check "stale validator warns about the restart" grep -q 'ignored the range request' "$TMP/last-out"
 check "stale-validator download still verifies" test -x "$H48/.local/bin/rpi"
+reset_test_overrides
+
+# A first download interrupted mid-body must keep its bytes and resume with a
+# 206 on the next attempt (validators are persisted before success).
+: >"$TMP/truncate-once"
+CACHE49=$TMP/cache49
+H49=$TMP/home49
+RPI_TEST_CACHE=$CACHE49
+before=$(log_mark)
+expect_ok "interrupted first download resumes instead of restarting" run_install "$H49" --profile mini
+delta=$(log_since "$before")
+check "interrupted download left its partial in the cache" \
+    test -s "$CACHE49/parts/$HOST_ARCHIVE"
+check "resume after truncation used 206" \
+    sh -c 'printf "%s\n" "$1" | grep -q " 206 "' _ "$delta"
+check "interrupted download did not restart from zero" \
+    sh -c '! grep -q "restarting from zero" "$1"' _ "$TMP/last-out"
+check "truncated fixture was consumed" test ! -e "$TMP/truncate-once"
+check "resumed interrupted install produced a binary" test -x "$H49/.local/bin/rpi"
+reset_test_overrides
+
+# A verified cached archive is reused without a network transfer.
+H50=$TMP/home50
+RPI_TEST_CACHE=$CACHE49
+before=$(log_mark)
+expect_ok "second install reuses the cached archive" run_install "$H50" --profile mini
+delta=$(log_since "$before")
+check "cache hit is announced" grep -q "using cached $HOST_ARCHIVE" "$TMP/last-out"
+check "cache hit fetched no archive bytes" \
+    sh -c '! printf "%s\n" "$1" | grep -q "GET .*rpi-.*\.tar\.gz HTTP"' _ "$delta"
+reset_test_overrides
+
+# A tampered cached archive (same meta hash) is re-downloaded, not installed.
+printf 'tampered' >>"$CACHE49/parts/$HOST_ARCHIVE"
+H50B=$TMP/home50b
+RPI_TEST_CACHE=$CACHE49
+before=$(log_mark)
+expect_ok "tampered cached archive is re-downloaded" run_install "$H50B" --profile mini
+delta=$(log_since "$before")
+check "tampered cache was replaced by a transfer" \
+    sh -c 'printf "%s\n" "$1" | grep -q "GET .*rpi-.*\.tar\.gz HTTP"' _ "$delta"
+check "tampered-cache install verified" test -x "$H50B/.local/bin/rpi"
+reset_test_overrides
+
+# Non-TTY output must stay clean: no ANSI escapes and no carriage returns.
+check "non-TTY install output has no ANSI escape" \
+    sh -c '! grep -q "$(printf "\033")" "$1"' _ "$TMP/last-out"
+check "non-TTY install output has no carriage return" \
+    sh -c '! grep -q "$(printf "\r")" "$1"' _ "$TMP/last-out"
+
+# A lock untouched for over an hour is reclaimed (an active transfer refreshes
+# its mtime every 30s, so active locks are never reclaimed by age alone).
+CACHE51=$TMP/cache51
+mkdir -p "$CACHE51/parts"
+: >"$CACHE51/parts/$HOST_ARCHIVE.lock"
+touch -t 202001010000 "$CACHE51/parts/$HOST_ARCHIVE.lock"
+H51=$TMP/home51
+RPI_TEST_CACHE=$CACHE51
+expect_ok "stale download lock is reclaimed" run_install "$H51" --profile mini
+check "stale lock reclaim is reported" grep -q 'reclaiming a stale download lock' "$TMP/last-out"
+check "stale lock install succeeded" test -x "$H51/.local/bin/rpi"
+reset_test_overrides
+
+# --no-cache must not populate the configured cache directory.
+CACHE52=$TMP/cache52
+H52=$TMP/home52
+RPI_TEST_CACHE=$CACHE52
+expect_ok "--no-cache install succeeds" run_install "$H52" --profile mini --no-cache
+check "--no-cache leaves the configured cache empty" \
+    test ! -e "$CACHE52/parts/$HOST_ARCHIVE"
+reset_test_overrides
+
+# RPI_INSTALL_REQUIRE_PLUGINS turns isolated plugin failures into exit 1.
+H53=$TMP/home53
+variant_release bad-plugin-sidecar
+expect_fail "RPI_INSTALL_REQUIRE_PLUGINS=1 exits non-zero on a plugin failure" \
+    env HOME="$H53" RPI_INSTALL_REQUIRE_PLUGINS=1 \
+    RPI_GITHUB_API_URL="$DEAD_URL" RPI_VERSION_CHECK_URL="$ENDPOINT_URL" \
+    RPI_RELEASE_BASE_URL="$BASE/variant-bad-plugin-sidecar/releases" \
+    RPI_SITE_BASE_URL="$BASE/variant-bad-plugin-sidecar-site" \
+    sh "$INSTALL_SH" --profile standard --yes
+check "require-plugins still warned about the failure" grep -q '1 of 6 plugins failed' "$TMP/last-out"
+check "require-plugins kept the binary" test -x "$H53/.local/bin/rpi"
 reset_test_overrides
 
 # 11.15 Semver comparison vectors (sourced helper mode; no install).

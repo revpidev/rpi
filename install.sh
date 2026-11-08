@@ -430,14 +430,20 @@ json_values() {
     tr ',' '\n' | sed -n 's/^[^"]*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
-# Extract one asset's size from the compact GitHub release JSON. Splitting on
-# braces isolates each asset object, so the size next to the name is found
-# without a real JSON parser.
+# Best-effort asset size for the profile prompt (R3.11.4 says "when the
+# metadata provides it"). The GitHub release JSON is normally pretty-printed,
+# so look for "size" after the matching "name" key rather than assuming a
+# single line/object. A miss only omits the size hint.
 json_asset_size() { # json_asset_size <release-body> <asset-name>
-    printf '%s' "$1" | tr '{}' '\n\n' |
-        grep -F "\"name\": \"$2\"" |
-        sed -n 's/.*"size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' |
-        head -n 1
+    printf '%s\n' "$1" | awk -v needle="\"name\": \"$2\"" '
+        index($0, needle) { found = 1 }
+        found && match($0, /"size"[^0-9]*[0-9]+/) {
+            s = substr($0, RSTART, RLENGTH)
+            gsub(/[^0-9]/, "", s)
+            print s
+            exit
+        }
+    '
 }
 
 resolve_version() {
@@ -1064,6 +1070,15 @@ meta_value() { # meta_value <file> <key>
     sed -n 's/^'"$2"'=//p' "$1" 2>/dev/null | head -n 1
 }
 
+# Persist the response validators as soon as a transfer has produced bytes:
+# the next attempt (retry or mirror switch) can then send Range + If-Range and
+# keep the partial instead of restarting from zero. Writing this only after a
+# *successful* transfer would make every interrupted first download start over.
+write_asset_meta() { # <meta> <sha> <asset> <etag> <lastmod> <url>
+    printf 'sha=%s\nasset=%s\nversion=%s\netag=%s\nlast_modified=%s\nurl=%s\n' \
+        "$2" "$3" "$VERSION" "$4" "$5" "$6" >"$1"
+}
+
 response_code() { # response_code <header-file>
     awk '/^HTTP\//{code=$2} END{print code}' "$1" 2>/dev/null
 }
@@ -1215,6 +1230,12 @@ download_asset() { # download_asset <asset> <candidates-newline-list> <expected-
             _status=$(response_code "$_hdr")
             _etag=$(response_header "$_hdr" ETag)
             _lastmod=$(response_header "$_hdr" Last-Modified)
+            # Keep the validators with any bytes we already have so an
+            # interrupted transfer resumes on the next attempt/mirror.
+            if { [ "$_status" = 200 ] || [ "$_status" = 206 ]; } &&
+                [ -f "$_part" ] && [ -s "$_part" ]; then
+                write_asset_meta "$_meta" "$_expected" "$_asset" "$_etag" "$_lastmod" "$_url"
+            fi
 
             if [ "$_status" = 200 ] && [ "$_offset" -gt 0 ]; then
                 warn "server ignored the range request; restarting from zero (discarded $_offset bytes)"
@@ -1246,8 +1267,7 @@ download_asset() { # download_asset <asset> <candidates-newline-list> <expected-
             if [ "$_code" = 0 ]; then
                 [ -s "$_part" ] || warn "empty download from $_url"
                 if [ -s "$_part" ] && ! head -c 256 "$_part" | grep -qi '<html'; then
-                    printf 'sha=%s\nasset=%s\nversion=%s\netag=%s\nlast_modified=%s\nurl=%s\n' \
-                        "$_expected" "$_asset" "$VERSION" "$_etag" "$_lastmod" "$_url" >"$_meta"
+                    write_asset_meta "$_meta" "$_expected" "$_asset" "$_etag" "$_lastmod" "$_url"
                     DOWNLOADED_FROM=$_url
                     stop_heartbeat_and_lock
                     IFS=$_ifs

@@ -799,16 +799,16 @@ function Invoke-HttpTransfer {
             if (-not $webResponse) { throw }
             $status = [int]$webResponse.StatusCode
             $webResponse.Close()
-            return [pscustomobject]@{ Status = $status; ETag = $null; LastModified = $null }
+            return [pscustomobject]@{ Status = $status; ETag = $null; LastModified = $null; Truncated = $false }
         }
         $status = [int]$response.StatusCode
         $etag = [string]$response.Headers['ETag']
         $lastModified = [string]$response.Headers['Last-Modified']
         if ($status -eq 200 -and $Offset -gt 0) {
-            return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified }
+            return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified; Truncated = $false }
         }
         if ($status -eq 416) {
-            return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified }
+            return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified; Truncated = $false }
         }
         $fileMode = [System.IO.FileMode]::Create
         if ($Offset -gt 0 -and $status -eq 206) { $fileMode = [System.IO.FileMode]::Append }
@@ -852,7 +852,8 @@ function Invoke-HttpTransfer {
         } finally {
             $file.Dispose()
         }
-        return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified }
+        $truncated = ($total -gt 0 -and $written -lt $total)
+        return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified; Truncated = $truncated }
     } finally {
         if ($response) { $response.Close() }
     }
@@ -879,6 +880,8 @@ function Invoke-AssetDownload {
         $metaSha = ([regex]::Match($metaText, '(?m)^sha=(.*)$')).Groups[1].Value.Trim()
         if ($ExpectedSha -and $metaSha -eq $ExpectedSha) {
             if ((Get-FileSha256 $part) -eq $ExpectedSha) {
+                $cachedUrl = ([regex]::Match($metaText, '(?m)^url=(.*)$')).Groups[1].Value.Trim()
+                if ($cachedUrl) { $script:LastDownloadUrl = $cachedUrl }
                 Write-Host "using cached $Asset"
                 return $part
             }
@@ -951,6 +954,27 @@ function Invoke-AssetDownload {
                     Remove-Item -Force $part, $meta -ErrorAction SilentlyContinue
                     continue
                 }
+                if ($transfer.Truncated) {
+                    if (Test-Path -LiteralPath $part) {
+                        $etagText = if ($transfer.ETag) { $transfer.ETag } else { '' }
+                        $lastModifiedText = if ($transfer.LastModified) { $transfer.LastModified } else { '' }
+                        @(
+                            "sha=$ExpectedSha"
+                            "asset=$Asset"
+                            "version=$Version"
+                            "etag=$etagText"
+                            "last_modified=$lastModifiedText"
+                            "url=$url"
+                        ) | Set-Content -LiteralPath $meta -Encoding ASCII
+                    }
+                    if ($attempt -ge $MaxAttempts) {
+                        Write-Warning "download truncated from $url after $attempt attempts; trying the next mirror"
+                        break
+                    }
+                    Write-Warning 'download truncated; retrying with a resume request'
+                    Start-Sleep -Seconds 1
+                    continue
+                }
                 $hasPartial = ($offset -gt 0)
                 $responseValidator = if ($transfer.ETag) { $transfer.ETag } else { $transfer.LastModified }
                 $decision = Get-RangeResumeDecision -Status $transfer.Status -CachedValidator $validator `
@@ -1017,6 +1041,54 @@ function Invoke-AssetDownload {
     } finally {
         Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Get-ZipMemberNames {
+    param([string]$Path)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        return @($zip.Entries | ForEach-Object { $_.FullName })
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+# The outer bundle may only contain the binary, settings.defaults.json and the
+# selected profile's .rpix (+sidecar) members; every expected member must be
+# present. Mirrors install.sh's validate_outer_archive.
+function Test-BundleMembers {
+    param(
+        [string[]]$Members,
+        [string]$ProfileName,
+        [string]$Version,
+        [string]$Target
+    )
+    $expected = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    [void]$expected.Add('rpi.exe')
+    if ($ProfileName -ne 'mini') {
+        [void]$expected.Add('settings.defaults.json')
+        foreach ($plugin in (Get-ProfilePluginList -ProfileName $ProfileName)) {
+            [void]$expected.Add("extensions/$plugin-$Version-$Target.rpix")
+            [void]$expected.Add("extensions/$plugin-$Version-$Target.rpix.sha256")
+        }
+    }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($member in $Members) {
+        if ([string]::IsNullOrEmpty($member)) { continue }
+        $name = $member -replace '\\', '/'
+        if ($name.StartsWith('./')) { $name = $name.Substring(2) }
+        if ($name -eq 'extensions/' -or $name -eq 'extensions') {
+            if ($ProfileName -eq 'mini') { return $false }
+            continue
+        }
+        if (-not $expected.Contains($name)) { return $false }
+        [void]$seen.Add($name)
+    }
+    foreach ($name in $expected) {
+        if (-not $seen.Contains($name)) { return $false }
+    }
+    return $true
 }
 
 # Reject unsafe zip members, symlinks and non-file entries before writing.
@@ -1410,6 +1482,10 @@ try {
     # ---- safe extraction + install ------------------------------------------
 
     $extractDir = Join-Path $TmpDir 'x'
+    $bundleMembers = @(Get-ZipMemberNames -Path $archivePath)
+    if (-not (Test-BundleMembers -Members $bundleMembers -ProfileName $ProfileValue -Version $Version -Target $Target)) {
+        Fail "archive $AssetName contains unregistered or missing members; aborting"
+    }
     Expand-SafeZipArchive -Path $archivePath -Destination $extractDir
     $extracted = Join-Path $extractDir 'rpi.exe'
     if (-not (Test-Path -LiteralPath $extracted -PathType Leaf)) {

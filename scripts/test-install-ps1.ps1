@@ -7,6 +7,7 @@
 # Read-Host are mocked. Runs on Windows PowerShell 5.1 and PowerShell 7+.
 
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $script:Tests = 0
 $script:Failed = 0
@@ -332,6 +333,32 @@ try {
 
     $index = ConvertFrom-ProfileIndex -Text 'not json' -Version '0.1.0' -AssetName $asset
     Check-True (-not $index.Ok) 'invalid JSON rejected'
+
+    # ---- outer bundle member allowlist ---------------------------------------
+
+    $miniMembers = @('rpi.exe')
+    Check-True (Test-BundleMembers -Members $miniMembers -ProfileName 'mini' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc') 'mini bundle with only rpi.exe accepted'
+    Check-True (-not (Test-BundleMembers -Members @('rpi.exe', 'settings.defaults.json') -ProfileName 'mini' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc')) 'mini bundle with settings rejected'
+    Check-True (-not (Test-BundleMembers -Members @() -ProfileName 'mini' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc')) 'bundle without rpi.exe rejected'
+
+    $stdMembers = New-Object System.Collections.Generic.List[string]
+    $stdMembers.Add('rpi.exe')
+    $stdMembers.Add('settings.defaults.json')
+    $stdMembers.Add('extensions/')
+    foreach ($plugin in (Get-ProfilePluginList -ProfileName 'standard')) {
+        $stdMembers.Add("extensions/$plugin-0.1.0-x86_64-pc-windows-msvc.rpix")
+        $stdMembers.Add("extensions/$plugin-0.1.0-x86_64-pc-windows-msvc.rpix.sha256")
+    }
+    Check-True (Test-BundleMembers -Members @($stdMembers) -ProfileName 'standard' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc') 'exact standard bundle accepted'
+    $extra = @($stdMembers) + @('extensions/rpi-usage-0.1.0-x86_64-pc-windows-msvc.rpix')
+    Check-True (-not (Test-BundleMembers -Members $extra -ProfileName 'standard' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc')) 'unregistered plugin member rejected'
+    $extra = @($stdMembers) + @('../evil')
+    Check-True (-not (Test-BundleMembers -Members $extra -ProfileName 'standard' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc')) 'unregistered traversal member rejected'
+    $missing = @($stdMembers | Where-Object { $_ -notlike '*.sha256' })
+    Check-True (-not (Test-BundleMembers -Members $missing -ProfileName 'standard' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc')) 'missing plugin sidecar member rejected'
+    $noSettings = @($stdMembers | Where-Object { $_ -ne 'settings.defaults.json' })
+    Check-True (-not (Test-BundleMembers -Members $noSettings -ProfileName 'standard' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc')) 'missing settings.defaults.json rejected'
+    Check-True (-not (Test-BundleMembers -Members @('rpi.exe', 'extensions/') -ProfileName 'mini' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc')) 'mini bundle with an extensions dir rejected'
 
     # ---- safe archive members / zip extraction -------------------------------
 
