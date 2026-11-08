@@ -33,7 +33,7 @@ macOS / Linux (POSIX sh; glibc vs musl is detected automatically):
 curl -fsSL https://revpi.dev/install.sh | sh
 ```
 
-The installer detects your OS/architecture, downloads the matching release archive, verifies its SHA-256 (an integrity check against corrupted downloads), and installs to `~/.local/bin` (override with `--prefix <dir>`). Both the scripts and the release assets are served from the official site — when GitHub is unreachable the installer automatically falls back to the revpi.dev mirror, and you can always download assets manually from GitHub Releases. If `~/.local/bin` is not on your `PATH`, add it:
+The installer detects your OS/architecture and installs the **standard** profile by default: it downloads ONE pinned release archive that already contains `rpi` plus the six official plugins, unpacks it, and installs the plugins locally (no per-plugin downloads). Its SHA-256 must match both the Release sidecar and the rpi-pages profile index — an integrity check against corrupted downloads and mirror mix-ups. Installation goes to `~/.local/bin` (override with `--prefix <dir>`). Both the scripts and the release assets are served from the official site — when GitHub is unreachable the installer automatically falls back to the revpi.dev mirror, and you can always download assets manually from GitHub Releases. If `~/.local/bin` is not on your `PATH`, add it:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"   # append to ~/.profile, ~/.bashrc or ~/.zshrc
@@ -58,7 +58,20 @@ curl -fsSL https://revpi.dev/install.sh | sh -s -- --add-path
 $env:RPI_INSTALL_ADD_PATH = 1; irm https://revpi.dev/install.ps1 | iex
 ```
 
-Manual install: download `rpi-<version>-<target>.tar.gz` (`.zip` on Windows) and its `.sha256` sidecar from [GitHub Releases](https://github.com/revpidev/rpi/releases), verify the checksum, and unpack the `rpi` binary anywhere on your `PATH`.
+#### Install profiles (V18-13)
+
+| Profile | Contents | Rough size |
+|---|---|---|
+| `mini` | `rpi` only | ~19 MB |
+| `standard` (default) | `rpi` + subagents, todo, ask-user-question, smart-fetch, statusline, plan-mode | ~33 MB |
+| `full` | standard + usage | ~34 MB |
+
+- Interactive installs ask first (`Enter` = standard). Only that prompt answer (or Enter for the default) consents to the bundled native (L0) plugins, which run unsandboxed. Non-interactive runs, prompt timeouts, and `--profile` / `RPI_INSTALL_PROFILE` alone do NOT consent: add `--yes` / `RPI_INSTALL_YES=1`, or choose `--profile mini`. On Windows: `-Profile` / `-Yes`.
+- A missing or invalid profile index fails closed; the installer never silently downgrades to `mini`. Choose `--profile mini` explicitly.
+- A fresh install seeds `settings.json` (`packages` + the plugins' `defaultSettings`) only when the file does not exist. An existing settings file is never modified; those plugins then show as `(untracked)` in `rpi list` and can be removed with `rpi remove`. Re-running the installer with the same profile reinstalls a plugin you removed.
+- musl builds are dynamically linked so they can load native plugins: they need `libgcc`, and standard/full additionally `libstdc++` (`apk add libgcc libstdc++` on Alpine). When the dynamic runtime is unavailable, the installer can only fall back to a statically linked, plugin-less `-static` archive, and only with explicit consent (`--static-fallback`, which is never a force switch). It refuses to replace an install that already has native plugins. Upgrading an old static musl install to the dynamic one is a breaking change: re-run the installer.
+
+The scripts are plain POSIX sh / PowerShell; mirrors, cache directories, progress and resume are documented in the script headers. Manual install: download `rpi-<version>-<target>.tar.gz` (`.zip` on Windows) and its `.sha256` sidecar from [GitHub Releases](https://github.com/revpidev/rpi/releases), verify the checksum, and unpack the `rpi` binary anywhere on your `PATH`.
 
 ### Build from source
 

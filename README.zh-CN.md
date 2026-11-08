@@ -33,7 +33,7 @@ macOS / Linux（POSIX sh；自动区分 glibc / musl）：
 curl -fsSL https://revpi.dev/install.sh | sh
 ```
 
-安装脚本自动检测操作系统与架构，下载匹配的 Release 资产并做 SHA-256 校验（针对下载损坏的完整性校验），默认安装到 `~/.local/bin`（可用 `--prefix <dir>` 覆盖）。脚本与资产均可从官网（revpi.dev）下载——GitHub 不可直连时安装脚本会自动回退到官网镜像，也可以随时从 GitHub Releases 手动下载资产。若 `~/.local/bin` 不在 `PATH` 中，请添加：
+安装脚本自动检测操作系统与架构，默认安装 **standard** profile：只下载一个预先打好的固定归档（内含 `rpi` 与六个官方插件），本地解包并物化插件（不逐个下载插件）。归档 SHA-256 必须同时等于 Release 侧车与 rpi-pages profile 索引中的值（针对下载损坏与镜像混用的完整性校验）。默认安装到 `~/.local/bin`（可用 `--prefix <dir>` 覆盖）。脚本与资产均可从官网（revpi.dev）下载——GitHub 不可直连时安装脚本会自动回退到官网镜像，也可以随时从 GitHub Releases 手动下载资产。若 `~/.local/bin` 不在 `PATH` 中，请添加：
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"   # 追加到 ~/.profile、~/.bashrc 或 ~/.zshrc
@@ -44,6 +44,19 @@ Windows（PowerShell；默认安装到 `%LOCALAPPDATA%\Programs\rpi`，可用 `-
 ```powershell
 irm https://revpi.dev/install.ps1 | iex
 ```
+
+#### 安装 profile（V18-13）
+
+| Profile | 内容 | 约体积 |
+|---|---|---|
+| `mini` | 仅 `rpi` | 19 MB |
+| `standard`（默认） | `rpi` + subagents、todo、ask-user-question、smart-fetch、statusline、plan-mode | 33 MB |
+| `full` | standard + usage | 34 MB |
+
+- 交互式安装会先询问（回车 = standard）。**只有该提示里的主动选择（含回车接受默认）才构成对 native（L0）插件的同意**；非交互、提示超时、仅给 `--profile` / `RPI_INSTALL_PROFILE` 都不算同意，必须再加 `--yes` / `RPI_INSTALL_YES=1`，或改用 `--profile mini`。Windows 对应 `-Profile` / `-Yes`。
+- profile 索引缺失或非法时直接失败，不会静默降级到 mini；需要无插件安装时请显式 `--profile mini`。
+- 全新安装会在 `settings.json` 不存在时播种 `packages` 与各插件 `defaultSettings`；既有 settings 一个字节都不改，这些插件随后在 `rpi list` 中显示为 `(untracked)`，可用 `rpi remove` 卸载。用同一 profile 重跑安装器会重新装上被移除的插件。
+- musl 主产物为动态链接（否则无法加载 native 插件）：需要 `libgcc`，standard/full 另需 `libstdc++`（Alpine：`apk add libgcc libstdc++`）。动态运行时不可用时只能回退到仅二进制的 `-static` 产物，且必须显式同意（`--static-fallback`，它只是同意、不是强制开关）；若已有 native 插件则拒绝替换。旧静态 musl 安装迁移到动态版属于 BREAKING，需重跑安装器。
 
 两个安装器都会在安装目录尚未成为当前生效的 `rpi` 时，询问是否把该目录加入 PATH。macOS/Linux 的交互式安装（stdout 是终端、`/dev/tty` 可用、未设置 `CI`/`RPI_NONINTERACTIVE`、`TERM` 不是 `dumb`）会询问一次（默认是），并向检测到的 profile 写入带 `# rpi` 标记、带幂等 `case` 守卫的块：fish（`fish_add_path`）、zsh、bash（优先 `.bashrc`，其次 `.bash_profile`/`.bash_login`，最后 `.profile`）或 POSIX 的 `~/.profile`。不支持的 shell 只打印手动说明；root/系统级安装以及安装目录不在 `$HOME` 下时打印准确的手动命令。设置 `CI`/`RPI_NONINTERACTIVE`、stdout 被重定向或没有控制终端时会跳过提示。若存在 pty 但没有上述标记，支持 `read -t` 的 shell 会在 `RPI_INSTALL_PROMPT_TIMEOUT` 秒（默认 60，视为“否”）后超时；用 `RPI_INSTALL_ADD_PATH=0`（或 `--no-add-path`）保证不等待，用 `--add-path`/`RPI_INSTALL_ADD_PATH=1` 直接写入。Windows 上安装器会把目录前插到 HKCU 用户 PATH，保留 `%VAR%` 与 registry value kind，去重并广播环境变更；若机器级 PATH 中的 rpi 仍会优先，会给出警告。可用 `--add-path` / `--no-add-path`（Unix）、`-AddPath` / `-NoAddPath`（Windows）或 `RPI_INSTALL_ADD_PATH=1|0`。
 
