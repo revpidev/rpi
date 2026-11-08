@@ -23,7 +23,7 @@
 - **`rpi-ask-user-question` / `rpi-todo` → rpiv-mono v2.15.0** (TE51): the compact answer receipt, code-targeted external answers with first-answer-wins, integral JSON numbers, replay null/safe-integer guards and all-or-nothing batch creation.
 - **`rpi-statusline` items mode** (TE52, ADR-0040): the strict 21-field declarative mode without a shell, the `/statusline` editor (select/reorder/options/preview/reset), field-driven subscriptions from `ctx.sessionStats`, host-palette colors, and command stdout that wraps instead of truncating at eight lines.
 - **`rpi-usage` typed providers and footer** (TE53, ADR-0039): eight first-party provider scripts (four new), typed `windows[]`/`ledgers[]`/`balance[]`, the `/usage` grammar (`--cached`, `--json`, `--provider`, `list`, `help`), `ui.emitStructured` reports, a 60-second local typed-reset countdown without requests, `usage.percentage`/`usage.resetCountdown`, and the current-session local-token fallback for a provider without a quota script.
-- **Distribution**: the seven `.rpix` archives ride this Release (native carrier only; `minHostVersion` injected from the pack version — `0.1.8-rc.3` here, `0.1.8` at the stable fold); the retired `rpi-mcp-adapter` is not part of the set.
+- **Distribution**: the seven `.rpix` archives ride this Release (native carrier only; `minHostVersion` injected from the pack version — `0.1.8-rc.4` here, `0.1.8` at the stable fold); the retired `rpi-mcp-adapter` is not part of the set. V18-13 adds mini/standard/full profiles, a single pinned bundle per profile, the rpi-pages profile index, dynamic musl main artifacts with a binary-only `-static` fallback, and transactional installer replacement; the V18-13-bearing Release uses the 124-file manifest (20 archives + 20 sidecars + 42 `.rpix` + 42 sidecars).
 
 ### Fixed
 
@@ -32,7 +32,7 @@
 
 ### Internal
 
-- Workspace version is `0.1.8-rc.3` (the `0.1.8` candidate; `Cargo.lock` synced and the seven lockstep crates follow `version.workspace`); this top section uses the base version `0.1.8`, matching the embedded-changelog contract for pre-release builds.
+- Workspace version is `0.1.8-rc.4` (the `0.1.8` candidate; `Cargo.lock` synced and the seven lockstep crates follow `version.workspace`); this top section uses the base version `0.1.8`, matching the embedded-changelog contract for pre-release builds.
 - All v0.1.8 host calls are additive (`rpiAbi: 1`, ADR-0013) with SDK feature probes and native/wasm parity tests.
 - Deviations: D-107–D-110 (env conformance form, telemetry schema form, image worker `spawn_blocking`, deferred view/events) and TE-D47–TE-D55 (subagent notice branding, external-answer cap, attention clearing, event-bus answers, fork cache, parallel scheduler, compaction drain, composite history, steer hold). No unregistered deviation remains.
 - Known boundaries: no real-account smoke for the private usage endpoints; Windows/pwsh paths were not exercised locally; `rpi-durable` remains experimental and SQLite schema v2 is not backward compatible; menu/settings, cross-period token activity, `titleItems` and third-party CLI credentials remain out of scope.
