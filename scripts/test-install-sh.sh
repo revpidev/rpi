@@ -470,7 +470,12 @@ echo "serving fake release via $SERVE_MODE"
 assets_json=""
 add_api_asset() {
     _n=$1
-    _entry="{\"name\": \"$_n\", \"browser_download_url\": \"$BASE/releases/download/v$VERSION/$_n\"}"
+    _size=19000000
+    case $_n in
+        *-full.*) _size=34000000 ;;
+        *-standard.*) _size=33000000 ;;
+    esac
+    _entry="{\"name\": \"$_n\", \"size\": $_size, \"browser_download_url\": \"$BASE/releases/download/v$VERSION/$_n\"}"
     _entry_sha="{\"name\": \"$_n.sha256\", \"browser_download_url\": \"$BASE/releases/download/v$VERSION/$_n.sha256\"}"
     if [ -z "$assets_json" ]; then
         assets_json="$_entry,$_entry_sha"
@@ -909,6 +914,7 @@ EOF
             sed 's/^/    | /' "$TMP/pty-profile-default-out"
         fi
         check "profile prompt lists the three profiles" grep -q 'Choose an install profile' "$TMP/pty-profile-default-out"
+        check "profile prompt shows archive sizes" grep -q 'MB)' "$TMP/pty-profile-default-out"
         check "Enter installs standard with 6/6 plugins" grep -q '6/6 installed' "$TMP/pty-profile-default-out"
         check "Enter seeds settings" test -f "$H28/.rpi/agent/settings.json"
 
@@ -1364,6 +1370,25 @@ reset_test_overrides
 # 11.15 Semver comparison vectors (sourced helper mode; no install).
 if ( set --
     RPI_INSTALL_TEST_SOURCE=1 . "$INSTALL_SH"
+    pretty='{
+  "tag_name": "v0.1.0",
+  "assets": [
+    {
+      "name": "rpi-0.1.0-x86_64-unknown-linux-gnu-standard.tar.gz",
+      "size": 33000000,
+      "uploader": { "login": "bot" }
+    },
+    {
+      "name": "rpi-0.1.0-x86_64-unknown-linux-gnu.tar.gz",
+      "size": 19000000
+    }
+  ]
+}'
+    compact='{"tag_name":"v0.1.0","assets":[{"name":"rpi-0.1.0-x86_64-unknown-linux-gnu-full.tar.gz","size":34000000}]}'
+    size_ok=1
+    [ "$(json_asset_size "$pretty" rpi-0.1.0-x86_64-unknown-linux-gnu-standard.tar.gz)" = 33000000 ] || size_ok=0
+    [ "$(json_asset_size "$pretty" rpi-0.1.0-x86_64-unknown-linux-gnu.tar.gz)" = 19000000 ] || size_ok=0
+    [ "$(json_asset_size "$compact" rpi-0.1.0-x86_64-unknown-linux-gnu-full.tar.gz)" = 34000000 ] || size_ok=0
     expect_semver() {
         a=$1 b=$2 want=$3
         _rc=0
@@ -1393,11 +1418,12 @@ if ( set --
     expect_semver bad 0.1.0 invalid &&
     expect_semver 1.0 0.1.0 invalid &&
     expect_semver 01.0.0 0.1.0 invalid &&
-    expect_semver 0.1.0-01 0.1.0 invalid
+    expect_semver 0.1.0-01 0.1.0 invalid &&
+    [ "$size_ok" = 1 ]
 ); then
-    pass "semver comparison vectors"
+    pass "semver comparison vectors and asset size parsing"
 else
-    fail "semver comparison vectors"
+    fail "semver comparison vectors and asset size parsing"
 fi
 
 # ---- summary ------------------------------------------------------------------------

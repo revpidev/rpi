@@ -435,7 +435,7 @@ json_values() {
 # so look for "size" after the matching "name" key rather than assuming a
 # single line/object. A miss only omits the size hint.
 json_asset_size() { # json_asset_size <release-body> <asset-name>
-    printf '%s\n' "$1" | awk -v needle="\"name\": \"$2\"" '
+    printf '%s\n' "$1" | awk -v needle="\"$2\"" '
         index($0, needle) { found = 1 }
         found && match($0, /"size"[^0-9]*[0-9]+/) {
             s = substr($0, RSTART, RLENGTH)
