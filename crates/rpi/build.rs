@@ -76,8 +76,27 @@ fn main() {
     // distinguishable at runtime via `std::env::consts`. Consumers read it
     // with `option_env!("RPI_BUILD_TARGET")` and fall back to manual
     // download guidance when it's absent (non-cargo builds); never guess.
+    //
+    // V18-13: the static musl fallback is published under the
+    // `<target>-static` distribution label, so RPI_DIST_TARGET may override
+    // the injected label while the Cargo target stays unchanged. Only the
+    // release workflow sets it; the CLI keeps using the label verbatim.
+    println!("cargo:rerun-if-env-changed=RPI_DIST_TARGET");
     let target = std::env::var("TARGET").unwrap_or_else(|_| panic!("no TARGET"));
-    println!("cargo:rustc-env=RPI_BUILD_TARGET={target}");
+    let dist_target = match std::env::var("RPI_DIST_TARGET") {
+        Ok(value) if value.is_empty() => target.clone(),
+        Ok(value) => {
+            assert!(
+                value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+')),
+                "RPI_DIST_TARGET contains unsupported characters: {value:?}"
+            );
+            value
+        }
+        Err(_) => target.clone(),
+    };
+    println!("cargo:rustc-env=RPI_BUILD_TARGET={dist_target}");
 
     // bat's curated set (embedded in syntect-assets as an uncompressed dump).
     let assets = HighlightingAssets::from_binary();

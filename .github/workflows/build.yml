@@ -4,9 +4,15 @@ name: build
 #   - Windows x64        x86_64-pc-windows-msvc     native (bundled MSVC)
 #   - macOS arm64        aarch64-apple-darwin        native (macos-14 arm64 runner)
 #   - Linux x64 glibc    x86_64-unknown-linux-gnu    native
-#   - Linux x64 musl     x86_64-unknown-linux-musl   apt musl-tools (musl-gcc); binary only
-#   - Linux arm64 musl   aarch64-unknown-linux-musl  cross-rs container (ghcr.io image); binary only
+#   - Linux x64 musl     x86_64-unknown-linux-musl   apt musl-tools (musl-gcc); dynamic + plugins
+#   - Linux arm64 musl   aarch64-unknown-linux-musl  cross-rs container (ghcr.io image); dynamic + plugins
 #   - Linux arm64 glibc  aarch64-unknown-linux-gnu   apt gcc/g++-aarch64-linux-gnu
+#
+# V18-13: musl main artifacts are dynamically linked (`-crt-static` off) so
+# they can dlopen native plugins; each musl target additionally publishes a
+# `-static` fallback binary (no plugins) built in a separate target dir.
+# Every target publishes standard/full profile archives assembled from the
+# dynamic binary and the seven extension cdylibs (see scripts/profiles.json).
 #
 # Triggers: distribution builds run only via workflow_dispatch (ADR-0042).
 # Tag pushes never start packaging automatically; a human starts every build.
@@ -50,6 +56,10 @@ jobs:
         os: [ubuntu-22.04, windows-latest]
     steps:
       - uses: actions/checkout@v5.1.0
+
+      - name: Profile packaging tests (Linux)
+        if: runner.os == 'Linux'
+        run: python3 scripts/test_package_profile.py
 
       - name: Shell installer tests
         if: runner.os == 'Linux'
@@ -162,19 +172,29 @@ jobs:
           cargo build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
         shell: bash
 
-      # musl targets ship the rpi binary only — no extension cdylibs: stock
-      # rustc does not support cdylib on *-linux-musl (cargo drops the crate
-      # type with a warning and still exits 0 — that, not a cross/mount issue,
-      # was the v0.1.1 aarch64-musl "missing .so" packaging failure), and a
-      # statically-linked musl rpi could not dlopen a native extension anyway.
-      - name: Build (x64 musl)
+      # V18-13: musl main artifacts are now dynamically linked. Stock rustc's
+      # musl targets default to +crt-static, and a static musl host cannot
+      # dlopen a cdylib ("Dynamic loading not supported"); `-crt-static` off is
+      # what makes native plugins possible. The Cargo target triple (and asset
+      # name) stays the same.
+      - name: Build (x64 musl, dynamic)
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: cargo build --release --target ${{ matrix.target }} --bin rpi
+        env:
+          RUSTFLAGS: -C target-feature=-crt-static -C link-self-contained=no
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin rpi
+          cargo build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
         shell: bash
 
-      - name: Build (arm64 musl via cross container)
+      - name: Build (arm64 musl, dynamic, via cross container)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cross build --release --target ${{ matrix.target }} --bin rpi
+        env:
+          RUSTFLAGS: -C target-feature=-crt-static
+        run: |
+          cross build --release --target ${{ matrix.target }} --bin rpi
+          cross build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
         shell: bash
 
       - name: Build (arm64 glibc)
@@ -194,6 +214,55 @@ jobs:
           cargo build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
         shell: bash
 
+      # The static fallback rebuild uses the same Cargo target but a separate
+      # target dir, so it can never overwrite the dynamic binary read by the
+      # base and profile archives. RPI_DIST_TARGET injects the `<target>-static`
+      # distribution label (build.rs), which the manifest, self-update and the
+      # extension registry then use.
+      - name: Build (musl static fallback)
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
+        env:
+          RPI_DIST_TARGET: ${{ matrix.target }}-static
+        run: |
+          if [ "${{ matrix.target }}" = 'aarch64-unknown-linux-musl' ]; then
+            cross build --release --target ${{ matrix.target }} \
+              --target-dir target/static-fallback --bin rpi
+          else
+            CARGO_TARGET_DIR=target/static-fallback \
+              cargo build --release --target ${{ matrix.target }} --bin rpi
+          fi
+        shell: bash
+
+      - name: Stage dynamic binary
+        shell: bash
+        run: |
+          TARGET=${{ matrix.target }}
+          STAGE="target/dist-staging/$TARGET"
+          mkdir -p "$STAGE"
+          if [ "${{ runner.os }}" = 'Windows' ]; then
+            cp "target/$TARGET/release/rpi.exe" "$STAGE/rpi.exe"
+          else
+            cp "target/$TARGET/release/rpi" "$STAGE/rpi"
+          fi
+          ls -l "$STAGE"
+
+      # Linkage assertion: the main musl binary must request an ELF
+      # interpreter (dynamic) and the fallback must not (static). This is the
+      # guard against the two builds silently sharing an output path again.
+      - name: Assert musl linkage (dynamic vs static fallback)
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          TARGET=${{ matrix.target }}
+          DYNAMIC="target/dist-staging/$TARGET/rpi"
+          STATIC="target/static-fallback/$TARGET/release/rpi"
+          readelf -l "$DYNAMIC" | grep -q 'Requesting program interpreter' || {
+            echo "::error::$DYNAMIC is not dynamically linked"; exit 1; }
+          if readelf -l "$STATIC" | grep -q 'Requesting program interpreter'; then
+            echo "::error::$STATIC is dynamically linked"; exit 1
+          fi
+          file "$DYNAMIC" "$STATIC"
+
       # ---- Packaging ----
 
       - name: Extract version
@@ -209,12 +278,15 @@ jobs:
         run: |
           VERSION=${{ steps.version.outputs.version }}
           TARGET=${{ matrix.target }}
+          STAGE="target/dist-staging/$TARGET"
           # macOS has no GNU sha256sum (ships shasum); both platforms print the same
           # format. NOTE: shasum defaults to SHA-1 — the fallback must pass -a 256,
           # otherwise sidecars are 40-hex SHA-1 and break verification (v0.1.1-rc bug).
           if command -v sha256sum >/dev/null; then SHA256="sha256sum"; else SHA256="shasum -a 256"; fi
           mkdir -p dist
-          tar -czf "dist/rpi-${VERSION}-${TARGET}.tar.gz" -C "target/${TARGET}/release" rpi
+          # Base archive: the dynamic binary (musl included) from the isolated
+          # staging copy, never directly from target/<triple>/release.
+          tar -czf "dist/rpi-${VERSION}-${TARGET}.tar.gz" -C "$STAGE" rpi
           # Sidecar must list the basename only: install.sh verifies from a
           # temp dir where the archive lives as <basename> (a dist/ path
           # prefix makes the check fail). Same shape as the fake releases in
@@ -222,11 +294,7 @@ jobs:
           (cd dist && $SHA256 "rpi-${VERSION}-${TARGET}.tar.gz" > "rpi-${VERSION}-${TARGET}.tar.gz.sha256")
 
           # ---- First-party extensions (.rpix; extension-distribution.md §3 / §9.2) ----
-          # Skipped on musl (see the build-step comment above: no cdylib
-          # support on *-linux-musl targets).
-          if [[ "$TARGET" == *-musl ]]; then
-            echo "skipping .rpix packaging for $TARGET (musl has no cdylib support)"
-          else
+          # Musl is no longer skipped: the dynamic build produces cdylibs too.
           DIST="$PWD/dist"
           # If a cdylib ever goes missing again (as on the v0.1.1 aarch64-musl
           # run), these listings show whether it landed in the profile dir,
@@ -269,7 +337,21 @@ jobs:
             (cd dist && $SHA256 "$RPIX" > "$RPIX.sha256")
             rm -rf "$TMP"
           done
-          fi
+
+          # ---- Install-profile archives (V18-13) ----
+          # standard/full bundle the dynamic binary with the 6/7 plugin
+          # archives; the musl static fallback is a binary-only asset.
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" scripts/package-profile.py \
+            --dist dist --version "$VERSION" --target "$TARGET" \
+            --binary "$STAGE/rpi" --format tar.gz
+          case "$TARGET" in
+            *-musl)
+              "$PY" scripts/package-profile.py --static \
+                --dist dist --version "$VERSION" --target "$TARGET" \
+                --binary "target/static-fallback/$TARGET/release/rpi"
+              ;;
+          esac
 
       - name: Package (zip)
         if: runner.os == 'Windows'
@@ -277,8 +359,9 @@ jobs:
         run: |
           $VERSION = "${{ steps.version.outputs.version }}"
           $TARGET = "${{ matrix.target }}"
+          $STAGE = "target\dist-staging\$TARGET"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path "target\$TARGET\release\rpi.exe" -DestinationPath "dist\rpi-$VERSION-$TARGET.zip"
+          Compress-Archive -Path "$STAGE\rpi.exe" -DestinationPath "dist\rpi-$VERSION-$TARGET.zip"
           $hash = (Get-FileHash "dist\rpi-$VERSION-$TARGET.zip" -Algorithm SHA256).Hash.ToLower()
           Set-Content -Path "dist\rpi-$VERSION-$TARGET.zip.sha256" -Value "$hash  rpi-$VERSION-$TARGET.zip"
 
@@ -320,6 +403,14 @@ jobs:
             $hash = (Get-FileHash "$DIST\$RPIX" -Algorithm SHA256).Hash.ToLower()
             Set-Content -Path "$DIST\$RPIX.sha256" -Value "$hash  $RPIX"
           }
+
+          # ---- Install-profile archives (V18-13) ----
+          $PY = 'python3'
+          if (-not (Get-Command python3 -ErrorAction SilentlyContinue)) { $PY = 'python' }
+          & $PY scripts\package-profile.py `
+            --dist dist --version $VERSION --target $TARGET `
+            --binary "$STAGE\rpi.exe" --format zip
+          if ($LASTEXITCODE -ne 0) { throw "profile packaging failed" }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6.0.0

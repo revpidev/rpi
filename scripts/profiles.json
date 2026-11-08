@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "profiles": {
+    "mini": [],
+    "standard": [
+      "rpi-subagents",
+      "rpi-todo",
+      "rpi-ask-user-question",
+      "rpi-smart-fetch",
+      "rpi-statusline",
+      "rpi-plan-mode"
+    ],
+    "full": [
+      "rpi-subagents",
+      "rpi-todo",
+      "rpi-ask-user-question",
+      "rpi-smart-fetch",
+      "rpi-statusline",
+      "rpi-plan-mode",
+      "rpi-usage"
+    ]
+  }
+}
