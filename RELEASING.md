@@ -32,12 +32,20 @@ Release checklist. The order is pinned by ADR-0011 ("endpoint and Release synchr
    | `aarch64-unknown-linux-musl` | `rpi-<version>-aarch64-unknown-linux-musl.tar.gz` (dynamic in the V18-13 target manifest) |
    | `aarch64-unknown-linux-gnu` | `rpi-<version>-aarch64-unknown-linux-gnu.tar.gz` |
 
-5. **Update the version endpoint** — only after step 4 is complete. In the `rpi-pages` repository, then commit and push (Git integration deploys):
+5. **Generate the profile index (V18-13-bearing releases), then update the version endpoint** — only after step 4 is complete. In the `rpi-pages` repository:
 
    ```bash
+   # V18-13-bearing release: index first, endpoint second
+   python3 scripts/generate-site.py --publish-profiles <version>
    python3 scripts/generate-site.py --version <version>
-   git add api/ && git commit -m "chore(api): latest-version -> v<version>" && git push
+   # pre-V18-13 release: endpoint only
+   # python3 scripts/generate-site.py --version <version>
+
+   git add api/ install.sh install.ps1
+   git commit -m "chore(api): v<version> profile index + latest-version" && git push
    ```
+
+   `--publish-profiles` must fail before anything is written if any standard/full bundle or sidecar is missing; never run `--version` after a failed index generation. After deploy, verify the index and its cache headers (`curl -fsS https://revpi.dev/api/install-profiles/<version>.json`; `Cache-Control` short/must-revalidate). A missing/stale index makes standard/full installation fail closed; users must either fix/retry the site or explicitly choose `--profile mini`.
 
 The official-site asset mirror (`https://revpi.dev/releases/download/...`) is a Pages Function that proxies GitHub — zero storage, nothing to upload; it works as soon as the Release assets exist. (`install.sh` / `install.ps1` themselves are synced to the site root by `generate-site.py`.)
 
@@ -57,7 +65,7 @@ V14-19 (an rpi-native requirement with no upstream counterpart; design in the rp
 1. Bump the workspace version to `<stable>-rc.N` + write `changes/v<stable>-rc.N.md` (the release notes; at stable-release time its entries fold into `changes/v<stable>.md`), merge to `main`.
 2. A human tags `v<stable>-rc.N` and pushes it, then manually starts build.yml through the GitHub UI or `gh workflow run build.yml --ref v<stable>-rc.N`; tag pushes never start packaging automatically. The workflow produces the manifest applicable to that tag: the existing 68-file manifest before V18-13, or the 124-file target manifest only after V18-13 has landed (six base targets including dynamic musl, two musl `-static` fallbacks, standard/full profile archives, seven `.rpix` per target for all six targets, plus `.sha256` sidecars); **the Release is automatically marked prerelease** (tag contains `-rc`), and `releases/latest` plus the install.sh fallback path stay stable.
 3. Wait for the assets using the same applicability rule as stable: 68 files before V18-13, or 20 archives + 20 sidecars + 7 × 6 extension `.rpix` assets and their sidecars = 124 files for a V18-13-bearing Release.
-4. **Only then** refresh the RC endpoint: in rpi-pages, `python3 scripts/generate-site.py --rc-version <stable>-rc.N` → commit + push. Clients probe `https://revpi.dev/api/latest-rc-version.json` (derived from the stable endpoint's directory).
+4. **Only then** generate the profile index (V18-13-bearing RC) and refresh the RC endpoint: in rpi-pages, run `python3 scripts/generate-site.py --publish-profiles <stable>-rc.N` (V18-13-bearing only; index first) then `python3 scripts/generate-site.py --rc-version <stable>-rc.N`, commit and push. Clients probe `https://revpi.dev/api/latest-rc-version.json` (derived from the stable endpoint's directory). A missing/stale RC profile index makes standard/full RC installation fail closed; users must explicitly choose `--profile mini`.
 
 ### Interaction with stable releases
 
@@ -76,4 +84,4 @@ Before the first GitHub Release exists, `https://github.com/revpidev/rpi/release
 
 ## Security note
 
-The `.sha256` sidecars are published next to the binaries and provide an **integrity check only** (corrupted downloads, mirror mix-ups). They do **not** protect against tampered release assets. Standard/full bundles additionally require the independent rpi-pages profile-index hash; their Release sidecar alone must never authorize plugin installation. Artifact signing (minisign / cosign) is a planned follow-up and will get its own ADR (see ADR-0011, security boundaries).
+The `.sha256` sidecars are published next to the binaries and provide an **integrity check only** (corrupted downloads, mirror mix-ups). They do **not** protect against tampered release assets. Standard/full bundles additionally require the independent rpi-pages profile-index hash; their Release sidecar alone must never authorize plugin installation. A missing/invalid profile index fails closed (exit 1); only an explicit `--profile mini` install is available, never an automatic downgrade. Artifact signing (minisign / cosign) is a planned follow-up and will get its own ADR (see ADR-0011, security boundaries).
