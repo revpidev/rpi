@@ -722,6 +722,31 @@ function ConvertFrom-ProfileIndex {
     return $result
 }
 
+# Persist the response validators next to the partial file. Written as soon as
+# a transfer has a status/validator (and again on success) so an interrupted
+# transfer or a mirror switch can resume with Range + If-Range.
+function Write-AssetMetaFile {
+    param(
+        [string]$Path,
+        [string]$Sha,
+        [string]$Asset,
+        [string]$Version,
+        [string]$ETag,
+        [string]$LastModified,
+        [string]$Url
+    )
+    if (-not $ETag) { $ETag = '' }
+    if (-not $LastModified) { $LastModified = '' }
+    @(
+        "sha=$Sha"
+        "asset=$Asset"
+        "version=$Version"
+        "etag=$ETag"
+        "last_modified=$LastModified"
+        "url=$Url"
+    ) | Set-Content -LiteralPath $Path -Encoding ASCII
+}
+
 # 206/200/416 decision for a partial file (install-packaging.md section 7).
 function Get-RangeResumeDecision {
     param([int]$Status, [string]$CachedValidator, [string]$ResponseValidator, [bool]$HasPartial)
@@ -790,6 +815,7 @@ function Invoke-HttpTransfer {
         $request.AddRange($Offset)
         $request.Headers['If-Range'] = $Validator
     }
+    $script:LastTransferValidators = $null
     $response = $null
     try {
         try {
@@ -804,6 +830,12 @@ function Invoke-HttpTransfer {
         $status = [int]$response.StatusCode
         $etag = [string]$response.Headers['ETag']
         $lastModified = [string]$response.Headers['Last-Modified']
+        if (($status -eq 200 -or $status -eq 206) -and ($etag -or $lastModified)) {
+            $script:LastTransferValidators = [pscustomobject]@{
+                ETag = $etag
+                LastModified = $lastModified
+            }
+        }
         if ($status -eq 200 -and $Offset -gt 0) {
             return [pscustomobject]@{ Status = $status; ETag = $etag; LastModified = $lastModified; Truncated = $false }
         }
@@ -941,6 +973,15 @@ function Invoke-AssetDownload {
                         -Validator $validator -StallTimeout $StallTimeout -LockPath $lock
                 } catch {
                     Write-Warning "download failed from ${url}: $($_.Exception.Message)"
+                    # .NET raises on a premature close when Content-Length is
+                    # known; keep the bytes and the validators so the retry can
+                    # resume with Range + If-Range instead of starting over.
+                    if ((Test-Path -LiteralPath $part) -and (Get-Item -LiteralPath $part).Length -gt 0 -and
+                        $script:LastTransferValidators) {
+                        Write-AssetMetaFile -Path $meta -Sha $ExpectedSha -Asset $Asset -Version $Version `
+                            -ETag $script:LastTransferValidators.ETag `
+                            -LastModified $script:LastTransferValidators.LastModified -Url $url
+                    }
                     if ($attempt -ge $MaxAttempts) { break }
                     Start-Sleep -Seconds ([Math]::Min(8, [Math]::Pow(2, $attempt - 1)))
                     continue
@@ -956,16 +997,8 @@ function Invoke-AssetDownload {
                 }
                 if ($transfer.Truncated) {
                     if (Test-Path -LiteralPath $part) {
-                        $etagText = if ($transfer.ETag) { $transfer.ETag } else { '' }
-                        $lastModifiedText = if ($transfer.LastModified) { $transfer.LastModified } else { '' }
-                        @(
-                            "sha=$ExpectedSha"
-                            "asset=$Asset"
-                            "version=$Version"
-                            "etag=$etagText"
-                            "last_modified=$lastModifiedText"
-                            "url=$url"
-                        ) | Set-Content -LiteralPath $meta -Encoding ASCII
+                        Write-AssetMetaFile -Path $meta -Sha $ExpectedSha -Asset $Asset -Version $Version `
+                            -ETag $transfer.ETag -LastModified $transfer.LastModified -Url $url
                     }
                     if ($attempt -ge $MaxAttempts) {
                         Write-Warning "download truncated from $url after $attempt attempts; trying the next mirror"
@@ -1013,16 +1046,8 @@ function Invoke-AssetDownload {
                         Write-Warning "empty download from $url"
                         continue
                     }
-                    $etagText = if ($transfer.ETag) { $transfer.ETag } else { '' }
-                    $lastModifiedText = if ($transfer.LastModified) { $transfer.LastModified } else { '' }
-                    @(
-                        "sha=$ExpectedSha"
-                        "asset=$Asset"
-                        "version=$Version"
-                        "etag=$etagText"
-                        "last_modified=$lastModifiedText"
-                        "url=$url"
-                    ) | Set-Content -LiteralPath $meta -Encoding ASCII
+                    Write-AssetMetaFile -Path $meta -Sha $ExpectedSha -Asset $Asset -Version $Version `
+                        -ETag $transfer.ETag -LastModified $transfer.LastModified -Url $url
                     if ($ExpectedSha) {
                         $actual = Get-FileSha256 $part
                         if ($actual -ne $ExpectedSha) {
@@ -1083,7 +1108,7 @@ function Test-BundleMembers {
             continue
         }
         if (-not $expected.Contains($name)) { return $false }
-        [void]$seen.Add($name)
+        if (-not $seen.Add($name)) { return $false }
     }
     foreach ($name in $expected) {
         if (-not $seen.Contains($name)) { return $false }
@@ -1483,7 +1508,11 @@ try {
     # ---- safe extraction + install ------------------------------------------
 
     $extractDir = Join-Path $TmpDir 'x'
-    $bundleMembers = @(Get-ZipMemberNames -Path $archivePath)
+    try {
+        $bundleMembers = @(Get-ZipMemberNames -Path $archivePath)
+    } catch {
+        Fail "archive $AssetName is not a readable zip: $($_.Exception.Message)"
+    }
     if (-not (Test-BundleMembers -Members $bundleMembers -ProfileName $ProfileValue -Version $Version -Target $Target)) {
         Fail "archive $AssetName contains unregistered or missing members; aborting"
     }

@@ -436,12 +436,25 @@ json_values() {
 # single line/object. A miss only omits the size hint.
 json_asset_size() { # json_asset_size <release-body> <asset-name>
     printf '%s\n' "$1" | awk -v needle="\"$2\"" '
-        index($0, needle) { found = 1 }
-        found && match($0, /"size"[^0-9]*[0-9]+/) {
-            s = substr($0, RSTART, RLENGTH)
-            gsub(/[^0-9]/, "", s)
-            print s
-            exit
+        {
+            line = $0
+            if (!found) {
+                pos = index(line, needle)
+                if (!pos) next
+                found = 1
+                line = substr(line, pos + length(needle))
+            }
+            # A "name" before the next "size" means the asset object ended
+            # without a size; do not borrow the following asset size.
+            npos = index(line, "\"name\"")
+            spos = match(line, /"size"[^0-9]*[0-9]+/)
+            if (npos > 0 && (spos == 0 || npos < spos)) { exit }
+            if (spos > 0) {
+                s = substr(line, RSTART, RLENGTH)
+                gsub(/[^0-9]/, "", s)
+                print s
+                exit
+            }
         }
     '
 }
@@ -1217,11 +1230,26 @@ download_asset() { # download_asset <asset> <candidates-newline-list> <expected-
               printf '%s\n' "$_transfer_rc" >"$_sentinel" ) &
             _pid=$!
             PROGRESS_LAST_MARK=0
+            _validators_saved=0
             while [ ! -f "$_sentinel" ]; do
                 _now_size=0
                 [ -f "$_part" ] && _now_size=$(wc -c <"$_part" | tr -d ' ')
                 _total=$(progress_total "$_hdr" "$_offset" "$_now_size")
                 print_progress "$_now_size" "$_total" "$_offset"
+                # Save validators while the transfer is still running, so an
+                # interrupt (Ctrl-C) that kills the parent before the
+                # post-transfer write still leaves a resumable partial.
+                if [ "$_validators_saved" = 0 ] && [ "$_now_size" -gt 0 ]; then
+                    _hstatus=$(response_code "$_hdr")
+                    if [ "$_hstatus" = 200 ] || [ "$_hstatus" = 206 ]; then
+                        _hetag=$(response_header "$_hdr" ETag)
+                        _hlast=$(response_header "$_hdr" Last-Modified)
+                        if [ -n "$_hetag" ] || [ -n "$_hlast" ]; then
+                            write_asset_meta "$_meta" "$_expected" "$_asset" "$_hetag" "$_hlast" "$_url"
+                            _validators_saved=1
+                        fi
+                    fi
+                fi
                 sleep 1
             done
             wait "$_pid" 2>/dev/null || true

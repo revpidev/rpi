@@ -350,6 +350,8 @@ try {
         $stdMembers.Add("extensions/$plugin-0.1.0-x86_64-pc-windows-msvc.rpix.sha256")
     }
     Check-True (Test-BundleMembers -Members @($stdMembers) -ProfileName 'standard' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc') 'exact standard bundle accepted'
+    $duplicate = @($stdMembers) + @($stdMembers[0])
+    Check-True (-not (Test-BundleMembers -Members $duplicate -ProfileName 'standard' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc')) 'duplicate bundle member rejected'
     $extra = @($stdMembers) + @('extensions/rpi-usage-0.1.0-x86_64-pc-windows-msvc.rpix')
     Check-True (-not (Test-BundleMembers -Members $extra -ProfileName 'standard' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc')) 'unregistered plugin member rejected'
     $extra = @($stdMembers) + @('../evil')
@@ -359,6 +361,38 @@ try {
     $noSettings = @($stdMembers | Where-Object { $_ -ne 'settings.defaults.json' })
     Check-True (-not (Test-BundleMembers -Members $noSettings -ProfileName 'standard' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc')) 'missing settings.defaults.json rejected'
     Check-True (-not (Test-BundleMembers -Members @('rpi.exe', 'extensions/') -ProfileName 'mini' -Version '0.1.0' -Target 'x86_64-pc-windows-msvc')) 'mini bundle with an extensions dir rejected'
+
+    # ---- asset meta persistence + real zip member listing -------------------
+
+    $metaPath = Join-Path $tempRoot 'asset.meta'
+    Write-AssetMetaFile -Path $metaPath -Sha ('b' * 64) -Asset 'asset.tar.gz' `
+        -Version '0.1.0' -ETag '"etag"' -LastModified '' -Url 'https://example/asset.tar.gz'
+    $metaText = Get-Content -LiteralPath $metaPath -Raw
+    Check-True ($metaText -match '(?m)^sha=b{64}$') 'asset meta records the sha'
+    Check-True ($metaText -match '(?m)^etag="etag"$') 'asset meta records the etag'
+    Check-True ($metaText -match '(?m)^url=https://example/asset.tar.gz$') 'asset meta records the url'
+
+    $memberZip = Join-Path $tempRoot 'members.zip'
+    $memberStream = [System.IO.File]::Open($memberZip, [System.IO.FileMode]::Create)
+    $memberArchive = New-Object System.IO.Compression.ZipArchive($memberStream, [System.IO.Compression.ZipArchiveMode]::Create)
+    foreach ($memberName in @('rpi.exe', 'settings.defaults.json', 'extensions/')) {
+        if ($memberName.EndsWith('/')) { [void]$memberArchive.CreateEntry($memberName); continue }
+        $memberEntry = $memberArchive.CreateEntry($memberName)
+        $memberWriter = New-Object System.IO.StreamWriter($memberEntry.Open())
+        $memberWriter.Write('x')
+        $memberWriter.Dispose()
+    }
+    $memberArchive.Dispose()
+    $memberStream.Dispose()
+    $names = @(Get-ZipMemberNames -Path $memberZip)
+    Check-True ($names.Count -eq 3) 'zip member names are listed'
+    Check-True ($names -contains 'extensions/') 'zip directory entry is listed'
+
+    $corruptZip = Join-Path $tempRoot 'corrupt.zip'
+    Set-Content -LiteralPath $corruptZip -Value 'not a zip'
+    $threw = $false
+    try { Get-ZipMemberNames -Path $corruptZip | Out-Null } catch { $threw = $true }
+    Check-True $threw 'unreadable zip raises for a clean failure path'
 
     # ---- safe archive members / zip extraction -------------------------------
 

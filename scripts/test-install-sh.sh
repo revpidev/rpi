@@ -1385,10 +1385,13 @@ if ( set --
   ]
 }'
     compact='{"tag_name":"v0.1.0","assets":[{"name":"rpi-0.1.0-x86_64-unknown-linux-gnu-full.tar.gz","size":34000000}]}'
+    compact2='{"assets":[{"name":"rpi-0.1.0-x86_64-unknown-linux-gnu.tar.gz","size":19000000},{"name":"rpi-0.1.0-x86_64-unknown-linux-gnu-standard.tar.gz","size":33000000}]}'
     size_ok=1
     [ "$(json_asset_size "$pretty" rpi-0.1.0-x86_64-unknown-linux-gnu-standard.tar.gz)" = 33000000 ] || size_ok=0
     [ "$(json_asset_size "$pretty" rpi-0.1.0-x86_64-unknown-linux-gnu.tar.gz)" = 19000000 ] || size_ok=0
     [ "$(json_asset_size "$compact" rpi-0.1.0-x86_64-unknown-linux-gnu-full.tar.gz)" = 34000000 ] || size_ok=0
+    [ "$(json_asset_size "$compact2" rpi-0.1.0-x86_64-unknown-linux-gnu-standard.tar.gz)" = 33000000 ] || size_ok=0
+    [ "$(json_asset_size "$compact2" rpi-0.1.0-x86_64-unknown-linux-gnu.tar.gz)" = 19000000 ] || size_ok=0
     expect_semver() {
         a=$1 b=$2 want=$3
         _rc=0
