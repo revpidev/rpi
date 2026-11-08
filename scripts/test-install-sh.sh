@@ -1126,7 +1126,10 @@ check "partial plugin failure skips settings seeding" \
     test ! -e "$H40/.rpi/agent/settings.json"
 reset_test_overrides
 
-for _case in abi2 minhost-new minhost-bad escape extra badsum missingentry; do
+_plugin_cases='abi2 minhost-new minhost-bad extra badsum missingentry'
+# The escape fixture needs Python's tarfile to emit a ../ member safely.
+command -v python3 >/dev/null 2>&1 && _plugin_cases="$_plugin_cases escape"
+for _case in $_plugin_cases; do
     _h=$TMP/home-plugin-$_case
     variant_release "$_case"
     expect_ok "plugin case $_case is isolated (exit 0)" run_install "$_h" --profile standard --yes
@@ -1148,6 +1151,7 @@ check "prerelease minHostVersion installs 6/6" grep -q '6/6 installed' "$TMP/las
 reset_test_overrides
 
 # 11.9 Unsafe outer archive is fatal before anything is written.
+if command -v python3 >/dev/null 2>&1; then
 make_unsafe_bundle "$WWW/variant-unsafe-outer" "$VERSION" "$HOST_TARGET" standard
 _unsafe_asset=rpi-$VERSION-$HOST_TARGET-standard.tar.gz
 _unsafe_sha=$(sha_of "$WWW/variant-unsafe-outer/releases/download/v$VERSION" "$_unsafe_asset")
@@ -1161,6 +1165,9 @@ expect_fail "unsafe outer archive is fatal" run_install "$H42" --profile standar
 check "unsafe outer archive is reported" grep -q 'unsafe archive member' "$TMP/last-out"
 check "unsafe outer archive leaves no binary" test ! -e "$H42/.local/bin/rpi"
 reset_test_overrides
+else
+    skip "unsafe outer archive (python3 unavailable for the tarfile fixture)"
+fi
 
 # 11.10 Existing settings are byte-for-byte untouched (and a second run stays
 # idempotent).
