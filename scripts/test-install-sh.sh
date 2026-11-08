@@ -27,7 +27,12 @@ set -eu
 # override this with --add-path or RPI_INSTALL_ADD_PATH=1. Clear the shell
 # profile overrides so tests never touch a developer's real dotfiles.
 export RPI_INSTALL_ADD_PATH=0
+# The legacy checks exercise the mini (binary-only) install path; the profile
+# matrix at the end explicitly overrides this for standard/full/static runs.
+export RPI_INSTALL_PROFILE=mini
 unset ZDOTDIR XDG_CONFIG_HOME RPI_NONINTERACTIVE RPI_INSTALL_PROMPT_TIMEOUT
+unset RPI_INSTALL_YES RPI_INSTALL_STATIC_FALLBACK RPI_CODING_AGENT_DIR
+unset RPI_INSTALL_CACHE_DIR RPI_INSTALL_REQUIRE_PLUGINS RPI_INSTALL_NO_CACHE
 
 # The default profile block is an idempotent case guard (one line).
 DEFAULT_PATH_LINE='case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
@@ -124,12 +129,219 @@ make_fake_archive() { # make_fake_archive <version> <target> [corrupt-sha]
     fi
 }
 
+# Profile plugin lists: prefer scripts/profiles.json (the packaging single
+# source of truth), fall back to the documented order without python3.
+if command -v python3 >/dev/null 2>&1; then
+    STANDARD_PLUGINS=$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["profiles"]["standard"]))' "$HERE/profiles.json")
+    FULL_PLUGINS=$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["profiles"]["full"]))' "$HERE/profiles.json")
+else
+    STANDARD_PLUGINS='rpi-subagents rpi-todo rpi-ask-user-question rpi-smart-fetch rpi-statusline rpi-plan-mode'
+    FULL_PLUGINS="$STANDARD_PLUGINS rpi-usage"
+fi
+
+# make_fake_rpix <outdir> <name> <version> <target> [minhost] [abi] [mode]
+# mode: ok | escape | extra | badsum | missingentry
+make_fake_rpix() {
+    rp_out=$1 rp_name=$2 rp_ver=$3 rp_tgt=$4 rp_min=${5:-} rp_abi=${6:-1} rp_mode=${7:-ok}
+    rp_stage=$TMP/rpix-stage-$rp_name-$rp_mode
+    rm -rf "$rp_stage"
+    mkdir -p "$rp_stage"
+    {
+        printf '{\n  "name": "%s",\n  "version": "%s",\n  "native": "libtest.so",\n  "rpiAbi": %s' \
+            "$rp_name" "$rp_ver" "$rp_abi"
+        if [ -n "$rp_min" ]; then
+            printf ',\n  "minHostVersion": "%s"' "$rp_min"
+        fi
+        if [ "$rp_name" = rpi-statusline ]; then
+            printf ',\n  "defaultSettings": {\n    "statusLine": {"type": "items", "items": ["live-total-tokens"]}\n  }'
+        fi
+        printf '\n}\n'
+    } >"$rp_stage/rpi-extension.json"
+    printf 'fake cdylib for %s\n' "$rp_name" >"$rp_stage/libtest.so"
+    case $rp_mode in
+        escape)
+            ( cd "$rp_stage" && $SHA256TOOL rpi-extension.json libtest.so > SHA256SUMS )
+            python3 - "$rp_stage" "$TMP/rpix-escape.tgz" <<'PYEOF'
+import os, sys, tarfile
+stage, out = sys.argv[1], sys.argv[2]
+with tarfile.open(out, "w:gz") as archive:
+    for name in ("rpi-extension.json", "libtest.so", "SHA256SUMS"):
+        archive.add(os.path.join(stage, name), arcname=name)
+    payload = b"escape\n"
+    info = tarfile.TarInfo("../evil")
+    info.size = len(payload)
+    import io
+    archive.addfile(info, io.BytesIO(payload))
+PYEOF
+            mkdir -p "$rp_out"
+            cp "$TMP/rpix-escape.tgz" "$rp_out/$rp_name-$rp_ver-$rp_tgt.rpix"
+            ( cd "$rp_out" && $SHA256TOOL "$rp_name-$rp_ver-$rp_tgt.rpix" >"$rp_name-$rp_ver-$rp_tgt.rpix.sha256" )
+            return 0
+            ;;
+        extra)
+            printf 'unlisted\n' >"$rp_stage/extra.txt"
+            ;;
+    esac
+    case $rp_mode in
+        badsum)
+            printf '%064d  rpi-extension.json\n' 0 >"$rp_stage/SHA256SUMS"
+            ;;
+        missingentry)
+            ( cd "$rp_stage" && $SHA256TOOL rpi-extension.json > SHA256SUMS )
+            ;;
+        extra)
+            ( cd "$rp_stage" && $SHA256TOOL rpi-extension.json libtest.so > SHA256SUMS )
+            ;;
+        *)
+            ( cd "$rp_stage" && $SHA256TOOL rpi-extension.json libtest.so > SHA256SUMS )
+            ;;
+    esac
+    mkdir -p "$rp_out"
+    # Bare filenames (no ./ prefix) like the release workflow's packaging.
+    ( cd "$rp_stage" && tar -czf "$rp_out/$rp_name-$rp_ver-$rp_tgt.rpix" $(ls) )
+    ( cd "$rp_out" && $SHA256TOOL "$rp_name-$rp_ver-$rp_tgt.rpix" >"$rp_name-$rp_ver-$rp_tgt.rpix.sha256" )
+}
+
+# make_fake_bundle <release-root> <version> <target> <profile> [mode]
+# mode applies to the first plugin: ok | bad-plugin-sidecar | escape | extra |
+# badsum | missingentry | abi2 | minhost-new | minhost-pre | minhost-bad
+make_fake_bundle() {
+    _root=$1 _ver=$2 _tgt=$3 _profile=$4 _mode=${5:-ok}
+    _stage=$TMP/bundle-$_ver-$_tgt-$_profile-$_mode
+    rm -rf "$_stage"
+    mkdir -p "$_stage/extensions"
+    printf '#!/bin/sh\necho "rpi fake %s %s %s"\n' "$_ver" "$_tgt" "$_profile" >"$_stage/rpi"
+    chmod 755 "$_stage/rpi"
+    if [ "$_profile" = full ]; then
+        _plugins=$FULL_PLUGINS
+    else
+        _plugins=$STANDARD_PLUGINS
+    fi
+    _first=$STANDARD_PLUGINS
+    _first=${_first%% *}
+    for _p in $_plugins; do
+        _min=""
+        _abi=1
+        _pmode=ok
+        if [ "$_p" = "$_first" ]; then
+            case $_mode in
+                bad-plugin-sidecar) _pmode=ok ;;
+                escape | extra | badsum | missingentry) _pmode=$_mode ;;
+                abi2) _abi=2 ;;
+                minhost-new) _min=0.1.999 ;;
+                minhost-pre) _min=0.0.0-rc.1 ;;
+                minhost-bad) _min=not-a-version ;;
+            esac
+        fi
+        make_fake_rpix "$_stage/extensions" "$_p" "$_ver" "$_tgt" "$_min" "$_abi" "$_pmode"
+        if [ "$_p" = "$_first" ] && [ "$_mode" = bad-plugin-sidecar ]; then
+            printf '%064d  %s-%s-%s.rpix\n' 0 "$_p" "$_ver" "$_tgt" \
+                >"$_stage/extensions/$_p-$_ver-$_tgt.rpix.sha256"
+        fi
+    done
+    {
+        printf '{\n  "packages": ['
+        _sep=""
+        for _p in $_plugins; do
+            printf '%s\n    "%s"' "$_sep" "$_p"
+            _sep=","
+        done
+        printf '\n  ]'
+        if echo " $_plugins " | grep -q ' rpi-statusline '; then
+            printf ',\n  "statusLine": {\n    "type": "items",\n    "items": ["live-total-tokens"]\n  }'
+        fi
+        printf '\n}\n'
+    } >"$_stage/settings.defaults.json"
+    _out=$_root/releases/download/v$_ver
+    mkdir -p "$_out"
+    rm -f "$_out/rpi-$_ver-$_tgt-$_profile.tar.gz"*
+    tar -czf "$_out/rpi-$_ver-$_tgt-$_profile.tar.gz" -C "$_stage" rpi settings.defaults.json extensions
+    ( cd "$_out" && $SHA256TOOL "rpi-$_ver-$_tgt-$_profile.tar.gz" \
+        >"rpi-$_ver-$_tgt-$_profile.tar.gz.sha256" )
+}
+
+# make_unsafe_bundle <release-root> <version> <target> <profile>
+make_unsafe_bundle() {
+    _root=$1 _ver=$2 _tgt=$3 _profile=$4
+    _stage=$TMP/unsafe-bundle-$_ver-$_tgt
+    rm -rf "$_stage"
+    mkdir -p "$_stage"
+    printf '#!/bin/sh\necho unsafe\n' >"$_stage/rpi"
+    chmod 755 "$_stage/rpi"
+    printf 'escape\n' >"$_stage/evil"
+    _out=$_root/releases/download/v$_ver
+    mkdir -p "$_out"
+    # GNU tar refuses to append to a compressed archive, so use Python's
+    # tarfile to emit a deliberately unsafe member name.
+    python3 - "$_out/rpi-$_ver-$_tgt-$_profile.tar.gz" "$_stage" <<'PYEOF'
+import sys, tarfile, os
+out, stage = sys.argv[1], sys.argv[2]
+with tarfile.open(out, "w:gz") as archive:
+    archive.add(os.path.join(stage, "rpi"), arcname="rpi")
+    archive.add(os.path.join(stage, "evil"), arcname="../evil")
+PYEOF
+    ( cd "$_out" && $SHA256TOOL "rpi-$_ver-$_tgt-$_profile.tar.gz" \
+        >"rpi-$_ver-$_tgt-$_profile.tar.gz.sha256" )
+}
+
+# write_profile_index <file> <version> <asset> <sha> [<asset> <sha> ...]
+write_profile_index() {
+    _file=$1 _ver=$2
+    shift 2
+    mkdir -p "${_file%/*}"
+    {
+        printf '{\n  "schemaVersion": 1,\n  "version": "%s",\n  "assets": {\n' "$_ver"
+        _sep=""
+        while [ $# -ge 2 ]; do
+            printf '%s    "%s": "%s"' "$_sep" "$1" "$2"
+            _sep=",
+"
+            shift 2
+        done
+        printf '\n  }\n}\n'
+    } >"$_file"
+}
+
+sha_of() { # sha_of <dir> <basename>
+    ( cd "$1" && $SHA256TOOL "$2" | sed 's/[[:space:]].*//' )
+}
+
 # Assets for the good release: host target (gnu or musl as detected) + musl
 # variant (for the --musl case) on Linux; darwin target on macOS.
 make_fake_archive "$VERSION" "$HOST_TARGET"
 if [ "$host_os" = Linux ] && [ "$MUSL_TARGET" != "$HOST_TARGET" ]; then
     make_fake_archive "$VERSION" "$MUSL_TARGET"
 fi
+
+# Dynamic profile bundles and the musl static fallback.
+make_fake_bundle "$WWW" "$VERSION" "$HOST_TARGET" standard
+make_fake_bundle "$WWW" "$VERSION" "$HOST_TARGET" full
+if [ "$host_os" = Linux ]; then
+    make_fake_bundle "$WWW" "$VERSION" "$MUSL_TARGET" standard
+    make_fake_bundle "$WWW" "$VERSION" "$MUSL_TARGET" full
+    _static_stage=$TMP/static-stage
+    mkdir -p "$_static_stage"
+    printf '#!/bin/sh\necho "rpi fake static"\n' >"$_static_stage/rpi"
+    chmod 755 "$_static_stage/rpi"
+    tar -czf "$WWW/releases/download/v$VERSION/rpi-$VERSION-$MUSL_TARGET-static.tar.gz" \
+        -C "$_static_stage" rpi
+    ( cd "$WWW/releases/download/v$VERSION" && \
+        $SHA256TOOL "rpi-$VERSION-$MUSL_TARGET-static.tar.gz" \
+        >"rpi-$VERSION-$MUSL_TARGET-static.tar.gz.sha256" )
+fi
+
+# Healthy rpi-pages profile index for the fake release.
+_index_dir=$WWW/api/install-profiles
+_index_args=""
+for _t in "$HOST_TARGET" $([ "$host_os" = Linux ] && [ "$MUSL_TARGET" != "$HOST_TARGET" ] && echo "$MUSL_TARGET"); do
+    [ -n "$_t" ] || continue
+    for _prof in standard full; do
+        _a=rpi-$VERSION-$_t-$_prof.tar.gz
+        _s=$(sha_of "$WWW/releases/download/v$VERSION" "$_a")
+        _index_args="$_index_args $_a $_s"
+    done
+done
+write_profile_index "$_index_dir/$VERSION.json" "$VERSION" $_index_args
 
 # Broken release for the checksum-failure case (endpoint-fallback resolution).
 BAD_VERSION=0.2.0
@@ -142,9 +354,81 @@ printf '{"version": "%s", "packageName": "rpi", "note": "test"}\n' "$VERSION" >"
 
 # ---- serve the fake release ---------------------------------------------------
 
+cat >"$TMP/serve.py" <<'PYEOF'
+# Test HTTP server: plain static files plus Range/If-Range support so the
+# installer's resume path can be exercised end to end. 206 is returned only
+# when the Range request carries an If-Range matching the current ETag (or no
+# If-Range); a stale validator deliberately gets a full 200, mirroring a
+# re-pushed release asset.
+import email.utils
+import hashlib
+import http.server
+import os
+import re
+import sys
+
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def send_file(self, head_only):
+        path = self.translate_path(self.path)
+        if not os.path.isfile(path):
+            self.send_error(404)
+            return
+        with open(path, "rb") as handle:
+            data = handle.read()
+        etag = '"%s"' % hashlib.sha256(data).hexdigest()[:32]
+        last_modified = email.utils.formatdate(os.path.getmtime(path), usegmt=True)
+        status = 200
+        start, end = 0, len(data) - 1
+        range_header = self.headers.get("Range")
+        if_range = self.headers.get("If-Range")
+        if range_header and (if_range is None or if_range == etag):
+            match = re.match(r"bytes=(\d+)-(\d*)$", range_header)
+            if match:
+                start = int(match.group(1))
+                end = int(match.group(2)) if match.group(2) else len(data) - 1
+                if start >= len(data):
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % len(data))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    return
+                end = min(end, len(data) - 1)
+                status = 206
+        body = data[start : end + 1]
+        self.send_response(status)
+        if path.endswith(".sha256"):
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+        else:
+            self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag", etag)
+        self.send_header("Last-Modified", last_modified)
+        self.send_header("Accept-Ranges", "bytes")
+        if status == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, len(data)))
+            self.send_header("Cache-Control", "no-store")
+        else:
+            self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self.send_file(False)
+
+    def do_HEAD(self):
+        self.send_file(True)
+
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+print("Serving HTTP on 127.0.0.1 port %d ..." % server.server_address[1], flush=True)
+server.serve_forever()
+PYEOF
+
 if command -v python3 >/dev/null 2>&1; then
     # -u: unbuffered, so the "Serving HTTP on ... port N" line hits the log
-    (cd "$WWW" && exec python3 -u -m http.server 0 --bind 127.0.0.1) >"$TMP/server.log" 2>&1 &
+    (cd "$WWW" && exec python3 -u "$TMP/serve.py") >"$TMP/server.log" 2>&1 &
     SERVER_PID=$!
     PORT=""
     i=0
@@ -168,15 +452,23 @@ echo "serving fake release via $SERVE_MODE"
 
 # Fake GitHub API document (compact JSON; browser_download_url points at BASE).
 assets_json=""
+add_api_asset() {
+    _n=$1
+    _entry="{\"name\": \"$_n\", \"browser_download_url\": \"$BASE/releases/download/v$VERSION/$_n\"}"
+    _entry_sha="{\"name\": \"$_n.sha256\", \"browser_download_url\": \"$BASE/releases/download/v$VERSION/$_n.sha256\"}"
+    if [ -z "$assets_json" ]; then
+        assets_json="$_entry,$_entry_sha"
+    else
+        assets_json="$assets_json,$_entry,$_entry_sha"
+    fi
+}
 for t in "$HOST_TARGET" $([ "$host_os" = Linux ] && [ "$MUSL_TARGET" != "$HOST_TARGET" ] && echo "$MUSL_TARGET"); do
     [ -n "$t" ] || continue
-    n=rpi-$VERSION-$t.tar.gz
-    entry="{\"name\": \"$n\", \"browser_download_url\": \"$BASE/releases/download/v$VERSION/$n\"}"
-    entry_sha="{\"name\": \"$n.sha256\", \"browser_download_url\": \"$BASE/releases/download/v$VERSION/$n.sha256\"}"
-    if [ -z "$assets_json" ]; then
-        assets_json="$entry,$entry_sha"
-    else
-        assets_json="$assets_json,$entry,$entry_sha"
+    add_api_asset "rpi-$VERSION-$t.tar.gz"
+    add_api_asset "rpi-$VERSION-$t-standard.tar.gz"
+    add_api_asset "rpi-$VERSION-$t-full.tar.gz"
+    if [ "$host_os" = Linux ]; then
+        add_api_asset "rpi-$VERSION-$t-static.tar.gz"
     fi
 done
 printf '{"tag_name": "v%s", "assets": [%s]}\n' "$VERSION" "$assets_json" >"$WWW/api-latest.json"
@@ -291,16 +583,43 @@ check "no manifest left behind" test ! -e "$H5/.local/bin/rpi.install.json"
 
 # ---- 6. --musl asset selection -----------------------------------------------------
 
-if [ "$host_os" = Linux ]; then
+if [ "$host_os" = Linux ] && [ "$MUSL_TARGET" = "$HOST_TARGET" ]; then
+    # musl host: the dynamic musl binary can run; force the dependency probes
+    # so the test does not depend on the CI image's apk packages.
     H6=$TMP/home6
-    expect_ok "install with --musl exits 0" \
+    expect_ok "install with --musl exits 0 (musl host, dynamic)" \
         env HOME="$H6" RPI_GITHUB_API_URL="$API_URL" \
         RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        RPI_INSTALL_HAS_LIBGCC=1 RPI_INSTALL_HAS_LIBSTDCXX=1 \
         sh "$INSTALL_SH" --musl
     check "--musl picks the musl asset ($MUSL_TARGET)" \
         grep -q "\"target\": \"$MUSL_TARGET\"" "$H6/.local/bin/rpi.install.json"
     check "--musl sourceUrl names the musl archive" \
         grep -q "rpi-$VERSION-$MUSL_TARGET.tar.gz" "$H6/.local/bin/rpi.install.json"
+elif [ "$host_os" = Linux ]; then
+    # glibc host: the dynamic musl runtime is unavailable, so --musl must only
+    # proceed with explicit static-fallback consent.
+    H6=$TMP/home6
+    expect_fail "--musl on glibc without consent fails" \
+        env HOME="$H6" RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --musl
+    check "musl runtime guidance is printed" grep -q 'cannot run on this system' "$TMP/last-out"
+    check "static consent guidance is printed" grep -q -- '--static-fallback' "$TMP/last-out"
+    check "no binary after the refused static fallback" test ! -e "$H6/.local/bin/rpi"
+
+    H6B=$TMP/home6b
+    expect_ok "--musl --static-fallback installs the static asset" \
+        env HOME="$H6B" RPI_GITHUB_API_URL="$API_URL" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+        sh "$INSTALL_SH" --musl --static-fallback
+    check "static manifest uses the -static label" \
+        grep -q "\"target\": \"$MUSL_TARGET-static\"" "$H6B/.local/bin/rpi.install.json"
+    check "static sourceUrl names the static archive" \
+        grep -q "rpi-$VERSION-$MUSL_TARGET-static.tar.gz" "$H6B/.local/bin/rpi.install.json"
+    check "static install writes no settings" test ! -e "$H6B/.rpi/agent/settings.json"
+    check "static install summary says it cannot load plugins" \
+        grep -q 'cannot load native plugins' "$TMP/last-out"
 else
     skip "--musl asset selection (Linux-only)"
 fi
@@ -567,6 +886,361 @@ EOF
     else
         skip "pty prompt tests (script -e/timeout/bash unavailable)"
     fi
+fi
+
+# ---- 11. install profiles, bundle integrity, local materialization ----------------
+
+# Reusable invoker: tests override the release/site/api/agent/cache endpoints
+# through RPI_TEST_* without rewriting the whole env for every case.
+RPI_TEST_API=""
+RPI_TEST_RELEASE=""
+RPI_TEST_SITE=""
+RPI_TEST_AGENT=""
+RPI_TEST_CACHE=""
+reset_test_overrides() {
+    RPI_TEST_API=""
+    RPI_TEST_RELEASE=""
+    RPI_TEST_SITE=""
+    RPI_TEST_AGENT=""
+    RPI_TEST_CACHE=""
+}
+run_install() { # run_install <home> <install.sh args...>
+    _home=$1
+    shift
+    env HOME="$_home" \
+        RPI_GITHUB_API_URL="${RPI_TEST_API:-$API_URL}" \
+        RPI_VERSION_CHECK_URL="$ENDPOINT_URL" \
+        RPI_RELEASE_BASE_URL="${RPI_TEST_RELEASE:-$BASE/releases}" \
+        RPI_SITE_BASE_URL="${RPI_TEST_SITE:-$BASE}" \
+        RPI_CODING_AGENT_DIR="${RPI_TEST_AGENT:-}" \
+        RPI_INSTALL_CACHE_DIR="${RPI_TEST_CACHE:-}" \
+        sh "$INSTALL_SH" "$@"
+}
+
+# Request-log helpers: the shared server log lets a case prove what was (and
+# was not) requested.
+log_mark() { wc -l <"$TMP/server.log" | tr -d ' '; }
+log_since() { tail -n +"$(( $1 + 1 ))" "$TMP/server.log"; }
+
+manifest_field() { # manifest_field <manifest> <key>
+    sed -n 's/^[[:space:]]*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -n 1
+}
+
+# 11.1 Non-interactive standard/full without --yes must fail before any
+# profile-index read or artifact download.
+H30=$TMP/home30
+before=$(log_mark)
+expect_fail "standard without consent fails (no TTY)" run_install "$H30" --profile standard
+check "refusal names the consent choices" grep -q 'refusing to install native plugins' "$TMP/last-out"
+check "refusal mentions --yes" grep -q -- '--yes' "$TMP/last-out"
+check "refusal mentions --profile mini" grep -q -- '--profile mini' "$TMP/last-out"
+check "no binary after refusal" test ! -e "$H30/.local/bin/rpi"
+check "no settings after refusal" test ! -e "$H30/.rpi/agent/settings.json"
+check "no profile-index request before consent" \
+    sh -c '! tail -n +$(( $1 + 1 )) "$2" | grep -q "/api/install-profiles/"' _ "$before" "$TMP/server.log"
+
+# 11.2 Trusted standard install: one bundle + sidecar + one index read, six
+# plugins materialized locally, settings seeded.
+H31=$TMP/home31
+before=$(log_mark)
+expect_ok "standard --yes installs the bundle" run_install "$H31" --profile standard --yes
+check "standard manifest version" \
+    test "$(manifest_field "$H31/.local/bin/rpi.install.json" version)" = "$VERSION"
+check "standard manifest target" \
+    test "$(manifest_field "$H31/.local/bin/rpi.install.json" target)" = "$HOST_TARGET"
+check "standard manifest sourceUrl names the bundle" \
+    grep -q "rpi-$VERSION-$HOST_TARGET-standard.tar.gz" "$H31/.local/bin/rpi.install.json"
+check "standard output reports 6/6 plugins" grep -q '6/6 installed' "$TMP/last-out"
+check "standard installs six plugin directories" \
+    test "$(find "$H31/.rpi/agent/extensions" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = 6
+check "standard settings packages entry lists six plugins" \
+    grep -q '"rpi-subagents"' "$H31/.rpi/agent/settings.json"
+check "standard settings carry the statusline default" \
+    grep -q '"statusLine"' "$H31/.rpi/agent/settings.json"
+check "standard settings have no usage plugin" \
+    sh -c '! grep -q "rpi-usage" "$1"' _ "$H31/.rpi/agent/settings.json"
+delta=$(log_since "$before")
+check "exactly one profile-index request" \
+    test "$(printf '%s\n' "$delta" | grep -c '/api/install-profiles/')" = 1
+check "no plugin artifact was downloaded from the network" \
+    sh -c '! printf "%s\n" "$1" | grep -q "\.rpix"' _ "$delta"
+check "the bundle and its sidecar were fetched" \
+    sh -c 'printf "%s\n" "$1" | grep -q "standard.tar.gz" && printf "%s\n" "$1" | grep -q "standard.tar.gz.sha256"' _ "$delta"
+check "installed bundle binary runs" "$H31/.local/bin/rpi"
+
+# 11.3 Full profile adds rpi-usage.
+H32=$TMP/home32
+expect_ok "full --yes installs the bundle" run_install "$H32" --profile full --yes
+check "full output reports 7/7 plugins" grep -q '7/7 installed' "$TMP/last-out"
+check "full settings include rpi-usage" grep -q '"rpi-usage"' "$H32/.rpi/agent/settings.json"
+check "full installs seven plugin directories" \
+    test "$(find "$H32/.rpi/agent/extensions" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = 7
+
+# 11.4 Environment-only profile + consent.
+H33=$TMP/home33
+expect_ok "RPI_INSTALL_PROFILE/RPI_INSTALL_YES installs standard" \
+    env HOME="$H33" RPI_INSTALL_PROFILE=standard RPI_INSTALL_YES=1 \
+    RPI_GITHUB_API_URL="$API_URL" RPI_VERSION_CHECK_URL="$ENDPOINT_URL" \
+    RPI_RELEASE_BASE_URL="$BASE/releases" RPI_SITE_BASE_URL="$BASE" \
+    sh "$INSTALL_SH"
+check "env-driven standard seeded settings" test -f "$H33/.rpi/agent/settings.json"
+
+# 11.5 RPI_CODING_AGENT_DIR is respected.
+H34=$TMP/home34
+AGENT34=$TMP/agent34
+RPI_TEST_AGENT=$AGENT34
+expect_ok "custom agent dir installs standard" run_install "$H34" --profile standard --yes
+check "plugins land in the custom agent dir" \
+    test -d "$AGENT34/extensions/rpi-subagents"
+check "settings land in the custom agent dir" test -f "$AGENT34/settings.json"
+check "HOME agent dir is untouched" test ! -e "$H34/.rpi/agent/settings.json"
+reset_test_overrides
+
+# 11.6 Index failure matrix: missing / version mismatch / missing asset /
+# malformed hash all fail closed; never auto-mini.
+mkdir -p "$WWW/bad-sites/no-index" "$WWW/bad-sites/version/api/install-profiles" \
+    "$WWW/bad-sites/missing/api/install-profiles" "$WWW/bad-sites/hash/api/install-profiles"
+printf '{"schemaVersion": 1, "version": "9.9.9", "assets": {}}\n' \
+    >"$WWW/bad-sites/version/api/install-profiles/$VERSION.json"
+write_profile_index "$WWW/bad-sites/missing/api/install-profiles/$VERSION.json" \
+    "$VERSION" "some-other-asset.tar.gz" "$(printf '%064d' 0)"
+printf '{\n  "schemaVersion": 1,\n  "version": "%s",\n  "assets": {\n    "rpi-%s-%s-standard.tar.gz": "not-a-hash"\n  }\n}\n' \
+    "$VERSION" "$VERSION" "$HOST_TARGET" >"$WWW/bad-sites/hash/api/install-profiles/$VERSION.json"
+
+H35=$TMP/home35
+RPI_TEST_SITE=$BASE/bad-sites/no-index
+expect_fail "missing profile index fails closed" run_install "$H35" --profile standard --yes
+check "missing index explains --profile mini" grep -q -- '--profile mini' "$TMP/last-out"
+check "missing index leaves no binary" test ! -e "$H35/.local/bin/rpi"
+reset_test_overrides
+
+H36=$TMP/home36
+RPI_TEST_SITE=$BASE/bad-sites/version
+expect_fail "index version mismatch fails" run_install "$H36" --profile standard --yes
+check "version mismatch is reported" grep -q 'version mismatch' "$TMP/last-out"
+reset_test_overrides
+
+H37=$TMP/home37
+RPI_TEST_SITE=$BASE/bad-sites/missing
+expect_fail "missing index asset entry fails" run_install "$H37" --profile standard --yes
+check "missing entry is reported" grep -q 'asset entry missing/duplicated' "$TMP/last-out"
+reset_test_overrides
+
+H38=$TMP/home38
+RPI_TEST_SITE=$BASE/bad-sites/hash
+expect_fail "malformed index hash fails" run_install "$H38" --profile standard --yes
+check "malformed hash is reported" grep -q 'asset entry missing/duplicated' "$TMP/last-out"
+reset_test_overrides
+
+# 11.7 Sidecar/index disagreement is fatal (no fallback to a different source).
+mkdir -p "$WWW/bad-sites/mismatch/api/install-profiles"
+write_profile_index "$WWW/bad-sites/mismatch/api/install-profiles/$VERSION.json" \
+    "$VERSION" "rpi-$VERSION-$HOST_TARGET-standard.tar.gz" "$(printf '%064d' 1)"
+H39=$TMP/home39
+RPI_TEST_SITE=$BASE/bad-sites/mismatch
+expect_fail "sidecar/index mismatch is fatal" run_install "$H39" --profile standard --yes
+check "mismatch names the profile index" grep -q 'rpi-pages profile index' "$TMP/last-out"
+check "mismatch leaves no binary" test ! -e "$H39/.local/bin/rpi"
+reset_test_overrides
+
+# 11.8 Inner plugin failures are isolated: the binary installs, the other
+# plugins materialize, the install exits 0 and settings are not seeded.
+variant_release() { # variant_release <mode> <profile>
+    _mode=$1 _prof=${2:-standard}
+    _root=$WWW/variant-$_mode
+    make_fake_bundle "$_root" "$VERSION" "$HOST_TARGET" "$_prof" "$_mode"
+    _asset=rpi-$VERSION-$HOST_TARGET-$_prof.tar.gz
+    _sha=$(sha_of "$_root/releases/download/v$VERSION" "$_asset")
+    write_profile_index "$WWW/variant-$_mode-site/api/install-profiles/$VERSION.json" \
+        "$VERSION" "$_asset" "$_sha"
+    RPI_TEST_API=$DEAD_URL
+    RPI_TEST_RELEASE=$BASE/variant-$_mode/releases
+    RPI_TEST_SITE=$BASE/variant-$_mode-site
+}
+
+H40=$TMP/home40
+variant_release bad-plugin-sidecar
+expect_ok "one bad plugin sidecar keeps the binary and exits 0" run_install "$H40" --profile standard --yes
+check "bad plugin sidecar warns 1 of 6" grep -q '1 of 6 plugins failed' "$TMP/last-out"
+check "bad plugin sidecar installs the binary" test -x "$H40/.local/bin/rpi"
+check "bad plugin sidecar still installs five plugins" \
+    test "$(find "$H40/.rpi/agent/extensions" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = 5
+check "partial plugin failure skips settings seeding" \
+    test ! -e "$H40/.rpi/agent/settings.json"
+reset_test_overrides
+
+for _case in abi2 minhost-new minhost-bad escape extra badsum missingentry; do
+    _h=$TMP/home-plugin-$_case
+    variant_release "$_case"
+    expect_ok "plugin case $_case is isolated (exit 0)" run_install "$_h" --profile standard --yes
+    check "plugin case $_case warns 1 of 6" grep -q '1 of 6 plugins failed' "$TMP/last-out"
+    check "plugin case $_case keeps the binary" test -x "$_h/.local/bin/rpi"
+    check "plugin case $_case leaves no .tmp/.old residue" \
+        test "$(find "$_h/.rpi/agent/extensions" -maxdepth 1 \( -name '*.tmp-*' -o -name '*.old-*' \) | wc -l | tr -d ' ')" = 0
+    if [ "$_case" = escape ]; then
+        check "escape rpix writes nothing outside the plugin temp dir" \
+            test ! -e "$_h/.rpi/agent/extensions/evil"
+    fi
+    reset_test_overrides
+done
+
+H41=$TMP/home41
+variant_release minhost-pre
+expect_ok "prerelease minHostVersion below the bundle is accepted" run_install "$H41" --profile standard --yes
+check "prerelease minHostVersion installs 6/6" grep -q '6/6 installed' "$TMP/last-out"
+reset_test_overrides
+
+# 11.9 Unsafe outer archive is fatal before anything is written.
+make_unsafe_bundle "$WWW/variant-unsafe-outer" "$VERSION" "$HOST_TARGET" standard
+_unsafe_asset=rpi-$VERSION-$HOST_TARGET-standard.tar.gz
+_unsafe_sha=$(sha_of "$WWW/variant-unsafe-outer/releases/download/v$VERSION" "$_unsafe_asset")
+write_profile_index "$WWW/variant-unsafe-outer-site/api/install-profiles/$VERSION.json" \
+    "$VERSION" "$_unsafe_asset" "$_unsafe_sha"
+H42=$TMP/home42
+RPI_TEST_API=$DEAD_URL
+RPI_TEST_RELEASE=$BASE/variant-unsafe-outer/releases
+RPI_TEST_SITE=$BASE/variant-unsafe-outer-site
+expect_fail "unsafe outer archive is fatal" run_install "$H42" --profile standard --yes
+check "unsafe outer archive is reported" grep -q 'unsafe archive member' "$TMP/last-out"
+check "unsafe outer archive leaves no binary" test ! -e "$H42/.local/bin/rpi"
+reset_test_overrides
+
+# 11.10 Existing settings are byte-for-byte untouched (and a second run stays
+# idempotent).
+H43=$TMP/home43
+mkdir -p "$H43/.rpi/agent"
+printf '{\n  "packages": [],\n  "theme": "custom"\n}\n' >"$H43/.rpi/agent/settings.json"
+_settings_before=$(sha_of "$H43/.rpi/agent" settings.json)
+expect_ok "existing settings install still materializes plugins" run_install "$H43" --profile standard --yes
+check "existing settings are byte-identical" \
+    test "$(sha_of "$H43/.rpi/agent" settings.json)" = "$_settings_before"
+check "existing settings are reported as untouched" grep -q 'left untouched' "$TMP/last-out"
+expect_ok "second standard install succeeds" run_install "$H43" --profile standard --yes
+check "second install keeps settings byte-identical" \
+    test "$(sha_of "$H43/.rpi/agent" settings.json)" = "$_settings_before"
+
+# 11.11 Upgrade failure keeps the previous binary and manifest.
+H44=$TMP/home44
+expect_ok "baseline mini install" run_install "$H44" --profile mini
+_bin_before=$(sha_of "$H44/.local/bin" rpi)
+_manifest_before=$(sha_of "$H44/.local/bin" rpi.install.json)
+RPI_TEST_SITE=$BASE/bad-sites/mismatch
+expect_fail "failed upgrade exits non-zero" run_install "$H44" --profile standard --yes
+check "failed upgrade keeps the old binary" \
+    test "$(sha_of "$H44/.local/bin" rpi)" = "$_bin_before"
+check "failed upgrade keeps the old manifest" \
+    test "$(sha_of "$H44/.local/bin" rpi.install.json)" = "$_manifest_before"
+reset_test_overrides
+
+# 11.12 Static fallback refuses to replace a binary that has existing native
+# plugins (only reachable on a glibc host, where --musl means static).
+if [ "$host_os" = Linux ] && [ "$MUSL_TARGET" != "$HOST_TARGET" ]; then
+    H45=$TMP/home45
+    mkdir -p "$H45/.rpi/agent/extensions/existing"
+    printf '{\n  "name": "existing",\n  "version": "0.1.0",\n  "native": "libexisting.so",\n  "rpiAbi": 1\n}\n' \
+        >"$H45/.rpi/agent/extensions/existing/rpi-extension.json"
+    printf 'so\n' >"$H45/.rpi/agent/extensions/existing/libexisting.so"
+    expect_fail "static fallback refuses existing native plugins" \
+        run_install "$H45" --musl --static-fallback
+    check "native precheck lists the plugin directory" grep -q 'existing native plugins' "$TMP/last-out"
+    check "native precheck does not delete the plugin" \
+        test -f "$H45/.rpi/agent/extensions/existing/libexisting.so"
+    check "native precheck leaves no binary" test ! -e "$H45/.local/bin/rpi"
+else
+    skip "static fallback native-plugin precheck (needs a glibc host with --musl)"
+fi
+
+# 11.13 --static-fallback is consent, not a force switch: the dynamic build
+# wins when it is usable.
+if [ "$HOST_TARGET" != "$MUSL_TARGET" ]; then
+    H46=$TMP/home46
+    expect_ok "static consent is ignored when dynamic is usable" \
+        run_install "$H46" --profile mini --static-fallback
+    check "dynamic asset installed despite static consent" \
+        grep -q "rpi-$VERSION-$HOST_TARGET.tar.gz" "$H46/.local/bin/rpi.install.json"
+    check "ignored static consent is explained" grep -q 'fallback is ignored' "$TMP/last-out"
+else
+    skip "static consent ignored when dynamic is usable (musl host)"
+fi
+
+# 11.14 Resume: a partial cache entry with the matching validator resumes with
+# a 206; a stale validator forces a clean 200 restart.
+HOST_ARCHIVE=rpi-$VERSION-$HOST_TARGET.tar.gz
+_full_sha=$(sha_of "$WWW/releases/download/v$VERSION" "$HOST_ARCHIVE")
+_full_size=$(wc -c <"$WWW/releases/download/v$VERSION/$HOST_ARCHIVE" | tr -d ' ')
+_half=$((_full_size / 2))
+_etag=$(printf '"%s"' "$(printf '%s' "$_full_sha" | cut -c1-32)")
+
+seed_partial_cache() { # seed_partial_cache <cachedir> <etag>
+    mkdir -p "$1/parts"
+    head -c "$_half" "$WWW/releases/download/v$VERSION/$HOST_ARCHIVE" >"$1/parts/$HOST_ARCHIVE"
+    {
+        printf 'sha=%s\nasset=%s\nversion=%s\netag=%s\nlast_modified=\nurl=%s\n' \
+            "$_full_sha" "$HOST_ARCHIVE" "$VERSION" "$2" \
+            "$BASE/releases/download/v$VERSION/$HOST_ARCHIVE"
+    } >"$1/parts/$HOST_ARCHIVE.meta"
+}
+
+CACHE47=$TMP/cache47
+seed_partial_cache "$CACHE47" "$_etag"
+H47=$TMP/home47
+RPI_TEST_CACHE=$CACHE47
+before=$(log_mark)
+expect_ok "matching-validator resume succeeds" run_install "$H47" --profile mini
+delta=$(log_since "$before")
+check "resume used a Range request with 206" \
+    sh -c 'printf "%s\n" "$1" | grep -q " 206 "' _ "$delta"
+check "resume did not restart from zero" \
+    sh -c '! grep -q "restarting from zero" "$1"' _ "$TMP/last-out"
+check "resumed archive verifies" test -x "$H47/.local/bin/rpi"
+reset_test_overrides
+
+CACHE48=$TMP/cache48
+seed_partial_cache "$CACHE48" '"stale-validator"'
+H48=$TMP/home48
+RPI_TEST_CACHE=$CACHE48
+expect_ok "stale-validator resume restarts and succeeds" run_install "$H48" --profile mini
+check "stale validator warns about the restart" grep -q 'ignored the range request' "$TMP/last-out"
+check "stale-validator download still verifies" test -x "$H48/.local/bin/rpi"
+reset_test_overrides
+
+# 11.15 Semver comparison vectors (sourced helper mode; no install).
+if ( set --
+    RPI_INSTALL_TEST_SOURCE=1 . "$INSTALL_SH"
+    expect_semver() {
+        a=$1 b=$2 want=$3
+        _rc=0
+        semver_le "$a" "$b" || _rc=$?
+        case $_rc in
+            0) got=le ;;
+            1) got=gt ;;
+            *) got=invalid ;;
+        esac
+        if [ "$got" != "$want" ]; then
+            printf 'semver %s vs %s: got %s want %s\n' "$a" "$b" "$got" "$want" >&2
+            return 1
+        fi
+    }
+    expect_semver 0.1.0 0.1.0 le &&
+    expect_semver 0.1.0-rc.1 0.1.0 le &&
+    expect_semver 0.1.0 0.1.0-rc.1 gt &&
+    expect_semver 0.1.0-rc.1 0.1.0-rc.2 le &&
+    expect_semver 0.1.0-rc.2 0.1.0-rc.10 le &&
+    expect_semver 0.1.0-alpha 0.1.0-beta le &&
+    expect_semver 0.1.0-alpha 0.1.0-alpha.1 le &&
+    expect_semver 0.1.0-alpha.1 0.1.0-alpha gt &&
+    expect_semver 0.1.0+build.1 0.1.0 le &&
+    expect_semver 1.0.0 0.9.9 gt &&
+    expect_semver 0.1.8-rc.3 0.1.8 le &&
+    expect_semver 0.1.8 0.1.8-rc.3 gt &&
+    expect_semver bad 0.1.0 invalid &&
+    expect_semver 1.0 0.1.0 invalid &&
+    expect_semver 01.0.0 0.1.0 invalid &&
+    expect_semver 0.1.0-01 0.1.0 invalid
+); then
+    pass "semver comparison vectors"
+else
+    fail "semver comparison vectors"
 fi
 
 # ---- summary ------------------------------------------------------------------------
