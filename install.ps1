@@ -1468,6 +1468,7 @@ try {
     }
 
     Write-Host ''
+    $script:LastDownloadUrl = ''
     try {
         $archivePath = Invoke-AssetDownload -Asset $AssetName -Urls @($candidates) `
             -ExpectedSha $expectedSha -PartsDir $partsDir
