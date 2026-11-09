@@ -51,17 +51,33 @@ if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     exit 1
 }
 
+function Get-FirstCommand {
+    # A Windows runner can expose `python` twice (hosted tool cache + the Store
+    # alias); a multiple-match Get-Command returns an array, and binding that to
+    # Start-Process -FilePath turns into an unusable joined path. Take the first
+    # PATH candidate only.
+    param([string]$Name)
+    $found = @(Get-Command $Name -ErrorAction SilentlyContinue)
+    if ($found.Count -gt 0) { return $found[0] }
+    return $null
+}
+
 if ($env:OS -eq 'Windows_NT') {
-    $python = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $python) { $python = Get-Command python3 -ErrorAction SilentlyContinue }
+    $python = Get-FirstCommand 'python'
+    if (-not $python) { $python = Get-FirstCommand 'python3' }
 } else {
-    $python = Get-Command python3 -ErrorAction SilentlyContinue
-    if (-not $python) { $python = Get-Command python -ErrorAction SilentlyContinue }
+    $python = Get-FirstCommand 'python3'
+    if (-not $python) { $python = Get-FirstCommand 'python' }
 }
 if (-not $python) {
     Write-Host 'ok - PowerShell main-flow tests # SKIP (python3/python unavailable)'
     exit 0
 }
+# `.Source` is the full path on ApplicationInfo in both editions; fall back in
+# case a future shim exposes the command through another CommandInfo type.
+$pythonExe = [string]$python.Source
+if (-not $pythonExe) { $pythonExe = [string]$python.Path }
+if (-not $pythonExe) { $pythonExe = [string]$python.Definition }
 
 if ($PSVersionTable.PSVersion.Major -ge 6) {
     $shellExe = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
@@ -190,12 +206,35 @@ function Write-ReleaseTree {
     [IO.File]::WriteAllText((Join-Path $indexDir "$Version.json"), ($index | ConvertTo-Json -Depth 5))
 }
 
+function Read-SharedText {
+    # Windows keeps the Start-Process redirection files open with write access,
+    # so [IO.File]::ReadAllText (which asks for FileShare.Read and therefore
+    # denies writers) fails with "file is being used by another process" while
+    # the child runs. Open with FileShare.ReadWrite instead and return '' on any
+    # transient failure so callers keep polling.
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return '' }
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $reader = New-Object System.IO.StreamReader($stream)
+            try { return [string]$reader.ReadToEnd() } finally { $reader.Dispose() }
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {
+        return ''
+    }
+}
+
 function Start-TestServer {
     param([string]$Root, [string]$Mode = 'normal')
     $log = Join-Path $Root 'server.log'
     $marker = Join-Path $Root 'server.marker'
+    $portFile = Join-Path $Root 'server.port'
     $stdout = Join-Path $Root 'server.out'
     $stderr = Join-Path $Root 'server.err'
+    Remove-Item -LiteralPath $portFile -ErrorAction SilentlyContinue
     $script:savedEnv['RPI_TEST_ROOT'] = $env:RPI_TEST_ROOT
     $script:savedEnv['RPI_TEST_MODE'] = $env:RPI_TEST_MODE
     $script:savedEnv['RPI_TEST_LOG'] = $env:RPI_TEST_LOG
@@ -204,7 +243,7 @@ function Start-TestServer {
     $env:RPI_TEST_MODE = $Mode
     $env:RPI_TEST_LOG = $log
     $env:RPI_TEST_MARKER = $marker
-    $proc = Start-Process -FilePath $python.Source -ArgumentList ('-u "' + $serverScript + '"') `
+    $proc = Start-Process -FilePath $pythonExe -ArgumentList ('-u "' + $serverScript + '"') `
         -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     $env:RPI_TEST_ROOT = $script:savedEnv['RPI_TEST_ROOT']
     $env:RPI_TEST_MODE = $script:savedEnv['RPI_TEST_MODE']
@@ -212,26 +251,22 @@ function Start-TestServer {
     $env:RPI_TEST_MARKER = $script:savedEnv['RPI_TEST_MARKER']
     $port = 0
     for ($i = 0; $i -lt 100; $i++) {
-        if (Test-Path -LiteralPath $stdout) {
-            $text = ''
-            try {
-                $raw = [IO.File]::ReadAllText($stdout)
-                if ($null -ne $raw) { $text = [string]$raw }
-            } catch { }
-            if ($text.Length -gt 0) {
-                $match = [regex]::Match($text, 'PORT=(\d+)')
-                if ($match.Success) { $port = [int]$match.Groups[1].Value; break }
-            }
+        # The port file is written once and closed, so it is readable on every
+        # platform; the redirection file is the fallback for old launches.
+        $text = Read-SharedText -Path $portFile
+        if ($text.Length -eq 0) { $text = Read-SharedText -Path $stdout }
+        if ($text.Length -gt 0) {
+            $match = [regex]::Match($text, 'PORT=(\d+)')
+            if ($match.Success) { $port = [int]$match.Groups[1].Value; break }
         }
         Start-Sleep -Milliseconds 100
     }
     if ($port -le 0) {
-        $err = ''
-        if (Test-Path -LiteralPath $stderr) {
-            try { $err = [string][IO.File]::ReadAllText($stderr) } catch { $err = '' }
-        }
+        $err = Read-SharedText -Path $stderr
+        $state = 'still running'
+        try { if ($proc.HasExited) { $state = "exit=$($proc.ExitCode)" } } catch { $state = 'state unknown' }
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-        throw "test HTTP server did not start: $err"
+        throw "test HTTP server did not start ($pythonExe $state): $err"
     }
     return [pscustomobject]@{ Process = $proc; Port = $port; Log = $log; Marker = $marker; BaseUrl = "http://127.0.0.1:$port" }
 }
@@ -399,7 +434,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-print("PORT=%d" % server.server_address[1], flush=True)
+# Publish the port twice: stdout is unreadable on Windows while the parent keeps
+# the redirection file locked, so the closed port file is the primary signal.
+port = server.server_address[1]
+with open(os.path.join(ROOT, "server.port"), "w") as handle:
+    handle.write("PORT=%d\n" % port)
+print("PORT=%d" % port, flush=True)
 server.serve_forever()
 '@)
 
@@ -444,7 +484,7 @@ try {
         if ($result.ExitCode -ne 0) {
             Write-Host '--- mini install output ---'
             Write-Host $result.Output
-            if (Test-Path -LiteralPath $normal.Log) { Write-Host '--- server log ---'; Get-Content -LiteralPath $normal.Log }
+            if (Test-Path -LiteralPath $normal.Log) { Write-Host '--- server log ---'; Write-Host (Read-SharedText -Path $normal.Log) }
         }
         Check-Equal '0' ([string]$result.ExitCode) 'mini install exits 0'
         Check-True (Test-Path -LiteralPath (Join-Path $miniPrefix 'rpi.exe')) 'mini installs the binary'
@@ -637,7 +677,7 @@ try {
             [IO.File]::WriteAllText((Join-Path $parts "$($mini.Name).meta"), (($metaLines -join "`n") + "`n"))
             $result = Invoke-Installer -Prefix $resumePrefix -ProfileName 'mini' `
                 -Env (New-InstallEnv -BaseUrl $resume.BaseUrl -AgentDir (Join-Path $tempRoot 'agent-resume') -CacheDir $resumeCache)
-            $resumeLog = if (Test-Path -LiteralPath $resume.Log) { Get-Content -LiteralPath $resume.Log -Raw } else { '' }
+            $resumeLog = Read-SharedText -Path $resume.Log
             Check-Equal '0' ([string]$result.ExitCode) '206 without a validator restarts and succeeds'
             Check-True ($result.Output -match 'restarting from zero') '206 without a validator is reported as a restart'
             Check-True ($resumeLog -match ' 206 ') 'the first resume request used 206'
@@ -661,8 +701,8 @@ try {
             $result = Invoke-Installer -Prefix $retryPrefix -ProfileName 'mini' -Env $retryEnv
             Check-Equal '0' ([string]$result.ExitCode) '429 with Retry-After eventually succeeds'
             $zipGets = @()
-            if (Test-Path -LiteralPath $retryTimes) {
-                $zipGets = @(Get-Content -LiteralPath $retryTimes | Where-Object { $_ -match '\.zip HTTP' })
+            foreach ($line in ((Read-SharedText -Path $retryTimes) -split "`n")) {
+                if ($line -match '\.zip HTTP') { $zipGets += $line }
             }
             Check-Equal '2' ([string]$zipGets.Count) '429 archive was requested exactly twice'
             if ($zipGets.Count -ge 2) {
@@ -708,7 +748,7 @@ try {
             $truncateEnv = New-InstallEnv -BaseUrl $truncate.BaseUrl -AgentDir (Join-Path $tempRoot 'agent-truncate') -CacheDir (Join-Path $tempRoot 'cache-truncate')
             $truncateEnv['RPI_INSTALL_ATTEMPTS'] = '3'
             $result = Invoke-Installer -Prefix $truncatePrefix -ProfileName 'mini' -Env $truncateEnv
-            $truncateLog = if (Test-Path -LiteralPath $truncate.Log) { [string](Get-Content -LiteralPath $truncate.Log -Raw) } else { '' }
+            $truncateLog = Read-SharedText -Path $truncate.Log
             Check-Equal '0' ([string]$result.ExitCode) 'truncated first download resumes and succeeds'
             Check-True ($result.Output -match 'download failed|premature|truncat') 'truncated download is reported'
             Check-True ($result.Output -match 'retrying in [0-9]+\.[0-9]{2}s') 'truncation retry uses the jittered backoff'
@@ -755,7 +795,7 @@ try {
                 [Environment]::SetEnvironmentVariable($key, [string]$promptEnv[$key])
             }
             try {
-                $ptyOutput = & $python.Source $ptyScript $shellExe -NoProfile -File $installer -Prefix $promptPrefix 2>&1 | Out-String
+                $ptyOutput = & $pythonExe $ptyScript $shellExe -NoProfile -File $installer -Prefix $promptPrefix 2>&1 | Out-String
                 $ptyCode = $LASTEXITCODE
             } finally {
                 foreach ($key in $saved.Keys) {
