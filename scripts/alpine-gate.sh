@@ -1,7 +1,9 @@
 #!/bin/sh
-# alpine-gate.sh - musl runtime gate for a V18-13 release build.
+# alpine-gate.sh - manual musl runtime gate for a V18-13 release build.
 #
-# Runs INSIDE an Alpine 3.21 container with the repository mounted at /work:
+# NOT part of .github/workflows/build.yml: the build workflow only produces the
+# assets, and runtime verification is done separately after an RC is published
+# (ADR-0042 keeps distribution verification manual). Run it by hand:
 #   docker run --rm -v "$PWD:/work" -w /work alpine:3.21 sh scripts/alpine-gate.sh x86_64
 #
 # x86_64 builds the dynamic binary, the static fallback and all seven native
@@ -30,9 +32,13 @@ esac
 EXT_CRATES=${EXT_CRATES:-"rpi-ext-subagents rpi-ext-smart-fetch rpi-ext-statusline rpi-ext-ask-user-question rpi-ext-todo rpi-ext-plan-mode rpi-ext-usage"}
 
 echo "=== Alpine $(cat /etc/alpine-release) / $ARCH ($TARGET) ==="
+# clang19-dev carries the unversioned /usr/lib/libclang.so that bindgen needs for
+# btls-sys (wreq -> rpi-smart-fetch); Alpine ships libclang only in versioned
+# subpackages. clang19 provides the resource headers libclang parses with.
 apk add --no-cache \
-    bash binutils build-base ca-certificates cmake curl file g++ git jq \
+    bash binutils build-base ca-certificates clang19 clang19-dev cmake curl file g++ git jq \
     linux-headers musl-dev perl pkgconf python3 tar xz zstd >/dev/null
+export LIBCLANG_PATH=/usr/lib
 
 if ! command -v cargo >/dev/null 2>&1; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |

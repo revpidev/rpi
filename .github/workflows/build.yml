@@ -85,38 +85,9 @@ jobs:
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-install-ps1-main.ps1
 
-  alpine-musl:
-    name: Alpine musl runtime gate
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    env:
-      EXT_CRATES: rpi-ext-subagents rpi-ext-smart-fetch rpi-ext-statusline rpi-ext-ask-user-question rpi-ext-todo rpi-ext-plan-mode rpi-ext-usage
-    steps:
-      - uses: actions/checkout@v5.1.0
-
-      - name: Set up QEMU for arm64
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
-      - name: Alpine 3.21 x86_64 runtime gate
-        run: |
-          docker run --rm \
-            -v "$PWD:/work" -w /work \
-            -e "EXT_CRATES=$EXT_CRATES" \
-            alpine:3.21 sh scripts/alpine-gate.sh x86_64 runtime
-
-      - name: Alpine 3.21 aarch64 build/linkage gate (QEMU)
-        run: |
-          docker run --rm --platform linux/arm64 \
-            -v "$PWD:/work" -w /work \
-            -e "EXT_CRATES=$EXT_CRATES" \
-            -e "CARGO_BUILD_JOBS=2" -e "CARGO_INCREMENTAL=0" \
-            alpine:3.21 sh scripts/alpine-gate.sh aarch64 build-only
-
   build:
     name: ${{ matrix.target }}
-    needs: [msrv, installers, alpine-musl]
+    needs: [msrv, installers]
     runs-on: ${{ matrix.os }}
     env:
       # First-party L0 extension crates shipped as .rpix archives in the same
