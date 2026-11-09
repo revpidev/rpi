@@ -7,6 +7,10 @@
 # Read-Host are mocked. Runs on Windows PowerShell 5.1 and PowerShell 7+.
 
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 resolves `ZipArchiveMode`/`ZipArchive` only from the base
+# assembly; loading `System.IO.Compression.FileSystem` alone leaves the type
+# unresolved ("Unable to find type"), which failed the rc.4 Windows 5.1 job.
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $script:Tests = 0
