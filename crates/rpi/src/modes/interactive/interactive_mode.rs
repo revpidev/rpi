@@ -401,6 +401,7 @@ pub async fn run_interactive_mode(
     // first-time-setup UI installs its own below while it is live).
     rpi_tui::recovery::install_panic_hook_for_handle(&mode.ui);
     register_signal_handlers(mode.shutdown_sender());
+    #[cfg(unix)]
     register_sigint_restore();
     mode.run().await;
     0

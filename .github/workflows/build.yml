@@ -2,7 +2,7 @@ name: build
 
 # Build matrix (only toolchains natively supported by GitHub runners; no third-party builders):
 #   - Windows x64        x86_64-pc-windows-msvc     native (bundled MSVC)
-#   - macOS arm64        aarch64-apple-darwin        native (macos-14 arm64 runner)
+#   - macOS arm64        aarch64-apple-darwin        native (macos-15 arm64 runner)
 #   - Linux x64 glibc    x86_64-unknown-linux-gnu    native
 #   - Linux x64 musl     x86_64-unknown-linux-musl   apt musl-tools (musl-gcc); dynamic + plugins
 #   - Linux arm64 musl   aarch64-unknown-linux-musl  cross-rs container (ghcr.io image); dynamic + plugins
@@ -108,7 +108,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
           - target: aarch64-apple-darwin
-            os: macos-14 # arm64 runner
+            os: macos-15 # arm64 runner; macos-14 was retired 2026-11-02
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
           - target: x86_64-unknown-linux-musl
