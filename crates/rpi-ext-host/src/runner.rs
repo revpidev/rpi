@@ -29,15 +29,20 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::BoxFuture;
+
+/// Poison-tolerant mutex lock (the crate's `read`/`write` precedent).
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 use crate::api::{
     EventHandler, ExtensionContext, ExtensionRuntime, HostActions, InsertionMap, LoadedExtension,
-    Unsubscribe,
+    SharedThrottleRegistry, Unsubscribe,
 };
 use crate::types::{
     BoundaryDispatchResult, BoundaryResult, DiagnosticKind, EVENT_AGENT_BEFORE_SETTLE,
@@ -190,6 +195,9 @@ pub struct ExtensionRunnerCore {
     next_listener_id: AtomicU64,
     shortcut_diagnostics: RwLock<Vec<HostDiagnostic>>,
     command_diagnostics: RwLock<Vec<HostDiagnostic>>,
+    /// Runtime-shared coalescing slots; unsubscribe removes its slot and any
+    /// pending payload through the same registry (rpi#78 A1/1.3).
+    throttled: SharedThrottleRegistry,
 }
 
 /// Merge a handler-returned `systemPromptOptions` object onto the current
@@ -241,6 +249,7 @@ impl ExtensionRunnerCore {
         runtime: ExtensionRuntime,
         cwd: String,
     ) -> Self {
+        let throttled = runtime.throttle_registry();
         ExtensionRunnerCore {
             extensions,
             runtime,
@@ -249,6 +258,7 @@ impl ExtensionRunnerCore {
             next_listener_id: AtomicU64::new(0),
             shortcut_diagnostics: RwLock::new(Vec::new()),
             command_diagnostics: RwLock::new(Vec::new()),
+            throttled,
         }
     }
 
@@ -399,6 +409,78 @@ impl ExtensionRunnerCore {
             .any(|ext| ext.has_handlers(event_type))
     }
 
+    // ========================================================================
+    // Opt-in event coalescing (rpi#78 A1/1.3, rpi-own additive)
+    // ========================================================================
+
+    /// Whether `emit` should dispatch now (`Some(payload)`) or hold the payload
+    /// for the flush/next window (`None`).
+    ///
+    /// Trailing coalescing: a registration that passed `throttleMs` to `on`
+    /// receives at most one dispatch per window. The payload of a suppressed
+    /// event replaces any older held payload (cumulative payloads are supersets,
+    /// so the newest one is the only one worth delivering) and is dispatched by
+    /// the next emitting event or by [`Self::flush_throttled`], which the agent
+    /// session calls before `message_end` so a subscriber never sees a stale
+    /// view when the stream settles.
+    fn throttle_payload(
+        &self,
+        event_type: &str,
+        path: &str,
+        id: u64,
+        throttle_ms: u64,
+        payload: Value,
+    ) -> Option<Value> {
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_millis(throttle_ms);
+        let key = (path.to_owned(), event_type.to_owned(), id);
+        let mut slots = lock(&self.throttled);
+        let slot = slots.entry(key).or_default();
+        match slot.last {
+            Some(last) if now.duration_since(last) < window => {
+                slot.pending = Some(payload);
+                None
+            }
+            _ => {
+                slot.last = Some(now);
+                slot.pending = None;
+                Some(payload)
+            }
+        }
+    }
+
+    /// Dispatch every payload held by a coalescing slot of `event_type`
+    /// (rpi#78 A1/1.3), in registration order. Called before `message_end` so
+    /// the trailing payload is never lost when a stream settles.
+    pub async fn flush_throttled(&self, event_type: &str) {
+        let handlers = self.handlers_for(event_type);
+        for (path, id, throttle_ms, handler) in handlers {
+            if throttle_ms == 0 {
+                continue;
+            }
+            let payload = {
+                let key = (path.clone(), event_type.to_owned(), id);
+                let mut slots = lock(&self.throttled);
+                match slots.get_mut(&key).and_then(|slot| slot.pending.take()) {
+                    Some(payload) => {
+                        if let Some(slot) = slots.get_mut(&key) {
+                            slot.last = Some(std::time::Instant::now());
+                        }
+                        Some(payload)
+                    }
+                    None => None,
+                }
+            };
+            let Some(payload) = payload else {
+                continue;
+            };
+            let ctx = self.create_context();
+            if let Err(error) = handler(payload, ctx).await {
+                self.emit_error(ExtensionError::new(&path, event_type, error));
+            }
+        }
+    }
+
     /// Snapshot of `(extension_path, handler)` pairs in dispatch order:
     /// extensions in load order, handlers in registration order within each
     /// extension (runner.ts:792-796).
@@ -416,7 +498,7 @@ impl ExtensionRunnerCore {
     /// onto the Agent's own stream options, so no extension event can be
     /// emitted during that window. If a future registry path starts emitting
     /// extension events, it needs the same skip (see the P1-2 review note).
-    fn handlers_for(&self, event_type: &str) -> Vec<(String, EventHandler)> {
+    fn handlers_for(&self, event_type: &str) -> Vec<(String, u64, u64, EventHandler)> {
         let mut out = Vec::new();
         for ext in &self.extensions {
             if ext.host_call_guard().is_active() {
@@ -427,8 +509,8 @@ impl ExtensionRunnerCore {
                 );
                 continue;
             }
-            for handler in ext.handlers_for(event_type) {
-                out.push((ext.path.clone(), handler));
+            for (id, throttle_ms, handler) in ext.handlers_with_throttle_for(event_type) {
+                out.push((ext.path.clone(), id, throttle_ms, handler));
             }
         }
         out
@@ -753,9 +835,20 @@ impl ExtensionRunnerCore {
         crate::types::stamp_event_type(&mut payload, event_type);
         let mut result: Option<Value> = None;
 
-        for (path, handler) in self.handlers_for(event_type) {
+        for (path, id, throttle_ms, handler) in self.handlers_for(event_type) {
             let ctx = self.create_context();
-            match handler(payload.clone(), ctx).await {
+            // rpi#78 A1/1.3: an opt-in `throttleMs` registration gets trailing
+            // coalescing — at most one dispatch per window, with the newest
+            // payload held for the next one (see `flush_throttled`).
+            let payload = if throttle_ms > 0 {
+                match self.throttle_payload(event_type, &path, id, throttle_ms, payload.clone()) {
+                    Some(payload) => payload,
+                    None => continue,
+                }
+            } else {
+                payload.clone()
+            };
+            match handler(payload, ctx).await {
                 Ok(handler_result) => {
                     if session_before && !handler_result.is_null() {
                         let cancel = handler_result
@@ -803,7 +896,7 @@ impl ExtensionRunnerCore {
         };
         let mut valid = true;
 
-        for (path, handler) in self.handlers_for(event_type) {
+        for (path, _id, _throttle, handler) in self.handlers_for(event_type) {
             let ctx = self.create_context();
             let mut event = base_event.clone();
             if let Value::Object(map) = &mut event {
@@ -881,7 +974,7 @@ impl ExtensionRunnerCore {
             Err(_) => return action,
         };
 
-        for (path, handler) in self.handlers_for(EVENT_CACHE_WARMING_DECISION) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT_CACHE_WARMING_DECISION) {
             let ctx = self.create_context();
             match handler(payload.clone(), ctx).await {
                 Ok(handler_result) => {
@@ -911,7 +1004,7 @@ impl ExtensionRunnerCore {
         let mut current_message = payload.get("message").cloned().unwrap_or(Value::Null);
         let mut modified = false;
 
-        for (path, handler) in self.handlers_for(EVENT_MESSAGE_END) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT_MESSAGE_END) {
             let ctx = self.create_context();
             let mut event = payload.clone();
             if let Value::Object(map) = &mut event {
@@ -956,7 +1049,7 @@ impl ExtensionRunnerCore {
         let mut current_event = payload.clone();
         let mut modified = false;
 
-        for (path, handler) in self.handlers_for(EVENT_TOOL_RESULT) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT_TOOL_RESULT) {
             let ctx = self.create_context();
             match handler(current_event.clone(), ctx).await {
                 Ok(handler_result) => {
@@ -1041,7 +1134,7 @@ impl ExtensionRunnerCore {
         let mut input_modified = false;
         let mut result: Option<Value> = None;
 
-        for (path, handler) in self.handlers_for(EVENT_TOOL_CALL) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT_TOOL_CALL) {
             let ctx = self.create_context();
             let mut event = payload.clone();
             if let Value::Object(map) = &mut event {
@@ -1087,7 +1180,7 @@ impl ExtensionRunnerCore {
     /// cross the JSON dispatch boundary, so over this boundary it is always
     /// invalid) or `{ result }`.
     pub async fn emit_user_bash(&self, payload: Value) -> Result<Option<Value>, ExtensionError> {
-        for (path, handler) in self.handlers_for(EVENT_USER_BASH) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT_USER_BASH) {
             let ctx = self.create_context();
             let handler_result = match handler(payload.clone(), ctx).await {
                 Ok(result) => result,
@@ -1126,7 +1219,7 @@ impl ExtensionRunnerCore {
         // mid-conversation support keep their cached prefix; a changed one
         // gets the replayed prompt/tool checkpoint as one leading system
         // message (runner.ts:1187-1317).
-        for (path, handler) in self.handlers_for(EVENT_CONTEXT) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT_CONTEXT) {
             let ctx = self.create_context();
             let visible_messages: Vec<Value> = current_messages
                 .as_array()
@@ -1170,7 +1263,7 @@ impl ExtensionRunnerCore {
 
         // Phase 2: `context_with_system` handlers see the restored full
         // transcript; their output is sent verbatim (runner.ts:1320-1354).
-        for (path, handler) in self.handlers_for(EVENT_CONTEXT_WITH_SYSTEM) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT_CONTEXT_WITH_SYSTEM) {
             let ctx = self.create_context();
             let had_leading_system_message = current_messages
                 .as_array()
@@ -1222,7 +1315,7 @@ impl ExtensionRunnerCore {
         let mut current_payload = payload;
         const EVENT: &str = "before_provider_request";
 
-        for (path, handler) in self.handlers_for(EVENT) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT) {
             let ctx = self.create_context();
             let event = serde_json::json!({
                 "type": EVENT,
@@ -1250,7 +1343,7 @@ impl ExtensionRunnerCore {
         let mut current_headers = headers;
         const EVENT: &str = "before_provider_headers";
 
-        for (path, handler) in self.handlers_for(EVENT) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT) {
             let ctx = self.create_context();
             let event = serde_json::json!({
                 "type": EVENT,
@@ -1319,7 +1412,7 @@ impl ExtensionRunnerCore {
         let mut messages: Vec<Value> = Vec::new();
         let mut modified = false;
 
-        for (path, handler) in self.handlers_for(EVENT_BEFORE_AGENT_START) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT_BEFORE_AGENT_START) {
             // `ctx.getSystemPrompt()` returns the current (chained) prompt
             // during this emit (runner.ts:1180-1188).
             *write(&current_prompt_cell) = current_render.clone();
@@ -1405,7 +1498,7 @@ impl ExtensionRunnerCore {
         let mut prompt_paths: Vec<Value> = Vec::new();
         let mut theme_paths: Vec<Value> = Vec::new();
 
-        for (path, handler) in self.handlers_for(EVENT) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT) {
             let ctx = self.create_context();
             match handler(payload.clone(), ctx).await {
                 Ok(handler_result) => {
@@ -1446,7 +1539,7 @@ impl ExtensionRunnerCore {
         let mut current_text = original_text.clone();
         let mut current_images = original_images.clone();
 
-        for (path, handler) in self.handlers_for(EVENT_INPUT) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT_INPUT) {
             let ctx = self.create_context();
             let mut event = payload.clone();
             if let Value::Object(map) = &mut event {
@@ -1505,7 +1598,7 @@ impl ExtensionRunnerCore {
         const EVENT: &str = "project_trust";
         let mut errors = Vec::new();
 
-        for (path, handler) in self.handlers_for(EVENT) {
+        for (path, _id, _throttle, handler) in self.handlers_for(EVENT) {
             let ctx = self.create_context();
             match handler(payload.clone(), ctx).await {
                 Ok(handler_result) => {
@@ -1587,5 +1680,64 @@ mod user_bash_validation_tests {
         assert!(is_user_bash_event_result(&json!({
             "result": {"output": "x", "exitCode": 0, "cancelled": false, "truncated": false}
         })));
+    }
+}
+
+#[cfg(test)]
+mod throttle_lifecycle_tests {
+    use super::*;
+    use crate::api::OnUnsubscribe;
+    use crate::host::NativeExtensionHost;
+    use crate::loader::{ExtensionFactory, InlineExtension};
+
+    /// Unsubscribe must release the pending cumulative snapshot immediately;
+    /// waiting for another event would retain it indefinitely (rpi#78 review).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsubscribe_releases_the_pending_slot() {
+        let host = NativeExtensionHost::new("/test-cwd");
+        let unsubscribe: Arc<Mutex<Option<OnUnsubscribe>>> = Arc::new(Mutex::new(None));
+        let saved = Arc::clone(&unsubscribe);
+        let factory: ExtensionFactory = Arc::new(move |api| {
+            let handler: EventHandler =
+                Arc::new(|_payload, _ctx| Box::pin(async { Ok(Value::Null) }));
+            *lock(&saved) = Some(
+                api.on_with_throttle("message_update", handler, 60_000)
+                    .expect("cumulative throttle registration"),
+            );
+            Box::pin(async { Ok(()) })
+        });
+        let errors = host
+            .load_inline(&[InlineExtension::Named {
+                name: "throttle-lifecycle".to_owned(),
+                factory,
+                hidden: false,
+                replaceable: false,
+                builtin: false,
+            }])
+            .await;
+        assert!(errors.is_empty(), "{errors:?}");
+
+        host.emit("message_update", json!({"text": "first"})).await;
+        host.emit("message_update", json!({"text": "latest"})).await;
+        let core = host.core();
+        assert_eq!(lock(&core.throttled).len(), 1);
+        assert!(
+            lock(&core.throttled)
+                .values()
+                .next()
+                .is_some_and(|slot| slot.pending.is_some())
+        );
+
+        lock(&unsubscribe)
+            .as_ref()
+            .expect("unsubscribe")
+            .unsubscribe();
+        assert!(lock(&core.throttled).is_empty());
+        // Idempotent unsubscribe cannot resurrect or retain the slot.
+        lock(&unsubscribe)
+            .as_ref()
+            .expect("unsubscribe")
+            .unsubscribe();
+        assert!(lock(&core.throttled).is_empty());
     }
 }

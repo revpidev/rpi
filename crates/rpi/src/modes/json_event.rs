@@ -40,6 +40,9 @@
 
 use serde_json::{Map, Value};
 
+use rpi_agent::types::AgentEvent;
+use rpi_ai::types::{AssistantContent, SharedAssistantMessage, StreamEvent, ToolCall};
+
 use crate::core::agent_session::AgentSessionEvent;
 
 /// `toJsonEvent` (json-event.ts:46-60): the single conversion point shared
@@ -47,55 +50,209 @@ use crate::core::agent_session::AgentSessionEvent;
 /// or the upstream error string when a `message_update` invariant is
 /// violated (see module docs for the failure-semantics rationale).
 pub fn to_json_event(event: &AgentSessionEvent) -> Result<Value, String> {
-    // AgentSessionEvent is a plain-data serde type; serialization cannot
-    // fail. Fall back to `null` (never reached) instead of panicking.
-    let mut value = serde_json::to_value(event).unwrap_or(Value::Null);
-    if value.get("type").and_then(Value::as_str) != Some("message_update") {
-        return Ok(value);
-    }
-    let Some(object) = value.as_object_mut() else {
-        return Ok(value);
-    };
-    // `message_update` is only emitted for assistant messages during
-    // streaming; upstream throws otherwise (json-event.ts:49-52). Since
-    // V15-13 the payload is `Arc<AssistantMessage>` — non-assistant payloads
-    // are unrepresentable at the type level; the runtime check is retained
-    // as defense in depth for deserialized inputs.
-    if object
-        .get("message")
-        .and_then(|message| message.get("role"))
-        .and_then(Value::as_str)
-        != Some("assistant")
+    // rpi#78 A1: build the delta shape from the typed event directly. The
+    // generic path (`to_value(event)` then strip) serialized the WHOLE
+    // cumulative `message` / `assistantMessageEvent.partial` on every delta —
+    // O(message) per delta and O(n²) per response — even though the wire shape
+    // drops both.
+    if let AgentSessionEvent::Agent(agent) = event
+        && let AgentEvent::MessageUpdate {
+            message,
+            assistant_message_event,
+        } = agent.as_ref()
     {
-        return Err("message_update message is not an assistant message".to_owned());
+        return message_update_payload(message, assistant_message_event);
     }
-    // `{ type, usage, assistantMessageEvent }` — the upstream return
-    // literal (json-event.ts:55-59). `usage` replaces the cumulative
-    // `message`: it is the latest cumulative provider-reported usage and
-    // may remain zero when a provider only reports usage at completion
-    // (docs/json.md:88-90). The role check above guarantees the snapshot
-    // is an assistant message, whose `usage` always serializes.
-    let usage = object
-        .get("message")
-        .and_then(|message| message.get("usage"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let assistant_message_event = match object.get_mut("assistantMessageEvent") {
-        Some(event) => to_json_assistant_message_event(event.take())?,
-        None => Value::Null,
-    };
-    let type_tag = object
-        .remove("type")
-        .unwrap_or_else(|| Value::String("message_update".to_owned()));
+    // AgentSessionEvent is a plain-data serde type; serialization cannot fail.
+    // Fall back to `null` (never reached) instead of panicking.
+    Ok(serde_json::to_value(event).unwrap_or(Value::Null))
+}
+
+/// The delta-only `message_update` shape `{type, usage, assistantMessageEvent}`
+/// (json-event.ts:55-59), shared by the JSON/RPC wire and the additive
+/// `message_update_delta` extension event (rpi#78 A1).
+///
+/// Cost is O(delta): `usage` is a fixed-size snapshot and the assistant event is
+/// rebuilt without its cumulative `partial`, so no caller materializes the whole
+/// accumulated message.
+pub fn message_update_payload(
+    message: &SharedAssistantMessage,
+    event: &StreamEvent,
+) -> Result<Value, String> {
     let mut wire = Map::new();
-    wire.insert("type".to_owned(), type_tag);
-    wire.insert("usage".to_owned(), usage);
-    wire.insert("assistantMessageEvent".to_owned(), assistant_message_event);
-    // Rebuilding the map (instead of `remove` + append) pins the wire key
-    // order to the upstream literal; `preserve_order` keeps insertion order
-    // on the wire.
-    *object = wire;
-    Ok(value)
+    wire.insert(
+        "type".to_owned(),
+        Value::String("message_update".to_owned()),
+    );
+    let usage = message.with(|message| message.usage.clone());
+    wire.insert(
+        "usage".to_owned(),
+        serde_json::to_value(&usage).map_err(|error| error.to_string())?,
+    );
+    wire.insert(
+        "assistantMessageEvent".to_owned(),
+        delta_assistant_message_event(event)?,
+    );
+    Ok(Value::Object(wire))
+}
+
+/// [`to_json_assistant_message_event`] without materializing `partial`.
+///
+/// The hot streaming variants (text/thinking/tool-call deltas and their
+/// starts/ends) are built field by field in the same key order serde produces
+/// (declaration order minus `partial`); anything else falls back to the generic
+/// serialize-and-strip path, so a variant added later stays correct at the old
+/// cost.
+fn delta_assistant_message_event(event: &StreamEvent) -> Result<Value, String> {
+    let mut object = Map::new();
+    match event {
+        StreamEvent::Start { .. } => {
+            object.insert("type".to_owned(), Value::String("start".to_owned()));
+        }
+        StreamEvent::TextStart { content_index, .. } => {
+            object.insert("type".to_owned(), Value::String("text_start".to_owned()));
+            object.insert(
+                "contentIndex".to_owned(),
+                Value::from(*content_index as u64),
+            );
+        }
+        StreamEvent::TextDelta {
+            content_index,
+            delta,
+            ..
+        } => {
+            object.insert("type".to_owned(), Value::String("text_delta".to_owned()));
+            object.insert(
+                "contentIndex".to_owned(),
+                Value::from(*content_index as u64),
+            );
+            object.insert("delta".to_owned(), Value::String(delta.clone()));
+        }
+        StreamEvent::TextEnd {
+            content_index,
+            content,
+            ..
+        } => {
+            object.insert("type".to_owned(), Value::String("text_end".to_owned()));
+            object.insert(
+                "contentIndex".to_owned(),
+                Value::from(*content_index as u64),
+            );
+            object.insert("content".to_owned(), Value::String(content.clone()));
+        }
+        StreamEvent::ThinkingStart { content_index, .. } => {
+            object.insert(
+                "type".to_owned(),
+                Value::String("thinking_start".to_owned()),
+            );
+            object.insert(
+                "contentIndex".to_owned(),
+                Value::from(*content_index as u64),
+            );
+        }
+        StreamEvent::ThinkingDelta {
+            content_index,
+            delta,
+            ..
+        } => {
+            object.insert(
+                "type".to_owned(),
+                Value::String("thinking_delta".to_owned()),
+            );
+            object.insert(
+                "contentIndex".to_owned(),
+                Value::from(*content_index as u64),
+            );
+            object.insert("delta".to_owned(), Value::String(delta.clone()));
+        }
+        StreamEvent::ThinkingEnd {
+            content_index,
+            content,
+            ..
+        } => {
+            object.insert("type".to_owned(), Value::String("thinking_end".to_owned()));
+            object.insert(
+                "contentIndex".to_owned(),
+                Value::from(*content_index as u64),
+            );
+            object.insert("content".to_owned(), Value::String(content.clone()));
+        }
+        StreamEvent::ToolCallStart {
+            content_index,
+            partial,
+            ..
+        } => {
+            // Upstream reads the label from the event's own snapshot
+            // (`partial.content[contentIndex]`); indexing is O(1), so the
+            // snapshot is read, never serialized.
+            let (id, tool_name) = partial.with(|partial| {
+                let Some(AssistantContent::ToolCall(tool_call)) =
+                    partial.content.get(*content_index)
+                else {
+                    return Err(format!(
+                        "toolcall_start content at index {content_index} is not a tool call"
+                    ));
+                };
+                Ok((tool_call.id.clone(), tool_call.name.clone()))
+            })?;
+            object.insert(
+                "type".to_owned(),
+                Value::String("toolcall_start".to_owned()),
+            );
+            object.insert(
+                "contentIndex".to_owned(),
+                Value::from(*content_index as u64),
+            );
+            object.insert("id".to_owned(), Value::String(id));
+            object.insert("toolName".to_owned(), Value::String(tool_name));
+        }
+        StreamEvent::ToolCallDelta {
+            content_index,
+            delta,
+            ..
+        } => {
+            object.insert(
+                "type".to_owned(),
+                Value::String("toolcall_delta".to_owned()),
+            );
+            object.insert(
+                "contentIndex".to_owned(),
+                Value::from(*content_index as u64),
+            );
+            object.insert("delta".to_owned(), Value::String(delta.clone()));
+        }
+        StreamEvent::ToolCallEnd {
+            content_index,
+            tool_call,
+            ..
+        } => {
+            object.insert("type".to_owned(), Value::String("toolcall_end".to_owned()));
+            object.insert(
+                "contentIndex".to_owned(),
+                Value::from(*content_index as u64),
+            );
+            object.insert(
+                "toolCall".to_owned(),
+                serde_json::to_value(TaggedToolCallRef(tool_call))
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        other => {
+            let value = serde_json::to_value(other).map_err(|error| error.to_string())?;
+            return to_json_assistant_message_event(value);
+        }
+    }
+    Ok(Value::Object(object))
+}
+
+/// Borrowing adapter for the canonical standalone `ToolCall` serde shape.
+/// Unlike serializing the whole `ToolCallEnd`, this never touches `partial`.
+struct TaggedToolCallRef<'a>(&'a ToolCall);
+
+impl serde::Serialize for TaggedToolCallRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        rpi_ai::types::tagged_tool_call::serialize(self.0, serializer)
+    }
 }
 
 /// `toJsonAssistantMessageEvent` (json-event.ts:18-33): strip the cumulative
@@ -189,7 +346,7 @@ mod tests {
 
     fn message_update(assistant_message_event: StreamEvent) -> AgentSessionEvent {
         AgentSessionEvent::Agent(Box::new(AgentEvent::MessageUpdate {
-            message: std::sync::Arc::new(assistant_message("cumulative")),
+            message: SharedAssistantMessage::new(assistant_message("cumulative")),
             assistant_message_event: std::sync::Arc::new(assistant_message_event),
         }))
     }
@@ -202,7 +359,7 @@ mod tests {
         let event = message_update(StreamEvent::TextDelta {
             content_index: 0,
             delta: "chunk".to_owned(),
-            partial: std::sync::Arc::new(assistant_message("cum")),
+            partial: SharedAssistantMessage::new(assistant_message("cum")),
         });
         let wire = to_json_event(&event).expect("convert");
         assert_eq!(
@@ -243,11 +400,11 @@ mod tests {
             cost: Default::default(),
         };
         let event = AgentSessionEvent::Agent(Box::new(AgentEvent::MessageUpdate {
-            message: std::sync::Arc::new(partial),
+            message: SharedAssistantMessage::new(partial),
             assistant_message_event: std::sync::Arc::new(StreamEvent::TextDelta {
                 content_index: 0,
                 delta: "x".to_owned(),
-                partial: std::sync::Arc::new(assistant_message("cum")),
+                partial: SharedAssistantMessage::new(assistant_message("cum")),
             }),
         }));
         let wire = to_json_event(&event).expect("convert");
@@ -274,7 +431,7 @@ mod tests {
         })];
         let event = message_update(StreamEvent::ToolCallStart {
             content_index: 0,
-            partial: std::sync::Arc::new(partial),
+            partial: SharedAssistantMessage::new(partial),
         });
         let wire = to_json_event(&event).expect("convert");
         // `{ ...deltaEvent, id, toolName }` (json-event.ts:28): remaining
@@ -298,7 +455,7 @@ mod tests {
         })];
         let event = message_update(StreamEvent::ToolCallStart {
             content_index: 0,
-            partial: std::sync::Arc::new(partial),
+            partial: SharedAssistantMessage::new(partial),
         });
         assert_eq!(
             to_json_event(&event),
@@ -309,7 +466,7 @@ mod tests {
         // `undefined` upstream).
         let event = message_update(StreamEvent::ToolCallStart {
             content_index: 7,
-            partial: std::sync::Arc::new(assistant_message("cum")),
+            partial: SharedAssistantMessage::new(assistant_message("cum")),
         });
         assert_eq!(
             to_json_event(&event),
@@ -317,9 +474,35 @@ mod tests {
         );
     }
 
+    /// The event's own partial remains authoritative; a valid tool call in the
+    /// outer snapshot must not repair a malformed event (rpi#78 review).
+    #[test]
+    fn toolcall_start_does_not_fallback_to_the_outer_message() {
+        let mut outer = assistant_message("outer");
+        outer.content = vec![AssistantContent::ToolCall(ToolCall {
+            id: "outer-tool".to_owned(),
+            name: "bash".to_owned(),
+            arguments: serde_json::Map::new(),
+            thought_signature: None,
+            namespace: None,
+            arguments_error: None,
+        })];
+        let event = AgentSessionEvent::Agent(Box::new(AgentEvent::MessageUpdate {
+            message: SharedAssistantMessage::new(outer),
+            assistant_message_event: std::sync::Arc::new(StreamEvent::ToolCallStart {
+                content_index: 0,
+                partial: SharedAssistantMessage::new(assistant_message("not a tool call")),
+            }),
+        }));
+        assert_eq!(
+            to_json_event(&event),
+            Err("toolcall_start content at index 0 is not a tool call".to_owned())
+        );
+    }
+
     // `message_update_rejects_non_assistant_message` (V13-era negative
     // test) was removed by V15-13 L3: `MessageUpdate` payloads are
-    // `Arc<AssistantMessage>`, so a non-assistant message is unrepresentable
+    // `SharedAssistantMessage`, so a non-assistant message is unrepresentable
     // at the type level — the invariant the test exercised is now enforced
     // by construction (the runtime role check in `to_json_event` stays as
     // defense in depth for deserialized inputs).

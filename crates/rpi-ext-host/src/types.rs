@@ -73,6 +73,10 @@ pub const EVENT_TURN_START: &str = "turn_start";
 pub const EVENT_TURN_END: &str = "turn_end";
 pub const EVENT_MESSAGE_START: &str = "message_start";
 pub const EVENT_MESSAGE_UPDATE: &str = "message_update";
+/// rpi#78 A1 (rpi-own, additive): the delta-only `message_update` payload
+/// `{type, usage, assistantMessageEvent}`. Subscribing to it lets the host skip
+/// materializing the cumulative `message` entirely; `rpiAbi` stays 1.
+pub const EVENT_MESSAGE_UPDATE_DELTA: &str = "message_update_delta";
 pub const EVENT_MESSAGE_END: &str = "message_end";
 pub const EVENT_TOOL_EXECUTION_START: &str = "tool_execution_start";
 pub const EVENT_TOOL_EXECUTION_UPDATE: &str = "tool_execution_update";
@@ -97,7 +101,7 @@ pub const EVENT_MODE_CHANGE: &str = "mode_change";
 /// `mcp_servers_change` after `session_shutdown`) and the version-level ABI
 /// minor bump (V16-06 FR-F/FR-H). V16-05 appends the rpi-own `mode_change`
 /// at the tail (after `input`).
-pub const ALL_EVENTS: [&str; 42] = [
+pub const ALL_EVENTS: [&str; 43] = [
     EVENT_PROJECT_TRUST,
     EVENT_RESOURCES_DISCOVER,
     EVENT_SESSION_START,
@@ -129,6 +133,7 @@ pub const ALL_EVENTS: [&str; 42] = [
     EVENT_TURN_END,
     EVENT_MESSAGE_START,
     EVENT_MESSAGE_UPDATE,
+    EVENT_MESSAGE_UPDATE_DELTA,
     EVENT_MESSAGE_END,
     EVENT_TOOL_EXECUTION_START,
     EVENT_TOOL_EXECUTION_UPDATE,

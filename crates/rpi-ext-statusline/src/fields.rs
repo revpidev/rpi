@@ -413,6 +413,11 @@ pub struct LiveView {
     /// Tiered token count from the model tokenizer or the CJK heuristic.
     /// `None` only for a live view assembled without text data (tests).
     pub tokens: Option<TokenBreakdown>,
+    /// This streaming frame switched the rate's numerator source (estimate ↔
+    /// provider-reported) and therefore measures two different things at once
+    /// (rpi#78 B). The rate row holds the previous reading instead of
+    /// publishing a number that mixes bases.
+    pub rate_source_switched: bool,
 }
 
 impl LiveView {
@@ -772,6 +777,15 @@ fn raw_value(id: FieldId, data: &FieldData) -> Option<FieldValue> {
             if live.streaming && live.decode_ms < MIN_RATE_DECODE_MS {
                 return None;
             }
+            // rpi#78 B: a frame whose numerator source just changed (local
+            // estimate ↔ provider-reported) mixes two measurement bases over
+            // one window; hold the previous reading rather than publish the
+            // jump. The settled frame never suppresses: both numerator and
+            // denominator are frozen there, so the number is the message's
+            // own average.
+            if live.streaming && live.rate_source_switched {
+                return None;
+            }
             if live.decode_ms == 0 {
                 return None;
             }
@@ -1079,6 +1093,7 @@ mod tests {
                     3,
                     TokenSource::Estimated,
                 )),
+                rate_source_switched: false,
             }),
             live_held: Vec::new(),
             git: Some(GitInfo {
@@ -1094,6 +1109,60 @@ mod tests {
             palette: None,
             preview: false,
         }
+    }
+
+    /// rpi#78 B: a streaming frame that switched the rate's numerator source
+    /// (estimate ↔ provider-reported) holds the previous reading instead of
+    /// publishing a ratio that mixes two measurement bases. The settled frame is
+    /// never suppressed: both numerator and denominator are frozen there.
+    #[test]
+    fn rate_holds_across_a_numerator_source_switch() {
+        let mut data = data();
+        let frame =
+            |streaming: bool, output: Option<u64>, exact: Option<u64>, switched: bool| LiveView {
+                streaming,
+                output_tokens: output,
+                output_tokens_exact: exact,
+                decode_ms: 4_000,
+                tokens: Some(TokenBreakdown::from_tiers(
+                    800,
+                    0,
+                    0,
+                    TokenSource::Estimated,
+                )),
+                rate_source_switched: switched,
+            };
+
+        data.live = Some(frame(true, None, None, false));
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &data).unwrap().text,
+            "~200.0 tok/s",
+            "the estimate-based streaming average"
+        );
+
+        // Provider running total arrives → the numerator basis changed.
+        data.live = Some(frame(true, Some(800), None, true));
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &data).unwrap().text,
+            "- tok/s",
+            "the switching frame falls back to the placeholder instead of a mixed-basis rate"
+        );
+
+        // The next frame is back to a single basis.
+        data.live = Some(frame(true, Some(800), None, false));
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &data).unwrap().text,
+            "200.0 tok/s",
+            "the provider-reported average"
+        );
+
+        // Settling is authoritative even when the source changed on that frame.
+        data.live = Some(frame(false, None, Some(800), true));
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &data).unwrap().text,
+            "200.0 tok/s",
+            "the settled rate is the message's own average"
+        );
     }
 
     #[test]
@@ -1171,6 +1240,7 @@ mod tests {
             output_tokens_exact: None,
             decode_ms: 1_000,
             tokens: Some(TokenBreakdown::from_tiers(2, 0, 0, TokenSource::Estimated)),
+            rate_source_switched: false,
         });
         assert_eq!(
             value(FieldId::LiveTotalTokens, &estimated).unwrap().text,
@@ -1364,6 +1434,7 @@ mod tests {
                     3,
                     TokenSource::Estimated,
                 )),
+                rate_source_switched: false,
             }),
             ..data.clone()
         };
@@ -1427,6 +1498,7 @@ mod tests {
             output_tokens_exact: None,
             decode_ms: 1_200,
             tokens: Some(TokenBreakdown::from_tiers(7, 0, 0, TokenSource::Estimated)),
+            rate_source_switched: false,
         });
         assert_eq!(value(FieldId::LiveOutputTokens, &fresh).unwrap().text, "7");
         assert_eq!(
@@ -1473,6 +1545,7 @@ mod tests {
                 output_tokens_exact: Some(3),
                 decode_ms: 150,
                 tokens: Some(TokenBreakdown::from_tiers(2, 1, 0, TokenSource::Estimated)),
+                rate_source_switched: false,
             }),
             ..data()
         };

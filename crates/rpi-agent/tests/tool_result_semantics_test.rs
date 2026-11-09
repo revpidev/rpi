@@ -144,7 +144,7 @@ fn scripted_stream_fn(responses: Vec<AssistantMessage>) -> StreamFn {
         let stream = rpi_ai::utils::event_stream::AssistantMessageEventStream::new();
         let final_message = message.clone();
         stream.push(StreamEvent::Start {
-            partial: Arc::new(message),
+            partial: rpi_ai::types::SharedAssistantMessage::new(message),
         });
         stream.push(StreamEvent::Done {
             reason: DoneReason::Stop,

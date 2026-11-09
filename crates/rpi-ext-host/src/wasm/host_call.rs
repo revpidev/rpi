@@ -212,9 +212,22 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .to_owned();
             let forward = state.forward.clone();
             let dispatch_event = event.clone();
+            // rpi#78 A1/1.3 (additive, rpi-own): only cumulative
+            // `message_update` snapshots may be coalesced. Delta streams and
+            // result-bearing events would lose content or decisions.
+            let throttle_ms = args.get("throttleMs").and_then(Value::as_u64).unwrap_or(0);
+            if throttle_ms > 0 && event != ext::EVENT_MESSAGE_UPDATE {
+                return Err((
+                    "invalidRequest",
+                    format!(
+                        "on: throttleMs is only supported for {}",
+                        ext::EVENT_MESSAGE_UPDATE
+                    ),
+                ));
+            }
             let unsubscribe = state
                 .api
-                .on(
+                .on_with_throttle(
                     &event,
                     Arc::new(move |payload, _ctx| {
                         let forward = forward.clone();
@@ -232,6 +245,7 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                                 .await
                         })
                     }),
+                    throttle_ms,
                 )
                 .map_err(|e| ("stale", e.to_string()))?;
             // #8967 (V15-09): park the unsubscribe in the per-extension pool

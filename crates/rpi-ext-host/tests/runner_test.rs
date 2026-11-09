@@ -2681,12 +2681,23 @@ async fn on_unsubscribe_after_invalidate_is_harmless() {
 /// `on()` overload positions and the rpi-own `mode_change` appends at the
 /// table tail.
 #[test]
-fn all_events_is_additive_42_in_order() {
+fn all_events_is_additive_43_in_order() {
     let events: Vec<&str> = rpi_ext_host::types::ALL_EVENTS.to_vec();
     assert_eq!(
         events.len(),
-        42,
-        "V16-05 appends the rpi-own mode_change tail entry"
+        43,
+        "rpi#78 adds the delta-only message_update variant after message_update"
+    );
+    // rpi#78 A1: the delta variant sits next to its cumulative sibling.
+    let index_of = |name: &str| {
+        events
+            .iter()
+            .position(|event| *event == name)
+            .unwrap_or_else(|| panic!("event {name} missing from ALL_EVENTS"))
+    };
+    assert_eq!(
+        index_of("message_update_delta"),
+        index_of("message_update") + 1
     );
     let index = |name: &str| {
         events
@@ -2938,4 +2949,92 @@ async fn runner_mcp_servers_change_carries_servers() {
         *received.lock().unwrap(),
         vec![json!([{"name": "docs", "enabled": true}])]
     );
+}
+
+/// rpi#78 A1/1.3: a registration that opted into `throttleMs` receives at most
+/// one dispatch per window; suppressed payloads are folded into the next
+/// dispatch and a flush delivers the trailing one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn throttle_ms_coalesces_and_flushes_the_trailing_payload() {
+    let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&received);
+    let host = host_with(vec![inline_ext("throttled", move |api| {
+        let seen = Arc::clone(&seen);
+        api.on_with_throttle(
+            "message_update",
+            json_handler(move |payload| {
+                seen.lock().unwrap().push(payload);
+                Ok(Value::Null)
+            }),
+            60_000,
+        )
+        .unwrap();
+    })])
+    .await;
+
+    // First event dispatches (the window opens), the rest are held.
+    host.emit("message_update", json!({"n": 1})).await;
+    host.emit("message_update", json!({"n": 2})).await;
+    host.emit("message_update", json!({"n": 3})).await;
+    assert_eq!(
+        received.lock().unwrap().len(),
+        1,
+        "only the first event of the window is dispatched: {:?}",
+        received.lock().unwrap()
+    );
+
+    // The flush (called before `message_end`) delivers the newest held payload.
+    host.flush_throttled("message_update").await;
+    {
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 2, "{received:?}");
+        assert_eq!(received[1], json!({"n": 3, "type": "message_update"}));
+    }
+
+    // A flush with nothing held is a no-op.
+    host.flush_throttled("message_update").await;
+    assert_eq!(received.lock().unwrap().len(), 2);
+
+    // Unthrottled registrations are unaffected (per-event dispatch).
+    let plain: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let counter = Arc::clone(&plain);
+    let host = host_with(vec![inline_ext("plain", move |api| {
+        let counter = Arc::clone(&counter);
+        api.on(
+            "message_update",
+            json_handler(move |_payload| {
+                *counter.lock().unwrap() += 1;
+                Ok(Value::Null)
+            }),
+        )
+        .unwrap();
+    })])
+    .await;
+    for _ in 0..3 {
+        host.emit("message_update", json!({})).await;
+    }
+    assert_eq!(*plain.lock().unwrap(), 3);
+}
+
+/// Coalescing is deliberately restricted to cumulative snapshots. Delta
+/// payloads cannot replace one another, and result-bearing events must never
+/// skip a handler decision (rpi#78 review).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn throttle_ms_rejects_delta_and_result_bearing_events() {
+    let host = host_with(vec![inline_ext("unsupported-throttles", |api| {
+        for event in ["message_update_delta", "session_before_compact"] {
+            let error = api
+                .on_with_throttle(event, json_handler(|_| Ok(Value::Null)), 10)
+                .expect_err("unsupported throttle must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("only supported for message_update"),
+                "unexpected error for {event}: {error}"
+            );
+        }
+    })])
+    .await;
+    assert!(!host.has_handlers("message_update_delta"));
+    assert!(!host.has_handlers("session_before_compact"));
 }

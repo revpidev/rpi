@@ -36,9 +36,8 @@
 //!   map (`ToolCall` has no such field in rpi); the JS quirk of
 //!   `undefined += delta` for a delta without a preceding `toolcall_start` is
 //!   not replicated.
-//! - Every event carries a clone of the accumulated partial (Rust ownership);
-//!   upstream events share the same object reference. Observable semantics
-//!   (each event's `partial` shows the accumulated state) are identical.
+//! - Events share one live partial handle, matching upstream object identity;
+//!   buffered events observe the latest accumulated state.
 //! - Malformed event JSON fails the stream with an `error` event (upstream
 //!   `JSON.parse` throws inside the IIFE, :199/:214); a valid JSON event with
 //!   an unknown `type` is warned and skipped (:361-365). Structurally invalid
@@ -50,13 +49,12 @@
 //!   (`AssistantContent` has no hole representation).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use futures::StreamExt;
 use rpi_ai::types::{
     AssistantContent, AssistantMessage, AssistantRole, CacheRetention, DoneReason, ErrorReason,
-    Model, ProviderHeaders, StopReason, StreamEvent, TextContent, ThinkingBudgets, ThinkingContent,
-    ThinkingLevel, ToolCall, TranscriptContext, Transport, Usage,
+    Model, ProviderHeaders, SharedAssistantMessage, StopReason, StreamEvent, TextContent,
+    ThinkingBudgets, ThinkingContent, ThinkingLevel, ToolCall, TranscriptContext, Transport, Usage,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use rpi_ai::utils::json_parse::parse_streaming_json;
@@ -299,7 +297,7 @@ pub fn stream_proxy(
     let signal = options.signal.clone();
     tokio::spawn(async move {
         // :121-137 — the partial message reconstructed from delta events.
-        let mut partial = initial_partial(&model);
+        let partial = SharedAssistantMessage::new(initial_partial(&model));
         // Transient `partialJson` per content index (:316-339); see the file
         // header notes for why it lives outside `ToolCall`.
         let mut partial_jsons: HashMap<usize, String> = HashMap::new();
@@ -307,7 +305,7 @@ pub fn stream_proxy(
             &model,
             &context,
             &options,
-            &mut partial,
+            &partial,
             &mut partial_jsons,
             &task_stream,
         )
@@ -318,19 +316,21 @@ pub fn stream_proxy(
                 // :214-224 — failures become an `error` event carrying the
                 // accumulated partial; `aborted` when the signal fired.
                 let aborted = signal.as_ref().is_some_and(|token| token.is_cancelled());
-                partial.stop_reason = if aborted {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                partial.error_message = Some(message);
+                partial.with_mut(|partial| {
+                    partial.stop_reason = if aborted {
+                        StopReason::Aborted
+                    } else {
+                        StopReason::Error
+                    };
+                    partial.error_message = Some(message);
+                });
                 task_stream.push(StreamEvent::Error {
                     reason: if aborted {
                         ErrorReason::Aborted
                     } else {
                         ErrorReason::Error
                     },
-                    error: partial,
+                    error: partial.snapshot(),
                 });
                 task_stream.end(None);
             }
@@ -346,7 +346,7 @@ async fn run(
     model: &Model,
     context: &TranscriptContext,
     options: &ProxyStreamOptions,
-    partial: &mut AssistantMessage,
+    partial: &SharedAssistantMessage,
     partial_jsons: &mut HashMap<usize, String>,
     stream: &AssistantMessageEventStream,
 ) -> Result<(), String> {
@@ -447,12 +447,14 @@ async fn run(
     // leaving consumers waiting on a result that never arrives
     // (ebc374490, #8997).
     if !saw_terminal_event {
-        partial.stop_reason = StopReason::Error;
-        partial.error_message =
-            Some("Connection closed by proxy server before the response completed".to_owned());
+        partial.with_mut(|partial| {
+            partial.stop_reason = StopReason::Error;
+            partial.error_message =
+                Some("Connection closed by proxy server before the response completed".to_owned());
+        });
         stream.push(StreamEvent::Error {
             reason: ErrorReason::Error,
-            error: partial.clone(),
+            error: partial.snapshot(),
         });
     }
     // :235 — `stream.end()`; a terminal `done`/`error` event is expected to
@@ -465,7 +467,7 @@ async fn run(
 /// (`done`/`error`, :195).
 fn process_data_line(
     line: &str,
-    partial: &mut AssistantMessage,
+    partial: &SharedAssistantMessage,
     partial_jsons: &mut HashMap<usize, String>,
     stream: &AssistantMessageEventStream,
     saw_terminal_event: &mut bool,
@@ -593,12 +595,13 @@ impl IncrementalUtf8Decoder {
 /// the upstream thrown `Error.message`; `Ok(None)` skips the event.
 fn process_proxy_event(
     proxy_event: ProxyAssistantMessageEvent,
-    partial: &mut AssistantMessage,
+    partial: &SharedAssistantMessage,
     partial_jsons: &mut HashMap<usize, String>,
 ) -> Result<Option<StreamEvent>, String> {
-    match proxy_event {
+    let shared = partial.clone();
+    shared.with_mut(|partial| match proxy_event {
         ProxyAssistantMessageEvent::Start => Ok(Some(StreamEvent::Start {
-            partial: Arc::new(partial.clone()),
+            partial: shared.clone(),
         })),
 
         ProxyAssistantMessageEvent::TextStart { content_index } => {
@@ -609,7 +612,7 @@ fn process_proxy_event(
             )?;
             Ok(Some(StreamEvent::TextStart {
                 content_index,
-                partial: Arc::new(partial.clone()),
+                partial: shared.clone(),
             }))
         }
 
@@ -626,7 +629,7 @@ fn process_proxy_event(
             Ok(Some(StreamEvent::TextDelta {
                 content_index,
                 delta,
-                partial: Arc::new(partial.clone()),
+                partial: shared.clone(),
             }))
         }
 
@@ -642,7 +645,7 @@ fn process_proxy_event(
             Ok(Some(StreamEvent::TextEnd {
                 content_index,
                 content,
-                partial: Arc::new(partial.clone()),
+                partial: shared.clone(),
             }))
         }
 
@@ -654,7 +657,7 @@ fn process_proxy_event(
             )?;
             Ok(Some(StreamEvent::ThinkingStart {
                 content_index,
-                partial: Arc::new(partial.clone()),
+                partial: shared.clone(),
             }))
         }
 
@@ -670,7 +673,7 @@ fn process_proxy_event(
             Ok(Some(StreamEvent::ThinkingDelta {
                 content_index,
                 delta,
-                partial: Arc::new(partial.clone()),
+                partial: shared.clone(),
             }))
         }
 
@@ -687,7 +690,7 @@ fn process_proxy_event(
             Ok(Some(StreamEvent::ThinkingEnd {
                 content_index,
                 content,
-                partial: Arc::new(partial.clone()),
+                partial: shared.clone(),
             }))
         }
 
@@ -713,7 +716,7 @@ fn process_proxy_event(
             partial_jsons.insert(content_index, String::new());
             Ok(Some(StreamEvent::ToolCallStart {
                 content_index,
-                partial: Arc::new(partial.clone()),
+                partial: shared.clone(),
             }))
         }
 
@@ -734,7 +737,7 @@ fn process_proxy_event(
             Ok(Some(StreamEvent::ToolCallDelta {
                 content_index,
                 delta,
-                partial: Arc::new(partial.clone()),
+                partial: shared.clone(),
             }))
         }
 
@@ -756,7 +759,7 @@ fn process_proxy_event(
                     Ok(Some(StreamEvent::ToolCallEnd {
                         content_index,
                         tool_call: call.clone(),
-                        partial: Arc::new(partial.clone()),
+                        partial: shared.clone(),
                     }))
                 }
                 _ => Ok(None),
@@ -812,7 +815,7 @@ fn process_proxy_event(
                 error: partial.clone(),
             }))
         }
-    }
+    })
 }
 
 /// Applies a `*_start` proxy event's content block to the partial message.
@@ -1021,7 +1024,7 @@ mod tests {
 
     #[test]
     fn test_process_toolcall_delta_parses_arguments_incrementally() {
-        let mut partial = initial_partial(&test_model());
+        let partial = SharedAssistantMessage::new(initial_partial(&test_model()));
         let mut partial_jsons = HashMap::new();
 
         let start = process_proxy_event(
@@ -1030,7 +1033,7 @@ mod tests {
                 id: "c1".to_owned(),
                 tool_name: "bash".to_owned(),
             },
-            &mut partial,
+            &partial,
             &mut partial_jsons,
         )
         .expect("start processes");
@@ -1041,7 +1044,7 @@ mod tests {
                 content_index: 0,
                 delta: "{\"cmd\":\"ls".to_owned(),
             },
-            &mut partial,
+            &partial,
             &mut partial_jsons,
         )
         .expect("delta processes");
@@ -1052,24 +1055,26 @@ mod tests {
         else {
             panic!("expected ToolCallDelta");
         };
-        assert_eq!(
-            delta_partial.content[0],
-            AssistantContent::ToolCall(ToolCall {
-                id: "c1".to_owned(),
-                name: "bash".to_owned(),
-                arguments: json!({"cmd": "ls"}).as_object().expect("object").clone(),
-                thought_signature: None,
-                namespace: None,
-                arguments_error: None,
-            })
-        );
+        delta_partial.with(|partial| {
+            assert_eq!(
+                partial.content[0],
+                AssistantContent::ToolCall(ToolCall {
+                    id: "c1".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({"cmd": "ls"}).as_object().expect("object").clone(),
+                    thought_signature: None,
+                    namespace: None,
+                    arguments_error: None,
+                })
+            );
+        });
 
         process_proxy_event(
             ProxyAssistantMessageEvent::ToolCallDelta {
                 content_index: 0,
                 delta: " -la\"}".to_owned(),
             },
-            &mut partial,
+            &partial,
             &mut partial_jsons,
         )
         .expect("delta processes");
@@ -1091,7 +1096,7 @@ mod tests {
                 content_index: 0,
                 tool_call: finished.clone(),
             },
-            &mut partial,
+            &partial,
             &mut partial_jsons,
         )
         .expect("end processes");

@@ -270,6 +270,10 @@ impl ExtensionRunner for ExtensionHostAdapter {
         self.host.has_handlers(event_type)
     }
 
+    async fn flush_throttled(&self, event_type: &str) {
+        self.host.flush_throttled(event_type).await;
+    }
+
     async fn emit_cancelable(&self, event_type: &str) -> Option<SessionCancelResult> {
         let payload = serde_json::json!({ "type": event_type });
         let result = self.host.emit(event_type, payload).await?;

@@ -352,6 +352,10 @@ async fn agent_event_payloads_match_upstream_shapes() {
             payload["assistantMessageEvent"].is_object(),
             "assistantMessageEvent object"
         );
+        assert_eq!(
+            payload["message"], payload["assistantMessageEvent"]["partial"],
+            "legacy cumulative fields must use one coherent snapshot"
+        );
     }
     assert!(
         updates.iter().any(|payload| payload
@@ -1218,4 +1222,94 @@ async fn agent_before_settle_boundary_persists_entries() {
         entry.raw_value().get("customType").and_then(Value::as_str) == Some("settle-note")
     });
     assert!(note.is_some(), "agent_before_settle draft persisted");
+}
+
+/// rpi#78 A1: the additive `message_update_delta` event reaches an inline
+/// extension with the delta-only shape `{type, usage, assistantMessageEvent}` —
+/// no cumulative `message`, and a payload whose size tracks the DELTA rather
+/// than the accumulated response. A consumer can rebuild the text from the
+/// deltas alone, which is exactly what the statusline needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn message_update_delta_forwards_a_delta_only_payload() {
+    let records: Records = Arc::new(Mutex::new(Vec::new()));
+    let host = NativeExtensionHost::new("/test-cwd");
+    let errors = host
+        .load_inline(&[
+            recording_ext(Arc::clone(&records), &["message_start"]),
+            recording_ext(
+                Arc::clone(&records),
+                &["message_update_delta", "message_end"],
+            ),
+        ])
+        .await;
+    assert!(errors.is_empty(), "unexpected load errors: {errors:?}");
+
+    // A long response: the deltas are small, the accumulated text is not.
+    let text = "y".repeat(20_000);
+    let fixture = fixture(vec![text_step(&text)], host).await;
+    fixture
+        .session
+        .prompt("respond", Default::default())
+        .await
+        .expect("prompt");
+
+    let updates = records_of(&records, "message_update_delta");
+    assert!(!updates.is_empty(), "expected delta events");
+    let mut assembled = String::new();
+    for payload in &updates {
+        assert_eq!(
+            payload.get("type").and_then(Value::as_str),
+            Some("message_update_delta")
+        );
+        assert!(
+            payload.get("message").is_none(),
+            "the delta payload must not carry the cumulative message: {payload}"
+        );
+        assert!(
+            payload.get("usage").is_some(),
+            "the delta payload carries the cumulative usage: {payload}"
+        );
+        assert!(
+            payload["assistantMessageEvent"].get("partial").is_none(),
+            "the delta payload must not carry the partial snapshot"
+        );
+        // O(delta): the payload is the delta plus a fixed-size envelope
+        // (`type` + cumulative `usage`), never the accumulated message.
+        // `*_delta` events carry `delta`, `*_end` events carry `content`; both
+        // are the event's own payload, never the accumulated message.
+        let delta_len = payload
+            .pointer("/assistantMessageEvent/delta")
+            .or_else(|| payload.pointer("/assistantMessageEvent/content"))
+            .and_then(Value::as_str)
+            .map_or(0, str::len);
+        let payload_len = serde_json::to_vec(payload).expect("serialize").len();
+        assert!(
+            payload_len < delta_len + 1_024,
+            "payload {payload_len} bytes must be the delta ({delta_len}) plus a small envelope"
+        );
+        if let Some(delta) = payload
+            .pointer("/assistantMessageEvent/delta")
+            .and_then(Value::as_str)
+            && payload
+                .pointer("/assistantMessageEvent/type")
+                .and_then(Value::as_str)
+                == Some("text_delta")
+        {
+            assembled.push_str(delta);
+        }
+    }
+    assert_eq!(assembled, text, "the deltas rebuild the response");
+
+    // The cumulative event is NOT delivered — nobody subscribed to it, which is
+    // what lets the host skip the O(message) materialization.
+    assert!(records_of(&records, "message_update").is_empty());
+    assert!(
+        fixture
+            .session
+            .has_extension_handlers("message_update_delta")
+    );
+    assert!(!fixture.session.has_extension_handlers("message_update"));
+    // `message_end` still carries the authoritative final message.
+    let ends = records_of(&records, "message_end");
+    assert!(!ends.is_empty(), "expected message_end");
 }

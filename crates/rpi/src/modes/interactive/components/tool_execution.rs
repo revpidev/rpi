@@ -54,7 +54,7 @@ use rpi_tui::tui::{
     Component, Container, RenderHandle, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult,
     TuiMouseEventType, TuiMouseHandlerResult, shared_component_from_boxed,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::core::themes::Theme;
 use crate::tools::sanitize::{sanitize_binary_output, strip_ansi};
@@ -180,6 +180,9 @@ pub struct ToolRenderContext {
     pub args: Value,
     pub tool_call_id: String,
     pub render_handle: RenderHandle,
+    /// Rebuild the affected component through the interactive driver drain.
+    /// Distinct from `render_handle`, which only schedules a frame.
+    pub invalidate: RenderHandle,
     pub state: RendererStateSlot,
     pub cwd: String,
     pub execution_started: bool,
@@ -276,6 +279,7 @@ pub struct ToolExecutionComponent {
     tool_definition: Option<Arc<dyn ToolDefinition>>,
     built_in_tool_definition: Option<Arc<dyn ToolDefinition>>,
     render_handle: RenderHandle,
+    invalidate: RenderHandle,
     cwd: String,
     execution_started: bool,
     args_complete: bool,
@@ -304,6 +308,7 @@ impl ToolExecutionComponent {
         cwd: impl Into<String>,
     ) -> Self {
         let tool_name = tool_name.into();
+        let invalidate = render_handle.clone();
         // `builtInToolDefinition = createAllToolDefinitions(cwd)[toolName]`
         // (tool-execution.ts:57) — T17 registry, render hooks only.
         let built_in_tool_definition =
@@ -328,6 +333,7 @@ impl ToolExecutionComponent {
             tool_definition,
             built_in_tool_definition,
             render_handle,
+            invalidate,
             cwd: cwd.into(),
             execution_started: false,
             args_complete: false,
@@ -358,6 +364,7 @@ impl ToolExecutionComponent {
             args: self.args.clone(),
             tool_call_id: self.tool_call_id.clone(),
             render_handle: self.render_handle.clone(),
+            invalidate: self.invalidate.clone(),
             state: self.renderer_state.clone(),
             cwd: self.cwd.clone(),
             execution_started: self.execution_started,
@@ -376,6 +383,18 @@ impl ToolExecutionComponent {
                 .last_render_width
                 .load(std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// Install the component-targeted driver invalidation callback after the
+    /// shared handle exists. Construction starts with `args_complete = false`,
+    /// so no async preview can request it before this setter runs.
+    pub(crate) fn set_invalidate_handle(&mut self, invalidate: RenderHandle) {
+        self.invalidate = invalidate;
+    }
+
+    /// Rebuild on the driver thread after an async renderer job completes.
+    pub(crate) fn rebuild_display(&mut self) {
+        self.update_display();
     }
 
     /// `createCallFallback` (tool-execution.ts:135-137 @ 5257d0d5f): the
@@ -471,6 +490,21 @@ impl ToolExecutionComponent {
     pub fn update_args(&mut self, args: Value) {
         self.args = args;
         self.update_display();
+    }
+
+    /// `updateArgs` with an unchanged-args short circuit (rpi#78 A4).
+    ///
+    /// A `message_update` re-passes EVERY tool call's arguments, and a text or
+    /// thinking delta never touches them; rebuilding the whole tool component
+    /// tree (and re-rendering the `write` body) for an identical value is pure
+    /// driver-thread work. Returns whether the display was rebuilt.
+    pub fn update_args_if_changed(&mut self, args: &Map<String, Value>) -> bool {
+        if matches!(&self.args, Value::Object(current) if current == args) {
+            return false;
+        }
+        self.args = Value::Object(args.clone());
+        self.update_display();
+        true
     }
 
     /// `markExecutionStarted` (tool-execution.ts:152-156).
@@ -1560,6 +1594,27 @@ mod tests {
         (component, theme)
     }
 
+    /// rpi#78 A4: the edit preview is computed off the driver thread, so a
+    /// test that needs the preview must wait for it (a re-render drains it).
+    fn settle_edit_preview(component: &mut ToolExecutionComponent) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let state = component
+                .renderer_state
+                .get_or_init::<crate::modes::interactive::tool_renderers::edit::EditRenderState>(
+            );
+            if !state.preview_pending() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the edit preview worker never settled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            component.set_args_complete();
+        }
+    }
+
     fn successful_edit_result() -> ToolResultState {
         ToolResultState {
             content: vec![],
@@ -1587,10 +1642,11 @@ mod tests {
         std::fs::write(tmp.path().join("src.txt"), "Hello, testing!").unwrap();
         let (mut component, theme) = make_edit_component(&tmp, "world", "testing");
 
-        // argsComplete computes the preview synchronously: "world" is
-        // absent from the post-edit file → error preview (issue #18 shows
+        // argsComplete starts the off-thread preview: "world" is absent from
+        // the post-edit file → error preview (issue #18 shows
         // "Could not find edits[0] …").
         component.set_args_complete();
+        settle_edit_preview(&mut component);
         let lines = component.render(80);
         let stripped = strip_ansi(&lines.join("\n"));
         assert!(
@@ -1630,6 +1686,7 @@ mod tests {
         let (mut component, theme) = make_edit_component(&tmp, "missing", "testing");
 
         component.set_args_complete();
+        settle_edit_preview(&mut component);
         let lines = component.render(80);
         let stripped = strip_ansi(&lines.join("\n"));
         assert!(

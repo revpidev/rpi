@@ -183,6 +183,7 @@ mod tests {
             args: json!({}),
             tool_call_id: "call_1".to_owned(),
             render_handle: RenderHandle::new(|| {}),
+            invalidate: RenderHandle::new(|| {}),
             state: state.clone(),
             cwd: "/cwd".to_owned(),
             execution_started: true,

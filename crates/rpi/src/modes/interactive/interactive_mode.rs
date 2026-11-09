@@ -136,6 +136,26 @@ const APP_TITLE: &str = "rpi";
 /// the event loop is always awake; here the driver polls with this cap).
 const DRIVER_PUMP_CAP: Duration = Duration::from_millis(50);
 
+/// Per-frame budget for the UI command drain (rpi#78 A4/0.5). The driver
+/// thread renders and drains in one loop, so a single slow command delays
+/// input and rendering together; foldable/idempotent commands past this budget
+/// are re-queued for the next slice instead.
+const DRAIN_SLICE_BUDGET: Duration = Duration::from_millis(4);
+
+/// Whether a command may be deferred to the next drain slice.
+///
+/// Only commands whose effect a later same-kind command fully supersedes
+/// qualify: `MessageUpdate` carries the latest accumulated partial (already
+/// folded above), `ToolExecutionUpdate` a partial tool result. Structural
+/// commands (`MessageEnd`, `ToolExecutionStart/End`, turn boundaries, …)
+/// always run in order and are never deferred on their own account.
+fn is_deferrable(command: &UiCommand) -> bool {
+    matches!(
+        command,
+        UiCommand::MessageUpdate(_) | UiCommand::ToolExecutionUpdate { .. }
+    )
+}
+
 /// Extra wait on top of the terminal-color query deadline. The Tui's own
 /// deadline is the real timeout; this backstop only covers tests without a
 /// pump. The deadline itself is SSH-aware
@@ -415,7 +435,7 @@ pub(crate) enum UiCommand {
     MessageStart(AgentMessage),
     /// V15-13 (rpi#53): the streaming partial is shared by `Arc` from the
     /// agent loop through the event and this queue — no deep copies per delta.
-    MessageUpdate(Arc<rpi_ai::types::AssistantMessage>),
+    MessageUpdate(rpi_ai::types::SharedAssistantMessage),
     MessageEnd(AgentMessage),
     ToolExecutionStart {
         tool_call_id: String,
@@ -562,6 +582,9 @@ pub(crate) enum UiCommand {
     /// never lock the component themselves (lock contract — the same
     /// discipline as the git branch watcher).
     SessionListEvent,
+    /// An async tool renderer completed. The weak handle targets exactly the
+    /// mounted component without retaining dropped tools or risking id reuse.
+    RefreshTool(Weak<Mutex<ToolExecutionComponent>>),
 }
 
 impl From<AgentSessionEvent> for UiCommand {
@@ -2357,6 +2380,12 @@ impl InteractiveUi {
     /// `AgentEnd` are never swallowed: the update immediately before
     /// `MessageEnd` is still processed first (ordering preserved).
     pub(crate) fn drain_events(&self) {
+        self.drain_events_with_budget(DRAIN_SLICE_BUDGET);
+    }
+
+    /// [`Self::drain_events`] with an explicit slice budget — the seam the
+    /// budget tests drive (a wall-clock assertion would be flaky in CI).
+    pub(crate) fn drain_events_with_budget(&self, budget: Duration) {
         let commands: Vec<UiCommand> = lock(&self.event_queue).drain(..).collect();
         let mut folded: Vec<UiCommand> = Vec::with_capacity(commands.len());
         for command in commands {
@@ -2367,8 +2396,35 @@ impl InteractiveUi {
             }
             folded.push(command);
         }
-        for command in folded {
+        // V13-06 FR-B (rpi#78 A4/0.5): bound the driver-thread slice. After
+        // folding, the remaining commands are still one-per-boundary; a single
+        // expensive one (or a burst of partial tool updates) must not own the
+        // frame. `MessageUpdate`/`ToolExecutionUpdate` are idempotent — a later
+        // command of the same kind supersedes them — so processing may STOP at
+        // one of them and re-queue the tail in order. Structural commands are
+        // never dropped or reordered: the tail (including them) goes back to
+        // the FRONT of the queue, so the next drain sees the original order.
+        let started = Instant::now();
+        let mut deferred: Vec<UiCommand> = Vec::new();
+        let mut iter = folded.into_iter();
+        while let Some(command) = iter.next() {
+            if started.elapsed() >= budget && is_deferrable(&command) {
+                deferred.push(command);
+                deferred.extend(iter);
+                break;
+            }
             self.handle_command(command);
+        }
+        if !deferred.is_empty() {
+            {
+                let mut queue = lock(&self.event_queue);
+                for command in deferred.into_iter().rev() {
+                    queue.push_front(command);
+                }
+            }
+            // Make sure the driver loop comes back for the tail instead of
+            // sleeping until the next producer-driven render.
+            self.render_handle.request_render();
         }
     }
 
@@ -2483,7 +2539,10 @@ impl InteractiveUi {
                         // streaming component: `updateContent(message, true)`
                         // (interactive-mode.ts:3140). MessageStart fires once
                         // per turn — the Arc wrap is a single move.
-                        component.update_content(&Arc::new(assistant.clone()), true);
+                        component.update_content(
+                            &rpi_ai::types::SharedAssistantMessage::new(assistant.clone()),
+                            true,
+                        );
                         let handle = Arc::new(Mutex::new(component));
                         let entry_address =
                             self.add_chat_child(Box::new(SharedChild(handle.clone())));
@@ -2496,35 +2555,62 @@ impl InteractiveUi {
                     _ => {}
                 }
             }
+            UiCommand::RefreshTool(component) => {
+                if let Some(component) = component.upgrade() {
+                    lock(&component).rebuild_display();
+                }
+            }
             UiCommand::MessageUpdate(message) => {
                 // message_update (interactive-mode.ts:2928-2961). The payload
-                // is the shared streaming partial (V15-13: `Arc` end-to-end —
-                // the queue push is a refcount bump, never a deep copy).
+                // is the shared live streaming partial; the queue push is a
+                // refcount bump, never a deep copy.
                 {
                     // interactive-mode.ts:3148: streaming updates pass
-                    // isStreaming = true. The Arc itself flows into the
-                    // component (V15-13 end-to-end sharing).
+                    // isStreaming = true. The live handle flows into the component.
                     if let Some(track) = lock(&self.streaming).as_ref() {
                         lock(&track.handle).update_content(&message, true);
-                        let assistant: &rpi_ai::types::AssistantMessage = &message;
-                        for content in &assistant.content {
-                            if let AssistantContent::ToolCall(tool_call) = content {
-                                let mut pending_tools = lock(&self.pending_tools);
-                                if !pending_tools.contains_key(&tool_call.id) {
-                                    let component = self.new_tool_execution_component(
-                                        &tool_call.name,
-                                        &tool_call.id,
-                                        &serde_json::Value::Object(tool_call.arguments.clone()),
-                                    );
-                                    let handle = Arc::new(Mutex::new(component));
-                                    self.add_chat_child(Box::new(SharedChild(handle.clone())));
-                                    pending_tools.insert(tool_call.id.clone(), handle);
-                                } else if let Some(component) = pending_tools.get(&tool_call.id) {
-                                    lock(component).update_args(serde_json::Value::Object(
+                        // rpi#78 A4: update known tool calls in place while the
+                        // live message is borrowed, so a text/thinking delta
+                        // neither clones a growing `write`/`edit` argument map
+                        // nor rebuilds the component tree. New calls are
+                        // collected (they need the one initial args clone) and
+                        // mounted after the message lock is released.
+                        let mut new_tools = Vec::new();
+                        message.with(|message| {
+                            for content in &message.content {
+                                let AssistantContent::ToolCall(tool_call) = content else {
+                                    continue;
+                                };
+                                let pending_tools = lock(&self.pending_tools);
+                                match pending_tools.get(&tool_call.id) {
+                                    Some(component) => {
+                                        // Lock order: live message -> tool
+                                        // component. No host API reads the live
+                                        // partial from inside a renderer, so the
+                                        // order cannot cycle.
+                                        lock(component)
+                                            .update_args_if_changed(&tool_call.arguments);
+                                    }
+                                    None => new_tools.push((
+                                        tool_call.name.clone(),
+                                        tool_call.id.clone(),
                                         tool_call.arguments.clone(),
-                                    ));
+                                    )),
                                 }
                             }
+                        });
+                        for (name, id, args) in new_tools {
+                            let mut pending_tools = lock(&self.pending_tools);
+                            if pending_tools.contains_key(&id) {
+                                continue;
+                            }
+                            let handle = self.new_shared_tool_execution_component(
+                                &name,
+                                &id,
+                                &serde_json::Value::Object(args),
+                            );
+                            self.add_chat_child(Box::new(SharedChild(handle.clone())));
+                            pending_tools.insert(id, handle);
                         }
                     }
                 }
@@ -2535,10 +2621,14 @@ impl InteractiveUi {
                 if matches!(message, AgentMessage::User(_)) {
                     return;
                 }
-                if let AgentMessage::Assistant(assistant) = &message {
+                // Take ownership: the message is stored by the streaming
+                // component as-is, so the end of a turn no longer deep-clones
+                // the whole assistant message (rpi#78 A4: two clones used to
+                // run on the driver thread here).
+                if let AgentMessage::Assistant(mut assistant) = message {
                     // `programStatus.handleEvent` (program-status-reporter.ts:
                     // 40-46): the latest response decides the outcome.
-                    lock(&self.program_status).handle_message_end(assistant);
+                    lock(&self.program_status).handle_message_end(&assistant);
                     self.report_program_status();
                     let streamed = lock(&self.streaming).take();
                     if let Some(track) = streamed {
@@ -2555,7 +2645,6 @@ impl InteractiveUi {
                                 "Operation aborted".to_string()
                             });
                         }
-                        let mut assistant = assistant.clone();
                         if let Some(message) = &error_message {
                             assistant.error_message = Some(message.clone());
                         }
@@ -2563,18 +2652,18 @@ impl InteractiveUi {
                         let stop_is_error = self.streaming_stop_reason_is_error(&assistant);
                         // `maybeShowAssistantDiagnostics` (:3310) and
                         // `maybeShowCacheMissNotice` (interactive-mode.ts:2994)
-                        // run in the non-error branch; called before
-                        // `update_content` so the message value can be shared
-                        // without cloning the (potentially large) content.
+                        // run in the non-error branch; they only borrow the
+                        // message, so it can be moved into the component below.
                         if !stop_is_error {
                             self.maybe_show_assistant_diagnostics(&assistant);
                             self.maybe_show_cache_miss_notice(&assistant);
                         }
                         // interactive-mode.ts:3193: message_end updates with
-                        // isStreaming = false. (Once per turn — the Arc wrap
-                        // is a move; the error-message mutation above already
-                        // needed the owned clone.)
-                        component.update_content(&Arc::new(assistant.clone()), false);
+                        // isStreaming = false. The Arc wrap is a move.
+                        component.update_content(
+                            &rpi_ai::types::SharedAssistantMessage::new(assistant),
+                            false,
+                        );
                         drop(component);
 
                         if stop_is_error {
@@ -2619,9 +2708,11 @@ impl InteractiveUi {
                 let component = match pending_tools.get(&tool_call_id) {
                     Some(component) => Arc::clone(component),
                     None => {
-                        let component =
-                            self.new_tool_execution_component(&tool_name, &tool_call_id, &args);
-                        let handle = Arc::new(Mutex::new(component));
+                        let handle = self.new_shared_tool_execution_component(
+                            &tool_name,
+                            &tool_call_id,
+                            &args,
+                        );
                         self.add_chat_child(Box::new(SharedChild(handle.clone())));
                         pending_tools.insert(tool_call_id.clone(), handle.clone());
                         handle
@@ -3159,6 +3250,28 @@ impl InteractiveUi {
         );
         component.set_expanded(*lock(&self.tool_output_expanded));
         component
+    }
+
+    /// Shared production component with a component-targeted invalidation
+    /// channel. Async renderer workers enqueue `RefreshTool`; only the driver
+    /// drain upgrades the weak handle and mutates the component tree.
+    fn new_shared_tool_execution_component(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        args: &serde_json::Value,
+    ) -> Arc<Mutex<ToolExecutionComponent>> {
+        let component = self.new_tool_execution_component(tool_name, tool_call_id, args);
+        let handle = Arc::new(Mutex::new(component));
+        let weak = Arc::downgrade(&handle);
+        let queue = Arc::clone(&self.event_queue);
+        let render_handle = self.render_handle.clone();
+        let invalidate = RenderHandle::new(move || {
+            lock(&queue).push_back(UiCommand::RefreshTool(weak.clone()));
+            render_handle.request_render();
+        });
+        lock(&handle).set_invalidate_handle(invalidate);
+        handle
     }
 
     /// Add a chat child; returns the child's address for later removal.
@@ -4853,12 +4966,11 @@ impl InteractiveUi {
                     // (interactive-mode.ts:3367-3401).
                     for content in &assistant.content {
                         if let AssistantContent::ToolCall(tool_call) = content {
-                            let component = self.new_tool_execution_component(
+                            let handle = self.new_shared_tool_execution_component(
                                 &tool_call.name,
                                 &tool_call.id,
                                 &serde_json::Value::Object(tool_call.arguments.clone()),
                             );
-                            let handle = Arc::new(Mutex::new(component));
                             self.add_chat_child(Box::new(SharedChild(handle.clone())));
                             if assistant.stop_reason == StopReason::Aborted
                                 || assistant.stop_reason == StopReason::Error
@@ -7772,13 +7884,12 @@ mod tests {
         }
     }
 
-    /// V15-13 L3: `MessageUpdate` payloads share the streaming partial by
-    /// `Arc` (test-side mirror of the production sharing).
+    /// `MessageUpdate` payloads share the live streaming partial.
     fn assistant_partial(
         content: Vec<AssistantContent>,
         stop_reason: StopReason,
-    ) -> Arc<rpi_ai::types::AssistantMessage> {
-        Arc::new(match assistant_message(content, stop_reason) {
+    ) -> rpi_ai::types::SharedAssistantMessage {
+        rpi_ai::types::SharedAssistantMessage::new(match assistant_message(content, stop_reason) {
             AgentMessage::Assistant(message) => message,
             _ => unreachable!("assistant_message always wraps Assistant"),
         })
@@ -8247,6 +8358,7 @@ mod tests {
             UiCommand::PasteImage => "paste_image",
             UiCommand::ClipboardPasteReady(_) => "clipboard_paste_ready",
             UiCommand::SessionListEvent => "session_list_event",
+            UiCommand::RefreshTool(_) => "refresh_tool",
         }
     }
 
@@ -8288,7 +8400,7 @@ mod tests {
                     message: assistant_partial(vec![text_content("x")], StopReason::Pending),
                     assistant_message_event: Arc::new(rpi_ai::types::StreamEvent::TextStart {
                         content_index: 0,
-                        partial: Arc::new(assistant_message_raw(
+                        partial: rpi_ai::types::SharedAssistantMessage::new(assistant_message_raw(
                             vec![text_content("x")],
                             StopReason::Pending,
                         )),
@@ -8763,6 +8875,141 @@ mod tests {
         ui.drain_events();
         ui.push(UiCommand::AgentStart);
         ui.drain_events();
+    }
+
+    /// rpi#78 A4/0.5: the drain slice budget stops at a deferrable command and
+    /// re-queues the tail in order — structural commands are never dropped and
+    /// a later drain still sees the original sequence.
+    #[tokio::test]
+    async fn drain_budget_defers_foldable_commands_in_order() {
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.push(UiCommand::MessageStart(assistant_message(
+            vec![text_content("start")],
+            StopReason::Pending,
+        )));
+        let mk = |id: &str| {
+            UiCommand::MessageUpdate(assistant_partial(
+                vec![AssistantContent::ToolCall(rpi_ai::types::ToolCall {
+                    id: id.to_owned(),
+                    name: "write".to_owned(),
+                    arguments: serde_json::Map::new(),
+                    thought_signature: None,
+                    namespace: None,
+                    arguments_error: None,
+                })],
+                StopReason::Pending,
+            ))
+        };
+        ui.push(mk("call_1"));
+        ui.push(UiCommand::ToolExecutionStart {
+            tool_call_id: "call_1".to_owned(),
+            tool_name: "write".to_owned(),
+            args: serde_json::json!({"path": "a.txt", "content": "x"}),
+        });
+        ui.push(mk("call_1"));
+
+        // Zero budget: the structural MessageStart still runs, the FIRST
+        // deferrable command stops the slice.
+        ui.drain_events_with_budget(Duration::ZERO);
+        assert_eq!(chat_children(ui), 1, "only the streaming message started");
+        assert!(
+            lock(&ui.pending_tools).is_empty(),
+            "ToolExecutionStart was deferred"
+        );
+        assert_eq!(lock(&ui.event_queue).len(), 3, "tail re-queued in order");
+
+        // A draining budget processes the tail.
+        ui.drain_events_with_budget(Duration::from_secs(30));
+        assert!(lock(&ui.pending_tools).contains_key("call_1"));
+        assert_eq!(lock(&ui.event_queue).len(), 0);
+    }
+
+    /// Async edit completion must enqueue a driver-side rebuild. A plain
+    /// `render()` before the drain still shows the pending component; only the
+    /// queued refresh applies the worker result (rpi#78 review).
+    #[tokio::test]
+    async fn edit_preview_completion_rebuilds_the_mounted_tool_on_drain() {
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let tmp = TempDir::new();
+        let path = tmp.path().join("src.txt");
+        std::fs::write(&path, "Hello, world!").unwrap();
+        let args = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "edits": [{"oldText": "world", "newText": "testing"}],
+        });
+        let call = AssistantContent::ToolCall(rpi_ai::types::ToolCall {
+            id: "edit-1".to_owned(),
+            name: "edit".to_owned(),
+            arguments: args.as_object().expect("args object").clone(),
+            thought_signature: None,
+            namespace: None,
+            arguments_error: None,
+        });
+        ui.push(UiCommand::MessageStart(assistant_message(
+            vec![text_content("start")],
+            StopReason::Pending,
+        )));
+        ui.push(UiCommand::MessageUpdate(assistant_partial(
+            vec![call.clone()],
+            StopReason::Pending,
+        )));
+        ui.push(UiCommand::MessageEnd(assistant_message(
+            vec![call],
+            StopReason::Stop,
+        )));
+        ui.drain_events_with_budget(Duration::from_secs(30));
+        let component = Arc::clone(lock(&ui.pending_tools).get("edit-1").expect("edit tool"));
+        let rendered = lock(&component).render(80).join("\n");
+        let rendered = rpi_test_support::vt::strip_ansi(&rendered);
+        assert!(!rendered.contains("Hello, testing!"), "{rendered}");
+
+        // The old implementation only requested a frame, leaving this queue
+        // empty forever. A redraw alone must not apply the outcome.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&ui.event_queue).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "preview completion was not queued"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let before_drain = lock(&component).render(80).join("\n");
+        assert!(!rpi_test_support::vt::strip_ansi(&before_drain).contains("Hello, testing!"));
+        ui.drain_events_with_budget(Duration::from_secs(30));
+        let after_drain = lock(&component).render(80).join("\n");
+        let after_drain = rpi_test_support::vt::strip_ansi(&after_drain);
+        assert!(after_drain.contains("+1 Hello, testing!"), "{after_drain}");
+    }
+
+    /// rpi#78 A4: a `message_update` that does not change a tool call's
+    /// arguments must not rebuild the tool component tree.
+    #[tokio::test]
+    async fn unchanged_tool_args_skip_the_component_rebuild() {
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let args = serde_json::json!({"path": "a.txt", "content": "x"});
+        ui.push(UiCommand::ToolExecutionStart {
+            tool_call_id: "call_1".to_owned(),
+            tool_name: "write".to_owned(),
+            args: args.clone(),
+        });
+        ui.drain_events();
+        let component = Arc::clone(lock(&ui.pending_tools).get("call_1").expect("pending tool"));
+        let before = lock(&component).render(80);
+        let map = args.as_object().expect("object args").clone();
+        assert!(
+            !lock(&component).update_args_if_changed(&map),
+            "identical args must not rebuild"
+        );
+        assert_eq!(lock(&component).render(80), before);
+        let mut changed = map.clone();
+        changed.insert("content".to_owned(), serde_json::json!("y"));
+        assert!(
+            lock(&component).update_args_if_changed(&changed),
+            "changed args rebuild"
+        );
     }
 
     #[tokio::test]

@@ -6,13 +6,18 @@
 //! - `Infinity` / `-Infinity` / `NaN` literals (accepted by the JS package for
 //!   JS-ism reasons) are treated as malformed: `serde_json::Value` cannot
 //!   represent them and they never occur in tool-call argument streams.
-//! - The parser operates on `char`s; the JS version indexes UTF-16 code units.
-//!   All decisions are per-character comparisons, so behavior is identical.
+//! - The parser operates on UTF-8 bytes; the JS version indexes UTF-16 code
+//!   units. Every decision is an ASCII comparison, and multi-byte scalar
+//!   values are opaque payload (they can never equal `"`, `\\` or a control
+//!   byte), so behavior is identical while a delta no longer pays a
+//!   `chars().collect::<Vec<char>>()` materialization (rpi#78 A3).
 //! - Raw JSON text is pre-sanitized for unpaired `\uXXXX` surrogate escapes
 //!   before `serde_json` parsing (JS `JSON.parse` accepts lone surrogates,
 //!   `serde_json` rejects them). See [`strip_lone_surrogate_escapes`].
 
 use serde_json::{Map, Value};
+
+use std::time::{Duration, Instant};
 
 const VALID_JSON_ESCAPES: [char; 8] = ['"', '\\', '/', 'b', 'f', 'n', 'r', 't'];
 
@@ -48,17 +53,17 @@ pub fn repair_json(json: &str) -> String {
 /// repair the input is returned untouched (no allocation); from the first
 /// repair onward every character flows into the materialized output.
 fn repair_json_if_needed(json: &str) -> Option<String> {
-    let chars: Vec<char> = json.chars().collect();
     let mut out: Option<String> = None;
     let mut in_string = false;
     let mut index = 0;
 
-    /// Emits a repaired slice at `index`, materializing `out` with the
-    /// untouched prefix `chars[..index]` on the first repair.
-    fn repair(out: &mut Option<String>, chars: &[char], index: usize, replacement: &str) {
+    /// Emits `replacement` at `index`, materializing `out` with the untouched
+    /// prefix `json[..index]` on the first repair. Every byte before `index`
+    /// is a char boundary (the caller tracks chars, not bytes).
+    fn repair(out: &mut Option<String>, json: &str, index: usize, replacement: &str) {
         if out.is_none() {
-            let mut materialized = String::with_capacity(chars.len());
-            materialized.extend(chars[..index].iter());
+            let mut materialized = String::with_capacity(json.len());
+            materialized.push_str(&json[..index]);
             *out = Some(materialized);
         }
         out.as_mut()
@@ -66,8 +71,17 @@ fn repair_json_if_needed(json: &str) -> Option<String> {
             .push_str(replacement);
     }
 
-    while index < chars.len() {
-        let char = chars[index];
+    /// `=` in JS terms: the JSON escape character `c`.
+    fn is_valid_escape(c: char) -> bool {
+        VALID_JSON_ESCAPES.contains(&c)
+    }
+
+    while index < json.len() {
+        let char = json[index..]
+            .chars()
+            .next()
+            .expect("index < len is a char boundary");
+        let char_len = char.len_utf8();
 
         if !in_string {
             if let Some(out) = out.as_mut() {
@@ -76,7 +90,7 @@ fn repair_json_if_needed(json: &str) -> Option<String> {
             if char == '"' {
                 in_string = true;
             }
-            index += 1;
+            index += char_len;
             continue;
         }
 
@@ -85,27 +99,28 @@ fn repair_json_if_needed(json: &str) -> Option<String> {
             if let Some(out) = out.as_mut() {
                 out.push(char);
             }
-            index += 1;
+            index += char_len;
             continue;
         }
 
         if char == '\\' {
-            let next_char = chars.get(index + 1).copied();
+            let next_char = json[index + 1..].chars().next();
             match next_char {
                 None => {
-                    repair(&mut out, &chars, index, "\\\\");
+                    repair(&mut out, json, index, "\\\\");
                     index += 1;
                     continue;
                 }
                 Some('u') => {
-                    let unicode_digits: String = chars.iter().skip(index + 2).take(4).collect();
-                    if unicode_digits.len() == 4
-                        && unicode_digits.chars().all(|c| c.is_ascii_hexdigit())
-                    {
-                        // Valid `\uXXXX` passes through untouched.
+                    // Exactly four ASCII hex digits after `\u` (a truncated or
+                    // non-hex tail is not a valid escape and falls through).
+                    let hex = json
+                        .get(index + 2..index + 6)
+                        .filter(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()));
+                    if let Some(digits) = hex {
                         if let Some(out) = out.as_mut() {
                             out.push_str("\\u");
-                            out.push_str(&unicode_digits);
+                            out.push_str(digits);
                         }
                         index += 6;
                         continue;
@@ -115,29 +130,29 @@ fn repair_json_if_needed(json: &str) -> Option<String> {
                 _ => {}
             }
 
-            let next_char = next_char.unwrap(); // invariant: None returned above
-            if VALID_JSON_ESCAPES.contains(&next_char) {
+            let next_char = next_char.expect("None returned above");
+            if is_valid_escape(next_char) {
                 // Valid escape passes through untouched.
                 if let Some(out) = out.as_mut() {
                     out.push('\\');
                     out.push(next_char);
                 }
-                index += 2;
+                index += 1 + next_char.len_utf8();
                 continue;
             }
 
-            repair(&mut out, &chars, index, "\\\\");
+            repair(&mut out, json, index, "\\\\");
             index += 1;
             continue;
         }
 
         if is_control_character(char) {
             let escaped = escape_control_character(char);
-            repair(&mut out, &chars, index, &escaped);
+            repair(&mut out, json, index, &escaped);
         } else if let Some(out) = out.as_mut() {
             out.push(char);
         }
-        index += 1;
+        index += char_len;
     }
 
     out
@@ -152,85 +167,120 @@ fn repair_json_if_needed(json: &str) -> Option<String> {
 /// Only escape sequences are inspected; raw UTF-8 text cannot contain
 /// surrogates. Paired escapes (valid astral characters) are preserved.
 pub fn strip_lone_surrogate_escapes(json: &str) -> String {
-    let chars: Vec<char> = json.chars().collect();
-    let mut out = String::new();
+    strip_lone_surrogate_escapes_if_needed(json).unwrap_or_else(|| json.to_owned())
+}
+
+/// Lazy [`strip_lone_surrogate_escapes`]: `None` when nothing had to be
+/// dropped, `Some(stripped)` otherwise.
+///
+/// The streaming hot path calls this on EVERY failed strict parse — i.e. on
+/// every partial JSON fragment — so the scan must not materialize a copy of
+/// the (growing) input unless an escape is actually dropped (rpi#78 A3).
+fn strip_lone_surrogate_escapes_if_needed(json: &str) -> Option<String> {
+    let mut out: Option<String> = None;
     let mut in_string = false;
     let mut index = 0;
+    // Input offset just past the last EMITTED high-surrogate escape. A low
+    // surrogate is kept only when it immediately follows one (paired escape).
+    let mut last_kept_high_end: Option<usize> = None;
 
-    // Reads the 4 hex digits after a `\u` at `slash` (index of the backslash).
-    let hex4 = |slash: usize| -> Option<u16> {
-        let digits: String = chars.iter().skip(slash + 2).take(4).collect();
-        if digits.len() == 4 && digits.chars().all(|c| c.is_ascii_hexdigit()) {
-            u16::from_str_radix(&digits, 16).ok()
-        } else {
-            None
+    /// Emits `text` only once a drop has materialized the output (before the
+    /// first drop the input is kept verbatim, so there is nothing to push).
+    fn emit(out: &mut Option<String>, text: &str) {
+        if let Some(buffer) = out.as_mut() {
+            buffer.push_str(text);
         }
-    };
+    }
 
-    while index < chars.len() {
-        let c = chars[index];
+    /// Drops the escape at `at`: materializes the untouched prefix the first
+    /// time, which is what makes the scan lazy.
+    fn drop_at(out: &mut Option<String>, json: &str, at: usize) {
+        if out.is_none() {
+            let mut buffer = String::with_capacity(json.len());
+            buffer.push_str(&json[..at]);
+            *out = Some(buffer);
+        }
+    }
+
+    // The four hex digits after a `\u` escape at `slash` (a byte offset).
+    fn hex4(json: &str, slash: usize) -> Option<u16> {
+        let digits = json
+            .get(slash + 2..slash + 6)
+            .filter(|digits| digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_hexdigit()))?;
+        u16::from_str_radix(digits, 16).ok()
+    }
+
+    while index < json.len() {
+        let c = json[index..]
+            .chars()
+            .next()
+            .expect("index < len is a char boundary");
+        let char_len = c.len_utf8();
         if !in_string {
-            out.push(c);
+            emit(&mut out, &json[index..index + char_len]);
             if c == '"' {
                 in_string = true;
             }
-            index += 1;
+            index += char_len;
+            last_kept_high_end = None;
+            continue;
+        }
+        if c == '\\'
+            && json[index + 1..].starts_with('u')
+            && let Some(code) = hex4(json, index)
+        {
+            let escape = &json[index..index + 6];
+            if (0xd800..0xdc00).contains(&code) {
+                // High surrogate: keep only when immediately followed
+                // by a low-surrogate escape.
+                let next_slash = index + 6;
+                let paired = json[next_slash..].starts_with("\\u")
+                    && hex4(json, next_slash)
+                        .map(|low| (0xdc00..0xe000).contains(&low))
+                        .unwrap_or(false);
+                if paired {
+                    emit(&mut out, escape);
+                    last_kept_high_end = Some(next_slash);
+                } else {
+                    drop_at(&mut out, json, index);
+                    last_kept_high_end = None;
+                }
+                index += 6;
+                continue;
+            }
+            if (0xdc00..0xe000).contains(&code) {
+                // Low surrogate: keep only when immediately preceded
+                // by an emitted high-surrogate escape.
+                if last_kept_high_end == Some(index) {
+                    emit(&mut out, escape);
+                } else {
+                    drop_at(&mut out, json, index);
+                }
+                last_kept_high_end = None;
+                index += 6;
+                continue;
+            }
+            emit(&mut out, escape);
+            last_kept_high_end = None;
+            index += 6;
             continue;
         }
         if c == '\\' {
-            if chars.get(index + 1) == Some(&'u')
-                && let Some(code) = hex4(index)
-            {
-                if (0xd800..0xdc00).contains(&code) {
-                    // High surrogate: keep only when immediately followed
-                    // by a low-surrogate escape.
-                    let next_slash = index + 6;
-                    let paired = chars.get(next_slash) == Some(&'\\')
-                        && chars.get(next_slash + 1) == Some(&'u')
-                        && hex4(next_slash)
-                            .map(|low| (0xdc00..0xe000).contains(&low))
-                            .unwrap_or(false);
-                    if paired {
-                        out.push_str(&chars[index..index + 6].iter().collect::<String>());
-                    }
-                    index += 6;
-                    continue;
-                }
-                if (0xdc00..0xe000).contains(&code) {
-                    // Low surrogate: keep only when immediately preceded
-                    // by a high-surrogate escape. The preceding pair was
-                    // already emitted, so check the tail of `out`.
-                    let mut tail = out.chars().rev().take(6).collect::<Vec<char>>();
-                    tail.reverse();
-                    let preceded = tail.len() == 6
-                        && tail[0] == '\\'
-                        && tail[1] == 'u'
-                        && u16::from_str_radix(&tail[2..6].iter().collect::<String>(), 16)
-                            .map(|high| (0xd800..0xdc00).contains(&high))
-                            .unwrap_or(false);
-                    if preceded {
-                        out.push_str(&chars[index..index + 6].iter().collect::<String>());
-                    }
-                    index += 6;
-                    continue;
-                }
-            }
             // Non-`\u` escape: emit both characters so an escaped quote does
             // not end the string literal (e.g. `\"` or `\\`).
-            out.push(c);
-            if let Some(&next) = chars.get(index + 1) {
-                out.push(next);
-                index += 2;
-            } else {
-                index += 1;
-            }
+            let next_len = json[index + 1..].chars().next().map_or(0, char::len_utf8);
+            let end = index + 1 + next_len;
+            emit(&mut out, &json[index..end]);
+            index = end;
+            last_kept_high_end = None;
             continue;
         }
-        out.push(c);
+        emit(&mut out, &json[index..index + char_len]);
         if c == '"' {
             in_string = false;
         }
-        index += 1;
+        index += char_len;
+        last_kept_high_end = None;
     }
 
     out
@@ -240,14 +290,14 @@ pub fn strip_lone_surrogate_escapes(json: &str) -> String {
 fn json_parse_lenient(text: &str) -> Result<Value, serde_json::Error> {
     match serde_json::from_str(text) {
         Ok(value) => Ok(value),
-        Err(first) => {
-            let stripped = strip_lone_surrogate_escapes(text);
-            if stripped != text {
-                serde_json::from_str(&stripped)
-            } else {
-                Err(first)
-            }
-        }
+        Err(first) => match strip_lone_surrogate_escapes_if_needed(text) {
+            // A materialized strip differs from the input by construction; its
+            // parse result stands. No lone surrogate (the streaming common
+            // case: a truncated fragment) keeps the first error without an
+            // alloc-and-compare round trip.
+            Some(stripped) => serde_json::from_str(&stripped),
+            None => Err(first),
+        },
     }
 }
 
@@ -308,40 +358,48 @@ pub fn parse_tool_call_arguments(json: Option<&str>) -> ParsedToolCallArguments 
 /// with `Allow.ALL`: every construct may be truncated. Returns `None` where
 /// the JS package throws (`PartialJSON` cannot occur with Allow.ALL at the
 /// top level except through malformed input).
-struct PartialParser {
-    chars: Vec<char>,
+struct PartialParser<'a> {
+    text: &'a str,
     index: usize,
 }
 
-impl PartialParser {
+impl PartialParser<'_> {
     fn len(&self) -> usize {
-        self.chars.len()
+        self.text.len()
     }
 
-    fn at(&self, index: usize) -> Option<char> {
-        self.chars.get(index).copied()
+    /// The byte at `index`. ASCII-only comparisons make continuation bytes
+    /// inert payload, so a byte cursor is behaviorally identical to the
+    /// original char cursor (rpi#78 A3).
+    fn at(&self, index: usize) -> Option<u8> {
+        self.text.as_bytes().get(index).copied()
     }
 
     /// JS `String.prototype.substring(from, to)`: clamps then swaps.
-    fn substring(&self, from: usize, to: usize) -> String {
+    /// Every caller passes char boundaries (quote/backslash/`e`/EOF offsets).
+    fn slice(&self, from: usize, to: usize) -> &str {
         let len = self.len();
         let a = from.min(len);
         let b = to.min(len);
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        self.chars[lo..hi].iter().collect()
+        &self.text[lo..hi]
     }
 
-    fn remaining(&self) -> String {
-        self.chars[self.index..].iter().collect()
+    fn remaining(&self) -> &str {
+        &self.text[self.index..]
     }
 
     fn last_index_of(&self, needle: char) -> Option<usize> {
-        self.chars.iter().rposition(|&c| c == needle)
+        debug_assert!(needle.is_ascii());
+        self.text
+            .as_bytes()
+            .iter()
+            .rposition(|&b| b == needle as u8)
     }
 
     fn skip_blank(&mut self) {
         while let Some(c) = self.at(self.index) {
-            if matches!(c, ' ' | '\n' | '\r' | '\t') {
+            if matches!(c, b' ' | b'\n' | b'\r' | b'\t') {
                 self.index += 1;
             } else {
                 break;
@@ -356,9 +414,9 @@ impl PartialParser {
         }
         let c = self.at(self.index)?;
         match c {
-            '"' => self.parse_str(),
-            '{' => self.parse_obj(),
-            '[' => self.parse_arr(),
+            b'"' => self.parse_str(),
+            b'{' => self.parse_obj(),
+            b'[' => self.parse_arr(),
             _ => {
                 let remaining = self.remaining();
                 for (literal, value) in [
@@ -371,7 +429,7 @@ impl PartialParser {
                         return Some(value);
                     }
                     // Allow partial literal prefixes (Allow.NULL / Allow.BOOL).
-                    if remaining.len() < literal.len() && literal.starts_with(&remaining) {
+                    if remaining.len() < literal.len() && literal.starts_with(remaining) {
                         self.index += literal.len();
                         return Some(value);
                     }
@@ -386,26 +444,26 @@ impl PartialParser {
         let mut escape = false;
         self.index += 1; // skip initial quote
         while self.index < self.len()
-            && (self.at(self.index) != Some('"')
-                || (escape && self.at(self.index.wrapping_sub(1)) == Some('\\')))
+            && (self.at(self.index) != Some(b'"')
+                || (escape && self.at(self.index.wrapping_sub(1)) == Some(b'\\')))
         {
-            escape = self.at(self.index) == Some('\\') && !escape;
+            escape = self.at(self.index) == Some(b'\\') && !escape;
             self.index += 1;
         }
-        if self.at(self.index) == Some('"') {
+        if self.at(self.index) == Some(b'"') {
             self.index += 1;
             let end = self.index - usize::from(escape);
-            return json_parse_lenient(&self.substring(start, end)).ok();
+            return json_parse_lenient(self.slice(start, end)).ok();
         }
         // Allow.STR: unterminated strings are completed with a closing quote.
         let end = self.index - usize::from(escape);
-        let candidate = format!("{}\"", self.substring(start, end));
+        let candidate = format!("{}\"", self.slice(start, end));
         if let Ok(value) = json_parse_lenient(&candidate) {
             return Some(value);
         }
         // Invalid escape sequence fallback: cut at the last backslash.
         let last_backslash = self.last_index_of('\\')?;
-        let candidate = format!("{}\"", self.substring(start, last_backslash));
+        let candidate = format!("{}\"", self.slice(start, last_backslash));
         json_parse_lenient(&candidate).ok()
     }
 
@@ -414,7 +472,7 @@ impl PartialParser {
         self.skip_blank();
         let mut obj = Map::new();
         loop {
-            if self.at(self.index) == Some('}') {
+            if self.at(self.index) == Some(b'}') {
                 break;
             }
             self.skip_blank();
@@ -435,7 +493,7 @@ impl PartialParser {
                 None => return Some(Value::Object(obj)), // Allow.OBJ
             }
             self.skip_blank();
-            if self.at(self.index) == Some(',') {
+            if self.at(self.index) == Some(b',') {
                 self.index += 1;
             }
         }
@@ -447,7 +505,7 @@ impl PartialParser {
         self.index += 1; // skip initial bracket
         let mut arr = Vec::new();
         loop {
-            if self.at(self.index) == Some(']') {
+            if self.at(self.index) == Some(b']') {
                 break;
             }
             match self.parse_any() {
@@ -455,7 +513,7 @@ impl PartialParser {
                 None => return Some(Value::Array(arr)), // Allow.ARR
             }
             self.skip_blank();
-            if self.at(self.index) == Some(',') {
+            if self.at(self.index) == Some(b',') {
                 self.index += 1;
             }
         }
@@ -469,34 +527,34 @@ impl PartialParser {
             if self.remaining() == "-" {
                 return None; // MalformedJSON "Not sure what '-' is"
             }
-            if let Ok(value) = json_parse_lenient(&self.remaining()) {
+            if let Ok(value) = json_parse_lenient(self.remaining()) {
                 return Some(value);
             }
             // Allow.NUM: cut at the last 'e' (partial exponent).
             let last_e = self.last_index_of('e')?;
-            return json_parse_lenient(&self.substring(0, last_e)).ok();
+            return json_parse_lenient(self.slice(0, last_e)).ok();
         }
 
         let start = self.index;
-        if self.at(self.index) == Some('-') {
+        if self.at(self.index) == Some(b'-') {
             self.index += 1;
         }
         while let Some(c) = self.at(self.index) {
-            if ",]}".contains(c) {
+            if matches!(c, b',' | b']' | b'}') {
                 break;
             }
             self.index += 1;
         }
         // index == len is fine under Allow.NUM.
-        let slice = self.substring(start, self.index);
-        if let Ok(value) = json_parse_lenient(&slice) {
+        let slice = self.slice(start, self.index);
+        if let Ok(value) = json_parse_lenient(slice) {
             return Some(value);
         }
         if slice == "-" {
             return None; // PartialJSON "Not sure what '-' is"
         }
         let last_e = self.last_index_of('e')?;
-        json_parse_lenient(&self.substring(start, last_e)).ok()
+        json_parse_lenient(self.slice(start, last_e)).ok()
     }
 }
 
@@ -507,7 +565,7 @@ fn partial_parse(partial_json: &str) -> Option<Value> {
         return None;
     }
     let mut parser = PartialParser {
-        chars: trimmed.chars().collect(),
+        text: trimmed,
         index: 0,
     };
     parser.parse_any()
@@ -544,6 +602,47 @@ pub fn parse_streaming_json_value(partial_json: Option<&str>) -> Value {
         return value;
     }
     Value::Object(Map::new())
+}
+
+/// Refresh cadence for the streamed tool-call argument PREVIEW (rpi#78 A3).
+///
+/// `parse_streaming_json` re-parses the whole accumulated argument text, so a
+/// per-delta call is O(args) work per delta and O(args²) per tool call. The
+/// preview only has to keep up with the renderer (a 16 ms frame tick), and the
+/// authoritative arguments always come from [`parse_tool_call_arguments`] when
+/// the block closes, so adapters may skip intermediate refreshes.
+pub const STREAMING_ARGS_PREVIEW_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Argument payloads up to this size are parsed on every delta: the parse is
+/// cheaper than the bookkeeping and keeps the preview's onset exact.
+const STREAMING_ARGS_PREVIEW_ALWAYS_BYTES: usize = 2048;
+
+/// Per-tool-call preview-parse throttle (see
+/// [`STREAMING_ARGS_PREVIEW_INTERVAL`]).
+#[derive(Debug, Default)]
+pub struct StreamingArgsPreview {
+    last: Option<Instant>,
+}
+
+impl StreamingArgsPreview {
+    /// Whether this delta should refresh `block.arguments` for an accumulated
+    /// argument text of `args_len` bytes.
+    pub fn should_parse(&mut self, args_len: usize) -> bool {
+        if args_len <= STREAMING_ARGS_PREVIEW_ALWAYS_BYTES {
+            // Small payloads refresh unconditionally and do not arm the
+            // throttle, so the first large delta after a small run still
+            // refreshes immediately.
+            return true;
+        }
+        let now = Instant::now();
+        match self.last {
+            Some(last) if now.duration_since(last) < STREAMING_ARGS_PREVIEW_INTERVAL => false,
+            _ => {
+                self.last = Some(now);
+                true
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -801,5 +900,62 @@ mod tests {
         );
         let value = parse_json_with_repair("{\"a\":\"x\\ud83dy\"}").expect("lenient parse");
         assert_eq!(value, json!({"a": "xy"}));
+    }
+
+    /// rpi#78 A3: the lazy strip must report `None` (no allocation) when the
+    /// input has no lone surrogate escape — the streaming hot path.
+    #[test]
+    fn strip_is_lazy_when_nothing_is_dropped() {
+        assert_eq!(
+            strip_lone_surrogate_escapes_if_needed("{\"a\":\"b\"}"),
+            None
+        );
+        let paired = "{\"a\":\"\\ud83d\\ude00\"}";
+        assert_eq!(strip_lone_surrogate_escapes_if_needed(paired), None);
+        assert!(strip_lone_surrogate_escapes_if_needed("{\"a\":\"x\\ud83dy\"}").is_some());
+    }
+
+    /// The byte-cursor partial parser must behave exactly like the previous
+    /// char-cursor one for multi-byte payloads: no panic at any char boundary,
+    /// and the decoded `content` grows monotonically (the write-preview
+    /// highlight cache relies on the prefix property — rpi#78 A4).
+    #[test]
+    fn partial_parse_byte_cursor_is_boundary_safe_and_monotonic() {
+        let content = "fn main() {\n    let s = \"hi\\there\";\n\tprintln!(\"a\\nb\");\n}\n// 中文注释 🚀\n/* x */\n";
+        let full = json!({"path": "a.rs", "content": content}).to_string();
+        let mut last = String::new();
+        let mut saw_cjk = false;
+        for (index, _) in full.char_indices() {
+            let prefix = &full[..index];
+            let map = parse_streaming_json(Some(prefix));
+            if let Some(decoded) = map.get("content").and_then(Value::as_str) {
+                assert!(
+                    decoded.starts_with(&last),
+                    "prefix property broke at {index}: {last:?} -> {decoded:?}"
+                );
+                saw_cjk |= decoded.contains('中') || decoded.contains('🚀');
+                last = decoded.to_owned();
+            }
+        }
+        assert_eq!(last, content);
+        assert!(saw_cjk, "the multi-byte payload must have been exercised");
+    }
+
+    /// rpi#78 A3: small argument payloads parse every delta; large ones are
+    /// throttled to the display cadence (the authoritative arguments come from
+    /// `parse_tool_call_arguments` at block end).
+    #[test]
+    fn streaming_args_preview_throttles_large_payloads() {
+        let mut preview = StreamingArgsPreview::default();
+        for _ in 0..10 {
+            assert!(preview.should_parse(64), "small payloads always refresh");
+        }
+        assert!(
+            preview.should_parse(4096),
+            "the first large delta refreshes"
+        );
+        assert!(!preview.should_parse(8192), "immediate re-parse is skipped");
+        std::thread::sleep(STREAMING_ARGS_PREVIEW_INTERVAL + std::time::Duration::from_millis(5));
+        assert!(preview.should_parse(8192), "the next window refreshes");
     }
 }

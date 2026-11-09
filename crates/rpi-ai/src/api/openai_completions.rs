@@ -31,7 +31,6 @@
 //!   body JSON (upstream reads it off the SDK error object).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
@@ -52,8 +51,8 @@ use crate::types::{
     AssistantContent, AssistantMessage, CacheControlFormat, CacheRetention, ChatTemplateKwargValue,
     ChatTemplateKwargVarKind, DoneReason, ErrorReason, InputModality, MaxTokensField, Message,
     Model, ModelThinkingLevel, OpenRouterRouting, ProviderHeaders, ProviderResponse, Role,
-    SessionAffinityFormat, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions,
-    TextContent, ThinkingBudgets, ThinkingContent, ThinkingFormat, Tool, ToolCall,
+    SessionAffinityFormat, SharedAssistantMessage, SimpleStreamOptions, StopReason, StreamEvent,
+    StreamOptions, TextContent, ThinkingBudgets, ThinkingContent, ThinkingFormat, Tool, ToolCall,
     ToolResultContent, TranscriptContext, Usage, UserContent, UserContentBlock,
     VercelGatewayRouting,
 };
@@ -66,6 +65,7 @@ use crate::utils::headers::{
     headers_to_record, identity_headers, merge_headers_chain, model_headers,
     provider_headers_to_header_map,
 };
+use crate::utils::json_parse::StreamingArgsPreview;
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_retry::{
     ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
@@ -1730,6 +1730,8 @@ struct ToolScratch {
     partial_args: Option<String>,
     custom_input: Option<CustomInputState>,
     stream_index: Option<usize>,
+    /// rpi#78 A3: refresh `block.arguments` at display cadence, not per delta.
+    args_preview: StreamingArgsPreview,
 }
 
 /// Outcome of handling one SSE event (the `[DONE]` sentinel ends the stream).
@@ -1926,7 +1928,7 @@ fn parse_legacy_encrypted_reasoning_detail(signature: Option<&str>) -> Option<Va
 /// protocol, accumulating the final assistant message. Factored out of the
 /// HTTP layer so tests can drive it with recorded streams.
 struct CompletionsProcessor<'a> {
-    output: &'a mut AssistantMessage,
+    output: &'a SharedAssistantMessage,
     model: &'a Model,
     grammar_tool_input_properties: &'a HashMap<String, String>,
     /// Resolved `compat.supportsFinishReason` (2c3041242).
@@ -1946,7 +1948,7 @@ struct CompletionsProcessor<'a> {
 
 impl<'a> CompletionsProcessor<'a> {
     fn new(
-        output: &'a mut AssistantMessage,
+        output: &'a SharedAssistantMessage,
         model: &'a Model,
         grammar_tool_input_properties: &'a HashMap<String, String>,
         supports_finish_reason: bool,
@@ -1991,45 +1993,48 @@ impl<'a> CompletionsProcessor<'a> {
         Ok(SseOutcome::Chunk)
     }
 
-    fn ensure_text_block(&mut self, events: &AssistantMessageEventStream) -> usize {
+    fn ensure_text_block(
+        &mut self,
+        output: &mut AssistantMessage,
+        events: &AssistantMessageEventStream,
+    ) -> usize {
         if let Some(index) = self.text_block {
             return index;
         }
-        self.output
-            .content
-            .push(AssistantContent::Text(TextContent {
-                text: String::new(),
-                text_signature: None,
-            }));
-        let index = self.output.content.len() - 1;
+        output.content.push(AssistantContent::Text(TextContent {
+            text: String::new(),
+            text_signature: None,
+        }));
+        let index = output.content.len() - 1;
         self.text_block = Some(index);
         events.push(StreamEvent::TextStart {
             content_index: index,
-            partial: Arc::new(self.output.clone()),
+            partial: self.output.clone(),
         });
         index
     }
 
     fn ensure_thinking_block(
         &mut self,
+        output: &mut AssistantMessage,
         thinking_signature: &str,
         events: &AssistantMessageEventStream,
     ) -> usize {
         if let Some(index) = self.thinking_block {
             return index;
         }
-        self.output
+        output
             .content
             .push(AssistantContent::Thinking(ThinkingContent {
                 thinking: String::new(),
                 thinking_signature: Some(thinking_signature.to_owned()),
                 redacted: None,
             }));
-        let index = self.output.content.len() - 1;
+        let index = output.content.len() - 1;
         self.thinking_block = Some(index);
         events.push(StreamEvent::ThinkingStart {
             content_index: index,
-            partial: Arc::new(self.output.clone()),
+            partial: self.output.clone(),
         });
         index
     }
@@ -2039,6 +2044,7 @@ impl<'a> CompletionsProcessor<'a> {
     /// upgrade and pending reasoning-detail application.
     fn ensure_tool_call_block(
         &mut self,
+        output: &mut AssistantMessage,
         tool_call: &Value,
         events: &AssistantMessageEventStream,
     ) -> usize {
@@ -2090,17 +2096,15 @@ impl<'a> CompletionsProcessor<'a> {
             if let Some(property) = &custom_property {
                 arguments.insert(property.clone(), json!(""));
             }
-            self.output
-                .content
-                .push(AssistantContent::ToolCall(ToolCall {
-                    id: id.unwrap_or("").to_owned(),
-                    name: name.to_owned(),
-                    arguments,
-                    thought_signature: None,
-                    namespace: None,
-                    arguments_error: None,
-                }));
-            let index = self.output.content.len() - 1;
+            output.content.push(AssistantContent::ToolCall(ToolCall {
+                id: id.unwrap_or("").to_owned(),
+                name: name.to_owned(),
+                arguments,
+                thought_signature: None,
+                namespace: None,
+                arguments_error: None,
+            }));
+            let index = output.content.len() - 1;
             self.scratch.insert(
                 index,
                 ToolScratch {
@@ -2114,6 +2118,7 @@ impl<'a> CompletionsProcessor<'a> {
                         json_buffer: GrammarToolInputJsonBuffer::default(),
                     }),
                     stream_index,
+                    args_preview: StreamingArgsPreview::default(),
                 },
             );
             if let Some(stream_index) = stream_index {
@@ -2124,7 +2129,7 @@ impl<'a> CompletionsProcessor<'a> {
             }
             events.push(StreamEvent::ToolCallStart {
                 content_index: index,
-                partial: Arc::new(self.output.clone()),
+                partial: self.output.clone(),
             });
             content_index = Some(index);
         }
@@ -2147,7 +2152,7 @@ impl<'a> CompletionsProcessor<'a> {
         if let Some(id) = id.filter(|id| !id.is_empty()) {
             self.tool_call_by_id.insert(id.to_owned(), index);
         }
-        if let Some(AssistantContent::ToolCall(block)) = self.output.content.get_mut(index)
+        if let Some(AssistantContent::ToolCall(block)) = output.content.get_mut(index)
             && block.name.is_empty()
             && !name.is_empty()
         {
@@ -2162,7 +2167,7 @@ impl<'a> CompletionsProcessor<'a> {
                 .get(&index)
                 .is_some_and(|scratch| scratch.custom_input.is_none())
         {
-            let block_name = match self.output.content.get(index) {
+            let block_name = match output.content.get(index) {
                 Some(AssistantContent::ToolCall(block)) => block.name.clone(),
                 _ => String::new(),
             };
@@ -2171,7 +2176,7 @@ impl<'a> CompletionsProcessor<'a> {
                 .get(&block_name)
                 .cloned()
                 .unwrap_or_else(|| "input".to_owned());
-            if let Some(AssistantContent::ToolCall(block)) = self.output.content.get_mut(index) {
+            if let Some(AssistantContent::ToolCall(block)) = output.content.get_mut(index) {
                 let mut arguments = Map::new();
                 arguments.insert(property.clone(), json!(""));
                 block.arguments = arguments;
@@ -2195,219 +2200,233 @@ impl<'a> CompletionsProcessor<'a> {
         chunk: &Value,
         events: &AssistantMessageEventStream,
     ) -> Result<(), String> {
-        if !chunk.is_object() {
-            return Ok(());
-        }
-
-        // OpenAI documents ChatCompletionChunk.id as the unique chat completion
-        // identifier; each chunk in a streamed completion carries the same id.
-        if self.output.response_id.is_none()
-            && let Some(id) = chunk.get("id").and_then(Value::as_str)
-        {
-            self.output.response_id = Some(id.to_owned());
-        }
-        if let Some(chunk_model) = chunk.get("model").and_then(Value::as_str)
-            && !chunk_model.is_empty()
-            && chunk_model != self.model.id
-            && self.output.response_model.is_none()
-        {
-            self.output.response_model = Some(chunk_model.to_owned());
-        }
-        if chunk.get("usage").is_some_and(is_js_truthy) {
-            self.output.usage = parse_chunk_usage(&chunk["usage"], self.model);
-        }
-
-        let Some(choice) = chunk
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-        else {
-            return Ok(());
-        };
-
-        // Fallback: some providers (e.g., Moonshot) return usage in
-        // choice.usage instead of the standard chunk.usage.
-        if !chunk.get("usage").is_some_and(is_js_truthy)
-            && let Some(usage) = choice.get("usage").filter(|usage| is_js_truthy(usage))
-        {
-            self.output.usage = parse_chunk_usage(usage, self.model);
-        }
-
-        if let Some(finish_reason) = choice.get("finish_reason")
-            && is_js_truthy(finish_reason)
-        {
-            // fe1c9b6d5: preserve the raw provider reason before mapping.
-            self.output.raw_stop_reason = finish_reason.as_str().map(str::to_owned);
-            let (stop_reason, error_message) = map_stop_reason(finish_reason.as_str());
-            self.output.stop_reason = stop_reason;
-            if let Some(error_message) = error_message {
-                self.output.error_message = Some(error_message);
+        self.output.with_mut(|output| {
+            if !chunk.is_object() {
+                return Ok(());
             }
-            self.has_finish_reason = true;
-        }
 
-        let Some(delta) = choice.get("delta").filter(|delta| is_js_truthy(delta)) else {
-            return Ok(());
-        };
-
-        // Reasoning and answer text may share one delta; reasoning comes first.
-        // Some endpoints return reasoning in reasoning_content (llama.cpp), or
-        // reasoning (other openai compatible endpoints). Use the first
-        // non-empty reasoning field to avoid duplication (e.g., chutes.ai
-        // returns both with the same content).
-        let reasoning_field = ["reasoning_content", "reasoning", "reasoning_text"]
-            .into_iter()
-            .find(|field| {
-                delta
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
-            });
-        if let Some(field) = reasoning_field {
-            // invariant: `find` matched a non-empty string value
-            let value = delta.get(field).and_then(Value::as_str).unwrap_or("");
-            let thinking_signature = if self.model.provider == "opencode-go" && field == "reasoning"
+            // OpenAI documents ChatCompletionChunk.id as the unique chat completion
+            // identifier; each chunk in a streamed completion carries the same id.
+            if output.response_id.is_none()
+                && let Some(id) = chunk.get("id").and_then(Value::as_str)
             {
-                "reasoning_content"
-            } else {
-                field
+                output.response_id = Some(id.to_owned());
+            }
+            if let Some(chunk_model) = chunk.get("model").and_then(Value::as_str)
+                && !chunk_model.is_empty()
+                && chunk_model != self.model.id
+                && output.response_model.is_none()
+            {
+                output.response_model = Some(chunk_model.to_owned());
+            }
+            if chunk.get("usage").is_some_and(is_js_truthy) {
+                output.usage = parse_chunk_usage(&chunk["usage"], self.model);
+            }
+
+            let Some(choice) = chunk
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
+            else {
+                return Ok(());
             };
-            let content_index = self.ensure_thinking_block(thinking_signature, events);
-            if let Some(AssistantContent::Thinking(block)) =
-                self.output.content.get_mut(content_index)
+
+            // Fallback: some providers (e.g., Moonshot) return usage in
+            // choice.usage instead of the standard chunk.usage.
+            if !chunk.get("usage").is_some_and(is_js_truthy)
+                && let Some(usage) = choice.get("usage").filter(|usage| is_js_truthy(usage))
             {
-                block.thinking.push_str(value);
+                output.usage = parse_chunk_usage(usage, self.model);
             }
-            events.push(StreamEvent::ThinkingDelta {
-                content_index,
-                delta: value.to_owned(),
-                partial: Arc::new(self.output.clone()),
-            });
-        }
 
-        if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-            for tool_call in tool_calls {
-                let content_index = self.ensure_tool_call_block(tool_call, events);
-
-                if let Some(id) = tool_call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                {
-                    let needs_id = matches!(
-                        self.output.content.get(content_index),
-                        Some(AssistantContent::ToolCall(block)) if block.id.is_empty()
-                    );
-                    if needs_id {
-                        if let Some(AssistantContent::ToolCall(block)) =
-                            self.output.content.get_mut(content_index)
-                        {
-                            block.id = id.to_owned();
-                        }
-                        self.tool_call_by_id.insert(id.to_owned(), content_index);
-                    }
+            if let Some(finish_reason) = choice.get("finish_reason")
+                && is_js_truthy(finish_reason)
+            {
+                // fe1c9b6d5: preserve the raw provider reason before mapping.
+                output.raw_stop_reason = finish_reason.as_str().map(str::to_owned);
+                let (stop_reason, error_message) = map_stop_reason(finish_reason.as_str());
+                output.stop_reason = stop_reason;
+                if let Some(error_message) = error_message {
+                    output.error_message = Some(error_message);
                 }
-                let name = tool_call
-                    .get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        tool_call
-                            .get("custom")
-                            .and_then(|custom| custom.get("name"))
-                            .and_then(Value::as_str)
-                    });
-                if let Some(AssistantContent::ToolCall(block)) =
-                    self.output.content.get_mut(content_index)
-                    && block.name.is_empty()
-                    && let Some(name) = name
-                {
-                    block.name = name.to_owned();
-                }
+                self.has_finish_reason = true;
+            }
 
-                let mut delta_text = String::new();
-                let function_arguments = tool_call
-                    .get("function")
-                    .and_then(|function| function.get("arguments"))
-                    .and_then(Value::as_str)
-                    .filter(|arguments| !arguments.is_empty());
-                let custom_input = tool_call
-                    .get("custom")
-                    .and_then(|custom| custom.get("input"))
-                    .and_then(Value::as_str)
-                    .filter(|input| !input.is_empty());
-                if let Some(arguments) = function_arguments {
-                    delta_text = arguments.to_owned();
-                    let partial = {
-                        let scratch = self.scratch.entry(content_index).or_default();
-                        let partial = scratch.partial_args.get_or_insert_with(String::new);
-                        partial.push_str(arguments);
-                        partial.clone()
+            let Some(delta) = choice.get("delta").filter(|delta| is_js_truthy(delta)) else {
+                return Ok(());
+            };
+
+            // Reasoning and answer text may share one delta; reasoning comes first.
+            // Some endpoints return reasoning in reasoning_content (llama.cpp), or
+            // reasoning (other openai compatible endpoints). Use the first
+            // non-empty reasoning field to avoid duplication (e.g., chutes.ai
+            // returns both with the same content).
+            let reasoning_field = ["reasoning_content", "reasoning", "reasoning_text"]
+                .into_iter()
+                .find(|field| {
+                    delta
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                });
+            if let Some(field) = reasoning_field {
+                // invariant: `find` matched a non-empty string value
+                let value = delta.get(field).and_then(Value::as_str).unwrap_or("");
+                let thinking_signature =
+                    if self.model.provider == "opencode-go" && field == "reasoning" {
+                        "reasoning_content"
+                    } else {
+                        field
                     };
-                    if let Some(AssistantContent::ToolCall(block)) =
-                        self.output.content.get_mut(content_index)
-                    {
-                        block.arguments = parse_streaming_json(Some(&partial));
-                    }
-                } else if let Some(input) = custom_input {
-                    let scratch = self.scratch.entry(content_index).or_default();
-                    if let Some(AssistantContent::ToolCall(block)) =
-                        self.output.content.get_mut(content_index)
-                    {
-                        let next_input =
-                            format!("{}{input}", custom_tool_call_input(block, scratch));
-                        delta_text =
-                            append_custom_tool_call_input(block, scratch, &next_input, false)?
-                                .unwrap_or_default();
-                    }
+                let content_index = self.ensure_thinking_block(output, thinking_signature, events);
+                if let Some(AssistantContent::Thinking(block)) =
+                    output.content.get_mut(content_index)
+                {
+                    block.thinking.push_str(value);
                 }
-                events.push(StreamEvent::ToolCallDelta {
+                events.push(StreamEvent::ThinkingDelta {
                     content_index,
-                    delta: delta_text,
-                    partial: Arc::new(self.output.clone()),
+                    delta: value.to_owned(),
+                    partial: self.output.clone(),
                 });
             }
-        }
 
-        // b7bb00b93 (#7994): reasoning details are replay metadata, not
-        // user-visible stream deltas — buffer them and serialize once at
-        // block finalize. Consecutive text/summary deltas merge into logical
-        // entries; encrypted entries remain opaque and discrete.
-        if let Some(reasoning_details) = delta.get("reasoning_details").and_then(Value::as_array) {
-            for detail in reasoning_details {
-                if !is_openai_reasoning_detail(detail) {
-                    continue;
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for tool_call in tool_calls {
+                    let content_index = self.ensure_tool_call_block(output, tool_call, events);
+
+                    if let Some(id) = tool_call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    {
+                        let needs_id = matches!(
+                            output.content.get(content_index),
+                            Some(AssistantContent::ToolCall(block)) if block.id.is_empty()
+                        );
+                        if needs_id {
+                            if let Some(AssistantContent::ToolCall(block)) =
+                                output.content.get_mut(content_index)
+                            {
+                                block.id = id.to_owned();
+                            }
+                            self.tool_call_by_id.insert(id.to_owned(), content_index);
+                        }
+                    }
+                    let name = tool_call
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            tool_call
+                                .get("custom")
+                                .and_then(|custom| custom.get("name"))
+                                .and_then(Value::as_str)
+                        });
+                    if let Some(AssistantContent::ToolCall(block)) =
+                        output.content.get_mut(content_index)
+                        && block.name.is_empty()
+                        && let Some(name) = name
+                    {
+                        block.name = name.to_owned();
+                    }
+
+                    let mut delta_text = String::new();
+                    let function_arguments = tool_call
+                        .get("function")
+                        .and_then(|function| function.get("arguments"))
+                        .and_then(Value::as_str)
+                        .filter(|arguments| !arguments.is_empty());
+                    let custom_input = tool_call
+                        .get("custom")
+                        .and_then(|custom| custom.get("input"))
+                        .and_then(Value::as_str)
+                        .filter(|input| !input.is_empty());
+                    if let Some(arguments) = function_arguments {
+                        delta_text = arguments.to_owned();
+                        // rpi#78 A3: no O(args) `String` clone per delta and no
+                        // full re-parse beyond display cadence. The authoritative
+                        // arguments are parsed from `partial_args` at block end
+                        // (`parse_tool_call_arguments`), so a skipped preview only
+                        // means the UI shows the previous parse for <33 ms.
+                        let refresh = {
+                            let scratch = self.scratch.entry(content_index).or_default();
+                            let partial = scratch.partial_args.get_or_insert_with(String::new);
+                            partial.push_str(arguments);
+                            scratch.args_preview.should_parse(partial.len())
+                        };
+                        if refresh {
+                            let scratch = self.scratch.entry(content_index).or_default();
+                            let partial = scratch.partial_args.as_deref().unwrap_or_default();
+                            let parsed = parse_streaming_json(Some(partial));
+                            if let Some(AssistantContent::ToolCall(block)) =
+                                output.content.get_mut(content_index)
+                            {
+                                block.arguments = parsed;
+                            }
+                        }
+                    } else if let Some(input) = custom_input {
+                        let scratch = self.scratch.entry(content_index).or_default();
+                        if let Some(AssistantContent::ToolCall(block)) =
+                            output.content.get_mut(content_index)
+                        {
+                            let next_input =
+                                format!("{}{input}", custom_tool_call_input(block, scratch));
+                            delta_text =
+                                append_custom_tool_call_input(block, scratch, &next_input, false)?
+                                    .unwrap_or_default();
+                        }
+                    }
+                    events.push(StreamEvent::ToolCallDelta {
+                        content_index,
+                        delta: delta_text,
+                        partial: self.output.clone(),
+                    });
                 }
-                self.ensure_thinking_block("", events);
-                append_openai_reasoning_detail(
-                    self.streamed_reasoning_details.get_or_insert_with(Vec::new),
-                    detail,
-                );
             }
-        }
 
-        if let Some(content) = delta.get("content").and_then(Value::as_str)
-            && !content.is_empty()
-        {
-            let content_index = self.ensure_text_block(events);
-            if let Some(AssistantContent::Text(block)) = self.output.content.get_mut(content_index)
+            // b7bb00b93 (#7994): reasoning details are replay metadata, not
+            // user-visible stream deltas — buffer them and serialize once at
+            // block finalize. Consecutive text/summary deltas merge into logical
+            // entries; encrypted entries remain opaque and discrete.
+            if let Some(reasoning_details) =
+                delta.get("reasoning_details").and_then(Value::as_array)
             {
-                block.text.push_str(content);
+                for detail in reasoning_details {
+                    if !is_openai_reasoning_detail(detail) {
+                        continue;
+                    }
+                    self.ensure_thinking_block(output, "", events);
+                    append_openai_reasoning_detail(
+                        self.streamed_reasoning_details.get_or_insert_with(Vec::new),
+                        detail,
+                    );
+                }
             }
-            events.push(StreamEvent::TextDelta {
-                content_index,
-                delta: content.to_owned(),
-                partial: Arc::new(self.output.clone()),
-            });
-        }
 
-        Ok(())
+            if let Some(content) = delta.get("content").and_then(Value::as_str)
+                && !content.is_empty()
+            {
+                let content_index = self.ensure_text_block(output, events);
+                if let Some(AssistantContent::Text(block)) = output.content.get_mut(content_index) {
+                    block.text.push_str(content);
+                }
+                events.push(StreamEvent::TextDelta {
+                    content_index,
+                    delta: content.to_owned(),
+                    partial: self.output.clone(),
+                });
+            }
+
+            Ok(())
+        })
     }
 
     /// `finishBlock`: emit the end event for one content block (closing the
     /// grammar JSON buffer for custom tools first).
     fn finish_block(
         &mut self,
+        output: &mut AssistantMessage,
         content_index: usize,
         events: &AssistantMessageEventStream,
     ) -> Result<(), String> {
@@ -2423,7 +2442,7 @@ impl<'a> CompletionsProcessor<'a> {
             .as_ref()
             .map(|details| details.iter().map(|d| d.to_string()).collect::<Vec<_>>())
             .map(|parts| format!("[{}]", parts.join(",")));
-        let end = match self.output.content.get_mut(content_index) {
+        let end = match output.content.get_mut(content_index) {
             Some(AssistantContent::Text(block)) => Some(BlockEnd::Text(block.text.clone())),
             Some(AssistantContent::Thinking(block)) => {
                 // #8671: serialize the buffered details exactly once, at
@@ -2454,24 +2473,24 @@ impl<'a> CompletionsProcessor<'a> {
             events.push(StreamEvent::ToolCallDelta {
                 content_index,
                 delta,
-                partial: Arc::new(self.output.clone()),
+                partial: self.output.clone(),
             });
         }
         match end {
             Some(BlockEnd::Text(content)) => events.push(StreamEvent::TextEnd {
                 content_index,
                 content,
-                partial: Arc::new(self.output.clone()),
+                partial: self.output.clone(),
             }),
             Some(BlockEnd::Thinking(content)) => events.push(StreamEvent::ThinkingEnd {
                 content_index,
                 content,
-                partial: Arc::new(self.output.clone()),
+                partial: self.output.clone(),
             }),
             Some(BlockEnd::ToolCall(tool_call)) => events.push(StreamEvent::ToolCallEnd {
                 content_index,
                 tool_call,
-                partial: Arc::new(self.output.clone()),
+                partial: self.output.clone(),
             }),
             None => {}
         }
@@ -2481,15 +2500,17 @@ impl<'a> CompletionsProcessor<'a> {
     /// The upstream `catch` arm (:699-701): apply buffered reasoning
     /// details to every thinking block on a failed stream.
     fn apply_streamed_reasoning_details_to_thinking_blocks(&mut self) {
-        let Some(details) = &self.streamed_reasoning_details else {
-            return;
-        };
-        let serialized = serde_json::to_string(details).unwrap_or_default();
-        for block in &mut self.output.content {
-            if let AssistantContent::Thinking(block) = block {
-                block.thinking_signature = Some(serialized.clone());
+        self.output.with_mut(|output| {
+            let Some(details) = &self.streamed_reasoning_details else {
+                return;
+            };
+            let serialized = serde_json::to_string(details).unwrap_or_default();
+            for block in &mut output.content {
+                if let AssistantContent::Thinking(block) = block {
+                    block.thinking_signature = Some(serialized.clone());
+                }
             }
-        }
+        })
     }
 
     /// Post-stream tail: finish all blocks, then the upstream final checks.
@@ -2498,47 +2519,47 @@ impl<'a> CompletionsProcessor<'a> {
         signal: Option<&CancellationToken>,
         events: &AssistantMessageEventStream,
     ) -> Result<DoneReason, String> {
-        for index in 0..self.output.content.len() {
-            self.finish_block(index, events)?;
-        }
-        if signal.is_some_and(|signal| signal.is_cancelled()) {
-            return Err("Request was aborted".to_owned());
-        }
-        if self.output.stop_reason == StopReason::Aborted {
-            return Err("Request was aborted".to_owned());
-        }
-        // 2c3041242: providers that never send `finish_reason` get their stop
-        // reason inferred from content.
-        if !self.has_finish_reason && !self.supports_finish_reason {
-            self.output.stop_reason = if self
-                .output
-                .content
-                .iter()
-                .any(|block| matches!(block, AssistantContent::ToolCall(_)))
+        self.output.with_mut(|output| {
+            for index in 0..output.content.len() {
+                self.finish_block(output, index, events)?;
+            }
+            if signal.is_some_and(|signal| signal.is_cancelled()) {
+                return Err("Request was aborted".to_owned());
+            }
+            if output.stop_reason == StopReason::Aborted {
+                return Err("Request was aborted".to_owned());
+            }
+            // 2c3041242: providers that never send `finish_reason` get their stop
+            // reason inferred from content.
+            if !self.has_finish_reason && !self.supports_finish_reason {
+                output.stop_reason = if output
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, AssistantContent::ToolCall(_)))
+                {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::Stop
+                };
+            }
+            if output.stop_reason == StopReason::Error {
+                return Err(output
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "Provider returned an error stop reason".to_owned()));
+            }
+            if (self.supports_finish_reason && !self.has_finish_reason)
+                || output.stop_reason == StopReason::Pending
             {
-                StopReason::ToolUse
-            } else {
-                StopReason::Stop
-            };
-        }
-        if self.output.stop_reason == StopReason::Error {
-            return Err(self
-                .output
-                .error_message
-                .clone()
-                .unwrap_or_else(|| "Provider returned an error stop reason".to_owned()));
-        }
-        if (self.supports_finish_reason && !self.has_finish_reason)
-            || self.output.stop_reason == StopReason::Pending
-        {
-            return Err("Stream ended without finish_reason".to_owned());
-        }
-        Ok(match self.output.stop_reason {
-            StopReason::Length => DoneReason::Length,
-            StopReason::ToolUse => DoneReason::ToolUse,
-            // Stop is the only remaining reachable reason (Pending/Error/
-            // Aborted returned above).
-            _ => DoneReason::Stop,
+                return Err("Stream ended without finish_reason".to_owned());
+            }
+            Ok(match output.stop_reason {
+                StopReason::Length => DoneReason::Length,
+                StopReason::ToolUse => DoneReason::ToolUse,
+                // Stop is the only remaining reachable reason (Pending/Error/
+                // Aborted returned above).
+                _ => DoneReason::Stop,
+            })
         })
     }
 }
@@ -2584,7 +2605,7 @@ async fn run(
     model: &Model,
     context: &TranscriptContext,
     options: &OpenAICompletionsOptions,
-    output: &mut AssistantMessage,
+    output: &SharedAssistantMessage,
     events: &AssistantMessageEventStream,
 ) -> Result<DoneReason, String> {
     let api_key = get_client_api_key(
@@ -2722,7 +2743,7 @@ async fn run(
     }
 
     events.push(StreamEvent::Start {
-        partial: Arc::new(output.clone()),
+        partial: output.clone(),
     });
 
     let mut processor = CompletionsProcessor::new(
@@ -2820,30 +2841,32 @@ pub fn stream(
     );
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
-        let mut output = initial_output(&model);
-        match run(&model, &context, &options, &mut output, &task_stream).await {
+        let output = SharedAssistantMessage::new(initial_output(&model));
+        match run(&model, &context, &options, &output, &task_stream).await {
             Ok(reason) => {
                 task_stream.push(StreamEvent::Done {
                     reason,
-                    message: output,
+                    message: output.snapshot(),
                 });
                 task_stream.end(None);
             }
             Err(message) => {
                 let aborted = signal.as_ref().is_some_and(|signal| signal.is_cancelled());
-                output.stop_reason = if aborted {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                output.error_message = Some(message);
+                output.with_mut(|output| {
+                    output.stop_reason = if aborted {
+                        StopReason::Aborted
+                    } else {
+                        StopReason::Error
+                    };
+                    output.error_message = Some(message);
+                });
                 task_stream.push(StreamEvent::Error {
                     reason: if aborted {
                         ErrorReason::Aborted
                     } else {
                         ErrorReason::Error
                     },
-                    error: output,
+                    error: output.snapshot(),
                 });
                 task_stream.end(None);
             }
@@ -5544,10 +5567,10 @@ mod build_and_stream_tests {
         AssistantMessage,
     ) {
         let events = AssistantMessageEventStream::new();
-        let mut output = initial_output(model);
+        let output = SharedAssistantMessage::new(initial_output(model));
         let reason = {
             let mut processor = CompletionsProcessor::new(
-                &mut output,
+                &output,
                 model,
                 grammar_props,
                 get_compat(model).supports_finish_reason,
@@ -5587,7 +5610,7 @@ mod build_and_stream_tests {
         };
         events.end(None);
         let collected: Vec<StreamEvent> = futures::executor::block_on(events.collect());
-        (collected, reason, output)
+        (collected, reason, output.snapshot())
     }
 
     fn event_kinds(events: &[StreamEvent]) -> Vec<&str> {
@@ -5712,6 +5735,62 @@ mod build_and_stream_tests {
     }
 
     #[test]
+    fn test_large_tool_argument_interleaved_close_is_authoritative() {
+        let long = "x".repeat(4096);
+        let first = format!(r#"{{"text":"{long}"#);
+        let second = "\"}";
+        let mut raw = Vec::new();
+        for index in 0..2 {
+            raw.push(json!({
+                "id": "c", "model": "m",
+                "choices": [{"index": 0, "finish_reason": null, "delta": {"tool_calls": [{
+                    "index": index, "id": format!("call_{index}"), "type": "function",
+                    "function": {"name": "write", "arguments": first}
+                }]}}]
+            }));
+        }
+        for index in 0..2 {
+            raw.push(json!({
+                "id": "c", "model": "m",
+                "choices": [{"index": 0, "finish_reason": null, "delta": {"tool_calls": [{
+                    "index": index, "function": {"arguments": second}
+                }]}}]
+            }));
+        }
+        raw.push(json!({
+            "id": "c", "model": "m",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        let payload = raw
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>()
+            + "data: [DONE]\n\n";
+        let (events, reason, output) =
+            replay(&make_model(json!({})), &no_grammar(), payload.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::ToolUse));
+        let ends: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 2);
+        for call in ends {
+            assert_eq!(call.arguments["text"], json!(long));
+            assert_eq!(call.arguments_error, None);
+        }
+        assert_eq!(output.content.len(), 2);
+        for block in &output.content {
+            let AssistantContent::ToolCall(call) = block else {
+                panic!("expected tool call");
+            };
+            assert_eq!(call.arguments["text"], json!(long));
+        }
+    }
+
+    #[test]
     fn test_processor_custom_grammar_tool() {
         let model = make_model(json!({}));
         let grammar = HashMap::from([("sql".to_owned(), "query".to_owned())]);
@@ -5737,10 +5816,8 @@ mod build_and_stream_tests {
             .collect();
         assert_eq!(deltas, vec!["{\"query\":\"SELECT ", "*", "\"}"]);
 
-        // 8b5899dce: the `toolcall_start` block's arguments are
-        // `{[input_property]: ""}` — not a permanently-empty object; the
-        // JSON then arrives through `toolcall_delta` (upstream
-        // openai-completions.ts:504-528).
+        // The queued start handle is live: by drain time it observes the
+        // authoritative arguments accumulated by the later deltas.
         let start = events
             .iter()
             .find_map(|event| match event {
@@ -5748,13 +5825,13 @@ mod build_and_stream_tests {
                 _ => None,
             })
             .expect("toolcall_start event");
-        match &start.content[0] {
+        start.with(|start| match &start.content[0] {
             AssistantContent::ToolCall(call) => assert_eq!(
                 call.arguments,
-                json!({"query": ""}).as_object().cloned().unwrap()
+                json!({"query": "SELECT *"}).as_object().cloned().unwrap()
             ),
             other => panic!("expected tool call block, got {other:?}"),
-        }
+        });
 
         let call = match &output.content[0] {
             AssistantContent::ToolCall(call) => call,

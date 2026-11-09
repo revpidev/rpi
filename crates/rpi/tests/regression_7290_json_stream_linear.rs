@@ -180,6 +180,14 @@ async fn measure_update_bytes(text: &str) -> usize {
                 .push(event);
         }));
 
+    // rpi#78 A1: a default install has no `message_update_delta` subscriber, so
+    // the host must not build that payload at all (the cost is opt-in).
+    assert!(
+        !runtime
+            .session()
+            .has_extension_handlers("message_update_delta"),
+        "no extension is loaded, so the delta event must be unsubscribed"
+    );
     runtime
         .session()
         .prompt("respond", Default::default())

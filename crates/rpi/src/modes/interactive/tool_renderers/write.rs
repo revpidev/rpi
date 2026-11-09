@@ -42,6 +42,17 @@ const WRITE_PARTIAL_FULL_HIGHLIGHT_LINES: usize = 50;
 /// `maxLines` for the collapsed call preview (write.ts:157).
 const WRITE_PREVIEW_LINES: usize = 10;
 
+/// Leading lines a cache materializes on construction (rpi#78 A4).
+///
+/// The collapsed preview renders [`WRITE_PREVIEW_LINES`] lines, and
+/// [`refresh_write_highlight_prefix`] re-highlights the first
+/// [`WRITE_PARTIAL_FULL_HIGHLIGHT_LINES`] while streaming, so nothing beyond
+/// this window can ever reach the screen without an explicit expand. Expanding
+/// highlights the rest on demand — a whole-file syntect pass used to run on the
+/// driver thread at `argsComplete` for every large write.
+const WRITE_HIGHLIGHT_WINDOW_LINES: usize =
+    WRITE_PARTIAL_FULL_HIGHLIGHT_LINES + WRITE_PREVIEW_LINES;
+
 /// `WriteHighlightCache` (write.ts:47-53): per tool call, carried by the
 /// [`RendererStateSlot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,13 +67,15 @@ struct WriteHighlightCache {
     raw_content: String,
     /// `normalizedLines` — tab-replaced, CR-stripped lines of `rawContent`.
     normalized_lines: Vec<String>,
-    /// `highlightedLines` — one styled line per `normalizedLines` entry.
+    /// `highlightedLines` — a *leading prefix* of `normalizedLines`, styled.
+    /// Shorter than `normalizedLines` by design when the content outgrows
+    /// [`WRITE_HIGHLIGHT_WINDOW_LINES`]; [`highlight_write_window`] extends it
+    /// on demand.
     highlighted_lines: Vec<String>,
-    /// Whether the cache was produced by a full rebuild of `raw_content`
-    /// (as opposed to incremental streaming maintenance). A completed call
-    /// reuses a `full` cache instead of re-running syntect over the whole
-    /// file on every `update_display` pass.
-    full: bool,
+    /// Whether `highlighted_lines` came from one context-aware block pass over
+    /// the current content. Incremental single-line updates clear this; an
+    /// argsComplete/expanded render restores it before exposing those lines.
+    highlighted_in_context: bool,
 }
 
 /// `WriteRenderState` (write.ts:55-61 `WriteCallRenderComponent.cache`): the
@@ -95,7 +108,9 @@ thread_local! {
 fn refresh_write_highlight_prefix(cache: &mut WriteHighlightCache, theme: &Theme) {
     #[cfg(test)]
     PREFIX_REFRESH_COUNT.with(|count| count.set(count.get() + 1));
-    let prefix_count = WRITE_PARTIAL_FULL_HIGHLIGHT_LINES.min(cache.normalized_lines.len());
+    let prefix_count = WRITE_PARTIAL_FULL_HIGHLIGHT_LINES
+        .min(cache.normalized_lines.len())
+        .min(cache.highlighted_lines.len());
     if prefix_count == 0 {
         return;
     }
@@ -109,9 +124,13 @@ fn refresh_write_highlight_prefix(cache: &mut WriteHighlightCache, theme: &Theme
     }
 }
 
-/// `rebuildWriteHighlightCacheFull` (write.ts:81-93): highlight the whole
-/// content from scratch; `None` when the path has no recognized language.
-fn rebuild_write_highlight_cache_full(
+/// `rebuildWriteHighlightCacheFull` (write.ts:81-93): normalize the whole
+/// content and materialize only the leading highlight window; the rest is
+/// highlighted on expand. Rendered bytes are unchanged: syntect's output for
+/// line *i* depends only on the text before it, so highlighting a prefix as one
+/// block equals the prefix of a whole-file highlight (the property the
+/// prefix-refresh deviation already relies on).
+fn rebuild_write_highlight_cache(
     raw_path: Option<String>,
     file_content: &str,
     theme: &Theme,
@@ -121,14 +140,53 @@ fn rebuild_write_highlight_cache_full(
     let lang = raw_path.as_deref().and_then(get_language_from_path)?;
     let display_content = normalize_display_text(file_content);
     let normalized = replace_tabs(&display_content);
-    Some(WriteHighlightCache {
+    let mut cache = WriteHighlightCache {
         raw_path,
         lang,
         raw_content: file_content.to_string(),
         normalized_lines: normalized.split('\n').map(str::to_string).collect(),
-        highlighted_lines: highlight_code(&normalized, Some(lang), theme),
-        full: true,
-    })
+        highlighted_lines: Vec::new(),
+        highlighted_in_context: false,
+    };
+    highlight_write_window(&mut cache, WRITE_HIGHLIGHT_WINDOW_LINES, theme, false);
+    Some(cache)
+}
+
+/// Highlight the leading `needed` lines of `cache` as one block.
+///
+/// Idempotent during streaming: an already-covered prefix is left alone unless
+/// the caller requires context-correct output (argsComplete or expanded). That
+/// corrects incremental single-line tails once without re-running syntect on
+/// every delta.
+fn highlight_write_window(
+    cache: &mut WriteHighlightCache,
+    needed: usize,
+    theme: &Theme,
+    require_context: bool,
+) {
+    let needed = needed.min(cache.normalized_lines.len());
+    if cache.highlighted_lines.len() >= needed && (!require_context || cache.highlighted_in_context)
+    {
+        return;
+    }
+    let source = cache.normalized_lines[..needed].join("\n");
+    let mut lines = highlight_code(&source, Some(cache.lang), theme);
+    // `highlight_code` keeps the trailing empty element of a text that ends
+    // with a newline; pin the length anyway so indexing never depends on it.
+    lines.resize(needed, String::new());
+    lines.truncate(needed);
+    cache.highlighted_lines = lines;
+    cache.highlighted_in_context = true;
+}
+
+/// Lines to materialize for a render: every normalized line when expanded,
+/// else the leading window.
+fn highlight_window(expanded: bool, total_lines: usize) -> usize {
+    if expanded {
+        total_lines
+    } else {
+        WRITE_HIGHLIGHT_WINDOW_LINES.min(total_lines)
+    }
 }
 
 /// `updateWriteHighlightCacheIncremental` (write.ts:95-126): keep the cache
@@ -144,13 +202,13 @@ fn update_write_highlight_cache_incremental(
 ) -> Option<WriteHighlightCache> {
     let lang = raw_path.as_deref().and_then(get_language_from_path)?;
     let Some(mut cache) = cache else {
-        return rebuild_write_highlight_cache_full(raw_path, file_content, theme);
+        return rebuild_write_highlight_cache(raw_path, file_content, theme);
     };
     if cache.lang != lang || cache.raw_path != raw_path {
-        return rebuild_write_highlight_cache_full(raw_path, file_content, theme);
+        return rebuild_write_highlight_cache(raw_path, file_content, theme);
     }
     if !file_content.starts_with(&cache.raw_content) {
-        return rebuild_write_highlight_cache_full(raw_path, file_content, theme);
+        return rebuild_write_highlight_cache(raw_path, file_content, theme);
     }
     if file_content.len() == cache.raw_content.len() {
         return Some(cache);
@@ -159,11 +217,11 @@ fn update_write_highlight_cache_incremental(
     let delta_raw = &file_content[cache.raw_content.len()..];
     let delta_normalized = replace_tabs(&normalize_display_text(delta_raw));
     cache.raw_content = file_content.to_string();
+    cache.highlighted_in_context = false;
     // write.ts:111-114: a fresh cache always has at least one (empty) line
     // from the split; the guard is kept for parity.
     if cache.normalized_lines.is_empty() {
         cache.normalized_lines.push(String::new());
-        cache.highlighted_lines.push(String::new());
     }
     let segments: Vec<&str> = delta_normalized.split('\n').collect();
     // write.ts:116-119: the first delta segment continues the current last
@@ -177,18 +235,24 @@ fn update_write_highlight_cache_incremental(
     // hot path). Refresh only while the delta actually touched the window.
     let delta_touches_prefix = last_index < WRITE_PARTIAL_FULL_HIGHLIGHT_LINES;
     cache.normalized_lines[last_index].push_str(segments[0]);
-    cache.highlighted_lines[last_index] =
-        highlight_single_line(&cache.normalized_lines[last_index], cache.lang, theme);
+    // rpi#78 A4: lines past the highlight window are never rendered while
+    // collapsed, so they are appended unhighlighted and materialized only by
+    // `highlight_write_window` (expand).
+    if last_index < cache.highlighted_lines.len() {
+        cache.highlighted_lines[last_index] =
+            highlight_single_line(&cache.normalized_lines[last_index], cache.lang, theme);
+    }
     for segment in &segments[1..] {
         cache.normalized_lines.push((*segment).to_string());
-        cache
-            .highlighted_lines
-            .push(highlight_single_line(segment, cache.lang, theme));
+        if cache.normalized_lines.len() <= WRITE_HIGHLIGHT_WINDOW_LINES {
+            cache
+                .highlighted_lines
+                .push(highlight_single_line(segment, cache.lang, theme));
+        }
     }
     if delta_touches_prefix {
         refresh_write_highlight_prefix(&mut cache, theme);
     }
-    cache.full = false;
     Some(cache)
 }
 
@@ -251,9 +315,15 @@ fn format_write_call(
         let (total_lines, max_lines, body): (usize, usize, String) = if lang.is_some() {
             match cache {
                 Some(cache) => {
-                    let total = trailing_trimmed_len(&cache.highlighted_lines);
+                    let total = trailing_trimmed_len(&cache.normalized_lines);
                     let max = preview_max_lines(expanded, total);
-                    let body = cache.highlighted_lines[..max].to_vec().join("\n");
+                    // `render_call` materialized at least `max` lines before
+                    // formatting; the window keeps the slice in range.
+                    let body = cache
+                        .highlighted_lines
+                        .get(..max)
+                        .map(|lines| lines.to_vec().join("\n"))
+                        .unwrap_or_default();
                     (total, max, body)
                 }
                 None => {
@@ -352,16 +422,16 @@ impl ToolDefinition for WriteToolRenderer {
         // incrementally while the content streams.
         if let Some(file_content) = file_content.as_deref() {
             if context.args_complete {
-                // The completed call re-highlights in full at most once per
-                // content: later `update_display` passes (result arrival,
-                // expand, resize) reuse a full cache that already covers
-                // this exact content instead of re-running syntect over the
-                // whole file (write perf on 300+ line writes).
+                // The completed call refreshes at most once per content: later
+                // `update_display` passes (result arrival, expand, resize) reuse
+                // a cache that already covers this exact content instead of
+                // re-running syntect (write perf on 300+ line writes). The
+                // window is materialized below; expanding highlights the rest.
                 let cache_is_current = cache.as_ref().is_some_and(|cache| {
-                    cache.full && cache.raw_path == raw_path && cache.raw_content == file_content
+                    cache.raw_path == raw_path && cache.raw_content == file_content
                 });
                 if !cache_is_current {
-                    *cache = rebuild_write_highlight_cache_full(raw_path, file_content, theme);
+                    *cache = rebuild_write_highlight_cache(raw_path, file_content, theme);
                 }
             } else {
                 *cache = update_write_highlight_cache_incremental(
@@ -373,6 +443,18 @@ impl ToolDefinition for WriteToolRenderer {
             }
         } else {
             *cache = None;
+        }
+        // Materialize the render window (all lines when expanded) — the only
+        // place a whole-file highlight can still be triggered, and only from an
+        // explicit expand.
+        if let Some(cache) = cache.as_mut() {
+            let all = cache.normalized_lines.len();
+            highlight_write_window(
+                cache,
+                highlight_window(context.expanded, all),
+                theme,
+                context.args_complete || context.expanded,
+            );
         }
         Some(Box::new(Text::new(
             format_write_call(args, context.expanded, theme, cache.as_ref(), &context.cwd),
@@ -422,6 +504,7 @@ mod tests {
             args: json!({}),
             tool_call_id: "call_1".to_owned(),
             render_handle: RenderHandle::new(|| {}),
+            invalidate: RenderHandle::new(|| {}),
             state: state.clone(),
             cwd: "/cwd".to_owned(),
             execution_started: true,
@@ -742,9 +825,8 @@ mod tests {
             let render_state = state.get_or_init::<WriteRenderState>();
             let cache = lock_recover(&render_state.cache);
             let cache = cache.as_ref().expect("streaming cache");
-            let fresh =
-                rebuild_write_highlight_cache_full(Some("src.rs".to_string()), &content, &theme)
-                    .expect("fresh cache");
+            let fresh = rebuild_write_highlight_cache(Some("src.rs".to_string()), &content, &theme)
+                .expect("fresh cache");
             assert_eq!(cache.raw_content, fresh.raw_content);
             assert_eq!(cache.normalized_lines, fresh.normalized_lines);
             assert_eq!(cache.highlighted_lines, fresh.highlighted_lines);
@@ -762,8 +844,7 @@ mod tests {
         let theme = theme();
         // No recognized language → no cache (write.ts:82-83, 100-101).
         assert!(
-            rebuild_write_highlight_cache_full(Some("notes.txt".to_string()), "x", &theme)
-                .is_none()
+            rebuild_write_highlight_cache(Some("notes.txt".to_string()), "x", &theme).is_none()
         );
         assert!(
             update_write_highlight_cache_incremental(
@@ -782,7 +863,7 @@ mod tests {
 
         // Prefix growth updates the cache in place.
         let cache =
-            rebuild_write_highlight_cache_full(Some("src.rs".to_string()), "fn main() {\n", &theme)
+            rebuild_write_highlight_cache(Some("src.rs".to_string()), "fn main() {\n", &theme)
                 .expect("cache");
         let updated = update_write_highlight_cache_incremental(
             Some(cache),
@@ -800,9 +881,6 @@ mod tests {
             updated.highlighted_lines.len(),
             updated.normalized_lines.len()
         );
-        // Prefix growth updates the cache in place — incrementally, so the
-        // cache is demoted from `full`.
-        assert!(!updated.full, "incremental append demotes full");
 
         // Content unchanged → the cache is returned as-is.
         let unchanged = update_write_highlight_cache_incremental(
@@ -826,7 +904,7 @@ mod tests {
         assert_eq!(rebuilt.raw_path.as_deref(), Some("src.py"));
 
         // Non-prefix growth rebuilds (an append would corrupt the line).
-        let cache = rebuild_write_highlight_cache_full(Some("src.rs".to_string()), "a\nb", &theme)
+        let cache = rebuild_write_highlight_cache(Some("src.rs".to_string()), "a\nb", &theme)
             .expect("cache");
         let rebuilt = update_write_highlight_cache_incremental(
             Some(cache),
@@ -837,26 +915,32 @@ mod tests {
         .expect("cache");
         assert_eq!(rebuilt.normalized_lines, vec!["a", "c"]);
 
-        // Full rebuilds (fresh or via the incremental fallbacks) mark
-        // `full` — the args_complete render reuses them.
-        assert!(
-            rebuild_write_highlight_cache_full(Some("src.rs".to_string()), "a\nc", &theme)
-                .expect("cache")
-                .full
+        // A rebuild materializes the leading highlight window only
+        // (rpi#78 A4): lines past it cannot reach a collapsed preview.
+        let tall: String = (1..=200).map(|i| format!("let v{i} = {i};\n")).collect();
+        let tall_cache = rebuild_write_highlight_cache(Some("src.rs".to_string()), &tall, &theme)
+            .expect("cache");
+        assert_eq!(tall_cache.normalized_lines.len(), 201);
+        assert_eq!(
+            tall_cache.highlighted_lines.len(),
+            WRITE_HIGHLIGHT_WINDOW_LINES,
+            "a rebuild must not highlight the whole file"
         );
-        assert!(
-            update_write_highlight_cache_incremental(
-                Some(
-                    rebuild_write_highlight_cache_full(Some("src.rs".to_string()), "a\nb", &theme,)
-                        .expect("cache")
-                ),
-                Some("src.rs".to_string()),
-                "a\nc",
-                &theme,
-            )
-            .expect("cache")
-            .full,
-            "non-prefix fallback rebuilds in full"
+        // The incremental fallbacks (path/language change, non-prefix growth)
+        // rebuild the same windowed cache.
+        let fallback = update_write_highlight_cache_incremental(
+            Some(
+                rebuild_write_highlight_cache(Some("src.rs".to_string()), "a\nb", &theme)
+                    .expect("cache"),
+            ),
+            Some("src.rs".to_string()),
+            &tall,
+            &theme,
+        )
+        .expect("cache");
+        assert_eq!(
+            fallback.highlighted_lines.len(),
+            WRITE_HIGHLIGHT_WINDOW_LINES
         );
     }
 
@@ -901,6 +985,112 @@ mod tests {
     /// Perf regression: after `args_complete`, repeated `render_call` passes
     /// with unchanged content must not re-run the full-file highlight
     /// (result arrival / expand / resize all re-render the call).
+    /// Incremental single-line tails must be corrected when exposed, even when
+    /// their vector already covers the requested window (rpi#78 review).
+    #[test]
+    fn streamed_write_expansion_restores_multiline_syntax_context() {
+        let theme = theme();
+        let state = RendererStateSlot::default();
+        let renderer = WriteToolRenderer;
+        let lines: Vec<String> = (1..=60)
+            .map(|i| match i {
+                50 => "/* block comment starts".to_owned(),
+                51..=54 => format!("comment line {i}"),
+                55 => "*/".to_owned(),
+                _ => format!("let v{i} = {i};"),
+            })
+            .collect();
+        let prefix = lines[..50].join("\n");
+        let content = lines.join("\n");
+        let whole = highlight_code(
+            &replace_tabs(&normalize_display_text(&content)),
+            Some("rust"),
+            &theme,
+        );
+        let mut ctx = context(&state);
+        ctx.args_complete = false;
+        ctx.args = json!({"path": "src.rs", "content": prefix});
+        let _ = call_text(&renderer, &ctx.args, &theme, &ctx);
+        ctx.args = json!({"path": "src.rs", "content": content});
+        let _ = call_text(&renderer, &ctx.args, &theme, &ctx);
+        {
+            let render_state = state.get_or_init::<WriteRenderState>();
+            let cache = lock_recover(&render_state.cache);
+            let cache = cache.as_ref().expect("streamed cache");
+            assert!(!cache.highlighted_in_context);
+            assert_eq!(cache.highlighted_lines.len(), 60);
+            assert_ne!(
+                cache.highlighted_lines, whole,
+                "the test must exercise context-free tail lines"
+            );
+        }
+
+        ctx.expanded = true;
+        let _ = call_text(&renderer, &ctx.args, &theme, &ctx);
+        let render_state = state.get_or_init::<WriteRenderState>();
+        let cache = lock_recover(&render_state.cache);
+        let cache = cache.as_ref().expect("expanded cache");
+        assert!(cache.highlighted_in_context);
+        assert_eq!(cache.highlighted_lines, whole);
+    }
+
+    /// rpi#78 A4: a collapsed `write` materializes only the leading highlight
+    /// window (the visible lines plus the streaming prefix block), and expanding
+    /// finishes the file off-thread-demand — the rendered bytes stay identical
+    /// to the pre-fix whole-file highlight.
+    #[test]
+    fn expanded_write_matches_a_whole_file_highlight() {
+        let theme = theme();
+        let state = RendererStateSlot::default();
+        let renderer = WriteToolRenderer;
+        let content: String = (1..=120)
+            .map(|i| format!("let v{i} = {i}; // 注{i}\n"))
+            .collect();
+        let whole = highlight_code(
+            &replace_tabs(&normalize_display_text(&content)),
+            Some("rust"),
+            &theme,
+        );
+
+        let mut ctx = context(&state);
+        ctx.args_complete = true;
+        ctx.args = json!({"path": "src.rs", "content": content});
+        let collapsed = call_text(&renderer, &ctx.args, &theme, &ctx);
+        assert!(collapsed.contains("more lines, 120 total"), "{collapsed}");
+        {
+            let render_state = state.get_or_init::<WriteRenderState>();
+            let cache = lock_recover(&render_state.cache);
+            let cache = cache.as_ref().expect("cache");
+            assert_eq!(cache.highlighted_lines.len(), WRITE_HIGHLIGHT_WINDOW_LINES);
+            // The materialized window is the prefix of a whole-file highlight.
+            assert_eq!(
+                cache.highlighted_lines,
+                whole[..WRITE_HIGHLIGHT_WINDOW_LINES].to_vec(),
+                "the window must be byte-identical to a whole-file highlight"
+            );
+        }
+
+        ctx.expanded = true;
+        let expanded = call_text(&renderer, &ctx.args, &theme, &ctx);
+        {
+            let render_state = state.get_or_init::<WriteRenderState>();
+            let cache = lock_recover(&render_state.cache);
+            let cache = cache.as_ref().expect("cache");
+            assert_eq!(
+                cache.highlighted_lines, whole,
+                "expanding must finish the whole-file highlight"
+            );
+        }
+        assert!(
+            expanded.contains("let v120 = 120;"),
+            "expand shows the tail"
+        );
+        assert!(
+            !expanded.contains("more lines"),
+            "expand drops the clamp hint"
+        );
+    }
+
     #[test]
     fn args_complete_reuses_full_cache_across_updates() {
         let theme = theme();
@@ -925,9 +1115,14 @@ mod tests {
         {
             let render_state = state.get_or_init::<WriteRenderState>();
             let cache = lock_recover(&render_state.cache);
-            let cache = cache.as_ref().expect("full cache");
-            assert!(cache.full, "completed args must leave a full cache");
+            let cache = cache.as_ref().expect("cache");
             assert_eq!(cache.raw_content, content);
+            assert_eq!(
+                cache.highlighted_lines.len(),
+                WRITE_HIGHLIGHT_WINDOW_LINES,
+                "argsComplete must materialize the window, not the file"
+            );
+            assert!(cache.normalized_lines.len() > WRITE_HIGHLIGHT_WINDOW_LINES);
         }
         let second = renderer.render_call(&ctx.args, &theme, &ctx).expect("call");
         assert_eq!(second.render(80), first_render, "identical re-render");

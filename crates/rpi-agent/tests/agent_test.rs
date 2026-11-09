@@ -119,7 +119,7 @@ fn abortable_stream_fn() -> StreamFn {
         tokio::spawn(async move {
             let partial = assistant_text("");
             let _ = tx.send(StreamEvent::Start {
-                partial: Arc::new(partial.clone()),
+                partial: rpi_ai::types::SharedAssistantMessage::new(partial.clone()),
             });
             loop {
                 if options.signal.as_ref().is_some_and(|s| s.is_cancelled()) {

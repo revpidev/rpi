@@ -823,8 +823,8 @@ fn refresh_items(
         }
     }
     let ctx = ctx_override.unwrap_or_else(|| fetch_items_ctx(calls, items));
-    let data = build_field_data(items, &ctx);
-    publish_items_from_data(calls, items, &data);
+    let mut data = build_field_data(items, &ctx);
+    publish_items_from_data(calls, items, &mut data);
     Some(data)
 }
 
@@ -950,7 +950,15 @@ fn publish_items_from_cache(
     publish_items_from_data(calls, items, data);
 }
 
-fn publish_items_from_data(calls: &AsyncHostCalls, items: &ItemsConfig, data: &FieldData) {
+fn publish_items_from_data(calls: &AsyncHostCalls, items: &ItemsConfig, data: &mut FieldData) {
+    // rpi#78 B: track the source AFTER provider usage has replaced the local
+    // estimate. Reading `live.tokens.source` here would never observe the
+    // estimate ↔ provider switch that this guard is meant to suppress.
+    if let Some(live) = data.live.as_mut() {
+        let source = live.reported_output().map(|tokens| tokens.source);
+        let switched = with_engine(|engine| engine.note_rate_source(live.streaming, source));
+        live.rate_source_switched = switched;
+    }
     let line = fields::render_line(&items.entries, &items.separator, items.use_colors, data);
     publish_line(calls, line.as_deref(), items.placement, items.padding);
     // Remember this frame's fresh live readings for the next frame's hold

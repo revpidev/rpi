@@ -184,7 +184,7 @@ fn live_tokens_lifecycle_over_the_carrier_seam() {
     assert!(receipt.get("error").is_none(), "install: {receipt:#?}");
 
     // ── ⑧ With liveTokens configured the subscription set grows by
-    //      message_start + message_update (10 total). ─────────────────────
+    //      message_start + both update probes (11 total). ────────────────
     let subscribed: Vec<String> = records()
         .iter()
         .filter(|(method, _)| method == "on")
@@ -195,8 +195,8 @@ fn live_tokens_lifecycle_over_the_carrier_seam() {
                 .to_owned()
         })
         .collect();
-    assert_eq!(subscribed.len(), 10, "subscribed: {subscribed:?}");
-    for event in ["message_start", "message_update"] {
+    assert_eq!(subscribed.len(), 11, "subscribed: {subscribed:?}");
+    for event in ["message_start", "message_update", "message_update_delta"] {
         assert!(subscribed.iter().any(|s| s == event), "missing {event}");
     }
 

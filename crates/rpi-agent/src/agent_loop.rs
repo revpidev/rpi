@@ -906,7 +906,7 @@ async fn run_loop(
 // streamAssistantResponse (agent-loop.ts:281-372)
 // ---------------------------------------------------------------------------
 
-fn stream_event_partial(event: &StreamEvent) -> Option<&std::sync::Arc<AssistantMessage>> {
+fn stream_event_partial(event: &StreamEvent) -> Option<&rpi_ai::types::SharedAssistantMessage> {
     match event {
         StreamEvent::TextStart { partial, .. }
         | StreamEvent::TextDelta { partial, .. }
@@ -1177,7 +1177,7 @@ async fn stream_assistant_response(
                 // stream, so one extraction clone per turn is fine.
                 added_partial = true;
                 emit(AgentEvent::MessageStart {
-                    message: AgentMessage::Assistant((*partial).clone()),
+                    message: AgentMessage::Assistant(partial.snapshot()),
                 })
                 .await;
             }
@@ -1194,14 +1194,13 @@ async fn stream_assistant_response(
             }
             other => {
                 if stream_started && let Some(partial) = stream_event_partial(&other) {
-                    // V15-13 zero-copy delta path: the accumulated
-                    // partial is shared by `Arc` straight into the
-                    // event (and from there into the agent state, every
-                    // listener, and the UI queue); no deep copies per
-                    // delta, and `context.messages` stays untouched
+                    // Zero-copy delta path: the accumulated live partial is
+                    // shared straight into the event (and from there into the
+                    // agent state, every listener, and the UI queue); no deep
+                    // copies per delta, and `context.messages` stays untouched
                     // until finalize.
                     emit(AgentEvent::MessageUpdate {
-                        message: std::sync::Arc::clone(partial),
+                        message: partial.clone(),
                         assistant_message_event: std::sync::Arc::new(other),
                     })
                     .await;

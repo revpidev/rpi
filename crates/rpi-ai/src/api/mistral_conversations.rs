@@ -53,7 +53,6 @@
 //! (`hasMistralHeaderOverride`).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
@@ -65,8 +64,8 @@ use crate::models::{ProviderStreams, clamp_thinking_level};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantRole, CacheRetention, DoneReason, ErrorReason,
     InputModality, Message, Model, ModelThinkingLevel, ProviderHeaders, ProviderResponse,
-    SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, Tool, ToolResultContent,
-    TranscriptContext, Usage, UserContent, UserContentBlock,
+    SharedAssistantMessage, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, Tool,
+    ToolResultContent, TranscriptContext, Usage, UserContent, UserContentBlock,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::custom_fetch::{SendFailure, send_provider_request};
@@ -76,6 +75,7 @@ use crate::utils::headers::{
     headers_to_record, identity_headers, merge_headers_chain, model_headers,
     provider_headers_to_header_map,
 };
+use crate::utils::json_parse::StreamingArgsPreview;
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_retry::{
     ProviderErrorInfo, ProviderRetryOptions, RetryError, retry_provider_request,
@@ -844,7 +844,7 @@ enum SseOutcome {
 /// Consumes Mistral SSE chunks and drives the [`StreamEvent`] protocol,
 /// accumulating the final assistant message.
 struct StreamProcessor<'a> {
-    output: &'a mut AssistantMessage,
+    output: &'a SharedAssistantMessage,
     model: &'a Model,
     current_block: Option<CurrentBlock>,
     /// Tool-call content index, keyed by `{callId}:{index}`.
@@ -853,10 +853,12 @@ struct StreamProcessor<'a> {
     tool_block_order: Vec<usize>,
     /// `partialArgs` scratch buffer per tool-block content index.
     partial_args: HashMap<usize, String>,
+    /// rpi#78 A3: preview-parse throttle per tool-block content index.
+    args_preview: HashMap<usize, StreamingArgsPreview>,
 }
 
 impl<'a> StreamProcessor<'a> {
-    fn new(output: &'a mut AssistantMessage, model: &'a Model) -> Self {
+    fn new(output: &'a SharedAssistantMessage, model: &'a Model) -> Self {
         Self {
             output,
             model,
@@ -864,18 +866,23 @@ impl<'a> StreamProcessor<'a> {
             tool_blocks_by_key: HashMap::new(),
             tool_block_order: Vec::new(),
             partial_args: HashMap::new(),
+            args_preview: HashMap::new(),
         }
     }
 
-    fn block_index(&self) -> usize {
-        self.output.content.len() - 1
+    fn block_index(output: &AssistantMessage) -> usize {
+        output.content.len() - 1
     }
 
     /// `finishCurrentBlock`: closes the open text/thinking block.
-    fn finish_current_block(&mut self, events: &AssistantMessageEventStream) {
+    fn finish_current_block_locked(
+        &mut self,
+        output: &mut AssistantMessage,
+        events: &AssistantMessageEventStream,
+    ) {
         match self.current_block.take() {
             Some(CurrentBlock::Text(index)) => {
-                let text = match &self.output.content[index] {
+                let text = match &output.content[index] {
                     AssistantContent::Text(text) => text.text.clone(),
                     // invariant: Text(index) only indexes text blocks
                     _ => String::new(),
@@ -883,11 +890,11 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::TextEnd {
                     content_index: index,
                     content: text,
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
             }
             Some(CurrentBlock::Thinking(index)) => {
-                let thinking = match &self.output.content[index] {
+                let thinking = match &output.content[index] {
                     AssistantContent::Thinking(thinking) => thinking.thinking.clone(),
                     // invariant: Thinking(index) only indexes thinking blocks
                     _ => String::new(),
@@ -895,68 +902,86 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::ThinkingEnd {
                     content_index: index,
                     content: thinking,
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
             }
             None => {}
         }
     }
 
-    fn open_text_block(&mut self, events: &AssistantMessageEventStream) -> usize {
+    fn open_text_block(
+        &mut self,
+        output: &mut AssistantMessage,
+        events: &AssistantMessageEventStream,
+    ) -> usize {
         if matches!(self.current_block, Some(CurrentBlock::Text(_))) {
-            return self.block_index();
+            return Self::block_index(output);
         }
-        self.finish_current_block(events);
-        self.output
+        self.finish_current_block_locked(output, events);
+        output
             .content
             .push(AssistantContent::Text(Default::default()));
-        let index = self.block_index();
+        let index = Self::block_index(output);
         self.current_block = Some(CurrentBlock::Text(index));
         events.push(StreamEvent::TextStart {
             content_index: index,
-            partial: Arc::new(self.output.clone()),
+            partial: self.output.clone(),
         });
         index
     }
 
-    fn open_thinking_block(&mut self, events: &AssistantMessageEventStream) -> usize {
+    fn open_thinking_block(
+        &mut self,
+        output: &mut AssistantMessage,
+        events: &AssistantMessageEventStream,
+    ) -> usize {
         if matches!(self.current_block, Some(CurrentBlock::Thinking(_))) {
-            return self.block_index();
+            return Self::block_index(output);
         }
-        self.finish_current_block(events);
-        self.output
+        self.finish_current_block_locked(output, events);
+        output
             .content
             .push(AssistantContent::Thinking(Default::default()));
-        let index = self.block_index();
+        let index = Self::block_index(output);
         self.current_block = Some(CurrentBlock::Thinking(index));
         events.push(StreamEvent::ThinkingStart {
             content_index: index,
-            partial: Arc::new(self.output.clone()),
+            partial: self.output.clone(),
         });
         index
     }
 
-    fn push_text_delta(&mut self, delta: &str, events: &AssistantMessageEventStream) {
-        let index = self.open_text_block(events);
-        if let AssistantContent::Text(text) = &mut self.output.content[index] {
+    fn push_text_delta(
+        &mut self,
+        output: &mut AssistantMessage,
+        delta: &str,
+        events: &AssistantMessageEventStream,
+    ) {
+        let index = self.open_text_block(output, events);
+        if let AssistantContent::Text(text) = &mut output.content[index] {
             text.text.push_str(delta);
         }
         events.push(StreamEvent::TextDelta {
             content_index: index,
             delta: delta.to_owned(),
-            partial: Arc::new(self.output.clone()),
+            partial: self.output.clone(),
         });
     }
 
-    fn push_thinking_delta(&mut self, delta: &str, events: &AssistantMessageEventStream) {
-        let index = self.open_thinking_block(events);
-        if let AssistantContent::Thinking(thinking) = &mut self.output.content[index] {
+    fn push_thinking_delta(
+        &mut self,
+        output: &mut AssistantMessage,
+        delta: &str,
+        events: &AssistantMessageEventStream,
+    ) {
+        let index = self.open_thinking_block(output, events);
+        if let AssistantContent::Thinking(thinking) = &mut output.content[index] {
             thinking.thinking.push_str(delta);
         }
         events.push(StreamEvent::ThinkingDelta {
             content_index: index,
             delta: delta.to_owned(),
-            partial: Arc::new(self.output.clone()),
+            partial: self.output.clone(),
         });
     }
 
@@ -989,112 +1014,115 @@ impl<'a> StreamProcessor<'a> {
 
     /// `consumeChatStream` per-chunk body.
     fn handle_chunk(&mut self, chunk: &CompletionChunk, events: &AssistantMessageEventStream) {
-        // Keep the first non-empty response id (`output.responseId ||= chunk.id`).
-        if self.output.response_id.as_deref().unwrap_or("").is_empty()
-            && let Some(id) = chunk.id.as_ref().filter(|id| !id.is_empty())
-        {
-            self.output.response_id = Some(id.clone());
-        }
-
-        if let Some(usage) = &chunk.usage {
-            let prompt_tokens = usage_number(usage, "prompt_tokens");
-            let cached_prompt_tokens = get_mistral_cached_prompt_tokens(usage, prompt_tokens);
-
-            self.output.usage.input = prompt_tokens.saturating_sub(cached_prompt_tokens);
-            self.output.usage.output = usage_number(usage, "completion_tokens");
-            self.output.usage.cache_read = cached_prompt_tokens;
-            self.output.usage.cache_write = 0;
-            let total_tokens = usage_number(usage, "total_tokens");
-            self.output.usage.total_tokens = if total_tokens > 0 {
-                total_tokens
-            } else {
-                self.output.usage.input
-                    + self.output.usage.output
-                    + self.output.usage.cache_read
-                    + self.output.usage.cache_write
-            };
-            calculate_cost(self.model, &mut self.output.usage);
-        }
-
-        let Some(choice) = chunk.choices.first() else {
-            return;
-        };
-
-        if let Some(finish_reason) = choice
-            .finish_reason
-            .as_deref()
-            .filter(|reason| !reason.is_empty())
-        {
-            // 5a53f086e: preserve the raw provider reason before mapping;
-            // unmapped reasons become provider errors with a message.
-            self.output.raw_stop_reason = Some(finish_reason.to_owned());
-            let (stop_reason, error_message) = map_chat_stop_reason(finish_reason);
-            self.output.stop_reason = stop_reason;
-            if let Some(error_message) = error_message {
-                self.output.error_message = Some(error_message);
+        self.output.with_mut(|output| {
+            // Keep the first non-empty response id (`output.responseId ||= chunk.id`).
+            if output.response_id.as_deref().unwrap_or("").is_empty()
+                && let Some(id) = chunk.id.as_ref().filter(|id| !id.is_empty())
+            {
+                output.response_id = Some(id.clone());
             }
-        }
 
-        if let Some(content) = &choice.delta.content {
-            match content {
-                DeltaContent::Text(text) => {
-                    let text_delta = sanitize_surrogates(text);
-                    // GLM models on Mistral send empty content deltas around
-                    // thinking and tool calls; opening a block for them
-                    // splits thinking, which Mistral rejects on replay
-                    // (#9674 `8930b9ec0`).
-                    if !text_delta.is_empty() {
-                        self.push_text_delta(text_delta, events);
-                    }
+            if let Some(usage) = &chunk.usage {
+                let prompt_tokens = usage_number(usage, "prompt_tokens");
+                let cached_prompt_tokens = get_mistral_cached_prompt_tokens(usage, prompt_tokens);
+
+                output.usage.input = prompt_tokens.saturating_sub(cached_prompt_tokens);
+                output.usage.output = usage_number(usage, "completion_tokens");
+                output.usage.cache_read = cached_prompt_tokens;
+                output.usage.cache_write = 0;
+                let total_tokens = usage_number(usage, "total_tokens");
+                output.usage.total_tokens = if total_tokens > 0 {
+                    total_tokens
+                } else {
+                    output.usage.input
+                        + output.usage.output
+                        + output.usage.cache_read
+                        + output.usage.cache_write
+                };
+                calculate_cost(self.model, &mut output.usage);
+            }
+
+            let Some(choice) = chunk.choices.first() else {
+                return;
+            };
+
+            if let Some(finish_reason) = choice
+                .finish_reason
+                .as_deref()
+                .filter(|reason| !reason.is_empty())
+            {
+                // 5a53f086e: preserve the raw provider reason before mapping;
+                // unmapped reasons become provider errors with a message.
+                output.raw_stop_reason = Some(finish_reason.to_owned());
+                let (stop_reason, error_message) = map_chat_stop_reason(finish_reason);
+                output.stop_reason = stop_reason;
+                if let Some(error_message) = error_message {
+                    output.error_message = Some(error_message);
                 }
-                DeltaContent::Chunks(items) => {
-                    for item in items {
-                        match item.get("type").and_then(Value::as_str) {
-                            Some("thinking") => {
-                                let delta_text = item
-                                    .get("thinking")
-                                    .and_then(Value::as_array)
-                                    .map(|parts| {
-                                        parts
-                                            .iter()
-                                            .filter_map(|part| {
-                                                part.get("text").and_then(Value::as_str)
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join("")
-                                    })
-                                    .unwrap_or_default();
-                                let thinking_delta = sanitize_surrogates(&delta_text);
-                                if thinking_delta.is_empty() {
-                                    continue;
+            }
+
+            if let Some(content) = &choice.delta.content {
+                match content {
+                    DeltaContent::Text(text) => {
+                        let text_delta = sanitize_surrogates(text);
+                        // GLM models on Mistral send empty content deltas around
+                        // thinking and tool calls; opening a block for them
+                        // splits thinking, which Mistral rejects on replay
+                        // (#9674 `8930b9ec0`).
+                        if !text_delta.is_empty() {
+                            self.push_text_delta(output, text_delta, events);
+                        }
+                    }
+                    DeltaContent::Chunks(items) => {
+                        for item in items {
+                            match item.get("type").and_then(Value::as_str) {
+                                Some("thinking") => {
+                                    let delta_text = item
+                                        .get("thinking")
+                                        .and_then(Value::as_array)
+                                        .map(|parts| {
+                                            parts
+                                                .iter()
+                                                .filter_map(|part| {
+                                                    part.get("text").and_then(Value::as_str)
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join("")
+                                        })
+                                        .unwrap_or_default();
+                                    let thinking_delta = sanitize_surrogates(&delta_text);
+                                    if thinking_delta.is_empty() {
+                                        continue;
+                                    }
+                                    self.push_thinking_delta(output, thinking_delta, events);
                                 }
-                                self.push_thinking_delta(thinking_delta, events);
-                            }
-                            Some("text") => {
-                                let text_delta = sanitize_surrogates(
-                                    item.get("text").and_then(Value::as_str).unwrap_or(""),
-                                );
-                                if text_delta.is_empty() {
-                                    continue;
+                                Some("text") => {
+                                    let text_delta = sanitize_surrogates(
+                                        item.get("text").and_then(Value::as_str).unwrap_or(""),
+                                    );
+                                    if text_delta.is_empty() {
+                                        continue;
+                                    }
+                                    self.push_text_delta(output, text_delta, events);
                                 }
-                                self.push_text_delta(text_delta, events);
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                 }
             }
-        }
 
-        for tool_call in choice.delta.tool_calls.as_deref().unwrap_or(&[]) {
-            self.finish_current_block(events);
-            self.handle_tool_call_delta(tool_call, events);
-        }
+            for tool_call in choice.delta.tool_calls.as_deref().unwrap_or(&[]) {
+                self.finish_current_block_locked(output, events);
+                self.handle_tool_call_delta(output, tool_call, events);
+            }
+        })
     }
 
     /// `consumeChatStream` tool-call accumulation.
     fn handle_tool_call_delta(
         &mut self,
+        output: &mut AssistantMessage,
         tool_call: &WireToolCall,
         events: &AssistantMessageEventStream,
     ) {
@@ -1119,7 +1147,7 @@ impl<'a> StreamProcessor<'a> {
         let content_index = match self.tool_blocks_by_key.get(&key) {
             Some(existing) => *existing,
             None => {
-                self.output
+                output
                     .content
                     .push(AssistantContent::ToolCall(crate::types::ToolCall {
                         id: call_id,
@@ -1129,12 +1157,12 @@ impl<'a> StreamProcessor<'a> {
                         namespace: None,
                         arguments_error: None,
                     }));
-                let content_index = self.output.content.len() - 1;
+                let content_index = output.content.len() - 1;
                 self.tool_blocks_by_key.insert(key.clone(), content_index);
                 self.tool_block_order.push(content_index);
                 events.push(StreamEvent::ToolCallStart {
                     content_index,
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
                 content_index
             }
@@ -1148,36 +1176,45 @@ impl<'a> StreamProcessor<'a> {
         };
         let partial = self.partial_args.entry(content_index).or_default();
         partial.push_str(&args_delta);
-        if let AssistantContent::ToolCall(call) = &mut self.output.content[content_index] {
+        // rpi#78 A3: authoritative arguments are parsed in `finish`.
+        let refresh = self
+            .args_preview
+            .entry(content_index)
+            .or_default()
+            .should_parse(partial.len());
+        if refresh && let AssistantContent::ToolCall(call) = &mut output.content[content_index] {
             call.arguments = parse_streaming_json(Some(partial));
         }
         events.push(StreamEvent::ToolCallDelta {
             content_index,
             delta: args_delta,
-            partial: Arc::new(self.output.clone()),
+            partial: self.output.clone(),
         });
     }
 
     /// `consumeChatStream` tail: close the open block, then finalize each
     /// tool call (final `parseStreamingJson` + `toolcall_end`).
     fn finish(&mut self, events: &AssistantMessageEventStream) {
-        self.finish_current_block(events);
-        for index in std::mem::take(&mut self.tool_block_order) {
-            let Some(partial) = self.partial_args.remove(&index) else {
-                continue;
-            };
-            let parsed = crate::utils::json_parse::parse_tool_call_arguments(Some(&partial));
-            let AssistantContent::ToolCall(call) = &mut self.output.content[index] else {
-                continue;
-            };
-            call.arguments = parsed.arguments;
-            call.arguments_error = parsed.arguments_error;
-            events.push(StreamEvent::ToolCallEnd {
-                content_index: index,
-                tool_call: call.clone(),
-                partial: Arc::new(self.output.clone()),
-            });
-        }
+        self.output.with_mut(|output| {
+            self.finish_current_block_locked(output, events);
+            for index in std::mem::take(&mut self.tool_block_order) {
+                let Some(partial) = self.partial_args.remove(&index) else {
+                    continue;
+                };
+                self.args_preview.remove(&index);
+                let parsed = crate::utils::json_parse::parse_tool_call_arguments(Some(&partial));
+                let AssistantContent::ToolCall(call) = &mut output.content[index] else {
+                    continue;
+                };
+                call.arguments = parsed.arguments;
+                call.arguments_error = parsed.arguments_error;
+                events.push(StreamEvent::ToolCallEnd {
+                    content_index: index,
+                    tool_call: call.clone(),
+                    partial: self.output.clone(),
+                });
+            }
+        })
     }
 }
 
@@ -1223,7 +1260,7 @@ async fn run(
     model: &Model,
     context: &TranscriptContext,
     options: &MistralOptions,
-    output: &mut AssistantMessage,
+    output: &SharedAssistantMessage,
     events: &AssistantMessageEventStream,
 ) -> Result<DoneReason, String> {
     let api_key = options
@@ -1396,7 +1433,7 @@ async fn run(
     }
 
     events.push(StreamEvent::Start {
-        partial: Arc::new(output.clone()),
+        partial: output.clone(),
     });
 
     let mut processor = StreamProcessor::new(output, model);
@@ -1445,7 +1482,10 @@ async fn run(
 }
 
 /// The upstream `stream` tail checks after the chat stream is consumed.
-fn finalize(options: &MistralOptions, output: &AssistantMessage) -> Result<DoneReason, String> {
+fn finalize(
+    options: &MistralOptions,
+    output: &SharedAssistantMessage,
+) -> Result<DoneReason, String> {
     if options
         .stream
         .signal
@@ -1454,7 +1494,7 @@ fn finalize(options: &MistralOptions, output: &AssistantMessage) -> Result<DoneR
     {
         return Err("Request was aborted".to_owned());
     }
-    match output.stop_reason {
+    output.with(|output| match output.stop_reason {
         // `Deferred` shares the `Pending` arm: no rpi provider produces it
         // (lifecycle is [DEFER], R2.2.1), so it is unreachable here and
         // treated as "stream ended without a usable finish reason".
@@ -1469,7 +1509,7 @@ fn finalize(options: &MistralOptions, output: &AssistantMessage) -> Result<DoneR
         StopReason::Stop => Ok(DoneReason::Stop),
         StopReason::Length => Ok(DoneReason::Length),
         StopReason::ToolUse => Ok(DoneReason::ToolUse),
-    }
+    })
 }
 
 /// `stream` (mistral-conversations).
@@ -1492,30 +1532,32 @@ pub fn stream(
     );
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
-        let mut output = initial_output(&model);
-        match run(&model, &context, &options, &mut output, &task_stream).await {
+        let output = SharedAssistantMessage::new(initial_output(&model));
+        match run(&model, &context, &options, &output, &task_stream).await {
             Ok(reason) => {
                 task_stream.push(StreamEvent::Done {
                     reason,
-                    message: output,
+                    message: output.snapshot(),
                 });
                 task_stream.end(None);
             }
             Err(message) => {
                 let aborted = signal.as_ref().is_some_and(|signal| signal.is_cancelled());
-                output.stop_reason = if aborted {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                output.error_message = Some(message);
+                output.with_mut(|output| {
+                    output.stop_reason = if aborted {
+                        StopReason::Aborted
+                    } else {
+                        StopReason::Error
+                    };
+                    output.error_message = Some(message);
+                });
                 task_stream.push(StreamEvent::Error {
                     reason: if aborted {
                         ErrorReason::Aborted
                     } else {
                         ErrorReason::Error
                     },
-                    error: output,
+                    error: output.snapshot(),
                 });
                 task_stream.end(None);
             }
@@ -1704,8 +1746,8 @@ mod tests {
     /// Drives the processor with a recorded SSE stream and collects events.
     fn run_processor(model: &Model, sse_payload: &str) -> (Vec<StreamEvent>, AssistantMessage) {
         let events = AssistantMessageEventStream::new();
-        let mut output = initial_output(model);
-        let mut processor = StreamProcessor::new(&mut output, model);
+        let output = SharedAssistantMessage::new(initial_output(model));
+        let mut processor = StreamProcessor::new(&output, model);
         let mut decoder = SseDecoder::new();
         for sse in decoder.feed(sse_payload.as_bytes()).unwrap() {
             if processor.handle_sse(&sse, &events).expect("sse") == SseOutcome::Done {
@@ -1718,7 +1760,7 @@ mod tests {
         processor.finish(&events);
         events.end(None);
         let collected: Vec<StreamEvent> = futures::executor::block_on(events.collect());
-        (collected, output)
+        (collected, output.snapshot())
     }
 
     // -----------------------------------------------------------------------
@@ -2389,8 +2431,8 @@ mod tests {
     /// Drives `handle_sse` over one raw SSE payload; returns the error if any.
     fn run_handle_sse(model: &Model, sse_payload: &str) -> Result<(), String> {
         let events = AssistantMessageEventStream::new();
-        let mut output = initial_output(model);
-        let mut processor = StreamProcessor::new(&mut output, model);
+        let output = SharedAssistantMessage::new(initial_output(model));
+        let mut processor = StreamProcessor::new(&output, model);
         let mut decoder = SseDecoder::new();
         for sse in decoder.feed(sse_payload.as_bytes()).unwrap() {
             processor.handle_sse(&sse, &events)?;
@@ -2412,8 +2454,8 @@ mod tests {
     /// [`run_handle_sse`] that returns the accumulated assistant message.
     fn run_handle_sse_output(model: &Model, sse_payload: &str) -> AssistantMessage {
         let events = AssistantMessageEventStream::new();
-        let mut output = initial_output(model);
-        let mut processor = StreamProcessor::new(&mut output, model);
+        let output = SharedAssistantMessage::new(initial_output(model));
+        let mut processor = StreamProcessor::new(&output, model);
         let mut decoder = SseDecoder::new();
         for sse in decoder.feed(sse_payload.as_bytes()).expect("decode") {
             processor.handle_sse(&sse, &events).expect("handle sse");
@@ -2421,7 +2463,28 @@ mod tests {
         for sse in decoder.finish().expect("decode") {
             processor.handle_sse(&sse, &events).expect("handle sse");
         }
-        output
+        output.snapshot()
+    }
+
+    /// Drive the full processor finish path and retain the emitted events.
+    fn run_handle_sse_events_output(
+        model: &Model,
+        sse_payload: &str,
+    ) -> (Vec<StreamEvent>, AssistantMessage) {
+        let events = AssistantMessageEventStream::new();
+        let output = SharedAssistantMessage::new(initial_output(model));
+        let mut processor = StreamProcessor::new(&output, model);
+        let mut decoder = SseDecoder::new();
+        for sse in decoder.feed(sse_payload.as_bytes()).expect("decode") {
+            processor.handle_sse(&sse, &events).expect("handle sse");
+        }
+        for sse in decoder.finish().expect("decode") {
+            processor.handle_sse(&sse, &events).expect("handle sse");
+        }
+        processor.finish(&events);
+        events.end(None);
+        let collected = futures::executor::block_on(events.collect());
+        (collected, output.snapshot())
     }
 
     /// #9674 (`8930b9ec0`): GLM models on Mistral send empty content deltas
@@ -2500,6 +2563,62 @@ mod tests {
             Value::Object(tool_calls[0].arguments.clone()),
             json!({"path": "a.txt"})
         );
+    }
+
+    #[test]
+    fn test_large_tool_argument_interleaved_close_is_authoritative() {
+        let model = make_model(json!({}));
+        let long = "x".repeat(4096);
+        let first = format!(r#"{{"text":"{long}"#);
+        let second = "\"}";
+        let mut events = Vec::new();
+        for index in 0..2 {
+            events.push(json!({
+                "id": "response-1", "model": model.id,
+                "choices": [{"index": 0, "finish_reason": null, "delta": {"tool_calls": [{
+                    "index": index, "id": format!("abc12345{index}"),
+                    "function": {"name": "write", "arguments": first}
+                }]}}]
+            }));
+        }
+        for index in 0..2 {
+            events.push(json!({
+                "id": "response-1", "model": model.id,
+                "choices": [{"index": 0, "finish_reason": null, "delta": {"tool_calls": [{
+                    "index": index, "function": {"name": "", "arguments": second}
+                }]}}]
+            }));
+        }
+        events.push(json!({
+            "id": "response-1", "model": model.id,
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "delta": {}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }));
+        let mut payload = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        payload.push_str("data: [DONE]\n\n");
+        let (stream_events, output) = run_handle_sse_events_output(&model, &payload);
+        let ends: Vec<&ToolCall> = stream_events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 2);
+        for call in ends {
+            assert_eq!(call.arguments["text"], json!(long));
+            assert_eq!(call.arguments_error, None);
+        }
+        assert_eq!(output.content.len(), 2);
+        for block in &output.content {
+            let AssistantContent::ToolCall(call) = block else {
+                panic!("expected tool call");
+            };
+            assert_eq!(call.arguments["text"], json!(long));
+        }
     }
 
     #[test]

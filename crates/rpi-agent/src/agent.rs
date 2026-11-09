@@ -111,12 +111,11 @@ pub struct AgentState {
     /// True while the agent is processing a prompt or continuation. Remains
     /// true until awaited `agent_end` listeners settle.
     pub is_streaming: bool,
-    /// Partial assistant message for the current streamed response, if any.
-    /// V15-13 (rpi#53): shared `Arc` — the per-delta reduction is a
-    /// refcount bump, not a deep copy. Only assistant partials are tracked
-    /// (`MessageUpdate` fires for assistant streams only); non-assistant
-    /// `MessageStart` events clear the slot.
-    pub streaming_message: Option<Arc<AssistantMessage>>,
+    /// Live partial assistant message for the current streamed response, if
+    /// any. The per-delta reduction is a refcount bump, not a deep copy. Only
+    /// assistant partials are tracked (`MessageUpdate` fires for assistant
+    /// streams only); non-assistant `MessageStart` events clear the slot.
+    pub streaming_message: Option<rpi_ai::types::SharedAssistantMessage>,
     /// Tool call ids currently executing.
     pub pending_tool_calls: HashSet<String>,
     /// Error message from the most recent failed or aborted assistant turn.
@@ -1255,13 +1254,15 @@ async fn process_events(
                 // Once per message (not per delta) — an extraction clone is
                 // fine here; the streaming hot path is the update arm below.
                 state.streaming_message = match message {
-                    AgentMessage::Assistant(assistant) => Some(Arc::new(assistant.clone())),
+                    AgentMessage::Assistant(assistant) => Some(
+                        rpi_ai::types::SharedAssistantMessage::new(assistant.clone()),
+                    ),
                     _ => None,
                 };
             }
             AgentEvent::MessageUpdate { message, .. } => {
                 // V15-13: refcount share (was a full message clone per delta).
-                state.streaming_message = Some(Arc::clone(message));
+                state.streaming_message = Some(message.clone());
             }
             AgentEvent::MessageEnd { message } => {
                 state.streaming_message = None;

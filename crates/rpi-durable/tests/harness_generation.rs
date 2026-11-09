@@ -702,7 +702,7 @@ async fn partial_progress_uses_the_harness_timer() {
 }
 
 #[tokio::test]
-async fn continuous_partials_do_not_rearm_the_timer_until_a_flush() {
+async fn continuous_partials_commit_latest_live_state_without_rearming() {
     const INTERVAL: u64 = 123_457;
     let timer = Arc::new(PartialTimer::default());
     let emitted = Arc::new(AtomicUsize::new(0));
@@ -779,7 +779,8 @@ async fn continuous_partials_do_not_rearm_the_timer_until_a_flush() {
     assert_eq!(
         timer.arms_with_delay(INTERVAL),
         2,
-        "the third delta must not replace the pending timer"
+        "the third delta must not replace the pending timer; its live handle
+        // must nevertheless supply the latest text to that timer"
     );
     timer.fire();
     for _ in 0..200 {

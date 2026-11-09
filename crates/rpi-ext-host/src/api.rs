@@ -40,6 +40,18 @@ use crate::types::{
 /// Boxed future used throughout the host boundary.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Shared per-registration `throttleMs` state (rpi#78). The runtime owns the
+/// registry so unsubscribe can release a pending payload immediately, even
+/// when no later event or flush occurs.
+pub(crate) type ThrottleKey = (String, String, u64);
+pub(crate) type SharedThrottleRegistry = Arc<Mutex<HashMap<ThrottleKey, ThrottleSlot>>>;
+
+#[derive(Debug, Default)]
+pub(crate) struct ThrottleSlot {
+    pub last: Option<std::time::Instant>,
+    pub pending: Option<Value>,
+}
+
 /// Unsubscribe closure (`() => void` upstream).
 pub type Unsubscribe = Box<dyn FnOnce() + Send>;
 
@@ -1499,6 +1511,7 @@ struct RuntimeInner {
     mcp_servers: Arc<std::sync::Mutex<crate::types::McpServerRegistry>>,
     mode: RwLock<ExtensionMode>,
     event_bus: EventBus,
+    throttled: SharedThrottleRegistry,
     /// Tracked event-bus subscriptions that are auto-unsubscribed on
     /// `invalidate()` (6ca423447, loader.ts:179-180). Keyed by a monotonically
     /// increasing ID so the returned wrapper can remove itself on early
@@ -1535,10 +1548,23 @@ impl ExtensionRuntime {
                 )),
                 mode: RwLock::new(ExtensionMode::Print),
                 event_bus: EventBus::new(),
+                throttled: Arc::new(Mutex::new(HashMap::new())),
                 event_bus_unsubscribers: std::sync::Mutex::new(HashMap::new()),
                 next_bus_subscription_id: AtomicU64::new(0),
             }),
         }
+    }
+
+    pub(crate) fn throttle_registry(&self) -> SharedThrottleRegistry {
+        Arc::clone(&self.inner.throttled)
+    }
+
+    pub(crate) fn clear_throttle_slot(&self, key: &ThrottleKey) {
+        self.inner
+            .throttled
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(key);
     }
 
     /// `runtime.mcpServers` (loader.ts:440-492): the extension-registered
@@ -2373,6 +2399,10 @@ pub struct LoadedExtension {
     /// `pi.on()` unsubscribe handle removes exactly its own registration
     /// by id (#8967, loader.ts:277-293 @ 46c9de402; upstream wraps the
     /// handler and splices by identity, ids are the Rust equivalent).
+    /// `throttleMs` per registration (rpi#78 A1/1.3): `0` = dispatch every
+    /// event inline (upstream parity). A positive value opts the registration
+    /// into trailing coalescing — see [`crate::runner::ExtensionRunnerCore::emit`].
+    handler_throttle: RwLock<HashMap<u64, u64>>,
     handlers: RwLock<HashMap<String, Vec<(u64, EventHandler)>>>,
     next_handler_id: std::sync::atomic::AtomicU64,
     tools: RwLock<InsertionMap<RegisteredTool>>,
@@ -2483,6 +2513,7 @@ impl LoadedExtension {
             replaceable: std::sync::atomic::AtomicBool::new(false),
             builtin: std::sync::atomic::AtomicBool::new(is_builtin),
             source_info: ExtSourceInfo::synthetic(extension_path, &source, base_dir),
+            handler_throttle: RwLock::new(HashMap::new()),
             handlers: RwLock::new(HashMap::new()),
             next_handler_id: std::sync::atomic::AtomicU64::new(0),
             tools: RwLock::new(InsertionMap::new()),
@@ -2566,10 +2597,20 @@ impl LoadedExtension {
     /// `pi.on(event, handler)` registration (loader.ts:280-293 @ 46c9de402):
     /// append with a fresh registration id; the unsubscribe handle returned
     /// by [`ExtensionApi::on`] removes by that id.
-    pub(crate) fn insert_handler(&self, event: &str, handler: EventHandler) -> u64 {
+    /// Register a handler with the opt-in `throttleMs` coalescing window
+    /// (rpi#78 A1/1.3). `0` keeps per-event dispatch.
+    pub(crate) fn insert_handler_with_throttle(
+        &self,
+        event: &str,
+        handler: EventHandler,
+        throttle_ms: u64,
+    ) -> u64 {
         let id = self
             .next_handler_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if throttle_ms > 0 {
+            write(&self.handler_throttle).insert(id, throttle_ms);
+        }
         write(&self.handlers)
             .entry(event.to_owned())
             .or_default()
@@ -2596,14 +2637,22 @@ impl LoadedExtension {
                 handlers.remove(event);
             }
         }
+        drop(handlers);
+        write(&self.handler_throttle).remove(&id);
         removed
     }
 
-    pub(crate) fn handlers_for(&self, event: &str) -> Vec<EventHandler> {
-        read(&self.handlers)
-            .get(event)
-            .map(|handlers| handlers.iter().map(|(_, h)| h.clone()).collect())
-            .unwrap_or_default()
+    /// `(registration id, throttleMs, handler)` pairs for one event, in
+    /// registration order.
+    pub(crate) fn handlers_with_throttle_for(&self, event: &str) -> Vec<(u64, u64, EventHandler)> {
+        let handlers = read(&self.handlers);
+        let Some(list) = handlers.get(event) else {
+            return Vec::new();
+        };
+        let throttle = read(&self.handler_throttle);
+        list.iter()
+            .map(|(id, handler)| (*id, throttle.get(id).copied().unwrap_or(0), handler.clone()))
+            .collect()
     }
 
     pub(crate) fn has_handlers(&self, event: &str) -> bool {
@@ -2996,13 +3045,37 @@ impl ExtensionApi {
     /// apply to later dispatches; the runner snapshots the handler list
     /// before each dispatch (`runner.ts:235-240` — `snapshotEventHandlers`).
     pub fn on(&self, event: &str, handler: EventHandler) -> Result<OnUnsubscribe, ExtError> {
+        self.on_with_throttle(event, handler, 0)
+    }
+
+    /// [`Self::on`] with the opt-in `throttleMs` coalescing window (rpi#78
+    /// A1/1.3). Only the cumulative `message_update` event supports coalescing:
+    /// delta streams and result-bearing events would lose data or decisions.
+    /// `message_end` flushes the newest held snapshot before carrying the
+    /// authoritative final state.
+    pub fn on_with_throttle(
+        &self,
+        event: &str,
+        handler: EventHandler,
+        throttle_ms: u64,
+    ) -> Result<OnUnsubscribe, ExtError> {
         self.assert_api_active()?;
         self.runtime.assert_active()?;
-        let id = self.extension.insert_handler(event, handler);
+        if throttle_ms > 0 && event != crate::types::EVENT_MESSAGE_UPDATE {
+            return Err(ExtError::Call(format!(
+                "throttleMs is only supported for {}, not {event}",
+                crate::types::EVENT_MESSAGE_UPDATE
+            )));
+        }
+        let id = self
+            .extension
+            .insert_handler_with_throttle(event, handler, throttle_ms);
         let extension = self.extension.clone();
+        let runtime = self.runtime.clone();
         let event = event.to_owned();
         Ok(OnUnsubscribe(Box::new(move || {
             extension.remove_handler(&event, id);
+            runtime.clear_throttle_slot(&(extension.path.clone(), event.clone(), id));
         })))
     }
 

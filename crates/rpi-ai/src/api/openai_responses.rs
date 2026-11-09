@@ -30,7 +30,6 @@
 //!   content blocks), so there is nothing to scrub.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};
@@ -52,8 +51,8 @@ use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
 use crate::models::{ProviderStreams, clamp_thinking_level};
 use crate::types::{
     AssistantMessage, CacheRetention, DoneReason, ErrorReason, Model, ModelThinkingLevel,
-    ProviderHeaders, ProviderResponse, SessionAffinityFormat, SimpleStreamOptions, StopReason,
-    StreamEvent, StreamOptions, TranscriptContext, Usage,
+    ProviderHeaders, ProviderResponse, SessionAffinityFormat, SharedAssistantMessage,
+    SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, TranscriptContext, Usage,
 };
 use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
@@ -546,7 +545,7 @@ async fn run(
     model: &Model,
     context: &TranscriptContext,
     options: &OpenAIResponsesOptions,
-    output: &mut AssistantMessage,
+    output: &SharedAssistantMessage,
     events: &AssistantMessageEventStream,
 ) -> Result<DoneReason, String> {
     let api_key = get_client_api_key(
@@ -562,7 +561,9 @@ async fn run(
         options.stream.session_id.as_deref()
     };
     let compat = get_compat(model);
-    output.provider_thinking_level = get_configuration_update_effort(model, options, &compat);
+    output.with_mut(|output| {
+        output.provider_thinking_level = get_configuration_update_effort(model, options, &compat);
+    });
     let grammar_tool_input_properties = create_grammar_tool_input_properties(
         Some(crate::utils::transcript::get_declared_tools(&context.messages).as_slice()),
         compat.supports_open_ai_grammar_tools,
@@ -675,7 +676,7 @@ async fn run(
     }
 
     events.push(StreamEvent::Start {
-        partial: Arc::new(output.clone()),
+        partial: output.clone(),
     });
 
     let model_id = model.id.clone();
@@ -750,7 +751,7 @@ async fn run(
     {
         return Err("Request was aborted".to_owned());
     }
-    match output.stop_reason {
+    output.with(|output| match output.stop_reason {
         StopReason::Pending => {
             Err("OpenAI Responses stream ended without a stop reason".to_owned())
         }
@@ -762,7 +763,7 @@ async fn run(
         StopReason::Length => Ok(DoneReason::Length),
         StopReason::ToolUse => Ok(DoneReason::ToolUse),
         _ => Ok(DoneReason::Stop),
-    }
+    })
 }
 
 /// `stream` (openai-responses).
@@ -782,30 +783,32 @@ pub fn stream(
     );
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
-        let mut output = initial_output(&model);
-        match run(&model, &context, &options, &mut output, &task_stream).await {
+        let output = SharedAssistantMessage::new(initial_output(&model));
+        match run(&model, &context, &options, &output, &task_stream).await {
             Ok(reason) => {
                 task_stream.push(StreamEvent::Done {
                     reason,
-                    message: output,
+                    message: output.snapshot(),
                 });
                 task_stream.end(None);
             }
             Err(message) => {
                 let aborted = signal.as_ref().is_some_and(|signal| signal.is_cancelled());
-                output.stop_reason = if aborted {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                output.error_message = Some(append_chatgpt_usage_hint(message));
+                output.with_mut(|output| {
+                    output.stop_reason = if aborted {
+                        StopReason::Aborted
+                    } else {
+                        StopReason::Error
+                    };
+                    output.error_message = Some(append_chatgpt_usage_hint(message));
+                });
                 task_stream.push(StreamEvent::Error {
                     reason: if aborted {
                         ErrorReason::Aborted
                     } else {
                         ErrorReason::Error
                     },
-                    error: output,
+                    error: output.snapshot(),
                 });
                 task_stream.end(None);
             }

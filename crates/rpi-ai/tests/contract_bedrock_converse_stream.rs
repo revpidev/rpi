@@ -258,6 +258,30 @@ fn minimal_stream_body() -> Vec<u8> {
     body
 }
 
+fn assert_one_live_partial(events: &[StreamEvent]) {
+    let mut first: Option<&rpi_ai::types::SharedAssistantMessage> = None;
+    for event in events {
+        let partial = match event {
+            StreamEvent::Start { partial }
+            | StreamEvent::TextStart { partial, .. }
+            | StreamEvent::TextDelta { partial, .. }
+            | StreamEvent::TextEnd { partial, .. }
+            | StreamEvent::ThinkingStart { partial, .. }
+            | StreamEvent::ThinkingDelta { partial, .. }
+            | StreamEvent::ThinkingEnd { partial, .. }
+            | StreamEvent::ToolCallStart { partial, .. }
+            | StreamEvent::ToolCallDelta { partial, .. }
+            | StreamEvent::ToolCallEnd { partial, .. } => partial,
+            StreamEvent::Done { .. } | StreamEvent::Error { .. } => continue,
+        };
+        if let Some(first) = first {
+            assert!(first.ptr_eq(partial), "all deltas share one live partial");
+        } else {
+            first = Some(partial);
+        }
+    }
+}
+
 async fn drive(
     model: &Model,
     ctx: &rpi_ai::types::TranscriptContext,
@@ -274,6 +298,7 @@ async fn drive(
         .await
         .expect("timed out waiting for the captured request (stream likely failed pre-send)")
         .expect("captured request");
+    assert_one_live_partial(&events);
     (events, request)
 }
 
@@ -715,6 +740,65 @@ async fn test_tool_call_stream() {
         Value::Object(tool_call.arguments.clone()),
         json!({"cmd": "ls"})
     );
+}
+
+#[tokio::test]
+async fn test_large_tool_argument_interleaved_close_is_authoritative() {
+    let long = "x".repeat(4096);
+    let first = format!(r#"{{"text":"{long}"#);
+    let second = "\"}";
+    let mut body = event_frame("messageStart", r#"{"role":"assistant"}"#);
+    for index in 0..2 {
+        let payload = json!({
+            "contentBlockIndex": index,
+            "start": {"toolUse": {"toolUseId": format!("toolu_{index}"), "name": "write"}}
+        });
+        body.extend_from_slice(&event_frame("contentBlockStart", &payload.to_string()));
+    }
+    for input in [first.as_str(), second] {
+        for index in 0..2 {
+            let payload = json!({
+                "contentBlockIndex": index,
+                "delta": {"toolUse": {"input": input}}
+            });
+            body.extend_from_slice(&event_frame("contentBlockDelta", &payload.to_string()));
+        }
+    }
+    for index in 0..2 {
+        let payload = json!({"contentBlockIndex": index});
+        body.extend_from_slice(&event_frame("contentBlockStop", &payload.to_string()));
+    }
+    body.extend_from_slice(&event_frame("messageStop", r#"{"stopReason":"tool_use"}"#));
+
+    let (events, _request) = drive(
+        &claude_model("http://unused"),
+        &context(vec![user_text("hi")]),
+        sigv4_options(test_env()),
+        (200, "application/vnd.amazon.eventstream", body),
+    )
+    .await;
+    let ends: Vec<&rpi_ai::types::ToolCall> = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends.len(), 2);
+    for call in ends {
+        assert_eq!(call.arguments["text"], json!(long));
+        assert_eq!(call.arguments_error, None);
+    }
+    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+        panic!("expected done event");
+    };
+    assert_eq!(message.content.len(), 2);
+    for block in &message.content {
+        let rpi_ai::types::AssistantContent::ToolCall(call) = block else {
+            panic!("expected tool call");
+        };
+        assert_eq!(call.arguments["text"], json!(long));
+    }
 }
 
 #[tokio::test]

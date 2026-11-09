@@ -50,7 +50,7 @@ use crate::state::EngineState;
 /// these two bookkeeping events map to `Trigger::Live` (never the 300ms
 /// debounce path).
 #[allow(dead_code)] // documented dispatch table; the match below is the live path
-const LIVE_DISPATCH_EVENTS: &[&str] = &["message_start", "message_update"];
+const LIVE_DISPATCH_EVENTS: &[&str] = &["message_start", "message_update", "message_update_delta"];
 
 /// Host-call handle + plugin-owned runtime, established once by
 /// `rpi_extension_init`. The cookie is stored as `usize` to keep the state
@@ -209,7 +209,12 @@ pub(crate) fn reconcile_subscriptions(
         settings.status_line.as_ref(),
         Some(config::StatusLine::Command(config)) if config.live_tokens.enabled
     );
-    let desired = subscriptions::desired_events(settings.status_line.as_ref(), command_live);
+    // rpi#78 A1/1.2: once the host has emitted a delta-only payload, drop the
+    // cumulative `message_update` subscription — that is the host's signal to
+    // stop materializing the whole accumulated message per delta.
+    let delta_supported = with_engine(|engine| engine.delta_supported());
+    let desired =
+        subscriptions::desired_events(settings.status_line.as_ref(), command_live, delta_supported);
     if let Some(state) = SUBSCRIPTIONS.get() {
         state
             .lock()
@@ -279,13 +284,29 @@ fn handle_dispatch(message: &Value) -> Value {
             });
             Trigger::Live
         }
-        "message_update" => {
+        "message_update" | "message_update_delta" => {
             // FR-A + #45: O(1) amortized per delta — count the chars,
-            // retain the raw delta text and read the cumulative partial's
-            // provider usage; all inside LiveMeasure. Same arm-on-event
-            // rule as message_start (also covers enabling liveTokens
-            // mid-stream).
+            // retain the raw delta text and read the provider usage; all
+            // inside LiveMeasure. Same arm-on-event rule as message_start
+            // (also covers enabling liveTokens mid-stream).
+            //
+            // rpi#78 A1/1.2: the delta-only payload carries `usage` instead of
+            // the cumulative `message`; receiving one proves the host supports
+            // it, so the next reconciliation drops the cumulative
+            // subscription (self-detecting, no version handshake needed — an
+            // old host simply never sends this event).
             with_engine(|engine| {
+                if event == "message_update_delta" {
+                    engine.note_delta_supported();
+                }
+                // The probe subscribes to both variants. The host emits delta
+                // first and cumulative second for the same agent event; once
+                // support is proven, ignore that legacy twin until the next
+                // settled reconciliation removes its subscription. Otherwise
+                // the first message would count every delta twice.
+                if event == "message_update" && engine.delta_supported() {
+                    return;
+                }
                 engine.arm_live_measure();
                 if let Some(live) = engine.live.as_mut() {
                     live.on_message_update(&payload);
@@ -402,7 +423,10 @@ mod tests {
         let count = live.len();
         live.dedup();
         assert_eq!(live.len(), count);
-        assert_eq!(count, 2, "message_start + message_update only");
+        assert_eq!(
+            count, 3,
+            "message_start + message_update (+ the rpi#78 delta variant)"
+        );
     }
 
     #[test]

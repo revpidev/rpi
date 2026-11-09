@@ -29,7 +29,6 @@
 //!   (consistent with D-021..D-026).
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
@@ -52,8 +51,8 @@ use crate::models::{ProviderStreams, clamp_thinking_level};
 use crate::types::{
     AssistantMessage, AssistantMessageDiagnostic, CacheRetention, Context, DiagnosticErrorInfo,
     DoneReason, ErrorReason, Message, Model, ModelThinkingLevel, NumberOrString, ProviderHeaders,
-    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions,
-    TranscriptContext, Transport, Usage,
+    ProviderResponse, SharedAssistantMessage, SimpleStreamOptions, StopReason, StreamEvent,
+    StreamOptions, TranscriptContext, Transport, Usage,
 };
 use crate::utils::custom_fetch::{SendFailure, send_provider_request};
 use crate::utils::event_stream::AssistantMessageEventStream;
@@ -879,8 +878,8 @@ fn initial_output(model: &Model) -> AssistantMessage {
 }
 
 /// `assertSuccessfulOutput`.
-fn assert_successful_output(output: &AssistantMessage) -> Result<(), CodexError> {
-    match output.stop_reason {
+fn assert_successful_output(output: &SharedAssistantMessage) -> Result<(), CodexError> {
+    output.with(|output| match output.stop_reason {
         StopReason::Pending => Err(CodexError::Other(
             "Codex stream ended without a stop reason".to_owned(),
         )),
@@ -891,15 +890,15 @@ fn assert_successful_output(output: &AssistantMessage) -> Result<(), CodexError>
                 .unwrap_or_else(|| "An unknown error occurred".to_owned()),
         )),
         _ => Ok(()),
-    }
+    })
 }
 
-fn done_reason(output: &AssistantMessage) -> DoneReason {
-    match output.stop_reason {
+fn done_reason(output: &SharedAssistantMessage) -> DoneReason {
+    output.with(|output| match output.stop_reason {
         StopReason::Length => DoneReason::Length,
         StopReason::ToolUse => DoneReason::ToolUse,
         _ => DoneReason::Stop,
-    }
+    })
 }
 
 fn transport_name(transport: Transport) -> &'static str {
@@ -914,7 +913,7 @@ fn transport_name(transport: Transport) -> &'static str {
 /// `createAssistantMessageDiagnostic("provider_transport_failure", ...)` +
 /// `appendAssistantMessageDiagnostic`.
 fn append_transport_failure_diagnostic(
-    output: &mut AssistantMessage,
+    output: &SharedAssistantMessage,
     error: &CodexError,
     transport: Transport,
     websocket_started: bool,
@@ -955,10 +954,12 @@ fn append_transport_failure_diagnostic(
         }),
         details: Some(details),
     };
-    output
-        .diagnostics
-        .get_or_insert_with(Vec::new)
-        .push(diagnostic);
+    output.with_mut(|output| {
+        output
+            .diagnostics
+            .get_or_insert_with(Vec::new)
+            .push(diagnostic);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -975,7 +976,7 @@ async fn process_websocket_stream(
     url: &str,
     body: &Value,
     headers: &reqwest::header::HeaderMap,
-    output: &mut AssistantMessage,
+    output: &SharedAssistantMessage,
     events: &AssistantMessageEventStream,
     model: &Model,
     websocket_started: &mut bool,
@@ -1061,7 +1062,7 @@ async fn process_websocket_stream(
         let mut codex_end_turn: Option<bool> = None;
         {
             let mut processor = ResponsesStreamProcessor::new(
-                &mut *output,
+                output,
                 model,
                 ResponsesStreamOptions {
                     service_tier: options.service_tier.as_deref(),
@@ -1084,7 +1085,7 @@ async fn process_websocket_stream(
                     if !*start_emitted {
                         *start_emitted = true;
                         events.push(StreamEvent::Start {
-                            partial: Arc::new(start_partial.clone()),
+                            partial: start_partial.clone(),
                         });
                     }
                 }
@@ -1105,7 +1106,7 @@ async fn process_websocket_stream(
         }
         // c3e7bc60a: assigned after the processor releases its `output` borrow.
         if let Some(end_turn) = codex_end_turn {
-            output.end_turn = Some(end_turn);
+            output.with_mut(|output| output.end_turn = Some(end_turn));
         }
 
         if options
@@ -1115,7 +1116,11 @@ async fn process_websocket_stream(
             .is_some_and(|signal| signal.is_cancelled())
         {
             keep_connection = false;
-        } else if use_cached_context && cache_key.is_some() && output.response_id.is_some() {
+        } else if use_cached_context
+            && cache_key.is_some()
+            && output.with(|output| output.response_id.is_some())
+        {
+            let output = output.snapshot();
             // invariant: checked is_some() above
             let (session_id, account_id) = cache_key.clone().unwrap();
             // #9548: `normalizeContext({ messages: [output] })`.
@@ -1177,7 +1182,7 @@ async fn run(
     model: &Model,
     context: &TranscriptContext,
     options: &OpenAiCodexResponsesOptions,
-    output: &mut AssistantMessage,
+    output: &SharedAssistantMessage,
     events: &AssistantMessageEventStream,
 ) -> Result<DoneReason, CodexError> {
     let signal = options.stream.signal.clone();
@@ -1256,7 +1261,7 @@ async fn run(
                 &ws_url,
                 &body,
                 &ws_header_map,
-                &mut *output,
+                output,
                 events,
                 model,
                 &mut websocket_started,
@@ -1451,14 +1456,14 @@ async fn run(
 
     if !start_emitted {
         events.push(StreamEvent::Start {
-            partial: Arc::new(output.clone()),
+            partial: output.clone(),
         });
     }
 
     // SSE body processing (upstream `processStream`).
     let model_id = model.id.clone();
     let mut processor = ResponsesStreamProcessor::new(
-        &mut *output,
+        output,
         model,
         ResponsesStreamOptions {
             service_tier: options.service_tier.as_deref(),
@@ -1551,7 +1556,7 @@ async fn run(
     drop(processor);
     // c3e7bc60a: preserve `response.end_turn` for debugging.
     if let Some(end_turn) = codex_end_turn {
-        output.end_turn = Some(end_turn);
+        output.with_mut(|output| output.end_turn = Some(end_turn));
     }
 
     if aborted() {
@@ -1584,30 +1589,32 @@ pub fn stream(
     );
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
-        let mut output = initial_output(&model);
-        match run(&model, &context, &options, &mut output, &task_stream).await {
+        let output = SharedAssistantMessage::new(initial_output(&model));
+        match run(&model, &context, &options, &output, &task_stream).await {
             Ok(reason) => {
                 task_stream.push(StreamEvent::Done {
                     reason,
-                    message: output,
+                    message: output.snapshot(),
                 });
                 task_stream.end(None);
             }
             Err(error) => {
                 let aborted = signal.as_ref().is_some_and(|signal| signal.is_cancelled());
-                output.stop_reason = if aborted {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                output.error_message = Some(error.message());
+                output.with_mut(|output| {
+                    output.stop_reason = if aborted {
+                        StopReason::Aborted
+                    } else {
+                        StopReason::Error
+                    };
+                    output.error_message = Some(error.message());
+                });
                 task_stream.push(StreamEvent::Error {
                     reason: if aborted {
                         ErrorReason::Aborted
                     } else {
                         ErrorReason::Error
                     },
-                    error: output,
+                    error: output.snapshot(),
                 });
                 task_stream.end(None);
             }

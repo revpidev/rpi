@@ -205,7 +205,9 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
-    use crate::types::{ApiKind, AssistantRole, DoneReason, ErrorReason, StopReason, Usage};
+    use crate::types::{
+        ApiKind, AssistantRole, DoneReason, ErrorReason, SharedAssistantMessage, StopReason, Usage,
+    };
 
     fn message(stop_reason: StopReason) -> AssistantMessage {
         AssistantMessage {
@@ -234,7 +236,7 @@ mod tests {
     async fn test_push_iterate_result() {
         let stream = AssistantMessageEventStream::new();
         stream.push(StreamEvent::Start {
-            partial: Arc::new(message(StopReason::Pending)),
+            partial: SharedAssistantMessage::new(message(StopReason::Pending)),
         });
         stream.push(StreamEvent::Done {
             reason: DoneReason::Stop,
@@ -244,6 +246,66 @@ mod tests {
 
         let events: Vec<StreamEvent> = stream.collect().await;
         assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn buffered_partials_share_identity_and_observe_latest_state() {
+        let stream = AssistantMessageEventStream::new();
+        let partial = SharedAssistantMessage::new(message(StopReason::Pending));
+        stream.push(StreamEvent::Start {
+            partial: partial.clone(),
+        });
+        partial.with_mut(|partial| {
+            partial
+                .content
+                .push(crate::types::AssistantContent::Text(Default::default()));
+        });
+        for delta in ["a", "b"] {
+            partial.with_mut(|partial| {
+                let crate::types::AssistantContent::Text(text) = &mut partial.content[0] else {
+                    unreachable!("text fixture")
+                };
+                text.text.push_str(delta);
+            });
+            stream.push(StreamEvent::TextDelta {
+                content_index: 0,
+                delta: delta.to_owned(),
+                partial: partial.clone(),
+            });
+        }
+        let mut terminal = message(StopReason::Stop);
+        terminal.content = partial.snapshot().content;
+        stream.push(StreamEvent::Done {
+            reason: DoneReason::Stop,
+            message: terminal.clone(),
+        });
+        stream.end(None);
+
+        // Nothing drains until every mutation and the terminal event are queued.
+        let events: Vec<StreamEvent> = stream.collect().await;
+        assert_eq!(events.len(), 4);
+        let mut deltas = Vec::new();
+        for event in &events[..3] {
+            let queued = match event {
+                StreamEvent::Start { partial } | StreamEvent::TextDelta { partial, .. } => partial,
+                _ => unreachable!("nonterminal fixture"),
+            };
+            assert!(queued.ptr_eq(&partial));
+            if let StreamEvent::TextDelta { delta, .. } = event {
+                deltas.push(delta.as_str());
+            }
+        }
+        assert_eq!(deltas, ["a", "b"]);
+        partial.with(|partial| {
+            let crate::types::AssistantContent::Text(text) = &partial.content[0] else {
+                unreachable!("text fixture")
+            };
+            assert_eq!(text.text, "ab");
+        });
+        let StreamEvent::Done { message, .. } = &events[3] else {
+            unreachable!("terminal fixture")
+        };
+        assert_eq!(message, &terminal);
     }
 
     #[tokio::test]
@@ -266,7 +328,7 @@ mod tests {
             message: message(StopReason::Stop),
         });
         stream.push(StreamEvent::Start {
-            partial: Arc::new(message(StopReason::Pending)),
+            partial: SharedAssistantMessage::new(message(StopReason::Pending)),
         });
         stream.end(None);
         let events: Vec<StreamEvent> = stream.collect().await;
@@ -277,7 +339,7 @@ mod tests {
     async fn test_end_result_fallback() {
         let stream = AssistantMessageEventStream::new();
         stream.push(StreamEvent::Start {
-            partial: Arc::new(message(StopReason::Pending)),
+            partial: SharedAssistantMessage::new(message(StopReason::Pending)),
         });
         stream.end(Some(message(StopReason::Aborted)));
         let result = stream.result().await.expect("resolved");
@@ -291,7 +353,7 @@ mod tests {
         let stream = AssistantMessageEventStream::new();
         let producer = stream.clone();
         producer.push(StreamEvent::Start {
-            partial: Arc::new(message(StopReason::Pending)),
+            partial: SharedAssistantMessage::new(message(StopReason::Pending)),
         });
         producer.end(None);
         let events: Vec<StreamEvent> = stream.collect().await;
@@ -320,16 +382,16 @@ mod tests {
     fn text_event(kind_index: usize, partial: &AssistantMessage) -> StreamEvent {
         match kind_index {
             0 => StreamEvent::Start {
-                partial: Arc::new(partial.clone()),
+                partial: SharedAssistantMessage::new(partial.clone()),
             },
             1 => StreamEvent::TextStart {
                 content_index: 0,
-                partial: Arc::new(partial.clone()),
+                partial: SharedAssistantMessage::new(partial.clone()),
             },
             _ => StreamEvent::TextDelta {
                 content_index: 0,
                 delta: "x".to_owned(),
-                partial: Arc::new(partial.clone()),
+                partial: SharedAssistantMessage::new(partial.clone()),
             },
         }
     }
@@ -440,7 +502,7 @@ mod tests {
             let partial = message(StopReason::Pending);
             for _ in 0..n {
                 stream.push(StreamEvent::Start {
-                    partial: Arc::new(partial.clone()),
+                    partial: SharedAssistantMessage::new(partial.clone()),
                 });
             }
             stream.end(None);

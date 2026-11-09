@@ -27,7 +27,6 @@
 //!   (ported from this file upstream).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};
@@ -47,9 +46,9 @@ use crate::models::ProviderStreams;
 use crate::types::{
     AnthropicAllowedFallbackModel, AssistantContent, AssistantMessage, CacheRetention, DoneReason,
     ErrorReason, Message, Model, ModelThinkingLevel, ProviderEnv, ProviderHeaders,
-    ProviderResponse, SessionAffinityFormat, SimpleStreamOptions, StopReason, StreamEvent,
-    StreamOptions, ThinkingLevel, Tool, ToolResultContent, ToolResultMessage, TranscriptContext,
-    Usage, UserContent, UserContentBlock,
+    ProviderResponse, SessionAffinityFormat, SharedAssistantMessage, SimpleStreamOptions,
+    StopReason, StreamEvent, StreamOptions, ThinkingLevel, Tool, ToolResultContent,
+    ToolResultMessage, TranscriptContext, Usage, UserContent, UserContentBlock,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::custom_fetch::send_provider_request;
@@ -59,7 +58,9 @@ use crate::utils::headers::{
     headers_to_record, identity_headers, merge_headers_chain, model_headers,
     provider_headers_to_header_map,
 };
-use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json};
+use crate::utils::json_parse::{
+    StreamingArgsPreview, parse_json_with_repair, parse_streaming_json,
+};
 use crate::utils::provider_env::get_provider_env_value;
 use crate::utils::provider_retry::{
     ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
@@ -1547,13 +1548,15 @@ fn json_u64(value: &Value) -> Option<u64> {
 struct BlockState {
     event_index: usize,
     partial_json: String,
+    /// rpi#78 A3: refresh `block.arguments` at display cadence, not per delta.
+    args_preview: StreamingArgsPreview,
 }
 
 /// Consumes Anthropic SSE events and drives the [`StreamEvent`] protocol,
 /// accumulating the final assistant message. Factored out of the HTTP layer
 /// so tests can drive it with recorded streams.
 struct StreamProcessor<'a> {
-    output: &'a mut AssistantMessage,
+    output: &'a SharedAssistantMessage,
     model: &'a Model,
     /// `usageModel` (:599-605): the model used for cost calculation — the
     /// requested model, or the fallback model (with its compat-listed cost)
@@ -1573,7 +1576,7 @@ struct StreamProcessor<'a> {
 
 impl<'a> StreamProcessor<'a> {
     fn new(
-        output: &'a mut AssistantMessage,
+        output: &'a SharedAssistantMessage,
         model: &'a Model,
         is_oauth_token: bool,
         tools: Option<&'a [Tool]>,
@@ -1591,15 +1594,15 @@ impl<'a> StreamProcessor<'a> {
         }
     }
 
-    fn recompute_total_and_cost(&mut self) {
+    fn recompute_total_and_cost(&mut self, output: &mut AssistantMessage) {
         // Anthropic doesn't provide total_tokens; compute from components.
-        self.output.usage.total_tokens = self.output.usage.input
-            + self.output.usage.output
-            + self.output.usage.cache_read
-            + self.output.usage.cache_write;
+        output.usage.total_tokens = output.usage.input
+            + output.usage.output
+            + output.usage.cache_read
+            + output.usage.cache_write;
         // Fallback responses bill at the fallback model's cost
         // (`usageModel`, eb1f87fa9).
-        calculate_cost(&self.usage_model, &mut self.output.usage);
+        calculate_cost(&self.usage_model, &mut output.usage);
     }
 
     /// `iterateAnthropicEvents` per-event body: filter, parse, flag, dispatch.
@@ -1644,424 +1647,434 @@ impl<'a> StreamProcessor<'a> {
         event: &Value,
         events: &AssistantMessageEventStream,
     ) -> Result<(), String> {
-        match event.get("type").and_then(Value::as_str) {
-            Some("message_start") => {
-                let message = &event["message"];
-                if let Some(id) = message.get("id").and_then(Value::as_str) {
-                    self.output.response_id = Some(id.to_owned());
-                }
-                // :592-593 — server-reported input transformations (latest
-                // assignment wins; message_delta may replace them later).
-                if let Some(transformations) = message.get("input_transformations")
-                    && transformations.is_array()
-                {
-                    self.input_transformations = Some(transformations.clone());
-                }
-                // :598 — keep the requested model ID on the assistant message
-                // and record the provider-reported model separately (#9188,
-                // 1283afd0d @ d1230ea20): a relay relabeling the model used to
-                // overwrite `output.model`, making the cross-model transform
-                // downgrade signed thinking replay to plain text.
-                let response_model = message
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .filter(|served| *served != self.model.id);
-                if let Some(served) = response_model {
-                    self.output.response_model = Some(served.to_owned());
-                }
-                // :599-605 — cost follows the served model when it matches a
-                // permitted fallback target (same provider + exact model);
-                // fallback pricing is retained (#9188).
-                let fallback_cost = response_model.and_then(|served| {
-                    allowed_fallback_models(self.model).and_then(|fallbacks| {
-                        fallbacks
-                            .iter()
-                            .find(|fallback| {
-                                fallback.provider == self.model.provider && fallback.model == served
-                            })
-                            .map(|fallback| fallback.cost.clone())
-                    })
-                });
-                self.usage_model = match response_model.zip(fallback_cost) {
-                    Some((served, cost)) => {
-                        let mut served_model = self.model.clone();
-                        served_model.id = served.to_owned();
-                        served_model.cost = cost;
-                        served_model
+        let partial = self.output.clone();
+        partial.with_mut(|output| {
+            match event.get("type").and_then(Value::as_str) {
+                Some("message_start") => {
+                    let message = &event["message"];
+                    if let Some(id) = message.get("id").and_then(Value::as_str) {
+                        output.response_id = Some(id.to_owned());
                     }
-                    None => self.model.clone(),
-                };
-                // Capture initial token usage from message_start; this ensures
-                // input token counts even if the stream is aborted early.
-                let usage = &message["usage"];
-                self.output.usage.input = json_u64(&usage["input_tokens"]).unwrap_or(0);
-                self.output.usage.output = json_u64(&usage["output_tokens"]).unwrap_or(0);
-                self.output.usage.cache_read =
-                    json_u64(&usage["cache_read_input_tokens"]).unwrap_or(0);
-                self.output.usage.cache_write =
-                    json_u64(&usage["cache_creation_input_tokens"]).unwrap_or(0);
-                self.output.usage.cache_write1h = Some(
-                    json_u64(&usage["cache_creation"]["ephemeral_1h_input_tokens"]).unwrap_or(0),
-                );
-                self.recompute_total_and_cost();
-            }
-            Some("content_block_start") => {
-                let event_index = json_u64(&event["index"]).unwrap_or(0) as usize;
-                let block = &event["content_block"];
-                match block.get("type").and_then(Value::as_str) {
-                    // :618-623 — a `fallback` marker block is skipped when it
-                    // opens the output; anything later is an unsupported
-                    // mid-output model switch (eb1f87fa9).
-                    Some("fallback") => {
-                        if !self.output.content.is_empty() {
-                            return Err(
-                                "Anthropic performed an unsupported mid-output model fallback"
-                                    .to_owned(),
-                            );
+                    // :592-593 — server-reported input transformations (latest
+                    // assignment wins; message_delta may replace them later).
+                    if let Some(transformations) = message.get("input_transformations")
+                        && transformations.is_array()
+                    {
+                        self.input_transformations = Some(transformations.clone());
+                    }
+                    // :598 — keep the requested model ID on the assistant message
+                    // and record the provider-reported model separately (#9188,
+                    // 1283afd0d @ d1230ea20): a relay relabeling the model used to
+                    // overwrite `output.model`, making the cross-model transform
+                    // downgrade signed thinking replay to plain text.
+                    let response_model = message
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .filter(|served| *served != self.model.id);
+                    if let Some(served) = response_model {
+                        output.response_model = Some(served.to_owned());
+                    }
+                    // :599-605 — cost follows the served model when it matches a
+                    // permitted fallback target (same provider + exact model);
+                    // fallback pricing is retained (#9188).
+                    let fallback_cost = response_model.and_then(|served| {
+                        allowed_fallback_models(self.model).and_then(|fallbacks| {
+                            fallbacks
+                                .iter()
+                                .find(|fallback| {
+                                    fallback.provider == self.model.provider
+                                        && fallback.model == served
+                                })
+                                .map(|fallback| fallback.cost.clone())
+                        })
+                    });
+                    self.usage_model = match response_model.zip(fallback_cost) {
+                        Some((served, cost)) => {
+                            let mut served_model = self.model.clone();
+                            served_model.id = served.to_owned();
+                            served_model.cost = cost;
+                            served_model
                         }
-                    }
-                    Some("text") => {
-                        // 59ad3dead: the initial `text` of a content_block_start
-                        // is part of the content, not a delta preamble — keep it.
-                        let initial_text = block
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned();
-                        self.output.content.push(AssistantContent::Text(
-                            crate::types::TextContent {
-                                text: initial_text,
-                                text_signature: None,
-                            },
-                        ));
-                        self.block_states.push(BlockState {
-                            event_index,
-                            ..BlockState::default()
-                        });
-                        events.push(StreamEvent::TextStart {
-                            content_index: self.output.content.len() - 1,
-                            partial: Arc::new(self.output.clone()),
-                        });
-                    }
-                    Some("thinking") => {
-                        // 59ad3dead: keep the initial `thinking`/`signature`
-                        // carried by content_block_start.
-                        self.output.content.push(AssistantContent::Thinking(
-                            crate::types::ThinkingContent {
-                                thinking: block
-                                    .get("thinking")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_owned(),
-                                thinking_signature: Some(
-                                    block
-                                        .get("signature")
+                        None => self.model.clone(),
+                    };
+                    // Capture initial token usage from message_start; this ensures
+                    // input token counts even if the stream is aborted early.
+                    let usage = &message["usage"];
+                    output.usage.input = json_u64(&usage["input_tokens"]).unwrap_or(0);
+                    output.usage.output = json_u64(&usage["output_tokens"]).unwrap_or(0);
+                    output.usage.cache_read =
+                        json_u64(&usage["cache_read_input_tokens"]).unwrap_or(0);
+                    output.usage.cache_write =
+                        json_u64(&usage["cache_creation_input_tokens"]).unwrap_or(0);
+                    output.usage.cache_write1h = Some(
+                        json_u64(&usage["cache_creation"]["ephemeral_1h_input_tokens"])
+                            .unwrap_or(0),
+                    );
+                    self.recompute_total_and_cost(output);
+                }
+                Some("content_block_start") => {
+                    let event_index = json_u64(&event["index"]).unwrap_or(0) as usize;
+                    let block = &event["content_block"];
+                    match block.get("type").and_then(Value::as_str) {
+                        // :618-623 — a `fallback` marker block is skipped when it
+                        // opens the output; anything later is an unsupported
+                        // mid-output model switch (eb1f87fa9).
+                        Some("fallback") => {
+                            if !output.content.is_empty() {
+                                return Err(
+                                    "Anthropic performed an unsupported mid-output model fallback"
+                                        .to_owned(),
+                                );
+                            }
+                        }
+                        Some("text") => {
+                            // 59ad3dead: the initial `text` of a content_block_start
+                            // is part of the content, not a delta preamble — keep it.
+                            let initial_text = block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned();
+                            output.content.push(AssistantContent::Text(
+                                crate::types::TextContent {
+                                    text: initial_text,
+                                    text_signature: None,
+                                },
+                            ));
+                            self.block_states.push(BlockState {
+                                event_index,
+                                ..BlockState::default()
+                            });
+                            events.push(StreamEvent::TextStart {
+                                content_index: output.content.len() - 1,
+                                partial: partial.clone(),
+                            });
+                        }
+                        Some("thinking") => {
+                            // 59ad3dead: keep the initial `thinking`/`signature`
+                            // carried by content_block_start.
+                            output.content.push(AssistantContent::Thinking(
+                                crate::types::ThinkingContent {
+                                    thinking: block
+                                        .get("thinking")
                                         .and_then(Value::as_str)
                                         .unwrap_or_default()
                                         .to_owned(),
-                                ),
-                                redacted: None,
-                            },
-                        ));
-                        self.block_states.push(BlockState {
-                            event_index,
-                            ..BlockState::default()
-                        });
-                        events.push(StreamEvent::ThinkingStart {
-                            content_index: self.output.content.len() - 1,
-                            partial: Arc::new(self.output.clone()),
-                        });
-                    }
-                    Some("redacted_thinking") => {
-                        self.output.content.push(AssistantContent::Thinking(
-                            crate::types::ThinkingContent {
-                                thinking: "[Reasoning redacted]".to_owned(),
-                                thinking_signature: block
-                                    .get("data")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned),
-                                redacted: Some(true),
-                            },
-                        ));
-                        self.block_states.push(BlockState {
-                            event_index,
-                            ..BlockState::default()
-                        });
-                        events.push(StreamEvent::ThinkingStart {
-                            content_index: self.output.content.len() - 1,
-                            partial: Arc::new(self.output.clone()),
-                        });
-                    }
-                    Some("tool_use") => {
-                        let name = block
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        self.output.content.push(AssistantContent::ToolCall(
-                            crate::types::ToolCall {
-                                id: block
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_owned(),
-                                name: if self.is_oauth_token {
-                                    from_claude_code_name(name, self.tools)
-                                } else {
-                                    name.to_owned()
+                                    thinking_signature: Some(
+                                        block
+                                            .get("signature")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default()
+                                            .to_owned(),
+                                    ),
+                                    redacted: None,
                                 },
-                                arguments: block
-                                    .get("input")
-                                    .and_then(Value::as_object)
-                                    .cloned()
-                                    .unwrap_or_default(),
-                                thought_signature: None,
-                                namespace: None,
-                                arguments_error: None,
-                            },
-                        ));
-                        self.block_states.push(BlockState {
-                            event_index,
-                            ..BlockState::default()
-                        });
-                        events.push(StreamEvent::ToolCallStart {
-                            content_index: self.output.content.len() - 1,
-                            partial: Arc::new(self.output.clone()),
-                        });
+                            ));
+                            self.block_states.push(BlockState {
+                                event_index,
+                                ..BlockState::default()
+                            });
+                            events.push(StreamEvent::ThinkingStart {
+                                content_index: output.content.len() - 1,
+                                partial: partial.clone(),
+                            });
+                        }
+                        Some("redacted_thinking") => {
+                            output.content.push(AssistantContent::Thinking(
+                                crate::types::ThinkingContent {
+                                    thinking: "[Reasoning redacted]".to_owned(),
+                                    thinking_signature: block
+                                        .get("data")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned),
+                                    redacted: Some(true),
+                                },
+                            ));
+                            self.block_states.push(BlockState {
+                                event_index,
+                                ..BlockState::default()
+                            });
+                            events.push(StreamEvent::ThinkingStart {
+                                content_index: output.content.len() - 1,
+                                partial: partial.clone(),
+                            });
+                        }
+                        Some("tool_use") => {
+                            let name = block
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            output.content.push(AssistantContent::ToolCall(
+                                crate::types::ToolCall {
+                                    id: block
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    name: if self.is_oauth_token {
+                                        from_claude_code_name(name, self.tools)
+                                    } else {
+                                        name.to_owned()
+                                    },
+                                    arguments: block
+                                        .get("input")
+                                        .and_then(Value::as_object)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                    thought_signature: None,
+                                    namespace: None,
+                                    arguments_error: None,
+                                },
+                            ));
+                            self.block_states.push(BlockState {
+                                event_index,
+                                ..BlockState::default()
+                            });
+                            events.push(StreamEvent::ToolCallStart {
+                                content_index: output.content.len() - 1,
+                                partial: partial.clone(),
+                            });
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-            Some("content_block_delta") => {
-                let event_index = json_u64(&event["index"]).unwrap_or(0) as usize;
-                let delta = &event["delta"];
-                let Some(content_index) = self
-                    .block_states
-                    .iter()
-                    .position(|state| state.event_index == event_index)
-                else {
-                    return Ok(());
-                };
-                match delta.get("type").and_then(Value::as_str) {
-                    Some("text_delta") => {
-                        let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
-                        if let Some(AssistantContent::Text(block)) =
-                            self.output.content.get_mut(content_index)
-                        {
-                            block.text.push_str(text);
-                            events.push(StreamEvent::TextDelta {
+                Some("content_block_delta") => {
+                    let event_index = json_u64(&event["index"]).unwrap_or(0) as usize;
+                    let delta = &event["delta"];
+                    let Some(content_index) = self
+                        .block_states
+                        .iter()
+                        .position(|state| state.event_index == event_index)
+                    else {
+                        return Ok(());
+                    };
+                    match delta.get("type").and_then(Value::as_str) {
+                        Some("text_delta") => {
+                            let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
+                            if let Some(AssistantContent::Text(block)) =
+                                output.content.get_mut(content_index)
+                            {
+                                block.text.push_str(text);
+                                events.push(StreamEvent::TextDelta {
+                                    content_index,
+                                    delta: text.to_owned(),
+                                    partial: partial.clone(),
+                                });
+                            }
+                        }
+                        Some("thinking_delta") => {
+                            let thinking =
+                                delta.get("thinking").and_then(Value::as_str).unwrap_or("");
+                            if let Some(AssistantContent::Thinking(block)) =
+                                output.content.get_mut(content_index)
+                            {
+                                block.thinking.push_str(thinking);
+                                events.push(StreamEvent::ThinkingDelta {
+                                    content_index,
+                                    delta: thinking.to_owned(),
+                                    partial: partial.clone(),
+                                });
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            let partial_json = delta
+                                .get("partial_json")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let state = &mut self.block_states[content_index];
+                            state.partial_json.push_str(partial_json);
+                            // rpi#78 A3: the authoritative arguments are parsed at
+                            // `content_block_stop`; the preview may lag one frame.
+                            let refresh = state.args_preview.should_parse(state.partial_json.len());
+                            if let Some(AssistantContent::ToolCall(block)) =
+                                output.content.get_mut(content_index)
+                            {
+                                if refresh {
+                                    block.arguments =
+                                        parse_streaming_json(Some(&state.partial_json));
+                                }
+                                events.push(StreamEvent::ToolCallDelta {
+                                    content_index,
+                                    delta: partial_json.to_owned(),
+                                    partial: partial.clone(),
+                                });
+                            }
+                        }
+                        Some("signature_delta") => {
+                            let signature =
+                                delta.get("signature").and_then(Value::as_str).unwrap_or("");
+                            if let Some(AssistantContent::Thinking(block)) =
+                                output.content.get_mut(content_index)
+                            {
+                                block
+                                    .thinking_signature
+                                    .get_or_insert_with(String::new)
+                                    .push_str(signature);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some("content_block_stop") => {
+                    let event_index = json_u64(&event["index"]).unwrap_or(0) as usize;
+                    let Some(content_index) = self
+                        .block_states
+                        .iter()
+                        .position(|state| state.event_index == event_index)
+                    else {
+                        return Ok(());
+                    };
+                    match output.content.get_mut(content_index) {
+                        Some(AssistantContent::Text(block)) => {
+                            events.push(StreamEvent::TextEnd {
                                 content_index,
-                                delta: text.to_owned(),
-                                partial: Arc::new(self.output.clone()),
+                                content: block.text.clone(),
+                                partial: partial.clone(),
                             });
                         }
-                    }
-                    Some("thinking_delta") => {
-                        let thinking = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
-                        if let Some(AssistantContent::Thinking(block)) =
-                            self.output.content.get_mut(content_index)
-                        {
-                            block.thinking.push_str(thinking);
-                            events.push(StreamEvent::ThinkingDelta {
+                        Some(AssistantContent::Thinking(block)) => {
+                            events.push(StreamEvent::ThinkingEnd {
                                 content_index,
-                                delta: thinking.to_owned(),
-                                partial: Arc::new(self.output.clone()),
+                                content: block.thinking.clone(),
+                                partial: partial.clone(),
                             });
                         }
-                    }
-                    Some("input_json_delta") => {
-                        let partial_json = delta
-                            .get("partial_json")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        self.block_states[content_index]
-                            .partial_json
-                            .push_str(partial_json);
-                        if let Some(AssistantContent::ToolCall(block)) =
-                            self.output.content.get_mut(content_index)
-                        {
-                            block.arguments = parse_streaming_json(Some(
+                        Some(AssistantContent::ToolCall(block)) => {
+                            let parsed = crate::utils::json_parse::parse_tool_call_arguments(Some(
                                 &self.block_states[content_index].partial_json,
                             ));
-                            events.push(StreamEvent::ToolCallDelta {
+                            block.arguments = parsed.arguments;
+                            block.arguments_error = parsed.arguments_error;
+                            events.push(StreamEvent::ToolCallEnd {
                                 content_index,
-                                delta: partial_json.to_owned(),
-                                partial: Arc::new(self.output.clone()),
+                                tool_call: block.clone(),
+                                partial: partial.clone(),
                             });
                         }
+                        None => {}
                     }
-                    Some("signature_delta") => {
-                        let signature =
-                            delta.get("signature").and_then(Value::as_str).unwrap_or("");
-                        if let Some(AssistantContent::Thinking(block)) =
-                            self.output.content.get_mut(content_index)
-                        {
-                            block
-                                .thinking_signature
-                                .get_or_insert_with(String::new)
-                                .push_str(signature);
+                }
+                Some("message_delta") => {
+                    let delta = &event["delta"];
+                    // :745-746 — replaces any message_start-collected array.
+                    if let Some(transformations) = event.get("input_transformations")
+                        && transformations.is_array()
+                    {
+                        self.input_transformations = Some(transformations.clone());
+                    }
+                    if let Some(reason) = delta.get("stop_reason").and_then(Value::as_str)
+                        && !reason.is_empty()
+                    {
+                        // 926eb15c1: preserve the raw provider reason before
+                        // mapping.
+                        output.raw_stop_reason = Some(reason.to_owned());
+                        let (stop_reason, error_message) =
+                            map_stop_reason(reason, delta.get("stop_details"))?;
+                        output.stop_reason = stop_reason;
+                        if let Some(error_message) = error_message {
+                            output.error_message = Some(error_message);
                         }
                     }
-                    _ => {}
+                    // Only update usage fields if present (not null). Preserves
+                    // input_tokens from message_start when proxies omit it in
+                    // message_delta.
+                    if let Some(usage) = event.get("usage") {
+                        if let Some(input) = json_u64(&usage["input_tokens"]) {
+                            output.usage.input = input;
+                        }
+                        if let Some(output_tokens) = json_u64(&usage["output_tokens"]) {
+                            output.usage.output = output_tokens;
+                        }
+                        if let Some(cache_read) = json_u64(&usage["cache_read_input_tokens"]) {
+                            output.usage.cache_read = cache_read;
+                        }
+                        if let Some(cache_write) = json_u64(&usage["cache_creation_input_tokens"]) {
+                            output.usage.cache_write = cache_write;
+                        }
+                        // #9210 (`667fc3dd3`): Vercel AI Gateway includes the
+                        // 1-hour cache-write TTL breakdown in deltas, though the
+                        // SDK only types it on message_start.
+                        if let Some(cache_write_1h) =
+                            json_u64(&usage["cache_creation"]["ephemeral_1h_input_tokens"])
+                        {
+                            output.usage.cache_write1h = Some(cache_write_1h);
+                        }
+                        // Reasoning tokens arrive in
+                        // `output_tokens_details.thinking_tokens` on the final
+                        // message_delta usage (a subset of output_tokens).
+                        if let Some(thinking_tokens) =
+                            json_u64(&usage["output_tokens_details"]["thinking_tokens"])
+                        {
+                            output.usage.reasoning = Some(thinking_tokens);
+                        }
+                    }
+                    self.recompute_total_and_cost(output);
                 }
+                _ => {}
             }
-            Some("content_block_stop") => {
-                let event_index = json_u64(&event["index"]).unwrap_or(0) as usize;
-                let Some(content_index) = self
-                    .block_states
-                    .iter()
-                    .position(|state| state.event_index == event_index)
-                else {
-                    return Ok(());
-                };
-                match self.output.content.get_mut(content_index) {
-                    Some(AssistantContent::Text(block)) => {
-                        events.push(StreamEvent::TextEnd {
-                            content_index,
-                            content: block.text.clone(),
-                            partial: Arc::new(self.output.clone()),
-                        });
-                    }
-                    Some(AssistantContent::Thinking(block)) => {
-                        events.push(StreamEvent::ThinkingEnd {
-                            content_index,
-                            content: block.thinking.clone(),
-                            partial: Arc::new(self.output.clone()),
-                        });
-                    }
-                    Some(AssistantContent::ToolCall(block)) => {
-                        let parsed = crate::utils::json_parse::parse_tool_call_arguments(Some(
-                            &self.block_states[content_index].partial_json,
-                        ));
-                        block.arguments = parsed.arguments;
-                        block.arguments_error = parsed.arguments_error;
-                        events.push(StreamEvent::ToolCallEnd {
-                            content_index,
-                            tool_call: block.clone(),
-                            partial: Arc::new(self.output.clone()),
-                        });
-                    }
-                    None => {}
-                }
-            }
-            Some("message_delta") => {
-                let delta = &event["delta"];
-                // :745-746 — replaces any message_start-collected array.
-                if let Some(transformations) = event.get("input_transformations")
-                    && transformations.is_array()
-                {
-                    self.input_transformations = Some(transformations.clone());
-                }
-                if let Some(reason) = delta.get("stop_reason").and_then(Value::as_str)
-                    && !reason.is_empty()
-                {
-                    // 926eb15c1: preserve the raw provider reason before
-                    // mapping.
-                    self.output.raw_stop_reason = Some(reason.to_owned());
-                    let (stop_reason, error_message) =
-                        map_stop_reason(reason, delta.get("stop_details"))?;
-                    self.output.stop_reason = stop_reason;
-                    if let Some(error_message) = error_message {
-                        self.output.error_message = Some(error_message);
-                    }
-                }
-                // Only update usage fields if present (not null). Preserves
-                // input_tokens from message_start when proxies omit it in
-                // message_delta.
-                if let Some(usage) = event.get("usage") {
-                    if let Some(input) = json_u64(&usage["input_tokens"]) {
-                        self.output.usage.input = input;
-                    }
-                    if let Some(output) = json_u64(&usage["output_tokens"]) {
-                        self.output.usage.output = output;
-                    }
-                    if let Some(cache_read) = json_u64(&usage["cache_read_input_tokens"]) {
-                        self.output.usage.cache_read = cache_read;
-                    }
-                    if let Some(cache_write) = json_u64(&usage["cache_creation_input_tokens"]) {
-                        self.output.usage.cache_write = cache_write;
-                    }
-                    // #9210 (`667fc3dd3`): Vercel AI Gateway includes the
-                    // 1-hour cache-write TTL breakdown in deltas, though the
-                    // SDK only types it on message_start.
-                    if let Some(cache_write_1h) =
-                        json_u64(&usage["cache_creation"]["ephemeral_1h_input_tokens"])
-                    {
-                        self.output.usage.cache_write1h = Some(cache_write_1h);
-                    }
-                    // Reasoning tokens arrive in
-                    // `output_tokens_details.thinking_tokens` on the final
-                    // message_delta usage (a subset of output_tokens).
-                    if let Some(thinking_tokens) =
-                        json_u64(&usage["output_tokens_details"]["thinking_tokens"])
-                    {
-                        self.output.usage.reasoning = Some(thinking_tokens);
-                    }
-                }
-                self.recompute_total_and_cost();
-            }
-            _ => {}
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Post-stream validation (upstream `iterateAnthropicEvents` tail plus the
     /// stream function's final checks).
     fn finish(self, signal: Option<&CancellationToken>) -> Result<DoneReason, String> {
-        if self.saw_message_start && !self.saw_message_end {
-            return Err("Anthropic stream ended before message_stop".to_owned());
-        }
-        if signal.is_some_and(|signal| signal.is_cancelled()) {
-            return Err("Request was aborted".to_owned());
-        }
-        let reason = match self.output.stop_reason {
-            // `Deferred` shares the `Pending` arm: no rpi provider produces it
-            // (lifecycle is [DEFER], R2.2.1), so it is unreachable here and
-            // treated as "stream ended without a usable stop reason".
-            StopReason::Pending | StopReason::Deferred => {
-                return Err("Anthropic stream ended without a stop reason".to_owned());
+        self.output.with_mut(|output| {
+            if self.saw_message_start && !self.saw_message_end {
+                return Err("Anthropic stream ended before message_stop".to_owned());
             }
-            StopReason::Aborted | StopReason::Error => {
-                return Err(self
-                    .output
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| "An unknown error occurred".to_owned()));
+            if signal.is_some_and(|signal| signal.is_cancelled()) {
+                return Err("Request was aborted".to_owned());
             }
-            StopReason::Stop => DoneReason::Stop,
-            StopReason::Length => DoneReason::Length,
-            StopReason::ToolUse => DoneReason::ToolUse,
-        };
-        // :790-803 (4e69b0c28): surface collected input transformations as a
-        // diagnostic on the successful final message — `undefined` fields
-        // are dropped from the JSON just like upstream's `?? undefined`.
-        if let Some(transformations) = &self.input_transformations
-            && let Some(entries) = transformations.as_array()
-            && !entries.is_empty()
-        {
-            let mapped: Vec<Value> = entries
-                .iter()
-                .map(|entry| {
-                    let mut object = serde_json::Map::new();
-                    for key in ["type", "path", "reason"] {
-                        if let Some(value) = entry.get(key).and_then(Value::as_str) {
-                            object.insert(key.to_owned(), json!(value));
+            let reason = match output.stop_reason {
+                // `Deferred` shares the `Pending` arm: no rpi provider produces it
+                // (lifecycle is [DEFER], R2.2.1), so it is unreachable here and
+                // treated as "stream ended without a usable stop reason".
+                StopReason::Pending | StopReason::Deferred => {
+                    return Err("Anthropic stream ended without a stop reason".to_owned());
+                }
+                StopReason::Aborted | StopReason::Error => {
+                    return Err(output
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "An unknown error occurred".to_owned()));
+                }
+                StopReason::Stop => DoneReason::Stop,
+                StopReason::Length => DoneReason::Length,
+                StopReason::ToolUse => DoneReason::ToolUse,
+            };
+            // :790-803 (4e69b0c28): surface collected input transformations as a
+            // diagnostic on the successful final message — `undefined` fields
+            // are dropped from the JSON just like upstream's `?? undefined`.
+            if let Some(transformations) = &self.input_transformations
+                && let Some(entries) = transformations.as_array()
+                && !entries.is_empty()
+            {
+                let mapped: Vec<Value> = entries
+                    .iter()
+                    .map(|entry| {
+                        let mut object = serde_json::Map::new();
+                        for key in ["type", "path", "reason"] {
+                            if let Some(value) = entry.get(key).and_then(Value::as_str) {
+                                object.insert(key.to_owned(), json!(value));
+                            }
                         }
-                    }
-                    Value::Object(object)
-                })
-                .collect();
-            let mut details = serde_json::Map::new();
-            details.insert("transformations".to_owned(), Value::Array(mapped));
-            self.output.diagnostics.get_or_insert_with(Vec::new).push(
-                crate::types::AssistantMessageDiagnostic {
-                    kind: "anthropic_input_transformations".to_owned(),
-                    timestamp: now_ms(),
-                    error: None,
-                    details: Some(details),
-                },
-            );
-        }
-        Ok(reason)
+                        Value::Object(object)
+                    })
+                    .collect();
+                let mut details = serde_json::Map::new();
+                details.insert("transformations".to_owned(), Value::Array(mapped));
+                output.diagnostics.get_or_insert_with(Vec::new).push(
+                    crate::types::AssistantMessageDiagnostic {
+                        kind: "anthropic_input_transformations".to_owned(),
+                        timestamp: now_ms(),
+                        error: None,
+                        details: Some(details),
+                    },
+                );
+            }
+            Ok(reason)
+        })
     }
 }
 
@@ -2102,7 +2115,7 @@ async fn run(
     model: &Model,
     context: &TranscriptContext,
     options: &AnthropicOptions,
-    output: &mut AssistantMessage,
+    output: &SharedAssistantMessage,
     events: &AssistantMessageEventStream,
 ) -> Result<DoneReason, String> {
     let api_key = options.stream.api_key.as_deref();
@@ -2319,22 +2332,24 @@ async fn run(
                     && is_preferred_strict_tool_rejection(&error)
                 {
                     disable_preferred_strict_tools = true;
-                    output.diagnostics.get_or_insert_with(Vec::new).push(
-                        crate::types::AssistantMessageDiagnostic {
-                            kind: "anthropic_strict_tools_fallback".to_owned(),
-                            timestamp: now_ms(),
-                            error: Some(crate::types::DiagnosticErrorInfo {
-                                name: Some("ProviderError".to_owned()),
-                                message,
-                                stack: None,
-                                code: None,
-                            }),
-                            details: Some(serde_json::Map::from_iter([(
-                                "reason".to_owned(),
-                                json!("strict_tool_limits_exceeded"),
-                            )])),
-                        },
-                    );
+                    output.with_mut(|output| {
+                        output.diagnostics.get_or_insert_with(Vec::new).push(
+                            crate::types::AssistantMessageDiagnostic {
+                                kind: "anthropic_strict_tools_fallback".to_owned(),
+                                timestamp: now_ms(),
+                                error: Some(crate::types::DiagnosticErrorInfo {
+                                    name: Some("ProviderError".to_owned()),
+                                    message,
+                                    stack: None,
+                                    code: None,
+                                }),
+                                details: Some(serde_json::Map::from_iter([(
+                                    "reason".to_owned(),
+                                    json!("strict_tool_limits_exceeded"),
+                                )])),
+                            },
+                        );
+                    });
                     continue;
                 }
                 return Err(message);
@@ -2354,7 +2369,7 @@ async fn run(
     }
 
     events.push(StreamEvent::Start {
-        partial: Arc::new(output.clone()),
+        partial: output.clone(),
     });
 
     let mut processor = StreamProcessor::new(
@@ -2414,7 +2429,7 @@ pub fn stream(
     );
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
-        let mut output = initial_output(&model);
+        let output = SharedAssistantMessage::new(initial_output(&model));
         // Effort is recorded only when this request actually sends effort
         // markers; disabled thinking has no providerThinkingLevel to replay.
         let thinking_disabled = model.reasoning
@@ -2431,32 +2446,36 @@ pub fn stream(
             == Some(true)
             && !thinking_disabled
         {
-            output.provider_thinking_level =
-                Some(options.effort.clone().unwrap_or_else(|| "high".to_owned()));
+            output.with_mut(|output| {
+                output.provider_thinking_level =
+                    Some(options.effort.clone().unwrap_or_else(|| "high".to_owned()));
+            });
         }
-        match run(&model, &context, &options, &mut output, &task_stream).await {
+        match run(&model, &context, &options, &output, &task_stream).await {
             Ok(reason) => {
                 task_stream.push(StreamEvent::Done {
                     reason,
-                    message: output,
+                    message: output.snapshot(),
                 });
                 task_stream.end(None);
             }
             Err(message) => {
                 let aborted = signal.as_ref().is_some_and(|signal| signal.is_cancelled());
-                output.stop_reason = if aborted {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                output.error_message = Some(message);
+                output.with_mut(|output| {
+                    output.stop_reason = if aborted {
+                        StopReason::Aborted
+                    } else {
+                        StopReason::Error
+                    };
+                    output.error_message = Some(message);
+                });
                 task_stream.push(StreamEvent::Error {
                     reason: if aborted {
                         ErrorReason::Aborted
                     } else {
                         ErrorReason::Error
                     },
-                    error: output,
+                    error: output.snapshot(),
                 });
                 task_stream.end(None);
             }
@@ -2637,7 +2656,7 @@ pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::types::{ApiKind, AssistantRole, Context, Usage};
+    use crate::types::{ApiKind, AssistantRole, Context, ToolCall, Usage};
 
     pub(crate) fn make_model(extra: serde_json::Value) -> Model {
         let mut value = json!({
@@ -3735,9 +3754,9 @@ pub(crate) mod tests {
         AssistantMessage,
     ) {
         let events = AssistantMessageEventStream::new();
-        let mut output = initial_output(model);
+        let output = SharedAssistantMessage::new(initial_output(model));
         let reason = {
-            let mut processor = StreamProcessor::new(&mut output, model, false, None);
+            let mut processor = StreamProcessor::new(&output, model, false, None);
             let mut decoder = SseDecoder::new();
             let mut result = Ok(());
             for sse in decoder.feed(bytes).unwrap() {
@@ -3761,7 +3780,7 @@ pub(crate) mod tests {
         };
         events.end(None);
         let collected: Vec<StreamEvent> = futures::executor::block_on(events.collect());
-        (collected, reason, output)
+        (collected, reason, output.snapshot())
     }
 
     /// FR-G R3 (eb1f87fa9) + #9188 (1283afd0d): `message_start` may report
@@ -3999,6 +4018,70 @@ pub(crate) mod tests {
         "data: {\"type\":\"message_stop\"}\n",
         "\n",
     );
+
+    #[test]
+    fn test_large_tool_argument_interleaved_close_is_authoritative() {
+        let long = "x".repeat(4096);
+        let first = format!(r#"{{"text":"{long}"#);
+        let second = "\"}";
+        let mut raw = vec![json!({
+            "type": "message_start",
+            "message": {"id": "msg_1", "usage": {"input_tokens": 1, "output_tokens": 0}}
+        })];
+        for index in 0..2 {
+            raw.push(json!({
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "tool_use", "id": format!("toolu_{index}"),
+                                  "name": "write", "input": {}}
+            }));
+        }
+        for delta in [first.as_str(), second] {
+            for index in 0..2 {
+                raw.push(json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": delta}
+                }));
+            }
+        }
+        for index in 0..2 {
+            raw.push(json!({"type": "content_block_stop", "index": index}));
+        }
+        raw.push(json!({
+            "type": "message_delta", "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 1}
+        }));
+        raw.push(json!({"type": "message_stop"}));
+        let payload = raw
+            .iter()
+            .map(|event| {
+                format!(
+                    "event: {}\ndata: {event}\n\n",
+                    event["type"].as_str().expect("event type")
+                )
+            })
+            .collect::<String>();
+        let (events, reason, output) = drive_sse(&make_model(json!({})), payload.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::ToolUse));
+        let ends: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 2);
+        for call in ends {
+            assert_eq!(call.arguments["text"], json!(long));
+            assert_eq!(call.arguments_error, None);
+        }
+        assert_eq!(output.content.len(), 2);
+        for block in &output.content {
+            let AssistantContent::ToolCall(call) = block else {
+                panic!("expected tool call");
+            };
+            assert_eq!(call.arguments["text"], json!(long));
+        }
+    }
 
     #[test]
     fn test_stream_processor_recorded_flow() {

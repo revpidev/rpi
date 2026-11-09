@@ -2693,7 +2693,7 @@ mod tests {
                 duration_ms: None,
             };
             stream.push(StreamEvent::Start {
-                partial: Arc::new(partial.clone()),
+                partial: crate::types::SharedAssistantMessage::new(partial.clone()),
             });
             // Surface the resolved api key in the final message so tests can
             // assert auth application happened.
@@ -4154,7 +4154,7 @@ mod tests {
             duration_ms: None,
         };
         stream.push(StreamEvent::Start {
-            partial: Arc::new(partial.clone()),
+            partial: crate::types::SharedAssistantMessage::new(partial.clone()),
         });
         stream.push(StreamEvent::Done {
             reason: DoneReason::Stop,

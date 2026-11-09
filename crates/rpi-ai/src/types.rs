@@ -37,10 +37,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::Stream;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -1485,6 +1485,69 @@ pub struct AssistantMessage {
     pub duration_ms: Option<u64>,
 }
 
+/// Shared live assistant response used by nonterminal stream events.
+///
+/// Cloning this handle is refcount-only. Buffered events therefore observe
+/// later mutations, matching the upstream live-partial contract; use
+/// [`snapshot`](Self::snapshot) when an immutable event-time value is needed.
+#[derive(Clone)]
+pub struct SharedAssistantMessage(Arc<Mutex<AssistantMessage>>);
+
+impl SharedAssistantMessage {
+    pub fn new(message: AssistantMessage) -> Self {
+        Self(Arc::new(Mutex::new(message)))
+    }
+
+    pub fn with<R>(&self, read: impl FnOnce(&AssistantMessage) -> R) -> R {
+        let guard = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        read(&guard)
+    }
+
+    pub fn with_mut<R>(&self, update: impl FnOnce(&mut AssistantMessage) -> R) -> R {
+        let mut guard = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        update(&mut guard)
+    }
+
+    pub fn snapshot(&self) -> AssistantMessage {
+        self.with(AssistantMessage::clone)
+    }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl fmt::Debug for SharedAssistantMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.snapshot().fmt(formatter)
+    }
+}
+
+impl PartialEq for SharedAssistantMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr_eq(other) || self.snapshot() == other.snapshot()
+    }
+}
+
+impl Serialize for SharedAssistantMessage {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Do not hold the message lock while the nested serializer runs.
+        self.snapshot().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedAssistantMessage {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        AssistantMessage::deserialize(deserializer).map(Self::new)
+    }
+}
+
 /// A tool call that another tool made while it ran, for example from a
 /// codemode script (types.ts:570-581 @ 4a080252f).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1778,9 +1841,10 @@ pub enum ErrorReason {
 /// appear before `start`.
 ///
 /// `partial` is the shared live response-so-far helper, not an event-time
-/// snapshot. Since V15-13 (rpi#53) it is shared behind an `Arc` — the
-/// same accumulated message flows provider -> agent loop -> events ->
-/// UI queue without deep copies (serde shape unchanged). Text and thinking blocks are empty when their `*_start` event
+/// snapshot. It is shared behind a [`SharedAssistantMessage`] — the same
+/// accumulated message flows provider -> agent loop -> events -> UI queue
+/// without deep copies (serde shape unchanged). Text and thinking blocks are
+/// empty when their `*_start` event
 /// is emitted and grow only through their corresponding `*_delta` events
 /// until the authoritative `*_end`. Redacted thinking may be complete at
 /// start and emit no deltas. Tool-call arguments at `toolcall_start` are
@@ -1799,53 +1863,53 @@ pub enum ErrorReason {
 )]
 pub enum StreamEvent {
     Start {
-        partial: Arc<AssistantMessage>,
+        partial: SharedAssistantMessage,
     },
     TextStart {
         content_index: usize,
-        partial: Arc<AssistantMessage>,
+        partial: SharedAssistantMessage,
     },
     TextDelta {
         content_index: usize,
         delta: String,
-        partial: Arc<AssistantMessage>,
+        partial: SharedAssistantMessage,
     },
     TextEnd {
         content_index: usize,
         content: String,
-        partial: Arc<AssistantMessage>,
+        partial: SharedAssistantMessage,
     },
     ThinkingStart {
         content_index: usize,
-        partial: Arc<AssistantMessage>,
+        partial: SharedAssistantMessage,
     },
     ThinkingDelta {
         content_index: usize,
         delta: String,
-        partial: Arc<AssistantMessage>,
+        partial: SharedAssistantMessage,
     },
     ThinkingEnd {
         content_index: usize,
         content: String,
-        partial: Arc<AssistantMessage>,
+        partial: SharedAssistantMessage,
     },
     #[serde(rename = "toolcall_start")]
     ToolCallStart {
         content_index: usize,
-        partial: Arc<AssistantMessage>,
+        partial: SharedAssistantMessage,
     },
     #[serde(rename = "toolcall_delta")]
     ToolCallDelta {
         content_index: usize,
         delta: String,
-        partial: Arc<AssistantMessage>,
+        partial: SharedAssistantMessage,
     },
     #[serde(rename = "toolcall_end")]
     ToolCallEnd {
         content_index: usize,
         #[serde(with = "tagged_tool_call")]
         tool_call: ToolCall,
-        partial: Arc<AssistantMessage>,
+        partial: SharedAssistantMessage,
     },
     Done {
         reason: DoneReason,
@@ -2851,7 +2915,7 @@ mod tests {
     #[test]
     fn stream_event_start_shape() {
         let ev = StreamEvent::Start {
-            partial: Arc::new(partial()),
+            partial: SharedAssistantMessage::new(partial()),
         };
         assert_eq!(
             to_json(&ev),
@@ -2862,11 +2926,37 @@ mod tests {
     }
 
     #[test]
+    fn shared_assistant_message_is_serde_transparent_and_poison_tolerant() {
+        let shared = SharedAssistantMessage::new(partial());
+        let cloned = shared.clone();
+        assert!(shared.ptr_eq(&cloned));
+        assert_eq!(to_json(&shared), PARTIAL_JSON);
+
+        let decoded: SharedAssistantMessage =
+            serde_json::from_str(PARTIAL_JSON).expect("deserialize shared message");
+        assert!(!decoded.ptr_eq(&shared));
+        assert_eq!(decoded.snapshot(), partial());
+        assert_eq!(to_json(&decoded), PARTIAL_JSON);
+
+        let poisoned = SharedAssistantMessage::new(partial());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            poisoned.with_mut(|_| panic!("poison the message lock"));
+        }));
+        assert!(panic.is_err());
+        poisoned.with_mut(|message| message.provider = "recovered".to_owned());
+        assert_eq!(
+            poisoned.with(|message| message.provider.clone()),
+            "recovered"
+        );
+        assert!(to_json(&poisoned).contains("\"provider\":\"recovered\""));
+    }
+
+    #[test]
     fn stream_event_text_delta_shape() {
         let ev = StreamEvent::TextDelta {
             content_index: 1,
             delta: "hi".to_owned(),
-            partial: Arc::new(partial()),
+            partial: SharedAssistantMessage::new(partial()),
         };
         assert_eq!(
             to_json(&ev),
@@ -2891,7 +2981,7 @@ mod tests {
         let ev = StreamEvent::ToolCallEnd {
             content_index: 2,
             tool_call,
-            partial: Arc::new(partial()),
+            partial: SharedAssistantMessage::new(partial()),
         };
         // Upstream ToolCall objects always carry their `type: "toolCall"` tag,
         // also standalone inside toolcall_end.
@@ -2961,7 +3051,7 @@ mod tests {
         let ev = StreamEvent::ToolCallEnd {
             content_index: 0,
             tool_call: call,
-            partial: Arc::new(partial()),
+            partial: SharedAssistantMessage::new(partial()),
         };
         let v: Value = serde_json::from_str(&to_json(&ev)).expect("parse");
         assert_eq!(v["toolCall"]["namespace"], json!("dynamic_tools"));
@@ -3001,14 +3091,14 @@ mod tests {
         let cases: Vec<(StreamEvent, &str)> = vec![
             (
                 StreamEvent::Start {
-                    partial: Arc::new(p()),
+                    partial: SharedAssistantMessage::new(p()),
                 },
                 "start",
             ),
             (
                 StreamEvent::TextStart {
                     content_index: 0,
-                    partial: Arc::new(p()),
+                    partial: SharedAssistantMessage::new(p()),
                 },
                 "text_start",
             ),
@@ -3016,7 +3106,7 @@ mod tests {
                 StreamEvent::TextDelta {
                     content_index: 0,
                     delta: String::new(),
-                    partial: Arc::new(p()),
+                    partial: SharedAssistantMessage::new(p()),
                 },
                 "text_delta",
             ),
@@ -3024,14 +3114,14 @@ mod tests {
                 StreamEvent::TextEnd {
                     content_index: 0,
                     content: String::new(),
-                    partial: Arc::new(p()),
+                    partial: SharedAssistantMessage::new(p()),
                 },
                 "text_end",
             ),
             (
                 StreamEvent::ThinkingStart {
                     content_index: 0,
-                    partial: Arc::new(p()),
+                    partial: SharedAssistantMessage::new(p()),
                 },
                 "thinking_start",
             ),
@@ -3039,7 +3129,7 @@ mod tests {
                 StreamEvent::ThinkingDelta {
                     content_index: 0,
                     delta: String::new(),
-                    partial: Arc::new(p()),
+                    partial: SharedAssistantMessage::new(p()),
                 },
                 "thinking_delta",
             ),
@@ -3047,14 +3137,14 @@ mod tests {
                 StreamEvent::ThinkingEnd {
                     content_index: 0,
                     content: String::new(),
-                    partial: Arc::new(p()),
+                    partial: SharedAssistantMessage::new(p()),
                 },
                 "thinking_end",
             ),
             (
                 StreamEvent::ToolCallStart {
                     content_index: 0,
-                    partial: Arc::new(p()),
+                    partial: SharedAssistantMessage::new(p()),
                 },
                 "toolcall_start",
             ),
@@ -3062,7 +3152,7 @@ mod tests {
                 StreamEvent::ToolCallDelta {
                     content_index: 0,
                     delta: String::new(),
-                    partial: Arc::new(p()),
+                    partial: SharedAssistantMessage::new(p()),
                 },
                 "toolcall_delta",
             ),
@@ -3070,7 +3160,7 @@ mod tests {
                 StreamEvent::ToolCallEnd {
                     content_index: 0,
                     tool_call: ToolCall::default(),
-                    partial: Arc::new(p()),
+                    partial: SharedAssistantMessage::new(p()),
                 },
                 "toolcall_end",
             ),

@@ -17,7 +17,8 @@ use rpi::core::themes::load_theme;
 use rpi::modes::interactive::components::assistant_message::AssistantMessageComponent;
 use rpi::modes::interactive::theme::markdown_theme;
 use rpi_ai::types::{
-    AssistantContent, AssistantMessage, AssistantRole, StopReason, TextContent, Usage,
+    AssistantContent, AssistantMessage, AssistantRole, SharedAssistantMessage, StopReason,
+    TextContent, Usage,
 };
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::InlineExtension;
@@ -130,7 +131,10 @@ async fn markdown_transformers_chain_through_runner_into_assistant_rendering() {
         1,
         runner.get_markdown_transformers(),
     );
-    streaming_component.update_content(&std::sync::Arc::new(assistant_message("stream")), true);
+    streaming_component.update_content(
+        &SharedAssistantMessage::new(assistant_message("stream")),
+        true,
+    );
     let stripped = strip_ansi(&streaming_component.render(80).join("\n"));
     assert!(stripped.contains("[b][a]stream"), "stripped: {stripped}");
 

@@ -244,6 +244,7 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
         "session_shutdown",
         "message_start",
         "message_update",
+        "message_update_delta",
         "message_end",
     ] {
         assert!(at_install.iter().any(|s| s == event), "missing {event}");
@@ -672,6 +673,153 @@ fn items_mode_lifecycle_over_the_carrier_seam() {
     poll_until("bundled tokenizer settled row", |records| {
         widget_texts(records).last().is_some_and(|text| text == "2")
     });
+
+    // Restore the generic test model for the remaining sections.
+    set_canned(
+        "ctx.model",
+        json!({"id": "test-model", "name": "Test Model", "contextWindow": 200_000}),
+    );
+    send_event("model_select", json!({"type": "model_select"}));
+
+    // ── 4d. rpi#78 A1/1.2: a delta-only `message_update_delta` payload
+    //        (usage instead of the cumulative message) is consumed, and
+    //        receiving one makes the plugin drop the cumulative
+    //        `message_update` subscription — the host's signal that it may stop
+    //        materializing the whole accumulated message per delta.
+    set_canned(
+        "ctx.model",
+        json!({"id": "deepseek-chat", "name": "DeepSeek", "contextWindow": 200_000}),
+    );
+    write_settings(json!({"statusLine": {
+        "type": "items",
+        "items": ["live-output-tokens", "live-output-rate"],
+        "liveTokens": {"refreshMs": 300},
+        "placement": "widget",
+        "useColors": false
+    }}));
+    send_event("model_select", json!({"type": "model_select"}));
+    poll_until("delta-mode settings applied", |records| {
+        let events = subscribed(records);
+        events.iter().any(|event| event == "message_update")
+    });
+    send_event(
+        "message_start",
+        json!({"type": "message_start", "message": {"role": "assistant"}}),
+    );
+    send_event(
+        "message_update_delta",
+        json!({
+            "type": "message_update_delta",
+            "usage": {"output": 0},
+            "assistantMessageEvent": {
+                "type": "text_delta",
+                "contentIndex": 0,
+                "delta": "hello world"
+            },
+        }),
+    );
+    poll_until("delta payload counted live", |records| {
+        widget_texts(records)
+            .last()
+            .is_some_and(|text| text.split(" · ").next() == Some("2"))
+    });
+    // A probing host emits the legacy cumulative twin immediately after the
+    // delta. It must be ignored once support is known, not counted a second
+    // time while reconciliation waits for the stream to settle.
+    let frames_before_legacy_twin = widget_texts(&records()).len();
+    send_event(
+        "message_update",
+        json!({
+            "type": "message_update",
+            "message": {"role": "assistant", "usage": {"output": 0}},
+            "assistantMessageEvent": {
+                "type": "text_delta",
+                "contentIndex": 0,
+                "delta": "hello world"
+            },
+        }),
+    );
+    let after_legacy_twin = poll_until("legacy twin was not double counted", |records| {
+        widget_texts(records).len() > frames_before_legacy_twin
+    });
+    assert_eq!(
+        widget_texts(&after_legacy_twin)
+            .last()
+            .and_then(|text| text.split(" · ").next()),
+        Some("2")
+    );
+
+    // rpi#78 B: once the rate is stable, provider usage replaces the local
+    // tokenizer total. That switching frame must hold the exact previous
+    // reading; the following frame resumes on the provider basis.
+    let before_source_switch = poll_until("streaming rate is visible", |records| {
+        widget_texts(records).last().is_some_and(|text| {
+            text.lines()
+                .any(|line| line.ends_with(" tok/s") && line != "- tok/s")
+        })
+    });
+    let previous_rate = widget_texts(&before_source_switch)
+        .last()
+        .and_then(|text| text.lines().find(|line| line.ends_with(" tok/s")))
+        .expect("rate line")
+        .to_owned();
+    let frames_before_provider = widget_texts(&records()).len();
+    send_event(
+        "message_update_delta",
+        json!({
+            "type": "message_update_delta",
+            "usage": {"output": 2},
+            "assistantMessageEvent": {
+                "type": "text_delta",
+                "contentIndex": 0,
+                "delta": ""
+            },
+        }),
+    );
+    let source_switch = poll_until("source-switch frame published", |records| {
+        widget_texts(records).len() > frames_before_provider
+    });
+    let switched_rate = widget_texts(&source_switch)
+        .last()
+        .and_then(|text| text.lines().find(|line| line.ends_with(" tok/s")))
+        .map(str::to_owned)
+        .expect("held rate line");
+    assert_eq!(switched_rate, previous_rate);
+    let frames_after_switch = widget_texts(&records()).len();
+    let after_source_switch = poll_until("post-switch frame published", |records| {
+        widget_texts(records).len() > frames_after_switch
+    });
+    let resumed_rate = widget_texts(&after_source_switch)
+        .last()
+        .and_then(|text| text.lines().find(|line| line.ends_with(" tok/s")))
+        .map(str::to_owned)
+        .expect("resumed rate line");
+    assert_ne!(resumed_rate, previous_rate);
+    send_event(
+        "message_end",
+        json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "usage": {"output": 2}},
+        }),
+    );
+    // Reconciliation is poll-driven and skipped while streaming, so the switch
+    // lands after the message settled.
+    poll_until("cumulative subscription dropped", |records| {
+        calls_of(records, "off")
+            .iter()
+            .any(|args| args.get("subscriptionId").is_some())
+            && subscribed(records)
+                .iter()
+                .any(|event| event == "message_update_delta")
+    });
+    let now = records();
+    assert!(
+        subscribed(&now)
+            .iter()
+            .any(|event| event == "message_update_delta"),
+        "the delta event is subscribed after the host proved support: {:?}",
+        subscribed(&now)
+    );
 
     // Restore the generic test model for the remaining sections.
     set_canned(

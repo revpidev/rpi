@@ -42,7 +42,6 @@
 //!   content blocks), so there is nothing to scrub.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::LazyLock;
 
 use serde_json::{Value, json};
@@ -62,8 +61,8 @@ use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
 use crate::models::{ProviderStreams, clamp_thinking_level};
 use crate::types::{
     AssistantMessage, DoneReason, ErrorReason, Model, ModelThinkingLevel, ProviderHeaders,
-    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions,
-    TranscriptContext, Usage,
+    ProviderResponse, SharedAssistantMessage, SimpleStreamOptions, StopReason, StreamEvent,
+    StreamOptions, TranscriptContext, Usage,
 };
 use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{NormalizedProviderError, format_provider_error};
@@ -490,7 +489,7 @@ async fn run(
     model: &Model,
     context: &TranscriptContext,
     options: &AzureOpenAIResponsesOptions,
-    output: &mut AssistantMessage,
+    output: &SharedAssistantMessage,
     events: &AssistantMessageEventStream,
 ) -> Result<DoneReason, String> {
     let deployment_name = resolve_deployment_name(model, Some(options));
@@ -612,7 +611,7 @@ async fn run(
     }
 
     events.push(StreamEvent::Start {
-        partial: Arc::new(output.clone()),
+        partial: output.clone(),
     });
 
     let mut processor = ResponsesStreamProcessor::new(
@@ -684,7 +683,7 @@ async fn run(
     {
         return Err("Request was aborted".to_owned());
     }
-    match output.stop_reason {
+    output.with(|output| match output.stop_reason {
         StopReason::Pending => {
             Err("Azure OpenAI Responses stream ended without a stop reason".to_owned())
         }
@@ -696,7 +695,7 @@ async fn run(
         StopReason::Length => Ok(DoneReason::Length),
         StopReason::ToolUse => Ok(DoneReason::ToolUse),
         _ => Ok(DoneReason::Stop),
-    }
+    })
 }
 
 /// `stream` (azure-openai-responses).
@@ -719,30 +718,32 @@ pub fn stream(
     );
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
-        let mut output = initial_output(&model);
-        match run(&model, &context, &options, &mut output, &task_stream).await {
+        let output = SharedAssistantMessage::new(initial_output(&model));
+        match run(&model, &context, &options, &output, &task_stream).await {
             Ok(reason) => {
                 task_stream.push(StreamEvent::Done {
                     reason,
-                    message: output,
+                    message: output.snapshot(),
                 });
                 task_stream.end(None);
             }
             Err(message) => {
                 let aborted = signal.as_ref().is_some_and(|signal| signal.is_cancelled());
-                output.stop_reason = if aborted {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                output.error_message = Some(message);
+                output.with_mut(|output| {
+                    output.stop_reason = if aborted {
+                        StopReason::Aborted
+                    } else {
+                        StopReason::Error
+                    };
+                    output.error_message = Some(message);
+                });
                 task_stream.push(StreamEvent::Error {
                     reason: if aborted {
                         ErrorReason::Aborted
                     } else {
                         ErrorReason::Error
                     },
-                    error: output,
+                    error: output.snapshot(),
                 });
                 task_stream.end(None);
             }

@@ -41,7 +41,6 @@
 //!   body stream; the `"response has no body"` branch is unreachable).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -51,11 +50,13 @@ use crate::models::ProviderStreams;
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantRole, CacheRetention,
     DiagnosticErrorInfo, DoneReason, ErrorReason, Model, NumberOrString, ProviderEnv,
-    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, TextContent,
-    ThinkingContent, ThinkingLevel, ToolCall, TranscriptContext, Usage, tagged_tool_call,
+    ProviderResponse, SharedAssistantMessage, SimpleStreamOptions, StopReason, StreamEvent,
+    StreamOptions, TextContent, ThinkingContent, ThinkingLevel, ToolCall, TranscriptContext, Usage,
+    tagged_tool_call,
 };
 use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::event_stream::AssistantMessageEventStream;
+use crate::utils::json_parse::StreamingArgsPreview;
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_env::get_provider_env_value;
 
@@ -355,20 +356,24 @@ fn content_slot(content: &mut Vec<AssistantContent>, index: usize) -> &mut Assis
 /// Fold rpi-messages events into a partial
 /// [`AssistantMessage`] and emits the corresponding [`StreamEvent`]s.
 struct EventConverter {
-    partial: AssistantMessage,
+    partial: SharedAssistantMessage,
     tool_json: HashMap<usize, String>,
+    /// rpi#78 A3: preview-parse throttle by content index.
+    args_preview: HashMap<usize, StreamingArgsPreview>,
 }
 
 impl EventConverter {
     fn new(model: &Model) -> Self {
         Self {
-            partial: initial_partial(model),
+            partial: SharedAssistantMessage::new(initial_partial(model)),
             tool_json: HashMap::new(),
+            args_preview: HashMap::new(),
         }
     }
 
     fn convert(&mut self, event: RpiMessagesEvent) -> StreamEvent {
-        match event {
+        let shared = self.partial.clone();
+        shared.with_mut(|partial| match event {
             RpiMessagesEvent::Done {
                 reason,
                 usage,
@@ -376,7 +381,7 @@ impl EventConverter {
                 provider_thinking_level,
                 rewrite,
             } => {
-                self.partial.stop_reason = match reason {
+                partial.stop_reason = match reason {
                     DoneReason::Stop => StopReason::Stop,
                     DoneReason::Length => StopReason::Length,
                     DoneReason::ToolUse => StopReason::ToolUse,
@@ -384,15 +389,15 @@ impl EventConverter {
                     // it, but the mapping is explicit rather than swallowed.
                     DoneReason::Deferred => StopReason::Deferred,
                 };
-                self.partial.usage = usage;
-                self.partial.response_id = response_id;
+                partial.usage = usage;
+                partial.response_id = response_id;
                 if let Some(level) = provider_thinking_level {
-                    self.partial.provider_thinking_level = Some(level);
+                    partial.provider_thinking_level = Some(level);
                 }
-                append_rewrite_diagnostic(&mut self.partial, rewrite.as_ref());
+                append_rewrite_diagnostic(partial, rewrite.as_ref());
                 StreamEvent::Done {
                     reason,
-                    message: self.partial.clone(),
+                    message: partial.clone(),
                 }
             }
             RpiMessagesEvent::Error {
@@ -403,31 +408,31 @@ impl EventConverter {
                 provider_thinking_level,
                 rewrite,
             } => {
-                self.partial.stop_reason = match reason {
+                partial.stop_reason = match reason {
                     ErrorReason::Aborted => StopReason::Aborted,
                     ErrorReason::Error => StopReason::Error,
                 };
-                self.partial.usage = usage;
-                self.partial.error_message = error_message;
-                self.partial.response_id = response_id;
+                partial.usage = usage;
+                partial.error_message = error_message;
+                partial.response_id = response_id;
                 if let Some(level) = provider_thinking_level {
-                    self.partial.provider_thinking_level = Some(level);
+                    partial.provider_thinking_level = Some(level);
                 }
-                append_rewrite_diagnostic(&mut self.partial, rewrite.as_ref());
+                append_rewrite_diagnostic(partial, rewrite.as_ref());
                 StreamEvent::Error {
                     reason,
-                    error: self.partial.clone(),
+                    error: partial.clone(),
                 }
             }
             RpiMessagesEvent::Start => StreamEvent::Start {
-                partial: Arc::new(self.partial.clone()),
+                partial: shared.clone(),
             },
             RpiMessagesEvent::TextStart { content_index } => {
-                *content_slot(&mut self.partial.content, content_index) =
+                *content_slot(&mut partial.content, content_index) =
                     AssistantContent::Text(TextContent::default());
                 StreamEvent::TextStart {
                     content_index,
-                    partial: Arc::new(self.partial.clone()),
+                    partial: shared.clone(),
                 }
             }
             RpiMessagesEvent::TextDelta {
@@ -437,14 +442,14 @@ impl EventConverter {
                 // Upstream's `as` cast would throw on a non-text block; rpi
                 // drops the delta instead of failing the stream.
                 if let AssistantContent::Text(text) =
-                    content_slot(&mut self.partial.content, content_index)
+                    content_slot(&mut partial.content, content_index)
                 {
                     text.text.push_str(&delta);
                 }
                 StreamEvent::TextDelta {
                     content_index,
                     delta,
-                    partial: Arc::new(self.partial.clone()),
+                    partial: shared.clone(),
                 }
             }
             RpiMessagesEvent::TextEnd {
@@ -452,7 +457,7 @@ impl EventConverter {
                 content,
                 content_signature,
             } => {
-                let slot = content_slot(&mut self.partial.content, content_index);
+                let slot = content_slot(&mut partial.content, content_index);
                 match slot {
                     AssistantContent::Text(text) => {
                         text.text = content.clone();
@@ -468,15 +473,15 @@ impl EventConverter {
                 StreamEvent::TextEnd {
                     content_index,
                     content,
-                    partial: Arc::new(self.partial.clone()),
+                    partial: shared.clone(),
                 }
             }
             RpiMessagesEvent::ThinkingStart { content_index } => {
-                *content_slot(&mut self.partial.content, content_index) =
+                *content_slot(&mut partial.content, content_index) =
                     AssistantContent::Thinking(ThinkingContent::default());
                 StreamEvent::ThinkingStart {
                     content_index,
-                    partial: Arc::new(self.partial.clone()),
+                    partial: shared.clone(),
                 }
             }
             RpiMessagesEvent::ThinkingDelta {
@@ -484,14 +489,14 @@ impl EventConverter {
                 delta,
             } => {
                 if let AssistantContent::Thinking(thinking) =
-                    content_slot(&mut self.partial.content, content_index)
+                    content_slot(&mut partial.content, content_index)
                 {
                     thinking.thinking.push_str(&delta);
                 }
                 StreamEvent::ThinkingDelta {
                     content_index,
                     delta,
-                    partial: Arc::new(self.partial.clone()),
+                    partial: shared.clone(),
                 }
             }
             RpiMessagesEvent::ThinkingEnd {
@@ -500,7 +505,7 @@ impl EventConverter {
                 content_signature,
                 redacted,
             } => {
-                let slot = content_slot(&mut self.partial.content, content_index);
+                let slot = content_slot(&mut partial.content, content_index);
                 match slot {
                     AssistantContent::Thinking(thinking) => {
                         thinking.thinking = content.clone();
@@ -518,7 +523,7 @@ impl EventConverter {
                 StreamEvent::ThinkingEnd {
                     content_index,
                     content,
-                    partial: Arc::new(self.partial.clone()),
+                    partial: shared.clone(),
                 }
             }
             RpiMessagesEvent::ToolCallStart {
@@ -526,7 +531,7 @@ impl EventConverter {
                 id,
                 tool_name,
             } => {
-                *content_slot(&mut self.partial.content, content_index) =
+                *content_slot(&mut partial.content, content_index) =
                     AssistantContent::ToolCall(ToolCall {
                         id,
                         name: tool_name,
@@ -536,32 +541,37 @@ impl EventConverter {
                         arguments_error: None,
                     });
                 self.tool_json.insert(content_index, String::new());
+                self.args_preview
+                    .insert(content_index, StreamingArgsPreview::default());
                 StreamEvent::ToolCallStart {
                     content_index,
-                    partial: Arc::new(self.partial.clone()),
+                    partial: shared.clone(),
                 }
             }
             RpiMessagesEvent::ToolCallDelta {
                 content_index,
                 delta,
             } => {
-                let json = format!(
-                    "{}{delta}",
-                    self.tool_json
-                        .get(&content_index)
-                        .cloned()
-                        .unwrap_or_default()
-                );
-                self.tool_json.insert(content_index, json.clone());
-                if let AssistantContent::ToolCall(tool_call) =
-                    content_slot(&mut self.partial.content, content_index)
+                // rpi#78 A3: append in place (no O(args) `String` clone per
+                // delta) and refresh the parsed preview at display cadence; the
+                // authoritative arguments arrive with `ToolCallEnd`.
+                let json = self.tool_json.entry(content_index).or_default();
+                json.push_str(&delta);
+                let refresh = self
+                    .args_preview
+                    .entry(content_index)
+                    .or_default()
+                    .should_parse(json.len());
+                if refresh
+                    && let AssistantContent::ToolCall(tool_call) =
+                        content_slot(&mut partial.content, content_index)
                 {
-                    tool_call.arguments = parse_streaming_json(Some(&json));
+                    tool_call.arguments = parse_streaming_json(Some(json));
                 }
                 StreamEvent::ToolCallDelta {
                     content_index,
                     delta,
-                    partial: Arc::new(self.partial.clone()),
+                    partial: shared.clone(),
                 }
             }
             RpiMessagesEvent::ToolCallEnd {
@@ -570,7 +580,7 @@ impl EventConverter {
             } => {
                 // `Object.assign(partial.content[i], event.toolCall)`: the end
                 // event's fields win; a locally-held thought signature survives.
-                let slot = content_slot(&mut self.partial.content, content_index);
+                let slot = content_slot(&mut partial.content, content_index);
                 match slot {
                     AssistantContent::ToolCall(existing) => {
                         // `Object.assign(partial.content[i], event.toolCall)`
@@ -591,17 +601,17 @@ impl EventConverter {
                     }
                 }
                 self.tool_json.remove(&content_index);
-                let AssistantContent::ToolCall(final_call) = &self.partial.content[content_index]
-                else {
+                self.args_preview.remove(&content_index);
+                let AssistantContent::ToolCall(final_call) = &partial.content[content_index] else {
                     unreachable!("slot was just assigned a ToolCall");
                 };
                 StreamEvent::ToolCallEnd {
                     content_index,
                     tool_call: final_call.clone(),
-                    partial: Arc::new(self.partial.clone()),
+                    partial: shared.clone(),
                 }
             }
-        }
+        })
     }
 }
 

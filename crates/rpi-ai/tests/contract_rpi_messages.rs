@@ -234,10 +234,36 @@ fn assert_usage_fixture(message: &rpi_ai::types::AssistantMessage) {
     assert_eq!(message.usage.cost.total, 0.3);
 }
 
+fn assert_one_live_partial(events: &[StreamEvent]) {
+    let mut first: Option<&rpi_ai::types::SharedAssistantMessage> = None;
+    for event in events {
+        let partial = match event {
+            StreamEvent::Start { partial }
+            | StreamEvent::TextStart { partial, .. }
+            | StreamEvent::TextDelta { partial, .. }
+            | StreamEvent::TextEnd { partial, .. }
+            | StreamEvent::ThinkingStart { partial, .. }
+            | StreamEvent::ThinkingDelta { partial, .. }
+            | StreamEvent::ThinkingEnd { partial, .. }
+            | StreamEvent::ToolCallStart { partial, .. }
+            | StreamEvent::ToolCallDelta { partial, .. }
+            | StreamEvent::ToolCallEnd { partial, .. } => partial,
+            StreamEvent::Done { .. } | StreamEvent::Error { .. } => continue,
+        };
+        if let Some(first) = first {
+            assert!(first.ptr_eq(partial), "all deltas share one live partial");
+        } else {
+            first = Some(partial);
+        }
+    }
+}
+
 async fn collect(stream: AssistantMessageEventStream) -> Vec<StreamEvent> {
-    tokio::time::timeout(Duration::from_secs(10), stream.collect())
+    let events: Vec<StreamEvent> = tokio::time::timeout(Duration::from_secs(10), stream.collect())
         .await
-        .expect("stream completes within 10s")
+        .expect("stream completes within 10s");
+    assert_one_live_partial(&events);
+    events
 }
 
 async fn result(stream: &AssistantMessageEventStream) -> rpi_ai::types::AssistantMessage {
@@ -320,6 +346,74 @@ async fn test_toolcall_end_preserves_arguments_error_and_namespace() {
     );
 }
 
+#[tokio::test]
+async fn test_large_tool_argument_interleaved_close_is_authoritative() {
+    let long = "x".repeat(4096);
+    let first = format!(r#"{{"text":"{long}"#);
+    let second = "\"}";
+    let mut raw = vec![json!({"type": "start"})];
+    for index in 0..2 {
+        raw.push(json!({
+            "type": "toolcall_start", "contentIndex": index,
+            "id": format!("call_{index}"), "toolName": "write"
+        }));
+    }
+    for delta in [first.as_str(), second] {
+        for index in 0..2 {
+            raw.push(json!({
+                "type": "toolcall_delta", "contentIndex": index, "delta": delta
+            }));
+        }
+    }
+    for index in 0..2 {
+        raw.push(json!({
+            "type": "toolcall_end", "contentIndex": index,
+            "toolCall": {"type": "toolCall", "id": format!("call_{index}"),
+                         "name": "write", "arguments": {"text": long}}
+        }));
+    }
+    raw.push(json!({"type": "done", "reason": "toolUse", "usage": usage_json()}));
+    let (base_url, _captured) = serve(vec![ScriptResponse::sse(raw)]).await;
+    let model = create_model(&format!("{base_url}/v1"));
+    let event_stream = stream(
+        &model,
+        &context(),
+        RpiMessagesOptions {
+            stream: StreamOptions {
+                request: rpi_ai::ProviderRequestOptions {
+                    api_key: Some("test-key".to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let result_future = event_stream.result();
+    let events = collect(event_stream).await;
+    let message = result_future.await.expect("message");
+
+    let ends: Vec<&rpi_ai::types::ToolCall> = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends.len(), 2, "events: {events:#?}");
+    for call in ends {
+        assert_eq!(call.arguments["text"], json!(long));
+        assert_eq!(call.arguments_error, None);
+    }
+    assert_eq!(message.content.len(), 2);
+    for block in &message.content {
+        let AssistantContent::ToolCall(call) = block else {
+            panic!("expected tool call");
+        };
+        assert_eq!(call.arguments["text"], json!(long));
+    }
+}
+
 /// Upstream: "streams text and tool calls and resolves the terminal message".
 #[tokio::test]
 async fn test_streams_text_and_tool_calls_and_resolves_the_terminal_message() {
@@ -379,11 +473,18 @@ async fn test_streams_text_and_tool_calls_and_resolves_the_terminal_message() {
             | StreamEvent::ThinkingEnd { partial, .. }
             | StreamEvent::ToolCallStart { partial, .. }
             | StreamEvent::ToolCallDelta { partial, .. }
-            | StreamEvent::ToolCallEnd { partial, .. } => Some(partial.stop_reason),
+            | StreamEvent::ToolCallEnd { partial, .. } => {
+                Some(partial.with(|partial| partial.stop_reason))
+            }
             StreamEvent::Done { .. } | StreamEvent::Error { .. } => None,
         })
         .collect();
-    assert_eq!(partial_stop_reasons.first(), Some(&StopReason::Pending));
+    assert!(
+        partial_stop_reasons
+            .iter()
+            .all(|reason| *reason == StopReason::ToolUse),
+        "queued live partials observe the terminal accumulator state"
+    );
 
     assert_eq!(message.stop_reason, StopReason::ToolUse);
     assert_usage_fixture(&message);

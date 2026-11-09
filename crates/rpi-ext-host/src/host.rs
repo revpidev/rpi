@@ -529,6 +529,11 @@ impl NativeExtensionHost {
         self.core().emit(event_type, payload).await
     }
 
+    /// Dispatch payloads held by `throttleMs` registrations (rpi#78 A1/1.3).
+    pub async fn flush_throttled(&self, event_type: &str) {
+        self.core().flush_throttled(event_type).await;
+    }
+
     pub async fn emit_message_end(&self, payload: Value) -> Option<Value> {
         self.core().emit_message_end(payload).await
     }

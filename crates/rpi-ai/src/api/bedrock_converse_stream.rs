@@ -77,13 +77,15 @@ use crate::models::ProviderStreams;
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantRole, CacheRetention,
     DoneReason, ErrorReason, Message, Model, ProviderEnv, ProviderHeaders, ProviderResponse,
-    SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, ThinkingBudgets, ThinkingLevel,
-    Tool, ToolResultContent, TranscriptContext, Usage, UserContent, UserContentBlock,
+    SharedAssistantMessage, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions,
+    ThinkingBudgets, ThinkingLevel, Tool, ToolResultContent, TranscriptContext, Usage, UserContent,
+    UserContentBlock,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::error_body::NormalizedProviderError;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{headers_to_record, provider_headers_to_header_map};
+use crate::utils::json_parse::StreamingArgsPreview;
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_env::get_provider_env_value;
 use crate::utils::provider_retry::{
@@ -1308,12 +1310,14 @@ fn map_stop_reason(reason: Option<&str>) -> (StopReason, Option<String>) {
 /// `partialJson` scratch buffer in another — matching upstream's
 /// delete-before-finish semantics.
 struct StreamProcessor<'a> {
-    output: &'a mut AssistantMessage,
+    output: &'a SharedAssistantMessage,
     model: &'a Model,
     /// Content index by Bedrock `contentBlockIndex`.
     blocks_by_bedrock_index: HashMap<u64, usize>,
     /// Tool-call partial JSON by content index.
     partial_json: HashMap<usize, String>,
+    /// rpi#78 A3: preview-parse throttle by content index.
+    args_preview: HashMap<usize, StreamingArgsPreview>,
     /// Scratch buffer for encrypted reasoning deltas (base64-decoded
     /// bytes), joined into `thinkingSignature` on flush — never persisted
     /// (`redactedChunks`, bedrock-converse-stream.ts:108, `d57e531f5`).
@@ -1326,7 +1330,7 @@ struct StreamProcessor<'a> {
 
 impl<'a> StreamProcessor<'a> {
     fn new(
-        output: &'a mut AssistantMessage,
+        output: &'a SharedAssistantMessage,
         model: &'a Model,
         failure: Arc<Mutex<BedrockFailureMetadata>>,
     ) -> Self {
@@ -1335,6 +1339,7 @@ impl<'a> StreamProcessor<'a> {
             model,
             blocks_by_bedrock_index: HashMap::new(),
             partial_json: HashMap::new(),
+            args_preview: HashMap::new(),
             redacted_chunks: HashMap::new(),
             failure,
         }
@@ -1403,41 +1408,43 @@ impl<'a> StreamProcessor<'a> {
         payload: &Value,
         events: &AssistantMessageEventStream,
     ) -> Result<(), String> {
-        match event_type {
-            "messageStart" => self.handle_message_start(payload, events),
-            "contentBlockStart" => {
-                self.handle_content_block_start(payload, events);
-                Ok(())
-            }
-            "contentBlockDelta" => {
-                self.handle_content_block_delta(payload, events);
-                Ok(())
-            }
-            "contentBlockStop" => {
-                self.handle_content_block_stop(payload, events);
-                Ok(())
-            }
-            "messageStop" => {
-                // 637737ca7: preserve the raw provider reason before mapping
-                // (JS assigns `undefined` when absent, i.e. `None`).
-                self.output.raw_stop_reason = payload
-                    .get("stopReason")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let (stop_reason, error_message) =
-                    map_stop_reason(payload.get("stopReason").and_then(Value::as_str));
-                self.output.stop_reason = stop_reason;
-                if let Some(error_message) = error_message {
-                    self.output.error_message = Some(error_message);
+        self.output.with_mut(|output| {
+            match event_type {
+                "messageStart" => self.handle_message_start(payload, events),
+                "contentBlockStart" => {
+                    self.handle_content_block_start(output, payload, events);
+                    Ok(())
                 }
-                Ok(())
+                "contentBlockDelta" => {
+                    self.handle_content_block_delta(output, payload, events);
+                    Ok(())
+                }
+                "contentBlockStop" => {
+                    self.handle_content_block_stop(output, payload, events);
+                    Ok(())
+                }
+                "messageStop" => {
+                    // 637737ca7: preserve the raw provider reason before mapping
+                    // (JS assigns `undefined` when absent, i.e. `None`).
+                    output.raw_stop_reason = payload
+                        .get("stopReason")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let (stop_reason, error_message) =
+                        map_stop_reason(payload.get("stopReason").and_then(Value::as_str));
+                    output.stop_reason = stop_reason;
+                    if let Some(error_message) = error_message {
+                        output.error_message = Some(error_message);
+                    }
+                    Ok(())
+                }
+                "metadata" => {
+                    self.handle_metadata(output, payload);
+                    Ok(())
+                }
+                _ => Ok(()),
             }
-            "metadata" => {
-                self.handle_metadata(payload);
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+        })
     }
 
     /// `messageStart`: role must be assistant.
@@ -1452,7 +1459,7 @@ impl<'a> StreamProcessor<'a> {
             );
         }
         events.push(StreamEvent::Start {
-            partial: Arc::new(self.output.clone()),
+            partial: self.output.clone(),
         });
         Ok(())
     }
@@ -1461,6 +1468,7 @@ impl<'a> StreamProcessor<'a> {
     /// and thinking blocks are created lazily on their first delta).
     fn handle_content_block_start(
         &mut self,
+        output: &mut AssistantMessage,
         payload: &Value,
         events: &AssistantMessageEventStream,
     ) {
@@ -1470,7 +1478,7 @@ impl<'a> StreamProcessor<'a> {
         let Some(tool_use) = payload.get("start").and_then(|start| start.get("toolUse")) else {
             return;
         };
-        self.output
+        output
             .content
             .push(AssistantContent::ToolCall(crate::types::ToolCall {
                 id: tool_use
@@ -1488,18 +1496,21 @@ impl<'a> StreamProcessor<'a> {
                 namespace: None,
                 arguments_error: None,
             }));
-        let content_index = self.output.content.len() - 1;
+        let content_index = output.content.len() - 1;
         self.blocks_by_bedrock_index.insert(index, content_index);
         self.partial_json.insert(content_index, String::new());
+        self.args_preview
+            .insert(content_index, StreamingArgsPreview::default());
         events.push(StreamEvent::ToolCallStart {
             content_index,
-            partial: Arc::new(self.output.clone()),
+            partial: self.output.clone(),
         });
     }
 
     /// `handleContentBlockDelta`.
     fn handle_content_block_delta(
         &mut self,
+        output: &mut AssistantMessage,
         payload: &Value,
         events: &AssistantMessageEventStream,
     ) {
@@ -1519,26 +1530,26 @@ impl<'a> StreamProcessor<'a> {
                 None => {
                     // Text blocks get no contentBlockStart upstream; create
                     // the block lazily on the first delta.
-                    self.output
+                    output
                         .content
                         .push(AssistantContent::Text(Default::default()));
-                    let index = self.output.content.len() - 1;
+                    let index = output.content.len() - 1;
                     self.blocks_by_bedrock_index.insert(bedrock_index, index);
                     events.push(StreamEvent::TextStart {
                         content_index: index,
-                        partial: Arc::new(self.output.clone()),
+                        partial: self.output.clone(),
                     });
                     Some(index)
                 }
             };
             if let Some(index) = index
-                && let AssistantContent::Text(text_block) = &mut self.output.content[index]
+                && let AssistantContent::Text(text_block) = &mut output.content[index]
             {
                 text_block.text.push_str(text);
                 events.push(StreamEvent::TextDelta {
                     content_index: index,
                     delta: text.to_owned(),
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
             }
             return;
@@ -1547,18 +1558,26 @@ impl<'a> StreamProcessor<'a> {
         // Tool use input chunks.
         if let Some(tool_use) = delta.get("toolUse") {
             if let Some(index) = block_index
-                && matches!(self.output.content[index], AssistantContent::ToolCall(_))
+                && matches!(output.content[index], AssistantContent::ToolCall(_))
             {
                 let input = tool_use.get("input").and_then(Value::as_str).unwrap_or("");
                 let partial = self.partial_json.entry(index).or_default();
                 partial.push_str(input);
-                if let AssistantContent::ToolCall(call) = &mut self.output.content[index] {
+                // rpi#78 A3: authoritative arguments land at content-block stop.
+                let refresh = self
+                    .args_preview
+                    .entry(index)
+                    .or_default()
+                    .should_parse(partial.len());
+                if let AssistantContent::ToolCall(call) = &mut output.content[index]
+                    && refresh
+                {
                     call.arguments = parse_streaming_json(Some(partial));
                 }
                 events.push(StreamEvent::ToolCallDelta {
                     content_index: index,
                     delta: input.to_owned(),
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
             }
             return;
@@ -1570,14 +1589,14 @@ impl<'a> StreamProcessor<'a> {
             let index = match block_index {
                 Some(index) => index,
                 None => {
-                    self.output
+                    output
                         .content
                         .push(AssistantContent::Thinking(Default::default()));
-                    let index = self.output.content.len() - 1;
+                    let index = output.content.len() - 1;
                     self.blocks_by_bedrock_index.insert(bedrock_index, index);
                     events.push(StreamEvent::ThinkingStart {
                         content_index: index,
-                        partial: Arc::new(self.output.clone()),
+                        partial: self.output.clone(),
                     });
                     index
                 }
@@ -1589,20 +1608,20 @@ impl<'a> StreamProcessor<'a> {
                 .filter(|text| !text.is_empty())
                 .map(str::to_owned);
             if let Some(text) = text {
-                if let AssistantContent::Thinking(thinking) = &mut self.output.content[index] {
+                if let AssistantContent::Thinking(thinking) = &mut output.content[index] {
                     thinking.thinking.push_str(&text);
                 }
                 events.push(StreamEvent::ThinkingDelta {
                     content_index: index,
                     delta: text,
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
             }
             if let Some(signature) = reasoning
                 .get("signature")
                 .and_then(Value::as_str)
                 .filter(|signature| !signature.is_empty())
-                && let AssistantContent::Thinking(thinking) = &mut self.output.content[index]
+                && let AssistantContent::Thinking(thinking) = &mut output.content[index]
             {
                 // `thinkingSignature` holds either an Anthropic signature
                 // or an opaque redacted payload, never both: mixing them
@@ -1627,23 +1646,23 @@ impl<'a> StreamProcessor<'a> {
                 let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(redacted) else {
                     return;
                 };
-                let first =
-                    if let AssistantContent::Thinking(thinking) = &mut self.output.content[index] {
-                        let first = thinking.redacted != Some(true);
-                        if first {
-                            thinking.redacted = Some(true);
-                            thinking.thinking_signature = Some(String::new());
-                            thinking.thinking.push_str(REDACTED_THINKING_PLACEHOLDER);
-                        }
-                        first
-                    } else {
-                        false
-                    };
+                let first = if let AssistantContent::Thinking(thinking) = &mut output.content[index]
+                {
+                    let first = thinking.redacted != Some(true);
+                    if first {
+                        thinking.redacted = Some(true);
+                        thinking.thinking_signature = Some(String::new());
+                        thinking.thinking.push_str(REDACTED_THINKING_PLACEHOLDER);
+                    }
+                    first
+                } else {
+                    false
+                };
                 if first {
                     events.push(StreamEvent::ThinkingDelta {
                         content_index: index,
                         delta: REDACTED_THINKING_PLACEHOLDER.to_owned(),
-                        partial: Arc::new(self.output.clone()),
+                        partial: self.output.clone(),
                     });
                 }
                 self.redacted_chunks
@@ -1656,7 +1675,12 @@ impl<'a> StreamProcessor<'a> {
 
     /// `handleContentBlockStop`: finalize the block and drop the scratch
     /// state (upstream `delete block.index` / `delete block.partialJson`).
-    fn handle_content_block_stop(&mut self, payload: &Value, events: &AssistantMessageEventStream) {
+    fn handle_content_block_stop(
+        &mut self,
+        output: &mut AssistantMessage,
+        payload: &Value,
+        events: &AssistantMessageEventStream,
+    ) {
         let Some(bedrock_index) = payload.get("contentBlockIndex").and_then(Value::as_u64) else {
             return;
         };
@@ -1665,25 +1689,26 @@ impl<'a> StreamProcessor<'a> {
         };
         // `contentBlockStop` flushes the redacted scratch buffer before the
         // terminal event (bedrock-converse-stream.ts:716).
-        if matches!(self.output.content[index], AssistantContent::Thinking(_)) {
-            self.flush_redacted_content(index);
+        if matches!(output.content[index], AssistantContent::Thinking(_)) {
+            self.flush_redacted_content_locked(output, index);
         }
-        match &mut self.output.content[index] {
+        match &mut output.content[index] {
             AssistantContent::Text(text) => {
                 events.push(StreamEvent::TextEnd {
                     content_index: index,
                     content: text.text.clone(),
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
             }
             AssistantContent::Thinking(thinking) => {
                 events.push(StreamEvent::ThinkingEnd {
                     content_index: index,
                     content: thinking.thinking.clone(),
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
             }
             AssistantContent::ToolCall(call) => {
+                self.args_preview.remove(&index);
                 let partial = self.partial_json.remove(&index).unwrap_or_default();
                 let parsed = crate::utils::json_parse::parse_tool_call_arguments(Some(&partial));
                 call.arguments = parsed.arguments;
@@ -1691,7 +1716,7 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::ToolCallEnd {
                     content_index: index,
                     tool_call: call.clone(),
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
             }
         }
@@ -1701,12 +1726,12 @@ impl<'a> StreamProcessor<'a> {
     /// encode the buffered encrypted reasoning into `thinkingSignature`
     /// (base64 of the concatenated bytes) and drop the scratch buffer, which
     /// must never reach a persisted message.
-    fn flush_redacted_content(&mut self, index: usize) {
+    fn flush_redacted_content_locked(&mut self, output: &mut AssistantMessage, index: usize) {
         let Some(bytes) = self.redacted_chunks.remove(&index) else {
             return;
         };
         use base64::Engine as _;
-        if let AssistantContent::Thinking(thinking) = &mut self.output.content[index] {
+        if let AssistantContent::Thinking(thinking) = &mut output.content[index] {
             thinking.thinking_signature =
                 Some(base64::engine::general_purpose::STANDARD.encode(bytes));
         }
@@ -1717,29 +1742,31 @@ impl<'a> StreamProcessor<'a> {
     /// settle without stopping each block (bedrock-converse-stream.ts:325,
     /// :330).
     fn flush_all_redacted(&mut self) {
-        let indices: Vec<usize> = self.redacted_chunks.keys().copied().collect();
-        for index in indices {
-            self.flush_redacted_content(index);
-        }
+        self.output.with_mut(|output| {
+            let indices: Vec<usize> = self.redacted_chunks.keys().copied().collect();
+            for index in indices {
+                self.flush_redacted_content_locked(output, index);
+            }
+        })
     }
 
     /// `handleMetadata`: usage accounting (cache read/write split) + cost.
-    fn handle_metadata(&mut self, payload: &Value) {
+    fn handle_metadata(&mut self, output: &mut AssistantMessage, payload: &Value) {
         let Some(usage) = payload.get("usage") else {
             return;
         };
         let number = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-        self.output.usage.input = number("inputTokens");
-        self.output.usage.output = number("outputTokens");
-        self.output.usage.cache_read = number("cacheReadInputTokens");
-        self.output.usage.cache_write = number("cacheWriteInputTokens");
+        output.usage.input = number("inputTokens");
+        output.usage.output = number("outputTokens");
+        output.usage.cache_read = number("cacheReadInputTokens");
+        output.usage.cache_write = number("cacheWriteInputTokens");
         // #9457 (8a7b0c03d @ d1230ea20): cache writes with a 1h TTL bill at
         // 2x base input — split them out of the aggregate
         // `cacheWriteInputTokens` so `calculateCost` prices the long
         // retention writes at the 1h rate. Absent `cacheDetails` leaves
         // `cacheWrite1h` unset (upstream `undefined`).
         if let Some(details) = usage.get("cacheDetails").and_then(Value::as_array) {
-            self.output.usage.cache_write1h = Some(
+            output.usage.cache_write1h = Some(
                 details
                     .iter()
                     .filter(|detail| detail.get("ttl").and_then(Value::as_str) == Some("1h"))
@@ -1754,12 +1781,12 @@ impl<'a> StreamProcessor<'a> {
         }
         let total = number("totalTokens");
         // JS `totalTokens || input + output` (0 is falsy).
-        self.output.usage.total_tokens = if total > 0 {
+        output.usage.total_tokens = if total > 0 {
             total
         } else {
-            self.output.usage.input + self.output.usage.output
+            output.usage.input + output.usage.output
         };
-        calculate_cost(self.model, &mut self.output.usage);
+        calculate_cost(self.model, &mut output.usage);
     }
 }
 
@@ -1826,7 +1853,7 @@ async fn run(
     model: &Model,
     context: &TranscriptContext,
     options: &BedrockOptions,
-    output: &mut AssistantMessage,
+    output: &SharedAssistantMessage,
     events: &AssistantMessageEventStream,
     failure: Arc<Mutex<BedrockFailureMetadata>>,
 ) -> Result<DoneReason, String> {
@@ -2118,7 +2145,10 @@ async fn run(
 }
 
 /// The upstream `stream` tail checks after the event stream is consumed.
-fn finalize(options: &BedrockOptions, output: &AssistantMessage) -> Result<DoneReason, String> {
+fn finalize(
+    options: &BedrockOptions,
+    output: &SharedAssistantMessage,
+) -> Result<DoneReason, String> {
     if options
         .stream
         .signal
@@ -2127,7 +2157,7 @@ fn finalize(options: &BedrockOptions, output: &AssistantMessage) -> Result<DoneR
     {
         return Err("Request was aborted".to_owned());
     }
-    match output.stop_reason {
+    output.with(|output| match output.stop_reason {
         // `Deferred` shares the `Pending` arm: no rpi provider produces it
         // (lifecycle is [DEFER], R2.2.1), so it is unreachable here and
         // treated as "stream ended without a usable stop reason".
@@ -2149,7 +2179,7 @@ fn finalize(options: &BedrockOptions, output: &AssistantMessage) -> Result<DoneR
         StopReason::Stop => Ok(DoneReason::Stop),
         StopReason::Length => Ok(DoneReason::Length),
         StopReason::ToolUse => Ok(DoneReason::ToolUse),
-    }
+    })
 }
 
 /// `stream` (bedrock-converse-stream).
@@ -2165,12 +2195,12 @@ pub fn stream(
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
         let failure = Arc::new(Mutex::new(BedrockFailureMetadata::default()));
-        let mut output = initial_output(&model);
+        let output = SharedAssistantMessage::new(initial_output(&model));
         match run(
             &model,
             &context,
             &options,
-            &mut output,
+            &output,
             &task_stream,
             failure.clone(),
         )
@@ -2179,22 +2209,24 @@ pub fn stream(
             Ok(reason) => {
                 task_stream.push(StreamEvent::Done {
                     reason,
-                    message: output,
+                    message: output.snapshot(),
                 });
                 task_stream.end(None);
             }
             Err(message) => {
                 let aborted = signal.as_ref().is_some_and(|signal| signal.is_cancelled());
-                output.stop_reason = if aborted {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                output.error_message = Some(message);
+                output.with_mut(|output| {
+                    output.stop_reason = if aborted {
+                        StopReason::Aborted
+                    } else {
+                        StopReason::Error
+                    };
+                    output.error_message = Some(message);
+                });
                 // 70bbe47a9: structured provider-failure metadata; aborted
                 // turns emit no diagnostic.
                 if !aborted && let Ok(guard) = failure.lock() {
-                    append_bedrock_failure_diagnostic(&mut output, &guard);
+                    output.with_mut(|output| append_bedrock_failure_diagnostic(output, &guard));
                 }
                 task_stream.push(StreamEvent::Error {
                     reason: if aborted {
@@ -2202,7 +2234,7 @@ pub fn stream(
                     } else {
                         ErrorReason::Error
                     },
-                    error: output,
+                    error: output.snapshot(),
                 });
                 task_stream.end(None);
             }

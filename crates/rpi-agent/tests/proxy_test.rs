@@ -352,233 +352,46 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
     // -- Event sequence and partial reconstruction (:238-353) --------------
     assert_eq!(events.len(), 13, "one event per proxy event");
 
-    let StreamEvent::Start { partial } = &events[0] else {
-        panic!("expected Start, got {:?}", events[0]);
-    };
-    assert_eq!(partial.stop_reason, StopReason::Pending);
-    assert!(partial.content.is_empty());
-    assert_eq!(partial.usage, Usage::default());
-    assert_eq!(partial.api, ApiKind::from("anthropic-messages"));
-    assert_eq!(partial.provider, "test-provider");
-    assert_eq!(partial.model, "test-model");
-    assert!(partial.timestamp > 0);
-
-    let StreamEvent::TextStart {
-        content_index,
-        partial,
-    } = &events[1]
-    else {
-        panic!("expected TextStart, got {:?}", events[1]);
-    };
-    assert_eq!(*content_index, 0);
-    assert_eq!(
-        partial.content[0],
-        AssistantContent::Text(TextContent {
-            text: String::new(),
-            text_signature: None,
+    // All queued nonterminal events retain one live handle. Draining after
+    // the terminal frame intentionally observes the authoritative final state.
+    let partials: Vec<_> = events[..12]
+        .iter()
+        .map(|event| match event {
+            StreamEvent::Start { partial }
+            | StreamEvent::TextStart { partial, .. }
+            | StreamEvent::TextDelta { partial, .. }
+            | StreamEvent::TextEnd { partial, .. }
+            | StreamEvent::ThinkingStart { partial, .. }
+            | StreamEvent::ThinkingDelta { partial, .. }
+            | StreamEvent::ThinkingEnd { partial, .. }
+            | StreamEvent::ToolCallStart { partial, .. }
+            | StreamEvent::ToolCallDelta { partial, .. }
+            | StreamEvent::ToolCallEnd { partial, .. } => partial,
+            StreamEvent::Done { .. } | StreamEvent::Error { .. } => unreachable!(),
         })
-    );
+        .collect();
+    for partial in &partials[1..] {
+        assert!(partials[0].ptr_eq(partial));
+    }
+    assert_eq!(partials[0].snapshot().stop_reason, StopReason::Stop);
 
-    let StreamEvent::TextDelta {
-        content_index,
-        delta,
-        partial,
-    } = &events[2]
-    else {
+    // Delta order and interleaving remain event-local even though partials live.
+    let StreamEvent::TextDelta { delta, .. } = &events[2] else {
         panic!("expected TextDelta, got {:?}", events[2]);
     };
-    assert_eq!(*content_index, 0);
     assert_eq!(delta, "Hello ");
-    assert_eq!(
-        partial.content[0],
-        AssistantContent::Text(TextContent {
-            text: "Hello ".to_owned(),
-            text_signature: None,
-        })
-    );
-
-    let StreamEvent::ToolCallStart {
-        content_index,
-        partial,
-    } = &events[3]
-    else {
-        panic!("expected ToolCallStart, got {:?}", events[3]);
-    };
-    assert_eq!(*content_index, 1);
-    assert_eq!(
-        partial.content[1],
-        AssistantContent::ToolCall(ToolCall {
-            id: "call_1".to_owned(),
-            name: "bash".to_owned(),
-            arguments: json!({}).as_object().expect("object").clone(),
-            thought_signature: None,
-            namespace: None,
-            arguments_error: None,
-        })
-    );
-
-    // Interleaved text delta accumulates across toolcall deltas
-    // (correlation by content_index).
-    let StreamEvent::TextDelta {
-        content_index,
-        delta,
-        partial,
-    } = &events[4]
-    else {
+    let StreamEvent::TextDelta { delta, .. } = &events[4] else {
         panic!("expected TextDelta, got {:?}", events[4]);
     };
-    assert_eq!(*content_index, 0);
     assert_eq!(delta, "world");
-    assert_eq!(
-        partial.content[0],
-        AssistantContent::Text(TextContent {
-            text: "Hello world".to_owned(),
-            text_signature: None,
-        })
-    );
-
-    let StreamEvent::ToolCallDelta {
-        content_index,
-        delta,
-        partial,
-    } = &events[5]
-    else {
+    let StreamEvent::ToolCallDelta { delta, .. } = &events[5] else {
         panic!("expected ToolCallDelta, got {:?}", events[5]);
     };
-    assert_eq!(*content_index, 1);
     assert_eq!(delta, r#"{"cmd":"ls"#);
-    assert_eq!(
-        partial.content[1],
-        AssistantContent::ToolCall(ToolCall {
-            id: "call_1".to_owned(),
-            name: "bash".to_owned(),
-            arguments: json!({"cmd": "ls"}).as_object().expect("object").clone(),
-            thought_signature: None,
-            namespace: None,
-            arguments_error: None,
-        })
-    );
-
-    let StreamEvent::ThinkingStart {
-        content_index,
-        partial,
-    } = &events[6]
-    else {
-        panic!("expected ThinkingStart, got {:?}", events[6]);
-    };
-    assert_eq!(*content_index, 2);
-    assert_eq!(
-        partial.content[2],
-        AssistantContent::Thinking(ThinkingContent {
-            thinking: String::new(),
-            thinking_signature: None,
-            redacted: None,
-        })
-    );
-
-    let StreamEvent::ToolCallDelta {
-        content_index,
-        partial,
-        ..
-    } = &events[7]
-    else {
-        panic!("expected ToolCallDelta, got {:?}", events[7]);
-    };
-    assert_eq!(*content_index, 1);
-    assert_eq!(
-        partial.content[1],
-        AssistantContent::ToolCall(ToolCall {
-            id: "call_1".to_owned(),
-            name: "bash".to_owned(),
-            arguments: json!({"cmd": "ls -la"})
-                .as_object()
-                .expect("object")
-                .clone(),
-            thought_signature: None,
-            namespace: None,
-            arguments_error: None,
-        })
-    );
-
-    let StreamEvent::ThinkingDelta {
-        content_index,
-        delta,
-        partial,
-    } = &events[8]
-    else {
+    let StreamEvent::ThinkingDelta { delta, .. } = &events[8] else {
         panic!("expected ThinkingDelta, got {:?}", events[8]);
     };
-    assert_eq!(*content_index, 2);
     assert_eq!(delta, "reasoning");
-    assert_eq!(
-        partial.content[2],
-        AssistantContent::Thinking(ThinkingContent {
-            thinking: "reasoning".to_owned(),
-            thinking_signature: None,
-            redacted: None,
-        })
-    );
-
-    let StreamEvent::ThinkingEnd {
-        content_index,
-        content,
-        partial,
-    } = &events[9]
-    else {
-        panic!("expected ThinkingEnd, got {:?}", events[9]);
-    };
-    assert_eq!(*content_index, 2);
-    assert_eq!(content, "reasoning");
-    assert_eq!(
-        partial.content[2],
-        AssistantContent::Thinking(ThinkingContent {
-            thinking: "reasoning".to_owned(),
-            thinking_signature: Some("sig-t".to_owned()),
-            redacted: None,
-        })
-    );
-
-    let StreamEvent::TextEnd {
-        content_index,
-        content,
-        partial,
-    } = &events[10]
-    else {
-        panic!("expected TextEnd, got {:?}", events[10]);
-    };
-    assert_eq!(*content_index, 0);
-    assert_eq!(content, "Hello world");
-    assert_eq!(
-        partial.content[0],
-        AssistantContent::Text(TextContent {
-            text: "Hello world".to_owned(),
-            text_signature: Some("sig-x".to_owned()),
-        })
-    );
-
-    let StreamEvent::ToolCallEnd {
-        content_index,
-        tool_call,
-        partial,
-    } = &events[11]
-    else {
-        panic!("expected ToolCallEnd, got {:?}", events[11]);
-    };
-    assert_eq!(*content_index, 1);
-    assert_eq!(tool_call.id, "call_1");
-    assert_eq!(tool_call.name, "bash");
-    assert_eq!(
-        tool_call.arguments,
-        json!({"cmd": "ls -la"})
-            .as_object()
-            .expect("object")
-            .clone()
-    );
-    // The partial keeps the finished call (without the transient partialJson).
-    assert_eq!(
-        partial.content[1],
-        AssistantContent::ToolCall(tool_call.clone())
-    );
 
     let StreamEvent::Done { reason, message } = &events[12] else {
         panic!("expected Done, got {:?}", events[12]);
@@ -616,6 +429,10 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
             redacted: None,
         })
     );
+    let live = partials[0].snapshot();
+    assert_eq!(live.content, message.content);
+    assert_eq!(live.stop_reason, message.stop_reason);
+    assert_eq!(live.usage, message.usage);
 }
 
 // ---------------------------------------------------------------------------

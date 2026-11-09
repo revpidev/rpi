@@ -39,8 +39,24 @@ pub const BASE_EVENTS: [&str; 5] = [
 /// read session totals.
 pub const COMMAND_EVENTS: [&str; 3] = ["message_end", "tool_execution_end", "session_compact"];
 
-/// Live event names (command: current `liveTokens.enabled`; items: field-driven).
+/// Live event names (command: current `liveTokens.enabled`; items:
+/// field-driven) — the legacy CUMULATIVE `message_update` payload.
 pub const LIVE_EVENTS: [&str; 3] = ["message_start", "message_update", "message_end"];
+
+/// Live subscriptions while probing for the delta-only event (rpi#78 A1/1.2).
+/// Both update variants are required: an old host never emits the unknown delta
+/// event, while a new host emits it only when a subscriber exists.
+pub const LIVE_EVENTS_PROBE: [&str; 4] = [
+    "message_start",
+    "message_update",
+    "message_update_delta",
+    "message_end",
+];
+
+/// Live event names after the host has proven delta support. Dropping the
+/// cumulative subscription lets the host skip materializing the accumulated
+/// `message` snapshot on every delta.
+pub const LIVE_EVENTS_DELTA: [&str; 3] = ["message_start", "message_update_delta", "message_end"];
 
 /// Compute the desired event set for a configuration.
 ///
@@ -49,14 +65,23 @@ pub const LIVE_EVENTS: [&str; 3] = ["message_start", "message_update", "message_
 /// effect within one poll without restarting the session; disabling it removes
 /// the streaming subscriptions immediately (the zero-overhead-when-off
 /// property is preserved).
-pub fn desired_events(config: Option<&StatusLine>, command_live: bool) -> BTreeSet<&'static str> {
+pub fn desired_events(
+    config: Option<&StatusLine>,
+    command_live: bool,
+    delta_supported: bool,
+) -> BTreeSet<&'static str> {
+    let live_events: &[&str] = if delta_supported {
+        &LIVE_EVENTS_DELTA
+    } else {
+        &LIVE_EVENTS_PROBE
+    };
     let mut desired: BTreeSet<&'static str> = BASE_EVENTS.iter().copied().collect();
     match config {
         None => {}
         Some(StatusLine::Command(_)) => {
             desired.extend(COMMAND_EVENTS);
             if command_live {
-                desired.extend(LIVE_EVENTS);
+                desired.extend(live_events.iter().copied());
             }
         }
         Some(StatusLine::Items(items)) => {
@@ -73,7 +98,7 @@ pub fn desired_events(config: Option<&StatusLine>, command_live: bool) -> BTreeS
                 desired.insert("mode_change");
             }
             if items.live_enabled() {
-                desired.extend(LIVE_EVENTS);
+                desired.extend(live_events.iter().copied());
             }
             if items.needs_git() {
                 desired.insert("tool_execution_end");
@@ -173,13 +198,13 @@ mod tests {
 
     #[test]
     fn no_config_keeps_only_the_base_lifecycle_set() {
-        let desired = desired_events(None, false);
+        let desired = desired_events(None, false, false);
         assert_eq!(desired, BASE_EVENTS.iter().copied().collect());
     }
 
     #[test]
     fn command_mode_uses_the_te12_table_plus_the_current_live_switch() {
-        let desired = desired_events(Some(&command()), false);
+        let desired = desired_events(Some(&command()), false, false);
         for event in COMMAND_EVENTS {
             assert!(desired.contains(event), "{event}");
         }
@@ -192,7 +217,7 @@ mod tests {
             );
         }
         assert!(desired.contains("message_end"));
-        let live = desired_events(Some(&command()), true);
+        let live = desired_events(Some(&command()), true, false);
         for event in LIVE_EVENTS {
             assert!(live.contains(event), "{event}");
         }
@@ -204,13 +229,13 @@ mod tests {
         if let StatusLine::Command(command) = &mut config {
             command.live_tokens.enabled = false;
         }
-        let off = desired_events(Some(&config), false);
+        let off = desired_events(Some(&config), false, false);
         assert!(!off.contains("message_start"));
         assert!(!off.contains("message_update"));
         if let StatusLine::Command(command) = &mut config {
             command.live_tokens.enabled = true;
         }
-        let on = desired_events(Some(&config), true);
+        let on = desired_events(Some(&config), true, false);
         for event in LIVE_EVENTS {
             assert!(on.contains(event), "{event}");
         }
@@ -220,7 +245,11 @@ mod tests {
     fn items_duration_only_subscribes_no_extra_collection() {
         // `session-duration` alone is a local tick; no message, totals or Git
         // events are needed.
-        let desired = desired_events(Some(&items(&[FieldId::SessionDuration], false)), false);
+        let desired = desired_events(
+            Some(&items(&[FieldId::SessionDuration], false)),
+            false,
+            false,
+        );
         assert_eq!(desired, BASE_EVENTS.iter().copied().collect());
         assert!(!desired.contains("message_end"));
         assert!(!desired.contains("tool_execution_end"));
@@ -241,7 +270,7 @@ mod tests {
             defaults.fields().map(FieldId::id).collect::<Vec<_>>(),
             vec!["live-total-tokens", "live-output-rate"]
         );
-        let desired = desired_events(Some(&StatusLine::Items(defaults)), false);
+        let desired = desired_events(Some(&StatusLine::Items(defaults)), false, false);
         for event in ["turn_end", "agent_settled", "session_compact"] {
             assert!(desired.contains(event), "default totals add {event}");
         }
@@ -258,7 +287,7 @@ mod tests {
 
     #[test]
     fn items_capabilities_map_to_their_events() {
-        let totals = desired_events(Some(&items(&[FieldId::UsedTokens], false)), false);
+        let totals = desired_events(Some(&items(&[FieldId::UsedTokens], false)), false, false);
         // `session_compact` is a totals trigger only in items mode.
         assert!(totals.contains("turn_end"));
         assert!(totals.contains("agent_settled"));
@@ -266,7 +295,7 @@ mod tests {
         assert!(!totals.contains("message_end"));
 
         for field in [FieldId::TotalTokens, FieldId::TurnCount, FieldId::StepCount] {
-            let desired = desired_events(Some(&items(&[field], false)), false);
+            let desired = desired_events(Some(&items(&[field], false)), false, false);
             assert!(desired.contains("turn_end"), "{field:?} adds turn_end");
             assert!(
                 desired.contains("agent_settled"),
@@ -278,17 +307,25 @@ mod tests {
             );
         }
 
-        let run_state = desired_events(Some(&items(&[FieldId::RunState], false)), false);
+        let run_state = desired_events(Some(&items(&[FieldId::RunState], false)), false, false);
         assert!(run_state.contains("agent_start"));
         assert!(run_state.contains("agent_settled"));
 
-        let mode = desired_events(Some(&items(&[FieldId::PermissionMode], false)), false);
+        let mode = desired_events(
+            Some(&items(&[FieldId::PermissionMode], false)),
+            false,
+            false,
+        );
         assert!(mode.contains("mode_change"));
 
-        let git = desired_events(Some(&items(&[FieldId::GitBranch], false)), false);
+        let git = desired_events(Some(&items(&[FieldId::GitBranch], false)), false, false);
         assert!(git.contains("tool_execution_end"));
 
-        let live = desired_events(Some(&items(&[FieldId::LiveOutputTokens], true)), false);
+        let live = desired_events(
+            Some(&items(&[FieldId::LiveOutputTokens], true)),
+            false,
+            false,
+        );
         for event in LIVE_EVENTS {
             assert!(live.contains(event), "{event}");
         }
@@ -296,9 +333,24 @@ mod tests {
 
     #[test]
     fn live_switch_alone_does_not_subscribe_events() {
-        let desired = desired_events(Some(&items(&[FieldId::Model], true)), false);
-        for event in LIVE_EVENTS {
+        let desired = desired_events(Some(&items(&[FieldId::Model], true)), false, false);
+        for event in LIVE_EVENTS_PROBE {
             assert!(!desired.contains(event), "{event}");
         }
+    }
+
+    #[test]
+    fn live_probe_subscribes_both_updates_then_drops_the_legacy_event() {
+        let config = items(&[FieldId::LiveOutputRate], true);
+        let probing = desired_events(Some(&config), false, false);
+        for event in LIVE_EVENTS_PROBE {
+            assert!(probing.contains(event), "probe is missing {event}");
+        }
+
+        let supported = desired_events(Some(&config), false, true);
+        for event in LIVE_EVENTS_DELTA {
+            assert!(supported.contains(event), "delta mode is missing {event}");
+        }
+        assert!(!supported.contains("message_update"));
     }
 }

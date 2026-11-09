@@ -17,8 +17,9 @@ use rpi_ai::auth::{
 };
 use rpi_ai::models::{Models, Provider};
 use rpi_ai::types::{
-    ApiKind, AssistantMessage, DoneReason, ErrorReason, InputModality, Model, ModelCost,
-    SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, TranscriptContext,
+    ApiKind, AssistantContent, AssistantMessage, DoneReason, ErrorReason, InputModality, Model,
+    ModelCost, SharedAssistantMessage, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions,
+    TranscriptContext,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
 use rpi_durable::chord::context::{BACKGROUND_CONTEXT, Context};
@@ -108,7 +109,7 @@ impl ScriptedProvider {
         match script {
             Script::Message(message) => {
                 stream.push(StreamEvent::Start {
-                    partial: Arc::new(partial(&message)),
+                    partial: SharedAssistantMessage::new(partial(&message)),
                 });
                 match message.stop_reason {
                     StopReason::Error => stream.push(StreamEvent::Error {
@@ -136,12 +137,12 @@ impl ScriptedProvider {
             Script::Pending(text) => {
                 let message = text_message(&text, StopReason::Pending);
                 stream.push(StreamEvent::Start {
-                    partial: Arc::new(message.clone()),
+                    partial: SharedAssistantMessage::new(message.clone()),
                 });
                 stream.push(StreamEvent::TextDelta {
                     content_index: 0,
                     delta: text,
-                    partial: Arc::new(message),
+                    partial: SharedAssistantMessage::new(message),
                 });
                 // Never finish.
             }
@@ -154,17 +155,27 @@ impl ScriptedProvider {
                 tokio::spawn(async move {
                     let mut start = text_message("", StopReason::Pending);
                     start.content.clear();
+                    let partial = SharedAssistantMessage::new(start);
                     producer.push(StreamEvent::Start {
-                        partial: Arc::new(start),
+                        partial: partial.clone(),
                     });
-                    let mut text = String::new();
                     for (delta, gate) in deltas.into_iter().zip(gates) {
                         gate.notified().await;
-                        text.push_str(&delta);
+                        partial.with_mut(|partial| {
+                            if partial.content.is_empty() {
+                                partial.content.push(AssistantContent::Text(
+                                    rpi_ai::types::TextContent::default(),
+                                ));
+                            }
+                            let AssistantContent::Text(text) = &mut partial.content[0] else {
+                                unreachable!("text fixture")
+                            };
+                            text.text.push_str(&delta);
+                        });
                         producer.push(StreamEvent::TextDelta {
                             content_index: 0,
                             delta,
-                            partial: Arc::new(text_message(&text, StopReason::Pending)),
+                            partial: partial.clone(),
                         });
                         emitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }

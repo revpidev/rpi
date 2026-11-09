@@ -30,7 +30,6 @@
 //!   after the hook, mirroring the SDK pipeline.
 
 use serde_json::{Map, Value, json};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
 
@@ -46,8 +45,8 @@ use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
 use crate::models::{ProviderStreams, clamp_thinking_level};
 use crate::types::{
     AssistantContent, AssistantMessage, DoneReason, ErrorReason, Model, ProviderResponse,
-    SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, ThinkingBudgets, ThinkingLevel,
-    Tool, ToolCall, TranscriptContext, Usage,
+    SharedAssistantMessage, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions,
+    ThinkingBudgets, ThinkingLevel, Tool, ToolCall, TranscriptContext, Usage,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::event_stream::AssistantMessageEventStream;
@@ -366,13 +365,13 @@ enum CurrentBlock {
 /// protocol, accumulating the final assistant message. Factored out of the
 /// HTTP layer so tests can drive it with recorded streams.
 struct StreamProcessor<'a> {
-    output: &'a mut AssistantMessage,
+    output: &'a SharedAssistantMessage,
     model: &'a Model,
     current_block: Option<CurrentBlock>,
 }
 
 impl<'a> StreamProcessor<'a> {
-    fn new(output: &'a mut AssistantMessage, model: &'a Model) -> Self {
+    fn new(output: &'a SharedAssistantMessage, model: &'a Model) -> Self {
         Self {
             output,
             model,
@@ -380,80 +379,89 @@ impl<'a> StreamProcessor<'a> {
         }
     }
 
-    fn block_index(&self) -> usize {
-        self.output.content.len() - 1
+    fn block_index(output: &AssistantMessage) -> usize {
+        output.content.len() - 1
     }
 
     /// Ends the current text/thinking block (upstream's shared tail used both
     /// on block-type switches and at end of stream).
-    fn end_current_block(&mut self, events: &AssistantMessageEventStream) {
+    fn end_current_block_locked(
+        &mut self,
+        output: &mut AssistantMessage,
+        events: &AssistantMessageEventStream,
+    ) {
         match self.current_block.take() {
             Some(CurrentBlock::Text(content_index)) => {
-                let content = match self.output.content.get(content_index) {
+                let content = match output.content.get(content_index) {
                     Some(AssistantContent::Text(text)) => text.text.clone(),
                     _ => String::new(),
                 };
                 events.push(StreamEvent::TextEnd {
                     content_index,
                     content,
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
             }
             Some(CurrentBlock::Thinking(content_index)) => {
-                let content = match self.output.content.get(content_index) {
+                let content = match output.content.get(content_index) {
                     Some(AssistantContent::Thinking(thinking)) => thinking.thinking.clone(),
                     _ => String::new(),
                 };
                 events.push(StreamEvent::ThinkingEnd {
                     content_index,
                     content,
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
             }
             None => {}
         }
     }
 
-    fn handle_text_part(&mut self, part: &Value, events: &AssistantMessageEventStream) {
+    fn handle_text_part(
+        &mut self,
+        output: &mut AssistantMessage,
+        part: &Value,
+        events: &AssistantMessageEventStream,
+    ) {
         let is_thinking = is_thinking_part(part.get("thought").and_then(Value::as_bool));
         let kind_matches = matches!(
             (is_thinking, self.current_block),
             (true, Some(CurrentBlock::Thinking(_))) | (false, Some(CurrentBlock::Text(_)))
         );
         if !kind_matches {
-            self.end_current_block(events);
+            self.end_current_block_locked(output, events);
             if is_thinking {
-                self.output.content.push(AssistantContent::Thinking(
-                    crate::types::ThinkingContent {
+                output
+                    .content
+                    .push(AssistantContent::Thinking(crate::types::ThinkingContent {
                         thinking: String::new(),
                         thinking_signature: None,
                         redacted: None,
-                    },
-                ));
-                self.current_block = Some(CurrentBlock::Thinking(self.block_index()));
+                    }));
+                self.current_block = Some(CurrentBlock::Thinking(Self::block_index(output)));
                 events.push(StreamEvent::ThinkingStart {
-                    content_index: self.block_index(),
-                    partial: Arc::new(self.output.clone()),
+                    content_index: Self::block_index(output),
+                    partial: self.output.clone(),
                 });
             } else {
-                self.output
+                output
                     .content
                     .push(AssistantContent::Text(crate::types::TextContent {
                         text: String::new(),
                         text_signature: None,
                     }));
-                self.current_block = Some(CurrentBlock::Text(self.block_index()));
+                self.current_block = Some(CurrentBlock::Text(Self::block_index(output)));
                 events.push(StreamEvent::TextStart {
-                    content_index: self.block_index(),
-                    partial: Arc::new(self.output.clone()),
+                    content_index: Self::block_index(output),
+                    partial: self.output.clone(),
                 });
             }
         }
 
         let text = part.get("text").and_then(Value::as_str).unwrap_or("");
         let incoming_signature = part.get("thoughtSignature").and_then(Value::as_str);
-        let content_index = self.block_index();
-        match self.output.content.get_mut(content_index) {
+        let content_index = Self::block_index(output);
+        match output.content.get_mut(content_index) {
             Some(AssistantContent::Thinking(thinking)) => {
                 thinking.thinking.push_str(text);
                 thinking.thinking_signature = retain_thought_signature(
@@ -463,7 +471,7 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::ThinkingDelta {
                     content_index,
                     delta: text.to_owned(),
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
             }
             Some(AssistantContent::Text(block)) => {
@@ -473,7 +481,7 @@ impl<'a> StreamProcessor<'a> {
                 events.push(StreamEvent::TextDelta {
                     content_index,
                     delta: text.to_owned(),
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
             }
             _ => {}
@@ -482,16 +490,17 @@ impl<'a> StreamProcessor<'a> {
 
     fn handle_function_call_part(
         &mut self,
+        output: &mut AssistantMessage,
         part: &Value,
         function_call: &Value,
         events: &AssistantMessageEventStream,
     ) {
-        self.end_current_block(events);
+        self.end_current_block_locked(output, events);
 
         // Generate a unique ID if not provided or if it's a duplicate.
         let provided_id = function_call.get("id").and_then(Value::as_str);
         let needs_new_id = provided_id.is_none_or(|id| {
-            self.output
+            output
                 .content
                 .iter()
                 .any(|block| matches!(block, AssistantContent::ToolCall(call) if call.id == id))
@@ -526,23 +535,23 @@ impl<'a> StreamProcessor<'a> {
             arguments_error: None,
         };
 
-        self.output
+        output
             .content
             .push(AssistantContent::ToolCall(tool_call.clone()));
-        let content_index = self.block_index();
+        let content_index = Self::block_index(output);
         events.push(StreamEvent::ToolCallStart {
             content_index,
-            partial: Arc::new(self.output.clone()),
+            partial: self.output.clone(),
         });
         events.push(StreamEvent::ToolCallDelta {
             content_index,
             delta: serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_owned()),
-            partial: Arc::new(self.output.clone()),
+            partial: self.output.clone(),
         });
         events.push(StreamEvent::ToolCallEnd {
             content_index,
             tool_call,
-            partial: Arc::new(self.output.clone()),
+            partial: self.output.clone(),
         });
     }
 
@@ -552,73 +561,81 @@ impl<'a> StreamProcessor<'a> {
         chunk: &Value,
         events: &AssistantMessageEventStream,
     ) -> Result<(), String> {
-        // GenerateContentResponse.responseId is output-only; keep the first
-        // non-empty one from the stream.
-        if self.output.response_id.as_deref().unwrap_or("").is_empty()
-            && let Some(response_id) = chunk.get("responseId").and_then(Value::as_str)
-            && !response_id.is_empty()
-        {
-            self.output.response_id = Some(response_id.to_owned());
-        }
-
-        let candidate = chunk
-            .get("candidates")
-            .and_then(Value::as_array)
-            .and_then(|candidates| candidates.first());
-        if let Some(parts) = candidate
-            .and_then(|candidate| candidate.get("content"))
-            .and_then(|content| content.get("parts"))
-            .and_then(Value::as_array)
-        {
-            for part in parts {
-                if part.get("text").is_some() {
-                    self.handle_text_part(part, events);
-                }
-                if let Some(function_call) = part.get("functionCall") {
-                    self.handle_function_call_part(part, function_call, events);
-                }
-            }
-        }
-
-        if let Some(finish_reason) = candidate
-            .and_then(|candidate| candidate.get("finishReason"))
-            .and_then(Value::as_str)
-        {
-            // 23cb385b6: preserve the raw provider reason before mapping.
-            self.output.raw_stop_reason = Some(finish_reason.to_owned());
-            self.output.stop_reason = map_stop_reason(finish_reason)?;
-            // 5093641a5 (#8059): only a clean `STOP` finish upgrades to
-            // toolUse — a tool call riding a length/error stop keeps the
-            // mapped reason instead of being misreported as toolUse.
-            if self.output.stop_reason == StopReason::Stop
-                && self
-                    .output
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, AssistantContent::ToolCall(_)))
+        let partial = self.output.clone();
+        partial.with_mut(|output| {
+            // GenerateContentResponse.responseId is output-only; keep the first
+            // non-empty one from the stream.
+            if output.response_id.as_deref().unwrap_or("").is_empty()
+                && let Some(response_id) = chunk.get("responseId").and_then(Value::as_str)
+                && !response_id.is_empty()
             {
-                self.output.stop_reason = StopReason::ToolUse;
+                output.response_id = Some(response_id.to_owned());
             }
-        }
 
-        if let Some(usage_metadata) = chunk.get("usageMetadata") {
-            let prompt = json_u64(&usage_metadata["promptTokenCount"]).unwrap_or(0);
-            let cached = json_u64(&usage_metadata["cachedContentTokenCount"]).unwrap_or(0);
-            let candidates = json_u64(&usage_metadata["candidatesTokenCount"]).unwrap_or(0);
-            let thoughts = json_u64(&usage_metadata["thoughtsTokenCount"]).unwrap_or(0);
-            // JS `prompt - cached` can go negative on anomalous counts; Usage
-            // is u64 in rpi, so saturate.
-            self.output.usage.input = prompt.saturating_sub(cached);
-            self.output.usage.output = candidates + thoughts;
-            self.output.usage.cache_read = cached;
-            self.output.usage.cache_write = 0;
-            self.output.usage.reasoning = Some(thoughts);
-            self.output.usage.total_tokens =
-                json_u64(&usage_metadata["totalTokenCount"]).unwrap_or(0);
-            calculate_cost(self.model, &mut self.output.usage);
-        }
+            let candidate = chunk
+                .get("candidates")
+                .and_then(Value::as_array)
+                .and_then(|candidates| candidates.first());
+            if let Some(parts) = candidate
+                .and_then(|candidate| candidate.get("content"))
+                .and_then(|content| content.get("parts"))
+                .and_then(Value::as_array)
+            {
+                for part in parts {
+                    if part.get("text").is_some() {
+                        self.handle_text_part(output, part, events);
+                    }
+                    if let Some(function_call) = part.get("functionCall") {
+                        self.handle_function_call_part(output, part, function_call, events);
+                    }
+                }
+            }
 
-        Ok(())
+            if let Some(finish_reason) = candidate
+                .and_then(|candidate| candidate.get("finishReason"))
+                .and_then(Value::as_str)
+            {
+                // 23cb385b6: preserve the raw provider reason before mapping.
+                output.raw_stop_reason = Some(finish_reason.to_owned());
+                output.stop_reason = map_stop_reason(finish_reason)?;
+                // 5093641a5 (#8059): only a clean `STOP` finish upgrades to
+                // toolUse — a tool call riding a length/error stop keeps the
+                // mapped reason instead of being misreported as toolUse.
+                if output.stop_reason == StopReason::Stop
+                    && output
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, AssistantContent::ToolCall(_)))
+                {
+                    output.stop_reason = StopReason::ToolUse;
+                }
+            }
+
+            if let Some(usage_metadata) = chunk.get("usageMetadata") {
+                let prompt = json_u64(&usage_metadata["promptTokenCount"]).unwrap_or(0);
+                let cached = json_u64(&usage_metadata["cachedContentTokenCount"]).unwrap_or(0);
+                let candidates = json_u64(&usage_metadata["candidatesTokenCount"]).unwrap_or(0);
+                let thoughts = json_u64(&usage_metadata["thoughtsTokenCount"]).unwrap_or(0);
+                // JS `prompt - cached` can go negative on anomalous counts; Usage
+                // is u64 in rpi, so saturate.
+                output.usage.input = prompt.saturating_sub(cached);
+                output.usage.output = candidates + thoughts;
+                output.usage.cache_read = cached;
+                output.usage.cache_write = 0;
+                output.usage.reasoning = Some(thoughts);
+                output.usage.total_tokens =
+                    json_u64(&usage_metadata["totalTokenCount"]).unwrap_or(0);
+                calculate_cost(self.model, &mut output.usage);
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Close the trailing block after the final network chunk.
+    fn end_current_block(&mut self, events: &AssistantMessageEventStream) {
+        self.output
+            .with_mut(|output| self.end_current_block_locked(output, events));
     }
 
     fn handle_sse(
@@ -674,7 +691,7 @@ async fn run(
     model: &Model,
     context: &TranscriptContext,
     options: &GoogleOptions,
-    output: &mut AssistantMessage,
+    output: &SharedAssistantMessage,
     events: &AssistantMessageEventStream,
 ) -> Result<DoneReason, String> {
     // 027a58479: reject a custom fetch instead of silently bypassing it
@@ -819,7 +836,7 @@ async fn run(
     }
 
     events.push(StreamEvent::Start {
-        partial: Arc::new(output.clone()),
+        partial: output.clone(),
     });
 
     let mut processor = StreamProcessor::new(output, model);
@@ -861,7 +878,7 @@ fn finish_processor(
     if signal.is_some_and(|signal| signal.is_cancelled()) {
         return Err("Request was aborted".to_owned());
     }
-    match processor.output.stop_reason {
+    processor.output.with(|output| match output.stop_reason {
         // `Deferred` shares the `Pending` arm: no rpi provider produces it
         // (lifecycle is [DEFER], R2.2.1), so it is unreachable here and
         // treated as "stream ended without a usable finish reason".
@@ -870,14 +887,14 @@ fn finish_processor(
         }
         // 23cb385b6 + 5a2539a7b: the raw provider reason becomes the error
         // text when one was seen.
-        StopReason::Aborted | StopReason::Error => Err(match &processor.output.raw_stop_reason {
+        StopReason::Aborted | StopReason::Error => Err(match &output.raw_stop_reason {
             Some(raw) => format!("Provider stopped with: {raw}"),
             None => "An unknown error occurred".to_owned(),
         }),
         StopReason::Stop => Ok(DoneReason::Stop),
         StopReason::Length => Ok(DoneReason::Length),
         StopReason::ToolUse => Ok(DoneReason::ToolUse),
-    }
+    })
 }
 
 /// `stream` (google-generative-ai).
@@ -892,30 +909,32 @@ pub fn stream(
     let context = context.clone();
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
-        let mut output = initial_output(&model);
-        match run(&model, &context, &options, &mut output, &task_stream).await {
+        let output = SharedAssistantMessage::new(initial_output(&model));
+        match run(&model, &context, &options, &output, &task_stream).await {
             Ok(reason) => {
                 task_stream.push(StreamEvent::Done {
                     reason,
-                    message: output,
+                    message: output.snapshot(),
                 });
                 task_stream.end(None);
             }
             Err(message) => {
                 let aborted = signal.as_ref().is_some_and(|signal| signal.is_cancelled());
-                output.stop_reason = if aborted {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                output.error_message = Some(message);
+                output.with_mut(|output| {
+                    output.stop_reason = if aborted {
+                        StopReason::Aborted
+                    } else {
+                        StopReason::Error
+                    };
+                    output.error_message = Some(message);
+                });
                 task_stream.push(StreamEvent::Error {
                     reason: if aborted {
                         ErrorReason::Aborted
                     } else {
                         ErrorReason::Error
                     },
-                    error: output,
+                    error: output.snapshot(),
                 });
                 task_stream.end(None);
             }

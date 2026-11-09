@@ -396,6 +396,12 @@ pub trait ExtensionRunner: Send + Sync {
         false
     }
 
+    /// Dispatch any payload a `throttleMs` registration is holding back
+    /// (rpi#78 A1/1.3, rpi-own additive). The agent session calls this before
+    /// `message_end` so a coalesced subscriber never misses the stream's final
+    /// intermediate state. Default: nothing is ever coalesced.
+    async fn flush_throttled(&self, _event_type: &str) {}
+
     /// Generic event emit with an optional structured result
     /// (`session_before_compact` / `session_before_tree` /
     /// `session_before_switch` / `session_before_fork`).

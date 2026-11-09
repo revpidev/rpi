@@ -199,13 +199,13 @@ pub enum AgentEvent {
     },
     /// Only emitted for assistant messages during streaming.
     ///
-    /// V15-13 (rpi#53): both payloads are shared behind `Arc` — the
-    /// accumulated partial and the delta event flow agent loop -> listeners
-    /// -> UI queue without deep copies (clone is refcount only; serde shape
-    /// unchanged). `assistant_message_event` is `Arc`-ed to keep the enum
-    /// small (`clippy::large_enum_variant`).
+    /// Both payloads are shared: the accumulated live partial and the delta
+    /// event flow agent loop -> listeners -> UI queue without deep copies
+    /// (clone is refcount only; serde shape unchanged).
+    /// `assistant_message_event` is `Arc`-ed to keep the enum small
+    /// (`clippy::large_enum_variant`).
     MessageUpdate {
-        message: std::sync::Arc<rpi_ai::types::AssistantMessage>,
+        message: rpi_ai::types::SharedAssistantMessage,
         assistant_message_event: std::sync::Arc<StreamEvent>,
     },
     MessageEnd {
@@ -331,7 +331,7 @@ mod tests {
             ),
             (
                 AgentEvent::MessageUpdate {
-                    message: std::sync::Arc::new(match assistant_msg() {
+                    message: rpi_ai::types::SharedAssistantMessage::new(match assistant_msg() {
                         AgentMessage::Assistant(m) => m,
                         _ => unreachable!("constructed above"),
                     }),
@@ -407,14 +407,14 @@ mod tests {
         assert_eq!(v["toolResults"][0]["toolCallId"], json!("c1"));
 
         let update = AgentEvent::MessageUpdate {
-            message: std::sync::Arc::new(match assistant_msg() {
+            message: rpi_ai::types::SharedAssistantMessage::new(match assistant_msg() {
                 AgentMessage::Assistant(m) => m,
                 _ => unreachable!("constructed above"),
             }),
             assistant_message_event: std::sync::Arc::new(StreamEvent::TextDelta {
                 content_index: 0,
                 delta: "d".to_owned(),
-                partial: std::sync::Arc::new(match assistant_msg() {
+                partial: rpi_ai::types::SharedAssistantMessage::new(match assistant_msg() {
                     AgentMessage::Assistant(m) => m,
                     _ => unreachable!("constructed above"),
                 }),

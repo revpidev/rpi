@@ -46,8 +46,8 @@ use rpi_agent::{
 use rpi_ai::models::{clamp_thinking_level, get_supported_thinking_levels, models_are_equal};
 use rpi_ai::models_json::OrderedMap;
 use rpi_ai::types::{
-    AssistantMessage, ImageContent, Model, StopReason, TextContent, Usage, UserContent,
-    UserContentBlock, UserMessage, UserRole,
+    AssistantMessage, ImageContent, Model, StopReason, StreamEvent, TextContent, Usage,
+    UserContent, UserContentBlock, UserMessage, UserRole,
 };
 use rpi_ai::utils::overflow::is_context_overflow;
 use rpi_ai::utils::retry::{RetryPolicy, is_retryable_assistant_error};
@@ -2447,22 +2447,61 @@ impl AgentSession {
                 message,
                 assistant_message_event,
             } => {
-                if runner.has_handlers("message_update") {
-                    // V15-13: the event payloads are Arc-shared; the ext ABI
-                    // boundary materializes its owned copy only when an
-                    // extension actually subscribes to message_update.
+                // rpi#78 A1: the delta-only event costs O(delta). It is built
+                // from the typed event (never from the cumulative snapshot), so
+                // a subscriber that only needs `assistantMessageEvent.delta` +
+                // `usage` — the statusline — never pays the O(message) ext-ABI
+                // materialization. Only paid for when actually subscribed.
+                if runner.has_handlers(ext::EVENT_MESSAGE_UPDATE_DELTA) {
+                    match crate::modes::json_event::message_update_payload(
+                        message,
+                        assistant_message_event,
+                    ) {
+                        Ok(payload) => {
+                            runner
+                                .emit_event(ext::EVENT_MESSAGE_UPDATE_DELTA, payload)
+                                .await;
+                        }
+                        Err(error) => {
+                            tracing::warn!("message_update_delta conversion failed: {error}");
+                        }
+                    }
+                }
+                if runner.has_handlers(ext::EVENT_MESSAGE_UPDATE) {
+                    // Materialize one coherent snapshot for both cumulative
+                    // fields. The event gets an independent handle so serializing
+                    // it cannot observe a later producer mutation.
+                    let snapshot = message.snapshot();
+                    let mut cumulative_event = assistant_message_event.as_ref().clone();
+                    match &mut cumulative_event {
+                        StreamEvent::Start { partial }
+                        | StreamEvent::TextStart { partial, .. }
+                        | StreamEvent::TextDelta { partial, .. }
+                        | StreamEvent::TextEnd { partial, .. }
+                        | StreamEvent::ThinkingStart { partial, .. }
+                        | StreamEvent::ThinkingDelta { partial, .. }
+                        | StreamEvent::ThinkingEnd { partial, .. }
+                        | StreamEvent::ToolCallStart { partial, .. }
+                        | StreamEvent::ToolCallDelta { partial, .. }
+                        | StreamEvent::ToolCallEnd { partial, .. } => {
+                            *partial = rpi_ai::types::SharedAssistantMessage::new(snapshot.clone());
+                        }
+                        StreamEvent::Done { .. } | StreamEvent::Error { .. } => {}
+                    }
                     let payload = serde_json::to_value(ext::MessageUpdateEvent {
-                        message: AgentMessage::Assistant(message.as_ref().clone()),
-                        assistant_message_event: serde_json::to_value(
-                            assistant_message_event.as_ref(),
-                        )
-                        .unwrap_or(serde_json::Value::Null),
+                        message: AgentMessage::Assistant(snapshot),
+                        assistant_message_event: serde_json::to_value(&cumulative_event)
+                            .unwrap_or(serde_json::Value::Null),
                     })
                     .unwrap_or_else(|_| serde_json::json!({}));
-                    runner.emit_event("message_update", payload).await;
+                    runner.emit_event(ext::EVENT_MESSAGE_UPDATE, payload).await;
                 }
             }
             AgentEvent::MessageEnd { message } => {
+                // rpi#78 A1/1.3: deliver any payload a `throttleMs` subscriber
+                // is still holding before the authoritative end event, so a
+                // coalescing consumer never sees a stale final view.
+                runner.flush_throttled(ext::EVENT_MESSAGE_UPDATE).await;
                 if let Some(replacement) = runner.emit_message_end(message).await {
                     // Extension-replaced messages re-enter state before
                     // persistence (agent-session.ts:752-765).

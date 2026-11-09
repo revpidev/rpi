@@ -723,7 +723,7 @@ async fn stream_response(
         Some(ModelsSimpleStreamOptions::from(options)),
     );
     let token = runtime.signal();
-    let mut pending: Option<Arc<AssistantMessage>> = None;
+    let mut pending: Option<rpi_ai::types::SharedAssistantMessage> = None;
     let mut fired = Arc::new(tokio::sync::Notify::new());
     let mut timer = None;
     loop {
@@ -744,7 +744,9 @@ async fn stream_response(
             _ = fired.notified(), if timer.is_some() => {
                 timer.take();
                 if let Some(partial) = pending.take() {
-                    commit_partial(runtime, &partial, attempt, context).await?;
+                    // Snapshot before awaiting the durable commit; the lock is never
+                    // held across runtime or storage callbacks.
+                    commit_partial(runtime, &partial.snapshot(), attempt, context).await?;
                 }
                 continue;
             }
@@ -758,7 +760,7 @@ async fn stream_response(
             event => partial_of(event),
         };
         if let Some(partial) = partial
-            && !partial.content.is_empty()
+            && partial.with(|partial| !partial.content.is_empty())
         {
             pending = Some(partial);
         }
@@ -769,7 +771,7 @@ async fn stream_response(
         .ok_or_else(|| SessionError::message("Model stream ended without a result"))
 }
 
-fn partial_of(event: &StreamEvent) -> Option<Arc<AssistantMessage>> {
+fn partial_of(event: &StreamEvent) -> Option<rpi_ai::types::SharedAssistantMessage> {
     match event {
         StreamEvent::Start { partial }
         | StreamEvent::TextStart { partial, .. }
@@ -780,7 +782,7 @@ fn partial_of(event: &StreamEvent) -> Option<Arc<AssistantMessage>> {
         | StreamEvent::ThinkingEnd { partial, .. }
         | StreamEvent::ToolCallStart { partial, .. }
         | StreamEvent::ToolCallDelta { partial, .. }
-        | StreamEvent::ToolCallEnd { partial, .. } => Some(Arc::clone(partial)),
+        | StreamEvent::ToolCallEnd { partial, .. } => Some(partial.clone()),
         StreamEvent::Done { .. } | StreamEvent::Error { .. } => None,
     }
 }

@@ -94,6 +94,10 @@ pub struct LiveMeasure {
     /// `message.usage.output`, only when `Some(n) && n > 0` (FR-C: 0 or
     /// missing — aborted/error, usage-less providers — stays `None`).
     output_tokens_exact: Option<u64>,
+    /// Numerator source of the last PUBLISHED streaming rate frame (rpi#78 B):
+    /// a switch between frames means the ratio's numerator changed meaning, so
+    /// that frame must not publish a rate.
+    last_rate_source: Option<crate::tokens::TokenSource>,
 }
 
 /// Read-side projection of [`LiveMeasure`] at one payload assembly
@@ -160,6 +164,7 @@ impl LivePeek {
             output_tokens_exact: self.output_tokens_exact,
             decode_ms: self.decode_ms,
             tokens: Some(tokens),
+            rate_source_switched: false,
         }
     }
 }
@@ -198,6 +203,7 @@ impl LiveMeasure {
         self.message_ended_elapsed_ms = None;
         self.message_ended_decode_ms = None;
         self.output_tokens_exact = None;
+        self.last_rate_source = None;
     }
 
     /// FR-A: per-delta bookkeeping — only `assistantMessageEvent.{type,
@@ -248,9 +254,15 @@ impl LiveMeasure {
             self.decode_started = Some(Instant::now());
         }
         self.pending_delta_chars += chars;
-        if let Some(output) = payload
+        // Two payload shapes are accepted (rpi#78 A1/1.2): the legacy
+        // cumulative `{message:{usage}}` and the delta-only `{usage}` (the
+        // cumulative message is dropped there, which is what makes the host
+        // path O(delta)).
+        let usage = payload
             .pointer("/message/usage/output")
-            .and_then(Value::as_u64)
+            .or_else(|| payload.pointer("/usage/output"))
+            .and_then(Value::as_u64);
+        if let Some(output) = usage
             && output > 0
         {
             self.streaming_output_tokens = Some(output);
@@ -486,6 +498,12 @@ pub struct EngineState {
     /// rows keep these values instead of flickering to the dash placeholders
     /// ([`Self::record_live_values`] / [`Self::live_held_values`]).
     last_live_values: Vec<(FieldId, FieldValue)>,
+    /// The host proved it emits the delta-only `message_update_delta`
+    /// (rpi#78 A1/1.2). Once set, reconciliation drops the cumulative
+    /// `message_update` subscription, so the host stops materializing the whole
+    /// accumulated message per delta. Latched for the process: a host that
+    /// emitted a delta event keeps doing so.
+    delta_supported: bool,
 }
 
 /// Mtime tolerance below the session-start wall clock: the host creates
@@ -509,6 +527,7 @@ impl Default for EngineState {
             pending_output: 0,
             git: GitCache::default(),
             last_live_values: Vec::new(),
+            delta_supported: false,
         }
     }
 }
@@ -577,6 +596,42 @@ impl EngineState {
     /// Project the current live measurement (items fields; `None` when the
     /// measurement is disarmed). This is a cheap clone; token counting is
     /// done by the caller via [`LiveMeasure::peek`].
+    /// Record the numerator source of a frame about to be published and report
+    /// whether the streaming frame's source just changed (rpi#78 B).
+    ///
+    /// A settled frame never counts as a switch: numerator and denominator are
+    /// both frozen there, so the value is the message's own average (the
+    /// authoritative `usage.output` correction is exactly what should show).
+    pub fn note_rate_source(
+        &mut self,
+        streaming: bool,
+        source: Option<crate::tokens::TokenSource>,
+    ) -> bool {
+        let Some(live) = self.live.as_mut() else {
+            return false;
+        };
+        if !streaming {
+            live.last_rate_source = None;
+            return false;
+        }
+        let switched = live
+            .last_rate_source
+            .is_some_and(|last| Some(last) != source);
+        live.last_rate_source = source;
+        switched
+    }
+
+    /// Whether the host emits the delta-only `message_update_delta`
+    /// (rpi#78 A1/1.2). Latched on the first delta event.
+    pub fn delta_supported(&self) -> bool {
+        self.delta_supported
+    }
+
+    /// Record that the host emitted a delta-only `message_update` payload.
+    pub fn note_delta_supported(&mut self) {
+        self.delta_supported = true;
+    }
+
     pub fn live_peek(&self, now: Instant) -> Option<LivePeek> {
         self.live.as_ref().map(|live| live.peek(now))
     }
@@ -1282,6 +1337,7 @@ mod tests {
                 0,
                 TokenSource::Estimated,
             )),
+            rate_source_switched: false,
         }));
         let held = state.live_held_values();
         let held_output = held
@@ -1321,6 +1377,7 @@ mod tests {
             output_tokens_exact: None,
             decode_ms: 300,
             tokens: Some(TokenBreakdown::from_tiers(7, 0, 0, TokenSource::Estimated)),
+            rate_source_switched: false,
         }));
         let refreshed = state.live_held_values();
         assert!(
@@ -1348,10 +1405,54 @@ mod tests {
             output_tokens_exact: Some(9),
             decode_ms: 1_000,
             tokens: Some(TokenBreakdown::from_tiers(9, 0, 0, TokenSource::Estimated)),
+            rate_source_switched: false,
         }));
         assert!(!state.live_held_values().is_empty());
         state.on_session_start(Some("new"));
         assert!(state.live_held_values().is_empty());
+    }
+
+    /// rpi#78 B: the rate's numerator source is tracked per streaming frame; a
+    /// switch is reported once, and both a new message and a settled frame
+    /// clear the tracking (the settled frame is authoritative).
+    #[test]
+    fn rate_source_switch_is_detected_once_per_message() {
+        use crate::fields::{FieldData, LiveView};
+        use crate::tokens::TokenSource;
+
+        let mut state = EngineState::default();
+        state.set_live_measure(true);
+        let _ = FieldData::default();
+        // No live measurement armed → no switch is ever reported.
+        assert!(!state.note_rate_source(true, Some(TokenSource::Estimated)));
+
+        state.live = Some(LiveMeasure::default());
+        assert!(
+            !state.note_rate_source(true, Some(TokenSource::Estimated)),
+            "the first frame has no previous source"
+        );
+        assert!(
+            !state.note_rate_source(true, Some(TokenSource::Estimated)),
+            "the same source is not a switch"
+        );
+        assert!(
+            state.note_rate_source(true, Some(TokenSource::ExactProvider)),
+            "estimate → provider is a switch"
+        );
+        assert!(
+            !state.note_rate_source(false, Some(TokenSource::ExactProvider)),
+            "a settled frame never counts as a switch"
+        );
+        assert!(
+            !state.note_rate_source(true, Some(TokenSource::Estimated)),
+            "the settle cleared the tracking, so the next message starts fresh"
+        );
+        // `begin_stream` (message_start) also clears it.
+        if let Some(live) = state.live.as_mut() {
+            let _ = LiveView::default();
+            live.begin_stream();
+        }
+        assert!(!state.note_rate_source(true, Some(TokenSource::ExactProvider)));
     }
 
     /// A settled frame replaces the hold cache: a row the finished message
@@ -1381,6 +1482,7 @@ mod tests {
                 0,
                 TokenSource::Estimated,
             )),
+            rate_source_switched: false,
         }));
         assert!(
             state
@@ -1397,6 +1499,7 @@ mod tests {
             output_tokens_exact: Some(1),
             decode_ms: 0,
             tokens: Some(TokenBreakdown::from_tiers(1, 0, 0, TokenSource::Estimated)),
+            rate_source_switched: false,
         }));
         let held = state.live_held_values();
         assert!(

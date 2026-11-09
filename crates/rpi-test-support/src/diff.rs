@@ -186,7 +186,6 @@ pub fn diff_events_normalized(
 mod tests {
     use super::*;
     use crate::faux::faux_assistant_message;
-    use std::sync::Arc;
 
     #[test]
     fn test_diff_text_equal_after_normalization() {
@@ -228,7 +227,7 @@ mod tests {
         let msg = faux_assistant_message("hi", Default::default());
         let events = vec![
             StreamEvent::Start {
-                partial: Arc::new(msg.clone()),
+                partial: rpi_ai::types::SharedAssistantMessage::new(msg.clone()),
             },
             StreamEvent::Done {
                 reason: rpi_ai::types::DoneReason::Stop,
@@ -242,7 +241,7 @@ mod tests {
     fn test_diff_event_sequence_reports_mismatch() {
         let msg = faux_assistant_message("hi", Default::default());
         let expected = vec![StreamEvent::Start {
-            partial: Arc::new(msg.clone()),
+            partial: rpi_ai::types::SharedAssistantMessage::new(msg.clone()),
         }];
         let actual = vec![StreamEvent::Done {
             reason: rpi_ai::types::DoneReason::Stop,

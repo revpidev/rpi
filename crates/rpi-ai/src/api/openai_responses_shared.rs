@@ -17,7 +17,6 @@
 //!   request's, matching upstream when no hook is supplied.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 
@@ -28,13 +27,14 @@ use crate::api::constrained_sampling::{
 };
 use crate::types::StreamEvent;
 use crate::types::{
-    AssistantContent, AssistantMessage, InputModality, Message, Model, StopReason,
-    TextSignaturePhase, TextSignatureV1, Tool, ToolCall, ToolResultContent, TranscriptContext,
-    Usage,
+    AssistantContent, AssistantMessage, InputModality, Message, Model, SharedAssistantMessage,
+    StopReason, TextSignaturePhase, TextSignatureV1, Tool, ToolCall, ToolResultContent,
+    TranscriptContext, Usage,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
+use crate::utils::json_parse::StreamingArgsPreview;
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 use crate::utils::transform_messages::transform_messages;
@@ -743,6 +743,8 @@ struct CustomInputState {
 struct ToolScratch {
     partial_json: Option<String>,
     custom_input: Option<CustomInputState>,
+    /// rpi#78 A3: refresh `block.arguments` at display cadence, not per delta.
+    args_preview: StreamingArgsPreview,
 }
 
 /// `ResponsesOutputSlot`: which content block an output index maps to.
@@ -831,7 +833,7 @@ fn map_stop_reason(
 /// [`StreamEvent`] protocol, accumulating the final assistant message.
 /// Factored out of the HTTP layer so tests can drive it with recorded events.
 pub struct ResponsesStreamProcessor<'a> {
-    output: &'a mut AssistantMessage,
+    output: &'a SharedAssistantMessage,
     model: &'a Model,
     options: ResponsesStreamOptions<'a>,
     saw_terminal_response_event: bool,
@@ -842,7 +844,7 @@ pub struct ResponsesStreamProcessor<'a> {
 
 impl<'a> ResponsesStreamProcessor<'a> {
     pub fn new(
-        output: &'a mut AssistantMessage,
+        output: &'a SharedAssistantMessage,
         model: &'a Model,
         options: ResponsesStreamOptions<'a>,
     ) -> Self {
@@ -857,11 +859,11 @@ impl<'a> ResponsesStreamProcessor<'a> {
         }
     }
 
-    fn apply_message_phase_stop_reason(&mut self, item: &Value) {
+    fn apply_message_phase_stop_reason(&mut self, output: &mut AssistantMessage, item: &Value) {
         if item.get("type").and_then(Value::as_str) == Some("message")
             && item.get("phase").and_then(Value::as_str) == Some("final_answer")
         {
-            self.output.stop_reason = StopReason::Stop;
+            output.stop_reason = StopReason::Stop;
         }
     }
 
@@ -886,7 +888,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
             events.push(StreamEvent::ToolCallDelta {
                 content_index,
                 delta,
-                partial: Arc::new(self.output.clone()),
+                partial: self.output.clone(),
             });
         }
     }
@@ -895,44 +897,45 @@ impl<'a> ResponsesStreamProcessor<'a> {
     /// its start event.
     fn create_slot(
         &mut self,
+        output: &mut AssistantMessage,
         output_index: usize,
         item: &Value,
         events: &AssistantMessageEventStream,
     ) -> Option<Slot> {
         match item.get("type").and_then(Value::as_str) {
             Some("reasoning") => {
-                self.output.content.push(AssistantContent::Thinking(
-                    crate::types::ThinkingContent {
+                output
+                    .content
+                    .push(AssistantContent::Thinking(crate::types::ThinkingContent {
                         thinking: String::new(),
                         thinking_signature: None,
                         redacted: None,
-                    },
-                ));
+                    }));
                 let slot = Slot::Thinking {
-                    content_index: self.output.content.len() - 1,
+                    content_index: output.content.len() - 1,
                 };
                 self.slots.insert(output_index, slot);
                 events.push(StreamEvent::ThinkingStart {
                     content_index: slot.content_index(),
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
                 Some(slot)
             }
             Some("message") => {
-                self.apply_message_phase_stop_reason(item);
-                self.output
+                self.apply_message_phase_stop_reason(output, item);
+                output
                     .content
                     .push(AssistantContent::Text(crate::types::TextContent {
                         text: String::new(),
                         text_signature: None,
                     }));
                 let slot = Slot::Text {
-                    content_index: self.output.content.len() - 1,
+                    content_index: output.content.len() - 1,
                 };
                 self.slots.insert(output_index, slot);
                 events.push(StreamEvent::TextStart {
                     content_index: slot.content_index(),
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
                 Some(slot)
             }
@@ -949,38 +952,37 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
-                self.output
-                    .content
-                    .push(AssistantContent::ToolCall(ToolCall {
-                        id: format!("{call_id}|{item_id}"),
-                        name: item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned(),
-                        arguments: Map::new(),
-                        thought_signature: None,
-                        // 02bd2d1c6 (#7709): preserve the Responses namespace.
-                        namespace: item
-                            .get("namespace")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        arguments_error: None,
-                    }));
+                output.content.push(AssistantContent::ToolCall(ToolCall {
+                    id: format!("{call_id}|{item_id}"),
+                    name: item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    arguments: Map::new(),
+                    thought_signature: None,
+                    // 02bd2d1c6 (#7709): preserve the Responses namespace.
+                    namespace: item
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    arguments_error: None,
+                }));
                 let slot = Slot::ToolCall {
-                    content_index: self.output.content.len() - 1,
+                    content_index: output.content.len() - 1,
                 };
                 self.scratch.insert(
                     slot.content_index(),
                     ToolScratch {
                         partial_json: Some(partial_json),
                         custom_input: None,
+                        args_preview: StreamingArgsPreview::default(),
                     },
                 );
                 self.slots.insert(output_index, slot);
                 events.push(StreamEvent::ToolCallStart {
                     content_index: slot.content_index(),
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
                 Some(slot)
             }
@@ -1004,22 +1006,20 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     .to_owned();
                 let mut arguments = Map::new();
                 arguments.insert(input_property.clone(), json!(input));
-                self.output
-                    .content
-                    .push(AssistantContent::ToolCall(ToolCall {
-                        id: format!("{call_id}|{item_id}"),
-                        name: name.to_owned(),
-                        arguments,
-                        thought_signature: None,
-                        // 02bd2d1c6 (#7709): preserve the Responses namespace.
-                        namespace: item
-                            .get("namespace")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        arguments_error: None,
-                    }));
+                output.content.push(AssistantContent::ToolCall(ToolCall {
+                    id: format!("{call_id}|{item_id}"),
+                    name: name.to_owned(),
+                    arguments,
+                    thought_signature: None,
+                    // 02bd2d1c6 (#7709): preserve the Responses namespace.
+                    namespace: item
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    arguments_error: None,
+                }));
                 let slot = Slot::ToolCall {
-                    content_index: self.output.content.len() - 1,
+                    content_index: output.content.len() - 1,
                 };
                 self.scratch.insert(
                     slot.content_index(),
@@ -1029,12 +1029,13 @@ impl<'a> ResponsesStreamProcessor<'a> {
                             property: input_property,
                             json_buffer: GrammarToolInputJsonBuffer::default(),
                         }),
+                        args_preview: StreamingArgsPreview::default(),
                     },
                 );
                 self.slots.insert(output_index, slot);
                 events.push(StreamEvent::ToolCallStart {
                     content_index: slot.content_index(),
-                    partial: Arc::new(self.output.clone()),
+                    partial: self.output.clone(),
                 });
                 Some(slot)
             }
@@ -1044,13 +1045,14 @@ impl<'a> ResponsesStreamProcessor<'a> {
 
     fn get_or_create_slot(
         &mut self,
+        output: &mut AssistantMessage,
         output_index: usize,
         item: &Value,
         events: &AssistantMessageEventStream,
     ) -> Option<Slot> {
         match self.slots.get(&output_index).copied() {
             Some(slot) => Some(slot),
-            None => self.create_slot(output_index, item, events),
+            None => self.create_slot(output, output_index, item, events),
         }
     }
 
@@ -1058,7 +1060,11 @@ impl<'a> ResponsesStreamProcessor<'a> {
     /// `reasoning.encrypted_content` from `response.output_item.done` and
     /// provide it only in the terminal response; backfill it so store:false
     /// multi-turn replay stays stateless.
-    fn backfill_reasoning_signatures(&mut self, response_output: &[Value]) -> Result<(), String> {
+    fn backfill_reasoning_signatures(
+        &mut self,
+        output: &mut AssistantMessage,
+        response_output: &[Value],
+    ) -> Result<(), String> {
         for item in response_output {
             if item.get("type").and_then(Value::as_str) != Some("reasoning") {
                 continue;
@@ -1075,8 +1081,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
             let Some(content_index) = self.reasoning_blocks_by_id.get(item_id).copied() else {
                 continue;
             };
-            let Some(AssistantContent::Thinking(block)) =
-                self.output.content.get_mut(content_index)
+            let Some(AssistantContent::Thinking(block)) = output.content.get_mut(content_index)
             else {
                 continue;
             };
@@ -1102,13 +1107,17 @@ impl<'a> ResponsesStreamProcessor<'a> {
     }
 
     /// `finalizeResponse`: terminal usage/stop-reason accounting.
-    fn finalize_response(&mut self, response: &Value) -> Result<(), String> {
+    fn finalize_response(
+        &mut self,
+        output: &mut AssistantMessage,
+        response: &Value,
+    ) -> Result<(), String> {
         self.saw_terminal_response_event = true;
         if let Some(response_output) = response.get("output").and_then(Value::as_array) {
-            self.backfill_reasoning_signatures(response_output)?;
+            self.backfill_reasoning_signatures(output, response_output)?;
         }
         if let Some(id) = response.get("id").and_then(Value::as_str) {
-            self.output.response_id = Some(id.to_owned());
+            output.response_id = Some(id.to_owned());
         }
         if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
             let cached_tokens =
@@ -1120,7 +1129,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
             let input = json_u64(&usage["input_tokens"])
                 .unwrap_or(0)
                 .saturating_sub(cached_tokens + cache_write_tokens);
-            self.output.usage = Usage {
+            output.usage = Usage {
                 input,
                 output: json_u64(&usage["output_tokens"]).unwrap_or(0),
                 cache_read: cached_tokens,
@@ -1133,7 +1142,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 cost: Default::default(),
             };
         }
-        calculate_cost(self.model, &mut self.output.usage);
+        calculate_cost(self.model, &mut output.usage);
         if let Some(apply) = &self.options.apply_service_tier_pricing {
             let response_tier = response.get("service_tier").and_then(Value::as_str);
             let service_tier = match self.options.resolve_service_tier {
@@ -1142,7 +1151,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     .or(self.options.service_tier)
                     .map(str::to_owned),
             };
-            apply(&mut self.output.usage, service_tier.as_deref());
+            apply(&mut output.usage, service_tier.as_deref());
         }
         // Map status to stop reason. For incomplete responses, retain the
         // provider's specific reason so max-output truncation and content
@@ -1152,23 +1161,22 @@ impl<'a> ResponsesStreamProcessor<'a> {
             .get("incomplete_details")
             .and_then(|details| details.get("reason"))
             .and_then(Value::as_str);
-        self.output.raw_stop_reason = match incomplete_reason {
+        output.raw_stop_reason = match incomplete_reason {
             // JS `${status}.${incompleteReason}` interpolates missing status
             // as "undefined".
             Some(reason) => Some(format!("{}.{reason}", status.unwrap_or("undefined"))),
             None => status.map(str::to_owned),
         };
         let mapped_stop = map_stop_reason(status, incomplete_reason)?;
-        self.output.stop_reason = mapped_stop.0;
-        self.output.error_message = mapped_stop.1;
-        if self
-            .output
+        output.stop_reason = mapped_stop.0;
+        output.error_message = mapped_stop.1;
+        if output
             .content
             .iter()
             .any(|block| matches!(block, AssistantContent::ToolCall(_)))
-            && self.output.stop_reason == StopReason::Stop
+            && output.stop_reason == StopReason::Stop
         {
-            self.output.stop_reason = StopReason::ToolUse;
+            output.stop_reason = StopReason::ToolUse;
         }
         Ok(())
     }
@@ -1179,405 +1187,423 @@ impl<'a> ResponsesStreamProcessor<'a> {
         event: &Value,
         events: &AssistantMessageEventStream,
     ) -> Result<(), String> {
-        let output_index = event.get("output_index").and_then(json_u64).unwrap_or(0) as usize;
-        match event.get("type").and_then(Value::as_str) {
-            Some("response.created") => {
-                if let Some(id) = event
-                    .get("response")
-                    .and_then(|response| response.get("id"))
-                    .and_then(Value::as_str)
-                {
-                    self.output.response_id = Some(id.to_owned());
-                }
-            }
-            Some("response.output_item.added") => {
-                if let Some(item) = event.get("item") {
-                    self.create_slot(output_index, item, events);
-                }
-            }
-            Some("response.reasoning_summary_text.delta")
-            | Some("response.reasoning_text.delta") => {
-                let Some(Slot::Thinking { content_index }) =
-                    self.get_slot(output_index, SlotKind::Thinking)
-                else {
-                    return Ok(());
-                };
-                let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
-                if let Some(AssistantContent::Thinking(block)) =
-                    self.output.content.get_mut(content_index)
-                {
-                    block.thinking.push_str(delta);
-                }
-                events.push(StreamEvent::ThinkingDelta {
-                    content_index,
-                    delta: delta.to_owned(),
-                    partial: Arc::new(self.output.clone()),
-                });
-            }
-            Some("response.reasoning_summary_part.done") => {
-                let Some(Slot::Thinking { content_index }) =
-                    self.get_slot(output_index, SlotKind::Thinking)
-                else {
-                    return Ok(());
-                };
-                if let Some(AssistantContent::Thinking(block)) =
-                    self.output.content.get_mut(content_index)
-                {
-                    block.thinking.push_str("\n\n");
-                }
-                events.push(StreamEvent::ThinkingDelta {
-                    content_index,
-                    delta: "\n\n".to_owned(),
-                    partial: Arc::new(self.output.clone()),
-                });
-            }
-            Some("response.output_text.delta") | Some("response.refusal.delta") => {
-                let Some(Slot::Text { content_index }) =
-                    self.get_slot(output_index, SlotKind::Text)
-                else {
-                    return Ok(());
-                };
-                let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
-                if let Some(AssistantContent::Text(block)) =
-                    self.output.content.get_mut(content_index)
-                {
-                    block.text.push_str(delta);
-                }
-                events.push(StreamEvent::TextDelta {
-                    content_index,
-                    delta: delta.to_owned(),
-                    partial: Arc::new(self.output.clone()),
-                });
-            }
-            Some("response.function_call_arguments.delta") => {
-                let Some(Slot::ToolCall { content_index }) =
-                    self.get_slot(output_index, SlotKind::ToolCall)
-                else {
-                    return Ok(());
-                };
-                let delta = event.get("delta").and_then(Value::as_str);
-                let Some(scratch) = self.scratch.get_mut(&content_index) else {
-                    return Ok(());
-                };
-                let Some(partial_json) = scratch.partial_json.as_mut() else {
-                    return Ok(());
-                };
-                let Some(delta) = delta else { return Ok(()) };
-                partial_json.push_str(delta);
-                let partial = partial_json.clone();
-                if let Some(AssistantContent::ToolCall(block)) =
-                    self.output.content.get_mut(content_index)
-                {
-                    block.arguments = parse_streaming_json(Some(&partial));
-                }
-                self.push_tool_call_delta(content_index, Some(delta.to_owned()), events);
-            }
-            Some("response.function_call_arguments.done") => {
-                let Some(Slot::ToolCall { content_index }) =
-                    self.get_slot(output_index, SlotKind::ToolCall)
-                else {
-                    return Ok(());
-                };
-                let Some(scratch) = self.scratch.get_mut(&content_index) else {
-                    return Ok(());
-                };
-                if scratch.partial_json.is_none() {
-                    return Ok(());
-                }
-                let previous_partial_json = scratch.partial_json.clone().unwrap_or_default();
-                let arguments = event
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                scratch.partial_json = Some(arguments.clone());
-                if let Some(AssistantContent::ToolCall(block)) =
-                    self.output.content.get_mut(content_index)
-                {
-                    let parsed =
-                        crate::utils::json_parse::parse_tool_call_arguments(Some(&arguments));
-                    block.arguments = parsed.arguments;
-                    block.arguments_error = parsed.arguments_error;
-                }
-                if let Some(delta) = arguments.strip_prefix(&previous_partial_json)
-                    && !delta.is_empty()
-                {
-                    self.push_tool_call_delta(content_index, Some(delta.to_owned()), events);
-                }
-            }
-            Some("response.custom_tool_call_input.delta") => {
-                let Some(Slot::ToolCall { content_index }) =
-                    self.get_slot(output_index, SlotKind::ToolCall)
-                else {
-                    return Ok(());
-                };
-                let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
-                let Some(scratch) = self.scratch.get_mut(&content_index) else {
-                    return Ok(());
-                };
-                if scratch.custom_input.is_none() {
-                    return Ok(());
-                }
-                if let Some(AssistantContent::ToolCall(block)) =
-                    self.output.content.get_mut(content_index)
-                {
-                    let next_input = format!("{}{delta}", custom_tool_call_input(block, scratch));
-                    let delta = append_custom_tool_call_input(block, scratch, &next_input, false)?;
-                    self.push_tool_call_delta(content_index, delta, events);
-                }
-            }
-            Some("response.custom_tool_call_input.done") => {
-                let Some(Slot::ToolCall { content_index }) =
-                    self.get_slot(output_index, SlotKind::ToolCall)
-                else {
-                    return Ok(());
-                };
-                let input = event.get("input").and_then(Value::as_str).unwrap_or("");
-                let Some(scratch) = self.scratch.get_mut(&content_index) else {
-                    return Ok(());
-                };
-                if scratch.custom_input.is_none() {
-                    return Ok(());
-                }
-                if let Some(AssistantContent::ToolCall(block)) =
-                    self.output.content.get_mut(content_index)
-                {
-                    let delta = append_custom_tool_call_input(block, scratch, input, true)?;
-                    self.push_tool_call_delta(content_index, delta, events);
-                }
-            }
-            Some("response.output_item.done") => {
-                let Some(item) = event.get("item") else {
-                    return Ok(());
-                };
-                self.apply_message_phase_stop_reason(item);
-                let Some(slot) = self.get_or_create_slot(output_index, item, events) else {
-                    return Ok(());
-                };
-                let content_index = slot.content_index();
-                match (item.get("type").and_then(Value::as_str), slot) {
-                    (Some("reasoning"), Slot::Thinking { .. }) => {
-                        let summary_text = join_text_parts(item.get("summary"));
-                        let content_text = join_text_parts(item.get("content"));
-                        let signature = serde_json::to_string(item).unwrap_or_default();
-                        if let Some(AssistantContent::Thinking(block)) =
-                            self.output.content.get_mut(content_index)
-                        {
-                            if !summary_text.is_empty() {
-                                block.thinking = summary_text;
-                            } else if !content_text.is_empty() {
-                                block.thinking = content_text;
-                            }
-                            block.thinking_signature = Some(signature);
-                            if let Some(item_id) = item.get("id").and_then(Value::as_str) {
-                                self.reasoning_blocks_by_id
-                                    .insert(item_id.to_owned(), content_index);
-                            }
-                            events.push(StreamEvent::ThinkingEnd {
-                                content_index,
-                                content: block.thinking.clone(),
-                                partial: Arc::new(self.output.clone()),
-                            });
-                        }
-                        self.slots.remove(&output_index);
-                    }
-                    (Some("message"), Slot::Text { .. }) => {
-                        let text = item
-                            .get("content")
-                            .and_then(Value::as_array)
-                            .map(|parts| {
-                                parts
-                                    .iter()
-                                    .map(|part| {
-                                        if part.get("type").and_then(Value::as_str)
-                                            == Some("output_text")
-                                        {
-                                            part.get("text").and_then(Value::as_str).unwrap_or("")
-                                        } else {
-                                            part.get("refusal")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("")
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("")
-                            })
-                            .unwrap_or_default();
-                        let phase =
-                            item.get("phase").and_then(Value::as_str).and_then(
-                                |phase| match phase {
-                                    "commentary" => Some(TextSignaturePhase::Commentary),
-                                    "final_answer" => Some(TextSignaturePhase::FinalAnswer),
-                                    _ => None,
-                                },
-                            );
-                        let signature = encode_text_signature_v1(
-                            item.get("id").and_then(Value::as_str).unwrap_or(""),
-                            phase,
-                        );
-                        if let Some(AssistantContent::Text(block)) =
-                            self.output.content.get_mut(content_index)
-                        {
-                            block.text = text;
-                            block.text_signature = Some(signature);
-                            events.push(StreamEvent::TextEnd {
-                                content_index,
-                                content: block.text.clone(),
-                                partial: Arc::new(self.output.clone()),
-                            });
-                        }
-                        self.slots.remove(&output_index);
-                    }
-                    (Some("function_call"), Slot::ToolCall { .. }) => {
-                        let has_partial_json = self
-                            .scratch
-                            .get(&content_index)
-                            .is_some_and(|scratch| scratch.partial_json.is_some());
-                        if !has_partial_json {
-                            return Ok(());
-                        }
-                        let partial = self
-                            .scratch
-                            .get(&content_index)
-                            .and_then(|scratch| scratch.partial_json.clone())
-                            .unwrap_or_default();
-                        let arguments = item
-                            .get("arguments")
-                            .and_then(Value::as_str)
-                            .filter(|arguments| !arguments.is_empty())
-                            .map(str::to_owned)
-                            .or(if partial.is_empty() {
-                                Some("{}".to_owned())
-                            } else {
-                                Some(partial)
-                            });
-                        if let Some(AssistantContent::ToolCall(block)) =
-                            self.output.content.get_mut(content_index)
-                        {
-                            // `item.arguments || partialJson || "{}"`.
-                            let fallback;
-                            let source = match &arguments {
-                                Some(source) => source,
-                                None => {
-                                    fallback = "{}".to_owned();
-                                    &fallback
-                                }
-                            };
-                            let parsed =
-                                crate::utils::json_parse::parse_tool_call_arguments(Some(source));
-                            block.arguments = parsed.arguments;
-                            block.arguments_error = parsed.arguments_error;
-                            // 02bd2d1c6: a namespace on the done item wins.
-                            if let Some(namespace) = item.get("namespace").and_then(Value::as_str) {
-                                block.namespace = Some(namespace.to_owned());
-                            }
-                            events.push(StreamEvent::ToolCallEnd {
-                                content_index,
-                                tool_call: block.clone(),
-                                partial: Arc::new(self.output.clone()),
-                            });
-                        }
-                        self.scratch.remove(&content_index);
-                        self.slots.remove(&output_index);
-                    }
-                    (Some("custom_tool_call"), Slot::ToolCall { .. }) => {
-                        let has_custom_input = self
-                            .scratch
-                            .get(&content_index)
-                            .is_some_and(|scratch| scratch.custom_input.is_some());
-                        if !has_custom_input {
-                            return Ok(());
-                        }
-                        let close_delta = {
-                            let Some(scratch) = self.scratch.get_mut(&content_index) else {
-                                return Ok(());
-                            };
-                            let input =
-                                item.get("input").and_then(Value::as_str).map(str::to_owned);
-                            if let Some(AssistantContent::ToolCall(block)) =
-                                self.output.content.get_mut(content_index)
-                            {
-                                let input =
-                                    input.unwrap_or_else(|| custom_tool_call_input(block, scratch));
-                                append_custom_tool_call_input(block, scratch, &input, true)?
-                            } else {
-                                None
-                            }
-                        };
-                        self.push_tool_call_delta(content_index, close_delta, events);
-                        if let Some(AssistantContent::ToolCall(block)) =
-                            self.output.content.get_mut(content_index)
-                        {
-                            // 02bd2d1c6: a namespace on the done item wins.
-                            if let Some(namespace) = item.get("namespace").and_then(Value::as_str) {
-                                block.namespace = Some(namespace.to_owned());
-                            }
-                            events.push(StreamEvent::ToolCallEnd {
-                                content_index,
-                                tool_call: block.clone(),
-                                partial: Arc::new(self.output.clone()),
-                            });
-                        }
-                        self.scratch.remove(&content_index);
-                        self.slots.remove(&output_index);
-                    }
-                    _ => {}
-                }
-            }
-            Some("response.completed") | Some("response.incomplete") => {
-                if let Some(response) = event.get("response") {
-                    self.finalize_response(response)?;
-                }
-            }
-            Some("error") => {
-                let code = event.get("code");
-                let message = event.get("message");
-                let render = |value: Option<&Value>| match value {
-                    Some(Value::String(text)) => text.clone(),
-                    _ => "null".to_owned(),
-                };
-                return Err(format!("Error Code {}: {}", render(code), render(message)));
-            }
-            Some("response.failed") => {
-                self.saw_terminal_response_event = true;
-                let response = event.get("response").cloned().unwrap_or(Value::Null);
-                // e5ef8d065: preserve the raw terminal status before erroring.
-                self.output.raw_stop_reason = response
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let error = response.get("error").filter(|error| !error.is_null());
-                let message = if let Some(error) = error {
-                    let code = error
-                        .get("code")
-                        .and_then(Value::as_str)
-                        .filter(|code| !code.is_empty())
-                        .unwrap_or("unknown");
-                    let text = error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .filter(|message| !message.is_empty())
-                        .unwrap_or("no message");
-                    format!("{code}: {text}")
-                } else {
-                    match response
-                        .get("incomplete_details")
-                        .and_then(|details| details.get("reason"))
+        self.output.with_mut(|output| {
+            let output_index = event.get("output_index").and_then(json_u64).unwrap_or(0) as usize;
+            match event.get("type").and_then(Value::as_str) {
+                Some("response.created") => {
+                    if let Some(id) = event
+                        .get("response")
+                        .and_then(|response| response.get("id"))
                         .and_then(Value::as_str)
                     {
-                        Some(reason) => format!("incomplete: {reason}"),
-                        None => "Unknown error (no error details in response)".to_owned(),
+                        output.response_id = Some(id.to_owned());
                     }
-                };
-                return Err(message);
+                }
+                Some("response.output_item.added") => {
+                    if let Some(item) = event.get("item") {
+                        self.create_slot(output, output_index, item, events);
+                    }
+                }
+                Some("response.reasoning_summary_text.delta")
+                | Some("response.reasoning_text.delta") => {
+                    let Some(Slot::Thinking { content_index }) =
+                        self.get_slot(output_index, SlotKind::Thinking)
+                    else {
+                        return Ok(());
+                    };
+                    let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                    if let Some(AssistantContent::Thinking(block)) =
+                        output.content.get_mut(content_index)
+                    {
+                        block.thinking.push_str(delta);
+                    }
+                    events.push(StreamEvent::ThinkingDelta {
+                        content_index,
+                        delta: delta.to_owned(),
+                        partial: self.output.clone(),
+                    });
+                }
+                Some("response.reasoning_summary_part.done") => {
+                    let Some(Slot::Thinking { content_index }) =
+                        self.get_slot(output_index, SlotKind::Thinking)
+                    else {
+                        return Ok(());
+                    };
+                    if let Some(AssistantContent::Thinking(block)) =
+                        output.content.get_mut(content_index)
+                    {
+                        block.thinking.push_str("\n\n");
+                    }
+                    events.push(StreamEvent::ThinkingDelta {
+                        content_index,
+                        delta: "\n\n".to_owned(),
+                        partial: self.output.clone(),
+                    });
+                }
+                Some("response.output_text.delta") | Some("response.refusal.delta") => {
+                    let Some(Slot::Text { content_index }) =
+                        self.get_slot(output_index, SlotKind::Text)
+                    else {
+                        return Ok(());
+                    };
+                    let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                    if let Some(AssistantContent::Text(block)) =
+                        output.content.get_mut(content_index)
+                    {
+                        block.text.push_str(delta);
+                    }
+                    events.push(StreamEvent::TextDelta {
+                        content_index,
+                        delta: delta.to_owned(),
+                        partial: self.output.clone(),
+                    });
+                }
+                Some("response.function_call_arguments.delta") => {
+                    let Some(Slot::ToolCall { content_index }) =
+                        self.get_slot(output_index, SlotKind::ToolCall)
+                    else {
+                        return Ok(());
+                    };
+                    let delta = event.get("delta").and_then(Value::as_str);
+                    let Some(scratch) = self.scratch.get_mut(&content_index) else {
+                        return Ok(());
+                    };
+                    let Some(partial_json) = scratch.partial_json.as_mut() else {
+                        return Ok(());
+                    };
+                    let Some(delta) = delta else { return Ok(()) };
+                    partial_json.push_str(delta);
+                    // rpi#78 A3: no O(args) clone per delta; the authoritative
+                    // arguments land at `response.function_call_arguments.done`.
+                    let refresh = scratch.args_preview.should_parse(partial_json.len());
+                    if refresh {
+                        let parsed = parse_streaming_json(Some(partial_json));
+                        if let Some(AssistantContent::ToolCall(block)) =
+                            output.content.get_mut(content_index)
+                        {
+                            block.arguments = parsed;
+                        }
+                    }
+                    self.push_tool_call_delta(content_index, Some(delta.to_owned()), events);
+                }
+                Some("response.function_call_arguments.done") => {
+                    let Some(Slot::ToolCall { content_index }) =
+                        self.get_slot(output_index, SlotKind::ToolCall)
+                    else {
+                        return Ok(());
+                    };
+                    let Some(scratch) = self.scratch.get_mut(&content_index) else {
+                        return Ok(());
+                    };
+                    if scratch.partial_json.is_none() {
+                        return Ok(());
+                    }
+                    let previous_partial_json = scratch.partial_json.clone().unwrap_or_default();
+                    let arguments = event
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    scratch.partial_json = Some(arguments.clone());
+                    if let Some(AssistantContent::ToolCall(block)) =
+                        output.content.get_mut(content_index)
+                    {
+                        let parsed =
+                            crate::utils::json_parse::parse_tool_call_arguments(Some(&arguments));
+                        block.arguments = parsed.arguments;
+                        block.arguments_error = parsed.arguments_error;
+                    }
+                    if let Some(delta) = arguments.strip_prefix(&previous_partial_json)
+                        && !delta.is_empty()
+                    {
+                        self.push_tool_call_delta(content_index, Some(delta.to_owned()), events);
+                    }
+                }
+                Some("response.custom_tool_call_input.delta") => {
+                    let Some(Slot::ToolCall { content_index }) =
+                        self.get_slot(output_index, SlotKind::ToolCall)
+                    else {
+                        return Ok(());
+                    };
+                    let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                    let Some(scratch) = self.scratch.get_mut(&content_index) else {
+                        return Ok(());
+                    };
+                    if scratch.custom_input.is_none() {
+                        return Ok(());
+                    }
+                    if let Some(AssistantContent::ToolCall(block)) =
+                        output.content.get_mut(content_index)
+                    {
+                        let next_input =
+                            format!("{}{delta}", custom_tool_call_input(block, scratch));
+                        let delta =
+                            append_custom_tool_call_input(block, scratch, &next_input, false)?;
+                        self.push_tool_call_delta(content_index, delta, events);
+                    }
+                }
+                Some("response.custom_tool_call_input.done") => {
+                    let Some(Slot::ToolCall { content_index }) =
+                        self.get_slot(output_index, SlotKind::ToolCall)
+                    else {
+                        return Ok(());
+                    };
+                    let input = event.get("input").and_then(Value::as_str).unwrap_or("");
+                    let Some(scratch) = self.scratch.get_mut(&content_index) else {
+                        return Ok(());
+                    };
+                    if scratch.custom_input.is_none() {
+                        return Ok(());
+                    }
+                    if let Some(AssistantContent::ToolCall(block)) =
+                        output.content.get_mut(content_index)
+                    {
+                        let delta = append_custom_tool_call_input(block, scratch, input, true)?;
+                        self.push_tool_call_delta(content_index, delta, events);
+                    }
+                }
+                Some("response.output_item.done") => {
+                    let Some(item) = event.get("item") else {
+                        return Ok(());
+                    };
+                    self.apply_message_phase_stop_reason(output, item);
+                    let Some(slot) = self.get_or_create_slot(output, output_index, item, events)
+                    else {
+                        return Ok(());
+                    };
+                    let content_index = slot.content_index();
+                    match (item.get("type").and_then(Value::as_str), slot) {
+                        (Some("reasoning"), Slot::Thinking { .. }) => {
+                            let summary_text = join_text_parts(item.get("summary"));
+                            let content_text = join_text_parts(item.get("content"));
+                            let signature = serde_json::to_string(item).unwrap_or_default();
+                            if let Some(AssistantContent::Thinking(block)) =
+                                output.content.get_mut(content_index)
+                            {
+                                if !summary_text.is_empty() {
+                                    block.thinking = summary_text;
+                                } else if !content_text.is_empty() {
+                                    block.thinking = content_text;
+                                }
+                                block.thinking_signature = Some(signature);
+                                if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                                    self.reasoning_blocks_by_id
+                                        .insert(item_id.to_owned(), content_index);
+                                }
+                                events.push(StreamEvent::ThinkingEnd {
+                                    content_index,
+                                    content: block.thinking.clone(),
+                                    partial: self.output.clone(),
+                                });
+                            }
+                            self.slots.remove(&output_index);
+                        }
+                        (Some("message"), Slot::Text { .. }) => {
+                            let text = item
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .map(|parts| {
+                                    parts
+                                        .iter()
+                                        .map(|part| {
+                                            if part.get("type").and_then(Value::as_str)
+                                                == Some("output_text")
+                                            {
+                                                part.get("text")
+                                                    .and_then(Value::as_str)
+                                                    .unwrap_or("")
+                                            } else {
+                                                part.get("refusal")
+                                                    .and_then(Value::as_str)
+                                                    .unwrap_or("")
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("")
+                                })
+                                .unwrap_or_default();
+                            let phase =
+                                item.get("phase").and_then(Value::as_str).and_then(|phase| {
+                                    match phase {
+                                        "commentary" => Some(TextSignaturePhase::Commentary),
+                                        "final_answer" => Some(TextSignaturePhase::FinalAnswer),
+                                        _ => None,
+                                    }
+                                });
+                            let signature = encode_text_signature_v1(
+                                item.get("id").and_then(Value::as_str).unwrap_or(""),
+                                phase,
+                            );
+                            if let Some(AssistantContent::Text(block)) =
+                                output.content.get_mut(content_index)
+                            {
+                                block.text = text;
+                                block.text_signature = Some(signature);
+                                events.push(StreamEvent::TextEnd {
+                                    content_index,
+                                    content: block.text.clone(),
+                                    partial: self.output.clone(),
+                                });
+                            }
+                            self.slots.remove(&output_index);
+                        }
+                        (Some("function_call"), Slot::ToolCall { .. }) => {
+                            let has_partial_json = self
+                                .scratch
+                                .get(&content_index)
+                                .is_some_and(|scratch| scratch.partial_json.is_some());
+                            if !has_partial_json {
+                                return Ok(());
+                            }
+                            let partial = self
+                                .scratch
+                                .get(&content_index)
+                                .and_then(|scratch| scratch.partial_json.clone())
+                                .unwrap_or_default();
+                            let arguments = item
+                                .get("arguments")
+                                .and_then(Value::as_str)
+                                .filter(|arguments| !arguments.is_empty())
+                                .map(str::to_owned)
+                                .or(if partial.is_empty() {
+                                    Some("{}".to_owned())
+                                } else {
+                                    Some(partial)
+                                });
+                            if let Some(AssistantContent::ToolCall(block)) =
+                                output.content.get_mut(content_index)
+                            {
+                                // `item.arguments || partialJson || "{}"`.
+                                let fallback;
+                                let source = match &arguments {
+                                    Some(source) => source,
+                                    None => {
+                                        fallback = "{}".to_owned();
+                                        &fallback
+                                    }
+                                };
+                                let parsed = crate::utils::json_parse::parse_tool_call_arguments(
+                                    Some(source),
+                                );
+                                block.arguments = parsed.arguments;
+                                block.arguments_error = parsed.arguments_error;
+                                // 02bd2d1c6: a namespace on the done item wins.
+                                if let Some(namespace) =
+                                    item.get("namespace").and_then(Value::as_str)
+                                {
+                                    block.namespace = Some(namespace.to_owned());
+                                }
+                                events.push(StreamEvent::ToolCallEnd {
+                                    content_index,
+                                    tool_call: block.clone(),
+                                    partial: self.output.clone(),
+                                });
+                            }
+                            self.scratch.remove(&content_index);
+                            self.slots.remove(&output_index);
+                        }
+                        (Some("custom_tool_call"), Slot::ToolCall { .. }) => {
+                            let has_custom_input = self
+                                .scratch
+                                .get(&content_index)
+                                .is_some_and(|scratch| scratch.custom_input.is_some());
+                            if !has_custom_input {
+                                return Ok(());
+                            }
+                            let close_delta = {
+                                let Some(scratch) = self.scratch.get_mut(&content_index) else {
+                                    return Ok(());
+                                };
+                                let input =
+                                    item.get("input").and_then(Value::as_str).map(str::to_owned);
+                                if let Some(AssistantContent::ToolCall(block)) =
+                                    output.content.get_mut(content_index)
+                                {
+                                    let input = input
+                                        .unwrap_or_else(|| custom_tool_call_input(block, scratch));
+                                    append_custom_tool_call_input(block, scratch, &input, true)?
+                                } else {
+                                    None
+                                }
+                            };
+                            self.push_tool_call_delta(content_index, close_delta, events);
+                            if let Some(AssistantContent::ToolCall(block)) =
+                                output.content.get_mut(content_index)
+                            {
+                                // 02bd2d1c6: a namespace on the done item wins.
+                                if let Some(namespace) =
+                                    item.get("namespace").and_then(Value::as_str)
+                                {
+                                    block.namespace = Some(namespace.to_owned());
+                                }
+                                events.push(StreamEvent::ToolCallEnd {
+                                    content_index,
+                                    tool_call: block.clone(),
+                                    partial: self.output.clone(),
+                                });
+                            }
+                            self.scratch.remove(&content_index);
+                            self.slots.remove(&output_index);
+                        }
+                        _ => {}
+                    }
+                }
+                Some("response.completed") | Some("response.incomplete") => {
+                    if let Some(response) = event.get("response") {
+                        self.finalize_response(output, response)?;
+                    }
+                }
+                Some("error") => {
+                    let code = event.get("code");
+                    let message = event.get("message");
+                    let render = |value: Option<&Value>| match value {
+                        Some(Value::String(text)) => text.clone(),
+                        _ => "null".to_owned(),
+                    };
+                    return Err(format!("Error Code {}: {}", render(code), render(message)));
+                }
+                Some("response.failed") => {
+                    self.saw_terminal_response_event = true;
+                    let response = event.get("response").cloned().unwrap_or(Value::Null);
+                    // e5ef8d065: preserve the raw terminal status before erroring.
+                    output.raw_stop_reason = response
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let error = response.get("error").filter(|error| !error.is_null());
+                    let message = if let Some(error) = error {
+                        let code = error
+                            .get("code")
+                            .and_then(Value::as_str)
+                            .filter(|code| !code.is_empty())
+                            .unwrap_or("unknown");
+                        let text = error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .filter(|message| !message.is_empty())
+                            .unwrap_or("no message");
+                        format!("{code}: {text}")
+                    } else {
+                        match response
+                            .get("incomplete_details")
+                            .and_then(|details| details.get("reason"))
+                            .and_then(Value::as_str)
+                        {
+                            Some(reason) => format!("incomplete: {reason}"),
+                            None => "Unknown error (no error details in response)".to_owned(),
+                        }
+                    };
+                    return Err(message);
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// End-of-stream check (upstream throws after the event loop).
     pub fn finish(self) -> Result<(), String> {
+        self.output.with(|output| {
         if !self.saw_terminal_response_event {
             return Err(
                 "OpenAI Responses stream ended before a terminal response event".to_owned(),
@@ -1588,8 +1614,8 @@ impl<'a> ResponsesStreamProcessor<'a> {
         // their arguments may be cut off or mixed up when a non-compliant
         // server omits `output_index` (llama.cpp). Finished calls removed
         // their scratch buffers.
-        if self.output.stop_reason == StopReason::ToolUse {
-            for (index, block) in self.output.content.iter().enumerate() {
+        if output.stop_reason == StopReason::ToolUse {
+            for (index, block) in output.content.iter().enumerate() {
                 let AssistantContent::ToolCall(call) = block else {
                     continue;
                 };
@@ -1605,6 +1631,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
             }
         }
         Ok(())
+        })
     }
 }
 
@@ -2409,10 +2436,10 @@ mod tests {
         raw_events: &[Value],
     ) -> (Vec<StreamEvent>, Result<(), String>, AssistantMessage) {
         let events = AssistantMessageEventStream::new();
-        let mut output = output_for(model);
+        let output = SharedAssistantMessage::new(output_for(model));
         let result = {
             let mut processor = ResponsesStreamProcessor::new(
-                &mut output,
+                &output,
                 model,
                 ResponsesStreamOptions {
                     service_tier: None,
@@ -2435,7 +2462,7 @@ mod tests {
         };
         events.end(None);
         let collected: Vec<StreamEvent> = futures::executor::block_on(events.collect());
-        (collected, result, output)
+        (collected, result, output.snapshot())
     }
 
     fn event_kinds(events: &[StreamEvent]) -> Vec<&str> {
@@ -2580,6 +2607,64 @@ mod tests {
     }
 
     #[test]
+    fn test_large_tool_argument_interleaved_close_is_authoritative() {
+        let long = "x".repeat(4096);
+        let first = format!(r#"{{"text":"{long}"#);
+        let second = "\"}";
+        let full = format!(r#"{{"text":"{long}"}}"#);
+        let mut raw = vec![json!({"type": "response.created", "response": {"id": "resp_1"}})];
+        for index in 0..2 {
+            raw.push(json!({
+                "type": "response.output_item.added", "output_index": index,
+                "item": {"type": "function_call", "call_id": format!("call_{index}"),
+                         "id": format!("fc_{index}"), "name": "write", "arguments": ""}
+            }));
+        }
+        for delta in [first.as_str(), second] {
+            for index in 0..2 {
+                raw.push(json!({
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": index, "delta": delta
+                }));
+            }
+        }
+        for index in 0..2 {
+            raw.push(json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": index, "arguments": full
+            }));
+            raw.push(json!({
+                "type": "response.output_item.done", "output_index": index,
+                "item": {"type": "function_call", "call_id": format!("call_{index}"),
+                         "id": format!("fc_{index}"), "name": "write", "arguments": full}
+            }));
+        }
+        raw.push(json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}));
+
+        let (events, result, output) = replay(&model(json!({})), &no_grammar(), &raw);
+        assert_eq!(result, Ok(()));
+        let ends: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 2);
+        for call in ends {
+            assert_eq!(call.arguments["text"], json!(long));
+            assert_eq!(call.arguments_error, None);
+        }
+        assert_eq!(output.content.len(), 2);
+        for block in &output.content {
+            let AssistantContent::ToolCall(call) = block else {
+                panic!("expected tool call");
+            };
+            assert_eq!(call.arguments["text"], json!(long));
+        }
+    }
+
+    #[test]
     fn test_processor_message_phase_final_answer() {
         let raw = vec![
             json!({"type": "response.output_item.added", "output_index": 0,
@@ -2654,7 +2739,7 @@ mod tests {
         let (events, result, output) = replay(&m, &grammar_props, &raw);
         assert_eq!(result, Ok(()));
 
-        // The start block's arguments already carry the item input.
+        // The queued start handle is live and observes the final input.
         let start = events
             .iter()
             .find_map(|event| match event {
@@ -2662,13 +2747,13 @@ mod tests {
                 _ => None,
             })
             .expect("toolcall_start event");
-        match &start.content[0] {
+        start.with(|start| match &start.content[0] {
             AssistantContent::ToolCall(call) => assert_eq!(
                 call.arguments,
-                json!({"query": "SELECT"}).as_object().cloned().unwrap()
+                json!({"query": "SELECT 1"}).as_object().cloned().unwrap()
             ),
             other => panic!("expected tool call block, got {other:?}"),
-        }
+        });
 
         // No synthesized first delta after start: every delta comes from the
         // explicit `custom_tool_call_input.delta`/`.done`, and their

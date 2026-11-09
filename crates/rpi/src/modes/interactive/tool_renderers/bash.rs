@@ -21,11 +21,11 @@
 //!   seconds / hours above, `fe219d7f8`).
 
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rpi_tui::components::text::Text;
 use rpi_tui::tui::Component;
-use rpi_tui::utils::{truncate_to_width, wrap_text_with_ansi};
+use rpi_tui::utils::{truncate_to_width, visible_width, wrap_text_with_ansi};
 use serde_json::Value;
 
 use super::render_utils::{ToolTimerState, invalid_arg_text, str_value};
@@ -33,7 +33,7 @@ use crate::core::themes::Theme;
 use crate::modes::interactive::components::keybinding_hints::key_hint;
 use crate::modes::interactive::components::tool_execution::{
     RenderShell, ResultRenderOptions, ToolDefinition, ToolRenderContext, ToolResultState,
-    get_text_output,
+    get_text_output, lock_recover,
 };
 use crate::modes::interactive::components::visual_truncate::truncate_to_visual_lines;
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size};
@@ -47,6 +47,145 @@ const BASH_PREVIEW_LINES: usize = 5;
 #[derive(Default)]
 pub struct BashRenderState {
     timer: ToolTimerState,
+    /// rpi#78 A4/0.3: incremental styling for the 100 ms partial snapshots.
+    output: Mutex<BashOutputCache>,
+}
+
+/// Per-call output styling + visual-line cache.
+///
+/// `bash` emits a full accumulated-output snapshot every 100 ms
+/// (`tools/bash.rs` `BASH_UPDATE_THROTTLE_MS`), and every update used to
+/// re-style the whole text line by line and re-wrap it to compute the collapsed
+/// preview. Both are incremental here: only the grown tail is re-styled, and
+/// the preview's tail lines are wrapped instead of the whole output.
+#[derive(Default)]
+struct BashOutputCache {
+    /// The raw (trimmed, footer-stripped) output the cache covers.
+    raw: String,
+    /// The fully styled text (`fg("toolOutput", line)` joined by `\n`).
+    styled: Arc<String>,
+    /// Visual-line bookkeeping for the collapsed preview; `None` disables the
+    /// incremental preview path (a CR in the output, or no counts yet).
+    visual: Option<VisualLines>,
+}
+
+#[derive(Default, Clone)]
+struct VisualLines {
+    width: usize,
+    /// Visual line count per logical line of `styled`.
+    counts: Vec<usize>,
+    total: usize,
+}
+
+/// One logical line as the render path sees it (`Text::render` replaces tabs)
+/// wrapped and right-padded at `width` to exactly what `Text::new(text, 0, 0,
+/// None).render(width)` produces per line (rpi#78 A4/0.3).
+fn wrap_output_line(line: &str, width: usize) -> Vec<String> {
+    let content_width = width.max(1);
+    wrap_text_with_ansi(&line.replace('\t', "   "), content_width)
+        .into_iter()
+        .map(|visual| {
+            let padding = content_width.saturating_sub(visible_width(&visual));
+            format!("{visual}{}", " ".repeat(padding))
+        })
+        .collect()
+}
+
+impl BashOutputCache {
+    /// Style `raw` (incrementally when it grew by appending) and return the
+    /// shared styled text. Byte-identical to
+    /// `raw.split('\n').map(|l| theme.fg("toolOutput", l)).join("\n")`.
+    fn styled(&mut self, raw: &str, theme: &Theme) -> Arc<String> {
+        if !raw.starts_with(&self.raw) {
+            self.raw.clear();
+            self.styled = Arc::new(String::new());
+            self.visual = None;
+        }
+        if raw.len() > self.raw.len() {
+            let raw_tail_start = self.raw.rfind('\n').map_or(0, |index| index + 1);
+            let styled_tail_start = self.styled.rfind('\n').map_or(0, |index| index + 1);
+            let styled = Arc::make_mut(&mut self.styled);
+            styled.truncate(styled_tail_start);
+            for (index, line) in raw[raw_tail_start..].split('\n').enumerate() {
+                if index > 0 {
+                    styled.push('\n');
+                }
+                styled.push_str(&theme.fg("toolOutput", line));
+            }
+            self.raw.clear();
+            self.raw.push_str(raw);
+            if let Some(visual) = self.visual.as_mut() {
+                // The line starting at `styled_tail_start` grew; everything
+                // before it is unchanged.
+                let keep = visual.counts.len().saturating_sub(1);
+                let styled = Arc::clone(&self.styled);
+                visual.resync_from(&styled, styled_tail_start, keep);
+            }
+        }
+        Arc::clone(&self.styled)
+    }
+
+    /// The collapsed preview: the last `max_visual_lines` visual lines plus the
+    /// number of hidden ones. `None` = use the whole-text path.
+    fn preview(&mut self, width: usize, max_visual_lines: usize) -> Option<(Vec<String>, usize)> {
+        // CR normalization happens on the whole text in `wrap_text_with_ansi`;
+        // a per-line fast path cannot reproduce it, so fall back.
+        if self.styled.contains('\r') {
+            self.visual = None;
+            return None;
+        }
+        if self
+            .visual
+            .as_ref()
+            .is_none_or(|visual| visual.width != width)
+        {
+            self.visual = Some(VisualLines::build(&self.styled, width));
+        }
+        let visual = self.visual.as_ref()?;
+        let skipped = visual.total.saturating_sub(max_visual_lines);
+        if skipped == 0 {
+            return None;
+        }
+        // Walk the logical lines backwards until enough visual lines are
+        // covered, then wrap only those (the preview keeps the tail).
+        let mut needed = max_visual_lines;
+        let mut start = visual.counts.len();
+        while start > 0 && needed > 0 {
+            start -= 1;
+            needed = needed.saturating_sub(visual.counts[start]);
+        }
+        let mut lines: Vec<String> = Vec::new();
+        for line in self.styled.split('\n').skip(start) {
+            lines.extend(wrap_output_line(line, width));
+        }
+        let keep_from = lines.len().saturating_sub(max_visual_lines);
+        lines.drain(..keep_from);
+        Some((lines, skipped))
+    }
+}
+
+impl VisualLines {
+    fn build(styled: &str, width: usize) -> Self {
+        let mut visual = VisualLines {
+            width,
+            counts: Vec::new(),
+            total: 0,
+        };
+        visual.resync_from(styled, 0, 0);
+        visual
+    }
+
+    /// Keep the counts for the first `keep` logical lines and recount
+    /// everything from byte `from_byte` on (the start of logical line `keep`).
+    fn resync_from(&mut self, styled: &str, from_byte: usize, keep: usize) {
+        self.counts.truncate(keep);
+        self.total = self.counts.iter().sum();
+        for line in styled[from_byte..].split('\n') {
+            let count = wrap_output_line(line, self.width).len();
+            self.counts.push(count);
+            self.total += count;
+        }
+    }
 }
 
 /// `formatBashCall` (bash.ts:231-237).
@@ -130,7 +269,11 @@ impl TruncationView {
 /// computed at `render()` time from the shared state so the 1s ticker only
 /// needs to request a re-render.
 struct BashResultRenderComponent {
-    styled_output: String,
+    styled_output: Arc<String>,
+    /// Precomputed collapsed preview at a known width: `(width, visual lines,
+    /// skipped count)` (rpi#78 A4/0.3). `None`/width mismatch falls back to the
+    /// whole-text wrap.
+    preview: Option<(usize, Vec<String>, usize)>,
     warnings: Option<String>,
     expanded: bool,
     is_partial: bool,
@@ -154,22 +297,29 @@ impl BashResultRenderComponent {
         }
         // padding_x = 0: the component sits inside the component's `Box`
         // (visual-truncate.rs doc).
-        let preview = truncate_to_visual_lines(&self.styled_output, BASH_PREVIEW_LINES, width, 0);
+        let (visual_lines, skipped_count) = match &self.preview {
+            Some((preview_width, lines, skipped)) if *preview_width == width => {
+                (lines.clone(), *skipped)
+            }
+            _ => {
+                let preview =
+                    truncate_to_visual_lines(&self.styled_output, BASH_PREVIEW_LINES, width, 0);
+                (preview.visual_lines, preview.skipped_count)
+            }
+        };
         let mut lines: Vec<String> = vec![String::new()];
-        if preview.skipped_count > 0 {
+        if skipped_count > 0 {
             // bash.ts:280-284.
             let hint = format!(
                 "{} {}{}",
-                self.theme.fg(
-                    "muted",
-                    &format!("... ({} earlier lines,", preview.skipped_count)
-                ),
+                self.theme
+                    .fg("muted", &format!("... ({skipped_count} earlier lines,")),
                 key_hint(&self.theme, "app.tools.expand", "to expand"),
                 self.theme.fg("muted", ")")
             );
             lines.push(truncate_to_width(&hint, width, "...", false));
         }
-        lines.extend(preview.visual_lines);
+        lines.extend(visual_lines);
         *self.cache.borrow_mut() = Some((width, lines.clone()));
         lines
     }
@@ -272,15 +422,28 @@ impl ToolDefinition for BashToolRenderer {
             output = output[..footer_start].trim_end().to_string();
         }
 
-        // bash.ts:263-267: per-line `toolOutput` coloring.
+        // bash.ts:263-267: per-line `toolOutput` coloring — incremental
+        // (rpi#78 A4/0.3): a 100 ms partial snapshot restyles only the grown
+        // tail instead of the whole accumulated output.
         let styled_output = if output.is_empty() {
-            String::new()
+            Arc::new(String::new())
         } else {
-            output
-                .split('\n')
-                .map(|line| theme.fg("toolOutput", line))
-                .collect::<Vec<_>>()
-                .join("\n")
+            let mut cache = lock_recover(&state.output);
+            cache.styled(&output, theme)
+        };
+        // The collapsed preview only needs the tail; compute it here (where the
+        // per-call cache is reachable) rather than wrapping the whole output on
+        // every update.
+        let preview = {
+            let width = context.terminal_width;
+            if width == 0 {
+                None
+            } else {
+                let mut cache = lock_recover(&state.output);
+                cache
+                    .preview(width, BASH_PREVIEW_LINES)
+                    .map(|(lines, skipped)| (width, lines, skipped))
+            }
         };
 
         // bash.ts:297-312: `[Full output: …. Truncated: …]` warnings.
@@ -310,6 +473,7 @@ impl ToolDefinition for BashToolRenderer {
 
         Some(Box::new(BashResultRenderComponent {
             styled_output,
+            preview,
             warnings,
             expanded: options.expanded,
             is_partial: options.is_partial,
@@ -345,6 +509,7 @@ mod tests {
             args: json!({}),
             tool_call_id: "call_1".to_owned(),
             render_handle: RenderHandle::new(|| {}),
+            invalidate: RenderHandle::new(|| {}),
             state: state.clone(),
             cwd: "/cwd".to_owned(),
             execution_started: true,
@@ -683,5 +848,116 @@ mod tests {
         // during `render_call`) would print `Took 0.`.
         assert!(stripped.contains("Took 1m 5s"), "stripped: {stripped}");
         assert!(!stripped.contains("Took 0."), "stripped: {stripped}");
+    }
+
+    fn naive_styled(raw: &str, theme: &Theme) -> String {
+        raw.split('\n')
+            .map(|line| theme.fg("toolOutput", line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// rpi#78 A4/0.3: the incremental styling must reproduce the naive
+    /// per-line join byte for byte, including tabs, blank lines and multi-byte
+    /// payloads.
+    #[test]
+    fn incremental_styling_matches_the_naive_join() {
+        let theme = theme();
+        let mut cache = BashOutputCache::default();
+        let full = "a\tb\n\n中文 🚀 // 注\n\tindented\nlast";
+        let mut raw = String::new();
+        for ch in full.chars() {
+            raw.push(ch);
+            let styled = cache.styled(&raw, &theme);
+            assert_eq!(*styled, naive_styled(&raw, &theme), "at {raw:?}");
+        }
+        // A non-prefix change rebuilds from scratch.
+        let replaced = cache.styled("other\ncontent", &theme);
+        assert_eq!(*replaced, naive_styled("other\ncontent", &theme));
+    }
+
+    /// The cached collapsed preview must equal the whole-text visual truncation
+    /// the renderer used before the cache existed.
+    #[test]
+    fn incremental_preview_matches_the_whole_text_truncation() {
+        let theme = theme();
+        let raw: String = (1..=40)
+            .map(|i| format!("line{i} {}\n", "x".repeat(i * 7)))
+            .collect();
+        let raw = raw.trim_end().to_string();
+        for width in [20usize, 40, 80] {
+            let mut cache = BashOutputCache::default();
+            let mut growing = String::new();
+            for line in raw.split('\n') {
+                if !growing.is_empty() {
+                    growing.push('\n');
+                }
+                growing.push_str(line);
+                let styled = cache.styled(&growing, &theme);
+                let expected = truncate_to_visual_lines(&styled, BASH_PREVIEW_LINES, width, 0);
+                match cache.preview(width, BASH_PREVIEW_LINES) {
+                    Some((lines, skipped)) => {
+                        assert_eq!(lines, expected.visual_lines, "width {width}");
+                        assert_eq!(skipped, expected.skipped_count, "width {width}");
+                    }
+                    None => assert_eq!(expected.skipped_count, 0, "width {width}"),
+                }
+            }
+        }
+    }
+
+    /// A CR in the output cannot be reproduced by the per-line fast path, so
+    /// the cache must defuse and let the renderer use the whole-text wrap.
+    #[test]
+    fn cr_output_falls_back_to_the_whole_text_path() {
+        let theme = theme();
+        let mut cache = BashOutputCache::default();
+        let _ = cache.styled("a\r\nb\r\nc", &theme);
+        assert!(cache.preview(80, BASH_PREVIEW_LINES).is_none());
+    }
+
+    /// Rendering with the precomputed preview must be byte-identical to the
+    /// whole-text fallback the renderer used before.
+    #[test]
+    fn cached_preview_renders_identically_to_the_fallback() {
+        let theme = theme();
+        let state = RendererStateSlot::default();
+        let renderer = BashToolRenderer;
+        let mut output: String = (1..=60)
+            .map(|i| format!("line{i} {}\n", "y".repeat(i * 3)))
+            .collect();
+        output.push_str("tail");
+        let result = ToolResultState {
+            content: vec![
+                crate::modes::interactive::components::tool_execution::ToolResultContentLoose::text(
+                    output,
+                ),
+            ],
+            is_error: false,
+            details: None,
+            duration_ms: None,
+        };
+
+        let render = |terminal_width: usize| {
+            let state = RendererStateSlot::default();
+            let mut ctx = context(&state);
+            ctx.terminal_width = terminal_width;
+            let component = renderer
+                .render_result(
+                    &result,
+                    ResultRenderOptions {
+                        expanded: false,
+                        is_partial: false,
+                    },
+                    &theme,
+                    &ctx,
+                )
+                .expect("result component");
+            component.render(80)
+        };
+        // 0 = unknown width at context-build time (whole-text fallback); 80 =
+        // the cache path.
+        let _ = state;
+        assert_eq!(render(80), render(0));
     }
 }

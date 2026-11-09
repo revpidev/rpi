@@ -226,12 +226,38 @@ fn event_kinds(events: &[StreamEvent]) -> Vec<&str> {
         .collect()
 }
 
+fn assert_one_live_partial(events: &[StreamEvent]) {
+    let mut first: Option<&rpi_ai::types::SharedAssistantMessage> = None;
+    for event in events {
+        let partial = match event {
+            StreamEvent::Start { partial }
+            | StreamEvent::TextStart { partial, .. }
+            | StreamEvent::TextDelta { partial, .. }
+            | StreamEvent::TextEnd { partial, .. }
+            | StreamEvent::ThinkingStart { partial, .. }
+            | StreamEvent::ThinkingDelta { partial, .. }
+            | StreamEvent::ThinkingEnd { partial, .. }
+            | StreamEvent::ToolCallStart { partial, .. }
+            | StreamEvent::ToolCallDelta { partial, .. }
+            | StreamEvent::ToolCallEnd { partial, .. } => partial,
+            StreamEvent::Done { .. } | StreamEvent::Error { .. } => continue,
+        };
+        if let Some(first) = first {
+            assert!(first.ptr_eq(partial), "all deltas share one live partial");
+        } else {
+            first = Some(partial);
+        }
+    }
+}
+
 async fn collect(
     stream: rpi_ai::utils::event_stream::AssistantMessageEventStream,
 ) -> Vec<StreamEvent> {
-    tokio::time::timeout(Duration::from_secs(10), stream.collect())
+    let events: Vec<StreamEvent> = tokio::time::timeout(Duration::from_secs(10), stream.collect())
         .await
-        .expect("stream completes within 10s")
+        .expect("stream completes within 10s");
+    assert_one_live_partial(&events);
+    events
 }
 
 /// Writes `contents` to a unique temp file and returns its path (removed by

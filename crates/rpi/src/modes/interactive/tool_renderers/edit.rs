@@ -4,14 +4,17 @@
 //! `computeEditsDiff`, edit-diff.ts:518-547) @ pi 0.82.1 (2efa728) (T17).
 //!
 //! Intentional differences:
-//! - The preview computation is synchronous: upstream starts an async
-//!   `computeEditsDiff` when `argsComplete` is first seen and invalidates
-//!   once the promise settles (edit.ts:381-390), so the preview appears one
-//!   frame later; here `render_call` reads the file and runs the ported diff
-//!   engine (`crate::tools::edit_diff::compute_edits_diff`) inline, so the
-//!   preview is visible in the same frame as `argsComplete`. The
-//!   `preview_pending` flag is kept for state-shape parity and is always
-//!   false outside that synchronous window. Visible behavior is equivalent.
+//! - The preview computation runs **off the driver thread** (rpi#78 A4).
+//!   Upstream starts an async `computeEditsDiff` when `argsComplete` is first
+//!   seen and invalidates once the promise settles (edit.ts:381-390); rpi runs
+//!   the same request on a worker thread and applies the result on the next
+//!   render (`requestRender` wakes the driver). Reading the file and running
+//!   two Myers diffs inline used to stall the TUI for tens to hundreds of
+//!   milliseconds on the single driver thread that also renders and handles
+//!   input. The preview therefore appears one frame later than before, with
+//!   identical rendered bytes; stale results are dropped by
+//!   `previewArgsKey` and repeated requests for the same `(args, mtime)` pair
+//!   are served from a cache.
 //! - Upstream keeps the call component in `EditRenderState.callComponent`
 //!   and reuses it through `context.lastComponent` (edit.ts:166-178,
 //!   tool-execution.ts:117-124); here the state holds only the preview
@@ -30,13 +33,13 @@
 //! - The tool renders its own framing (`renderShell: "self"`, edit.ts:310):
 //!   the call box carries the header background and the diff body itself.
 
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::{ColorFn, Text};
-use rpi_tui::tui::{Component, Container};
+use rpi_tui::tui::{Component, Container, RenderHandle};
 use serde_json::{Value, json};
 
 use super::render_utils::{render_tool_path, str_value};
@@ -76,6 +79,31 @@ struct EditRenderStateInner {
     preview_args_key: Option<String>,
     preview_pending: bool,
     settled_error: bool,
+    /// In-flight preview worker (set while `preview_pending`).
+    job: Option<PreviewJobCell>,
+    /// Last computed preview keyed by `args key + file mtime`.
+    cache: Option<(String, EditPreview)>,
+}
+
+impl EditRenderState {
+    /// Test seam (rpi#78 A4): whether the async preview is still in flight.
+    #[cfg(test)]
+    pub(crate) fn preview_pending(&self) -> bool {
+        lock_recover(&self.inner).preview_pending
+    }
+}
+
+/// Where a preview worker hands its result back. The driver thread drains it at
+/// the start of the next `render_call`, so `preview_pending` is the only state
+/// shared across threads.
+type PreviewJobCell = Arc<Mutex<Option<PreviewJobOutcome>>>;
+
+struct PreviewJobOutcome {
+    /// The `previewArgsKey` the diff was computed for; a mismatch means the
+    /// args moved on and the result must be dropped (edit.ts:385-388).
+    args_key: Option<String>,
+    cache_key: String,
+    preview: EditPreview,
 }
 
 /// The `{ path, edits }` input for the preview (edit.ts:137-143).
@@ -332,6 +360,88 @@ fn build_edit_call_component(
     component
 }
 
+/// Cache key for a preview request: the args identity plus the file's current
+/// mtime, so a repeated request for an unchanged file is served from the cache
+/// while a file that changed since the computation is diffed again.
+fn preview_cache_key(args_key: Option<&str>, path: &str, cwd: &Path) -> String {
+    let resolved = crate::tools::path_utils::resolve_to_cwd(path, cwd);
+    let mtime = std::fs::metadata(&resolved)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+    format!("{}\x00{mtime}", args_key.unwrap_or_default())
+}
+
+/// `computeEditsDiff` + the `EditDiffResult | EditDiffError` shape.
+fn compute_preview(
+    path: &str,
+    replacements: &[EditReplacement],
+    cwd: &Path,
+    args_key: Option<String>,
+    cache_key: String,
+) -> PreviewJobOutcome {
+    let result = compute_edits_diff(path, replacements, cwd);
+    let preview = match result.error {
+        Some(error) => EditPreview::Error { error },
+        None => EditPreview::Diff {
+            diff: result.diff.unwrap_or_default(),
+            first_changed_line: result.first_changed_line,
+        },
+    };
+    PreviewJobOutcome {
+        args_key,
+        cache_key,
+        preview,
+    }
+}
+
+/// Run the request on a worker thread and enqueue a component-targeted driver
+/// rebuild when it lands. A failed spawn degrades to the inline computation
+/// (correctness first), followed by the same invalidation path.
+fn spawn_preview_job(
+    input: &RenderablePreviewInput,
+    args_key: Option<String>,
+    cache_key: String,
+    cwd: PathBuf,
+    cell: PreviewJobCell,
+    invalidate: RenderHandle,
+) {
+    let path = input.path.clone();
+    let replacements = input.replacements();
+    let fallback_replacements = replacements.clone();
+    let worker_cell = Arc::clone(&cell);
+    let worker_key = args_key.clone();
+    let worker_cache_key = cache_key.clone();
+    let worker_cwd = cwd.clone();
+    let worker_invalidate = invalidate.clone();
+    let spawned = std::thread::Builder::new()
+        .name("rpi-edit-preview".to_owned())
+        .spawn(move || {
+            let outcome = compute_preview(
+                &path,
+                &replacements,
+                &worker_cwd,
+                worker_key,
+                worker_cache_key,
+            );
+            *lock_recover(&worker_cell) = Some(outcome);
+            worker_invalidate.request_render();
+        });
+    if spawned.is_err() {
+        let outcome = compute_preview(
+            &input.path,
+            &fallback_replacements,
+            &cwd,
+            args_key,
+            cache_key,
+        );
+        *lock_recover(&cell) = Some(outcome);
+        invalidate.request_render();
+    }
+}
+
 /// The edit tool's render definition (edit.ts:297-437).
 pub struct EditToolRenderer;
 
@@ -349,39 +459,58 @@ impl ToolDefinition for EditToolRenderer {
             .map(|input| preview_args_key(&input.path, &input.edits));
 
         let mut inner = lock_recover(&state.inner);
+        // Drain a finished worker (rpi#78 A4): the driver thread applies the
+        // result during its next render, exactly one frame after the request.
+        if let Some(outcome) = inner
+            .job
+            .as_ref()
+            .and_then(|cell| lock_recover(cell).take())
+        {
+            inner.job = None;
+            inner.preview_pending = false;
+            if inner.preview_args_key == outcome.args_key {
+                inner.cache = Some((outcome.cache_key, outcome.preview.clone()));
+                set_edit_preview(&mut inner, outcome.preview, outcome.args_key.as_deref());
+            }
+        }
         // `component.previewArgsKey !== argsKey` → reset (edit.ts:374-379).
         if inner.preview_args_key != args_key {
             inner.preview = None;
             inner.preview_args_key = args_key.clone();
             inner.preview_pending = false;
             inner.settled_error = false;
+            inner.job = None;
         }
 
         // `context.argsComplete && previewInput && !preview && !previewPending`
-        // (edit.ts:381): computed synchronously — see the module doc.
+        // (edit.ts:381): start the off-thread computation (see the module doc).
         if context.args_complete
             && inner.preview.is_none()
             && !inner.preview_pending
             && let Some(input) = preview_input.as_ref()
         {
-            inner.preview_pending = true;
+            let cwd = Path::new(&context.cwd);
             let request_key = args_key.clone();
-            let result =
-                compute_edits_diff(&input.path, &input.replacements(), Path::new(&context.cwd));
-            // The requestKey race guard (edit.ts:385-388) is trivially
-            // satisfied while the lock is held (single-threaded render
-            // loop); kept for parity.
-            if inner.preview_args_key == request_key {
-                let preview = match result.error {
-                    Some(error) => EditPreview::Error { error },
-                    None => EditPreview::Diff {
-                        diff: result.diff.unwrap_or_default(),
-                        first_changed_line: result.first_changed_line,
-                    },
-                };
+            let cache_key = preview_cache_key(args_key.as_deref(), &input.path, cwd);
+            let cached = inner
+                .cache
+                .as_ref()
+                .filter(|(key, _)| *key == cache_key)
+                .map(|(_, preview)| preview.clone());
+            if let Some(preview) = cached {
                 set_edit_preview(&mut inner, preview, request_key.as_deref());
             } else {
-                inner.preview_pending = false;
+                inner.preview_pending = true;
+                let cell: PreviewJobCell = Arc::new(Mutex::new(None));
+                inner.job = Some(Arc::clone(&cell));
+                spawn_preview_job(
+                    input,
+                    request_key,
+                    cache_key,
+                    cwd.to_path_buf(),
+                    cell,
+                    context.invalidate.clone(),
+                );
             }
         }
 
@@ -430,6 +559,11 @@ impl ToolDefinition for EditToolRenderer {
                 },
                 args_key.as_deref(),
             );
+            // rpi#78 A4: the settled result is authoritative — a still-pending
+            // preview was computed against the already-edited file and must not
+            // overwrite it (the rpi#18 race, widened by the async request).
+            inner.job = None;
+            inner.preview_pending = false;
         }
         // `callComponent.settledError !== context.isError` (edit.ts:412-415).
         if inner.settled_error != context.is_error {
@@ -488,6 +622,7 @@ mod tests {
             args,
             tool_call_id: "call_1".to_owned(),
             render_handle: RenderHandle::new(|| {}),
+            invalidate: RenderHandle::new(|| {}),
             state: state.clone(),
             cwd: "/cwd".to_owned(),
             execution_started: true,
@@ -562,18 +697,36 @@ mod tests {
         }
     }
 
+    fn preview_pending(ctx: &ToolRenderContext) -> bool {
+        let state = ctx.state.get_or_init::<EditRenderState>();
+        lock_recover(&state.inner).preview_pending
+    }
+
+    /// Render the call component, waiting for an in-flight preview worker
+    /// (rpi#78 A4: the async diff lands on the next render, exactly like the
+    /// upstream promise).
     fn call_component_lines(
         renderer: &EditToolRenderer,
         args: &Value,
         theme: &Theme,
         ctx: &ToolRenderContext,
     ) -> (Vec<String>, String) {
-        let component = renderer
-            .render_call(args, theme, ctx)
-            .expect("call component");
-        let lines = component.render(80);
-        let stripped = strip_ansi(&lines.join("\n"));
-        (lines, stripped)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let component = renderer
+                .render_call(args, theme, ctx)
+                .expect("call component");
+            let lines = component.render(80);
+            let stripped = strip_ansi(&lines.join("\n"));
+            if !preview_pending(ctx) {
+                return (lines, stripped);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the edit preview worker never settled: {stripped}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     #[test]
@@ -600,7 +753,8 @@ mod tests {
         assert!(!stripped.contains("Hello, testing!"));
         assert!(lines[0].starts_with(theme.get_bg_ansi("toolPendingBg")));
 
-        // After argsComplete the diff preview appears in the same frame.
+        // After argsComplete the diff preview is computed off-thread and lands
+        // on the next render (rpi#78 A4).
         ctx.args_complete = true;
         let (lines, stripped) = call_component_lines(&renderer, &args, &theme, &ctx);
         assert!(stripped.contains("edit src.txt"), "stripped: {stripped}");
@@ -999,5 +1153,94 @@ mod tests {
         );
         assert!(get_renderable_preview_input(&json!({"path": "a.txt", "oldText": "x"})).is_none());
         assert!(get_renderable_preview_input(&json!({})).is_none());
+    }
+
+    /// rpi#78 A4: the `argsComplete` render must RETURN without computing the
+    /// diff (file read + two Myers diffs used to run on the driver thread).
+    #[test]
+    fn args_complete_returns_before_the_diff_is_computed() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.path().join("src.txt"), "Hello, world!").unwrap();
+        let theme = theme();
+        let state = RendererStateSlot::default();
+        let renderer = EditToolRenderer;
+        let args =
+            json!({"path": "src.txt", "edits": [{"oldText": "world", "newText": "testing"}]});
+        let mut ctx = context(&state, args.clone());
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+
+        let (_, stripped) = {
+            let component = renderer
+                .render_call(&args, &theme, &ctx)
+                .expect("call component");
+            let lines = component.render(80);
+            let stripped = strip_ansi(&lines.join("\n"));
+            (lines, stripped)
+        };
+        assert!(
+            preview_pending(&ctx),
+            "the preview must be in flight, not computed inline"
+        );
+        assert!(stripped.contains("edit src.txt"), "stripped: {stripped}");
+        assert!(
+            !stripped.contains("+1 Hello, testing!"),
+            "stripped: {stripped}"
+        );
+
+        // The worker's result lands on a later render.
+        let (_, settled) = call_component_lines(&renderer, &args, &theme, &ctx);
+        assert!(!preview_pending(&ctx));
+        assert!(settled.contains("+1 Hello, testing!"), "settled: {settled}");
+    }
+
+    /// The `previewArgsKey` race guard (edit.ts:385-388): a result computed for
+    /// args that have since changed must never be applied.
+    #[test]
+    fn stale_worker_result_is_dropped() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.path().join("a.txt"), "alpha").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "beta").unwrap();
+        let theme = theme();
+        let state = RendererStateSlot::default();
+        let renderer = EditToolRenderer;
+        let mut ctx = context(&state, json!({}));
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+
+        let args_a = json!({"path": "a.txt", "edits": [{"oldText": "alpha", "newText": "ALPHA"}]});
+        let _ = renderer.render_call(&args_a, &theme, &ctx).expect("call A");
+        let args_b = json!({"path": "b.txt", "edits": [{"oldText": "beta", "newText": "BETA"}]});
+        let (_, stripped) = call_component_lines(&renderer, &args_b, &theme, &ctx);
+        assert!(stripped.contains("+1 BETA"), "stripped: {stripped}");
+        assert!(
+            !stripped.contains("ALPHA"),
+            "stale preview applied: {stripped}"
+        );
+    }
+
+    /// A repeated request for the same `(args, mtime)` is served from the cache
+    /// without another diff run (the upstream promise-result cache shape).
+    #[test]
+    fn repeated_request_hits_the_preview_cache() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.path().join("src.txt"), "Hello, world!").unwrap();
+        let theme = theme();
+        let state = RendererStateSlot::default();
+        let renderer = EditToolRenderer;
+        let args =
+            json!({"path": "src.txt", "edits": [{"oldText": "world", "newText": "testing"}]});
+        let mut ctx = context(&state, args.clone());
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        let (_, first) = call_component_lines(&renderer, &args, &theme, &ctx);
+        assert!(first.contains("+1 Hello, testing!"), "first: {first}");
+
+        // Drop the applied preview (as a state reset would) but keep the cache.
+        {
+            let render_state = state.get_or_init::<EditRenderState>();
+            let mut inner = lock_recover(&render_state.inner);
+            inner.preview = None;
+            inner.preview_pending = false;
+        }
+        let (_, second) = call_component_lines(&renderer, &args, &theme, &ctx);
+        assert_eq!(second, first, "the cached preview renders identically");
     }
 }

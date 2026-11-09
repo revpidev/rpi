@@ -237,6 +237,7 @@ mod tests {
             args: serde_json::json!({}),
             tool_call_id: "call-1".to_owned(),
             render_handle: rpi_tui::tui::RenderHandle::new(|| {}),
+            invalidate: rpi_tui::tui::RenderHandle::new(|| {}),
             state: super::super::components::tool_execution::RendererStateSlot::default(),
             cwd: "/w".to_owned(),
             execution_started: true,
