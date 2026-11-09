@@ -128,7 +128,7 @@ jobs:
 
       # ---- Linux cross toolchains (installation methods natively supported by GitHub runners) ----
 
-      - name: Install musl toolchain (x64)
+      - name: Install musl toolchain (x64 static fallback)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
@@ -138,12 +138,15 @@ jobs:
         # rpi-ext-smart-fetch) compiles C++ through the cmake crate.
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      # arm64 musl: apt has no ready-made toolchain, and the large musl.cc files are
-      # unstable on runners (108MB download timeouts); switched to the cross-rs container
-      # approach — the cross binary comes from GitHub Releases and the images from ghcr.io,
-      # both on GitHub's own CDN.
-      - name: Install cross (arm64 musl)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
+      # Both musl targets build in the cross-rs container (the large musl.cc
+      # toolchain files were unstable on runners; cross and its images come
+      # from GitHub's CDN). apt has no aarch64 musl toolchain at all, and for
+      # x86_64 the apt musl-tools sysroot only has libc, so musl-gcc cannot
+      # resolve the dynamic libgcc_s.so.1 that V18-13's `-crt-static` off build
+      # needs ("cannot find libgcc_s.so.1"). The crosstool-ng sysroot in the
+      # cross image carries it.
+      - name: Install cross (musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl' || matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           curl -sL --retry 5 --retry-all-errors \
             https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-gnu.tar.gz \
@@ -187,19 +190,8 @@ jobs:
       # dlopen a cdylib ("Dynamic loading not supported"); `-crt-static` off is
       # what makes native plugins possible. The Cargo target triple (and asset
       # name) stays the same.
-      - name: Build (x64 musl, dynamic)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        env:
-          RUSTFLAGS: -C target-feature=-crt-static -C link-self-contained=no
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: |
-          cargo build --release --target ${{ matrix.target }} --bin rpi
-          cargo build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
-        shell: bash
-
-      - name: Build (arm64 musl, dynamic, via cross container)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
+      - name: Build (musl, dynamic, via cross container)
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
         env:
           RUSTFLAGS: -C target-feature=-crt-static
         run: |
