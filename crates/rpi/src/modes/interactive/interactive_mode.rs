@@ -43,8 +43,8 @@
 //! - `bindExtensions` is called with `mode: None` (upstream binds via
 //!   `bindCurrentSessionExtensions` with no explicit mode for interactive).
 //! - Startup notices are ported (`show_startup_notices_if_needed`, V17-07
-//!   #68 — the changelog asset in condensed or full form); the package-update
-//!   check (npm-registry probing, not a product endpoint) is not ported; the
+//!   #68 — the changelog asset in condensed or full form); the asynchronous
+//!   package-update check follows the running host's stable/RC channel; the
 //!   startup version check and install telemetry landed with T14-W6a
 //!   (ADR-0002 §8); the tmux keyboard checks landed with V17-10 #65
 //!   (`tmux_check`, async probe at startup);
@@ -548,6 +548,12 @@ pub(crate) enum UiCommand {
     /// Mode-internal: the startup version check found a newer release
     /// (interactive-mode.ts:843-847 → `showNewVersionNotification`).
     NewVersionAvailable(crate::core::version_check::LatestRpiRelease),
+    /// The blocking startup package probe completed. It is drained even with
+    /// no updates so Windows can restore the terminal title after npm exits.
+    PackageUpdateCheckCompleted {
+        packages: Vec<String>,
+        channel: crate::core::version_check::UpdateChannel,
+    },
     /// Mode-internal: the async tmux keyboard check resolved with a warning
     /// (interactive-mode.ts:1180-1185 → `showWarning`). Routed through the
     /// drain like every other async result (the chat container is mutated
@@ -1516,6 +1522,9 @@ struct SelectorFrame {
     push: bool,
 }
 
+pub(crate) type PackageUpdateChecker =
+    dyn Fn(crate::core::version_check::UpdateChannel) -> Vec<String> + Send + Sync;
+
 pub(crate) struct InteractiveUi {
     pub(crate) ui: TuiHandle,
     /// The bound session. Replaceable behind an `RwLock` so session
@@ -1694,6 +1703,9 @@ pub(crate) struct InteractiveUi {
     /// [`InteractiveUi::set_latest_version_transport`] (same M1 discipline).
     pub(crate) latest_version_transport:
         Mutex<Arc<dyn crate::core::version_check::LatestVersionTransport>>,
+    /// Blocking startup package probe. Tests replace it with a no-op so the
+    /// interactive suite never reaches npm, Git, or the extension registry.
+    package_update_checker: Mutex<Arc<PackageUpdateChecker>>,
     /// In-flight `/share` state between the loader swap and the gist
     /// worker's completion (interactive-mode.ts:5540-5560). `None` once the
     /// drain has settled the share (success, failure or abort) — the
@@ -2261,6 +2273,11 @@ impl InteractiveUi {
         transport: Arc<dyn crate::core::version_check::LatestVersionTransport>,
     ) {
         *lock(&self.latest_version_transport) = transport;
+    }
+
+    #[allow(dead_code)] // test hook (lib builds never swap the checker)
+    pub(crate) fn set_package_update_checker(&self, checker: Arc<PackageUpdateChecker>) {
+        *lock(&self.package_update_checker) = checker;
     }
 
     /// The live `Arc<InteractiveUi>` for callbacks that need one; `None`
@@ -3155,6 +3172,13 @@ impl InteractiveUi {
                 // (interactive-mode.ts:843-847), routed through the drain
                 // like every other async result.
                 self.show_new_version_notification(&release);
+            }
+            UiCommand::PackageUpdateCheckCompleted { packages, channel } => {
+                if !packages.is_empty() {
+                    self.show_package_update_notification(&packages, channel);
+                }
+                #[cfg(windows)]
+                self.update_terminal_title();
             }
             UiCommand::ShowWarning(message) => {
                 // `checkTmuxKeyboardSetup().then((warning) => ...)`
@@ -4599,6 +4623,53 @@ impl InteractiveUi {
         }
         self.add_chat_child(Box::new(Text::new(changelog_line, 1, 0, None)));
         self.add_chat_child(Box::new(DynamicBorder::new(emphasis_border(&theme))));
+        self.render_handle.request_render();
+    }
+
+    /// `showPackageUpdateNotification` (interactive-mode.ts:4636-4654):
+    /// list every outdated package and use the running host's registry
+    /// channel in the update command.
+    pub(crate) fn show_package_update_notification(
+        &self,
+        packages: &[String],
+        channel: crate::core::version_check::UpdateChannel,
+    ) {
+        let theme = Arc::clone(&lock(&self.theme));
+        let command = match channel {
+            crate::core::version_check::UpdateChannel::Stable => {
+                format!("{APP_NAME} update --extensions")
+            }
+            crate::core::version_check::UpdateChannel::PreRelease => {
+                format!("{APP_NAME} update --extensions --rc")
+            }
+        };
+        let instruction = theme.fg("muted", "Package updates are available. Run ")
+            + &theme.fg("accent", &command);
+        let package_lines = packages
+            .iter()
+            .map(|package| format!("- {package}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let heading =
+            crate::core::themes::Theme::bold(&theme.fg("warning", "Package Updates Available"));
+        let border = || {
+            let theme = Arc::clone(&theme);
+            Box::new(move |text: &str| theme.fg("warning", text))
+                as rpi_tui::components::text::ColorFn
+        };
+
+        self.add_chat_child(Box::new(Spacer::new(1)));
+        self.add_chat_child(Box::new(DynamicBorder::new(border())));
+        self.add_chat_child(Box::new(Text::new(
+            format!(
+                "{heading}\n{instruction}\n{}\n{package_lines}",
+                theme.fg("muted", "Packages:")
+            ),
+            1,
+            0,
+            None,
+        )));
+        self.add_chat_child(Box::new(DynamicBorder::new(border())));
         self.render_handle.request_render();
     }
 
@@ -6140,6 +6211,34 @@ impl InteractiveMode {
             Arc::new(Mutex::new(container))
         };
 
+        let package_update_checker: Arc<PackageUpdateChecker> = {
+            let cwd = cwd.clone();
+            let agent_dir = agent_dir.clone();
+            let project_trusted =
+                session.settings_manager(|settings| settings.is_project_trusted());
+            Arc::new(move |channel| {
+                let settings_manager = crate::core::settings_manager::SettingsManager::create(
+                    &cwd,
+                    Some(&agent_dir),
+                    crate::core::settings_manager::SettingsManagerCreateOptions { project_trusted },
+                );
+                let manager = crate::core::package_manager::DefaultPackageManager::new(
+                    cwd.clone(),
+                    agent_dir.clone(),
+                    settings_manager,
+                );
+                manager
+                    .check_for_available_updates_with_channel(channel)
+                    .map(|updates| {
+                        updates
+                            .into_iter()
+                            .map(|update| update.display_name)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+        };
+
         let ui_state = Arc::new(InteractiveUi {
             ui: ui.clone(),
             session: RwLock::new(session.clone()),
@@ -6209,6 +6308,7 @@ impl InteractiveMode {
             latest_version_transport: Mutex::new(Arc::new(
                 crate::core::version_check::ReqwestLatestVersionTransport,
             )),
+            package_update_checker: Mutex::new(package_update_checker),
             share_state: Mutex::new(None),
             last_sigint_time: AtomicU64::new(0),
             last_escape_time: AtomicU64::new(0),
@@ -6662,6 +6762,20 @@ impl InteractiveMode {
         ui_state.update_terminal_title();
     }
 
+    /// Start the upstream package-update probe without blocking the UI.
+    /// The result returns through the normal driver-thread event drain.
+    fn start_package_update_check(&self) {
+        let channel = crate::core::version_check::channel_of_version(VERSION);
+        let checker = lock(&self.ui_state.package_update_checker).clone();
+        let ui_state = Arc::clone(&self.ui_state);
+        tokio::spawn(async move {
+            let Ok(packages) = tokio::task::spawn_blocking(move || checker(channel)).await else {
+                return;
+            };
+            ui_state.push(UiCommand::PackageUpdateCheckCompleted { packages, channel });
+        });
+    }
+
     /// Run the interactive mode (interactive-mode.ts:832-920): drive the TUI
     /// from a dedicated thread while this loop sequences prompts.
     pub async fn run(&mut self) {
@@ -6690,6 +6804,8 @@ impl InteractiveMode {
                 }
             });
         }
+
+        self.start_package_update_check();
 
         let driver_ui = self.ui.clone();
         let driver_shared = Arc::clone(&self.ui_state);
@@ -8351,6 +8467,7 @@ mod tests {
             UiCommand::SwitchTuiMode(_) => "switch_tui_mode",
             UiCommand::GitBranchChanged => "git_branch_changed",
             UiCommand::NewVersionAvailable(_) => "new_version_available",
+            UiCommand::PackageUpdateCheckCompleted { .. } => "package_update_check_completed",
             UiCommand::ShowWarning(_) => "show_warning",
             UiCommand::ShareAbort => "share_abort",
             UiCommand::ShareCompleted(_) => "share_completed",
@@ -9465,6 +9582,78 @@ mod tests {
         );
         // The stable action is not present (avoid mixing the two lines).
         assert!(!rendered.contains("--self"), "rendered: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn package_update_notifications_use_channel_specific_commands() {
+        for (channel, expected_command) in [
+            (
+                crate::core::version_check::UpdateChannel::Stable,
+                "rpi update --extensions",
+            ),
+            (
+                crate::core::version_check::UpdateChannel::PreRelease,
+                "rpi update --extensions --rc",
+            ),
+        ] {
+            let (mode, _terminal, _session) = mode_harness().await;
+            let ui = &mode.ui_state;
+            let before = chat_children(ui);
+            ui.push(UiCommand::PackageUpdateCheckCompleted {
+                packages: vec!["rpi-statusline".to_string(), "rpi-subagents".to_string()],
+                channel,
+            });
+            ui.drain_events();
+            assert_eq!(chat_children(ui) - before, 4);
+            let rendered = lock(&ui.chat_container).render(100).join("\n");
+            assert!(rendered.contains("Package Updates Available"), "{rendered}");
+            assert!(rendered.contains(expected_command), "{rendered}");
+            assert!(rendered.contains("- rpi-statusline"), "{rendered}");
+            assert!(rendered.contains("- rpi-subagents"), "{rendered}");
+            if channel == crate::core::version_check::UpdateChannel::Stable {
+                assert!(!rendered.contains("--rc"), "{rendered}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_package_check_queues_updates_for_the_running_channel() {
+        let (mode, _terminal, _session) = mode_harness().await;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let checker_observed = Arc::clone(&observed);
+        mode.ui_state
+            .set_package_update_checker(Arc::new(move |channel| {
+                lock(&checker_observed).push(channel);
+                vec!["rpi-statusline".to_string()]
+            }));
+
+        mode.start_package_update_check();
+        let before = chat_children(&mode.ui_state);
+        for _ in 0..100 {
+            mode.ui_state.drain_events();
+            if chat_children(&mode.ui_state) > before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let running_channel = crate::core::version_check::channel_of_version(VERSION);
+        assert_eq!(*lock(&observed), vec![running_channel]);
+        let rendered = lock(&mode.ui_state.chat_container).render(100).join("\n");
+        assert!(rendered.contains("Package Updates Available"), "{rendered}");
+        assert!(rendered.contains("- rpi-statusline"), "{rendered}");
+        match running_channel {
+            crate::core::version_check::UpdateChannel::Stable => {
+                assert!(rendered.contains("rpi update --extensions"), "{rendered}");
+                assert!(!rendered.contains("--rc"), "{rendered}");
+            }
+            crate::core::version_check::UpdateChannel::PreRelease => {
+                assert!(
+                    rendered.contains("rpi update --extensions --rc"),
+                    "{rendered}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -341,8 +341,8 @@ pub(crate) struct TestSession {
 // ---------------------------------------------------------------------------
 //
 // Unit tests must never emit real requests to product endpoints (revpi.dev
-// install telemetry / version checks). Every mode test harness swaps the
-// production transports for these no-ops via
+// install telemetry / version checks / extension updates). Every mode test
+// harness swaps the production transports and package checker for no-ops via
 // [`install_noop_product_transports`]; the optional counters let a test
 // assert the injection actually carries the calls.
 
@@ -397,6 +397,8 @@ pub(crate) fn install_noop_product_transports(
     mode.ui_state
         .set_latest_version_transport(Arc::clone(&latest_version)
             as Arc<dyn crate::core::version_check::LatestVersionTransport>);
+    mode.ui_state
+        .set_package_update_checker(Arc::new(|_| Vec::new()));
     (report_install, latest_version)
 }
 

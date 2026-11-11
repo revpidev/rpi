@@ -79,7 +79,7 @@ use crate::core::skills::{
     glob_match, is_enabled_by_overrides, lexical_relative, match_candidates,
     matches_any_exact_pattern, matches_any_pattern, split_patterns,
 };
-use crate::core::version_check::{UpdateChannel, is_newer_package_version};
+use crate::core::version_check::{UpdateChannel, channel_of_version, is_newer_package_version};
 use crate::tools::path_utils::resolve_path;
 
 /// `NETWORK_TIMEOUT_MS` (package-manager.ts:38).
@@ -784,11 +784,13 @@ pub struct PackageUpdate {
     pub scope: SourceScope,
 }
 
-/// `PackageUpdate["type"]`.
+/// `PackageUpdate["type"]`, plus the rpi-specific artifact channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageUpdateKind {
     Npm,
     Git,
+    Registry,
+    GithubRelease,
 }
 
 /// `ConfiguredUpdateSource` (package-manager.ts, `update` locals), plus
@@ -3041,6 +3043,46 @@ impl DefaultPackageManager {
         Ok(())
     }
 
+    /// Apply only defaults whose per-key migration version increased from the
+    /// manifest installed before this update. Legacy manifests have version
+    /// zero, including rc installs that carried defaults before update
+    /// migrations existed. Unversioned defaults remain install-only.
+    fn apply_updated_default_settings(
+        &mut self,
+        source: &str,
+        scope: SourceScope,
+        previous_migration: serde_json::Map<String, Value>,
+    ) -> Result<(), String> {
+        if scope != SourceScope::User {
+            return Ok(());
+        }
+        let Some(dir) = self.get_installed_path(source, scope) else {
+            return Ok(());
+        };
+        let Some(defaults) = extension_registry::installed_extension_default_settings(&dir) else {
+            return Ok(());
+        };
+        let migration = extension_registry::installed_extension_default_settings_migration(&dir)
+            .unwrap_or_default();
+        let defaults: serde_json::Map<String, Value> = defaults
+            .into_iter()
+            .filter(|(key, _)| {
+                let next = migration.get(key).and_then(Value::as_u64);
+                let previous = previous_migration
+                    .get(key)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                next.is_some_and(|version| version > previous)
+            })
+            .collect();
+        self.settings_manager
+            .apply_global_defaults(&defaults)
+            .map_err(|error| {
+                format!("Updated {source}, but could not apply its default settings: {error}")
+            })?;
+        Ok(())
+    }
+
     /// `remove` (package-manager.ts:1023-1041).
     pub fn remove(&self, source: &str, local: bool) -> Result<(), String> {
         let parsed = parse_source(source);
@@ -3189,7 +3231,7 @@ impl DefaultPackageManager {
     /// installed-but-untracked extensions (older installs, hand-copied
     /// dev builds, orphaned `github:` directories); a single-source
     /// update matches them by identity too.
-    pub fn update(&self, source: Option<&str>) -> Result<(), String> {
+    pub fn update(&mut self, source: Option<&str>) -> Result<(), String> {
         self.update_with_channel(source, UpdateChannel::Stable)
     }
 
@@ -3199,7 +3241,7 @@ impl DefaultPackageManager {
     /// 与旧行为一致（预发布被 [`extension_registry::select_registry_version`]
     /// 过滤）。`github:`/npm/git 源不感知通道（R6.3.4）。
     pub fn update_with_channel(
-        &self,
+        &mut self,
         source: Option<&str>,
         channel: UpdateChannel,
     ) -> Result<(), String> {
@@ -3211,7 +3253,7 @@ impl DefaultPackageManager {
     /// shipped path is the two-phase plan/apply pair so the legacy and
     /// planned paths can never diverge.
     pub fn update_with_channel_exact(
-        &self,
+        &mut self,
         source: Option<&str>,
         channel: UpdateChannel,
         exact_version: Option<&str>,
@@ -3500,7 +3542,7 @@ impl DefaultPackageManager {
     /// Registry/`github:` rows reuse the cached resolution; npm/git rows
     /// still go through the command runner. One failing source does not
     /// stop the rest; the first error is returned after the loop.
-    pub fn apply_update_plan(&self, plan: &UpdatePlan) -> (UpdateApplySummary, Option<String>) {
+    pub fn apply_update_plan(&mut self, plan: &UpdatePlan) -> (UpdateApplySummary, Option<String>) {
         let mut summary = UpdateApplySummary::default();
         let mut first_error: Option<String> = None;
         for entry in &plan.entries {
@@ -3548,6 +3590,17 @@ impl DefaultPackageManager {
                     }
                 }
                 UpdatePlanAction::Update => {
+                    let previous_migration = if entry.scope == SourceScope::User {
+                        self.get_installed_path(&entry.source, entry.scope)
+                            .and_then(|dir| {
+                                extension_registry::installed_extension_default_settings_migration(
+                                    &dir,
+                                )
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        serde_json::Map::new()
+                    };
                     let result = if let Some(npm) = &entry.npm {
                         let spec = match &npm.parsed.version {
                             Some(_) => npm.parsed.spec.clone(),
@@ -3586,6 +3639,14 @@ impl DefaultPackageManager {
                             "No resolved artifact for update plan row {}",
                             entry.source
                         ))
+                    };
+                    let result = match result {
+                        Ok(()) => self.apply_updated_default_settings(
+                            &entry.source,
+                            entry.scope,
+                            previous_migration,
+                        ),
+                        Err(error) => Err(error),
                     };
                     match result {
                         Ok(()) => summary.updated += 1,
@@ -3726,8 +3787,19 @@ impl DefaultPackageManager {
 
     /// `checkForAvailableUpdates` (package-manager.ts:1175-1238): local and
     /// pinned sources never report updates; the per-package checks run with
-    /// concurrency 4. Offline returns an empty list.
+    /// concurrency 4. Offline returns an empty list. The running host version
+    /// selects the stable or pre-release registry channel.
     pub fn check_for_available_updates(&self) -> Result<Vec<PackageUpdate>, String> {
+        self.check_for_available_updates_with_channel(channel_of_version(config::VERSION))
+    }
+
+    /// Update probe with an explicit registry channel. Discovered installs
+    /// participate too, matching the extensions that the loader and `update`
+    /// can see even when an installer left them without a settings entry.
+    pub fn check_for_available_updates_with_channel(
+        &self,
+        channel: UpdateChannel,
+    ) -> Result<Vec<PackageUpdate>, String> {
         if self.offline {
             return Ok(Vec::new());
         }
@@ -3743,17 +3815,27 @@ impl DefaultPackageManager {
 
         // Settings only carry user/project entries; the temporary-scope
         // filter is upstream parity (package-manager.ts:1191-1195).
-        let checks: Vec<(String, SourceScope)> = package_sources
+        let mut checks: Vec<(String, SourceScope)> = package_sources
             .iter()
             .filter(|(_, scope)| *scope != SourceScope::Temporary)
             .map(|(pkg, scope)| (Self::package_source_string(pkg).to_string(), *scope))
             .collect();
+        for discovered in self.discover_installed_extension_sources() {
+            let identity = self.get_package_identity(&discovered.source, Some(discovered.scope));
+            if package_sources.iter().any(|(pkg, scope)| {
+                self.get_package_identity(Self::package_source_string(pkg), Some(*scope))
+                    == identity
+            }) {
+                continue;
+            }
+            checks.push((discovered.source, discovered.scope));
+        }
         let results = run_with_concurrency(
             checks
                 .iter()
                 .map(|(source, scope)| {
                     let manager = &*self;
-                    move || manager.check_one_for_available_update(source, *scope)
+                    move || manager.check_one_for_available_update(source, *scope, channel)
                 })
                 .collect(),
             UPDATE_CHECK_CONCURRENCY,
@@ -3762,10 +3844,13 @@ impl DefaultPackageManager {
     }
 
     /// One `checkForAvailableUpdates` probe (package-manager.ts:1196-1234).
+    /// Registry resolution failures are non-updates, matching the existing
+    /// best-effort npm/git startup probes.
     fn check_one_for_available_update(
         &self,
         source: &str,
         scope: SourceScope,
+        channel: UpdateChannel,
     ) -> Result<Option<PackageUpdate>, String> {
         match parse_source(source) {
             ParsedSource::Local(_) => Ok(None),
@@ -3805,10 +3890,51 @@ impl DefaultPackageManager {
                     scope,
                 }))
             }
-            // Registry/`github:` sources are not part of the startup
-            // update probe (PackageUpdateKind has no variant for them);
-            // `update` re-resolves them by range directly.
-            ParsedSource::Registry(_) | ParsedSource::GithubRelease(_) => Ok(None),
+            ParsedSource::Registry(parsed) => {
+                let Some(installed_path) = self.get_installed_path(source, scope) else {
+                    return Ok(None);
+                };
+                let Some(current) =
+                    extension_registry::installed_extension_version(&installed_path)
+                else {
+                    return Ok(None);
+                };
+                let Ok(resolved) = self.resolve_registry_install_with_channel(&parsed, channel)
+                else {
+                    return Ok(None);
+                };
+                if !is_newer_package_version(&resolved.info.version, &current) {
+                    return Ok(None);
+                }
+                Ok(Some(PackageUpdate {
+                    source: source.to_string(),
+                    display_name: parsed.name,
+                    kind: PackageUpdateKind::Registry,
+                    scope,
+                }))
+            }
+            ParsedSource::GithubRelease(parsed) => {
+                let Some(installed_path) = self.find_github_install_dir(&parsed, scope) else {
+                    return Ok(None);
+                };
+                let Some(current) =
+                    extension_registry::installed_extension_version(&installed_path)
+                else {
+                    return Ok(None);
+                };
+                let Ok((resolved, _tag)) = self.resolve_github_install(&parsed) else {
+                    return Ok(None);
+                };
+                if !is_newer_package_version(&resolved.info.version, &current) {
+                    return Ok(None);
+                }
+                Ok(Some(PackageUpdate {
+                    source: source.to_string(),
+                    display_name: format!("{}/{}", parsed.owner, parsed.repo),
+                    kind: PackageUpdateKind::GithubRelease,
+                    scope,
+                }))
+            }
         }
     }
 
@@ -7431,7 +7557,7 @@ mod update_tests {
     fn test_update_without_packages_is_noop() {
         let dirs = TestDirs::new();
         let runner = FakeRunner::ok();
-        let manager = manager(&dirs, runner.clone());
+        let mut manager = manager(&dirs, runner.clone());
         manager.update(None).unwrap();
         assert!(runner.calls().is_empty());
     }
@@ -8486,6 +8612,140 @@ mod registry_tests {
         assert_eq!(installed["keep"], 1);
     }
 
+    /// Extension-distribution §4: an update migrates only the defaults whose
+    /// per-key migration version increases. Legacy rc installs have no
+    /// migration marker even when they already carry `defaultSettings`; once
+    /// migrated, deleting a key remains a durable opt-out on later updates.
+    #[test]
+    fn test_update_migrates_manifest_default_settings_only_once() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let mut manager = manager_ok(&dirs, transport.clone());
+        let name = "ext-defaults";
+        let defaults = r#","defaultSettings":{"statusLine":{"type":"items","items":["live-total-tokens","live-output-rate"]},"extensionOwned":{"enabled":true}}"#;
+        let migration = r#","defaultSettingsMigration":{"statusLine":1}"#;
+
+        let archive = build_rpix(name, "0.1.0", true, &[]);
+        serve_registry_archive(&transport, name, "0.1.0", archive, true);
+        manager.install_and_persist(name, false).unwrap();
+
+        // An affected rc.4 installation already has defaults but no migration
+        // marker, and its update path never wrote statusLine.
+        let archive = build_rpix_with_manifest(name, "0.2.0", true, &[], defaults);
+        serve_registry_archive(&transport, name, "0.2.0", archive, true);
+        manager.update(None).unwrap();
+        let installed: Value =
+            serde_json::from_str(&settings_packages(&dirs)).expect("settings json");
+        assert!(installed.get("statusLine").is_none());
+
+        // The fixed manifest introduces statusLine's migration version. Only
+        // that declared key is seeded; unrelated defaults stay install-only.
+        let fixed = format!("{defaults}{migration}");
+        let archive = build_rpix_with_manifest(name, "0.3.0", true, &[], &fixed);
+        serve_registry_archive(&transport, name, "0.3.0", archive, true);
+        manager.update(None).unwrap();
+        let installed: Value =
+            serde_json::from_str(&settings_packages(&dirs)).expect("settings json");
+        assert_eq!(installed["statusLine"]["type"], "items");
+        assert_eq!(
+            installed["statusLine"]["items"],
+            serde_json::json!(["live-total-tokens", "live-output-rate"])
+        );
+        assert!(installed.get("extensionOwned").is_none());
+
+        // The next update has the same migration version. Deleting statusLine
+        // is an explicit opt-out and must not be undone.
+        let path = dirs.agent_dir.join("settings.json");
+        let mut installed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("settings")).expect("json");
+        installed.as_object_mut().unwrap().remove("statusLine");
+        std::fs::write(&path, serde_json::to_string_pretty(&installed).unwrap()).unwrap();
+        let archive = build_rpix_with_manifest(name, "0.4.0", true, &[], &fixed);
+        serve_registry_archive(&transport, name, "0.4.0", archive, true);
+        manager.update(None).unwrap();
+        let installed: Value =
+            serde_json::from_str(&settings_packages(&dirs)).expect("settings json");
+        assert!(installed.get("statusLine").is_none());
+
+        // A newly versioned key migrates independently without re-enabling
+        // statusLine.
+        let later = r#","defaultSettings":{"statusLine":{"type":"items"},"laterDefault":{"enabled":true}},"defaultSettingsMigration":{"statusLine":1,"laterDefault":1}"#;
+        let archive = build_rpix_with_manifest(name, "0.5.0", true, &[], later);
+        serve_registry_archive(&transport, name, "0.5.0", archive, true);
+        manager.update(None).unwrap();
+        let installed: Value =
+            serde_json::from_str(&settings_packages(&dirs)).expect("settings json");
+        assert!(installed.get("statusLine").is_none());
+        assert_eq!(installed["laterDefault"]["enabled"], true);
+    }
+
+    #[test]
+    fn test_update_migration_preserves_existing_values_and_project_scope() {
+        let defaults = r#","defaultSettings":{"statusLine":{"type":"items"}}"#;
+        let fixed = r#","defaultSettings":{"statusLine":{"type":"items"}},"defaultSettingsMigration":{"statusLine":1}"#;
+        for initial in [
+            serde_json::json!({"type": "command", "command": "echo hi"}),
+            Value::Null,
+        ] {
+            let dirs = TestDirs::new();
+            let initial_document = if initial.is_null() {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"statusLine": initial.clone()})
+            };
+            std::fs::write(
+                dirs.agent_dir.join("settings.json"),
+                serde_json::to_string(&initial_document).unwrap(),
+            )
+            .unwrap();
+            let transport = MapTransport::new();
+            let archive = build_rpix_with_manifest("ext-defaults", "0.2.0", true, &[], defaults);
+            serve_registry_archive(&transport, "ext-defaults", "0.2.0", archive, true);
+            let mut manager = manager_ok(&dirs, transport.clone());
+            manager.install_and_persist("ext-defaults", false).unwrap();
+            if initial.is_null() {
+                // Runtime validation rejects null at load, but the defaults
+                // writer must preserve an existing on-disk null without
+                // replacing it or rewriting unrelated settings.
+                let path = dirs.agent_dir.join("settings.json");
+                let mut on_disk: Value = serde_json::from_str(
+                    &std::fs::read_to_string(&path).expect("settings before null injection"),
+                )
+                .expect("settings json");
+                on_disk["statusLine"] = Value::Null;
+                std::fs::write(&path, serde_json::to_string(&on_disk).unwrap()).unwrap();
+            }
+            let archive = build_rpix_with_manifest("ext-defaults", "0.3.0", true, &[], fixed);
+            serve_registry_archive(&transport, "ext-defaults", "0.3.0", archive, true);
+            manager.update(None).unwrap();
+            let installed: Value =
+                serde_json::from_str(&settings_packages(&dirs)).expect("settings json");
+            assert_eq!(installed["statusLine"], initial);
+        }
+
+        // Project-local updates never write the global defaults, even when a
+        // migration version increases.
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let archive = build_rpix_with_manifest("ext-defaults", "0.2.0", true, &[], defaults);
+        serve_registry_archive(&transport, "ext-defaults", "0.2.0", archive, true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("ext-defaults", true).unwrap();
+        let archive = build_rpix_with_manifest("ext-defaults", "0.3.0", true, &[], fixed);
+        serve_registry_archive(&transport, "ext-defaults", "0.3.0", archive, true);
+        manager.update(None).unwrap();
+        let global =
+            std::fs::read_to_string(dirs.agent_dir.join("settings.json")).unwrap_or_default();
+        assert!(!global.contains("statusLine"), "{global}");
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.cwd.join(".rpi/extensions/ext-defaults")
+            )
+            .as_deref(),
+            Some("0.3.0")
+        );
+    }
+
     #[test]
     fn test_install_registry_native_refused_without_confirmation() {
         let dirs = TestDirs::new();
@@ -9181,6 +9441,87 @@ mod registry_tests {
     }
 
     #[test]
+    fn test_check_for_available_updates_registry_uses_running_channel() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let name = "ext-startup";
+        let current = "0.1.0";
+        let next_stable = "0.2.0";
+        let next_rc = "0.3.0-rc.1";
+        place_untracked_extension(&dirs, name, current);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager
+            .settings_manager
+            .set_packages(vec![PackageSource::Source(name.to_string())]);
+
+        let target = config::build_target().unwrap();
+        let artifact = |version: &str| {
+            let archive = build_rpix(name, version, true, &[]);
+            serde_json::json!({
+                "version": version,
+                "rpiAbi": 1,
+                "capabilities": ["tools"],
+                "artifacts": [{
+                    "target": target,
+                    "file": format!("{name}-{version}-{target}.rpix"),
+                    "sha256": sha256_hex(&archive),
+                    "release": format!("v{version}"),
+                }]
+            })
+        };
+        let serve = |versions: Vec<serde_json::Value>| {
+            let index = serde_json::json!({
+                "schemaVersion": 1,
+                "name": name,
+                "repository": format!("acme/{name}"),
+                "kind": "native",
+                "versions": versions,
+            })
+            .to_string();
+            transport.insert(
+                &extension_registry::registry_index_url(REGISTRY_BASE, name),
+                index.into_bytes(),
+            );
+        };
+
+        serve(vec![artifact(current), artifact(next_rc)]);
+        let updates = manager.check_for_available_updates().unwrap();
+        match crate::core::version_check::channel_of_version(config::VERSION) {
+            UpdateChannel::Stable => assert!(updates.is_empty()),
+            UpdateChannel::PreRelease => {
+                assert_eq!(updates.len(), 1);
+                assert_eq!(updates[0].source, name);
+                assert_eq!(updates[0].display_name, name);
+            }
+        }
+
+        serve(vec![
+            artifact(current),
+            artifact(next_stable),
+            artifact(next_rc),
+        ]);
+        let updates = manager.check_for_available_updates().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].source, name);
+        assert_eq!(updates[0].display_name, name);
+        assert_eq!(updates[0].kind, PackageUpdateKind::Registry);
+
+        for (installed, stable_count, rc_count) in
+            [(current, 1, 1), (next_stable, 0, 1), (next_rc, 0, 0)]
+        {
+            place_untracked_extension(&dirs, name, installed);
+            let stable = manager
+                .check_for_available_updates_with_channel(UpdateChannel::Stable)
+                .unwrap();
+            assert_eq!(stable.len(), stable_count, "stable from {installed}");
+            let rc = manager
+                .check_for_available_updates_with_channel(UpdateChannel::PreRelease)
+                .unwrap();
+            assert_eq!(rc.len(), rc_count, "pre-release from {installed}");
+        }
+    }
+
+    #[test]
     fn test_update_discovers_untracked_installed_extensions() {
         let dirs = TestDirs::new();
         let transport = MapTransport::new();
@@ -9267,7 +9608,7 @@ mod registry_tests {
         let dirs = TestDirs::new();
         let transport = MapTransport::new();
         serve_registry_extension(&transport, "ext-b", "0.2.0", false);
-        let manager = manager_ok(&dirs, transport.clone());
+        let mut manager = manager_ok(&dirs, transport.clone());
         place_untracked_extension(&dirs, "ext-b", "0.1.0");
 
         manager.update(Some("ext-b")).unwrap();
@@ -9680,6 +10021,56 @@ mod registry_tests {
     }
 
     #[test]
+    fn test_check_for_available_updates_github_release() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let serve_latest = |version: &str| {
+            serve_github_release(
+                &transport,
+                "acme",
+                "tools",
+                &format!("v{version}"),
+                "tools",
+                version,
+                false,
+            );
+            let release = serde_json::json!({
+                "tag_name": format!("v{version}"),
+                "assets": [
+                    {"name": format!("tools-{version}.rpix")},
+                    {"name": format!("tools-{version}.rpix.sha256")},
+                ]
+            });
+            transport.insert(
+                &extension_registry::github_release_api_url("acme", "tools", None),
+                release.to_string().into_bytes(),
+            );
+        };
+        serve_latest("1.0.0");
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager
+            .install_and_persist("github:acme/tools", false)
+            .unwrap();
+
+        let calls_before = transport.calls().len();
+        assert!(manager.check_for_available_updates().unwrap().is_empty());
+        assert_eq!(transport.calls().len(), calls_before + 1);
+
+        serve_latest("1.1.0");
+        let calls_before = transport.calls().len();
+        let updates = manager.check_for_available_updates().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].source, "github:acme/tools");
+        assert_eq!(updates[0].display_name, "acme/tools");
+        assert_eq!(updates[0].kind, PackageUpdateKind::GithubRelease);
+        assert_eq!(
+            transport.calls().len(),
+            calls_before + 1,
+            "the probe fetches release metadata, not the artifact"
+        );
+    }
+
+    #[test]
     fn test_update_github_release_to_latest() {
         let dirs = TestDirs::new();
         let transport = MapTransport::new();
@@ -9737,7 +10128,7 @@ mod registry_tests {
         let mut manager = manager_ok(&dirs, transport.clone());
         manager.install_and_persist("subagents", false).unwrap();
         // Offline update: no registry access at all (early return).
-        let manager = registry_manager(
+        let mut manager = registry_manager(
             &dirs,
             transport.clone(),
             Some(Box::new(|_| true)),

@@ -25,5 +25,8 @@
       "numberFormat": "compact",
       "liveTokens": true
     }
+  },
+  "defaultSettingsMigration": {
+    "statusLine": 1
   }
 }

@@ -33,14 +33,16 @@ fn manifest_pins_capabilities_abi_and_native_only_carrier() {
             .is_some_and(|text| text.contains("items") && text.contains("/statusline")),
         "description names the items mode and the editor"
     );
-    // Fresh-install defaults: keep the manifest's `defaultSettings` exactly
-    // equal to the crate's frozen default items, so an install seeds the same
-    // configuration the `/statusline` editor shows (issue #2).
+    // Install defaults: keep the manifest's `defaultSettings` exactly equal
+    // to the crate's frozen default items, so an install seeds the same
+    // configuration the `/statusline` editor shows (issue #2). Version 1 also
+    // migrates legacy and rc.4 upgrades whose update path never seeded it.
     assert_eq!(
         manifest["defaultSettings"]["statusLine"],
         Value::Object(rpi_ext_statusline::items::ItemsConfig::default().to_settings_object()),
         "manifest defaultSettings must match ItemsConfig::default"
     );
+    assert_eq!(manifest["defaultSettingsMigration"]["statusLine"], 1);
 }
 
 #[test]
