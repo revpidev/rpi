@@ -1,4 +1,4 @@
-# cross (aarch64-unknown-linux-musl) configuration — V18-13.
+# cross (Linux musl targets) configuration — V18-13.
 #
 # The static musl fallback rebuild runs through the cross container and sets
 # RPI_DIST_TARGET=<target>-static so build.rs injects the `-static`
