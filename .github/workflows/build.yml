@@ -128,15 +128,23 @@ jobs:
 
       # ---- Linux cross toolchains (installation methods natively supported by GitHub runners) ----
 
+      # Bypass the runner's mirror selector: its Azure entry can be unreachable
+      # even when the official Ubuntu archive is available.
       - name: Install musl toolchain (x64 static fallback)
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y musl-tools
 
       - name: Install aarch64 gcc (arm64 glibc)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         # g++ is required alongside gcc: btls-sys (BoringSSL, via wreq in
         # rpi-ext-smart-fetch) compiles C++ through the cmake crate.
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+        run: |
+          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       # Both musl targets build in the cross-rs container (the large musl.cc
       # toolchain files were unstable on runners; cross and its images come
