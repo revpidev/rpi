@@ -5672,9 +5672,9 @@ mod tests {
         tui.stop(TuiStopOptions::default());
     }
 
-    /// A terminal that answers only DA1 (no OSC support) must still settle
-    /// after the grace deadline: empty result delivered once, entry reaped so
-    /// it cannot swallow a later query's replies.
+    /// A terminal that answers only DA1 (no OSC support) still settles after
+    /// the grace deadline. The entry remains only to finish late delivery and
+    /// is reaped by the next DA1 without leaking it into keyboard input.
     #[test]
     fn terminal_colors_query_da1_only_settles_at_the_grace_deadline() {
         let (terminal, tui, component_h, _listeners) = colors_test_setup();
@@ -5684,16 +5684,19 @@ mod tests {
         tui.tick(Instant::now() + Duration::from_secs(10));
         let colors = query.try_recv().expect("grace deadline resolves it");
         assert_eq!(colors, crate::terminal_colors::TerminalColors::default());
+        assert_eq!(
+            tui.lock_inner().base.pending_terminal_color_queries.len(),
+            1,
+            "the late-delivery entry remains until a later DA1"
+        );
+        send_input(&terminal, &tui, "\x1b[?62;22c");
+        assert!(component_h.inputs().is_empty());
         assert!(
             tui.lock_inner()
                 .base
                 .pending_terminal_color_queries
-                .is_empty(),
-            "a da1-only query is reaped at the deadline"
+                .is_empty()
         );
-        // A later DA1 is ordinary input again.
-        send_input(&terminal, &tui, "\x1b[?62;22c");
-        assert_eq!(component_h.inputs(), vec!["\x1b[?62;22c"]);
         tui.stop(TuiStopOptions::default());
     }
 
@@ -5720,6 +5723,10 @@ mod tests {
         );
 
         send_input(&terminal, &tui, "\x1b]11;#ffffff\x07");
+        assert!(
+            lock_shared(&late).is_empty(),
+            "an ordinary timeout still waits for DA1"
+        );
         send_input(&terminal, &tui, "\x1b[?62;22c");
         let late = lock_shared(&late);
         assert_eq!(
@@ -5741,6 +5748,101 @@ mod tests {
         // With no query pending, color replies are ordinary input again.
         send_input(&terminal, &tui, "\x1b]11;#ffffff\x07");
         assert_eq!(component_h.inputs(), vec!["\x1b]11;#ffffff\x07"]);
+        tui.stop(TuiStopOptions::default());
+    }
+
+    /// Issue #77: an early DA1 followed by a grace-deadline expiry must not
+    /// discard the late-reply subscription. A delayed OSC 11 restores the
+    /// system theme's panel backgrounds without requiring a second DA1. The
+    /// remaining replies still count toward full-report cleanup afterward.
+    #[test]
+    fn terminal_colors_query_early_da1_timeout_still_delivers_late_colors() {
+        let (terminal, tui, component_h, listeners) = colors_test_setup();
+        let late: Arc<Mutex<Vec<crate::terminal_colors::TerminalColors>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let late_clone = Arc::clone(&late);
+        let mut query = tui.query_terminal_colors(crate::tui::TerminalColorQueryOptions {
+            timeout: Duration::from_millis(1),
+            on_late_reply: Some(Box::new(move |colors| {
+                lock_shared(&late_clone).push(colors);
+            })),
+        });
+        send_input(&terminal, &tui, "\x1b[?62;22c");
+        assert!(query.try_recv().is_err(), "early DA1 keeps it pending");
+        tui.tick(Instant::now() + Duration::from_secs(10));
+        assert_eq!(
+            query.try_recv(),
+            Ok(crate::terminal_colors::TerminalColors::default())
+        );
+
+        send_input(&terminal, &tui, "\x1b]11;#ffffff\x07");
+        assert_eq!(
+            lock_shared(&late).as_slice(),
+            &[crate::terminal_colors::TerminalColors {
+                foreground: None,
+                background: Some(RgbColor {
+                    r: 255,
+                    g: 255,
+                    b: 255
+                }),
+                palette: None,
+            }]
+        );
+        assert_eq!(
+            tui.lock_inner().base.pending_terminal_color_queries.len(),
+            1,
+            "the delivered entry stays to consume the remaining replies"
+        );
+
+        send_input(&terminal, &tui, "\x1b]10;#000000\x07");
+        for reply in palette_replies() {
+            send_input(&terminal, &tui, &reply);
+        }
+        assert!(
+            tui.lock_inner()
+                .base
+                .pending_terminal_color_queries
+                .is_empty(),
+            "a complete color report reaps the already-delivered query"
+        );
+        assert_eq!(lock_shared(&late).len(), 1, "no duplicate late callback");
+        assert_eq!(component_h.inputs(), Vec::<String>::new());
+        assert_eq!(*lock_shared(&listeners), Vec::<String>::new());
+        tui.stop(TuiStopOptions::default());
+    }
+
+    #[test]
+    fn terminal_colors_query_late_background_then_da1_reaps_without_duplicate_callback() {
+        let (terminal, tui, component_h, listeners) = colors_test_setup();
+        let late: Arc<Mutex<Vec<crate::terminal_colors::TerminalColors>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let late_clone = Arc::clone(&late);
+        let mut query = tui.query_terminal_colors(crate::tui::TerminalColorQueryOptions {
+            timeout: Duration::from_millis(1),
+            on_late_reply: Some(Box::new(move |colors| {
+                lock_shared(&late_clone).push(colors);
+            })),
+        });
+        send_input(&terminal, &tui, "\x1b[?62;22c");
+        assert!(query.try_recv().is_err(), "early DA1 keeps it pending");
+        tui.tick(Instant::now() + Duration::from_secs(10));
+        assert_eq!(
+            query.try_recv(),
+            Ok(crate::terminal_colors::TerminalColors::default())
+        );
+        send_input(&terminal, &tui, "\x1b]11;#ffffff\x07");
+        assert_eq!(lock_shared(&late).len(), 1);
+
+        send_input(&terminal, &tui, "\x1b[?62;22c");
+        assert!(
+            tui.lock_inner()
+                .base
+                .pending_terminal_color_queries
+                .is_empty()
+        );
+        assert_eq!(lock_shared(&late).len(), 1, "no duplicate late callback");
+        assert_eq!(component_h.inputs(), Vec::<String>::new());
+        assert_eq!(*lock_shared(&listeners), Vec::<String>::new());
         tui.stop(TuiStopOptions::default());
     }
 

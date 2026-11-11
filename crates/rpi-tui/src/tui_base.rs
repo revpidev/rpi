@@ -138,8 +138,9 @@ pub(crate) struct PendingTerminalColorQuery {
     /// A DA1 has been seen. A DA1 arriving before any color reply is not a
     /// reliable terminator (stale reply from a prior process, interleaved
     /// keyboard query, slow SSH): the query stays pending for a grace window
-    /// so the OSC replies can still land. Once set, completion also pops the
-    /// entry because no second DA1 will arrive.
+    /// so the OSC replies can still land. Receiving every color pops the entry
+    /// early; after a grace timeout, a valid delayed OSC 11 completes the
+    /// late-reply delivery immediately, and a later DA1 reaps the entry.
     pub(crate) da1_seen: bool,
     /// Receives the result: the promise's resolve until the timeout, then
     /// `onLateReply`. Unset once the query completed; later replies are
@@ -1316,22 +1317,16 @@ impl TuiBase {
                 index += 1;
                 continue;
             }
-            let da1_seen = self.pending_terminal_color_queries[index].da1_seen;
             self.pending_terminal_color_queries[index].deadline = None;
             // Resolve the promise with the replies so far, and keep
             // collecting late replies for `onLateReply` (tui.ts:1481-1484).
+            // This also applies after an early DA1: expiring its grace window
+            // must not discard a delayed OSC background report (issue #77).
             let colors = terminal_color_query_result(&self.pending_terminal_color_queries[index]);
             if let Some(TerminalColorQueryDelivery::Resolve(sender)) =
                 self.pending_terminal_color_queries[index].delivery.take()
             {
                 let _ = sender.send(colors);
-            }
-            if da1_seen {
-                // The terminal already sent its DA1 before the colors; no
-                // second terminator is coming, and keeping the entry would
-                // misroute a later query's replies.
-                self.pending_terminal_color_queries.remove(index);
-                continue;
             }
             self.pending_terminal_color_queries[index].delivery = self
                 .pending_terminal_color_queries[index]
@@ -1525,16 +1520,33 @@ impl TuiBase {
         let Some(query) = self.pending_terminal_color_queries.front_mut() else {
             return false;
         };
-        // `if (!query.deliver || query.replied.has(key))` (tui.ts:1142).
-        if query.delivery.is_none() || query.replied[index] {
+        if query.replied[index] {
             return true;
         }
+        let settled_after_early_da1 = query.da1_seen && query.deadline.is_none();
+        if query.delivery.is_none() && !settled_after_early_da1 {
+            return true;
+        }
+        // After an early-DA1 grace expiry, delivery and collection have
+        // separate lifetimes: an OSC 11 callback must not stop the remaining
+        // replies from completing the report and reaping this entry.
+        let complete_late_background = query.da1_seen
+            && query.deadline.is_none()
+            && response.target == OscColorTarget::Background
+            && response.rgb.is_some()
+            && matches!(query.delivery, Some(TerminalColorQueryDelivery::Late(_)));
         query.replied[index] = true;
         query.replied_count += 1;
         match response.target {
             OscColorTarget::Foreground => query.foreground = response.rgb,
             OscColorTarget::Background => query.background = response.rgb,
             OscColorTarget::Palette(index) => query.palette[index as usize] = response.rgb,
+        }
+        if complete_late_background {
+            // The early DA1 may have been the only terminator. Once its grace
+            // window has expired, deliver a delayed background immediately
+            // instead of depending on a second DA1 that may never arrive.
+            complete_terminal_color_query(query);
         }
         let mut pop_after_complete = false;
         if query.replied_count == TERMINAL_COLOR_REPLY_COUNT {
