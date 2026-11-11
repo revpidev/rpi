@@ -101,6 +101,8 @@ rpi update --models     # refresh the remote model catalog
 
 Re-running the install script also updates an existing installation.
 
+Interactive startup checks installed packages asynchronously. A stable host compares registry extensions against the latest stable version, while an RC host compares against the latest RC; an available update lists the packages and shows the matching `rpi update --extensions` or `rpi update --extensions --rc` command.
+
 ### Uninstalling
 
 ```bash
@@ -157,6 +159,8 @@ Four hidden built-in extensions provide agent-level surfaces:
 | `builtin:llama.cpp` | llama.cpp router integration (`/llama`) and native decision-model classifiers. |
 
 Seven first-party extensions ship as `.rpix` archives in lockstep with the host release: `rpi-subagents` (delegation, background runs, worktrees), `rpi-smart-fetch` (fingerprinted web fetch), `rpi-statusline` (script or declarative 30-field footer with session totals, turns/steps, tiered token stats and a `/statusline` editor), `rpi-ask-user-question` (structured questions), `rpi-todo` (task list), `rpi-plan-mode` (read-only planning and approval), and `rpi-usage` (typed quota/balance footer for eight providers, `/usage [--cached] [--json] [provider|all]`, `/usage list|help`, and a local session-token report for providers without a quota script).
+
+A global update also seeds an absent extension default when the manifest increases that key's `defaultSettingsMigration` version; existing values and project-local installs are unchanged. `rpi-statusline` uses migration version 1 for `statusLine`, so pre-fix RC installations gain the default token rows without requiring a manual `/statusline` save.
 
 ### Permission modes and plan mode
 
