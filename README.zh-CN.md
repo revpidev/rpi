@@ -11,7 +11,7 @@
 
 Rpi 是一个用 Rust 编写的终端 AI 编程助手，源自 [Pi coding agent](https://github.com/earendil-works/pi)：继承了 Pi 的架构，行为持续与钉死的上游版本对拍验证——当前行为基线为 **Pi v1.4.0**（`4a080252f`，见 [`UPSTREAM.md`](./UPSTREAM.md)）。rpi 是独立项目，随着两者演进可能出现偏差。编译产出为单个静态二进制，不依赖 Node、Python 或任何运行时。
 
-当前发布线为 **v0.1.7**，即最新稳定版（2026-10-19）。使用下方脚本安装，已有安装用 `rpi update` 更新（见[状态](#状态)）。
+当前发布线为 **v0.1.8**，即最新稳定版（2026-11-12）。使用下方脚本安装，已有安装用 `rpi update` 更新（见[状态](#状态)）。
 
 ## 特性
 
@@ -288,9 +288,10 @@ workspace 使用 edition 2024、MSRV 1.95。CI 负责构建发布资产；强制
 | v0.1.4 | 2026-09 | Pi v0.85.0 对齐；交互式自定义 UI ABI；`rpi-ask-user-question`；RC 更新通道 |
 | v0.1.5 | 2026-09 | Pi v0.86.1 对齐；`rpi-todo`；prompt cache warming；验证式剪贴板链 |
 | v0.1.6 | 2026-10 | Pi v1.0.0 对齐；内建 `codemode` 与 MCP；`rpi-plan-mode` / `rpi-usage`；权限模式与 usage-provider 框架 |
-| **v0.1.7** | **2026-10** | **Pi v1.1.0 对齐；issue #57–#71；移除 `rpi-mcp-adapter`；实验性 `rpi-durable` 栈；`rpi-subagents` v0.76.1** |
+| v0.1.7 | 2026-10 | Pi v1.1.0 对齐；issue #57–#71；移除 `rpi-mcp-adapter`；实验性 `rpi-durable` 栈；`rpi-subagents` v0.76.1 |
+| **v0.1.8** | **2026-11** | **Pi v1.4.0 对齐；durable 运行时/存储增量；安装 profile；七插件锁步；流式与 statusline 加固** |
 
-**当前发布线：v0.1.7。** 最新已发布稳定版为 v0.1.7。使用 `rpi update`（或 `rpi update --all` 同时更新七款锁步插件）；`rpi update --rc` 选择预发布通道。各版本发布说明见 [`changes/`](./changes) 与 [`CHANGELOG.md`](./CHANGELOG.md)。
+**当前发布线：v0.1.8。** 最新已发布稳定版为 v0.1.8。使用 `rpi update`（或 `rpi update --all` 同时更新七款锁步插件）；`rpi update --rc` 选择预发布通道。各版本发布说明见 [`changes/`](./changes) 与 [`CHANGELOG.md`](./CHANGELOG.md)。
 
 ## 许可证
 
