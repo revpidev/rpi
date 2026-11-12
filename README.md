@@ -113,6 +113,8 @@ rpi update --models     # refresh the remote model catalog
 
 Re-running the install script also updates an existing installation.
 
+Extension updates group already-current plugins once in the plan and print details only for plugins that actually update. Live download percentage, bytes and speed remain visible, while native (L0) confirmation stays required; default output no longer repeats connection URLs, verification stages or temporary paths.
+
 Interactive startup checks installed packages asynchronously. A stable host compares registry extensions against the latest stable version, while an RC host compares against the latest RC; an available update lists the packages and shows the matching `rpi update --extensions` or `rpi update --extensions --rc` command.
 
 ### Uninstalling

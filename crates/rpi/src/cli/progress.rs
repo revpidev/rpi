@@ -202,12 +202,9 @@ impl DownloadObserver for ProgressRenderer {
         match event {
             DownloadEvent::Connecting { url, attempt } => {
                 self.clear_line(&mut inner);
-                let suffix = if *attempt > 1 {
-                    format!(" (attempt {attempt})")
-                } else {
-                    String::new()
-                };
-                self.write_line(&format!("Connecting…{suffix} {url}"));
+                if *attempt > 1 {
+                    self.write_line(&format!("Connecting (attempt {attempt})… {url}"));
+                }
             }
             DownloadEvent::Progress { downloaded, total } => {
                 self.render_progress(&mut inner, *downloaded, *total);
@@ -253,21 +250,15 @@ impl DownloadObserver for ProgressRenderer {
                     format_bytes(*discarded_bytes as f64)
                 ));
             }
-            DownloadEvent::Verifying { file } => {
+            DownloadEvent::Verifying { .. } => {
                 self.clear_line(&mut inner);
-                self.write_line(&format!("Verifying {}…", file.display()));
             }
-            DownloadEvent::Installing { target } => {
+            DownloadEvent::Installing { .. } => {
                 self.clear_line(&mut inner);
-                self.write_line(&format!("Installing {}…", target.display()));
             }
             DownloadEvent::Done { file, bytes } => {
                 self.clear_line(&mut inner);
-                self.write_line(&format!(
-                    "Downloaded {} ({})",
-                    file.display(),
-                    format_bytes(*bytes as f64)
-                ));
+                self.write_line(&downloaded_message(file, *bytes));
             }
             DownloadEvent::Failed { message } => {
                 self.clear_line(&mut inner);
@@ -275,6 +266,14 @@ impl DownloadObserver for ProgressRenderer {
             }
         }
     }
+}
+
+pub(crate) fn downloaded_message(file: &std::path::Path, bytes: u64) -> String {
+    let name = file
+        .file_name()
+        .unwrap_or(file.as_os_str())
+        .to_string_lossy();
+    format!("Downloaded {name} ({})", format_bytes(bytes as f64))
 }
 
 /// Pure single-line formatter (width tiers: 100 / 80 / 60 / 50).
@@ -386,6 +385,20 @@ mod tests {
             .expect("heartbeat for unknown totals")
             .0;
         assert!(unknown.contains("300 B"), "{unknown}");
+    }
+
+    #[test]
+    fn downloaded_message_uses_only_the_file_name() {
+        let message = downloaded_message(
+            std::path::Path::new("/root/.rpi/agent/tmp/downloads/rpi-usage-0.1.8-rc.5.rpix"),
+            1_200_000,
+        );
+        assert!(
+            message.starts_with("Downloaded rpi-usage-0.1.8-rc.5.rpix ("),
+            "{message}"
+        );
+        assert!(message.contains("MiB"), "{message}");
+        assert!(!message.contains("/root/"), "{message}");
     }
 
     #[test]

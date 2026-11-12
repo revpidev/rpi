@@ -2582,47 +2582,49 @@ impl DefaultPackageManager {
         }))
     }
 
-    /// The install-info table (design §7.2 step 5): name / version /
-    /// author / capabilities in full, plus kind and integrity level; L0
-    /// gets the prominent trust warning (pi-mcp-adapter R8).
+    /// Compact install metadata (design §7.2 step 5), followed by the L0
+    /// trust warning when native code is involved.
     fn print_install_info(info: &ExtensionInstallInfo) {
-        println!("Extension: {} {}", info.name, info.version);
-        println!(
-            "Kind: {}",
-            match info.kind {
-                ExtensionKind::Native => "native (L0)",
-                ExtensionKind::Wasm => "wasm (L1, sandboxed)",
-            }
-        );
+        let source = match info.integrity {
+            IntegrityLevel::RegistryIndex => "registry",
+            IntegrityLevel::ReleaseSidecar => "github",
+        };
         if let Some(author) = &info.author {
-            println!("Author: {author}");
+            println!("  Source: {source} · Author: {author}");
+        } else {
+            println!("  Source: {source}");
         }
         if let Some(homepage) = &info.homepage {
-            println!("Homepage: {homepage}");
+            println!("  Homepage: {homepage}");
         }
-        if info.capabilities.is_empty() {
-            println!("Capabilities: (none)");
+        let kind = match info.kind {
+            ExtensionKind::Native => "native (L0)",
+            ExtensionKind::Wasm => "wasm (L1, sandboxed)",
+        };
+        let capabilities = if info.capabilities.is_empty() {
+            "(none)".to_string()
         } else {
-            println!("Capabilities: {}", info.capabilities.join(", "));
-        }
+            info.capabilities.join(", ")
+        };
+        println!("  Kind: {kind} · Capabilities: {capabilities}");
         match info.integrity {
             IntegrityLevel::RegistryIndex => {
-                println!("Integrity: sha256 pinned by the registry index");
+                println!("  Integrity: SHA-256 pinned by the registry");
             }
             IntegrityLevel::ReleaseSidecar => {
                 println!(
-                    "Integrity: sha256 from the release's own .sha256 sidecar (NOT pinned by \
-                     the registry index — lower assurance)"
+                    "  Integrity: SHA-256 from the release's own .sha256 sidecar (NOT pinned by \
+                     the registry — lower assurance)"
                 );
             }
         }
         if info.kind == ExtensionKind::Native {
             eprintln!(
-                "WARNING: \"{}\" is a native (L0) extension. It runs WITHOUT a sandbox, with \
-                 full OS permissions — exactly like the {APP_NAME} binary itself. Install it \
-                 only if you trust its author.",
-                info.name,
-                APP_NAME = config::APP_NAME,
+                "WARNING: Native (L0) extensions run without a sandbox and have full OS permissions."
+            );
+            eprintln!(
+                "Install only if you trust {}.",
+                info.author.as_deref().unwrap_or("the extension author")
             );
         }
     }
@@ -2702,6 +2704,7 @@ impl DefaultPackageManager {
             &resolved.info.name,
             &resolved.info.version,
         )?;
+        println!("Installed {} {}", resolved.info.name, resolved.info.version);
         Ok(())
     }
 
@@ -2824,6 +2827,7 @@ impl DefaultPackageManager {
             &resolved.info.name,
             Some(source_string),
         )?;
+        println!("Installed {} {}", resolved.info.name, resolved.info.version);
         Ok(())
     }
 
@@ -2840,6 +2844,10 @@ impl DefaultPackageManager {
             ));
         }
         let resolved = self.resolve_registry_install_with_channel(source, channel)?;
+        println!(
+            "Extension: {} {}",
+            resolved.info.name, resolved.info.version
+        );
         self.run_registry_install(&resolved, scope)
     }
 
@@ -2856,6 +2864,10 @@ impl DefaultPackageManager {
             ));
         }
         let (resolved, _tag) = self.resolve_github_install(source)?;
+        println!(
+            "Extension: {} {}",
+            resolved.info.name, resolved.info.version
+        );
         self.run_github_install(&resolved, scope, source_string)
     }
 
@@ -3560,36 +3572,26 @@ impl DefaultPackageManager {
             match entry.action {
                 UpdatePlanAction::UpToDate => {
                     summary.up_to_date += 1;
-                    let message = match &entry.note {
-                        Some(note) if note.contains("no pre-release") => format!(
-                            "{} is already up to date (no pre-release versions published)",
-                            entry.source
-                        ),
-                        _ => format!("{} is already up to date", entry.source),
-                    };
-                    self.emit_progress(&ProgressEvent {
-                        kind: ProgressKind::Start,
-                        action: ProgressAction::Update,
-                        source: entry.source.clone(),
-                        message: Some(message),
-                    });
+                    if entry
+                        .note
+                        .as_deref()
+                        .is_some_and(|note| note.contains("no pre-release versions published"))
+                    {
+                        self.emit_progress(&ProgressEvent {
+                            kind: ProgressKind::Start,
+                            action: ProgressAction::Update,
+                            source: entry.source.clone(),
+                            message: Some(format!(
+                                "{} is already up to date (no pre-release versions published)",
+                                entry.source
+                            )),
+                        });
+                    }
                 }
                 UpdatePlanAction::Local
                 | UpdatePlanAction::Untracked
                 | UpdatePlanAction::Skipped => {
                     summary.skipped += 1;
-                    let note = entry.note.as_deref().unwrap_or("not updated");
-                    let message = if note.starts_with("Skipping ") {
-                        note.to_string()
-                    } else {
-                        format!("Skipping {}: {note}", entry.source)
-                    };
-                    self.emit_progress(&ProgressEvent {
-                        kind: ProgressKind::Start,
-                        action: ProgressAction::Update,
-                        source: entry.source.clone(),
-                        message: Some(message),
-                    });
                 }
                 UpdatePlanAction::Error => {
                     summary.failed += 1;
@@ -3635,13 +3637,19 @@ impl DefaultPackageManager {
                             ParsedSource::GithubRelease(_) => self.with_progress(
                                 ProgressAction::Update,
                                 &entry.source,
-                                &format!("Updating {}...", entry.source),
+                                &format!(
+                                    "Updating {} to {}...",
+                                    entry.source, resolved.info.version
+                                ),
                                 || self.run_github_install(resolved, entry.scope, &entry.source),
                             ),
                             _ => self.with_progress(
                                 ProgressAction::Update,
                                 &entry.source,
-                                &format!("Updating {}...", entry.source),
+                                &format!(
+                                    "Updating {} to {}...",
+                                    entry.source, resolved.info.version
+                                ),
                                 || self.run_registry_install(resolved, entry.scope),
                             ),
                         }
@@ -9200,6 +9208,66 @@ mod registry_tests {
     }
 
     #[test]
+    fn test_compact_update_output_groups_up_to_date_extensions() {
+        let entry = |source: &str, action| UpdatePlanEntry {
+            source: source.to_string(),
+            current: Some("0.1.8-rc.4".to_string()),
+            target: Some("0.1.8-rc.5".to_string()),
+            kind: "registry",
+            action,
+            note: None,
+            pinned: false,
+            scope: SourceScope::User,
+            npm: None,
+            git: None,
+            resolved: None,
+        };
+        let plan = UpdatePlan {
+            entries: vec![
+                entry("rpi-usage", UpdatePlanAction::Update),
+                entry("rpi-ask-user-question", UpdatePlanAction::UpToDate),
+                entry("rpi-smart-fetch", UpdatePlanAction::UpToDate),
+                entry("rpi-statusline", UpdatePlanAction::UpToDate),
+                entry("rpi-subagents", UpdatePlanAction::UpToDate),
+                entry("rpi-todo", UpdatePlanAction::UpToDate),
+                entry("rpi-plan-mode", UpdatePlanAction::UpToDate),
+            ],
+        };
+        let output =
+            crate::cli::package_command::update_plan_output(&plan, UpdateChannel::PreRelease);
+        assert!(output.starts_with("Extension updates (RC):\n"), "{output}");
+        assert!(
+            output.contains("rpi-usage 0.1.8-rc.4 → 0.1.8-rc.5"),
+            "{output}"
+        );
+        assert!(
+            output.contains("  Up to date: rpi-ask-user-question"),
+            "{output}"
+        );
+        assert!(output.contains("\n              rpi-"), "{output}");
+        assert!(
+            !output.contains("rpi-usage is already up to date"),
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("rpi-ask-user-question").count(),
+            1,
+            "{output}"
+        );
+
+        let summary = crate::cli::package_command::update_summary_output(&UpdateApplySummary {
+            updated: 1,
+            up_to_date: 6,
+            skipped: 0,
+            failed: 0,
+        });
+        assert_eq!(
+            summary,
+            "Updated 1 extension · 6 already up to date\nRestart rpi to load the update.\n"
+        );
+    }
+
+    #[test]
     fn test_partial_resume_hint_requires_a_retained_partial() {
         let dirs = TestDirs::new();
         let manager = manager_ok(&dirs, MapTransport::new());
@@ -9667,9 +9735,28 @@ mod registry_tests {
         })));
 
         serve_registry_extension(&transport, "ext-a", "0.2.0", true);
-        manager.update(None).unwrap();
-        // ext-a moved forward; local-only is skipped with a note, not an
-        // error, and its directory is untouched.
+        let plan = manager
+            .plan_updates(None, UpdateChannel::Stable, None)
+            .unwrap();
+        let skipped = plan
+            .entries
+            .iter()
+            .find(|entry| entry.source == "local-only")
+            .unwrap();
+        assert_eq!(skipped.action, UpdatePlanAction::Untracked);
+        assert!(
+            skipped
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("not in the registry")
+        );
+        let (summary, error) = manager.apply_update_plan(&plan);
+        assert_eq!(error, None);
+        assert_eq!(summary.updated, 1);
+        assert_eq!(summary.skipped, 1);
+        // ext-a moved forward; local-only stays untouched. The plan already
+        // carries the skip reason, so apply does not print it a second time.
         assert_eq!(
             extension_registry::installed_extension_version(
                 &dirs.agent_dir.join("extensions/ext-a")
@@ -9685,12 +9772,12 @@ mod registry_tests {
             Some("0.1.0")
         );
         assert!(
-            notes
+            !notes
                 .lock()
                 .unwrap()
                 .iter()
                 .any(|message| message.starts_with("Skipping local-only:")),
-            "skip note emitted: {:?}",
+            "skip note must not be duplicated: {:?}",
             notes.lock().unwrap()
         );
     }

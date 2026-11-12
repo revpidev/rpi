@@ -36,7 +36,7 @@ use crate::core::model_runtime::{
 };
 use crate::core::package_manager::{
     ConfiguredPackage, DefaultPackageManager, InstallConfirmCallback, PackageCommandRunner,
-    SystemPackageCommandRunner, UpdateApplySummary, UpdatePlan,
+    SystemPackageCommandRunner, UpdateApplySummary, UpdatePlan, UpdatePlanAction,
 };
 use crate::core::self_update::{BinarySelfUpdateRequest, BinarySelfUpdateSeam};
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
@@ -676,11 +676,7 @@ pub fn print_self_update_note(note: &str) {
 /// the self-uninstall data-dir prompt).
 fn confirm_native_extension_install(info: &ExtensionInstallInfo) -> bool {
     use std::io::Write;
-    print!(
-        "Install native extension \"{}\" {} (no sandbox, full OS permissions)? [y/N] \
-         (use --yes to skip this prompt in non-interactive runs) ",
-        info.name, info.version
-    );
+    print!("Install {} {}? [y/N] ", info.name, info.version);
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     match std::io::stdin().read_line(&mut line) {
@@ -714,13 +710,56 @@ pub async fn run_update(args: &[String]) -> i32 {
 }
 
 /// V18-12 FR-D: plan table printed before any download/confirmation.
-fn print_update_plan(plan: &UpdatePlan) {
+pub(crate) fn update_plan_output(plan: &UpdatePlan, channel: UpdateChannel) -> String {
     if plan.is_empty() {
-        return;
+        return String::new();
     }
-    println!("Extension updates:");
+    let channel_label = if channel == UpdateChannel::PreRelease {
+        " (RC)"
+    } else {
+        ""
+    };
+    let mut output = format!("Extension updates{channel_label}:\n");
+    for entry in plan
+        .entries
+        .iter()
+        .filter(|entry| entry.action != UpdatePlanAction::UpToDate)
+    {
+        output.push_str(&entry.plan_line());
+        output.push('\n');
+    }
+
+    let up_to_date: Vec<&str> = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.action == UpdatePlanAction::UpToDate)
+        .map(|entry| entry.source.as_str())
+        .collect();
+    if !up_to_date.is_empty() {
+        let mut line = "  Up to date: ".to_string();
+        let mut first_on_line = true;
+        for source in up_to_date {
+            let separator = if first_on_line { "" } else { ", " };
+            if !first_on_line && line.len() + separator.len() + source.len() > 88 {
+                output.push_str(&line);
+                output.push('\n');
+                line = "              ".to_string();
+                first_on_line = true;
+            }
+            let separator = if first_on_line { "" } else { ", " };
+            line.push_str(separator);
+            line.push_str(source);
+            first_on_line = false;
+        }
+        output.push_str(&line);
+        output.push('\n');
+    }
+    output
+}
+
+fn print_update_plan(plan: &UpdatePlan, channel: UpdateChannel) {
+    print!("{}", update_plan_output(plan, channel));
     for entry in &plan.entries {
-        println!("{}", entry.plan_line());
         if let Some(warning) = entry.downgrade_warning() {
             eprintln!("{warning}");
         }
@@ -728,18 +767,36 @@ fn print_update_plan(plan: &UpdatePlan) {
 }
 
 /// V18-12 FR-D: closing counts (R3.10.9).
-fn print_update_summary(summary: &UpdateApplySummary) {
-    let mut line = format!(
-        "Updated {} extensions · {} up to date · {} skipped",
-        summary.updated, summary.up_to_date, summary.skipped
-    );
+pub(crate) fn update_summary_output(summary: &UpdateApplySummary) -> String {
+    let noun = if summary.updated == 1 {
+        "extension"
+    } else {
+        "extensions"
+    };
+    let mut line = format!("Updated {} {noun}", summary.updated);
+    if summary.up_to_date > 0 {
+        line.push_str(&format!(" · {} already up to date", summary.up_to_date));
+    }
+    if summary.skipped > 0 {
+        line.push_str(&format!(" · {} skipped", summary.skipped));
+    }
     if summary.failed > 0 {
         line.push_str(&format!(" · {} failed", summary.failed));
     }
-    println!("{line}");
+    line.push('\n');
     if summary.updated > 0 {
-        println!("restart {APP_NAME} to load them");
+        let update_noun = if summary.updated == 1 {
+            "update"
+        } else {
+            "updates"
+        };
+        line.push_str(&format!("Restart {APP_NAME} to load the {update_noun}.\n"));
     }
+    line
+}
+
+fn print_update_summary(summary: &UpdateApplySummary) {
+    print!("{}", update_summary_output(summary));
 }
 
 /// [`run_update`] against explicit directories with injectable command
@@ -914,7 +971,7 @@ pub async fn run_update_in(
             }
             return 0;
         }
-        print_update_plan(&plan);
+        print_update_plan(&plan, update_channel);
         let (summary, error) = manager.apply_update_plan(&plan);
         print_update_summary(&summary);
         if let Some(message) = error {
