@@ -108,6 +108,7 @@ trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
 VERSION=0.1.0
+RC_VERSION=0.1.0-rc.1
 WWW=$TMP/www
 
 make_fake_archive() { # make_fake_archive <version> <target> [corrupt-sha]
@@ -354,6 +355,15 @@ for _t in "$HOST_TARGET" $([ "$host_os" = Linux ] && [ "$MUSL_TARGET" != "$HOST_
 done
 write_profile_index "$_index_dir/$VERSION.json" "$VERSION" $_index_args
 
+# A parallel RC release exercises channel selection without changing the
+# stable fixtures used by the legacy cases.
+make_fake_archive "$RC_VERSION" "$HOST_TARGET"
+make_fake_bundle "$WWW" "$RC_VERSION" "$HOST_TARGET" standard
+_rc_asset=rpi-$RC_VERSION-$HOST_TARGET-standard.tar.gz
+_rc_sha=$(sha_of "$WWW/releases/download/v$RC_VERSION" "$_rc_asset")
+write_profile_index "$_index_dir/$RC_VERSION.json" "$RC_VERSION" "$_rc_asset" "$_rc_sha"
+printf '{"version": "%s", "packageName": "rpi", "note": "test RC"}\n' "$RC_VERSION" >"$WWW/latest-rc-version.json"
+
 # Broken release for the checksum-failure case (endpoint-fallback resolution).
 BAD_VERSION=0.2.0
 make_fake_archive "$BAD_VERSION" "$HOST_TARGET" corrupt
@@ -566,8 +576,23 @@ for t in "$HOST_TARGET" $([ "$host_os" = Linux ] && [ "$MUSL_TARGET" != "$HOST_T
 done
 printf '{"tag_name": "v%s", "assets": [%s]}\n' "$VERSION" "$assets_json" >"$WWW/api-latest.json"
 
+rc_assets_json=""
+for _suffix in "" "-standard"; do
+    _n=rpi-$RC_VERSION-$HOST_TARGET$_suffix.tar.gz
+    _entry="{\"name\": \"$_n\", \"browser_download_url\": \"$BASE/releases/download/v$RC_VERSION/$_n\"}"
+    _entry_sha="{\"name\": \"$_n.sha256\", \"browser_download_url\": \"$BASE/releases/download/v$RC_VERSION/$_n.sha256\"}"
+    if [ -z "$rc_assets_json" ]; then
+        rc_assets_json="$_entry,$_entry_sha"
+    else
+        rc_assets_json="$rc_assets_json,$_entry,$_entry_sha"
+    fi
+done
+printf '{"tag_name": "v%s", "assets": [%s]}\n' "$RC_VERSION" "$rc_assets_json" >"$WWW/api-rc.json"
+
 API_URL=$BASE/api-latest.json
+RC_API_URL=$BASE/api-rc.json
 ENDPOINT_URL=$BASE/latest-version.json
+RC_ENDPOINT_URL=$BASE/latest-rc-version.json
 DEAD_URL=$BASE/does-not-exist.json
 
 # ---- tiny test harness ---------------------------------------------------------
@@ -661,6 +686,35 @@ check "fallback sourceUrl constructed from RPI_RELEASE_BASE_URL" \
     grep -q "\"sourceUrl\": \"$BASE/releases/download/v$VERSION/rpi-$VERSION-$HOST_TARGET.tar.gz\"" \
     "$H4/.local/bin/rpi.install.json"
 check "fallback announced in output" grep -q 'falling back to version endpoint' "$TMP/last-out"
+
+# ---- 4a. stable / RC channel selection --------------------------------------------
+
+check "rc channel defaults to the RC version endpoint" \
+    sh -c 'p=$1; set --; RPI_INSTALL_CHANNEL=rc; export RPI_INSTALL_CHANNEL; RPI_INSTALL_TEST_SOURCE=1; export RPI_INSTALL_TEST_SOURCE; . "$p"; [ "$VERSION_CHECK_URL" = "https://revpi.dev/api/latest-rc-version.json" ]' _ "$INSTALL_SH"
+
+H_RC=$TMP/home-rc
+expect_ok "rc channel installs the RC standard bundle" \
+    env HOME="$H_RC" RPI_INSTALL_CHANNEL=rc RPI_GITHUB_API_URL="$API_URL" \
+    RPI_VERSION_CHECK_URL="$RC_ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+    RPI_SITE_BASE_URL="$BASE" sh "$INSTALL_SH" --profile standard --yes
+check "rc manifest version comes from the RC endpoint" \
+    grep -q "\"version\": \"$RC_VERSION\"" "$H_RC/.local/bin/rpi.install.json"
+check "rc summary names the channel" grep -q '· rc ·' "$TMP/last-out"
+check "rc standard install seeds settings" grep -q 'settings seeded:' "$TMP/last-out"
+
+H_RC_API=$TMP/home-rc-api
+expect_ok "rc release metadata supplies download URLs" \
+    env HOME="$H_RC_API" RPI_INSTALL_CHANNEL=rc RPI_GITHUB_API_URL="$RC_API_URL" \
+    RPI_VERSION_CHECK_URL="$RC_ENDPOINT_URL" RPI_RELEASE_BASE_URL="$BASE/releases" \
+    RPI_SITE_BASE_URL="$BASE" sh "$INSTALL_SH" --profile mini
+check "rc API sourceUrl names the RC archive" \
+    grep -q "\"sourceUrl\": \"$BASE/releases/download/v$RC_VERSION/rpi-$RC_VERSION-$HOST_TARGET.tar.gz\"" \
+    "$H_RC_API/.local/bin/rpi.install.json"
+
+expect_fail "invalid install channel is rejected" \
+    env HOME="$TMP/home-invalid-channel" RPI_INSTALL_CHANNEL=beta sh "$INSTALL_SH"
+check "invalid channel diagnostic names the allowed values" \
+    grep -q 'RPI_INSTALL_CHANNEL must be stable or rc' "$TMP/last-out"
 
 # ---- 5. sha256 mismatch aborts without residue -----------------------------------
 

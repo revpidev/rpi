@@ -63,15 +63,17 @@
     never modify PATH; they print the manual command instead.
 
     Environment overrides (for mirrors and tests):
+      RPI_INSTALL_CHANNEL    stable|rc (default stable; rc reads the RC version
+                             endpoint and the matching Release)
       RPI_INSTALL_ADD_PATH   1/true/yes/on = add without prompting;
                              0/false/no/off = never add; unset = prompt when
                              the installer is interactive
       RPI_NONINTERACTIVE     1/true/yes/on = never prompt (explicit -AddPath
                              or RPI_INSTALL_ADD_PATH=1 still writes)
-      RPI_GITHUB_API_URL     GitHub API URL for the latest release
-                             (default: https://api.github.com/repos/revpidev/rpi/releases/latest)
-      RPI_VERSION_CHECK_URL  Fallback version endpoint
-                             (default: https://revpi.dev/api/latest-version)
+      RPI_GITHUB_API_URL     Release metadata API override
+                             (stable default: https://api.github.com/repos/revpidev/rpi/releases/latest)
+      RPI_VERSION_CHECK_URL  Channel version endpoint override
+                             (stable: latest-version.json; rc: latest-rc-version.json)
       RPI_RELEASE_BASE_URL   Base used to construct GitHub download URLs
                              (default: https://github.com/revpidev/rpi/releases)
       RPI_SITE_BASE_URL      Official-site mirror base (default: https://revpi.dev);
@@ -114,8 +116,15 @@ if ($Help) {
 }
 
 $Repo = 'revpidev/rpi'
-$GitHubApiUrl = if ($env:RPI_GITHUB_API_URL) { $env:RPI_GITHUB_API_URL } else { "https://api.github.com/repos/$Repo/releases/latest" }
-$VersionCheckUrl = if ($env:RPI_VERSION_CHECK_URL) { $env:RPI_VERSION_CHECK_URL } else { 'https://revpi.dev/api/latest-version' }
+$InstallChannel = if ($env:RPI_INSTALL_CHANNEL) { $env:RPI_INSTALL_CHANNEL.Trim().ToLowerInvariant() } else { 'stable' }
+$GitHubApiUrl = if ($env:RPI_GITHUB_API_URL) { $env:RPI_GITHUB_API_URL } else { '' }
+$VersionCheckUrl = if ($env:RPI_VERSION_CHECK_URL) {
+    $env:RPI_VERSION_CHECK_URL
+} elseif ($InstallChannel -eq 'rc') {
+    'https://revpi.dev/api/latest-rc-version.json'
+} else {
+    'https://revpi.dev/api/latest-version'
+}
 $ReleaseBaseUrl = if ($env:RPI_RELEASE_BASE_URL) { $env:RPI_RELEASE_BASE_URL } else { "https://github.com/$Repo/releases" }
 $SiteBaseUrl = if ($env:RPI_SITE_BASE_URL) { $env:RPI_SITE_BASE_URL } else { 'https://revpi.dev' }
 $Target = 'x86_64-pc-windows-msvc'
@@ -143,6 +152,10 @@ $PromptTimeout = Get-InstallEnvInt -Name 'RPI_INSTALL_PROMPT_TIMEOUT' -Default 6
 function Fail([string]$Message) {
     Write-Host "error: $Message" -ForegroundColor Red
     exit 1
+}
+
+if ($InstallChannel -notin @('stable', 'rc')) {
+    Fail "RPI_INSTALL_CHANNEL must be stable or rc (got: $InstallChannel)"
 }
 
 if ($AddPath -and $NoAddPath) {
@@ -1896,6 +1909,74 @@ function Install-ProfilePlugins {
     }
 }
 
+function Resolve-InstallVersion {
+    param(
+        [string]$Channel,
+        [string]$GitHubApiUrl,
+        [string]$VersionCheckUrl,
+        [string]$Repo
+    )
+
+    if ($Channel -eq 'rc') {
+        try {
+            $infoDoc = Invoke-RestMethod -Uri $VersionCheckUrl
+        } catch {
+            Fail "RC version endpoint $VersionCheckUrl is unreachable: $($_.Exception.Message)"
+        }
+        $Version = ([string]$infoDoc.version) -replace '^v', ''
+        if (-not $Version) { Fail "RC version endpoint $VersionCheckUrl did not return a version" }
+        $ReleaseAssets = @()
+        $releaseApi = if ($GitHubApiUrl) {
+            $GitHubApiUrl
+        } else {
+            "https://api.github.com/repos/$Repo/releases/tags/v$Version"
+        }
+        try {
+            $release = Invoke-RestMethod -Uri $releaseApi -Headers @{ 'User-Agent' = 'rpi-installer' }
+            $releaseVersion = ([string]$release.tag_name) -replace '^v', ''
+            if ($releaseVersion -eq $Version) {
+                $ReleaseAssets = @($release.assets)
+            } else {
+                Write-Warning "GitHub release API returned v$releaseVersion for RC v$Version; using naming-rule URLs"
+            }
+        } catch {
+            Write-Warning 'GitHub release API unavailable; using naming-rule download URLs'
+        }
+        return [pscustomobject]@{
+            Version = $Version
+            ReleaseAssets = $ReleaseAssets
+            ResolvedVia = 'RC version endpoint'
+        }
+    }
+
+    $api = if ($GitHubApiUrl) { $GitHubApiUrl } else { "https://api.github.com/repos/$Repo/releases/latest" }
+    try {
+        $release = Invoke-RestMethod -Uri $api -Headers @{ 'User-Agent' = 'rpi-installer' }
+        $Version = ([string]$release.tag_name) -replace '^v', ''
+        if ($Version) {
+            return [pscustomobject]@{
+                Version = $Version
+                ReleaseAssets = @($release.assets)
+                ResolvedVia = 'GitHub API'
+            }
+        }
+    } catch { }
+
+    Write-Warning 'GitHub API unavailable; falling back to version endpoint'
+    try {
+        $infoDoc = Invoke-RestMethod -Uri $VersionCheckUrl
+    } catch {
+        Fail "version endpoint $VersionCheckUrl is unreachable: $($_.Exception.Message)"
+    }
+    $Version = ([string]$infoDoc.version) -replace '^v', ''
+    if (-not $Version) { Fail "version endpoint $VersionCheckUrl did not return a version" }
+    return [pscustomobject]@{
+        Version = $Version
+        ReleaseAssets = @()
+        ResolvedVia = 'version endpoint'
+    }
+}
+
 # ---- platform check ----------------------------------------------------------
 
 $Target = 'x86_64-pc-windows-msvc'
@@ -1914,31 +1995,10 @@ try {
 
 # ---- version / asset URL resolution ------------------------------------------
 
-$Version = $null
-$ReleaseAssets = @()
-
-try {
-    $release = Invoke-RestMethod -Uri $GitHubApiUrl -Headers @{ 'User-Agent' = 'rpi-installer' }
-    $v = ([string]$release.tag_name) -replace '^v', ''
-    if ($v) {
-        $Version = $v
-        $ReleaseAssets = @($release.assets)
-    }
-} catch { }
-
-if ($Version) {
-    Write-Host "latest release: v$Version (via GitHub API)"
-} else {
-    Write-Warning "GitHub API unavailable; falling back to version endpoint"
-    try {
-        $infoDoc = Invoke-RestMethod -Uri $VersionCheckUrl
-    } catch {
-        Fail "version endpoint $VersionCheckUrl is unreachable: $($_.Exception.Message)"
-    }
-    $Version = ([string]$infoDoc.version) -replace '^v', ''
-    if (-not $Version) { Fail "version endpoint $VersionCheckUrl did not return a version" }
-    Write-Host "latest release: v$Version (via version endpoint)"
-}
+$resolution = Resolve-InstallVersion -Channel $InstallChannel -GitHubApiUrl $GitHubApiUrl -VersionCheckUrl $VersionCheckUrl -Repo $Repo
+$Version = $resolution.Version
+$ReleaseAssets = @($resolution.ReleaseAssets)
+Write-Host "latest release: v$Version (via $($resolution.ResolvedVia))"
 
 function Get-ReleaseAssetSize {
     param([object[]]$Assets, [string]$Name)
@@ -2240,7 +2300,7 @@ try {
     # ---- guidance -----------------------------------------------------------
 
     Write-Host ''
-    Write-Host "rpi $Version installed - stable - profile $ProfileValue"
+    Write-Host "rpi $Version installed - $InstallChannel - profile $ProfileValue"
     Write-Host "  binary:   $InstallPath"
     Write-Host "  asset:    $AssetName"
     Write-Host "  manifest: $ManifestPath"

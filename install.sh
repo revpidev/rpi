@@ -58,6 +58,8 @@
 #   incompatible rpiAbi/minHostVersion entries are rejected.
 #
 # Environment overrides (mirrors and tests):
+#   RPI_INSTALL_CHANNEL           stable|rc (default stable; rc reads the RC
+#                                 version endpoint and matching Release)
 #   RPI_INSTALL_PROFILE           mini|standard|full (flags win)
 #   RPI_INSTALL_YES               1/true/yes = non-interactive L0 consent
 #   RPI_INSTALL_STATIC_FALLBACK   1/true/yes = consent to the static fallback
@@ -74,8 +76,8 @@
 #   RPI_CODING_AGENT_DIR          agent dir (settings/extensions root)
 #   RPI_INSTALL_ADD_PATH          1/0 (see --add-path/--no-add-path)
 #   RPI_NONINTERACTIVE            1/true/yes = never prompt
-#   RPI_GITHUB_API_URL            latest-release API
-#   RPI_VERSION_CHECK_URL         fallback version endpoint
+#   RPI_GITHUB_API_URL            release metadata API override
+#   RPI_VERSION_CHECK_URL         channel version endpoint override
 #   RPI_RELEASE_BASE_URL          GitHub release base URL
 #   RPI_SITE_BASE_URL             official-site mirror base URL
 #
@@ -94,8 +96,14 @@
 set -eu
 
 REPO="revpidev/rpi"
+INSTALL_CHANNEL=$(printf '%s' "${RPI_INSTALL_CHANNEL:-stable}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+if [ "$INSTALL_CHANNEL" = rc ]; then
+    DEFAULT_VERSION_CHECK_URL="https://revpi.dev/api/latest-rc-version.json"
+else
+    DEFAULT_VERSION_CHECK_URL="https://revpi.dev/api/latest-version"
+fi
 GITHUB_API_URL=${RPI_GITHUB_API_URL:-"https://api.github.com/repos/$REPO/releases/latest"}
-VERSION_CHECK_URL=${RPI_VERSION_CHECK_URL:-"https://revpi.dev/api/latest-version"}
+VERSION_CHECK_URL=${RPI_VERSION_CHECK_URL:-$DEFAULT_VERSION_CHECK_URL}
 RELEASE_BASE_URL=${RPI_RELEASE_BASE_URL:-"https://github.com/$REPO/releases"}
 SITE_BASE_URL=${RPI_SITE_BASE_URL:-"https://revpi.dev"}
 
@@ -159,6 +167,11 @@ die() {
     exit 1
 }
 
+case "$INSTALL_CHANNEL" in
+    stable | rc) ;;
+    *) die "RPI_INSTALL_CHANNEL must be stable or rc (got: $INSTALL_CHANNEL)" ;;
+esac
+
 lower_trim() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
@@ -207,8 +220,8 @@ standard/full exit before fetching the profile index or any artifact. mini
 needs no consent. CI should use RPI_INSTALL_PROFILE=mini or explicitly accept
 the native-plugin risk with RPI_INSTALL_YES=1.
 
-Environment overrides: RPI_INSTALL_PROFILE, RPI_INSTALL_YES,
-RPI_INSTALL_STATIC_FALLBACK, RPI_INSTALL_REQUIRE_PLUGINS,
+Environment overrides: RPI_INSTALL_CHANNEL=stable|rc, RPI_INSTALL_PROFILE,
+RPI_INSTALL_YES, RPI_INSTALL_STATIC_FALLBACK, RPI_INSTALL_REQUIRE_PLUGINS,
 RPI_INSTALL_NO_CACHE, RPI_INSTALL_CACHE_DIR, RPI_INSTALL_PROGRESS,
 RPI_INSTALL_ATTEMPTS, RPI_INSTALL_STALL_TIMEOUT,
 RPI_INSTALL_CONNECT_TIMEOUT, RPI_INSTALL_PROMPT_TIMEOUT,
@@ -465,6 +478,29 @@ json_asset_size() { # json_asset_size <release-body> <asset-name>
 }
 
 resolve_version() {
+    if [ "$INSTALL_CHANNEL" = rc ]; then
+        body=$(fetch_stdout "$VERSION_CHECK_URL" 2>/dev/null) ||
+            die "RC version endpoint $VERSION_CHECK_URL is unreachable"
+        VERSION=$(printf '%s' "$body" | json_values version | head -n 1)
+        [ -n "$VERSION" ] || die "RC version endpoint $VERSION_CHECK_URL did not return a version"
+        VERSION=${VERSION#v}
+        RESOLVED_VIA="RC version endpoint"
+
+        release_api=${RPI_GITHUB_API_URL:-"https://api.github.com/repos/$REPO/releases/tags/v$VERSION"}
+        if API_BODY=$(fetch_stdout "$release_api" 2>/dev/null) && [ -n "$API_BODY" ]; then
+            tag=$(printf '%s' "$API_BODY" | json_values tag_name | head -n 1)
+            tag=${tag#v}
+            if [ "$tag" != "$VERSION" ]; then
+                warn "GitHub release API returned v$tag for RC v$VERSION; using naming-rule URLs"
+                API_BODY=""
+            fi
+        else
+            API_BODY=""
+            warn "GitHub release API unavailable; using naming-rule download URLs"
+        fi
+        return 0
+    fi
+
     if API_BODY=$(fetch_stdout "$GITHUB_API_URL" 2>/dev/null) && [ -n "$API_BODY" ]; then
         tag=$(printf '%s' "$API_BODY" | json_values tag_name | head -n 1)
         if [ -n "$tag" ]; then
@@ -2585,7 +2621,7 @@ info ""
 if [ "$IS_STATIC" = 1 ]; then
     info "rpi $VERSION installed (static fallback) · profile mini"
 else
-    info "rpi $VERSION installed · stable · profile $PROFILE"
+    info "rpi $VERSION installed · $INSTALL_CHANNEL · profile $PROFILE"
 fi
 info "  binary:   $INSTALL_PATH"
 info "  asset:    $ASSET_NAME"

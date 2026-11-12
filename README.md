@@ -45,6 +45,18 @@ Windows (PowerShell; installs to `%LOCALAPPDATA%\Programs\rpi`, override with `-
 irm https://revpi.dev/install.ps1 | iex
 ```
 
+Both installers default to the `stable` channel. Set `RPI_INSTALL_CHANNEL=rc` to resolve `latest-rc-version.json` and install that RC with its matching plugin bundle; unset it or use `stable` to return to stable installs.
+
+```bash
+# Unix: install the latest RC (non-interactive native-plugin consent)
+curl -fsSL https://revpi.dev/install.sh | RPI_INSTALL_CHANNEL=rc sh -s -- --yes
+```
+
+```powershell
+# Windows: install the latest RC
+$env:RPI_INSTALL_CHANNEL = 'rc'; irm https://revpi.dev/install.ps1 | iex
+```
+
 Both installers offer to add the install directory to your PATH when it is not already the active `rpi`. On macOS/Linux an interactive install (terminal stdout, usable `/dev/tty`, no `CI`/`RPI_NONINTERACTIVE`, `TERM` not `dumb`) asks once (default yes) and writes a marked `# rpi` block with an idempotent `case` guard to the detected profile: fish (`fish_add_path`), zsh, bash (`.bashrc`, then `.bash_profile`/`.bash_login`, then `.profile`), or the POSIX `~/.profile`. Unsupported shells only print manual guidance; root/system-wide or outside-`$HOME` prefixes print the exact manual command. The prompt is skipped when `CI`/`RPI_NONINTERACTIVE` is set, stdout is redirected, or no controlling terminal exists. If a pty is attached without those markers, shells with `read -t` time out after `RPI_INSTALL_PROMPT_TIMEOUT` seconds (default 60, treated as "no"); set `RPI_INSTALL_ADD_PATH=0` (or `--no-add-path`) to guarantee no wait, and `--add-path`/`RPI_INSTALL_ADD_PATH=1` to write without prompting. On Windows the installer prepends to the HKCU user PATH, preserves `%VAR%` entries and the registry value kind, removes duplicates, broadcasts `WM_SETTINGCHANGE`, and warns if a machine-level `rpi` still wins in a new terminal. Use `--add-path` / `--no-add-path` (Unix), `-AddPath` / `-NoAddPath` (Windows), or set `RPI_INSTALL_ADD_PATH=1|0` for non-interactive runs.
 
 ```bash

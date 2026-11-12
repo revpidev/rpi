@@ -110,6 +110,52 @@ try {
     Check-Equal 'C:\Program Files\rpi' (ConvertTo-NormalizedPathEntry '"C:\Program Files\rpi"') 'quoted PATH entry normalized'
     Check-Equal 'C:\Tools\rpi' (ConvertTo-NormalizedPathEntry 'C:\Tools\rpi\') 'trailing separator normalized'
 
+    $script:VersionRequests = @()
+    function Invoke-RestMethod {
+        param([string]$Uri, [hashtable]$Headers)
+        $script:VersionRequests += $Uri
+        switch ($Uri) {
+            'https://revpi.dev/api/latest-rc-version.json' {
+                return [pscustomobject]@{ version = '0.1.8-rc.5' }
+            }
+            'https://revpi.dev/api/latest-version' {
+                return [pscustomobject]@{ version = '0.1.7' }
+            }
+            'https://api.github.com/repos/revpidev/rpi/releases/tags/v0.1.8-rc.5' {
+                return [pscustomobject]@{
+                    tag_name = 'v0.1.8-rc.5'
+                    assets = @([pscustomobject]@{ name = 'rpi-0.1.8-rc.5-x86_64-pc-windows-msvc.zip' })
+                }
+            }
+            'https://api.github.com/repos/revpidev/rpi/releases/latest' {
+                return [pscustomobject]@{ tag_name = 'v0.1.7'; assets = @() }
+            }
+            default { throw "unexpected version URL: $Uri" }
+        }
+    }
+
+    $rcResolution = Resolve-InstallVersion -Channel 'rc' -GitHubApiUrl '' `
+        -VersionCheckUrl 'https://revpi.dev/api/latest-rc-version.json' -Repo 'revpidev/rpi'
+    Check-Equal '0.1.8-rc.5' $rcResolution.Version 'rc channel resolves the RC endpoint version'
+    Check-Equal 'RC version endpoint' $rcResolution.ResolvedVia 'rc channel names its version source'
+    Check-Equal '1' ([string]$rcResolution.ReleaseAssets.Count) 'rc tag release supplies asset metadata'
+    Check-Equal 'https://revpi.dev/api/latest-rc-version.json' $script:VersionRequests[0] 'rc endpoint is queried before release metadata'
+    Check-Equal 'https://api.github.com/repos/revpidev/rpi/releases/tags/v0.1.8-rc.5' $script:VersionRequests[1] 'rc metadata uses the matching tag API'
+
+    $script:VersionRequests = @()
+    $stableResolution = Resolve-InstallVersion -Channel 'stable' -GitHubApiUrl '' `
+        -VersionCheckUrl 'https://revpi.dev/api/latest-version' -Repo 'revpidev/rpi'
+    Check-Equal '0.1.7' $stableResolution.Version 'stable channel keeps the latest-release API'
+    Check-Equal 'https://api.github.com/repos/revpidev/rpi/releases/latest' $script:VersionRequests[0] 'stable metadata uses releases/latest'
+
+    $script:VersionRequests = @()
+    $mismatchResolution = Resolve-InstallVersion -Channel 'rc' `
+        -GitHubApiUrl 'https://api.github.com/repos/revpidev/rpi/releases/latest' `
+        -VersionCheckUrl 'https://revpi.dev/api/latest-rc-version.json' -Repo 'revpidev/rpi'
+    Check-Equal '0.1.8-rc.5' $mismatchResolution.Version 'stable metadata cannot override the rc endpoint version'
+    Check-Equal '0' ([string]$mismatchResolution.ReleaseAssets.Count) 'mismatched release metadata is discarded'
+    Remove-Item Function:\Invoke-RestMethod -ErrorAction SilentlyContinue
+
     if ($env:OS -eq 'Windows_NT') {
         $savedLocal = $env:LOCALAPPDATA
         $env:LOCALAPPDATA = 'C:\Users\me\AppData\Local'

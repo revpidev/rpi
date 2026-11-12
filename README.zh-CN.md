@@ -45,6 +45,18 @@ Windows（PowerShell；默认安装到 `%LOCALAPPDATA%\Programs\rpi`，可用 `-
 irm https://revpi.dev/install.ps1 | iex
 ```
 
+两个安装器默认使用 `stable` 通道。设置 `RPI_INSTALL_CHANNEL=rc` 可读取 `latest-rc-version.json`，安装对应 RC 及其配套插件包；取消设置或改为 `stable` 即恢复正式版安装。
+
+```bash
+# Unix：安装最新 RC（非交互同意安装 native 插件）
+curl -fsSL https://revpi.dev/install.sh | RPI_INSTALL_CHANNEL=rc sh -s -- --yes
+```
+
+```powershell
+# Windows：安装最新 RC
+$env:RPI_INSTALL_CHANNEL = 'rc'; irm https://revpi.dev/install.ps1 | iex
+```
+
 #### 安装 profile（V18-13）
 
 | Profile | 内容 | 约体积 |
