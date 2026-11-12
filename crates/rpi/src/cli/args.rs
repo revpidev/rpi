@@ -536,11 +536,11 @@ pub fn print_help(extension_flags: &[ExtensionFlag], use_ansi: bool) -> String {
 
 {commands_bold}
   {APP_NAME} install <source> [-l]     Install extension source (registry name, github:, npm:, git:, path)
-  {APP_NAME} remove <source> [-l]      Remove extension source from settings
+  {APP_NAME} remove <source> [-l]      Remove an installed extension
   {APP_NAME} uninstall <source> [-l]   Alias for remove
   {APP_NAME} update [source|self|rpi]  Update rpi, extensions, or model catalogs
   {APP_NAME} self-uninstall [--purge]  Uninstall this rpi binary installation
-  {APP_NAME} list                      List installed extensions from settings
+  {APP_NAME} list                      List installed extensions
   {APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
   {APP_NAME} auth <command>            Print credentials or check provider readiness
   {APP_NAME} <command> --help          Show help for install/remove/uninstall/update/self-uninstall/list/config/auth

@@ -1307,24 +1307,29 @@ Examples:
             r#"Usage:
   {REMOVE_USAGE}
 
-Remove a package and its source from settings.
+Remove an installed extension and its settings entry.
+Installed files are deleted; local path sources are only removed from settings.
 Alias: {APP_NAME} uninstall <source> [-l]
 
 Options:
-  -l, --local       Remove from project settings ({config_dir}/settings.json)
+  -l, --local       Use project scope ({config_dir}/settings.json)
   -a, --approve     Trust project-local files for this command
   -na, --no-approve Ignore project-local files for this command
 
 Examples:
-  {APP_NAME} remove npm:@foo/bar
-  {APP_NAME} uninstall npm:@foo/bar
+  {APP_NAME} remove rpi-todo
+  {APP_NAME} uninstall rpi-subagents
+  {APP_NAME} remove rpi-todo --local
+
+To uninstall the rpi binary instead:
+  {APP_NAME} self-uninstall [--purge]
 "#
         ),
         PackageCommandKind::List => format!(
             r#"Usage:
   {LIST_USAGE}
 
-List installed packages from user and project settings.
+List installed extensions from user and project scopes.
 
 Options:
   -a, --approve      Trust project-local files for this command
@@ -2015,6 +2020,10 @@ mod package_command_tests {
         let remove = package_command_help(PackageCommandKind::Remove);
         assert!(remove.contains(REMOVE_USAGE));
         assert!(remove.contains("rpi uninstall <source> [-l]"));
+        assert!(remove.contains("rpi remove rpi-todo"));
+        assert!(remove.contains("rpi uninstall rpi-subagents"));
+        assert!(remove.contains("rpi self-uninstall [--purge]"));
+        assert!(!remove.contains("npm:@foo/bar"));
         let list = package_command_help(PackageCommandKind::List);
         assert!(list.contains(LIST_USAGE));
     }
@@ -2157,6 +2166,31 @@ mod package_command_tests {
         )
         .unwrap();
         assert_eq!(settings["packages"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_uninstall_untracked_registry_package_exits_0() {
+        let dirs = TestDirs::new();
+        let install_dir = dirs.agent_dir.join("extensions/rpi-todo");
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(
+            install_dir.join("rpi-extension.json"),
+            r#"{"name":"rpi-todo","version":"0.1.0","native":"dist/librpi_todo.so","capabilities":[],"rpiAbi":1}"#,
+        )
+        .unwrap();
+
+        let parsed = parse(&["uninstall", "rpi-todo"]);
+        assert_eq!(
+            run_package_command_in(&parsed, &dirs.cwd, &dirs.agent_dir, None),
+            0
+        );
+        assert!(!install_dir.exists());
+
+        let parsed = parse(&["uninstall", "rpi-todo"]);
+        assert_eq!(
+            run_package_command_in(&parsed, &dirs.cwd, &dirs.agent_dir, None),
+            1
+        );
     }
 
     #[test]

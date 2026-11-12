@@ -3108,10 +3108,21 @@ impl DefaultPackageManager {
         )
     }
 
-    /// `removeAndPersist` (package-manager.ts:1043-1046).
+    /// `removeAndPersist` (package-manager.ts:1043-1046), extended to report
+    /// success for discovered artifact installs that have no settings entry.
     pub fn remove_and_persist(&mut self, source: &str, local: bool) -> Result<bool, String> {
+        let scope = if local {
+            SourceScope::Project
+        } else {
+            SourceScope::User
+        };
+        let installed = matches!(
+            parse_source(source),
+            ParsedSource::Registry(_) | ParsedSource::GithubRelease(_)
+        ) && self.get_installed_path(source, scope).is_some();
         self.remove(source, local)?;
-        self.remove_source_from_settings(source, local)
+        let settings_removed = self.remove_source_from_settings(source, local)?;
+        Ok(settings_removed || installed)
     }
 
     /// `getInstalledPath` (package-manager.ts:862-878).
@@ -8891,6 +8902,20 @@ mod registry_tests {
         assert!(removed);
         assert!(!dirs.agent_dir.join("extensions/subagents").exists());
         assert!(!settings_packages(&dirs).contains("subagents"));
+    }
+
+    #[test]
+    fn test_remove_untracked_registry_install_succeeds() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        place_untracked_extension(&dirs, "rpi-todo", "0.1.0");
+        let mut manager = manager_ok(&dirs, transport);
+        let settings_before = settings_packages(&dirs);
+
+        assert!(manager.remove_and_persist("rpi-todo", false).unwrap());
+        assert!(!dirs.agent_dir.join("extensions/rpi-todo").exists());
+        assert_eq!(settings_packages(&dirs), settings_before);
+        assert!(!manager.remove_and_persist("rpi-todo", false).unwrap());
     }
 
     #[test]

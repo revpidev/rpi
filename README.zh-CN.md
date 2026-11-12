@@ -105,6 +105,15 @@ rpi update --models     # 刷新远程模型目录
 
 ### 卸载
 
+使用 `rpi remove <name>`（别名：`rpi uninstall <name>`）卸载单个插件；项目级安装需加 `--local`。settings 中登记的插件和 `rpi list` 显示为 `(untracked)` 的安装产物都支持卸载。已安装的插件文件会被删除；本地路径源只移除 settings 条目，不删除原目录。
+
+```bash
+rpi remove rpi-todo          # 卸载用户级插件
+rpi remove rpi-todo --local  # 卸载项目级插件
+```
+
+rpi 本体使用独立命令卸载：
+
 ```bash
 rpi self-uninstall           # 删除二进制与安装清单；保留 ~/.rpi
 rpi self-uninstall --purge   # 连同 ~/.rpi（会话、认证、设置）一起删除

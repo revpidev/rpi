@@ -105,6 +105,15 @@ Interactive startup checks installed packages asynchronously. A stable host comp
 
 ### Uninstalling
 
+Remove one plugin with `rpi remove <name>` (alias: `rpi uninstall <name>`), adding `--local` for a project-scoped install. This works both for settings-tracked plugins and for artifact installs shown as `(untracked)` by `rpi list`. Installed plugin files are deleted; a local path source is only removed from settings.
+
+```bash
+rpi remove rpi-todo          # remove a user-scoped plugin
+rpi remove rpi-todo --local  # remove a project-scoped plugin
+```
+
+Uninstall the rpi binary separately:
+
 ```bash
 rpi self-uninstall           # removes the binary and install manifest; keeps ~/.rpi
 rpi self-uninstall --purge   # also deletes ~/.rpi (sessions, auth, settings)
