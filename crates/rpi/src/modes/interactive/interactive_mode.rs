@@ -192,6 +192,9 @@ pub(crate) mod commands_selectors;
 pub(crate) mod component_registry;
 pub(crate) mod tmux_check;
 pub(crate) mod ui_bridge;
+#[cfg(feature = "v19-benchmark")]
+#[doc(hidden)]
+pub mod v19_replay;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -452,7 +455,7 @@ pub(crate) enum UiCommand {
         result: serde_json::Value,
         is_error: bool,
         /// `durationMs` from the event (agent-loop.ts `tool_execution_end`
-        /// @ 4a080252f): rides the event, not the result payload.
+        /// @ b4afdddf): rides the event, not the result payload.
         duration_ms: Option<u64>,
     },
     QueueUpdate {
@@ -1506,7 +1509,7 @@ fn resolve_theme(session: &AgentSession, initial_theme_setting: Option<&str>) ->
 /// (upstream GCs this; here the mode lives for the process lifetime).
 /// `pub(crate)` so the slash-command handlers in `commands.rs` can
 /// extend it.
-/// One frame of the editor-region selector stack (ADR-0041 / 4a080252f):
+/// One frame of the editor-region selector stack (ADR-0041 / b4afdddf):
 /// each dialog/selector mounts on top of the previous one. `dialog` marks
 /// host/extension dialogs that capture input and count for `ui.hasOverlay`;
 /// inline editor components (`setEditorComponent`) share the region but do
@@ -1715,10 +1718,10 @@ pub(crate) struct InteractiveUi {
     last_sigint_time: AtomicU64,
     last_escape_time: AtomicU64,
     /// `anthropicSubscriptionWarningShown` (interactive-mode.ts:328 @
-    /// 4a080252f): the Anthropic extra-usage warning fires at most once per
+    /// b4afdddf): the Anthropic extra-usage warning fires at most once per
     /// session, no matter which call site reaches it first.
     anthropic_subscription_warning_shown: AtomicBool,
-    /// `startupNoticesShown` (interactive-mode.ts:494 @ 4a080252f):
+    /// `startupNoticesShown` (interactive-mode.ts:494 @ b4afdddf):
     /// `show_startup_notices_if_needed` renders the changelog block only
     /// once per mode instance.
     startup_notices_shown: AtomicBool,
@@ -1935,7 +1938,7 @@ pub(crate) struct ShareState {
 }
 
 /// `ANTHROPIC_SUBSCRIPTION_AUTH_WARNING` (interactive-mode.ts:321-322 @
-/// 4a080252f), verbatim.
+/// b4afdddf), verbatim.
 const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING: &str = "Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage. Disable this warning in /settings.";
 
 /// `isAnthropicSubscriptionAuthKey` (interactive-mode.ts:324-326): the key
@@ -1945,7 +1948,7 @@ fn is_anthropic_subscription_auth_key(api_key: Option<&str>) -> bool {
 }
 
 /// The `showStartupNoticesIfNeeded` body (interactive-mode.ts:856-870 @
-/// 4a080252f): the bordered condensed line or the full "What's New" block.
+/// b4afdddf): the bordered condensed line or the full "What's New" block.
 /// A free function so the golden-frame snapshot tests can render the exact
 /// block without a full mode.
 pub(crate) fn startup_notice_components(
@@ -2004,7 +2007,7 @@ impl InteractiveUi {
     }
 
     /// `maybeWarnAboutAnthropicSubscriptionAuth` (interactive-mode.ts:
-    /// 5261-5289 @ 4a080252f): warn once per session when the selected
+    /// 5261-5289 @ b4afdddf): warn once per session when the selected
     /// anthropic model authenticates through a Claude subscription (OAuth or
     /// an `sk-ant-oat…` key). Auth lookup failures are swallowed
     /// (warning-only); `warnings.anthropicExtraUsage === false` disables it.
@@ -2762,7 +2765,7 @@ impl InteractiveUi {
                 if let Some(component) = pending_tools.remove(&tool_call_id) {
                     // `component.updateResult({ ...event.result, isError:
                     // event.isError, durationMs: event.durationMs })`
-                    // (interactive-mode.ts:3646 @ 4a080252f): `durationMs`
+                    // (interactive-mode.ts:3646 @ b4afdddf): `durationMs`
                     // is a sibling of the tool result on the event.
                     let mut result = result;
                     if let Some(duration_ms) = duration_ms
@@ -3893,7 +3896,7 @@ impl InteractiveUi {
     }
 
     /// `showStartupNoticesIfNeeded` (interactive-mode.ts:843-871 @
-    /// 4a080252f): render the new-entry changelog block once per mode
+    /// b4afdddf): render the new-entry changelog block once per mode
     /// instance. Resumed sessions never have `changelog_markdown`
     /// (`getChangelogForDisplay` skips sessions with messages), so the
     /// early return keeps the restore path unchanged.
@@ -4223,7 +4226,7 @@ impl InteractiveUi {
     }
 
     /// `maybeShowCacheMissNotice` (interactive-mode.ts:4185-4191 @
-    /// 4a080252f): behind the `showCacheMissNotices` gate, detect a cache
+    /// b4afdddf): behind the `showCacheMissNotices` gate, detect a cache
     /// miss on the just-completed assistant message and render the notice.
     /// rpi's session listener may have already persisted the message before
     /// the UI drain; the detector skips the message itself either way.
@@ -4243,7 +4246,7 @@ impl InteractiveUi {
         }
     }
 
-    /// `addCacheMissNotice` (interactive-mode.ts:4193-4206 @ 4a080252f):
+    /// `addCacheMissNotice` (interactive-mode.ts:4193-4206 @ b4afdddf):
     /// display thresholds (20k tokens or $0.10), label priority
     /// model-switch > idle > generic, `{tokens} tokens re-billed (~$x.xx)`.
     /// The notice is derived state and is never persisted.
@@ -6010,7 +6013,7 @@ pub(crate) fn scope_group_lines(
     lines
 }
 
-/// `isExtensionCommand` (interactive-mode.ts:4771-4779 @ 4a080252f).
+/// `isExtensionCommand` (interactive-mode.ts:4771-4779 @ b4afdddf).
 fn is_extension_command(runner: &Arc<dyn ExtensionRunner>, text: &str) -> bool {
     if !text.starts_with('/') {
         return false;
@@ -6854,7 +6857,7 @@ impl InteractiveMode {
         }
 
         // `void this.maybeWarnAboutAnthropicSubscriptionAuth()`
-        // (interactive-mode.ts:1228 @ 4a080252f): fire-and-forget before the
+        // (interactive-mode.ts:1228 @ b4afdddf): fire-and-forget before the
         // initial-message processing (rpi has no crash-notification face to
         // sit after; the startup sequence position is the correspondence).
         {
@@ -7284,7 +7287,7 @@ impl InteractiveMode {
     /// Run one prompt off the run loop.
     ///
     /// Upstream runs `session.prompt` from the editor submit callback
-    /// (interactive-mode.ts:3319-3340 @ 4a080252f), so its run loop
+    /// (interactive-mode.ts:3319-3340 @ b4afdddf), so its run loop
     /// (`getUserInput` → `prompt`, 1255-1262) never blocks and keeps
     /// dispatching submits while a run is active — a message typed then is
     /// queued as a steer and its `Steering:` row appears immediately. The
@@ -7329,7 +7332,7 @@ impl InteractiveMode {
         }
     }
 
-    /// `flushCompactionQueue(options)` (interactive-mode.ts:4781-4858 @ 4a080252f) — the
+    /// `flushCompactionQueue(options)` (interactive-mode.ts:4781-4858 @ b4afdddf) — the
     /// priority chain: `will_retry` re-queues everything into the retry
     /// turn; otherwise extension commands run immediately, the first
     /// non-extension message becomes the prompt (with its mode), and the
@@ -13356,7 +13359,7 @@ mod tests {
         mode.shutdown().await;
     }
 
-    /// ADR-0041 / 4a080252f: concurrent extension dialogs form a stack. The
+    /// ADR-0041 / b4afdddf: concurrent extension dialogs form a stack. The
     /// second dialog supersedes the first but does not settle it; closing the
     /// top restores the previous one, and closing the last restores the
     /// editor. Both promises settle in order.

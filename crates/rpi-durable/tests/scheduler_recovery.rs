@@ -1,5 +1,5 @@
 //! Scheduler recovery, blocked-definition, and migration tests (port of
-//! `packages/durable/test/harness-tasks-recovery.test.ts` @ `4a080252f`).
+//! `packages/durable/test/harness-tasks-recovery.test.ts` @ `b4afdddf`).
 //!
 //! Fixtures stamp durable records directly (simulating a crash between commits)
 //! and then reopen a Harness over the same Storage, exercising `open()`'s

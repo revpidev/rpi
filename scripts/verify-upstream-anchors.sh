@@ -2,11 +2,11 @@
 # Verifies the upstream line anchors cited by the codemode/tool_search source
 # comments (V16-07 review O-E).
 #
-# Earlier pin bumps moved these lines repeatedly. The v1.1.0 -> v1.4.0 bump
-# (V18-00, ADR-0038) moved them again; the table below was relocated by symbol
-# against the 4a080252f checkout. V18-03 removed MCP_TYPESCRIPT_PREAMBLE and
+# Earlier pin bumps moved these lines repeatedly. The v1.4.0 -> v1.5.2 bump
+# (V19-00, ADR-0048) moved them again; the table below was relocated by symbol
+# against the b4afdddf checkout. V18-03 removed MCP_TYPESCRIPT_PREAMBLE and
 # mcpStructuredContentSchema with their upstream counterparts; the table now
-# binds the v1.4.0 declaration, worker-admission and MCP result-schema symbols.
+# binds the v1.5.2 declaration, worker-admission and MCP result-schema symbols.
 # This check binds each
 # comment to the pinned checkout in both directions:
 #   1. the rpi source still cites the expected `(<basename>:<range>)`, and
@@ -97,37 +97,37 @@ crates/rpi-codemode/src/runtime/worker.rs@packages/codemode/src/runtime/vm.ts@vm
 crates/rpi-codemode/src/runtime/worker.rs@packages/codemode/src/runtime/vm.ts@vm.ts:133-145@function discardOutput
 crates/rpi-codemode/src/runtime/worker.rs@packages/codemode/src/runtime/vm.ts@vm.ts:254-296@const bridge = vm.newFunction
 crates/rpi-codemode/src/quickjs.rs@packages/codemode/src/runtime/vm.ts@vm.ts:147-151@function describeException
-crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:29-32@export interface ToolSearchMatch
+crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:33-36@export interface ToolSearchMatch
 crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:39-61@const STOP_WORDS
-crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:63-69@function stem
+crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:70-76@function stem
 crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:71-80@export function tokenize
-crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:86-101@function schemaText
-crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:103-116@export function createToolSearchDocument
-crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:118-157@export class Bm25Ranker
-crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:159-167@export const toolSearchSchema
-crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:187-189@function isSearchable
-crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:195-209@function searchAndLoad
-crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:215@export const TOOL_SEARCH_DESCRIPTION
-crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:217-244@export function createToolSearchToolDefinition
-crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:230@async execute\(_toolCallId
-crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:139@const CHARS_PER_TOKEN = 4
-crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:116@export const CODEMODE_DOCS_PATH
+crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:104-126@function schemaText
+crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:131-141@export function createToolSearchDocument
+crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:213-261@export class Bm25Ranker
+crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:264-269@export const toolSearchSchema
+crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:292-294@function isSearchable
+crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:300-315@function searchAndLoad
+crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:320@export const TOOL_SEARCH_DESCRIPTION
+crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:322-349@export function createToolSearchToolDefinition
+crates/rpi/src/extensions/tool_search.rs@packages/coding-agent/src/extensions/tool-search/tool.ts@tool.ts:335@async execute\(_toolCallId
+crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:144@const CHARS_PER_TOKEN = 4
+crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:121@export const CODEMODE_DOCS_PATH
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:123-136@function describeGlobals
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:163-179@export interface CodemodeDescriptionOptions
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:180-185@function renderToolSection
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:203-227@function selectCatalog
 crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:228-276@export function createCodemodeDescription
-crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:293-313@function describeOutput
-crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:293-313@function describeScriptCall
-crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/core/settings-schema.ts@settings-schema.ts:470@export interface CodemodeSettings
+crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:308-318@function describeOutput
+crates/rpi/src/extensions/codemode/description.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:354-357@function describeScriptCall
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/core/settings-schema.ts@settings-schema.ts:482@export interface CodemodeSettings
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/index.ts@index.ts:20-30@function readMode
-crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/core/agent-session.ts@agent-session.ts:1514-1526@getAllTools
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/core/agent-session.ts@agent-session.ts:1579-1592@getAllTools
 crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:78-83@export const codemodeSchema
-crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:159-162@export function getCodemodeCallableTools
-crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:320-358@function prepareCodemodeLoadout
-crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:371-398@export function createCodemodeToolDefinition
-crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:383@exposure: "model-only"
-crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:387@constrainedSampling: \{ type: "grammar"
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:164-166@export function getCodemodeCallableTools
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:370-413@function prepareCodemodeLoadout
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:421-443@export function createCodemodeToolDefinition
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:433@exposure: "model-only"
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:437@constrainedSampling: \{ type: "grammar"
 
 crates/rpi-codemode/src/declarations.rs@packages/codemode/src/declarations.ts@declarations.ts:14-34@const TAG_KEYWORDS
 crates/rpi-codemode/src/declarations.rs@packages/codemode/src/declarations.ts@declarations.ts:133-153@export function schemaToType
@@ -141,9 +141,9 @@ crates/rpi/src/extensions/codemode/execute.rs@packages/coding-agent/src/extensio
 crates/rpi/src/extensions/mcp/ui.rs@packages/coding-agent/src/extensions/mcp/index.ts@index.ts:1191-1209@await waitForServers
 crates/rpi-mcp/src/types.rs@packages/mcp/src/client.ts@client.ts:143-150@function validateCallToolResult
 crates/rpi/src/modes/interactive/tool_renderers/render_utils.rs@packages/coding-agent/src/core/tools/render-utils.ts@render-utils.ts:146-170@export function toolTimerText
-crates/rpi/src/extensions/mcp/tools.rs@packages/coding-agent/src/extensions/mcp/tools.ts@tools.ts:159-174@export function createMcpResultSchema
-crates/rpi/src/extensions/mcp/tools.rs@packages/coding-agent/src/extensions/mcp/tools.ts@tools.ts:135-156@function relocateSchema
-crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:362-385@function getScriptReach
+crates/rpi/src/extensions/mcp/tools.rs@packages/coding-agent/src/extensions/mcp/tools.ts@tools.ts:135-152@export function createMcpResultSchema
+crates/rpi/src/extensions/mcp/tools.rs@packages/coding-agent/src/extensions/mcp/tools.ts@tools.ts:111-130@function relocateSchema
+crates/rpi/src/extensions/codemode/tool.rs@packages/coding-agent/src/extensions/codemode/tool.ts@tool.ts:416-419@function getScriptReach
 ANCHORS
 
 if ((failures > 0)); then

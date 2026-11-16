@@ -1,5 +1,5 @@
 //! BM25 tool search for `tool_search` (port of
-//! `packages/durable/src/search.ts` @ `4a080252f`).
+//! `packages/durable/src/search.ts` @ `b4afdddf`).
 //!
 //! Durable keeps its own copy of the ranking the coding agent uses; the same
 //! ranker backs `searchTools()` in code mode.

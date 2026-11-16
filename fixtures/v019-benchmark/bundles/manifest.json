@@ -1,0 +1,130 @@
+{
+  "bundles": {
+    "cjk-fullscreen-1mib-200.json": {
+      "bytes": 1099280,
+      "sha256": "354aa16923899d3a6b859c91c9daa41cc762404ac5bd7d16bdd3815a94f4a725",
+      "suite": "cpu"
+    },
+    "code-fullscreen-1mib-main.json": {
+      "bytes": 1113807,
+      "sha256": "305feef5aaed1c4a92e854bcdc449787042a795239d7dfa1ae566e8d85509488",
+      "suite": "cpu"
+    },
+    "code-fullscreen-history-scroll.json": {
+      "bytes": 294620,
+      "sha256": "ece9cdd4724bd18703d5fb533480e3f090e976d0ca2a5e08b7e6896864ddf302",
+      "suite": "cpu"
+    },
+    "code-fullscreen-resize.json": {
+      "bytes": 294621,
+      "sha256": "6d26a0bf113f5fdee961a3c473de7b2ab533f5896b08d2be3238ca1578080216",
+      "suite": "cpu"
+    },
+    "code-regular-1mib-200.json": {
+      "bytes": 1101561,
+      "sha256": "e555a50391c61b4773e748cde15611f85bc2cba2382185d7f3900e3f57e50155",
+      "suite": "cpu"
+    },
+    "code-regular-1mib-80.json": {
+      "bytes": 1105639,
+      "sha256": "522e3eda198d97a4c5136fd04512ce5bec5d0fbf6b143980ed24f168dbe85bdd",
+      "suite": "cpu"
+    },
+    "long-arguments-fullscreen.json": {
+      "bytes": 55126,
+      "sha256": "5efd4723b7d2dcdef21c640606ed565244572ca038ff13c54035287f69cf303b",
+      "suite": "cpu"
+    },
+    "memory-empty-default.json": {
+      "bytes": 2211,
+      "sha256": "a70f423d59192b536a76f6c1f1e7d37e99902d25fc856e652efb2ffa659b0d58",
+      "suite": "memory"
+    },
+    "memory-empty-no-extensions.json": {
+      "bytes": 2214,
+      "sha256": "0f2cd292c1121b7421b453c64533738f3576aed5eaf6d394c3c6cde30a55feba",
+      "suite": "memory"
+    },
+    "memory-glm-switch-kimi.json": {
+      "bytes": 2333,
+      "sha256": "3046b52ac7c1aff25db190c79c6280791482aa631e6d4bd1fd2d6cb43af9f919",
+      "suite": "memory"
+    },
+    "memory-kimi-switch-glm.json": {
+      "bytes": 2333,
+      "sha256": "44fcd11e0eba6f28172135f869f5a09702c66c5350244067282203bbd363bdd3",
+      "suite": "memory"
+    },
+    "memory-long-default.json": {
+      "bytes": 1091389,
+      "sha256": "c37bb21136238fe28a3ceae5c91e3b9583450f2f22357f27dd9f9e2821656911",
+      "suite": "memory"
+    },
+    "memory-long-no-extensions.json": {
+      "bytes": 1091392,
+      "sha256": "5dbfa13d16a5c969e351a327534d582043f264b47a246e808e19d99dde326607",
+      "suite": "memory"
+    },
+    "memory-png-over-budget.json": {
+      "bytes": 664750,
+      "sha256": "3ba043982eca69ec6886da4911d1e45e7801e4c8b541aaacc7db7c353e80e8f7",
+      "suite": "memory"
+    },
+    "mermaid-off-fullscreen.json": {
+      "bytes": 6252,
+      "sha256": "1f55fcca95e2a09a9e2474b1c85a3523f2ae67e562880215e32babac53f3b9af",
+      "suite": "cpu"
+    },
+    "mermaid-streaming-fullscreen.json": {
+      "bytes": 6230,
+      "sha256": "0ab08e67824650b25209b13321fbd29c6e2e63c9fc149699402a3c9a74b03534",
+      "suite": "cpu"
+    },
+    "smoke-text-regular.json": {
+      "bytes": 828,
+      "sha256": "54afa1c00e1dbd7be3a90fe3769e381040d2c954d4737f8b71081293f3bb337c",
+      "suite": "cpu"
+    },
+    "text-fullscreen-cumulative-extension.json": {
+      "bytes": 9079,
+      "sha256": "ff5abbec57769ae23af337ba8d0a2d46a08dad388cb8b117b1b6bd66dce3def3",
+      "suite": "cpu"
+    },
+    "text-fullscreen-default-statusline.json": {
+      "bytes": 9170,
+      "sha256": "08a790de3b72cf17209345a443e32f12f436e9516fdc3c73f9c4558756f4a549",
+      "suite": "cpu"
+    },
+    "text-fullscreen-glm.json": {
+      "bytes": 9061,
+      "sha256": "434822b8ee81a019ae38a26de44576cac08bdc28689783e7ea582075504c7f83",
+      "suite": "cpu"
+    },
+    "text-fullscreen-kimi.json": {
+      "bytes": 9071,
+      "sha256": "a1cffe5dbe67ed871ea8f5ac2e5b6cc1a51c7fdac9af5ded596feeb12d13aed3",
+      "suite": "cpu"
+    },
+    "text-fullscreen-new-200.json": {
+      "bytes": 9061,
+      "sha256": "e363a1ba5b8b9a94b765104ff22416d86af5f0f5d644883bc9074afc97f866cb",
+      "suite": "cpu"
+    },
+    "text-fullscreen-new-80.json": {
+      "bytes": 9059,
+      "sha256": "a09bba888afdc17bdf71b3ce6eab5f6ae239f57718be0e4d91942efbcef86526",
+      "suite": "cpu"
+    },
+    "text-regular-livetokens-off.json": {
+      "bytes": 9094,
+      "sha256": "6b23ed858395f7e015ef258ec2865168ef29fe435e4069bd1e4f6c085b64440e",
+      "suite": "cpu"
+    },
+    "text-regular-new-80.json": {
+      "bytes": 9053,
+      "sha256": "1f50641f95eaa535e163060ba4c9013e777992c314e2d08c70a46be9a935c6e1",
+      "suite": "cpu"
+    }
+  },
+  "schema": "rpi-v19-benchmark-inputs-v1"
+}

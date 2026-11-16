@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/providers/kimi-coding.ts` @ pi 1.4.0 (4a080252f).
+//! Port of `packages/ai/src/providers/kimi-coding.ts` @ pi 1.5.2 (b4afdddf).
 //!
 //! Models come from the vendored catalog (`generated.rs`), which carries the
 //! same data as upstream `kimi-coding.models.ts` (corrections baked in —

@@ -1,5 +1,5 @@
 //! Durable sleeping, host timers and wakeups (V18-06 FR-C/FR-D; port of
-//! `packages/durable/test/harness-sleep.test.ts` @ `4a080252f`).
+//! `packages/durable/test/harness-sleep.test.ts` @ `b4afdddf`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

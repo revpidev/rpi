@@ -1,6 +1,6 @@
 //! Nested tool calls and structured output (V18-06 FR-A; port of
 //! `packages/durable/test/harness-nested-tools.test.ts` and
-//! `harness-structured-output.test.ts` @ `4a080252f`).
+//! `harness-structured-output.test.ts` @ `b4afdddf`).
 //!
 //! Drives the real `pi.tool` built-in through a Harness over memory storage with
 //! a scripted provider.

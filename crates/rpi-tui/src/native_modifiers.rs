@@ -1,4 +1,4 @@
-//! Port of `packages/tui/src/native-modifiers.ts` @ pi 1.4.0 (`4a080252f`),
+//! Port of `packages/tui/src/native-modifiers.ts` @ pi 1.5.2 (`b4afdddf`),
 //! with the platform gating tracking the `4181f66` revision (`73dd066ee`
 //! added the win32 helper path).
 //!

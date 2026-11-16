@@ -1,5 +1,5 @@
-//! Port of `packages/ai/src/providers/openrouter.ts` @ pi 1.4.0
-//! (4a080252f), including the per-key `/models/user` catalog from ee409a85f.
+//! Port of `packages/ai/src/providers/openrouter.ts` @ pi 1.5.2
+//! (b4afdddf), including the per-key `/models/user` catalog from ee409a85f.
 
 use std::collections::HashMap;
 use std::sync::Arc;

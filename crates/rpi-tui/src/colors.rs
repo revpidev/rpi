@@ -1,7 +1,7 @@
 //! Color model, parsing and ANSI styling. Every color converts to sRGB, so
 //! color math never fails.
 //!
-//! Port of `packages/tui/src/colors.ts` @ pi v1.4.0 (4a080252f), with the
+//! Port of `packages/tui/src/colors.ts` @ pi v1.5.2 (b4afdddf), with the
 //! OKLab/OKHSL math in [`crate::oklab`].
 //!
 //! Intentional differences: none functional. `Rgb` channels stay `f64` (only

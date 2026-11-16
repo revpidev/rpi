@@ -1,5 +1,5 @@
 //! What the model reads about code mode (port of
-//! `packages/durable/src/codemode/describe.ts` @ `4a080252f`).
+//! `packages/durable/src/codemode/describe.ts` @ `b4afdddf`).
 //!
 //! The module carries the fixed tool description, the deterministic
 //! TypeScript-style declaration rendering used by the `codemode` prompt

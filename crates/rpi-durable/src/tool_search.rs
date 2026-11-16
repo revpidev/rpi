@@ -1,5 +1,5 @@
 //! The `tool_search` tool and extension (port of
-//! `packages/durable/src/tool-search/tool-search.ts` @ `4a080252f`).
+//! `packages/durable/src/tool-search/tool-search.ts` @ `b4afdddf`).
 //!
 //! The model searches the deferred tools it is not offered yet; the matches are
 //! loaded with `control.addTools`, so the next request offers them. Loading

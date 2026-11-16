@@ -53,6 +53,10 @@ fixtures/
 
 `fixtures/read-line-range.json` is a handwritten cross-surface contract fixture (not generated): the TUI read row, session tree and the exported viewer's Node test all assert the same offset/limit matrix (#9887).
 
+## V19-00 replay inputs
+
+`v019-benchmark/bundles/` is generated only by `python3 scripts/v019-benchmark/generate_inputs.py`; do not hand-edit the JSON bundles or `manifest.json`. The generator is deterministic, uses fixed delta boundaries and records each bundle's SHA-256, byte length and `cpu`/`memory` suite. Verify with `--check`. The inputs are rpi-owned measurement data, not upstream golden recordings and not a G14 re-record. The full build/run, stable-overlay and `/proc` evidence protocol is documented in `scripts/v019-benchmark/README.md`.
+
 ## 2. Runbook (repeatable generation)
 
 Prerequisites (one-time; `node_modules/` and `dist/` are both in `.gitignore`, so red-line G4 is not touched):
@@ -241,13 +245,13 @@ byte-checked during the V17-02 codemode end-to-end test
 ## V18-00 export HTML asset synchronization (2026-10-26)
 
 The six embedded assets under `crates/rpi/src/core/export_html/` are generated
-from `external/pi/packages/coding-agent/src/core/export-html/` at Pi v1.4.0
-`4a080252f06caf63a525d7873c5d94d3c23887e0`. Do not edit them by hand. From the
-repository root, run:
+from `external/pi/packages/coding-agent/src/core/export-html/`; V19-00 refreshed
+them mechanically at Pi v1.5.2 `b4afdddf44e059c67ccf5097e5317d913521b470`.
+Do not edit them by hand. From the repository root, run:
 
 ```bash
-python3 scripts/sync-export-html-assets.py --pin 4a080252f06caf63a525d7873c5d94d3c23887e0
-python3 scripts/sync-export-html-assets.py --pin 4a080252f06caf63a525d7873c5d94d3c23887e0 --check
+python3 scripts/sync-export-html-assets.py --pin b4afdddf44e059c67ccf5097e5317d913521b470
+python3 scripts/sync-export-html-assets.py --pin b4afdddf44e059c67ccf5097e5317d913521b470 --check
 ```
 
 The declared outputs are `template.html`, `template.css`, `template.js`,

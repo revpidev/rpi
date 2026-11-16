@@ -139,6 +139,14 @@ pub extern "C" fn init(calls: RpiHostCalls, cookie: PluginCookie) -> RVec<u8> {
     if response.get("error").is_some() {
         return pack(response);
     }
+    // V19-00 replay-only cumulative consumer. Existing fixture users do not
+    // set this opt-in, so their event subscription set remains unchanged.
+    if std::env::var_os("RPI_V19_CUMULATIVE_FIXTURE").is_some() {
+        let response = host_call(&calls, cookie, "on", json!({"event": "message_update"}));
+        if response.get("error").is_some() {
+            return pack(response);
+        }
+    }
     // V14-22 dual-carrier parity fixture: register the scripted interactive
     // UI tool. Registration is additive and must not fail the load when the
     // `tools` capability is absent (bare `.so` loads keep working).
@@ -164,6 +172,17 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
     let message: Value = serde_json::from_slice(&message[..]).unwrap_or(Value::Null);
     let kind = message.get("kind").and_then(Value::as_str).unwrap_or("");
     let payload = message.get("payload").cloned().unwrap_or(Value::Null);
+    if kind == "event"
+        && message.get("event").and_then(Value::as_str) == Some("message_update")
+        && std::env::var_os("RPI_V19_CUMULATIVE_FIXTURE").is_some()
+    {
+        static EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if let Some(path) = std::env::var_os("RPI_V19_CUMULATIVE_COUNT_FILE") {
+            let _ = std::fs::write(path, count.to_string());
+        }
+        return pack(json!({"ok": true, "count": count}));
+    }
     // TE01 probe (ADR-0015): triggered by a tool_call event for the
     // (never-registered) tool name "te01_probe", so the probe result rides
     // the emit_tool_call return channel. Other tool_calls gate as before.

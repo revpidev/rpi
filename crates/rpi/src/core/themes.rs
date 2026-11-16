@@ -45,7 +45,7 @@ pub mod system;
 pub use self::system::SYSTEM_THEME_NAME;
 
 // ===========================================================================
-// Terminal color state (theme.ts:406-417 @ 4a080252f)
+// Terminal color state (theme.ts:406-417 @ b4afdddf)
 // ===========================================================================
 
 /// The terminal's reported colors; replaced (never mutated) on update, so
@@ -112,7 +112,7 @@ pub fn terminal_colors_pending() -> bool {
     TERMINAL_COLORS_PENDING.load(AtomicOrdering::Relaxed)
 }
 
-/// `detectColorFgBgTheme` (theme.ts:697-705 @ 4a080252f): the last numeric
+/// `detectColorFgBgTheme` (theme.ts:697-705 @ b4afdddf): the last numeric
 /// `COLORFGBG` field is an ANSI index classified like Vim — 0-6 and 8 dark,
 /// 7 and 9-15 light; anything else has no answer.
 pub fn detect_color_fg_bg_theme(colorfgbg: Option<&str>) -> Option<TerminalTheme> {
@@ -134,7 +134,7 @@ pub fn detect_color_fg_bg_theme(colorfgbg: Option<&str>) -> Option<TerminalTheme
     })
 }
 
-/// `detectTerminalTheme` (theme.ts:707-716 @ 4a080252f): the reported
+/// `detectTerminalTheme` (theme.ts:707-716 @ b4afdddf): the reported
 /// background (with the foreground as a tiebreaker) decides; without one the
 /// terminal's light/dark report, then `COLORFGBG`, then dark.
 pub fn detect_terminal_theme(
@@ -771,7 +771,7 @@ pub enum ColorMode {
 /// terminal-image.ts:172; theme construction consumes it,
 /// resource-loader.ts @ ddba59618 #9973).
 pub fn terminal_color_mode() -> ColorMode {
-    // Single detection source (terminal-image.ts:172 @ 4a080252f): reuse the
+    // Single detection source (terminal-image.ts:172 @ b4afdddf): reuse the
     // capability-based decision instead of re-reading the flags.
     match rpi_tui::terminal_image::get_terminal_color_mode() {
         tui_colors::TerminalColorMode::TrueColor => ColorMode::TrueColor,
@@ -876,7 +876,7 @@ pub struct ThemeJson {
     pub schema: Option<String>,
     #[serde(default)]
     pub name: String,
-    /// `appearance` (theme.ts:96-100 @ 4a080252f): the background the theme
+    /// `appearance` (theme.ts:96-100 @ b4afdddf): the background the theme
     /// is designed for; detected from the theme colors when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "ThemeAppearance")]
@@ -903,7 +903,7 @@ pub struct ThemeInfo {
     pub path: Option<PathBuf>,
 }
 
-/// `ThemeStyle` (theme.ts:123-128 @ 4a080252f): a token name or a concrete
+/// `ThemeStyle` (theme.ts:123-128 @ b4afdddf): a token name or a concrete
 /// color for either slot plus text attributes.
 #[derive(Debug, Clone, Default)]
 pub struct ThemeStyle {
@@ -921,7 +921,7 @@ pub enum ThemeStyleColor {
 
 /// A constructed theme with pre-computed ANSI escape sequences.
 ///
-/// Port of `class Theme` (theme.ts:330-432 @ 4a080252f). Foreground and
+/// Port of `class Theme` (theme.ts:330-432 @ b4afdddf). Foreground and
 /// background colours are separated because they use different ANSI reset
 /// codes (39 vs 49). `colors` holds the concrete color per token (terminal
 /// defaults resolved at construction) and `dim_tokens` the tokens rendered
@@ -1510,7 +1510,7 @@ pub fn load_theme_json(name: &str) -> Result<ThemeJson, RpiError> {
 /// Load and construct a [`Theme`] by name (theme.ts:629-636).
 pub fn load_theme(name: &str, mode: Option<ColorMode>) -> Result<Theme, RpiError> {
     // The system theme name is reserved: it takes precedence over custom
-    // themes of the same name (theme.ts:629-636 @ 4a080252f).
+    // themes of the same name (theme.ts:629-636 @ b4afdddf).
     if name == SYSTEM_THEME_NAME {
         return Ok(create_system_theme(mode));
     }
@@ -1531,7 +1531,7 @@ pub fn get_available_themes() -> Vec<ThemeInfo> {
     let mut seen: HashSet<String> = HashSet::new();
 
     // The system theme is generated, so it has no file; it comes first
-    // (theme.ts:470-514 @ 4a080252f).
+    // (theme.ts:470-514 @ b4afdddf).
     seen.insert(SYSTEM_THEME_NAME.to_string());
     result.push(ThemeInfo {
         name: SYSTEM_THEME_NAME.to_string(),
@@ -1641,7 +1641,7 @@ pub fn get_resolved_theme_colors(theme_name: &str) -> Result<HashMap<String, Str
     Ok(css_colors)
 }
 
-/// Check if a theme is a light theme (theme.ts:1048-1051 @ 4a080252f):
+/// Check if a theme is a light theme (theme.ts:1048-1051 @ b4afdddf):
 /// loads the theme and compares its appearance.
 pub fn is_light_theme(theme_name: &str) -> bool {
     get_theme_by_name(theme_name)
@@ -1736,7 +1736,7 @@ pub fn resolve_theme_setting(
 
 /// sRGB → linear conversion for one channel (theme.ts:719-722).
 /// `detectTerminalBackgroundFromEnv` (theme.ts:734-753 @ 9841914, superseded
-/// by `detectTerminalTheme` @ 4a080252f): the `COLORFGBG` index classified
+/// by `detectTerminalTheme` @ b4afdddf): the `COLORFGBG` index classified
 /// like Vim, falling back to dark.
 pub fn detect_terminal_background_from_env() -> TerminalThemeDetection {
     let colorfgbg = std::env::var("COLORFGBG").unwrap_or_default();
@@ -1812,7 +1812,7 @@ fn terminal_rgb_color(rgb: TerminalRgb) -> tui_colors::Color {
     })
 }
 
-/// `detectAppearance` (theme.ts:436-445 @ 4a080252f): the background a theme
+/// `detectAppearance` (theme.ts:436-445 @ b4afdddf): the background a theme
 /// is designed for, from the lightness of its own colors. Palette indices
 /// 0-15 follow the user's terminal and say nothing about the theme.
 fn detect_appearance(
@@ -2990,7 +2990,7 @@ mod tests {
 
     #[test]
     fn test_detect_color_fg_bg_theme_classifies_indices_like_vim() {
-        // 0-6 and 8 dark; 7 and 9-15 light (theme.ts:697-705 @ 4a080252f).
+        // 0-6 and 8 dark; 7 and 9-15 light (theme.ts:697-705 @ b4afdddf).
         assert_eq!(
             detect_color_fg_bg_theme(Some("15;0")),
             Some(TerminalTheme::Dark)

@@ -4,7 +4,7 @@
 //! (upstream `ProcessTerminal`): raw mode, stdin reading, Kitty keyboard
 //! protocol negotiation with modifyOtherKeys fallback (DA response without a
 //! Kitty answer falls back immediately, no startup timeout), bracketed paste,
-//! OSC 9;4 taskbar progress, OSC 7501 program status (V17-05, `@ 4a080252f`),
+//! OSC 9;4 taskbar progress, OSC 7501 program status (V17-05, `@ b4afdddf`),
 //! and terminal state restore on `stop()`.
 //!
 //! Intentional differences:
@@ -258,7 +258,7 @@ const MAX_COLOR_TIMEOUT: Duration = Duration::from_secs(5);
 /// gets 500ms and local terminals 100ms.
 ///
 /// The default query timeout is a deliberate rpi extension: upstream
-/// (`theme-controller.ts:25 @ 4a080252f`) uses 100ms everywhere, which is too
+/// (`theme-controller.ts:25 @ b4afdddf`) uses 100ms everywhere, which is too
 /// short for a high-latency SSH pty. See ADR-0045.
 pub fn resolve_terminal_color_timeout_ms_with(getenv: impl Fn(&str) -> Option<String>) -> Duration {
     let configured =
@@ -568,7 +568,7 @@ fn stdout_winsize() -> io::Result<(u16, u16)> {
 }
 
 /// `ENABLE_VIRTUAL_TERMINAL_INPUT` (wincon.h, 0x0200; terminal.ts:420-427
-/// @ `4a080252f`): without it Windows consoles lose modifier state and
+/// @ `b4afdddf`): without it Windows consoles lose modifier state and
 /// Shift+Tab arrives as plain `\t` instead of `\x1b[Z`.
 #[cfg(any(windows, test))]
 const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;

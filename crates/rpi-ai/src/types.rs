@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/types.ts` @ pi 1.4.0 (4a080252f).
+//! Port of `packages/ai/src/types.ts` @ pi 1.5.2 (b4afdddf).
 //!
 //! Core wire types: messages, content blocks, usage, tools, models (with
 //! compat matrices), stream options and the assistant stream event protocol.
@@ -177,11 +177,11 @@ pub enum ModelThinkingLevel {
 /// level unsupported, `Some(value)` = provider/model-specific mapped value.
 pub type ThinkingLevelMap = std::collections::BTreeMap<ModelThinkingLevel, Option<String>>;
 
-/// `SamplingParams` (types.ts:92 @ 4a080252f): arbitrary sampling parameters
+/// `SamplingParams` (types.ts:92 @ b4afdddf): arbitrary sampling parameters
 /// merged into the request body as-is.
 pub type SamplingParams = serde_json::Map<String, Value>;
 
-/// `SamplingParamsByThinkingLevel` (types.ts:93 @ 4a080252f; R2.3.1):
+/// `SamplingParamsByThinkingLevel` (types.ts:93 @ b4afdddf; R2.3.1):
 /// per-thinking-level sampling parameter overrides. Applies to the
 /// `openai-completions` / `openai-responses` / `azure-openai-responses` APIs.
 pub type SamplingParamsByThinkingLevel =
@@ -849,7 +849,7 @@ pub struct UsageCost {
 }
 
 impl Usage {
-    /// `combineUsage` (usage-totals.ts:31 @ 4a080252f): field-wise sum;
+    /// `combineUsage` (usage-totals.ts:31 @ b4afdddf): field-wise sum;
     /// optional splits stay `None` when both sides are `None`.
     pub fn combined(&self, other: &Usage) -> Usage {
         Usage {
@@ -1077,7 +1077,7 @@ impl fmt::Debug for ImagesOptions {
 // `api/system-one-shared.ts`; V16-07 FR-F)
 // ---------------------------------------------------------------------------
 
-/// `ClassifierChoiceQuestion` (types.ts:633-637 @ 4a080252f).
+/// `ClassifierChoiceQuestion` (types.ts:633-637 @ b4afdddf).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassifierChoiceQuestion {
@@ -1119,7 +1119,7 @@ pub enum ClassifierQuestion {
     Bool(ClassifierBoolQuestion),
 }
 
-/// `ClassifierContext` (types.ts:668-676 @ 4a080252f).
+/// `ClassifierContext` (types.ts:668-676 @ b4afdddf).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassifierContext {
@@ -1267,7 +1267,7 @@ pub trait ProviderClassifier: Send + Sync {
 }
 
 /// `Provider.generateImages` for the unified schema-v6 `ImageModel`
-/// (models.ts:221-226 @ 4a080252f). The older image subsystem's
+/// (models.ts:221-226 @ b4afdddf). The older image subsystem's
 /// `images_models::ProviderImages` stays as is; this trait is the unified
 /// runtime's contract.
 pub trait ProviderImageGenerator: Send + Sync {
@@ -1447,7 +1447,7 @@ pub struct AssistantMessage {
     pub provider_thinking_level: Option<String>,
     /// Pi thinking level the agent loop requested for this response. Absent
     /// outside the agent loop and for legacy responses (R2.7.1,
-    /// types.ts:553-554 @ 4a080252f). The agent loop records it on every
+    /// types.ts:553-554 @ b4afdddf). The agent loop records it on every
     /// finalized assistant message (agent-loop.ts:409).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<ModelThinkingLevel>,
@@ -1480,7 +1480,7 @@ pub struct AssistantMessage {
     /// a monotonic clock. Set by the assistant message event stream on the
     /// final message of a response it saw start; absent for legacy messages
     /// and for deferred results fetched later (R2.7.1, types.ts:571-575
-    /// @ 4a080252f).
+    /// @ b4afdddf).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
 }
@@ -1549,7 +1549,7 @@ impl<'de> Deserialize<'de> for SharedAssistantMessage {
 }
 
 /// A tool call that another tool made while it ran, for example from a
-/// codemode script (types.ts:570-581 @ 4a080252f).
+/// codemode script (types.ts:570-581 @ b4afdddf).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NestedToolCallRecord {
@@ -1571,7 +1571,7 @@ pub struct NestedToolCallRecord {
 }
 
 /// Bounded record of the nested calls a tool made. Results are not recorded
-/// (types.ts:583-588 @ 4a080252f).
+/// (types.ts:583-588 @ b4afdddf).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NestedToolCalls {
@@ -1605,7 +1605,7 @@ pub struct ToolResultMessage {
     /// Unix timestamp in milliseconds.
     pub timestamp: i64,
     /// Milliseconds the tool's execution took, measured with a monotonic
-    /// clock. Absent for legacy results (R2.7.1, types.ts:595 @ 4a080252f).
+    /// clock. Absent for legacy results (R2.7.1, types.ts:595 @ b4afdddf).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
 }
@@ -2082,7 +2082,7 @@ pub struct Model {
     pub compat: Option<ModelCompat>,
 }
 
-/// `ModelType` (types.ts:1158-1165 @ 4a080252f, schema v6): what a catalog
+/// `ModelType` (types.ts:1158-1165 @ b4afdddf, schema v6): what a catalog
 /// entry is for. Chat is the default and omits `type` in catalog data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -2106,7 +2106,7 @@ impl ModelType {
     }
 }
 
-/// `ImageModel` (types.ts:1143-1156 @ 4a080252f): image-generation catalog
+/// `ImageModel` (types.ts:1143-1156 @ b4afdddf): image-generation catalog
 /// entry. Parsed through [`AnyModel`]; `AnyModel` dispatch tries this shape
 /// before the classifier and chat shapes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2131,7 +2131,7 @@ pub struct ImageModel {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
-/// `ClassifierModel` (types.ts:1150-1155 @ 4a080252f): structured classifier
+/// `ClassifierModel` (types.ts:1150-1155 @ b4afdddf): structured classifier
 /// catalog entry. Parsed through [`AnyModel`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2156,7 +2156,7 @@ pub struct ClassifierModel {
     pub compat: Option<ModelCompat>,
 }
 
-/// `AnyModel` (types.ts:1167-1168 @ 4a080252f): anything a provider can
+/// `AnyModel` (types.ts:1167-1168 @ b4afdddf): anything a provider can
 /// list. Deserialization dispatches on the raw `type` field (missing =
 /// chat), so each variant is unambiguous; unknown types are rejected and
 /// skipped by callers (catalog/remote parse).
@@ -2206,7 +2206,7 @@ impl<'de> Deserialize<'de> for AnyModel {
 }
 
 impl AnyModel {
-    /// `getModelType` (utils/model-operations.ts @ 4a080252f).
+    /// `getModelType` (utils/model-operations.ts @ b4afdddf).
     pub fn model_type(&self) -> ModelType {
         match self {
             AnyModel::Image(_) => ModelType::Image,
@@ -2247,7 +2247,7 @@ impl AnyModel {
         }
     }
 
-    /// Merge key `type\0id` (remote-catalog-provider.ts:26-30 @ 4a080252f):
+    /// Merge key `type\0id` (remote-catalog-provider.ts:26-30 @ b4afdddf):
     /// the same upstream id may appear once per type.
     pub fn merge_key(&self) -> String {
         format!("{}\0{}", self.model_type().as_str(), self.id())
@@ -2283,7 +2283,7 @@ impl From<Model> for AnyModel {
     }
 }
 
-/// `isModelType` (utils/model-operations.ts @ 4a080252f).
+/// `isModelType` (utils/model-operations.ts @ b4afdddf).
 pub fn is_model_type(model: &AnyModel, model_type: ModelType) -> bool {
     model.model_type() == model_type
 }
@@ -2716,7 +2716,7 @@ pub struct VercelGatewayRouting {
 
 // ---------------------------------------------------------------------------
 // Model type guards and error results (`utils/model-operations.ts` @
-// 4a080252f; V16-06/V16-07 R2.5.2/R2.5.3)
+// b4afdddf; V16-06/V16-07 R2.5.2/R2.5.3)
 // ---------------------------------------------------------------------------
 fn assert_model_type(
     model: &AnyModel,

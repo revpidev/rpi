@@ -1,5 +1,5 @@
 //! Tool task integration tests (port of `packages/durable/test/harness-tools.test.ts`
-//! cases @ `4a080252f`): validation failure, an executed result entry, and
+//! cases @ `b4afdddf`): validation failure, an executed result entry, and
 //! diagnostics.
 
 mod generation_support;

@@ -1,7 +1,7 @@
 //! OpenRouter `/models/user` response types and pricing conversion.
 //!
-//! Port of `packages/ai/src/providers/openrouter-api.ts` @ pi 1.4.0
-//! (4a080252f, ee409a85f).
+//! Port of `packages/ai/src/providers/openrouter-api.ts` @ pi 1.5.2
+//! (b4afdddf, ee409a85f).
 
 use serde::Deserialize;
 

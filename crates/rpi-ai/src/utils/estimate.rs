@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/utils/estimate.ts` @ `4a080252f` (v1.4.0,
+//! Port of `packages/ai/src/utils/estimate.ts` @ `b4afdddf` (v1.5.2,
 //! `27075fe07`).
 //!
 //! chars/3.5 heuristic token estimation with usage-anchor trailing

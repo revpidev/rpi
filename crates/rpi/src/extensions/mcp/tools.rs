@@ -1,5 +1,5 @@
 //! MCP tool adaptation (port of
-//! `packages/coding-agent/src/extensions/mcp/tools.ts` @ 4a080252f).
+//! `packages/coding-agent/src/extensions/mcp/tools.ts` @ b4afdddf).
 //!
 //! Results map onto the model-facing content (text and images). Text over
 //! 20 KB keeps its start and end with the middle cut out, and the full text
@@ -141,7 +141,7 @@ const SCHEMA_MAP_KEYWORDS: [&str; 6] = [
     "definitions",
 ];
 
-/// `relocateSchema` (tools.ts:135-156): rewrite local references so they
+/// `relocateSchema` (tools.ts:111-130): rewrite local references so they
 /// resolve below `pointer` of the enclosing schema.
 fn relocate_schema(schema: &Value, pointer: &str) -> Value {
     match schema {
@@ -187,7 +187,7 @@ fn relocate_schema(schema: &Value, pointer: &str) -> Value {
     }
 }
 
-/// `createMcpResultSchema` (tools.ts:159-174): the `CallToolResult` scripts
+/// `createMcpResultSchema` (tools.ts:135-152): the `CallToolResult` scripts
 /// receive (without `_meta`, which `convert_mcp_result` drops), with the
 /// tool's own output schema as `structuredContent`.
 pub fn create_mcp_result_schema(structured_content_schema: Option<&Value>) -> Value {
@@ -569,7 +569,7 @@ fn text_component(text: String) -> ComponentTree {
     json!({"type": "text", "props": {"text": text}})
 }
 
-/// `createMcpToolRenderers` (tools.ts:298 @ 4a080252f, #10285): the
+/// `createMcpToolRenderers` (tools.ts:298 @ b4afdddf, #10285): the
 /// render slice of one MCP tool. Used both as the registered tool's own
 /// renderers and by the extension's `registerToolRenderer` resolver, so a
 /// resumed session renders calls to `mcp__<server>__<tool>` before the

@@ -82,7 +82,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// `getPathCommandArgument` (interactive-mode.ts:6511-6538 @ 4a080252f):
+/// `getPathCommandArgument` (interactive-mode.ts:6511-6538 @ b4afdddf):
 /// extract the path argument of `/export` / `/import` — the quoted string
 /// when the first char is a quote, otherwise the first whitespace-delimited
 /// token; `None` when the text is the bare command or has no argument.

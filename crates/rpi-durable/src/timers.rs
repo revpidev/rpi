@@ -1,5 +1,5 @@
 //! Host timers for the Session and Harness (port of
-//! `packages/durable/src/timers.ts` @ `4a080252f`).
+//! `packages/durable/src/timers.ts` @ `b4afdddf`).
 //!
 //! A foreground timer paces or resumes work and must fire, so one the host
 //! declines or throws on falls back to the runtime's timer, reported once. A

@@ -1,5 +1,5 @@
 //! Leaf-wise JSON assignment (port of `packages/durable/src/harness/json.ts`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 //!
 //! Chord records a container assignment as one full set and only emits an append
 //! when a string leaf is reassigned with a longer string. Writing a partial whole

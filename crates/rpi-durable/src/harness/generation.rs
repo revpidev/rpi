@@ -1,5 +1,5 @@
 //! Built-in generation task (port of
-//! `packages/durable/src/harness/generation.ts` @ `4a080252f`).
+//! `packages/durable/src/harness/generation.ts` @ `b4afdddf`).
 //!
 //! The generation task prepares the positional system prompt and tool loadout,
 //! requests or classifies the model response, retries retryable failures, and

@@ -1,4 +1,4 @@
-//! Port of `packages/tui/src/program-status.ts` @ pi 1.4.0 (4a080252f).
+//! Port of `packages/tui/src/program-status.ts` @ pi 1.5.2 (b4afdddf).
 //!
 //! Program Status Protocol (OSC 7501): a program tells the terminal whether
 //! it is idle, working, blocked on the user, done, or failed. Only the root

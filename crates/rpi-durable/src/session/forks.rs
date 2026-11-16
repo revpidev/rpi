@@ -1,5 +1,5 @@
 //! Conversation document fork copy planner (port of
-//! `packages/durable/src/session/forks.ts` @ `4a080252f`).
+//! `packages/durable/src/session/forks.ts` @ `b4afdddf`).
 //!
 //! A fork copies every conversation document of the source conversation whose
 //! `fork` policy is `asOf` (selected at the fork entry's owning conversation

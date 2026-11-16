@@ -1,5 +1,5 @@
 //! Per-file mutation serialization (port of
-//! `packages/durable/src/tools/file-mutation-queue.ts` @ `4a080252f`).
+//! `packages/durable/src/tools/file-mutation-queue.ts` @ `b4afdddf`).
 
 use std::collections::HashMap;
 use std::future::Future;

@@ -1,5 +1,5 @@
 //! Immutable invocation-scoped context values and cancellation
-//! (port of `chord/src/context/index.ts` @ `4a080252f`).
+//! (port of `chord/src/context/index.ts` @ `b4afdddf`).
 //!
 //! Upstream carries an `AbortSignal` behind a `ContextKey`; rpi maps that to
 //! [`tokio_util::sync::CancellationToken`], the workspace-wide cancellation

@@ -7,7 +7,7 @@
 > remaining leg plus the shared fixture server.
 
 The built-in `crates/rpi-mcp` client is compared against the upstream package
-client `external/pi/packages/mcp` @ `4a080252f` (v1.4.0, read-only). The
+client `external/pi/packages/mcp` @ `b4afdddf` (v1.5.2, read-only). The
 shared fixture server (`fixture-server.mjs`, stdio) drives both sides, and
 the normalized transcripts/results are diffed:
 

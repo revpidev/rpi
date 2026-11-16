@@ -1,5 +1,5 @@
 //! Detached in-memory reference implementation of [`Storage`]
-//! (port of `src/storage/memory.ts` @ `4a080252f`).
+//! (port of `src/storage/memory.ts` @ `b4afdddf`).
 //!
 //! Reads and retained writes are cloned intentionally to match the ownership
 //! boundary of serialization-backed stores. This is backend conformance, not

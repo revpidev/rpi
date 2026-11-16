@@ -16,7 +16,7 @@ use crate::core::model_runtime::ModelRuntime;
 /// `DEFAULT_THINKING_LEVEL` (defaults.ts:3).
 pub const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::Medium;
 
-/// `defaultModelPerProvider` (model-resolver.ts:20-62 @ 4a080252f) — ids
+/// `defaultModelPerProvider` (model-resolver.ts:20-62 @ b4afdddf) — ids
 /// pinned to the upstream commit; unknown providers fall through to
 /// "first available".
 pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 41] = [

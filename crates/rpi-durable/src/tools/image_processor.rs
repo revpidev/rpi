@@ -1,5 +1,5 @@
 //! Optional image processing for the read tool (port of
-//! `packages/durable/src/tools/image-processor.ts` @ `4a080252f`).
+//! `packages/durable/src/tools/image-processor.ts` @ `b4afdddf`).
 //!
 //! A processor orients by EXIF, converts BMP to PNG and shrinks an image to
 //! the model's input limits. It runs off the async thread.

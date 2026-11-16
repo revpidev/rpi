@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/auth/resolve.ts` @ `4a080252f` (v1.4.0,
+//! Port of `packages/ai/src/auth/resolve.ts` @ `b4afdddf` (v1.5.2,
 //! `bde882c74`).
 //!
 //! Shared auth resolution: a stored credential owns the provider (hit stops),

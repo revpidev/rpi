@@ -251,7 +251,7 @@ pub static BUILTIN_PROVIDERS: &[BuiltinProviderSpec] = &[
     },
     BuiltinProviderSpec {
         // Classifier-only provider (schema v6): `typesafeProvider()` @
-        // 4a080252f; upstream order = between together and vercel-ai-gateway.
+        // b4afdddf; upstream order = between together and vercel-ai-gateway.
         id: "typesafe",
         in_catalog: true,
         factory: Some(typesafe::typesafe_provider),

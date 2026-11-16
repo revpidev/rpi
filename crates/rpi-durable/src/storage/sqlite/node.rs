@@ -1,6 +1,6 @@
 //! Node-adapter equivalents: open a file-backed database or storage with the
 //! upstream defaults (port of `packages/chord/src/sqlite/node.ts` and
-//! `src/storage/sqlite/node.ts` @ `4a080252f`).
+//! `src/storage/sqlite/node.ts` @ `b4afdddf`).
 
 use crate::chord::sqlite::database::SqliteDatabaseOptions;
 use crate::chord::sqlite::validate_sqlite_schema_prefix;

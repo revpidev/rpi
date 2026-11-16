@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "repository": "external/pi",
+  "remote": "https://github.com/earendil-works/pi.git",
+  "regression": {
+    "tag": "v1.4.0",
+    "commit": "4a080252f06caf63a525d7873c5d94d3c23887e0",
+    "tree": "56ea45bfd3ef589feaddfaf504cfc08d838d812b"
+  },
+  "target": {
+    "tag": "v1.5.2",
+    "commit": "b4afdddf44e059c67ccf5097e5317d913521b470",
+    "tree": "ed418d79cb44d3690f110e1077c4612db033f2c9"
+  },
+  "range": {
+    "commits": 703,
+    "files": 3211,
+    "insertions": 483679,
+    "deletions": 39196
+  }
+}

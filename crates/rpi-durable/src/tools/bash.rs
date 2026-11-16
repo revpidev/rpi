@@ -1,5 +1,5 @@
 //! Bash and PowerShell tools (port of `packages/durable/src/tools/bash.ts`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

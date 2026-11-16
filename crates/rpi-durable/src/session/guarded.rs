@@ -1,5 +1,5 @@
 //! Storage failure guard (port of `GuardedStorage` in
-//! `packages/durable/src/session/session.ts` @ `4a080252f`).
+//! `packages/durable/src/session/session.ts` @ `b4afdddf`).
 //!
 //! Every Storage call a Session's components make goes through this wrapper.
 //! The first error a Storage method throws — other than an invalid read

@@ -1,6 +1,6 @@
 //! Generation task integration tests (port of the generation cases of
 //! `packages/durable/test/harness-inbox.test.ts` and `harness-tasks.test.ts`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 //!
 //! Every case drives the real `pi.generation` built-in through a Harness over
 //! memory storage with a scripted provider (see `generation_support`).

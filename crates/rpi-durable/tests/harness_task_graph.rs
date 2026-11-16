@@ -1,5 +1,5 @@
 //! Harness task-graph integration tests (port of
-//! `packages/durable/test/harness-task-graph.test.ts` @ `4a080252f`).
+//! `packages/durable/test/harness-task-graph.test.ts` @ `b4afdddf`).
 //!
 //! Scoped to what does not need the scheduler: tasks are created directly on the
 //! Session line, and the graph is observed through the Harness composition.

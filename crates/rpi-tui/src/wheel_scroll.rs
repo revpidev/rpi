@@ -1,4 +1,4 @@
-//! Port of `packages/tui/src/wheel-scroll.ts` @ 4a080252f (`Release v1.4.0`,
+//! Port of `packages/tui/src/wheel-scroll.ts` @ b4afdddf (`Release v1.5.2`,
 //! #9758).
 //!
 //! [`WheelScrollAccelerator`] converts mouse-wheel events into line counts.
@@ -151,7 +151,7 @@ impl WheelScrollAccelerator {
 }
 
 // =============================================================================
-// Tests (port of packages/tui/test/wheel-scroll.test.ts @ 4a080252f, 1:1)
+// Tests (port of packages/tui/test/wheel-scroll.test.ts @ b4afdddf, 1:1)
 // =============================================================================
 
 #[cfg(test)]

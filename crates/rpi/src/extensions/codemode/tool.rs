@@ -1,5 +1,5 @@
 //! The `codemode` tool definition and its `prepareLoadout` hook. Port of
-//! `packages/coding-agent/src/extensions/codemode/tool.ts` @ 4a080252f.
+//! `packages/coding-agent/src/extensions/codemode/tool.ts` @ b4afdddf.
 //!
 //! The tool is registered inactive (`exposure: model-only`,
 //! `defaultActive: false`); enabling it is the `defaultTools`/`--tools`
@@ -29,7 +29,7 @@ pub const CODEMODE_STORE_ENTRY_TYPE: &str = "codemode-store";
 /// Default for `inlineBudget`, in estimated tokens.
 pub const DEFAULT_CODEMODE_INLINE_BUDGET: usize = 3000;
 
-/// `codemode.mode` / `codemode.inlineBudget` types (settings-schema.ts:470).
+/// `codemode.mode` / `codemode.inlineBudget` types (settings-schema.ts:482).
 /// The key registration/validation lives in the settings manager (V16-13
 /// FR-D R1/R2); these re-exports keep the codemode consumer surface stable.
 pub use crate::core::settings_manager::{CodemodeMode, CodemodeSettings};
@@ -48,7 +48,7 @@ pub fn settings_from_manager(
     manager.get_codemode_settings()
 }
 
-/// `ToolInfo` view of one registered tool (`agent-session.ts:1514-1526`).
+/// `ToolInfo` view of one registered tool (`agent-session.ts:1579-1592`).
 #[derive(Debug, Clone)]
 pub struct ToolInfo {
     pub name: String,
@@ -142,7 +142,7 @@ pub fn to_codemode_declaration(
 }
 
 /// Tools a script may call: every given tool except the codemode tool
-/// itself (tool.ts:159-162).
+/// itself (tool.ts:164-166).
 pub fn get_codemode_callable_tools(tools: &[ToolInfo]) -> Vec<ToolInfo> {
     tools
         .iter()
@@ -184,7 +184,7 @@ fn loadout_tool_info(entry: &rpi_ext_host::types::ToolLoadoutEntry) -> ToolInfo 
 }
 
 /// How the codemode tool presents tools that are both declared and callable
-/// from scripts (`prepareCodemodeLoadout`, tool.ts:320-358).
+/// from scripts (`prepareCodemodeLoadout`, tool.ts:370-413).
 fn prepare_codemode_loadout(
     loadout: &ToolLoadout,
     options: &CodemodeToolOptions,
@@ -304,8 +304,8 @@ fn contains_identifier_word(code: &str, needle: &str) -> bool {
     false
 }
 
-/// `createCodemodeToolDefinition` (tool.ts:371-398).
-/// `getScriptReach` (codemode/tool.ts:362-385 @ 4a080252f): a script that
+/// `createCodemodeToolDefinition` (tool.ts:421-443).
+/// `getScriptReach` (codemode/tool.ts:416-419 @ b4afdddf): a script that
 /// uses a discovery global reaches every tool; otherwise its identifier
 /// words may name tools/namespaces (the MCP wait matches a namespace
 /// contained in a word).
@@ -378,10 +378,10 @@ pub fn create_codemode_tool_definition(
         ]),
         parameters: codemode_schema(),
         // Capable models write the script as raw text instead of a JSON-escaped
-        // string (tool.ts:387).
+        // string (tool.ts:437).
         constrained_sampling: Some(codemode_constrained_sampling()),
         output_schema: None,
-        // Scripts must not start other scripts (tool.ts:383).
+        // Scripts must not start other scripts (tool.ts:433).
         exposure: ToolExposure::ModelOnly,
         namespace: None,
         annotations: None,

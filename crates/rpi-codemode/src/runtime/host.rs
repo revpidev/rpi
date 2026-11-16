@@ -1,5 +1,5 @@
 //! Async host side of the sandbox (port of `CodemodeSandbox` / `Execution`
-//! in `packages/codemode/src/runtime/host.ts` @ 4a080252f).
+//! in `packages/codemode/src/runtime/host.ts` @ b4afdddf).
 //!
 //! One script run gets its own worker thread, fresh wasmtime `Store`, and
 //! fresh QuickJS VM. A runaway script, including one that only spins the
@@ -285,7 +285,7 @@ impl CodemodeSandbox {
         let calls = Arc::new(Mutex::new(CallTable::default()));
         let mut output: Vec<CodemodeOutputItem> = Vec::new();
         // Reserve the shared worker slot immediately before the worker
-        // starts (`acquireWorker`, host.ts:20-46 @ 4a080252f). A denied
+        // starts (`acquireWorker`, host.ts:20-46 @ b4afdddf). A denied
         // reservation fails the execution without starting a worker.
         let release = match self.acquire_worker.as_ref() {
             None => None,

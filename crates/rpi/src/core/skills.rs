@@ -1424,7 +1424,7 @@ pub enum SkillFileReadTool {
 }
 
 /// The skill-file reader for a selected/hidden tool set
-/// (system-prompt.ts:160-167 @ 4a080252f): the first DECLARED reader wins; a
+/// (system-prompt.ts:160-167 @ b4afdddf): the first DECLARED reader wins; a
 /// hidden reader is still reachable through another tool, so skills stay and
 /// the hint names no tool (`"indirect"`, #10343).
 pub fn skill_file_read_tool(

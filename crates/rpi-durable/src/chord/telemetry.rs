@@ -1,5 +1,5 @@
 //! Content-free telemetry context (port of the telemetry surface used by
-//! `packages/durable/src/harness/telemetry.ts` @ `4a080252f`).
+//! `packages/durable/src/harness/telemetry.ts` @ `b4afdddf`).
 //!
 //! A host supplies a [`TelemetrySink`]; phases and tools set attributes and
 //! add events carrying durable record IDs, never prompts, tokens, or

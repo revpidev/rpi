@@ -25,7 +25,7 @@
 //!   `ModelRuntime::get_error()` instead (the local `refresh` returns no
 //!   error map).
 //! - Provider ordering uses `str::cmp` (code-point order) where upstream
-//!   uses `localeCompare` (model-selector.ts:243 @ 4a080252f). The shipping
+//!   uses `localeCompare` (model-selector.ts:243 @ b4afdddf). The shipping
 //!   provider ids are lowercase ASCII and sort identically under the
 //!   `en-US`/`zh-CN`/`en`/`de-DE` collations checked for V18-09; a
 //!   mixed-case custom provider id can order differently. Kept as a
@@ -38,7 +38,7 @@
 //!   config-selector.rs); upstream `Text` children wrap instead.
 //! - The current-model marker is a suffix (`id [provider] ✓`) where upstream
 //!   prefixes it next to the cursor (`→ ✓ id [provider]`, model-selector.ts:325-329
-//!   @ 4a080252f); the selection cursor and the ` · default` badge text match
+//!   @ b4afdddf); the selection cursor and the ` · default` badge text match
 //!   upstream.
 
 use std::sync::{Arc, Mutex};
@@ -131,7 +131,7 @@ impl Default for SelectorState {
     }
 }
 
-/// `sortModels` (model-selector.ts:231-246 @ 4a080252f): current model
+/// `sortModels` (model-selector.ts:231-246 @ b4afdddf): current model
 /// first, default model second, then by provider. `sort_by` is stable, so
 /// models of the same provider keep the snapshot order (upstream
 /// `Array.prototype.sort` is stable).
@@ -160,7 +160,7 @@ fn sorted_models(
     models
 }
 
-/// `loadModelsFromSnapshot` (model-selector.ts:161-176 @ 4a080252f).
+/// `loadModelsFromSnapshot` (model-selector.ts:161-176 @ b4afdddf).
 fn load_models_from_snapshot(
     state: &mut SelectorState,
     runtime: &ModelRuntime,
@@ -181,7 +181,7 @@ fn load_models_from_snapshot(
         default_model,
     );
     // Refresh scoped entries against the catalog; keep the original when the
-    // model is gone (model-selector.ts:168-171 @ 4a080252f).
+    // model is gone (model-selector.ts:168-171 @ b4afdddf).
     state.scoped_models = state
         .scoped_models
         .iter()
@@ -222,7 +222,7 @@ fn load_models_from_snapshot(
     };
 }
 
-/// `setScope` (model-selector.ts:267-277 @ 4a080252f).
+/// `setScope` (model-selector.ts:267-277 @ b4afdddf).
 fn set_scope(
     state: &mut SelectorState,
     scope: ModelScope,
@@ -247,7 +247,7 @@ fn set_scope(
     apply_model_filter(state, &query, default_model);
 }
 
-/// `filterModels` (model-selector.ts:279-303 @ 4a080252f): the default
+/// `filterModels` (model-selector.ts:279-303 @ b4afdddf): the default
 /// entry carries a `" default"` search suffix, and a query that
 /// is a prefix of `"default"` (trim + lowercase, non-empty) pins it to
 /// the top (`isDefaultSearch`, model-selector.ts:262-266). rpi previously
@@ -301,7 +301,7 @@ fn apply_model_filter(
             filtered
         }
     };
-    // `filterModels` tail (model-selector.ts:298-301 @ 4a080252f): an
+    // `filterModels` tail (model-selector.ts:298-301 @ b4afdddf): an
     // active query highlights the best match on row 0; clearing it keeps
     // the current numeric position clamped to the restored list instead
     // of restoring the index from before the query.
@@ -1099,7 +1099,7 @@ mod tests {
         let rows = list_rows(&component.render(80));
         // ` · default` badge on the persisted default (1d3503fb9), which
         // sorts first when no model is current (sortModels tiebreak,
-        // model-selector.ts:231-246 @ 4a080252f).
+        // model-selector.ts:231-246 @ b4afdddf).
         assert_eq!(rows[0], "→ b2 [beta] · default");
         assert!(!rows[1].contains("· default"));
         assert!(!rows[2].contains("· default"));
@@ -1172,7 +1172,7 @@ mod tests {
 
     /// Gap 1 of rpi#76: while a query is active the highlighted row is the
     /// best match (row 0), so Enter picks it. Upstream `filterModels` tail
-    /// (model-selector.ts:298-301 @ 4a080252f).
+    /// (model-selector.ts:298-301 @ b4afdddf).
     #[tokio::test]
     async fn query_selects_best_match_row_zero_and_enter_selects_it() {
         install_keybindings();
@@ -1199,7 +1199,7 @@ mod tests {
 
     /// Clearing the query keeps the current numeric position (0 after the
     /// query rule) instead of restoring the index from before the query
-    /// (model-selector.ts:298-301 @ 4a080252f).
+    /// (model-selector.ts:298-301 @ b4afdddf).
     #[tokio::test]
     async fn clearing_query_keeps_position_not_the_pre_query_index() {
         install_keybindings();
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     /// A cleared query keeps the numeric position and clamps it to the
-    /// restored list length (model-selector.ts:301 @ 4a080252f), including
+    /// restored list length (model-selector.ts:301 @ b4afdddf), including
     /// the empty-list case.
     #[tokio::test]
     async fn cleared_index_clamps_to_the_restored_list() {
@@ -1634,7 +1634,7 @@ mod tests {
     /// FR-A R2 refresh path: a query active across a completed background
     /// catalog refresh re-highlights row 0 instead of keeping the
     /// pre-refresh numeric position (upstream `refreshModels` →
-    /// `filterModels`, model-selector.ts:208-209/298-301 @ 4a080252f).
+    /// `filterModels`, model-selector.ts:208-209/298-301 @ b4afdddf).
     #[tokio::test]
     async fn query_stays_on_row_zero_across_catalog_refresh() {
         install_keybindings();

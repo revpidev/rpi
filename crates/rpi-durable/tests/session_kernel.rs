@@ -1,5 +1,5 @@
 //! Session-kernel integration tests (port of the session domain of
-//! `packages/durable/test/session-*.test.ts` @ `4a080252f`).
+//! `packages/durable/test/session-*.test.ts` @ `b4afdddf`).
 //!
 //! Each test cites the upstream case it adapts. Rust asserts value equality
 //! where upstream asserts reference identity (V17-14 §7.3).

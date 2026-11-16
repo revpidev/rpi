@@ -33,6 +33,8 @@
 //! suite implements it for its TUI type (delegating to the inherent
 //! `tick`/`has_pending_work` methods).
 
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::collections::HashSet;
 use std::future::Future;
 use std::ops::Deref;
@@ -59,11 +61,13 @@ pub(crate) fn state_lock() -> MutexGuard<'static, ()> {
 }
 
 /// `withEnv` (tui-render.test.ts:43-65): set/unset an env var, restore on drop.
+#[cfg(test)]
 pub(crate) struct EnvGuard {
     key: &'static str,
     saved: Option<String>,
 }
 
+#[cfg(test)]
 impl EnvGuard {
     pub(crate) fn set(key: &'static str, value: Option<&str>) -> EnvGuard {
         let saved = std::env::var(key).ok();
@@ -75,6 +79,7 @@ impl EnvGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.saved {
@@ -137,7 +142,7 @@ struct VtState {
 
 /// Clonable handle so tests keep access after the TUI takes ownership.
 #[derive(Clone)]
-pub(crate) struct VirtualTerminal {
+pub struct VirtualTerminal {
     state: Arc<Mutex<VtState>>,
 }
 
@@ -148,7 +153,7 @@ impl Default for VirtualTerminal {
 }
 
 impl VirtualTerminal {
-    pub(crate) fn new(columns: usize, rows: usize) -> Self {
+    pub fn new(columns: usize, rows: usize) -> Self {
         VirtualTerminal {
             state: Arc::new(Mutex::new(VtState {
                 cols: columns,
@@ -173,7 +178,7 @@ impl VirtualTerminal {
     }
 
     /// Simulate keyboard input (upstream `sendInput`).
-    pub(crate) fn send_input(&self, data: &str) {
+    pub fn send_input(&self, data: &str) {
         let handler = self.lock().input_handler.take();
         if let Some(mut handler) = handler {
             handler(data);
@@ -185,7 +190,7 @@ impl VirtualTerminal {
     }
 
     /// Resize the terminal (upstream `resize`).
-    pub(crate) fn resize(&self, columns: usize, rows: usize) {
+    pub fn resize(&self, columns: usize, rows: usize) {
         {
             let mut state = self.lock();
             state.cols = columns;
@@ -218,7 +223,7 @@ impl VirtualTerminal {
     }
 
     /// The visible viewport of the active buffer (upstream `getViewport`).
-    pub(crate) fn get_viewport(&self) -> Vec<String> {
+    pub fn get_viewport(&self) -> Vec<String> {
         let state = self.lock();
         let screen_top = state.lines.len() - state.rows;
         state.lines[screen_top..]
@@ -286,7 +291,7 @@ impl VirtualTerminal {
     }
 
     /// Concatenated recorded writes (upstream `getWrites`).
-    pub(crate) fn get_writes(&self) -> String {
+    pub fn get_writes(&self) -> String {
         self.lock().writes.concat()
     }
 

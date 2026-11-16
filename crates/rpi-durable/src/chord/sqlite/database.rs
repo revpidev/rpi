@@ -1,5 +1,5 @@
 //! Asynchronous SQLite facade (port of `packages/chord/src/sqlite/database.ts`
-//! and `node.ts` @ `4a080252f`; re-exported as `rpi_durable::storage::sqlite::database`
+//! and `node.ts` @ `b4afdddf`; re-exported as `rpi_durable::storage::sqlite::database`
 //! for the durable entry points).
 //!
 //! Selected stack (FR-C R4): `rusqlite` + `bundled` + a dedicated blocking

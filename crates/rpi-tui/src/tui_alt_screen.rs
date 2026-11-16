@@ -3786,7 +3786,7 @@ impl TuiAltScreenInner {
     }
 
     /// `compositeScrollToEndIndicator` (tui-alt-screen.ts:1611-1648 @
-    /// 4a080252f; 79680533c, #9842 8c7279378): center the jump-to-end label
+    /// b4afdddf; 79680533c, #9842 8c7279378): center the jump-to-end label
     /// on the last row of a follow-end primary scroll view scrolled away
     /// from its end, independently of scrollbar visibility, and record its
     /// hit rectangle.
@@ -3827,7 +3827,7 @@ impl TuiAltScreenInner {
         let scrollbar_column = crate::layout::get_scrollbar_geometry(box_, false)
             .map(|geometry| geometry.column)
             .unwrap_or(clip.x + clip.width as isize);
-        // #9842 (8c7279378, tui-alt-screen.ts:1630-1641 @ 4a080252f): center
+        // #9842 (8c7279378, tui-alt-screen.ts:1630-1641 @ b4afdddf): center
         // the label on the clip independently of scrollbar visibility, then
         // clip drawing/click bounds before the scrollbar column.
         let label = truncate_to_width(&indicator(), clip.width, "", false);
@@ -4024,6 +4024,7 @@ impl TuiAltScreenInner {
         if self.stopped || !self.alt_screen_active {
             return;
         }
+        let _frame_probe = crate::benchmark::FrameProbe::new("fullscreen");
         let width = usize::from(self.terminal().columns()).max(1);
         let height = usize::from(self.terminal().rows()).max(1);
         // Refresh the lock-free size cache (same role as TuiMainScreen).
@@ -4044,6 +4045,7 @@ impl TuiAltScreenInner {
         if self.refresh_search(&next_layout) {
             next_layout = render_layout_frame(&root, width, height, self.render_handle.clone());
         }
+        crate::benchmark::mark_layout();
         let screen: Vec<String> = next_layout
             .lines
             .iter()
@@ -4112,6 +4114,7 @@ impl TuiAltScreenInner {
             None => &screen,
         };
 
+        crate::benchmark::mark_paint();
         let mut buffer = String::from(BEGIN_SYNCHRONIZED_OUTPUT);
         if full_redraw {
             self.full_redraw_count += 1;
@@ -4212,7 +4215,7 @@ impl TuiAltScreenInner {
             buffer.push_str("\x1b[?25l");
         }
         buffer.push_str(END_SYNCHRONIZED_OUTPUT);
-        self.terminal().write(&buffer);
+        crate::benchmark::terminal_write(&buffer, || self.terminal().write(&buffer));
 
         self.previous_screen = screen;
         self.previous_screen_width = width;

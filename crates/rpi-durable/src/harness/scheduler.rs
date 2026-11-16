@@ -1,5 +1,5 @@
 //! Task scheduler of one Harness (port of
-//! `packages/durable/src/harness/scheduler.ts` @ `4a080252f`).
+//! `packages/durable/src/harness/scheduler.ts` @ `b4afdddf`).
 //!
 //! [`TaskScheduler`] mirrors every committed non-terminal task (`pending`,
 //! `running`, `waiting`, `completing`) in memory; the synchronous commit

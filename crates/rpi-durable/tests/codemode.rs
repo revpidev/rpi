@@ -1,5 +1,5 @@
 //! Code mode extension integration tests (V18-06 follow-up; port of
-//! `packages/durable/test/codemode*.test.ts` @ `4a080252f`).
+//! `packages/durable/test/codemode*.test.ts` @ `b4afdddf`).
 //!
 //! Covers the catalog/discovery globals, the store document, persisted start
 //! replies, journal divergence, structured and image output, nested errors,

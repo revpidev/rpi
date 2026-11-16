@@ -99,9 +99,9 @@ it is in scope.
 ## Non-negotiable rules
 
 1. **Upstream parity pin.** The behavioral gold standard is pinned in
-   `UPSTREAM.md` (currently `4a080252f`, Pi v1.4.0). Behavior changes that
+   `UPSTREAM.md` (currently `b4afdddf`, Pi v1.5.2). Behavior changes that
    diverge from upstream require an ADR first (registered in the docs
-   repository). The red-line pins (`4a080252f` / subagents `3a63e0ad` /
+   repository). The red-line pins (`b4afdddf` / subagents `3a63e0ad` /
    smart-fetch `b0111612` / rpiv-mono `ce6d3530`) move only via the documented
    rebase process, never opportunistically. (mcp-adapter was removed from the
    pin set with ADR-0037, TE49.)

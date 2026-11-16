@@ -1,4 +1,4 @@
-//! Read tool (port of `packages/durable/src/tools/read.ts` @ `4a080252f`).
+//! Read tool (port of `packages/durable/src/tools/read.ts` @ `b4afdddf`).
 
 use std::sync::Arc;
 

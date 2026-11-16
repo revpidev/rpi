@@ -1,5 +1,5 @@
 //! Harness type surface (port of `packages/durable/src/harness/types.ts`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 //!
 //! This module mirrors the upstream harness type surface as Rust data types and
 //! seam traits. Upstream expresses most of it as TypeScript interfaces; the Rust

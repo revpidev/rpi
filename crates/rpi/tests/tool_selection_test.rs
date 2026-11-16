@@ -7,7 +7,7 @@
 //! names it` / `filters MCP tools by the mcp__ entries of --tools` /
 //! `removes MCP tools matching --exclude-tools patterns`) and
 //! `test/suite/regressions/5109-exclude-tools.test.ts` (`matches allowlist
-//! and denylist patterns`) @ 4a080252f (`04b97ef00`).
+//! and denylist patterns`) @ b4afdddf (`04b97ef00`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

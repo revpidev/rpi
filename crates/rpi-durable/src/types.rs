@@ -1,5 +1,5 @@
 //! Durable data model and storage contract (port of the storage-relevant
-//! sections of `packages/durable/src/types.ts` @ `4a080252f`).
+//! sections of `packages/durable/src/types.ts` @ `b4afdddf`).
 //!
 //! The minimal record set is exactly what the shared conformance suite and the
 //! three backends compile and run against (V17-13 §8-5): conversation, entry,

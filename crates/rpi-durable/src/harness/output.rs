@@ -1,5 +1,5 @@
 //! Bounded tool output and throttled progress commits (port of
-//! `packages/chord/src/output.ts` @ `4a080252f`).
+//! `packages/chord/src/output.ts` @ `b4afdddf`).
 //!
 //! [`bound_output`] slices text to whole lines within the limits;
 //! [`OutputBuffer`] keeps exact totals across chunks while storing only the

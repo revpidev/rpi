@@ -1,5 +1,5 @@
 //! Durable storage stack: port of `packages/durable` (`@earendil-works/pi-durable`
-//! @ 4a080252f / v1.4.0) — the M4 storage foundation.
+//! @ b4afdddf / v1.5.2) — the M4 storage foundation.
 //!
 //! **Experimental.** The API changes without notice between releases.
 //!
@@ -77,7 +77,7 @@ pub use session::{
     prepare_fork_document_copies, watch_listener,
 };
 
-// Code mode (port of `packages/durable/src/codemode` @ `4a080252f`).
+// Code mode (port of `packages/durable/src/codemode` @ `b4afdddf`).
 pub use codemode::{
     CATALOG_GLOBALS, CLASSIFY_TOOL, CODEMODE_INTERNAL_PREFIX, CODEMODE_JOURNAL_DOC,
     CODEMODE_MODULE_VERSION, CODEMODE_RUN_DOC, CODEMODE_STORE_DOC, CODEMODE_TOOL_NAME,

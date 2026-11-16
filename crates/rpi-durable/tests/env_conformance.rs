@@ -1,5 +1,5 @@
 //! Execution-environment conformance tests (port of
-//! `packages/durable/src/testing/env-conformance.ts` @ `4a080252f` against
+//! `packages/durable/src/testing/env-conformance.ts` @ `b4afdddf` against
 //! [`NodeExecutionEnv`]).
 
 #[path = "tools_support.rs"]

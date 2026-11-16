@@ -13,6 +13,14 @@ path = "src/main.rs"
 name = "rpi-rpc"
 path = "src/bin/rpi_rpc.rs"
 
+[[bin]]
+name = "rpi-v19-replay"
+path = "src/bin/rpi_v19_replay.rs"
+required-features = ["v19-benchmark"]
+
+[features]
+v19-benchmark = ["rpi-tui/v19-benchmark"]
+
 [dependencies]
 rpi-ai.workspace = true
 rpi-agent.workspace = true

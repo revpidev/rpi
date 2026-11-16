@@ -1,5 +1,5 @@
 //! Runs one codemode script (port of
-//! `packages/coding-agent/src/extensions/codemode/execute.ts` @ 4a080252f).
+//! `packages/coding-agent/src/extensions/codemode/execute.ts` @ b4afdddf).
 //! Split from `tool.rs` so the sandbox runtime only loads when a script runs.
 
 use std::collections::HashMap;
@@ -145,7 +145,7 @@ fn with_article(word: &str) -> String {
 }
 
 /// A script value in an error message: `null`, `a string`, `an array`, or
-/// its keys (`{ prompt }`) (`describeValue`, execute.ts:107-116 @ 4a080252f).
+/// its keys (`{ prompt }`) (`describeValue`, execute.ts:107-116 @ b4afdddf).
 fn describe_value(value: &Value) -> String {
     match value {
         Value::Null => "null".to_owned(),

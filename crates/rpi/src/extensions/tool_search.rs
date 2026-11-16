@@ -1,6 +1,6 @@
 //! `tool_search`: BM25 tool discovery over the tools that are not declared to
 //! the model (`codemode`/`deferred` exposure). Port of
-//! `packages/coding-agent/src/extensions/tool-search/tool.ts` @ 4a080252f.
+//! `packages/coding-agent/src/extensions/tool-search/tool.ts` @ b4afdddf.
 //!
 //! The same ranker backs `searchTools()` in codemode scripts.
 
@@ -23,7 +23,7 @@ pub struct ToolSearchDocument {
     pub text: String,
 }
 
-/// `ToolSearchMatch` (tool.ts:29-32).
+/// `ToolSearchMatch` (tool.ts:33-36).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSearchMatch {
     pub name: String,
@@ -37,7 +37,7 @@ const STOP_WORDS: [&str; 21] = [
 ];
 
 /// Naive singular form, so `issues` matches `issue` and `searches` matches
-/// `search` (tool.ts:63-69).
+/// `search` (tool.ts:70-76).
 fn stem(term: &str) -> String {
     if term.len() > 4 && term.ends_with("ies") {
         return format!("{}y", &term[..term.len() - 3]);
@@ -80,7 +80,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Schema descriptions and property names, recursively (tool.ts:86-101).
+/// Schema descriptions and property names, recursively (tool.ts:104-126).
 fn schema_text(schema: &Value, parts: &mut Vec<String>) {
     let Some(object) = schema.as_object() else {
         return;
@@ -108,7 +108,7 @@ fn schema_text(schema: &Value, parts: &mut Vec<String>) {
 
 /// Search text of a tool: the name, the name with `_` as spaces, the
 /// description, schema descriptions and property names, and the namespace
-/// with its description and instructions (tool.ts:103-116).
+/// with its description and instructions (tool.ts:131-141).
 pub fn create_tool_search_document(
     name: &str,
     description: &str,
@@ -137,7 +137,7 @@ pub fn create_tool_search_document(
 }
 
 /// Okapi BM25 with the usual parameters. Ties keep document order
-/// (tool.ts:118-157).
+/// (tool.ts:213-261).
 pub struct Bm25Ranker {
     k1: f64,
     b: f64,
@@ -237,7 +237,7 @@ impl Bm25Ranker {
     }
 }
 
-/// `toolSearchSchema` (tool.ts:159-167).
+/// `toolSearchSchema` (tool.ts:264-269).
 pub fn tool_search_schema() -> Value {
     json!({
         "type": "object",
@@ -250,10 +250,10 @@ pub fn tool_search_schema() -> Value {
     })
 }
 
-/// `TOOL_SEARCH_DESCRIPTION` (tool.ts:215).
+/// `TOOL_SEARCH_DESCRIPTION` (tool.ts:320).
 pub const TOOL_SEARCH_DESCRIPTION: &str = "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nSome of the tools, such as tools of MCP servers, may not have been provided to you upfront, and you should use this tool (`tool_search`) to search for the required tools. For MCP tool discovery, always use `tool_search`.";
 
-/// `isSearchable` (tool.ts:187-189).
+/// `isSearchable` (tool.ts:292-294).
 fn is_searchable(exposure: ToolExposure) -> bool {
     matches!(exposure, ToolExposure::Codemode | ToolExposure::Deferred)
 }
@@ -299,7 +299,7 @@ fn parse_searchable_tools(api: &ExtensionApi) -> Vec<SearchableTool> {
 }
 
 /// Rank the searchable tools that are not active yet and activate the
-/// matches, so the next model call declares them (tool.ts:195-209).
+/// matches, so the next model call declares them (tool.ts:300-315).
 pub fn search_and_load(api: &ExtensionApi, query: &str, limit: usize) -> Vec<(String, String)> {
     let active = api.get_active_tools().unwrap_or_default();
     let active_set: HashSet<&str> = active.iter().map(String::as_str).collect();
@@ -337,7 +337,7 @@ pub fn search_and_load(api: &ExtensionApi, query: &str, limit: usize) -> Vec<(St
         .collect()
 }
 
-/// `createToolSearchToolDefinition` (tool.ts:217-244).
+/// `createToolSearchToolDefinition` (tool.ts:322-349).
 pub fn create_tool_search_tool_definition(api: ExtensionApi) -> ToolDefinition {
     ToolDefinition {
         name: TOOL_SEARCH_TOOL_NAME.to_owned(),
@@ -351,7 +351,7 @@ pub fn create_tool_search_tool_definition(api: ExtensionApi) -> ToolDefinition {
         constrained_sampling: None,
         output_schema: None,
         // Searching is not something scripts need; it changes what the model
-        // sees (tool.ts:230).
+        // sees (tool.ts:335).
         exposure: ToolExposure::ModelOnly,
         namespace: None,
         annotations: None,
@@ -441,7 +441,7 @@ pub fn inline_extension() -> InlineExtension {
 
 #[cfg(test)]
 mod tests {
-    //! Ports `test/tool-search.test.ts` @ 4a080252f (ranker cases).
+    //! Ports `test/tool-search.test.ts` @ b4afdddf (ranker cases).
 
     use super::*;
 

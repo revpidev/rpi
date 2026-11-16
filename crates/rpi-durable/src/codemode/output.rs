@@ -1,5 +1,5 @@
 //! A script's result as the model reads it (port of
-//! `packages/durable/src/codemode/output.ts` @ `4a080252f`).
+//! `packages/durable/src/codemode/output.ts` @ `b4afdddf`).
 //!
 //! A "Script completed/failed" header with the wall time, the script's text
 //! items (`==> text N/M <==` when there are several), its `console` lines in

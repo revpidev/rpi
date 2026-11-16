@@ -1071,6 +1071,7 @@ impl TuiMainScreenInner {
         width: i32,
         height: i32,
     ) {
+        crate::benchmark::mark_paint();
         self.full_redraw_count += 1;
         let mut buffer = String::from("\x1b[?2026h"); // begin synchronized output
         if clear {
@@ -1105,7 +1106,7 @@ impl TuiMainScreenInner {
             i += 1;
         }
         buffer.push_str("\x1b[?2026l"); // end synchronized output
-        self.terminal().write(&buffer);
+        crate::benchmark::terminal_write(&buffer, || self.terminal().write(&buffer));
         self.cursor_row = 0.max(new_lines.len() as i32 - 1);
         self.hardware_cursor_row = self.cursor_row;
         // Reset max lines when clearing, otherwise track growth.
@@ -1245,6 +1246,7 @@ impl TuiMainScreenInner {
         if self.stopped {
             return;
         }
+        let _frame_probe = crate::benchmark::FrameProbe::new("regular");
         // V13-07 S5: read the terminal size ONCE per frame (upstream reads a
         // cached property, tui-main-screen.ts:182-183; each `columns()`/
         // `rows()` here is an ioctl — the old code called them four times,
@@ -1283,7 +1285,9 @@ impl TuiMainScreenInner {
         // Render all components to get new lines. Resolve fake cursors before
         // compositing so overlays and line slicing see plain SGR codes
         // (tui-main-screen.ts:265).
-        let mut new_lines = self.resolve_fake_cursors(self.render_children(width));
+        let rendered_children = self.render_children(width);
+        crate::benchmark::mark_layout();
+        let mut new_lines = self.resolve_fake_cursors(rendered_children);
 
         // Composite overlays into the rendered lines (before differential compare).
         if !self.overlay_stack.is_empty() {
@@ -1388,6 +1392,7 @@ impl TuiMainScreenInner {
         // No changes - but still need to update the hardware cursor position
         // if it moved.
         if first_changed == -1 {
+            crate::benchmark::mark_paint();
             self.position_hardware_cursor(cursor_pos, new_lines.len() as i32);
             self.previous_viewport_top = prev_viewport_top;
             self.previous_height = height;
@@ -1397,6 +1402,7 @@ impl TuiMainScreenInner {
         // All changes are in deleted lines (nothing to render, just clear).
         if first_changed >= new_lines.len() as i32 {
             if self.previous_lines.len() > new_lines.len() {
+                crate::benchmark::mark_paint();
                 let mut buffer = String::from("\x1b[?2026h");
                 buffer.push_str(&self.delete_changed_kitty_images(first_changed, last_changed));
                 // Move to the end of new content (clamp to 0 for empty content).
@@ -1450,7 +1456,7 @@ impl TuiMainScreenInner {
                     buffer.push_str(&format!("\x1b[{move_back}A"));
                 }
                 buffer.push_str("\x1b[?2026l");
-                self.terminal().write(&buffer);
+                crate::benchmark::terminal_write(&buffer, || self.terminal().write(&buffer));
                 self.cursor_row = target_row;
                 self.hardware_cursor_row = target_row;
             }
@@ -1478,6 +1484,7 @@ impl TuiMainScreenInner {
 
         // Render from the first changed line to the end; all updates are
         // wrapped in synchronized output.
+        crate::benchmark::mark_paint();
         let mut buffer = String::from("\x1b[?2026h");
         buffer.push_str(&self.delete_changed_kitty_images(first_changed, last_changed));
         let prev_viewport_bottom = prev_viewport_top + height - 1;
@@ -1626,7 +1633,7 @@ impl TuiMainScreenInner {
         }
 
         // Write the entire buffer at once.
-        self.terminal().write(&buffer);
+        crate::benchmark::terminal_write(&buffer, || self.terminal().write(&buffer));
 
         // Track cursor position for the next render. cursorRow tracks the end
         // of content (for viewport calculation); hardwareCursorRow tracks the
@@ -1680,7 +1687,7 @@ impl TuiMainScreenInner {
         buffer.push_str(&format!("\x1b[{}G", target_col + 1));
 
         if !buffer.is_empty() {
-            self.terminal().write(&buffer);
+            crate::benchmark::terminal_write(&buffer, || self.terminal().write(&buffer));
         }
 
         self.hardware_cursor_row = target_row;

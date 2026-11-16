@@ -1,4 +1,4 @@
-//! OAuth errors (port of `packages/mcp/src/oauth/errors.ts` @ 4a080252f).
+//! OAuth errors (port of `packages/mcp/src/oauth/errors.ts` @ b4afdddf).
 
 /// Format an issuer like the upstream error message: a JSON string, or
 /// `none` when it is absent.

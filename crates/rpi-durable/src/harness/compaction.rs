@@ -1,5 +1,5 @@
 //! Built-in compaction task (port of
-//! `packages/durable/src/harness/compaction.ts` @ `4a080252f`).
+//! `packages/durable/src/harness/compaction.ts` @ `b4afdddf`).
 //!
 //! A compaction selects an old prefix of the model context, summarizes it with a
 //! separate model request, and appends a `pi.compaction` entry whose `head` is

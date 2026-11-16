@@ -1,5 +1,5 @@
 //! OAuth authorization code flow with PKCE and dynamic client
-//! registration (port of `packages/mcp/src/oauth/flow.ts` @ 4a080252f).
+//! registration (port of `packages/mcp/src/oauth/flow.ts` @ b4afdddf).
 //!
 //! Includes the v1.0.0 hardening: `authServerMetadataUrl` replaces
 //! discovery (trusted as configured), RFC 9207 `iss` is validated before a

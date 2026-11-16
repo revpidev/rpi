@@ -1,5 +1,5 @@
 //! Portable execution environment (port of `packages/durable/src/env/*`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 //!
 //! The module carries the upstream `ExecutionEnv` surface: the result-shaped
 //! [`FileSystem`] and [`Shell`] capability traits, the snapshot-scanning file

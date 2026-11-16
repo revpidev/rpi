@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::tool_execution::lock_recover;
 
-/// `formatToolDuration` (render-utils.ts:117-128 @ 4a080252f): `4.2s` below a
+/// `formatToolDuration` (render-utils.ts:117-128 @ b4afdddf): `4.2s` below a
 /// minute, then `1m 30s` and `2h 3m 4s`. Under a minute keeps one decimal and
 /// rounds half away from zero like JS `toFixed(1)` (1250ms → `1.3s`); the
 /// duration is truncated to whole milliseconds first like `Date.now()`

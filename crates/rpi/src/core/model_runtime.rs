@@ -2655,7 +2655,7 @@ impl ModelRuntime {
         self.models.get_all_models(provider_id)
     }
 
-    /// `getModelsOfType` (model-registry.ts:150-152 @ 4a080252f).
+    /// `getModelsOfType` (model-registry.ts:150-152 @ b4afdddf).
     pub fn get_models_of_type(
         &self,
         model_type: rpi_ai::types::ModelType,
@@ -2687,7 +2687,7 @@ impl ModelRuntime {
             .await
     }
 
-    /// `classify` (model-registry.ts:173-179 @ 4a080252f): structured
+    /// `classify` (model-registry.ts:173-179 @ b4afdddf): structured
     /// classification with request-time authentication. Never rejects.
     pub async fn classify(
         &self,

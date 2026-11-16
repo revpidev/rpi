@@ -1,5 +1,5 @@
 //! Consumed subset of `@earendil-works/chord/sqlite` (port of
-//! `packages/chord/src/sqlite` @ `4a080252f`).
+//! `packages/chord/src/sqlite` @ `b4afdddf`).
 //!
 //! Carries the portable SQLite driver interfaces ([`database`]), the generic
 //! migration runner and schema-prefix validation. Durable storage code and its

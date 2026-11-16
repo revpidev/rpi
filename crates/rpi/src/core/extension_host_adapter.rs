@@ -629,7 +629,7 @@ impl ExtensionRunner for ExtensionHostAdapter {
     ) -> Option<BeforeAgentStartResult> {
         // #9548: the event carries the structured options; the rendered
         // prompt is recomputed per handler inside the runner (chained), so
-        // the session no longer pre-renders it. 4a080252f: the payload is a
+        // the session no longer pre-renders it. b4afdddf: the payload is a
         // `messageType` union — user runs carry `prompt`/`images`, custom
         // runs carry the starting `message`.
         let options_json = serde_json::to_value(system_prompt_options).unwrap_or(Value::Null);

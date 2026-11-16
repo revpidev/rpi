@@ -1,5 +1,5 @@
 //! Document definitions and typed access rules (port of `packages/durable/src/documents.ts`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 //!
 //! A definition describes one logical document address: its kind, version,
 //! scope, conversation history/fork semantics, initializer, migration, and

@@ -1,4 +1,4 @@
-//! Built-in entry kinds (port of `packages/durable/src/entries.ts` @ `4a080252f`).
+//! Built-in entry kinds (port of `packages/durable/src/entries.ts` @ `b4afdddf`).
 //!
 //! An entry is one immutable transcript event ([`crate::types::EntryRecord`]).
 //! `model` carries the messages the entry contributes to model context; `data`

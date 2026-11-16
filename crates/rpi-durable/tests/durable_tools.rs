@@ -1,5 +1,5 @@
 //! Durable tool integration tests (port of `packages/durable/test/tools.test.ts`
-//! @ `4a080252f` and the environment-facing cases of `harness-tools`).
+//! @ `b4afdddf` and the environment-facing cases of `harness-tools`).
 
 mod generation_support;
 #[path = "tools_support.rs"]

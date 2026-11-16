@@ -1,6 +1,6 @@
 //! Session kernel: one mutation line, the loaded document tracker cache, and
 //! committed publication (port of `packages/durable/src/session/session.ts`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 //!
 //! Only committed state is observable. Every commit callback, storage
 //! settlement, adoption and publication runs while the single mutation line is
