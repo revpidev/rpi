@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import resource
+import shutil
 import signal
 import statistics
 import subprocess
@@ -142,6 +143,12 @@ class ProcessMonitor:
 
 
 def prepare_agent(bundle: dict[str, object], sandbox: Path) -> tuple[Path, Path]:
+    # The logical cwd is deliberately independent of the evidence output path.
+    # Reset this dedicated per-scenario sandbox between processes so both the
+    # initial state and rendered footer path are identical across A/B roots.
+    if sandbox.exists():
+        shutil.rmtree(sandbox)
+    sandbox.mkdir(parents=True)
     agent = sandbox / "agent"
     cwd = sandbox / "cwd"
     home = sandbox / "home"
@@ -415,6 +422,12 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--arena")
+    parser.add_argument(
+        "--sandbox-root",
+        type=Path,
+        default=Path(os.environ.get("TMPDIR", "/tmp")) / "rpi-v19-replay-sandbox",
+        help="dedicated logical sandbox root; each scenario is reset before a run",
+    )
     parser.add_argument("--input-sha256", help="negative-test override")
     args = parser.parse_args()
     if args.repeat < 1:
@@ -447,7 +460,7 @@ def main() -> int:
                 bundle,
                 supplied_hash,
                 output / f"run-{index + 1}",
-                output / "sandbox",
+                args.sandbox_root.resolve() / str(bundle["scenario"]),
                 args.arena,
             )
         )

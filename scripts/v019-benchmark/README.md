@@ -11,7 +11,7 @@ cargo build --release -p rpi-ext-statusline -p rpi-test-native-plugin
 cargo build --release -p rpi --bin rpi-v19-replay --features v19-benchmark
 ```
 
-The same workspace `Cargo.lock`, compiler, target and release profile must be used for an A/B comparison. Record the source commit and the hash of the harness-only change separately.
+The same workspace `Cargo.lock`, compiler, target and release profile must be used for an A/B comparison. Record the source commit and the hash of the reviewed measurement overlay separately.
 
 ## Inputs and scenarios
 
@@ -43,7 +43,7 @@ python3 scripts/v019-benchmark/run_replay.py \
   --repeat 3
 ```
 
-Every repeat is a fresh process, but all repeats use the same logical cwd and sequential sandbox. The runner:
+Every repeat is a fresh process. The logical cwd is `<sandbox-root>/<scenario>` (default `/tmp/rpi-v19-replay-sandbox/<scenario>`), not a child of the evidence output directory. The runner resets that dedicated sandbox before each process, so separate baseline/candidate output roots still render identical paths. Use `--sandbox-root` only for another dedicated, non-shared location; do not run the same scenario concurrently. The runner:
 
 - verifies the input against the manifest and passes the expected SHA-256 to the child;
 - sets `RPI_V19_DISABLE_ADAPTIVE_BACKPRESSURE=1` for the candidate-side internal switch (the stable build simply ignores it);
@@ -73,13 +73,13 @@ The suite runner writes a host/build/binary/Cargo.lock identity index and links 
 
 ## Stable v0.1.8 source identity and instrumentation
 
-Keep an independent detached worktree at stable commit `16062830e9aa4ee305c41dbc811d91995885b5b1` for read-only source verification. To obtain the same internal frame metrics from stable, use a separate disposable measurement worktree at that commit and apply only the reviewed V19-00 harness change (for example, cherry-pick its harness-only commit). Do not apply later functional or optimization commits.
+Keep an independent detached worktree at stable commit `16062830e9aa4ee305c41dbc811d91995885b5b1` for read-only source verification. To obtain the same internal frame metrics from stable, use a separate disposable measurement worktree at that commit and apply the reviewed V19-00 measurement overlay. The overlay explicitly contains replay/probe/test-fixture instrumentation, mechanical pin-provenance updates and the user-approved export `template.css/template.js` synchronization; it contains no later functional or optimization commits. Do not describe it as instrumentation-only.
 
 For each stable measurement, record:
 
 - stable source commit and worktree diff;
 - harness commit/patch SHA-256;
-- proof that the overlay contains only replay/probe/test-fixture instrumentation;
+- an itemized diff proving the overlay is limited to the V19-00 instrumentation, pin provenance and approved mechanical export assets;
 - the build commands above and identical input manifest.
 
 The unmodified stable checkout remains the source-of-truth; the instrumented measurement build is explicitly described as stable plus observability, never as an unrelated release or an rc.5/debug baseline.

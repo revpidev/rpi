@@ -18,6 +18,24 @@ python3 scripts/v019-benchmark/run_replay.py \
   --output-dir "$OUT/smoke" \
   --repeat 2 >"$OUT/smoke.log"
 
+# Evidence paths must not leak into the logical cwd or the frame hashes. This
+# is the stable/candidate A/B case, not merely two repeats in one directory.
+for root in cross-a cross-b; do
+  python3 scripts/v019-benchmark/run_replay.py \
+    --binary "$BINARY" \
+    --bundle fixtures/v019-benchmark/bundles/smoke-text-regular.json \
+    --output-dir "$OUT/$root" \
+    --repeat 1 >"$OUT/$root.log"
+done
+cmp "$OUT/cross-a/run-1/terminal.bytes" "$OUT/cross-b/run-1/terminal.bytes"
+python3 - "$OUT/cross-a/run-1/summary.json" "$OUT/cross-b/run-1/summary.json" <<'PY'
+import json, sys
+left = json.load(open(sys.argv[1]))
+right = json.load(open(sys.argv[2]))
+for key in ('finalScreenSha256', 'terminalOutputSha256', 'frameHashes'):
+    assert left[key] == right[key], key
+PY
+
 if python3 scripts/v019-benchmark/run_replay.py \
   --binary "$BINARY" \
   --bundle fixtures/v019-benchmark/bundles/smoke-text-regular.json \
