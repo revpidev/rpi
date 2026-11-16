@@ -53,16 +53,18 @@ m = json.load(open('fixtures/v019-benchmark/bundles/manifest.json'))
 print(m['bundles']['smoke-text-regular.json']['sha256'])
 PY
 )
+LOGICAL_SANDBOX="${TMPDIR:-/tmp}/rpi-v19-replay-sandbox/smoke-text-regular"
 if env -u RPI_V19_BENCHMARK_LOG RPI_OFFLINE=1 "$BINARY" \
   --bundle fixtures/v019-benchmark/bundles/smoke-text-regular.json \
-  --agent-dir "$OUT/smoke/sandbox/agent" \
-  --cwd "$OUT/smoke/sandbox/cwd" \
+  --agent-dir "$LOGICAL_SANDBOX/agent" \
+  --cwd "$LOGICAL_SANDBOX/cwd" \
   --summary "$OUT/missing-log-summary.json" \
   --terminal-output "$OUT/missing-log-terminal.bytes" \
   --input-sha256 "$INPUT_HASH" >"$OUT/missing-log.log" 2>&1; then
   echo "error: replay passed without a frame log" >&2
   exit 1
 fi
+grep -q 'RPI_V19_BENCHMARK_LOG is required' "$OUT/missing-log.log"
 
 cargo build -q -p rpi --bin rpi-v19-replay --features v19-benchmark
 if target/debug/rpi-v19-replay >"$OUT/debug-profile.log" 2>&1; then
