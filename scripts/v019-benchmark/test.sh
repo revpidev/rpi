@@ -6,6 +6,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 BINARY="${1:-$ROOT/target/release/rpi-v19-replay}"
 OUT="${TMPDIR:-/tmp}/rpi-v19-harness-self-test"
+printf 'binary: %s\n' "$BINARY"
+sha256sum "$BINARY"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
@@ -54,6 +56,9 @@ print(m['bundles']['smoke-text-regular.json']['sha256'])
 PY
 )
 LOGICAL_SANDBOX="${TMPDIR:-/tmp}/rpi-v19-replay-sandbox/smoke-text-regular"
+# The preceding smoke/cross runs create the logical agent dir. Assert it so a
+# reordered script cannot make this negative fail for the wrong reason.
+test -f "$LOGICAL_SANDBOX/agent/models.json"
 if env -u RPI_V19_BENCHMARK_LOG RPI_OFFLINE=1 "$BINARY" \
   --bundle fixtures/v019-benchmark/bundles/smoke-text-regular.json \
   --agent-dir "$LOGICAL_SANDBOX/agent" \
