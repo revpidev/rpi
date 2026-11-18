@@ -530,6 +530,30 @@ pub async fn open_with_storage(
     open_with_storage_and_identity(storage, extensions, settings, models, None).await
 }
 
+/// Open a Harness over `storage` with one fixed execution environment.
+pub async fn open_with_storage_and_env(
+    storage: Arc<dyn Storage>,
+    extensions: Vec<Extension>,
+    models: Models,
+    env: Arc<dyn rpi_durable::env::types::ExecutionEnv>,
+) -> Opened {
+    let env: rpi_durable::harness::EnvFactory = Arc::new(move |_, _| {
+        let env = Some(Arc::clone(&env));
+        Box::pin(async move { env })
+    });
+    open_with_timing_and_env(
+        storage,
+        extensions,
+        None,
+        models.into(),
+        None,
+        None,
+        None,
+        Some(env),
+    )
+    .await
+}
+
 /// Open a Harness over `storage` with explicit request identity.
 pub async fn open_with_storage_and_identity(
     storage: Arc<dyn Storage>,
@@ -569,6 +593,23 @@ pub async fn open_with_timing(
     now: Option<rpi_durable::session::NowFn>,
     set_timer: Option<rpi_durable::harness::SetTimer>,
 ) -> Opened {
+    open_with_timing_and_env(
+        storage, extensions, settings, models, identity, now, set_timer, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_with_timing_and_env(
+    storage: Arc<dyn Storage>,
+    extensions: Vec<Extension>,
+    settings: Option<rpi_durable::harness::SettingsSource>,
+    models: rpi_durable::harness::ModelsSource,
+    identity: Option<rpi_ai::utils::identity::ClientIdentity>,
+    now: Option<rpi_durable::session::NowFn>,
+    set_timer: Option<rpi_durable::harness::SetTimer>,
+    env: Option<rpi_durable::harness::EnvFactory>,
+) -> Opened {
     let registry = Arc::new(RegistryImpl::with_builtins(builtin_tasks()));
     for extension in extensions {
         registry.install(extension).expect("install extension");
@@ -581,7 +622,7 @@ pub async fn open_with_timing(
         identity,
         registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,
         settings,
-        env: None,
+        env,
         conversation_created: None,
         now,
         set_timer,

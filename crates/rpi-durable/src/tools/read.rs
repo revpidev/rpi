@@ -435,8 +435,14 @@ async fn read_image(
     } else {
         format!("Read image file [{}]. {}", image.mime_type, notes.join(" "))
     };
+    let structured_output = json!({
+        "type": "image",
+        "data": &image.data,
+        "mimeType": &image.mime_type,
+    });
     Ok(ToolExecutionResult {
         output: Some(vec![ToolResultContent::Image(image)]),
+        structured_output: Some(structured_output),
         diagnostics: Some(vec![ToolDiagnostic {
             severity: DiagnosticSeverity::Info,
             code: Some("image".to_string()),
@@ -627,10 +633,11 @@ async fn read_text(
             Vec::new()
         } else {
             vec![ToolResultContent::Text(TextContent {
-                text: output_text,
+                text: output_text.clone(),
                 text_signature: None,
             })]
         }),
+        structured_output: Some(Value::String(output_text)),
         details,
         diagnostics: Some(diagnostics),
         ..Default::default()
@@ -715,19 +722,24 @@ fn parameters() -> Value {
     })
 }
 
-/// `createReadTool` (read.ts:73). Remarks about truncation and continuation are
-/// diagnostics; the content is only file text.
+/// `createReadTool` (read.ts:101). Text and image-processing remarks are
+/// diagnostics; programs receive the text or the image block.
 pub fn create_read_tool() -> ToolRegistration {
     create_read_tool_with_options(ReadToolOptions::default())
 }
 
 /// `createReadTool` with image processing.
 pub fn create_read_tool_with_options(options: ReadToolOptions) -> ToolRegistration {
+    let formats = if options.image_processor.is_some() {
+        "jpg, png, gif, webp, bmp"
+    } else {
+        "jpg, png, gif, webp"
+    };
     ToolRegistration {
         tool: Tool {
             name: "read".to_string(),
             description: format!(
-                "Read the contents of a text file. Output is truncated to {DEFAULT_MAX_LINES} lines or {}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+                "Read the contents of a file. Supports text files and images ({formats}). Images are sent as attachments. For text files, output is truncated to {DEFAULT_MAX_LINES} lines or {}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
                 DEFAULT_MAX_BYTES / 1024
             ),
             parameters: parameters(),
@@ -737,7 +749,20 @@ pub fn create_read_tool_with_options(options: ReadToolOptions) -> ToolRegistrati
         execution_mode: None,
         prepare_arguments: None,
         output_limits: None,
-        structured_output_schema: None,
+        structured_output_schema: Some(json!({
+            "anyOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "properties": {
+                        "type": { "const": "image" },
+                        "data": { "type": "string" },
+                        "mimeType": { "type": "string" }
+                    },
+                    "required": ["type", "data", "mimeType"]
+                }
+            ]
+        })),
         callers: None,
         deferred: false,
         execute: Arc::new(ReadTool { options }),

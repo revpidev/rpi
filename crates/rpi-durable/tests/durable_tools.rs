@@ -90,6 +90,13 @@ async fn read_reports_offsets_and_limits_as_diagnostics() {
     .await;
     let result = result.expect("read");
     let output = text_output(&result);
+    assert_eq!(
+        result
+            .structured_output
+            .as_ref()
+            .and_then(serde_json::Value::as_str),
+        Some(output.as_str())
+    );
     assert!(!output.contains("Line 40"));
     assert!(output.contains("Line 41"));
     assert!(output.contains("Line 60"));
@@ -595,6 +602,32 @@ async fn powershell_falls_back_to_the_next_program() {
 // Parameter schemas (the typebox replacement face)
 // ---------------------------------------------------------------------------
 
+#[test]
+fn read_declares_its_description_and_text_or_image_structured_output() {
+    let read = create_read_tool();
+    assert_eq!(
+        read.tool.description,
+        "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
+    );
+    assert_eq!(
+        read.structured_output_schema,
+        Some(json!({
+            "anyOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "properties": {
+                        "type": { "const": "image" },
+                        "data": { "type": "string" },
+                        "mimeType": { "type": "string" }
+                    },
+                    "required": ["type", "data", "mimeType"]
+                }
+            ]
+        }))
+    );
+}
+
 /// Every tool declares an object schema whose properties carry types and
 /// descriptions, and the shared `rpi-ai` validation face enforces required
 /// fields and coerces numeric strings.
@@ -713,13 +746,21 @@ async fn read_returns_a_supported_image_within_the_limits() {
     )
     .await;
     let result = result.expect("read image");
-    let content = result.output.expect("content");
+    let content = result.output.as_ref().expect("content");
     assert_eq!(content.len(), 1);
-    assert!(matches!(
-        &content[0],
-        rpi_ai::types::ToolResultContent::Image(image)
-            if image.mime_type == "image/png" && !image.data.is_empty()
-    ));
+    let rpi_ai::types::ToolResultContent::Image(image) = &content[0] else {
+        panic!("expected an image block");
+    };
+    assert_eq!(image.mime_type, "image/png");
+    assert!(!image.data.is_empty());
+    assert_eq!(
+        result.structured_output,
+        Some(json!({
+            "type": "image",
+            "data": image.data,
+            "mimeType": image.mime_type
+        }))
+    );
     assert!(result.diagnostics.iter().flatten().any(|diagnostic| {
         diagnostic.code.as_deref() == Some("image")
             && diagnostic.message.contains("Read image file [")

@@ -6,8 +6,11 @@
 //! corrupt journals, and cancellation, plus the harness-level round trip.
 
 mod generation_support;
+#[path = "tools_support.rs"]
+mod tools_support;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -20,8 +23,10 @@ use rpi_durable::codemode::{
     CodemodeImage, CodemodeJournal, CodemodeJournalEntry, CodemodeNamespaceInfo, CodemodeOutcome,
     CodemodeRunState, CodemodeSandbox, CodemodeStart, CodemodeStoreState, CodemodeTextItem,
     CodemodeToolDetails, CodemodeToolInfo, CodemodeToolOptions, GENERATE_IMAGES_TOOL,
-    create_codemode_tool, format_outcome,
+    create_codemode_extension, create_codemode_tool, format_outcome,
 };
+use rpi_durable::env::node::{NodeExecutionEnv, NodeExecutionEnvOptions};
+use rpi_durable::env::types::ExecutionEnv;
 use rpi_durable::harness::types::{DiagnosticSeverity, OutputSkip, OutputWindow};
 use rpi_durable::harness::{
     Extension, NestedCallOptions, NestedToolExecutionResult, RetainedOutput, ToolCaller,
@@ -30,12 +35,14 @@ use rpi_durable::harness::{
 };
 use rpi_durable::ids::TaskId;
 use rpi_durable::session::DocOwner;
-use rpi_durable::types::{EntryRecord, ScanOrder, TaskQuery};
+use rpi_durable::storage::MemoryStorage;
+use rpi_durable::tools::create_read_tool;
+use rpi_durable::types::{EntryRecord, ScanOrder, Storage, TaskQuery};
 use tokio_util::sync::CancellationToken;
 
 use generation_support::{
-    Script, context, entries, open, root_ready, submit_input, test_models, text_message,
-    tool_use_message,
+    Script, context, entries, open, open_with_storage_and_env, root_ready, submit_input,
+    test_models, text_message, tool_use_message,
 };
 
 // ---------------------------------------------------------------------------
@@ -223,6 +230,19 @@ fn codemode_section_lists_tools_and_the_extension_exposes_the_section() {
     );
     assert_eq!(extension.sections.len(), 1);
     assert_eq!(extension.sections[0].key, "codemode");
+}
+
+/// Upstream `codemode-imports.test.ts` (#11254): loading the extension does not
+/// load a QuickJS WASM runtime; the host-supplied sandbox is the Rust boundary.
+#[test]
+fn creating_codemode_extension_does_not_call_the_sandbox() {
+    let sandbox = Arc::new(CountingSandbox::default());
+    let extension = create_codemode_extension(CodemodeToolOptions {
+        sandbox: Arc::clone(&sandbox) as Arc<dyn CodemodeSandbox>,
+        ..Default::default()
+    });
+    assert_eq!(extension.name, "codemode");
+    assert_eq!(sandbox.0.load(Ordering::SeqCst), 0);
 }
 
 /// Upstream `createCodemodeTool` declares `OUTPUT_LIMITS`: the formatter keeps
@@ -760,6 +780,147 @@ async fn an_image_result_flows_through_a_nested_call() {
     assert!(texts[0].contains("rendered"));
 }
 
+struct ReadFileSandbox {
+    image_path: String,
+    text_path: String,
+    expected_data: String,
+}
+
+#[async_trait]
+impl CodemodeSandbox for ReadFileSandbox {
+    fn fingerprint(&self) -> String {
+        "read-file-1".to_string()
+    }
+
+    async fn run(
+        &self,
+        start: CodemodeStart,
+        host: &dyn CodemodeHost,
+        _context: &Context,
+    ) -> Result<CodemodeOutcome, String> {
+        let declaration = start
+            .tools
+            .iter()
+            .find(|tool| tool.name == "read")
+            .expect("read declaration");
+        assert!(declaration.structured);
+        assert!(declaration.description.contains("Promise<string | {"));
+        assert!(declaration.description.contains("data: string"));
+        assert!(declaration.description.contains("mimeType: string"));
+        let picture = host
+            .call_tool(
+                "read",
+                serde_json::json!({ "path": self.image_path })
+                    .as_object()
+                    .cloned()
+                    .expect("image arguments"),
+                "read-image",
+            )
+            .await?;
+        assert!(!picture.is_error, "{:?}", picture.diagnostics);
+        let picture = picture.structured_output.expect("image structured output");
+        assert_eq!(picture["type"], serde_json::json!("image"));
+        assert_eq!(picture["data"], serde_json::json!(self.expected_data));
+        assert_eq!(picture["mimeType"], serde_json::json!("image/png"));
+        let image = CodemodeImage {
+            data: picture["data"].as_str().expect("image data").to_string(),
+            mime_type: picture["mimeType"]
+                .as_str()
+                .expect("image MIME type")
+                .to_string(),
+        };
+        let note = host
+            .call_tool(
+                "read",
+                serde_json::json!({ "path": self.text_path })
+                    .as_object()
+                    .cloned()
+                    .expect("text arguments"),
+                "read-text",
+            )
+            .await?;
+        assert!(!note.is_error, "{:?}", note.diagnostics);
+        let note = note
+            .structured_output
+            .as_ref()
+            .and_then(JsonValue::as_str)
+            .expect("text structured output");
+        Ok(
+            CodemodeOutcome::output(format!("image image/png {} {note}", image.data.len()))
+                .with_images(vec![image]),
+        )
+    }
+}
+
+/// Upstream `codemode.test.ts` (#11015): `image(await tools.read(...))` emits
+/// the image block, while a text read resolves to the file's text.
+#[tokio::test]
+async fn read_results_flow_through_image_and_text_codemode_calls() {
+    const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let dir = tools_support::TempDir::new("durable-codemode-read");
+    let image_path = dir.path().join("pixel.png");
+    let text_path = dir.path().join("note.txt");
+    std::fs::write(
+        &image_path,
+        base64::engine::general_purpose::STANDARD
+            .decode(PNG_1X1)
+            .expect("PNG fixture"),
+    )
+    .expect("write PNG");
+    std::fs::write(&text_path, "hello").expect("write text");
+    let env: Arc<dyn ExecutionEnv> = Arc::new(NodeExecutionEnv::new(NodeExecutionEnvOptions {
+        cwd: Some(dir.path_str()),
+        ..Default::default()
+    }));
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage_and_env(
+        storage,
+        vec![extension(vec![
+            create_codemode_tool(CodemodeToolOptions {
+                sandbox: Arc::new(ReadFileSandbox {
+                    image_path: image_path.to_string_lossy().into_owned(),
+                    text_path: text_path.to_string_lossy().into_owned(),
+                    expected_data: PNG_1X1.to_string(),
+                }),
+                ..Default::default()
+            }),
+            create_read_tool(),
+        ])],
+        test_models(vec![
+            Script::Message(tool_use_message(
+                CODEMODE_TOOL_NAME,
+                "c1",
+                serde_json::json!({ "code": "return 1" }),
+            )),
+            Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
+        ]),
+        env,
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    submission.wait(&context()).await.expect("wait");
+    let entries = entries(&conversation).await;
+    let texts = tool_result_texts(&entries);
+    assert_eq!(texts.len(), 1);
+    assert!(
+        texts[0].contains(&format!("image image/png {} hello", PNG_1X1.len())),
+        "got {}",
+        texts[0]
+    );
+    let contents = tool_result_contents(&entries);
+    let image = contents
+        .iter()
+        .flatten()
+        .find_map(|content| match content {
+            ToolResultContent::Image(image) => Some(image),
+            ToolResultContent::Text(_) => None,
+        })
+        .expect("emitted image");
+    assert_eq!(image.data, PNG_1X1);
+    assert_eq!(image.mime_type, "image/png");
+}
+
 struct GeneratedImageTool;
 
 #[async_trait]
@@ -1188,6 +1349,26 @@ impl ToolExecutionApi for PanicApi {
         _options: NestedCallOptions,
     ) -> Result<NestedToolExecutionResult, rpi_durable::session::SessionError> {
         Self::never()
+    }
+}
+
+#[derive(Default)]
+struct CountingSandbox(AtomicUsize);
+
+#[async_trait]
+impl CodemodeSandbox for CountingSandbox {
+    fn fingerprint(&self) -> String {
+        "counting".to_string()
+    }
+
+    async fn run(
+        &self,
+        _start: CodemodeStart,
+        _host: &dyn CodemodeHost,
+        _context: &Context,
+    ) -> Result<CodemodeOutcome, String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err("must not run".to_string())
     }
 }
 
