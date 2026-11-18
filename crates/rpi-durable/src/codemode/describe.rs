@@ -538,22 +538,21 @@ impl CodemodeCatalog {
             {
                 continue;
             }
-            let text = [
-                tool.name.clone(),
-                tool.name.replace('_', " "),
-                tool.description.clone(),
-                own.map(|namespace| namespace.name.clone())
-                    .unwrap_or_default(),
-                own.and_then(|namespace| namespace.description.clone())
-                    .unwrap_or_default(),
-            ]
-            .into_iter()
-            .filter(|part| !part.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+            let namespace_text = own.map(|namespace| {
+                [
+                    Some(namespace.name.clone()),
+                    namespace.description.clone(),
+                    namespace.instructions.clone(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ")
+            });
             documents.push(SearchDocument {
                 name: tool.name.clone(),
-                text,
+                text: tool.description.clone(),
+                namespace_text,
             });
         }
         rank_documents(query, &documents, limit)

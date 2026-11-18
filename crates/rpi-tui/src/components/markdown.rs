@@ -988,6 +988,20 @@ fn is_blank_quoted_line(line: &str) -> bool {
 /// blocks where the source has blank lines (marked emits `space` tokens for
 /// blank lines between block tokens; comrak drops them). Leading/trailing
 /// blank lines become leading/trailing space blocks.
+fn strip_html_comments(html: &str) -> String {
+    let mut output = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find("<!--") {
+        output.push_str(&rest[..start]);
+        rest = match rest[start + 4..].find("-->") {
+            Some(end) => &rest[start + 4 + end + 3..],
+            None => "",
+        };
+    }
+    output.push_str(rest);
+    output
+}
+
 fn synthesize_blocks<'a>(
     children: Vec<Node<'a>>,
     source: &str,
@@ -1022,6 +1036,32 @@ fn synthesize_blocks<'a>(
         }
     }
 
+    let mut position = blocks.len();
+    while position > 0 {
+        position -= 1;
+        let comment_only = match &blocks[position] {
+            Block::Node(node) => match &node.data.borrow().value {
+                NodeValue::HtmlBlock(html) => strip_html_comments(&html.literal).trim().is_empty(),
+                _ => false,
+            },
+            Block::Space => false,
+        };
+        if !comment_only {
+            continue;
+        }
+        blocks.remove(position);
+        if matches!(blocks.get(position), Some(Block::Space))
+            && (position == 0 || matches!(blocks.get(position - 1), Some(Block::Space)))
+        {
+            blocks.remove(position);
+        } else if position == blocks.len()
+            && position > 0
+            && matches!(blocks.get(position - 1), Some(Block::Space))
+        {
+            blocks.remove(position - 1);
+        }
+        position = position.min(blocks.len());
+    }
     blocks
 }
 
@@ -1450,6 +1490,7 @@ impl Markdown {
         };
 
         let mut position = 0;
+        let mut drop_leading_space = false;
         while position < children.len() {
             let token = children[position];
             let value = &token.data.borrow().value;
@@ -1458,6 +1499,12 @@ impl Markdown {
                     // Escape tokens (upstream `escape`) are resolved into
                     // text nodes; re-emit the backslash when preserving.
                     let raw = node_slice(source, index, token.data.borrow().sourcepos);
+                    let raw = if drop_leading_space {
+                        raw.trim_start_matches([' ', '\t'])
+                    } else {
+                        raw
+                    };
+                    drop_leading_space = false;
                     if self.options.render_latex {
                         if let Some(pending_tail) = self.render_inline_text_with_latex(
                             raw,
@@ -1509,27 +1556,40 @@ impl Markdown {
                 }
                 NodeValue::Link(link) => {
                     let link_text = self.render_inline_tokens(token, source, index, style_context);
-                    let styled_link = (self.theme.link)(&(self.theme.underline)(&link_text));
+                    let raw = node_slice(source, index, token.data.borrow().sourcepos);
+                    let (href, punctuation) = if raw.starts_with("http://")
+                        || raw.starts_with("https://")
+                    {
+                        match link.url.char_indices().find(|(_, character)| {
+                            crate::utils::is_cjk_punctuation_char(*character)
+                        }) {
+                            Some((position, _)) => (&link.url[..position], &link.url[position..]),
+                            None => (link.url.as_str(), ""),
+                        }
+                    } else {
+                        (link.url.as_str(), "")
+                    };
+                    let link_text = if !punctuation.is_empty() && link_text.ends_with(punctuation) {
+                        &link_text[..link_text.len() - punctuation.len()]
+                    } else {
+                        link_text.as_str()
+                    };
+                    let styled_link = (self.theme.link)(&(self.theme.underline)(link_text));
                     if get_capabilities().hyperlinks {
-                        // OSC 8: clickable hyperlink; the URL is not printed
-                        // inline, so the link text always shows.
-                        result.push_str(&hyperlink(&styled_link, &link.url));
+                        result.push_str(&hyperlink(&styled_link, href));
                         result.push_str(style_context.style_prefix);
                     } else {
-                        // Fallback: print the URL in parentheses when the
-                        // text differs from the href. mailto: links compare
-                        // with the prefix stripped (autolinked emails).
-                        let href_for_comparison =
-                            link.url.strip_prefix("mailto:").unwrap_or(&link.url);
-                        let plain_text = strip_ansi(&link_text);
-                        if plain_text == link.url || plain_text == href_for_comparison {
+                        let href_for_comparison = href.strip_prefix("mailto:").unwrap_or(href);
+                        let plain_text = strip_ansi(link_text);
+                        if plain_text == href || plain_text == href_for_comparison {
                             result.push_str(&styled_link);
                         } else {
                             result.push_str(&styled_link);
-                            result.push_str(&(self.theme.link_url)(&format!(" ({})", link.url)));
+                            result.push_str(&(self.theme.link_url)(&format!(" ({href})")));
                         }
                         result.push_str(style_context.style_prefix);
                     }
+                    result.push_str(punctuation);
                 }
                 NodeValue::Strikethrough => {
                     let raw = node_slice(source, index, token.data.borrow().sourcepos);
@@ -1578,7 +1638,17 @@ impl Markdown {
                 }
                 NodeValue::LineBreak | NodeValue::SoftBreak => result.push('\n'),
                 NodeValue::HtmlInline(html) => {
-                    result.push_str(&apply_text_with_newlines(html));
+                    if html.starts_with("<!--") {
+                        drop_leading_space = position == 0
+                            || node_slice(
+                                source,
+                                index,
+                                children[position - 1].data.borrow().sourcepos,
+                            )
+                            .ends_with([' ', '\t']);
+                    } else {
+                        result.push_str(&apply_text_with_newlines(html));
+                    }
                 }
                 // Images and any other inline nodes render as nothing,
                 // matching the upstream default case (no `text` property).
@@ -1858,6 +1928,7 @@ impl Markdown {
         token: Node<'_>,
         source: &str,
         index: &LineIndex,
+        width: usize,
         next_token_type: Option<TokenType>,
         style_context: &InlineStyleContext<'_>,
     ) -> Option<Vec<String>> {
@@ -1898,6 +1969,11 @@ impl Markdown {
                     } else {
                         render_latex(latex.text, true)
                             .unwrap_or_else(|| trim_js(&raw[*start..*end]).to_string())
+                    };
+                    let rendered = if rendered.split('\n').any(|line| visible_width(line) > width) {
+                        trim_js(&raw[*start..*end]).to_string()
+                    } else {
+                        rendered
                     };
                     for line in rendered.split('\n') {
                         lines.push(self.apply_default_style(line));
@@ -1987,6 +2063,7 @@ impl Markdown {
                         token,
                         source,
                         index,
+                        width,
                         next_token_type,
                         style_context,
                     )
@@ -2088,11 +2165,36 @@ impl Markdown {
                     source_start,
                     source_end,
                 );
+                if width < 3 {
+                    for (position, quote_block) in quote_blocks.iter().enumerate() {
+                        let next_quote_type = quote_blocks
+                            .get(position + 1)
+                            .map(Block::token_type)
+                            .or(next_token_type)
+                            .unwrap_or(TokenType::Other);
+                        lines.extend(self.render_token(
+                            quote_block,
+                            source,
+                            index,
+                            width,
+                            Some(next_quote_type),
+                            style_context,
+                        ));
+                    }
+                    if spacing_after(next_token_type) {
+                        lines.push(String::new());
+                    }
+                    while lines.last().is_some_and(|line| line.is_empty()) {
+                        lines.pop();
+                    }
+                    return lines;
+                }
                 let mut rendered_quote_lines: Vec<String> = Vec::new();
                 for (position, quote_block) in quote_blocks.iter().enumerate() {
                     let next_quote_type = quote_blocks
                         .get(position + 1)
                         .map(Block::token_type)
+                        .or(next_token_type)
                         .unwrap_or(TokenType::Other);
                     rendered_quote_lines.extend(self.render_token(
                         quote_block,
@@ -2129,8 +2231,10 @@ impl Markdown {
                 }
             }
             NodeValue::HtmlBlock(html) => {
-                // Render HTML as plain text (escaped for terminal).
-                lines.push(self.apply_default_style(html.literal.trim()));
+                let without_comments = strip_html_comments(&html.literal);
+                if !without_comments.trim().is_empty() {
+                    lines.push(self.apply_default_style(without_comments.trim()));
+                }
             }
             _ => {
                 // Any other block types render as nothing (upstream default
@@ -4744,5 +4848,67 @@ $$");
             render("`**这是测试。**`"),
             ["\x1b[33m**这是测试。**\x1b[0m"]
         );
+    }
+
+    #[test]
+    fn html_comments_leave_no_text_or_extra_block_gap() {
+        assert_eq!(plain(&md("a <!-- hidden --> b"), 80), ["a b"]);
+        assert_eq!(plain(&md("<!-- streamed"), 80), [""]);
+        assert_eq!(
+            plain(&md("before\n\n<!-- hidden -->\n\nafter"), 80),
+            ["before", "", "after"]
+        );
+        assert_eq!(plain(&md("<!-- first -->\n\nafter"), 80), ["after"]);
+        assert_eq!(plain(&md("before\n\n<!-- last -->"), 80), ["before"]);
+        assert_eq!(plain(&md("<span>keep</span>"), 80), ["<span>keep</span>"]);
+    }
+
+    #[test]
+    fn bare_urls_stop_before_cjk_punctuation_but_explicit_links_do_not() {
+        let _guard = TEST_CAPS_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        set_capabilities(caps(true));
+        let linked = md("https://example.com/path，next").render(120).join("\n");
+        assert!(
+            linked.contains("\x1b]8;;https://example.com/path\x1b\\"),
+            "{linked:?}"
+        );
+        assert!(linked.contains("path\x1b[24m"), "{linked:?}");
+        assert!(linked.contains("，next"), "{linked:?}");
+        assert!(
+            !linked.contains("\x1b]8;;https://example.com/path，"),
+            "{linked:?}"
+        );
+        let explicit = md("[label](https://example.com/，next)")
+            .render(120)
+            .join("\n");
+        assert!(
+            explicit.contains("https://example.com/%EF%BC%8Cnext")
+                || explicit.contains("https://example.com/，next")
+        );
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    fn overwide_display_math_falls_back_to_raw_source() {
+        let math = r"$$\begin{matrix}a&b\\c&d\end{matrix}$$";
+        let wide = plain(&md(math), 80).join("\n");
+        let narrow = plain(&md(math), 3).join("\n");
+        assert!(
+            !wide.contains("\\begin{matrix}"),
+            "wide={wide:?}; narrow={narrow:?}"
+        );
+        assert_eq!(
+            narrow.replace('\n', ""),
+            math,
+            "wide={wide:?}; narrow={narrow:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_blockquotes_drop_the_border() {
+        assert_eq!(plain(&md("> xy"), 2), ["xy"]);
+        assert_eq!(plain(&md("> xy"), 3), ["│ x", "│ y"]);
     }
 }

@@ -48,6 +48,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 regex.workspace = true
 unicode-normalization.workspace = true
+unicode-segmentation.workspace = true
 base64.workspace = true
 uuid.workspace = true
 image.workspace = true

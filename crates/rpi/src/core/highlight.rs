@@ -91,6 +91,10 @@ const EXT_TO_LANG: &[(&str, &str)] = &[
     ("rb", "ruby"),
     ("rs", "rust"),
     ("go", "go"),
+    ("dart", "dart"),
+    ("nix", "nix"),
+    ("groovy", "groovy"),
+    ("gradle", "groovy"),
     ("java", "java"),
     ("kt", "kotlin"),
     ("swift", "swift"),
@@ -570,7 +574,7 @@ mod tests {
         let mut langs: Vec<&str> = EXT_TO_LANG.iter().map(|(_, l)| *l).collect();
         langs.sort_unstable();
         langs.dedup();
-        assert_eq!(langs.len(), 43);
+        assert_eq!(langs.len(), 46);
         for lang in &langs {
             if *lang == "powershell" {
                 // PowerShell's grammar uses `\g<...>` subroutine calls, which
@@ -772,6 +776,42 @@ mod tests {
             let stripped: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
             let expected: Vec<String> = code.split('\n').map(str::to_string).collect();
             assert_eq!(stripped, expected, "{lang} must round-trip");
+        }
+    }
+
+    #[test]
+    fn dart_nix_groovy_and_gradle_highlight_and_round_trip() {
+        let t = theme();
+        let cases = [
+            ("dart", "void main() { // note\n  print('hi');\n}"),
+            (
+                "nix",
+                "{ pkgs ? import <nixpkgs> {} }:\npkgs.stdenv.mkDerivation { name = \"demo\"; }",
+            ),
+            ("groovy", "class Demo {\n  String value = 'hi' // note\n}"),
+            (
+                "groovy",
+                "plugins { id 'java' }\ndependencies { implementation 'org.example:demo:1.0' }",
+            ),
+        ];
+        for (lang, code) in cases {
+            assert!(supports_language(lang), "{lang} grammar must exist");
+            let output = highlight_code(code, Some(lang), &t).join("\n");
+            assert!(
+                output.contains('\x1b'),
+                "{lang} must be highlighted, not plain fallback"
+            );
+            assert!(
+                output.contains(t.get_fg_ansi("syntaxString").as_str()),
+                "{lang} string scope"
+            );
+            assert_eq!(strip_ansi(&output), code, "{lang} source round-trip");
+        }
+        for path in ["Main.dart", "flake.nix", "Build.groovy", "build.gradle"] {
+            assert!(
+                get_language_from_path(path).is_some_and(supports_language),
+                "{path}"
+            );
         }
     }
 

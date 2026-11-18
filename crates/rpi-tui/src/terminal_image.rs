@@ -343,6 +343,14 @@ fn detect_capabilities_inner(
         };
     }
 
+    if term_program == "orca" && env_var("ORCA_IMAGE_PROTOCOL") == "kitty" {
+        return TerminalCapabilities {
+            images: Some(ImageProtocol::Kitty),
+            true_color: true,
+            hyperlinks: true,
+        };
+    }
+
     if env_flag("KITTY_WINDOW_ID") || term_program == "kitty" {
         return TerminalCapabilities {
             images: Some(ImageProtocol::Kitty),
@@ -399,7 +407,10 @@ fn detect_capabilities_inner(
     // termProgram === "zed"` (terminal-image.ts:112-115 @ 9841914;
     // `zed` joined in 649214477 / #8828): truecolor + hyperlinks on, images
     // off.
-    if term_program == "alacritty" || term_program == "vscode" || term_program == "zed" {
+    let is_alacritty = term_program == "alacritty"
+        || term.starts_with("alacritty")
+        || env_flag("ALACRITTY_WINDOW_ID");
+    if is_alacritty || term_program == "vscode" || term_program == "zed" {
         return TerminalCapabilities {
             images: None,
             true_color: true,
@@ -1307,8 +1318,10 @@ mod tests {
     /// `withEnv` (terminal-image.test.ts:37-55): clears every capability env
     /// var, applies `overrides` (None = unset), runs `f`, then restores.
     fn with_env(overrides: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        const ENV_KEYS: [&str; 16] = [
+        const ENV_KEYS: [&str; 18] = [
             "TERM",
+            "ORCA_IMAGE_PROTOCOL",
+            "ALACRITTY_WINDOW_ID",
             "TERM_PROGRAM",
             "TERMINAL_EMULATOR",
             "COLORTERM",
@@ -1786,6 +1799,36 @@ mod tests {
                 }
             );
         });
+    }
+
+    #[test]
+    fn orca_and_alacritty_capability_matrix() {
+        with_env(
+            &[
+                ("TERM_PROGRAM", Some("orca")),
+                ("ORCA_IMAGE_PROTOCOL", Some("kitty")),
+            ],
+            || assert_eq!(detect_capabilities(), KITTY_CAPS),
+        );
+        with_env(&[("TERM_PROGRAM", Some("orca"))], || {
+            assert_eq!(detect_capabilities().images, None);
+        });
+        for overrides in [
+            &[("TERM_PROGRAM", Some("alacritty"))][..],
+            &[("TERM", Some("alacritty-direct"))][..],
+            &[("ALACRITTY_WINDOW_ID", Some("1"))][..],
+        ] {
+            with_env(overrides, || {
+                assert_eq!(
+                    detect_capabilities(),
+                    TerminalCapabilities {
+                        images: None,
+                        true_color: true,
+                        hyperlinks: true,
+                    }
+                );
+            });
+        }
     }
 
     /// "applies environment overrides" (terminal-image.test.ts:228-238,

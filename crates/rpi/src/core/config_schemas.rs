@@ -103,6 +103,8 @@ pub struct SettingsDocument {
     #[serde(rename = "$schema")]
     pub schema: Option<String>,
     pub last_changelog_version: Option<String>,
+    /// Last seen changelog version per extension package.
+    pub extension_changelog_versions: Option<BTreeMap<String, String>>,
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
     pub default_thinking_level: Option<ModelThinkingLevel>,

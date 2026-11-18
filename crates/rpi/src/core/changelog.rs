@@ -217,6 +217,99 @@ fn join_entries(entries: &[&ChangelogEntry]) -> String {
         .join("\n\n")
 }
 
+/// Package metadata needed by the fresh-launch extension changelog pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionPackageMetadata {
+    pub name: String,
+    pub version: String,
+    pub changelog_path: std::path::PathBuf,
+}
+
+fn path_inside(parent: &std::path::Path, child: &std::path::Path) -> bool {
+    let Ok(relative) = child.strip_prefix(parent) else {
+        return false;
+    };
+    !relative.as_os_str().is_empty()
+        && !relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+/// Resolve `package.json#rpi.changelogPath` (legacy `#pi` accepted) or the
+/// package-root CHANGELOG.md, rejecting paths that escape the package.
+pub fn extension_package_metadata(
+    package_root: &std::path::Path,
+) -> Option<ExtensionPackageMetadata> {
+    let package_json_path = package_root.join("package.json");
+    let text = std::fs::read_to_string(package_json_path).ok()?;
+    let value: serde_json::Value =
+        serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    let manifest = value
+        .get("rpi")
+        .or_else(|| value.get("pi"))
+        .and_then(serde_json::Value::as_object);
+    let configured = manifest
+        .and_then(|manifest| manifest.get("changelogPath"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("CHANGELOG.md");
+    if configured.is_empty() {
+        return None;
+    }
+    let changelog_path = package_root.join(configured);
+    if !changelog_path.is_file() {
+        return None;
+    }
+    let canonical_root = package_root.canonicalize().ok()?;
+    let canonical_changelog = changelog_path.canonicalize().ok()?;
+    if !path_inside(&canonical_root, &canonical_changelog) {
+        return None;
+    }
+    Some(ExtensionPackageMetadata {
+        name: value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        version: value.get("version")?.as_str()?.to_owned(),
+        changelog_path,
+    })
+}
+
+/// Read and transform the new sections for one extension package. The
+/// package name is prefixed to each level-two heading.
+pub fn extension_changelog_for_display(
+    package: &ExtensionPackageMetadata,
+    source: &str,
+    last_version: &str,
+) -> Option<String> {
+    let text = std::fs::read_to_string(&package.changelog_path).ok()?;
+    let entries = parse_changelog(text.trim_start_matches('\u{feff}'));
+    let new_entries = get_new_entries(&entries, last_version);
+    if new_entries.is_empty() {
+        return None;
+    }
+    let name = if package.name.is_empty() {
+        source
+    } else {
+        package.name.as_str()
+    };
+    Some(
+        new_entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .content
+                    .strip_prefix("## ")
+                    .map(|heading| format!("## {name} {heading}"))
+                    .unwrap_or_else(|| entry.content.clone())
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+            .trim()
+            .to_owned(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +417,45 @@ mod tests {
         let entries = parse_changelog("## [0.1.7]\na\n\n## [0.1.8]\nb\n");
         assert_eq!(get_new_entries(&entries, "0.1.7-rc.1").len(), 1);
         assert!(get_new_entries(&entries, "0.1.8-rc.3").is_empty());
+    }
+
+    #[test]
+    fn extension_changelog_uses_manifest_and_prerelease_normalized_last_seen() {
+        let root = std::env::temp_dir().join(format!(
+            "rpi-extension-changelog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"demo-ext","version":"1.2.0","rpi":{"changelogPath":"docs/CHANGES.md"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("docs/CHANGES.md"),
+            "## [1.1.0]\n\nold\n\n## [1.2.0]\n\nnew feature\n",
+        )
+        .unwrap();
+        let package = extension_package_metadata(&root).expect("manifest metadata");
+        let markdown = extension_changelog_for_display(&package, "fallback", "1.1.0-rc.1")
+            .expect("new extension section");
+        assert!(markdown.contains("## demo-ext [1.2.0]"), "{markdown}");
+        assert!(markdown.contains("new feature"));
+        assert!(!markdown.contains("old"));
+
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"demo-ext","version":"1.2.0","rpi":{"changelogPath":"../outside.md"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.parent().unwrap().join("outside.md"), "bad").unwrap();
+        assert!(extension_package_metadata(&root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(root.parent().unwrap().join("outside.md"));
     }
 
     /// The embedded asset parses and its top section matches VERSION

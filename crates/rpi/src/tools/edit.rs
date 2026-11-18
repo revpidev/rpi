@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::edit_diff::{
-    EditReplacement, apply_edits_to_normalized_content, detect_line_ending, generate_diff_string,
-    generate_unified_patch, normalize_to_lf, restore_line_endings, strip_bom,
+    EditReplacement, apply_edits_to_normalized_content, apply_replacements_to_original,
+    generate_edit_diff, normalize_to_lf, strip_bom,
 };
 use super::file_mutation_queue::with_file_mutation_queue;
 use super::path_utils::resolve_to_cwd;
@@ -334,7 +334,6 @@ impl AgentTool for EditTool {
             // --- Process content (edit.ts:340-343) ---
             // Strip BOM before matching. The model will not include an invisible BOM in oldText.
             let (bom, content) = strip_bom(&raw_content);
-            let original_ending = detect_line_ending(&content);
             let normalized_content = normalize_to_lf(&content);
 
             let applied =
@@ -347,21 +346,23 @@ impl AgentTool for EditTool {
                 return Err(AgentError::Message("Operation aborted".to_string()));
             }
 
-            // --- Write back (edit.ts:346-347) ---
+            // Diff before writing: a failure here leaves the file unchanged.
+            let diff_result = generate_edit_diff(
+                &path_owned,
+                &applied.base_content,
+                &applied.new_content,
+                &applied.replacements,
+                4,
+            );
             let final_content = format!(
                 "{bom}{}",
-                restore_line_endings(&applied.new_content, original_ending)
+                apply_replacements_to_original(&content, &applied.replacements)
             );
             ops.write_file(&absolute_path, &final_content).await?;
 
             if signal.is_cancelled() {
                 return Err(AgentError::Message("Operation aborted".to_string()));
             }
-
-            // --- Generate diff (edit.ts:350-351) ---
-            let diff_result = generate_diff_string(&applied.base_content, &applied.new_content, 4);
-            let patch =
-                generate_unified_patch(&path_owned, &applied.base_content, &applied.new_content, 4);
 
             // --- Build details JSON (edit.ts:352-360) ---
             // Upstream: { diff, patch, firstChangedLine }.
@@ -372,12 +373,12 @@ impl AgentTool for EditTool {
             let details = match diff_result.first_changed_line {
                 Some(line) => json!({
                     "diff": diff_result.diff,
-                    "patch": patch,
+                    "patch": diff_result.patch,
                     "firstChangedLine": line,
                 }),
                 None => json!({
                     "diff": diff_result.diff,
-                    "patch": patch,
+                    "patch": diff_result.patch,
                 }),
             };
 

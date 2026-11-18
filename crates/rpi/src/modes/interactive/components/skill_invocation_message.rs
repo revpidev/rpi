@@ -8,6 +8,7 @@
 use std::boxed::Box as StdBox;
 use std::sync::Arc;
 
+use rpi_ext_host::types::MarkdownTransformerFn;
 use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 use rpi_tui::components::text::Text;
@@ -17,6 +18,7 @@ use crate::core::agent_session::ParsedSkillBlock;
 use crate::core::themes::Theme;
 
 use super::keybinding_hints::key_text;
+use super::markdown_transform::create_header_prefixed_markdown_transform;
 
 /// Component that renders a skill invocation message with collapsed/expanded
 /// state (skill-invocation-message.ts:11-55). Uses the same background color
@@ -30,6 +32,9 @@ pub struct SkillInvocationMessageComponent {
     content_box: TuiBox,
     /// `outputPad` (skill-invocation-message.ts:16, #10557).
     output_pad: usize,
+    markdown_transformers: Vec<MarkdownTransformerFn>,
+    message_id: Option<String>,
+    timestamp: Option<String>,
 }
 
 impl SkillInvocationMessageComponent {
@@ -46,9 +51,24 @@ impl SkillInvocationMessageComponent {
             theme,
             content_box: TuiBox::new(0, 0, None),
             output_pad,
+            markdown_transformers: Vec::new(),
+            message_id: None,
+            timestamp: None,
         };
         component.update_display();
         component
+    }
+
+    pub fn set_markdown_context(
+        &mut self,
+        transformers: Vec<MarkdownTransformerFn>,
+        message_id: Option<String>,
+        timestamp: Option<String>,
+    ) {
+        self.markdown_transformers = transformers;
+        self.message_id = message_id;
+        self.timestamp = timestamp;
+        self.update_display();
     }
 
     /// `setOutputPad` (skill-invocation-message.ts:28-30 @ 18336987a,
@@ -85,7 +105,7 @@ impl SkillInvocationMessageComponent {
                 Box::new(move |t: &str| theme.fg("customMessageText", t))
             };
             content_box.add_child(StdBox::new(Markdown::new(
-                format!("{header}{}", self.skill_block.content),
+                self.skill_block.content.clone(),
                 0,
                 0,
                 Arc::clone(&self.markdown_theme),
@@ -93,7 +113,16 @@ impl SkillInvocationMessageComponent {
                     color: Some(color),
                     ..Default::default()
                 }),
-                None,
+                Some(rpi_tui::components::markdown::MarkdownOptions {
+                    transform: Some(create_header_prefixed_markdown_transform(
+                        header,
+                        "custom",
+                        self.markdown_transformers.clone(),
+                        self.message_id.clone(),
+                        self.timestamp.clone(),
+                    )),
+                    ..Default::default()
+                }),
             )));
         } else {
             // Collapsed: single line - [skill] name (hint to expand)

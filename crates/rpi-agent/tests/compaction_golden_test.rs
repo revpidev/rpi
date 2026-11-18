@@ -408,6 +408,63 @@ fn golden_prepare_branch_entries() {
 }
 
 #[test]
+fn branch_summary_uses_context_edits_and_skips_failed_responses() {
+    use rpi_agent::session::{
+        ContextEditEntry, ContextEditReplacement, ContextEditableContent, MessageEntry,
+    };
+    use rpi_ai::types::UserContent;
+    use rpi_test_support::faux::{FauxAssistantOptions, faux_assistant_message};
+
+    let user = |id: &str, parent_id: Option<&str>, text: &str| {
+        SessionEntry::Message(MessageEntry {
+            id: id.to_owned(),
+            parent_id: parent_id.map(str::to_owned),
+            timestamp: "2026-11-18T00:00:00.000Z".to_owned(),
+            message: agent_message(&json!({"role": "user", "content": text, "timestamp": 1})),
+        })
+    };
+    let entries = vec![
+        user("u1", None, "raw secret"),
+        user("u2", Some("u1"), "hidden"),
+        SessionEntry::ContextEdit(ContextEditEntry {
+            id: "e1".to_owned(),
+            parent_id: Some("u2".to_owned()),
+            timestamp: "2026-11-18T00:00:01.000Z".to_owned(),
+            target_id: "u1".to_owned(),
+            replacement: Some(ContextEditReplacement {
+                content: ContextEditableContent::Text("redacted".to_owned()),
+            }),
+        }),
+        SessionEntry::ContextEdit(ContextEditEntry {
+            id: "e2".to_owned(),
+            parent_id: Some("e1".to_owned()),
+            timestamp: "2026-11-18T00:00:02.000Z".to_owned(),
+            target_id: "u2".to_owned(),
+            replacement: None,
+        }),
+        SessionEntry::Message(MessageEntry {
+            id: "a1".to_owned(),
+            parent_id: Some("e2".to_owned()),
+            timestamp: "2026-11-18T00:00:03.000Z".to_owned(),
+            message: AgentMessage::Assistant(faux_assistant_message(
+                "failed partial response",
+                FauxAssistantOptions {
+                    stop_reason: Some(StopReason::Error),
+                    error_message: Some("fixture failure".to_owned()),
+                    ..Default::default()
+                },
+            )),
+        }),
+    ];
+    let preparation = prepare_branch_entries(&entries, 0);
+    assert_eq!(preparation.messages.len(), 1);
+    let AgentMessage::User(message) = &preparation.messages[0] else {
+        panic!("expected the redacted user message")
+    };
+    assert_eq!(message.content, UserContent::Text("redacted".to_owned()));
+}
+
+#[test]
 fn golden_is_context_overflow() {
     let golden = golden();
     for case in golden["isContextOverflow"].as_array().expect("array") {
@@ -1234,6 +1291,44 @@ async fn prompt_compact_with_file_lists_byte_exact() {
         captured_prompt(&capture, 0),
         expected["promptText"].as_str().expect("promptText")
     );
+}
+
+#[tokio::test]
+async fn branch_summary_request_uses_current_auth_and_thinking_arguments() {
+    let mut builder = EntryBuilder::new();
+    builder.user("Inspect the auth flow");
+    let entries = builder.finish();
+    let capture = capture_stream_fn(&["SUMMARY"]);
+    let mut model = test_model();
+    model.reasoning = true;
+    let args = SummarizationArgs {
+        api_key: Some("test-only-key".to_owned()),
+        headers: Some([("x-test".to_owned(), Some("header".to_owned()))].into()),
+        env: Some([("TEST_ENV".to_owned(), "value".to_owned())].into()),
+        thinking_level: Some(rpi_agent::types::ThinkingLevel::High),
+        ..Default::default()
+    };
+    generate_branch_summary(
+        &entries,
+        &GenerateBranchSummaryOptions {
+            model: &model,
+            stream_fn: &capture.stream_fn,
+            args: &args,
+            custom_instructions: None,
+            replace_instructions: false,
+            reserve_tokens: 16384,
+            callbacks: None,
+        },
+    )
+    .await;
+    let (_, options) = capture.calls.lock().expect("calls")[0].clone();
+    assert_eq!(
+        options.reasoning,
+        Some(rpi_ai::types::ModelThinkingLevel::High)
+    );
+    assert_eq!(options.request.api_key.as_deref(), Some("test-only-key"));
+    assert_eq!(options.request.headers, args.headers);
+    assert_eq!(options.request.env, args.env);
 }
 
 /// Branch summary render + preamble/file-list splice — prompts §5/§6.

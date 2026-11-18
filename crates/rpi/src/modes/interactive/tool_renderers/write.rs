@@ -777,6 +777,26 @@ mod tests {
     }
 
     #[test]
+    fn call_highlights_dart_nix_groovy_and_gradle() {
+        for (path, code) in [
+            ("Main.dart", "void main() { print('hi'); }"),
+            ("flake.nix", "{ name = \"demo\"; }"),
+            ("Build.groovy", "class Demo { String value = 'hi' }"),
+            ("build.gradle", "plugins { id 'java' }"),
+        ] {
+            let rendered = format_write_call(
+                &json!({"path": path, "content": code}),
+                false,
+                &theme(),
+                None,
+                "/cwd",
+            );
+            assert!(rendered.contains('\x1b'), "{path} should be highlighted");
+            assert!(strip_ansi(&rendered).ends_with(code), "{path}");
+        }
+    }
+
+    #[test]
     fn streaming_preview_grows_incrementally_and_clamps_at_10_lines() {
         let theme = theme();
         let state = RendererStateSlot::default();

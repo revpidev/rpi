@@ -1287,7 +1287,12 @@ impl TuiMainScreenInner {
         // (tui-main-screen.ts:265).
         let rendered_children = self.render_children(width);
         crate::benchmark::mark_layout();
-        let mut new_lines = self.resolve_fake_cursors(rendered_children);
+        let mut new_lines = self.resolve_fake_cursors(
+            rendered_children
+                .into_iter()
+                .map(|line| crate::utils::strip_osc133_zone_prefix(&line))
+                .collect(),
+        );
 
         // Composite overlays into the rendered lines (before differential compare).
         if !self.overlay_stack.is_empty() {

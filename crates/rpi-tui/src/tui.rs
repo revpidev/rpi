@@ -194,6 +194,13 @@ pub trait Component: Send {
     /// Each returned string is one line; visible width must not exceed `width`.
     fn render(&self, width: usize) -> Vec<String>;
 
+    /// Whether this component consumes fullscreen viewport navigation keys.
+    /// Default false preserves the transcript-scroll behavior for existing
+    /// native and hosted components.
+    fn captures_viewport_input(&self) -> bool {
+        false
+    }
+
     /// Optional handler for keyboard input when the component has focus
     /// (upstream optional `handleInput`, tui.ts:75).
     fn handle_input(&mut self, _data: &str) {}

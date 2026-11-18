@@ -324,6 +324,7 @@ pub(crate) fn run_clipboard_write_command(
     let mut command = std::process::Command::new(program);
     command
         .args(args)
+        .current_dir("/")
         .stdin(if is_query {
             std::process::Stdio::null()
         } else {

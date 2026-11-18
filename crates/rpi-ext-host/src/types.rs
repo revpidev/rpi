@@ -1439,6 +1439,39 @@ pub const COMPONENT_TREE_SCHEMA_V1: &str = r#"{
   }
 }"#;
 
+pub type KeyTextFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
+pub type KeyHintFn = Arc<dyn Fn(&str, &str) -> String + Send + Sync>;
+
+/// Host-owned keybinding callbacks for native renderers and their resolved
+/// key text for JSON-carrier guests. The callbacks are process-local; the map
+/// is additive on the wire and leaves old guests unaffected.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct KeybindingHints {
+    #[serde(skip)]
+    pub key_text: Option<KeyTextFn>,
+    #[serde(skip)]
+    pub key_hint: Option<KeyHintFn>,
+    #[serde(default)]
+    pub keybindings: std::collections::BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for KeybindingHints {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KeybindingHints")
+            .field("keybindings", &self.keybindings)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for KeybindingHints {
+    fn eq(&self, other: &Self) -> bool {
+        self.keybindings == other.keybindings
+    }
+}
+
+impl Eq for KeybindingHints {}
+
 /// Serializable subset of `ToolRenderContext` (types.ts:413-438). The
 /// non-serializable fields (`invalidate`, `lastComponent`, `state`, theme)
 /// are TUI-internal and land with the W4 render bridge.
@@ -1471,6 +1504,8 @@ pub struct ToolRenderContext {
     /// Omitted on the wire when unknown (the renderer falls back).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_width: Option<u64>,
+    #[serde(default, flatten)]
+    pub keybinding_hints: KeybindingHints,
 }
 
 /// `renderCall` placeholder (types.ts:483): returns a declarative
@@ -1783,18 +1818,22 @@ impl ToolDefinition {
 // ============================================================================
 
 /// `MessageRenderOptions` (types.ts:1130-1134).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageRenderOptions {
     pub expanded: bool,
     pub output_pad: u32,
+    #[serde(default, flatten)]
+    pub keybinding_hints: KeybindingHints,
 }
 
 /// `EntryRenderOptions` (types.ts:1136-1138).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EntryRenderOptions {
     pub expanded: bool,
+    #[serde(default, flatten)]
+    pub keybinding_hints: KeybindingHints,
 }
 
 /// `MessageRenderer` (types.ts:1140-1144). `message` is the `CustomMessage`
@@ -2048,21 +2087,91 @@ pub fn stamp_event_type(value: &mut Value, event_type: &str) {
 // v0.11 additions (types.ts @ 4181f66)
 // ============================================================================
 
-/// `MarkdownTransformContext` (types.ts:1147-1153 @ 4181f66).
+/// `MarkdownMessageType` (types.ts:1561 @ b4afdddf).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MarkdownMessageType {
+    #[serde(rename = "user")]
+    User,
+    #[serde(rename = "assistant")]
+    Assistant,
+    #[serde(rename = "assistant-thinking")]
+    AssistantThinking,
+    #[serde(rename = "custom")]
+    Custom,
+    #[serde(rename = "summary")]
+    Summary,
+    #[serde(rename = "changelog")]
+    Changelog,
+}
+
+impl MarkdownMessageType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::AssistantThinking => "assistant-thinking",
+            Self::Custom => "custom",
+            Self::Summary => "summary",
+            Self::Changelog => "changelog",
+        }
+    }
+}
+
+/// `MarkdownTransformerOptions` (types.ts:1583 @ b4afdddf).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownTransformerOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_types: Option<Vec<MarkdownMessageType>>,
+}
+
+/// `MarkdownTransformContext` (types.ts:1563-1577 @ b4afdddf).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarkdownTransformContext {
-    /// `"user" | "assistant" | "assistant-thinking"`
     pub message_type: String,
     pub is_streaming: bool,
     pub available_width: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
 }
 
-/// `MarkdownTransformer` (types.ts:1153 @ 4181f66): chained, width-aware
+/// `MarkdownTransformer` (types.ts:1579 @ b4afdddf): chained, width-aware
 /// Markdown source transformer. Host dispatches as a `render` kind message;
-/// the guest returns the transformed string. TUI rendering wiring is T29.
+/// the guest returns the transformed string.
 pub type MarkdownTransformerFn =
     Arc<dyn Fn(String, MarkdownTransformContext) -> String + Send + Sync>;
+
+/// `MarkdownTransformerRegistration` (types.ts:1589 @ b4afdddf).
+#[derive(Clone)]
+pub struct MarkdownTransformerRegistration {
+    pub transformer: MarkdownTransformerFn,
+    pub message_types: std::collections::HashSet<MarkdownMessageType>,
+}
+
+impl MarkdownTransformerRegistration {
+    pub fn new(transformer: MarkdownTransformerFn, options: MarkdownTransformerOptions) -> Self {
+        let message_types = options.message_types.unwrap_or_else(|| {
+            vec![
+                MarkdownMessageType::User,
+                MarkdownMessageType::Assistant,
+                MarkdownMessageType::AssistantThinking,
+            ]
+        });
+        Self {
+            transformer,
+            message_types: message_types.into_iter().collect(),
+        }
+    }
+
+    pub fn matches(&self, message_type: &str) -> bool {
+        self.message_types
+            .iter()
+            .any(|candidate| candidate.as_str() == message_type)
+    }
+}
 
 /// `ResolvedRequestAuth` (model-registry.ts:17-25 @ 4181f66) — return type
 /// of `getApiKeyAndHeaders`. Upstream is a discriminated union on `ok: true |

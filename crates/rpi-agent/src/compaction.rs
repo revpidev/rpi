@@ -627,7 +627,10 @@ pub struct SummarizationArgs {
 
 /// `createSummarizationOptions` (compaction.ts:539-553): reasoning models get
 /// the session thinking level (unless "off").
-fn create_summarization_options(model: &Model, args: &SummarizationArgs) -> StreamOptions {
+pub(crate) fn create_summarization_options(
+    model: &Model,
+    args: &SummarizationArgs,
+) -> StreamOptions {
     let reasoning = match &args.thinking_level {
         Some(level) if model.reasoning && *level != ThinkingLevel::Off => Some(*level),
         _ => None,

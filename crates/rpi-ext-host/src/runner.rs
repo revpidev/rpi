@@ -753,13 +753,31 @@ impl ExtensionRunnerCore {
             .find_map(|ext| ext.message_renderer(custom_type))
     }
 
-    /// `getMarkdownTransformers` (runner.ts:589-591 @ 4181f66): one
-    /// transformer per extension, flattened in load order; extensions
-    /// without a registered transformer contribute nothing.
+    /// `getMarkdownTransformers` (runner.ts:792 @ b4afdddf): each
+    /// registration leaves unlisted message surfaces unchanged.
     pub fn get_markdown_transformers(&self) -> Vec<crate::types::MarkdownTransformerFn> {
         self.extensions
             .iter()
-            .filter_map(|ext| ext.markdown_transformer())
+            .filter_map(|ext| ext.markdown_transformer_registration())
+            .map(|registration| {
+                let transformer = registration.transformer.clone();
+                Arc::new(
+                    move |markdown, context: crate::types::MarkdownTransformContext| {
+                        if registration.matches(&context.message_type) {
+                            transformer(markdown, context)
+                        } else {
+                            markdown
+                        }
+                    },
+                ) as crate::types::MarkdownTransformerFn
+            })
+            .collect()
+    }
+
+    pub fn get_extension_source_infos(&self) -> Vec<crate::types::ExtSourceInfo> {
+        self.extensions
+            .iter()
+            .map(|extension| extension.source_info.clone())
             .collect()
     }
 

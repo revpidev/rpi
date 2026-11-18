@@ -884,31 +884,41 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
         // for `render` kind "markdownTransform" is handled by the forward
         // path (same as message/entry renderers).
         "registerMarkdownTransformer" => {
+            let options = args
+                .get("options")
+                .cloned()
+                .map(serde_json::from_value::<crate::types::MarkdownTransformerOptions>)
+                .transpose()
+                .map_err(|error| ("invalidRequest", error.to_string()))?
+                .unwrap_or_default();
             let forward = state.forward.clone();
             state
                 .api
-                .register_markdown_transformer(Arc::new(move |markdown, context| {
-                    let forward = forward.clone();
-                    // On error, return the input unchanged (upstream
-                    // applyMarkdownTransformers catches and continues).
-                    match forward.dispatch_blocking(
-                        json!({
-                            "kind": "render",
-                            "what": "markdownTransform",
-                            "markdown": markdown,
-                            "context": context,
-                        }),
-                        false,
-                    ) {
-                        // markdown-transform.ts:19-23: non-string Ok return
-                        // preserves the current markdown (do not assign).
-                        Ok(result) => result
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| markdown.to_owned()),
-                        Err(_) => markdown,
-                    }
-                }))
+                .register_markdown_transformer_with_options(
+                    Arc::new(move |markdown, context| {
+                        let forward = forward.clone();
+                        // On error, return the input unchanged (upstream
+                        // applyMarkdownTransformers catches and continues).
+                        match forward.dispatch_blocking(
+                            json!({
+                                "kind": "render",
+                                "what": "markdownTransform",
+                                "markdown": markdown,
+                                "context": context,
+                            }),
+                            false,
+                        ) {
+                            // markdown-transform.ts:19-23: non-string Ok return
+                            // preserves the current markdown (do not assign).
+                            Ok(result) => result
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| markdown.to_owned()),
+                            Err(_) => markdown,
+                        }
+                    }),
+                    options,
+                )
                 .map_err(|e| ("stale", e.to_string()))?;
             Ok(Value::Null)
         }
@@ -982,7 +992,9 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             let options = args
                 .get("options")
                 .cloned()
-                .and_then(|v| serde_json::from_value::<crate::api::ExecOptions>(v).ok());
+                .map(serde_json::from_value::<crate::api::ExecOptions>)
+                .transpose()
+                .map_err(|error| ("invalidRequest", error.to_string()))?;
             let api = state.api.clone();
             let handle = state.async_handle.clone();
             block_on(&handle, async move {

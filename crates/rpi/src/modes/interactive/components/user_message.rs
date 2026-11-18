@@ -19,7 +19,7 @@ use rpi_tui::tui::Component;
 
 use crate::core::themes::Theme;
 
-use super::markdown_transform::create_markdown_transform;
+use super::markdown_transform::create_markdown_transform_with_metadata;
 use super::util::{OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START};
 
 /// Component that renders a user message (user-message.ts:11-57).
@@ -35,6 +35,8 @@ pub struct UserMessageComponent {
     content: StdBox<Markdown>,
     /// Extension-registered Markdown transformers (user-message.ts:17).
     markdown_transformers: Vec<MarkdownTransformerFn>,
+    message_id: Option<String>,
+    timestamp: Option<String>,
 }
 
 impl UserMessageComponent {
@@ -59,9 +61,17 @@ impl UserMessageComponent {
                 None,
             )),
             markdown_transformers,
+            message_id: None,
+            timestamp: None,
         };
         component.rebuild();
         component
+    }
+
+    pub fn set_message_metadata(&mut self, message_id: Option<String>, timestamp: Option<String>) {
+        self.message_id = message_id;
+        self.timestamp = timestamp;
+        self.rebuild();
     }
 
     /// `setOutputPad` (user-message.ts:24-27).
@@ -96,10 +106,12 @@ impl UserMessageComponent {
                 // user-message.ts:50-54: the transform chain joins the
                 // marker/escape options in the same options object; `None`
                 // (no registered transformers) is a pass-through.
-                transform: create_markdown_transform(
+                transform: create_markdown_transform_with_metadata(
                     "user",
                     false,
                     self.markdown_transformers.clone(),
+                    self.message_id.clone(),
+                    self.timestamp.clone(),
                 ),
                 ..Default::default()
             }),

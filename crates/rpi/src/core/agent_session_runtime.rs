@@ -287,8 +287,7 @@ impl AgentSessionRuntime {
         let previous_session_file = self.session.session_file();
         let session_manager =
             SessionManager::open(Path::new(session_path), None, cwd_override.map(Path::new))?;
-        assert_session_cwd_exists(&session_manager, self.cwd())
-            .map_err(|error| RpiError::Session(error.to_string()))?;
+        assert_session_cwd_exists(&session_manager, self.cwd()).map_err(RpiError::from)?;
         let target_file = session_manager
             .get_session_file()
             .map(|p| p.to_string_lossy().into_owned());

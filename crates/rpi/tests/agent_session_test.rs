@@ -2774,6 +2774,104 @@ async fn second_navigation_while_first_pending_is_rejected_9179() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aborted_navigation_cannot_install_its_late_summary() {
+    let fixture = session_fixture(
+        vec![assistant(&"summary ".repeat(400))],
+        FauxProviderOptions {
+            tokens_per_second: Some(60.0),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let (target, original_leaf) = seed_navigation_conversation(&fixture);
+    let session = fixture.session.clone();
+    let navigation = tokio::spawn(async move {
+        session
+            .navigate_tree(
+                &target,
+                rpi::core::agent_session::NavigateTreeOptions {
+                    summarize: true,
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while fixture.provider.call_count() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "summary never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    fixture.session.abort_branch_summary();
+    let result = tokio::time::timeout(Duration::from_secs(10), navigation)
+        .await
+        .expect("navigation settles")
+        .expect("join")
+        .expect("navigation result");
+    assert!(result.cancelled && result.aborted);
+    let manager = fixture.session.session_manager();
+    let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(manager.get_leaf_id(), Some(original_leaf.as_str()));
+    assert!(!manager.get_entries().iter().any(|entry| {
+        matches!(
+            entry.known(),
+            Some(rpi_agent::session::SessionEntry::BranchSummary(_))
+        )
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn next_prompt_records_live_thinking_on_the_navigated_branch() {
+    use rpi_agent::types::ThinkingLevel;
+
+    let fixture = session_fixture(
+        vec![assistant("after navigation")],
+        FauxProviderOptions::default(),
+        None,
+    )
+    .await;
+    let (target, _) = seed_navigation_conversation(&fixture);
+    fixture.session.set_thinking_level(ThinkingLevel::Medium);
+    fixture
+        .session
+        .navigate_tree(
+            &target,
+            rpi::core::agent_session::NavigateTreeOptions::default(),
+        )
+        .await
+        .expect("navigate");
+    fixture
+        .session
+        .prompt("after navigation", Default::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+
+    let manager = fixture.session.session_manager();
+    let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+    let thinking = manager
+        .get_branch(None)
+        .into_iter()
+        .find_map(|entry| match entry.known() {
+            Some(rpi_agent::session::SessionEntry::ThinkingLevelChange(change)) => {
+                Some(change.clone())
+            }
+            _ => None,
+        })
+        .expect("live thinking recorded on the new branch");
+    assert_eq!(thinking.thinking_level, "medium");
+    assert!(
+        manager
+            .get_branch(None)
+            .iter()
+            .any(|entry| entry.id() == thinking.id)
+    );
+}
+
 /// V16-03 FR-A R3 (canonical projection authority): once
 /// `_installAgentRequestProjection` is in place, a direct
 /// `agent.setState(messages)` assignment no longer reaches the provider
@@ -3408,6 +3506,37 @@ async fn resume_applies_tool_modifiers_to_the_recorded_loadout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_tool_reconcile_keeps_existing_order_and_appends_new_tools() {
+    let session = resume_session_with_loadout(
+        &[],
+        Some(vec!["read".to_owned(), "grep".to_owned()]),
+        false,
+        Vec::new(),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(session.get_active_tool_names(), ["read", "grep"]);
+    let original_prompt = session.system_prompt();
+
+    session.set_active_tools_by_name(vec![
+        "grep".to_owned(),
+        "read".to_owned(),
+        "grep".to_owned(),
+    ]);
+    assert_eq!(session.get_active_tool_names(), ["read", "grep"]);
+    assert_eq!(session.system_prompt(), original_prompt);
+
+    session.set_active_tools_by_name(vec![
+        "bash".to_owned(),
+        "grep".to_owned(),
+        "read".to_owned(),
+    ]);
+    assert_eq!(session.get_active_tool_names(), ["read", "grep", "bash"]);
+    session.set_active_tools_by_name(vec!["read".to_owned()]);
+    assert_eq!(session.get_active_tool_names(), ["read"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_activates_unmentioned_tools_but_keeps_removed_ones_inactive() {
     let custom: Vec<Arc<dyn rpi_agent::types::AgentTool>> = vec![Arc::new(NamedTool("late-tool"))];
     let session = resume_session_with_loadout(
@@ -3421,4 +3550,88 @@ async fn resume_activates_unmentioned_tools_but_keeps_removed_ones_inactive() {
     let mut active = session.get_active_tool_names();
     active.sort();
     assert_eq!(active, vec!["late-tool", "read"], "grep stays removed");
+}
+
+fn queued_test_image(width: u32, height: u32) -> rpi_ai::types::ImageContent {
+    use base64::Engine;
+    let image = image::DynamicImage::ImageRgba8(image::RgbaImage::new(width, height));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("encode test image");
+    rpi_ai::types::ImageContent {
+        data: base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()),
+        mime_type: "image/png".to_owned(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_image_only_message_is_resized_at_delivery_and_dequeued() {
+    let fixture = session_fixture(
+        vec![assistant(&"word ".repeat(400)), assistant("second answer")],
+        FauxProviderOptions {
+            tokens_per_second: Some(60.0),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let session = fixture.session.clone();
+    let prompt_task =
+        tokio::spawn(async move { session.prompt("start", Default::default()).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(fixture.session.is_streaming());
+    fixture
+        .session
+        .steer(
+            "",
+            Some(vec![queued_test_image(2100, 2100)]),
+            rpi::core::extensions::InputSource::Interactive,
+        )
+        .await
+        .expect("image-only steer");
+    assert_eq!(fixture.session.pending_message_count(), 1);
+
+    prompt_task.await.expect("prompt task").expect("prompt");
+    fixture.session.wait_for_idle().await;
+    let message_texts: Vec<String> = fixture
+        .session
+        .messages()
+        .iter()
+        .map(|message| match message {
+            AgentMessage::User(user) => format!(
+                "user:{}",
+                rpi_ai::utils::text::content_text_user(&user.content, "")
+            ),
+            other => format!("{other:?}").chars().take(30).collect(),
+        })
+        .collect();
+    assert_eq!(
+        fixture.session.pending_message_count(),
+        0,
+        "steering={:?}, follow_up={:?}, messages={message_texts:?}",
+        fixture.session.get_steering_messages(),
+        fixture.session.get_follow_up_messages(),
+    );
+    let messages = fixture.session.messages();
+    let image_message = messages
+        .iter()
+        .find_map(|message| match message {
+            AgentMessage::User(user)
+                if matches!(
+                    &user.content,
+                    rpi_ai::types::UserContent::Blocks(blocks)
+                        if blocks.iter().any(|block| matches!(block, rpi_ai::types::UserContentBlock::Image(_)))
+                ) =>
+            {
+                Some(user)
+            }
+            _ => None,
+        })
+        .expect("queued user message");
+    let text = rpi_ai::utils::text::content_text_user(&image_message.content, "");
+    assert!(
+        text.contains("original 2100x2100, displayed at 2000x2000"),
+        "{text}"
+    );
 }

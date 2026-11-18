@@ -57,6 +57,7 @@ pub enum Modifier {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Style {
     pub fg: Option<Color>,
+    pub bg: Option<Color>,
     pub bold: bool,
     pub italic: bool,
 }
@@ -77,22 +78,46 @@ impl Style {
     fn sgr(&self) -> (String, String) {
         let mut open = String::new();
         let mut close = String::new();
-        if self.italic {
-            open.push_str("\x1b[3m");
-        }
-        match self.fg {
-            Some(Color::Rgb(r, g, b)) => open.push_str(&format!("\x1b[38;2;{r};{g};{b}m")),
-            Some(Color::Ansi256(n)) => open.push_str(&format!("\x1b[38;5;{n}m")),
-            None => {}
-        }
-        if self.bold {
-            open.push_str("\x1b[1m");
+        if let Some(background) = self.bg {
+            let mut codes = Vec::new();
+            if self.italic {
+                codes.push("3".to_owned());
+            }
+            if self.bold {
+                codes.push("1".to_owned());
+            }
+            if let Some(foreground) = self.fg {
+                codes.push(match foreground {
+                    Color::Rgb(r, g, b) => format!("38;2;{r};{g};{b}"),
+                    Color::Ansi256(n) => format!("38;5;{n}"),
+                });
+            }
+            codes.push(match background {
+                Color::Rgb(r, g, b) => format!("48;2;{r};{g};{b}"),
+                Color::Ansi256(n) => format!("48;5;{n}"),
+            });
+            open.push_str(&format!("\x1b[{}m", codes.join(";")));
+        } else {
+            if self.italic {
+                open.push_str("\x1b[3m");
+            }
+            match self.fg {
+                Some(Color::Rgb(r, g, b)) => open.push_str(&format!("\x1b[38;2;{r};{g};{b}m")),
+                Some(Color::Ansi256(n)) => open.push_str(&format!("\x1b[38;5;{n}m")),
+                None => {}
+            }
+            if self.bold {
+                open.push_str("\x1b[1m");
+            }
         }
         if self.bold {
             close.push_str("\x1b[22m");
         }
         if self.fg.is_some() {
             close.push_str("\x1b[39m");
+        }
+        if self.bg.is_some() {
+            close.push_str("\x1b[49m");
         }
         if self.italic {
             close.push_str("\x1b[23m");
@@ -204,13 +229,15 @@ pub fn render(src: &str, styles: &MermaidStyles, max_width: Option<usize>) -> Op
         return None;
     }
 
-    let outcome: Option<Result<MermaidArt, Oversize>> = parse_graph(src)
-        .map(|graph| {
-            if graph.groups.is_empty() {
-                layout_flowchart(&graph, styles, max_width)
-            } else {
-                render_grouped(&graph, styles, max_width)
-            }
+    let outcome: Option<Result<MermaidArt, Oversize>> = render_pie(src, styles, max_width)
+        .or_else(|| {
+            parse_graph(src).map(|graph| {
+                if graph.groups.is_empty() {
+                    layout_flowchart(&graph, styles, max_width)
+                } else {
+                    render_grouped(&graph, styles, max_width)
+                }
+            })
         })
         .or_else(|| parse_state(src).map(|graph| layout_flowchart(&graph, styles, max_width)))
         .or_else(|| {
@@ -229,6 +256,70 @@ pub fn render(src: &str, styles: &MermaidStyles, max_width: Option<usize>) -> Op
     Some(fallback(src, styles, max_width, too_wide))
 }
 
+fn render_pie(
+    src: &str,
+    styles: &MermaidStyles,
+    max_width: Option<usize>,
+) -> Option<Result<MermaidArt, Oversize>> {
+    let mut statements = src.lines().map(str::trim).filter(|line| !line.is_empty());
+    if statements.next()?.split_whitespace().next()? != "pie" {
+        return None;
+    }
+    let mut title = None;
+    let mut entries = Vec::new();
+    for statement in statements {
+        if let Some(value) = statement.strip_prefix("title ") {
+            title = Some(value.trim().to_owned());
+            continue;
+        }
+        let Some((label, value)) = statement.split_once(':') else {
+            continue;
+        };
+        let Ok(value) = value.trim().parse::<f64>() else {
+            continue;
+        };
+        if value.is_finite() && value >= 0.0 {
+            entries.push((clean_label(label), value));
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    let mut plain = Vec::new();
+    let mut styled = Vec::new();
+    if let Some(title) = title {
+        plain.push(title.clone());
+        styled.push(to_ansi_lines(&[Line::from(Span::styled(
+            title,
+            styles.title,
+        ))]));
+    }
+    for (label, value) in entries {
+        let value_text = if value.fract() == 0.0 {
+            format!("{}", value as u64)
+        } else {
+            value.to_string()
+        };
+        plain.push(format!("{label} {} {value_text}", "█".repeat(20)));
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(label, styles.node_text),
+            Span::styled(format!(" {}", "█".repeat(20)), styles.edge),
+            Span::styled(format!(" {value_text}"), styles.edge_label),
+        ]));
+        styled.push(to_ansi_lines(&lines));
+    }
+    let styled_lines = styled.concat();
+    let width = plain.iter().map(|line| line.width()).max().unwrap_or(0);
+    if max_width.is_some_and(|max_width| width > max_width) {
+        return Some(Err(Oversize::Width));
+    }
+    Some(Ok(MermaidArt {
+        styled_lines,
+        plain_lines: plain,
+    }))
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Shape {
     Rect,
@@ -239,6 +330,16 @@ enum Shape {
 struct Node {
     label: String,
     shape: Shape,
+    class_name: Option<String>,
+    href: Option<String>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct AuthorStyle {
+    fill: Option<Color>,
+    stroke: Option<Color>,
+    color: Option<Color>,
+    bold: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -291,6 +392,7 @@ struct Graph {
     cur_group: Option<usize>,
     over_cap: bool,
     dir: Dir,
+    class_defs: HashMap<String, AuthorStyle>,
 }
 
 impl Graph {
@@ -308,7 +410,12 @@ impl Graph {
         }
         let label = label.unwrap_or(id).to_string();
         self.index.insert(id.to_string(), self.nodes.len());
-        self.nodes.push(Node { label, shape });
+        self.nodes.push(Node {
+            label,
+            shape,
+            class_name: None,
+            href: None,
+        });
         self.node_group.push(self.cur_group);
         Some(self.nodes.len() - 1)
     }
@@ -355,6 +462,7 @@ fn parse_graph(src: &str) -> Option<Graph> {
         cur_group: None,
         over_cap: false,
         dir,
+        class_defs: HashMap::new(),
     };
 
     let mut stack: Vec<usize> = Vec::new();
@@ -380,7 +488,19 @@ fn parse_graph(src: &str) -> Option<Graph> {
                 graph.cur_group = stack.last().copied();
                 continue;
             }
-            "classdef" | "class" | "style" | "linkstyle" | "click" | "direction" => continue,
+            "classdef" => {
+                parse_class_def(st, &mut graph);
+                continue;
+            }
+            "class" => {
+                parse_class_assignment(st, &mut graph);
+                continue;
+            }
+            "click" => {
+                parse_click(st, &mut graph);
+                continue;
+            }
+            "style" | "linkstyle" | "direction" => continue,
             _ => {}
         }
         parse_statement(st, &mut graph);
@@ -393,6 +513,93 @@ fn parse_graph(src: &str) -> Option<Graph> {
         return None;
     }
     Some(graph)
+}
+
+fn parse_author_color(value: &str) -> Option<Color> {
+    let hex = value.strip_prefix('#')?;
+    let expand = |digits: &str| {
+        if digits.len() == 3 {
+            digits
+                .chars()
+                .flat_map(|digit| [digit, digit])
+                .collect::<String>()
+        } else {
+            digits.to_owned()
+        }
+    };
+    let hex = expand(hex);
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(Color::Rgb(
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ))
+}
+
+fn parse_class_def(statement: &str, graph: &mut Graph) {
+    let Some((_, rest)) = statement.split_once(char::is_whitespace) else {
+        return;
+    };
+    let (name, declarations) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    if name.trim().is_empty() {
+        return;
+    }
+    let mut style = AuthorStyle::default();
+    for declaration in declarations.split(',') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match property.trim().to_ascii_lowercase().as_str() {
+            "fill" => style.fill = parse_author_color(value),
+            "stroke" => style.stroke = parse_author_color(value),
+            "color" => style.color = parse_author_color(value),
+            "font-weight" => style.bold = value.eq_ignore_ascii_case("bold"),
+            _ => {}
+        }
+    }
+    graph.class_defs.insert(name.to_owned(), style);
+}
+
+fn parse_class_assignment(statement: &str, graph: &mut Graph) {
+    let Some((targets, class_name)) = statement
+        .split_once(char::is_whitespace)
+        .and_then(|(_, rest)| rest.split_once(char::is_whitespace))
+    else {
+        return;
+    };
+    for id in targets
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        if let Some(index) = graph.index.get(id).copied() {
+            graph.nodes[index].class_name = Some(class_name.trim().to_owned());
+        }
+    }
+}
+
+fn parse_click(statement: &str, graph: &mut Graph) {
+    let mut parts = statement.split_whitespace();
+    let _ = parts.next();
+    let Some(id) = parts.next() else {
+        return;
+    };
+    let url = parts
+        .next()
+        .map(str::trim)
+        .map(|url| url.trim_matches('"'))
+        .unwrap_or_default();
+    if !(url.starts_with("https://") || url.starts_with("http://"))
+        || url.chars().any(char::is_control)
+    {
+        return;
+    }
+    if let Some(index) = graph.index.get(id).copied() {
+        graph.nodes[index].href = Some(url.to_owned());
+    }
 }
 
 fn parse_subgraph_decl(rest: &str) -> (String, String) {
@@ -567,6 +774,17 @@ fn parse_node(chars: &[char], start: usize, graph: &mut Graph) -> Option<(usize,
     let shape = shape.unwrap_or(Shape::Rect);
     let label = label.as_deref();
     let idx = graph.node_index(&id, label, shape)?;
+    let mut after = skip_spaces(chars, after);
+    if chars.get(after..after + 3) == Some(&[':', ':', ':']) {
+        after += 3;
+        let class_start = after;
+        while after < chars.len() && is_id_char(chars[after]) {
+            after += 1;
+        }
+        if after > class_start {
+            graph.nodes[idx].class_name = Some(chars[class_start..after].iter().collect());
+        }
+    }
     Some((idx, after))
 }
 
@@ -895,6 +1113,7 @@ fn parse_state(src: &str) -> Option<Graph> {
         cur_group: None,
         over_cap: false,
         dir: Dir::Down,
+        class_defs: HashMap::new(),
     };
 
     let mut in_note = false;
@@ -1109,6 +1328,7 @@ fn parse_class(src: &str) -> Option<(Graph, Vec<ClassInfo>)> {
         cur_group: None,
         over_cap: false,
         dir: Dir::Down,
+        class_defs: HashMap::new(),
     };
     let mut infos: Vec<ClassInfo> = Vec::new();
     let mut cur_class: Option<usize> = None;
@@ -1357,6 +1577,7 @@ fn parse_er(src: &str) -> Option<(Graph, Vec<ClassInfo>)> {
         cur_group: None,
         over_cap: false,
         dir: Dir::Down,
+        class_defs: HashMap::new(),
     };
     let mut infos: Vec<ClassInfo> = Vec::new();
     let mut cur_entity: Option<usize> = None;
@@ -1504,7 +1725,7 @@ fn render_class(
             NodeExtra::Compartments(vec![title, info.attrs.clone(), info.methods.clone()])
         })
         .collect();
-    let mut canvas = layout_canvas(graph, &extras, max_width)?;
+    let mut canvas = layout_canvas(graph, &extras, max_width, styles)?;
     match graph.dir {
         Dir::Up => canvas.flip_vertical(),
         Dir::Left => canvas.flip_horizontal(),
@@ -1544,6 +1765,8 @@ struct Canvas {
     style: Vec<u8>,
     occupied: Vec<bool>,
     cur_style: u8,
+    author_style: Vec<Option<Style>>,
+    links: Vec<Option<String>>,
 }
 
 impl Canvas {
@@ -1558,6 +1781,8 @@ impl Canvas {
             style: vec![0; n],
             occupied: vec![false; n],
             cur_style: STY_SOLID,
+            author_style: vec![None; n],
+            links: vec![None; n],
         }
     }
 
@@ -1601,6 +1826,8 @@ impl Canvas {
                 self.ch[di] = sub.ch[si];
                 self.cls[di] = sub.cls[si];
                 self.style[di] = sub.style[si];
+                self.author_style[di] = sub.author_style[si];
+                self.links[di] = sub.links[si].clone();
                 self.occupied[di] = true;
             }
         }
@@ -1667,6 +1894,8 @@ impl Canvas {
                 let (i, j) = (self.idx(x, y), self.idx(x, y2));
                 self.ch.swap(i, j);
                 self.cls.swap(i, j);
+                self.author_style.swap(i, j);
+                self.links.swap(i, j);
             }
         }
         for c in self.ch.iter_mut() {
@@ -1683,6 +1912,8 @@ impl Canvas {
                 let (i, j) = (self.idx(x, y), self.idx(x2, y));
                 self.ch.swap(i, j);
                 self.cls.swap(i, j);
+                self.author_style.swap(i, j);
+                self.links.swap(i, j);
             }
         }
         for c in self.ch.iter_mut() {
@@ -1721,7 +1952,8 @@ impl Canvas {
             let mut spans: Vec<Span> = Vec::new();
             let mut plain_row = String::new();
             let mut run = String::new();
-            let mut run_cls = Cls::Empty;
+            let mut run_style = Style::default();
+            let mut run_link: Option<String> = None;
             for x in 0..last {
                 let i = self.idx(x, y);
                 let c = self.ch[i];
@@ -1729,18 +1961,33 @@ impl Canvas {
                     continue;
                 }
                 let cls = self.cls[i];
+                let style = self.author_style[i].unwrap_or_else(|| style_for(cls, styles));
+                let link = self.links[i].clone();
                 plain_row.push(c);
-                if cls != run_cls && !run.is_empty() {
-                    spans.push(Span::styled(
-                        std::mem::take(&mut run),
-                        style_for(run_cls, styles),
-                    ));
+                if (style != run_style || link != run_link) && !run.is_empty() {
+                    let text = std::mem::take(&mut run);
+                    let content = if let Some(url) =
+                        run_link.filter(|_| crate::terminal_image::get_capabilities().hyperlinks)
+                    {
+                        crate::terminal_image::hyperlink(&text, &url)
+                    } else {
+                        text
+                    };
+                    spans.push(Span::styled(content, run_style));
                 }
-                run_cls = cls;
+                run_style = style;
+                run_link = link;
                 run.push(c);
             }
             if !run.is_empty() {
-                spans.push(Span::styled(run, style_for(run_cls, styles)));
+                let content = if let Some(url) =
+                    run_link.filter(|_| crate::terminal_image::get_capabilities().hyperlinks)
+                {
+                    crate::terminal_image::hyperlink(&run, &url)
+                } else {
+                    std::mem::take(&mut run)
+                };
+                spans.push(Span::styled(content, run_style));
             }
             styled.push(Line::from(spans));
             plain.push(plain_row.trim_end().to_string());
@@ -1878,7 +2125,7 @@ fn layout_flowchart(
     max_width: Option<usize>,
 ) -> Result<MermaidArt, Oversize> {
     let extras: Vec<NodeExtra> = (0..graph.nodes.len()).map(|_| NodeExtra::Plain).collect();
-    let mut canvas = layout_canvas(graph, &extras, max_width)?;
+    let mut canvas = layout_canvas(graph, &extras, max_width, styles)?;
     match graph.dir {
         Dir::Up => canvas.flip_vertical(),
         Dir::Left => canvas.flip_horizontal(),
@@ -1901,6 +2148,7 @@ fn layout_canvas(
     graph: &Graph,
     extras: &[NodeExtra],
     max_width: Option<usize>,
+    styles: &MermaidStyles,
 ) -> Result<Canvas, Oversize> {
     let n = graph.nodes.len();
     if n == 0 {
@@ -2036,12 +2284,15 @@ fn layout_canvas(
             NodeExtra::Compartments(sections) => {
                 draw_class_box(&mut canvas, &placed[idx], sections)
             }
-            NodeExtra::Plain => draw_box(
-                &mut canvas,
-                &placed[idx],
-                &wrapped[idx],
-                graph.nodes[idx].shape,
-            ),
+            NodeExtra::Plain => {
+                draw_box(
+                    &mut canvas,
+                    &placed[idx],
+                    &wrapped[idx],
+                    graph.nodes[idx].shape,
+                );
+                apply_node_style(&mut canvas, &placed[idx], &graph.nodes[idx], graph, styles);
+            }
         }
     }
     for (i, edge) in graph.edges.iter().enumerate() {
@@ -2149,7 +2400,15 @@ fn render_grouped(
         keep[gi] = has_nodes || has_children || referenced[gi];
     }
 
-    let mut canvas = build_scope(graph, None, &scope_edges, &direct_nodes, &keep, max_width)?;
+    let mut canvas = build_scope(
+        graph,
+        None,
+        &scope_edges,
+        &direct_nodes,
+        &keep,
+        max_width,
+        styles,
+    )?;
     match graph.dir {
         Dir::Up => canvas.flip_vertical(),
         Dir::Left => canvas.flip_horizontal(),
@@ -2169,6 +2428,7 @@ fn build_scope(
     direct_nodes: &HashMap<Option<usize>, Vec<usize>>,
     keep: &[bool],
     max_width: Option<usize>,
+    styles: &MermaidStyles,
 ) -> Result<Canvas, Oversize> {
     let mut items: Vec<Item> = Vec::new();
     if let Some(nodes) = direct_nodes.get(&scope) {
@@ -2193,14 +2453,26 @@ fn build_scope(
                 nodes.push(Node {
                     label: graph.nodes[*ni].label.clone(),
                     shape: graph.nodes[*ni].shape,
+                    class_name: graph.nodes[*ni].class_name.clone(),
+                    href: graph.nodes[*ni].href.clone(),
                 });
                 extras.push(NodeExtra::Plain);
             }
             Item::Group(gi) => {
-                let sub = build_scope(graph, Some(*gi), scope_edges, direct_nodes, keep, None)?;
+                let sub = build_scope(
+                    graph,
+                    Some(*gi),
+                    scope_edges,
+                    direct_nodes,
+                    keep,
+                    None,
+                    styles,
+                )?;
                 nodes.push(Node {
                     label: graph.groups[*gi].label.clone(),
                     shape: Shape::Rect,
+                    class_name: None,
+                    href: None,
                 });
                 extras.push(NodeExtra::Frame(sub));
             }
@@ -2234,8 +2506,9 @@ fn build_scope(
         cur_group: None,
         over_cap: false,
         dir: graph.dir,
+        class_defs: graph.class_defs.clone(),
     };
-    layout_canvas(&synth, &extras, max_width)
+    layout_canvas(&synth, &extras, max_width, styles)
 }
 
 fn draw_class_box(canvas: &mut Canvas, p: &Placed, sections: &[Vec<String>]) {
@@ -2842,6 +3115,43 @@ fn fit_label(label: &str, inner: usize) -> String {
     }
     out.push('…');
     out
+}
+
+fn apply_node_style(
+    canvas: &mut Canvas,
+    p: &Placed,
+    node: &Node,
+    graph: &Graph,
+    styles: &MermaidStyles,
+) {
+    let author = node
+        .class_name
+        .as_ref()
+        .and_then(|name| graph.class_defs.get(name));
+    for y in p.y..p.y + p.h {
+        for x in p.x..p.x + p.w {
+            let index = canvas.idx(x, y);
+            let cls = canvas.cls[index];
+            if let Some(author) = author
+                && matches!(cls, Cls::Text | Cls::Border)
+            {
+                let base = style_for(cls, styles);
+                canvas.author_style[index] = Some(Style {
+                    fg: match cls {
+                        Cls::Text => author.color.or(base.fg),
+                        Cls::Border => author.stroke.or(base.fg),
+                        _ => base.fg,
+                    },
+                    bg: author.fill.or(base.bg),
+                    bold: author.bold || base.bold,
+                    italic: base.italic,
+                });
+            }
+            if cls == Cls::Text && node.href.is_some() {
+                canvas.links[index] = node.href.clone();
+            }
+        }
+    }
 }
 
 fn draw_box(canvas: &mut Canvas, p: &Placed, lines: &[String], shape: Shape) {
@@ -5394,5 +5704,65 @@ mod tests {
         let out = plain("sequenceDiagram\n Alice->>Bob: hi\n Note over Alice: solo note");
         assert!(!out.contains(CONT), "sentinel leaked:\n{out}");
         assert!(out.contains("solo note"), "{out}");
+    }
+
+    #[test]
+    fn pie_renders_title_label_and_full_bar() {
+        let out = plain("pie\n  title Pets\n  \"Dogs\" : 4");
+        assert!(out.contains("Pets"), "{out}");
+        assert!(out.contains("Dogs"), "{out}");
+        assert!(out.contains(&"█".repeat(20)), "{out}");
+    }
+
+    #[test]
+    fn author_class_def_overrides_theme() {
+        let out = render(
+            "flowchart LR\n  A[Hot]:::highlight --> B[Plain]\n  classDef highlight fill:#f96,stroke:#333,color:#000,font-weight:bold",
+            &styles(),
+            None,
+        )
+        .unwrap()
+        .styled_lines
+        .join("\n");
+        assert!(
+            out.contains("\x1b[1;38;2;51;51;51;48;2;255;153;102m"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("\x1b[1;38;2;0;0;0;48;2;255;153;102m"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn click_links_only_labels_when_hyperlinks_are_enabled() {
+        let _guard = crate::terminal_image::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let original = crate::terminal_image::get_capabilities();
+        let mut enabled = original;
+        enabled.hyperlinks = true;
+        crate::terminal_image::set_capabilities(enabled);
+        let source = "flowchart TD\n  A[Docs] --> B[Done]\n  click A \"https://example.com/docs\"";
+        let linked = render(source, &styles(), None)
+            .unwrap()
+            .styled_lines
+            .join("\n");
+        assert_eq!(
+            linked
+                .matches("\x1b]8;;https://example.com/docs\x1b\\")
+                .count(),
+            1
+        );
+        let mut disabled = original;
+        disabled.hyperlinks = false;
+        crate::terminal_image::set_capabilities(disabled);
+        let unlinked = render(source, &styles(), None)
+            .unwrap()
+            .styled_lines
+            .join("\n");
+        assert!(!unlinked.contains("\x1b]8;;"));
+        assert!(!unlinked.contains("https://example.com/docs"));
+        crate::terminal_image::set_capabilities(original);
     }
 }

@@ -26,11 +26,27 @@ use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size, truncate_head};
 // ReadOperations (read.ts:43-50)
 // ---------------------------------------------------------------------------
 
+/// A byte stream opened for text selection. Regular files carry the size at
+/// open; special files have no fixed size and are read to EOF.
+pub struct ReadByteStream {
+    pub reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+    pub initial_size: Option<u64>,
+}
+
 /// Pluggable operations for the read tool.
 ///
 /// Override these to delegate file reading to remote systems (for example SSH).
 #[async_trait]
 pub trait ReadOperations: Send + Sync {
+    /// Optional streaming reader. Older operations return `None` and retain
+    /// the whole-file fallback.
+    async fn create_read_stream(
+        &self,
+        _absolute_path: &Path,
+    ) -> std::io::Result<Option<ReadByteStream>> {
+        Ok(None)
+    }
+
     /// Read file contents as a byte vector.
     async fn read_file(&self, absolute_path: &Path) -> std::io::Result<Vec<u8>>;
 
@@ -51,6 +67,19 @@ pub struct LocalReadOperations;
 
 #[async_trait]
 impl ReadOperations for LocalReadOperations {
+    async fn create_read_stream(
+        &self,
+        absolute_path: &Path,
+    ) -> std::io::Result<Option<ReadByteStream>> {
+        let file = tokio::fs::File::open(absolute_path).await?;
+        let metadata = file.metadata().await?;
+        let initial_size = metadata.is_file().then_some(metadata.len());
+        Ok(Some(ReadByteStream {
+            reader: Box::pin(file),
+            initial_size,
+        }))
+    }
+
     async fn read_file(&self, absolute_path: &Path) -> std::io::Result<Vec<u8>> {
         tokio::fs::read(absolute_path).await
     }
@@ -215,6 +244,105 @@ fn format_number(v: f64) -> String {
     } else {
         format!("{v}")
     }
+}
+
+struct StreamSelection {
+    content: String,
+    total_file_lines: usize,
+    selected_total_lines: usize,
+    selected_total_bytes: usize,
+    first_selected_line_len: usize,
+}
+
+fn valid_stream_range(offset: Option<f64>, limit: Option<f64>) -> bool {
+    fn valid(value: Option<f64>) -> bool {
+        value.is_none_or(|value| value.is_finite() && value >= 0.0 && value.fract() == 0.0)
+    }
+    valid(offset) && valid(limit)
+}
+
+async fn read_selected_stream(
+    mut stream: ReadByteStream,
+    start_line_raw: f64,
+    limit: Option<f64>,
+    signal: &CancellationToken,
+) -> Result<StreamSelection, AgentError> {
+    use tokio::io::AsyncReadExt;
+
+    let start_line = start_line_raw as usize;
+    let end_line = limit.map(|limit| start_line_raw + limit);
+    let mut current_line = 0usize;
+    let mut selected_count = 0usize;
+    let mut selected_total_bytes = 0usize;
+    let mut selected_last_empty = false;
+    let mut first_selected_line_len = 0usize;
+    let mut retained = Vec::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut pending = Vec::new();
+
+    let mut process_line = |line: &[u8]| {
+        let in_window =
+            current_line >= start_line && end_line.is_none_or(|end| (current_line as f64) < end);
+        if in_window {
+            let text = String::from_utf8_lossy(line).into_owned();
+            if selected_count > 0 {
+                selected_total_bytes += 1;
+            }
+            selected_total_bytes += text.len();
+            if selected_count == 0 {
+                first_selected_line_len = text.len();
+            }
+            if retained.len() <= 2000 {
+                retained.push(text.clone());
+            }
+            selected_count += 1;
+            selected_last_empty = text.is_empty();
+        }
+        current_line += 1;
+    };
+
+    loop {
+        if signal.is_cancelled() {
+            return Err(AgentError::Message("Operation aborted".to_string()));
+        }
+        let allowed = stream.initial_size.map_or(buffer.len(), |remaining| {
+            remaining.min(buffer.len() as u64) as usize
+        });
+        if allowed == 0 {
+            break;
+        }
+        let read = stream.reader.read(&mut buffer[..allowed]).await?;
+        if read == 0 {
+            break;
+        }
+        if let Some(remaining) = &mut stream.initial_size {
+            *remaining = remaining.saturating_sub(read as u64);
+        }
+        pending.extend_from_slice(&buffer[..read]);
+        let mut start = 0;
+        for (index, byte) in pending.iter().enumerate() {
+            if *byte == b'\n' {
+                process_line(&pending[start..index]);
+                start = index + 1;
+            }
+        }
+        pending = pending[start..].to_vec();
+    }
+    process_line(&pending);
+
+    let content = retained.join("\n");
+    let selected_total_lines = if content.is_empty() {
+        0
+    } else {
+        selected_count - usize::from(selected_last_empty)
+    };
+    Ok(StreamSelection {
+        content,
+        total_file_lines: current_line,
+        selected_total_lines,
+        selected_total_bytes,
+        first_selected_line_len,
+    })
 }
 
 #[async_trait]
@@ -384,65 +512,92 @@ impl AgentTool for ReadTool {
         }
 
         // ===================== Text branch (read.ts:264-316) =====================
-        let buffer = self.operations.read_file(&absolute_path).await?;
-        // buffer.toString("utf-8") — invalid sequences become U+FFFD.
-        let text_content = String::from_utf8_lossy(&buffer);
-        let all_lines: Vec<&str> = text_content.split('\n').collect();
-        let total_file_lines = all_lines.len();
-
-        // Offset handling (1-indexed → 0-indexed) (read.ts:271).
-        // JS: offset ? Math.max(0, offset - 1) : 0   (0 is falsy).
         let start_line_raw = match offset {
             Some(o) if o != 0.0 => (o - 1.0).max(0.0),
             _ => 0.0,
         };
         let start_line_display = start_line_raw as usize + 1;
-
-        // Offset out-of-bounds check (read.ts:274-276).
-        if start_line_raw >= total_file_lines as f64 {
-            return Err(AgentError::Message(format!(
-                "Offset {} is beyond end of file ({} lines total)",
-                format_number(offset.unwrap_or(0.0)),
-                total_file_lines
-            )));
-        }
-
         let start_line = start_line_raw as usize;
-
-        // Apply limit if specified (read.ts:280-286).
-        let user_limited_lines: Option<usize>;
-        let selected_content: String;
-
-        if let Some(lim) = limit {
-            // JS `Math.min(startLine + limit, allLines.length)` then
-            // `allLines.slice(startLine, endLine)` (read.ts:280-286): a JS
-            // slice with end < start returns `[]` instead of failing, so a
-            // model-controlled negative / NaN-ish `limit` yields an empty
-            // selection. The direct `all_lines[start_line..end_line]`
-            // porting panicked on `end < start` — clamp to the JS semantics
-            // (same shape as the harness reader, harness/tools/read.rs) and
-            // never panic on out-of-range model input.
-            let end_line_raw = (start_line_raw + lim).min(total_file_lines as f64);
-            let end_line = end_line_raw.max(start_line_raw) as usize;
-            selected_content = if end_line > start_line {
-                all_lines[start_line..end_line].join("\n")
-            } else {
-                String::new()
-            };
-            user_limited_lines = Some(end_line.saturating_sub(start_line));
+        let (
+            selected_content,
+            total_file_lines,
+            selected_total_lines,
+            selected_total_bytes,
+            first_selected_line_len,
+            user_limited_lines,
+        ) = if valid_stream_range(offset, limit)
+            && let Some(stream) = self.operations.create_read_stream(&absolute_path).await?
+        {
+            let selection = read_selected_stream(stream, start_line_raw, limit, &signal).await?;
+            if start_line_raw >= selection.total_file_lines as f64 {
+                return Err(AgentError::Message(format!(
+                    "Offset {} is beyond end of file ({} lines total)",
+                    format_number(offset.unwrap_or(0.0)),
+                    selection.total_file_lines
+                )));
+            }
+            let limited = limit.map(|lim| {
+                let end = ((start_line_raw + lim).min(selection.total_file_lines as f64) as usize)
+                    .max(start_line);
+                end.saturating_sub(start_line)
+            });
+            (
+                selection.content,
+                selection.total_file_lines,
+                selection.selected_total_lines,
+                selection.selected_total_bytes,
+                selection.first_selected_line_len,
+                limited,
+            )
         } else {
-            selected_content = all_lines[start_line..].join("\n");
-            user_limited_lines = None;
-        }
+            let buffer = self.operations.read_file(&absolute_path).await?;
+            let text_content = String::from_utf8_lossy(&buffer);
+            let all_lines: Vec<&str> = text_content.split('\n').collect();
+            let total_file_lines = all_lines.len();
+            if start_line_raw >= total_file_lines as f64 {
+                return Err(AgentError::Message(format!(
+                    "Offset {} is beyond end of file ({} lines total)",
+                    format_number(offset.unwrap_or(0.0)),
+                    total_file_lines
+                )));
+            }
+            let (selected_content, user_limited_lines) = if let Some(lim) = limit {
+                let end_line_raw = (start_line_raw + lim).min(total_file_lines as f64);
+                let end_line = end_line_raw.max(start_line_raw) as usize;
+                let content = if end_line > start_line {
+                    all_lines[start_line..end_line].join("\n")
+                } else {
+                    String::new()
+                };
+                (content, Some(end_line.saturating_sub(start_line)))
+            } else {
+                (all_lines[start_line..].join("\n"), None)
+            };
+            let selected_total_lines = if selected_content.is_empty() {
+                0
+            } else {
+                selected_content.split('\n').count() - usize::from(selected_content.ends_with('\n'))
+            };
+            (
+                selected_content.clone(),
+                total_file_lines,
+                selected_total_lines,
+                selected_content.len(),
+                all_lines.get(start_line).map_or(0, |line| line.len()),
+                user_limited_lines,
+            )
+        };
 
         // Apply truncation (read.ts:288-314).
-        let truncation = truncate_head(&selected_content, None);
+        let mut truncation = truncate_head(&selected_content, None);
+        truncation.total_lines = selected_total_lines;
+        truncation.total_bytes = selected_total_bytes;
         let output_text: String;
         let details: Value;
 
         if truncation.first_line_exceeds_limit {
             // First line alone exceeds byte limit — sed fallback (read.ts:290-293).
-            let first_line_size = format_size(all_lines[start_line].len());
+            let first_line_size = format_size(first_selected_line_len);
             output_text = format!(
                 "[Line {start_line_display} is {first_line_size}, exceeds {} limit. \
                  Use bash: sed -n '{start_line_display}p' {path} | head -c {DEFAULT_MAX_BYTES}]",

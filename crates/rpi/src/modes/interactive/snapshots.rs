@@ -357,10 +357,12 @@ fn startup_notice_full_block() {
         Arc::new(Mutex::new(dark_theme()));
     let markdown_theme = Mutex::new(markdown_theme(&load_theme("dark", None).unwrap()));
     let components = crate::modes::interactive::interactive_mode::startup_notice_components(
-        "## [0.1.7] - 2026-10-15\n\n### Fixed\n\n- Something fixed.\n",
+        Some("## [0.1.7] - 2026-10-15\n\n### Fixed\n\n- Something fixed.\n"),
+        &[],
         false,
         &theme,
         &markdown_theme,
+        Vec::new(),
     );
     let lines: Vec<String> = components
         .iter()
@@ -377,16 +379,58 @@ fn startup_notice_condensed_line() {
         Arc::new(Mutex::new(dark_theme()));
     let markdown_theme = Mutex::new(markdown_theme(&load_theme("dark", None).unwrap()));
     let components = crate::modes::interactive::interactive_mode::startup_notice_components(
-        "## [0.1.7] - 2026-10-15\n\n### Fixed\n\n- Something fixed.\n",
+        Some("## [0.1.7] - 2026-10-15\n\n### Fixed\n\n- Something fixed.\n"),
+        &[],
         true,
         &theme,
         &markdown_theme,
+        Vec::new(),
     );
     let lines: Vec<String> = components
         .iter()
         .flat_map(|component| component.render(60))
         .collect();
     assert_snapshot("startup_notice_condensed_line", &lines);
+}
+
+#[test]
+fn startup_notice_extensions_only_collapses_one_line_per_package() {
+    use std::sync::Mutex;
+
+    let theme: crate::modes::interactive::components::ThemeHandle =
+        Arc::new(Mutex::new(dark_theme()));
+    let markdown_theme = Mutex::new(markdown_theme(&load_theme("dark", None).unwrap()));
+    let updates = vec![
+        crate::modes::interactive::interactive_mode::ExtensionChangelogUpdate {
+            name: "demo-ext".to_owned(),
+            version: "1.2.0".to_owned(),
+            markdown: "## demo-ext [1.2.0]\n\nnew".to_owned(),
+        },
+        crate::modes::interactive::interactive_mode::ExtensionChangelogUpdate {
+            name: "other-ext".to_owned(),
+            version: "2.0.0".to_owned(),
+            markdown: "## other-ext [2.0.0]\n\nchange".to_owned(),
+        },
+    ];
+    let components = crate::modes::interactive::interactive_mode::startup_notice_components(
+        None,
+        &updates,
+        true,
+        &theme,
+        &markdown_theme,
+        Vec::new(),
+    );
+    let rendered = components
+        .iter()
+        .flat_map(|component| component.render(80))
+        .map(|line| line.trim().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("Updated demo-ext to v1.2.0.\nUpdated other-ext to v2.0.0."),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("What's New"), "{rendered}");
 }
 
 // --- editor-border status spinners (c1d4c8011, V15-07 FR-C) ----------------

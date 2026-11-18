@@ -851,6 +851,7 @@ fn current_frame(component: &mut QuestionnaireComponent, width: usize) -> Compon
         done: component
             .done()
             .map_or(DoneValue::Absent, DoneValue::Present),
+        captures_viewport_input: Some(component.captures_viewport_input()),
     }
 }
 

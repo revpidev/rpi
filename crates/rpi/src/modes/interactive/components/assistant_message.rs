@@ -27,7 +27,7 @@ use rpi_tui::tui::{
 
 use crate::core::themes::Theme;
 
-use super::markdown_transform::create_markdown_transform;
+use super::markdown_transform::create_markdown_transform_with_metadata;
 use super::util::{OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START};
 
 /// Component that renders a complete assistant message
@@ -59,7 +59,7 @@ pub struct AssistantMessageComponent {
     /// the transform options depend on `is_streaming`, and every child pads
     /// with `output_pad`. A change reconstructs all slots; during streaming
     /// deltas both stay constant, so unchanged blocks are reused.
-    last_global_key: Option<(bool, usize)>,
+    last_global_key: Option<(bool, usize, Option<String>, Option<String>)>,
     /// Per-child slot descriptors parallel to `content_container.children`
     /// (V15-13 FR-L2, rpi#53 root cause 2): `update_content` diffs slot by
     /// slot — unchanged blocks keep their component instances (and their
@@ -72,6 +72,8 @@ pub struct AssistantMessageComponent {
     /// `isStreaming` (assistant-message.ts:23): set by `updateContent`'s
     /// argument and captured into the transform context.
     is_streaming: bool,
+    message_id: Option<String>,
+    timestamp: Option<String>,
 }
 
 /// Cheap fingerprint of the rebuild inputs: streaming flag, thinking-block
@@ -209,11 +211,21 @@ impl AssistantMessageComponent {
             theme,
             markdown_transformers,
             is_streaming: false,
+            message_id: None,
+            timestamp: None,
         };
         if let Some(message) = message {
             component.update_content(&SharedAssistantMessage::new(message), false);
         }
         component
+    }
+
+    pub fn set_message_metadata(&mut self, message_id: Option<String>, timestamp: Option<String>) {
+        self.message_id = message_id;
+        self.timestamp = timestamp;
+        if let Some(message) = self.last_message.clone() {
+            self.update_content(&message, self.is_streaming);
+        }
     }
 
     /// `setHideThinkingBlock` (assistant-message.ts:51-56): also clears the
@@ -316,7 +328,12 @@ impl AssistantMessageComponent {
         // block on the next render). Children are re-added in exactly the
         // order a full rebuild produces, so the rendered output is
         // byte-identical; only the construction (and re-parse) is skipped.
-        let global_key = (is_streaming, self.output_pad);
+        let global_key = (
+            is_streaming,
+            self.output_pad,
+            self.message_id.clone(),
+            self.timestamp.clone(),
+        );
         let global_changed = self.last_global_key.as_ref() != Some(&global_key);
         self.last_global_key = Some(global_key);
 
@@ -338,7 +355,7 @@ impl AssistantMessageComponent {
         let mut new_children: Vec<StdBox<dyn Component>> = Vec::new();
         let mut new_slots: Vec<SlotDesc> = Vec::new();
 
-        let has_visible_content = message.content.iter().any(has_visible_content_block);
+        let has_visible_content = self.has_visible_content_from(&message.content, 0);
 
         if has_visible_content {
             let slot = SlotDesc::LeadingSpacer;
@@ -410,7 +427,7 @@ impl AssistantMessageComponent {
                     // Add spacing only when another visible assistant content
                     // block follows (assistant-message.ts:122-126).
                     let has_visible_content_after =
-                        message.content[i..].iter().any(has_visible_content_block);
+                        self.has_visible_content_from(&message.content[i..], thinking_run_index);
 
                     // Per-run visibility override + clickable toggle
                     // (assistant-message.ts:141-171 @ 9841914, 71026970a):
@@ -425,6 +442,9 @@ impl AssistantMessageComponent {
                         .get(&run_index)
                         .copied()
                         .unwrap_or(self.hide_thinking_block);
+                    if hidden && self.hidden_thinking_label.trim().is_empty() {
+                        continue;
+                    }
                     let joined = thinking_blocks.join("\n\n");
                     let slot = SlotDesc::ThinkingRun {
                         fp: block_fingerprint(&joined),
@@ -528,6 +548,36 @@ impl AssistantMessageComponent {
         }
     }
 
+    fn has_visible_content_from(&self, content: &[AssistantContent], start_run: usize) -> bool {
+        let mut index = 0;
+        let mut run_index = start_run;
+        while index < content.len() {
+            match &content[index] {
+                AssistantContent::Text(text) if !text.text.trim().is_empty() => return true,
+                AssistantContent::Thinking(_) => {
+                    let mut nonempty = false;
+                    while let Some(AssistantContent::Thinking(thinking)) = content.get(index) {
+                        nonempty |= !thinking.thinking.trim().is_empty();
+                        index += 1;
+                    }
+                    let hidden = self
+                        .thinking_visibility_overrides
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&run_index)
+                        .copied()
+                        .unwrap_or(self.hide_thinking_block);
+                    if nonempty && (!hidden || !self.hidden_thinking_label.trim().is_empty()) {
+                        return true;
+                    }
+                    run_index += 1;
+                }
+                _ => index += 1,
+            }
+        }
+        false
+    }
+
     /// Fresh `MouseRegion` child for one thinking run
     /// (assistant-message.ts:104-171): the run renders as one Markdown
     /// section, or a static italic label when hidden; the region records
@@ -601,10 +651,12 @@ impl AssistantMessageComponent {
     /// block's message type (assistant-message.ts:110-113, 156-162); `None`
     /// when no transformer is registered (the Markdown renders unchanged).
     fn markdown_options(&self, message_type: &str) -> Option<MarkdownOptions> {
-        create_markdown_transform(
+        create_markdown_transform_with_metadata(
             message_type,
             self.is_streaming,
             self.markdown_transformers.clone(),
+            self.message_id.clone(),
+            self.timestamp.clone(),
         )
         .map(|transform| MarkdownOptions {
             transform: Some(transform),
@@ -630,15 +682,6 @@ impl AssistantMessageComponent {
         if let Some(message) = self.last_message.clone() {
             self.update_content(&message, self.is_streaming);
         }
-    }
-}
-
-/// `hasVisibleContent` predicate (assistant-message.ts:89-91, 124-126).
-fn has_visible_content_block(content: &AssistantContent) -> bool {
-    match content {
-        AssistantContent::Text(text) => !text.text.trim().is_empty(),
-        AssistantContent::Thinking(thinking) => !thinking.thinking.trim().is_empty(),
-        AssistantContent::ToolCall(_) => false,
     }
 }
 
@@ -1470,5 +1513,45 @@ mod tests {
         component.set_hide_thinking_block(false);
         let rendered = strip_ansi(&component.render(60).join("\n"));
         assert!(rendered.contains("first secret"));
+    }
+
+    #[test]
+    fn hidden_thinking_with_an_empty_label_has_zero_rows_or_spacers() {
+        let mut component = AssistantMessageComponent::new(
+            Some(message(vec![thinking("secret"), text("answer")])),
+            true,
+            theme(),
+            markdown_theme(&load_theme("dark", None).unwrap()),
+            "Thinking...",
+            0,
+            Vec::new(),
+        );
+        component.set_hidden_thinking_label("");
+        let rendered = component
+            .content_container
+            .render(60)
+            .iter()
+            .map(|line| strip_ansi(line).trim_end().to_owned())
+            .collect::<Vec<_>>();
+        assert!(!rendered.join("\n").contains("secret"));
+        assert_eq!(
+            rendered,
+            ["", "answer"],
+            "only the normal leading spacer remains"
+        );
+
+        component.update_content(
+            &shared_message(vec![
+                thinking("secret"),
+                AssistantContent::ToolCall(Default::default()),
+            ]),
+            false,
+        );
+        assert!(
+            component
+                .render(60)
+                .iter()
+                .all(|line| line.trim().is_empty())
+        );
     }
 }

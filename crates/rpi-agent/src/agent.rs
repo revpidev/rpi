@@ -87,6 +87,11 @@ pub type PrepareNextTurnWithContextFn = Arc<
         + Sync,
 >;
 
+/// Transforms a drained steering/follow-up batch before it enters the run,
+/// request context, event stream, and transcript.
+pub type PrepareQueuedMessagesFn =
+    Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // AgentState (types.ts:327-352)
 // ---------------------------------------------------------------------------
@@ -403,6 +408,7 @@ pub struct Agent {
     next_listener_id: AtomicU64,
     steering_queue: Arc<Mutex<PendingMessageQueue>>,
     follow_up_queue: Arc<Mutex<PendingMessageQueue>>,
+    prepare_queued_messages: Arc<RwLock<Option<PrepareQueuedMessagesFn>>>,
     active_run: Arc<Mutex<Option<ActiveRun>>>,
 
     pub convert_to_llm: ConvertToLlmFn,
@@ -502,6 +508,7 @@ impl Agent {
                 options.follow_up_mode.unwrap_or(QueueMode::OneAtATime),
             ))),
             active_run: Arc::new(Mutex::new(None)),
+            prepare_queued_messages: Arc::new(RwLock::new(None)),
             convert_to_llm: options
                 .convert_to_llm
                 .unwrap_or_else(default_convert_to_llm),
@@ -699,6 +706,14 @@ impl Agent {
 
     pub fn set_follow_up_mode(&self, mode: QueueMode) {
         lock(&self.follow_up_queue).mode = mode;
+    }
+
+    /// Install the delivery-time transform shared by both pending queues.
+    pub fn set_prepare_queued_messages(&self, hook: Option<PrepareQueuedMessagesFn>) {
+        *self
+            .prepare_queued_messages
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
     /// Queue a message to be injected after the current assistant turn
@@ -952,22 +967,38 @@ impl Agent {
         let get_steering_messages: GetQueuedMessagesFn = {
             let skip = skip.clone();
             let queue = self.steering_queue.clone();
+            let prepare = self.prepare_queued_messages.clone();
             Arc::new(move || {
                 let skip = skip.clone();
                 let queue = queue.clone();
+                let prepare = prepare.clone();
                 Box::pin(async move {
                     if skip.swap(false, Ordering::SeqCst) {
                         return Vec::new();
                     }
-                    lock(&queue).drain()
+                    let messages = lock(&queue).drain();
+                    let prepare = prepare.read().unwrap_or_else(|e| e.into_inner()).clone();
+                    match prepare {
+                        Some(prepare) => prepare(messages).await,
+                        None => messages,
+                    }
                 })
             })
         };
         let get_follow_up_messages: GetQueuedMessagesFn = {
             let queue = self.follow_up_queue.clone();
+            let prepare = self.prepare_queued_messages.clone();
             Arc::new(move || {
                 let queue = queue.clone();
-                Box::pin(async move { lock(&queue).drain() })
+                let prepare = prepare.clone();
+                Box::pin(async move {
+                    let messages = lock(&queue).drain();
+                    let prepare = prepare.read().unwrap_or_else(|e| e.into_inner()).clone();
+                    match prepare {
+                        Some(prepare) => prepare(messages).await,
+                        None => messages,
+                    }
+                })
             })
         };
 

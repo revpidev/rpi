@@ -503,6 +503,7 @@ async fn l0_load_capability_denied_and_full_surface() {
         duration_ms: None,
         output_pad: 1,
         terminal_width: None,
+        keybinding_hints: Default::default(),
     };
     let call_tree = render_call(context).expect("renderCall returns a tree");
     assert_eq!(call_tree["type"], serde_json::json!("text"));
@@ -545,6 +546,7 @@ async fn l0_load_capability_denied_and_full_surface() {
             duration_ms: None,
             output_pad: 1,
             terminal_width: None,
+            keybinding_hints: Default::default(),
         },
     )
     .expect("partial renderResult returns a tree");
@@ -587,6 +589,7 @@ async fn l0_load_capability_denied_and_full_surface() {
             duration_ms: None,
             output_pad: 1,
             terminal_width: None,
+            keybinding_hints: Default::default(),
         },
     )
     .expect("final renderResult returns a tree");
@@ -639,6 +642,7 @@ async fn l0_load_capability_denied_and_full_surface() {
             duration_ms: None,
             output_pad: 1,
             terminal_width: None,
+        keybinding_hints: Default::default(),
         },
     )
     .expect("batch renderResult returns a tree");

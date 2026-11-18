@@ -345,38 +345,35 @@ fn resize_image(
     loop {
         let resized = img.resize_exact(current_width, current_height, FilterType::Lanczos3);
 
-        // PNG candidate (image-resize-core.ts:112).
+        let mut best: Option<(String, String)> = None;
         if let Ok(png_data) = encode_png(&resized) {
             let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
             if png_b64.len() < max_bytes {
-                return Some(ResizedImage {
-                    data: png_b64,
-                    mime_type: "image/png".to_string(),
-                    original_width,
-                    original_height,
-                    width: current_width,
-                    height: current_height,
-                    was_resized: true,
-                });
+                best = Some((png_b64, "image/png".to_string()));
             }
         }
-
-        // JPEG candidates at each quality level (image-resize-core.ts:113-115).
         for &quality in &quality_steps {
             if let Ok(jpeg_data) = encode_jpeg(&resized, quality) {
                 let jpeg_b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_data);
-                if jpeg_b64.len() < max_bytes {
-                    return Some(ResizedImage {
-                        data: jpeg_b64,
-                        mime_type: "image/jpeg".to_string(),
-                        original_width,
-                        original_height,
-                        width: current_width,
-                        height: current_height,
-                        was_resized: true,
-                    });
+                if jpeg_b64.len() < max_bytes
+                    && best
+                        .as_ref()
+                        .is_none_or(|(current, _)| jpeg_b64.len() < current.len())
+                {
+                    best = Some((jpeg_b64, "image/jpeg".to_string()));
                 }
             }
+        }
+        if let Some((data, mime_type)) = best {
+            return Some(ResizedImage {
+                data,
+                mime_type,
+                original_width,
+                original_height,
+                width: current_width,
+                height: current_height,
+                was_resized: true,
+            });
         }
 
         // Check if we've reached 1×1 (image-resize-core.ts:142-144).

@@ -41,6 +41,12 @@ pub enum BashExecError {
     Aborted,
     #[error("timeout:{0}")]
     Timeout(f64),
+    #[error("timeout:{timeout}")]
+    TimeoutWithShell {
+        timeout: f64,
+        exit_code: i32,
+        after_seconds: f64,
+    },
     #[error("{0}")]
     Message(String),
 }
@@ -448,7 +454,7 @@ impl BashOperations for LocalBashOperations {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let (tx, mut rx) = mpsc::channel::<IoMsg>(64);
-        if let Some(mut s) = stdout {
+        let stdout_task = stdout.map(|mut s| {
             let tx = tx.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
@@ -469,9 +475,9 @@ impl BashOperations for LocalBashOperations {
                         }
                     }
                 }
-            });
-        }
-        if let Some(mut s) = stderr {
+            })
+        });
+        let stderr_task = stderr.map(|mut s| {
             let tx = tx.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
@@ -492,17 +498,20 @@ impl BashOperations for LocalBashOperations {
                         }
                     }
                 }
-            });
-        }
+            })
+        });
         drop(tx);
         if from_stdin && let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             let _ = stdin.write_all(command.as_bytes()).await;
             let _ = stdin.shutdown().await;
         }
+        let started_at = tokio::time::Instant::now();
         let mut timed_out = false;
         let mut aborted = false;
         let mut exited = false;
+        let mut exited_before_deadline_after_ms: Option<u128> = None;
+        let mut shell_exited_after_ms: Option<u128> = None;
         let mut exit_code: Option<i32> = None;
         let mut stdout_ended = false;
         let mut stderr_ended = false;
@@ -523,10 +532,28 @@ impl BashOperations for LocalBashOperations {
             tokio::pin!(kill_grace_fut);
             tokio::select! {
                 biased;
-                _ = options.signal.cancelled(), if !aborted && !timed_out => { aborted = true; if let Some(p) = pid { kill_process_tree(p); } killed_at = Some(tokio::time::Instant::now()); }
-                _ = &mut timeout_fut, if !timed_out && !aborted => { timed_out = true; if let Some(p) = pid { kill_process_tree(p); } killed_at = Some(tokio::time::Instant::now()); }
-                _ = &mut kill_grace_fut, if killed_at.is_some() && !exited => { tracing::warn!(grace_ms = KILL_GRACE_MS, "killed child did not exit within grace; abandoning wait"); break; }
-                result = child.wait(), if !exited => { exited = true; exit_code = result.ok().map(|s| exit_status_to_code(&s)); }
+                _ = options.signal.cancelled(), if !aborted && !timed_out => {
+                    aborted = true;
+                    if let Some(p) = pid { kill_process_tree(p); }
+                    if let Some(task) = &stdout_task { task.abort(); }
+                    if let Some(task) = &stderr_task { task.abort(); }
+                    killed_at = Some(tokio::time::Instant::now());
+                }
+                _ = &mut timeout_fut, if !timed_out && !aborted => {
+                    timed_out = true;
+                    exited_before_deadline_after_ms = shell_exited_after_ms;
+                    if let Some(p) = pid { kill_process_tree(p); }
+                    if let Some(task) = &stdout_task { task.abort(); }
+                    if let Some(task) = &stderr_task { task.abort(); }
+                    break;
+                }
+                _ = &mut kill_grace_fut, if killed_at.is_some() && !exited => {
+                    if let Some(task) = &stdout_task { task.abort(); }
+                    if let Some(task) = &stderr_task { task.abort(); }
+                    tracing::warn!(grace_ms = KILL_GRACE_MS, "killed child did not exit within grace; abandoning wait");
+                    break;
+                }
+                result = child.wait(), if !exited => { exited = true; shell_exited_after_ms = Some(started_at.elapsed().as_millis()); exit_code = result.ok().map(|s| exit_status_to_code(&s)); }
                 msg = rx.recv() => { match msg { Some(IoMsg::Data(b)) => { pending_data = Some(b); } Some(IoMsg::StdoutEof) => { stdout_ended = true; } Some(IoMsg::StderrEof) => { stderr_ended = true; } None => { stdout_ended = true; stderr_ended = true; } } }
             }
             if let Some(b) = pending_data.take() {
@@ -544,6 +571,14 @@ impl BashOperations for LocalBashOperations {
                 tokio::select! {
                     biased;
                     msg = rx.recv() => { match msg { Some(IoMsg::Data(b)) => { d = Some(b); idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(EXIT_STDIO_GRACE_MS)); } Some(IoMsg::StdoutEof) => { stdout_ended = true; if stderr_ended { break; } } Some(IoMsg::StderrEof) => { stderr_ended = true; if stdout_ended { break; } } None => { break; } } }
+                    _ = &mut timeout_fut, if !timed_out && !aborted => {
+                        timed_out = true;
+                        exited_before_deadline_after_ms = shell_exited_after_ms;
+                        if let Some(p) = pid { kill_process_tree(p); }
+                        if let Some(task) = &stdout_task { task.abort(); }
+                        if let Some(task) = &stderr_task { task.abort(); }
+                        break;
+                    }
                     _ = &mut idle => { break; }
                 }
                 if let Some(b) = d.take() {
@@ -555,6 +590,13 @@ impl BashOperations for LocalBashOperations {
             return Err(BashExecError::Aborted);
         }
         if timed_out {
+            if let (Some(after_ms), Some(code)) = (exited_before_deadline_after_ms, exit_code) {
+                return Err(BashExecError::TimeoutWithShell {
+                    timeout: options.timeout.unwrap_or(0.0),
+                    exit_code: code,
+                    after_seconds: (after_ms as f64 / 100.0).round() / 10.0,
+                });
+            }
             return Err(BashExecError::Timeout(options.timeout.unwrap_or(0.0)));
         }
         Ok(exit_code)
@@ -899,6 +941,16 @@ impl AgentTool for BashTool {
                     BashExecError::Timeout(secs) => Err(AgentError::Message(append_status(
                         &text,
                         &format!("Command timed out after {secs} seconds"),
+                    ))),
+                    BashExecError::TimeoutWithShell {
+                        timeout,
+                        exit_code,
+                        after_seconds,
+                    } => Err(AgentError::Message(append_status(
+                        &text,
+                        &format!(
+                            "Command timed out after {timeout} seconds. The shell exited with code {exit_code} after {after_seconds} seconds, but background processes it started kept writing output until the timeout."
+                        ),
                     ))),
                     BashExecError::Message(m) => Err(AgentError::Message(m)),
                 }

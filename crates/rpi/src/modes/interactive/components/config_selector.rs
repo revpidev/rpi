@@ -164,11 +164,10 @@ fn get_item_scope(item: &ResourceItem) -> SourceScope {
 fn format_base_dir(base_dir: &str) -> String {
     let home_dir = config::user_home_dir().map(|p| p.to_string_lossy().into_owned());
     let display_path = match &home_dir {
-        Some(home) if base_dir == home => "~".to_string(),
-        Some(home) if base_dir.starts_with(home) => {
-            format!("~{}", base_dir[home.len()..].replace('\\', "/"))
+        Some(home) => {
+            crate::tools::path_utils::shorten_home_path(base_dir, home).replace('\\', "/")
         }
-        _ => base_dir.replace('\\', "/"),
+        None => base_dir.replace('\\', "/"),
     };
     if display_path.ends_with('/') {
         display_path

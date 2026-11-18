@@ -351,54 +351,64 @@ fn normalize_globstars(pattern: &[char]) -> Vec<char> {
 }
 
 fn glob_match(value: &[char], pattern: &[char]) -> bool {
-    // Backtracking matcher: `**` crosses `/`, `*` does not.
-    if pattern.is_empty() {
-        return value.is_empty();
-    }
-    if pattern[0] == '*' {
-        let crosses_slash = pattern.len() > 1 && pattern[1] == '*';
-        // A globstar may match zero path segments: `a/**/b` also matches
-        // `a/b` (the trailing `/` is absorbed).
-        if crosses_slash
-            && pattern.len() > 2
-            && pattern[2] == '/'
-            && glob_match(value, &pattern[3..])
-        {
-            return true;
+    fn inner(
+        value: &[char],
+        pattern: &[char],
+        memo: &mut std::collections::HashMap<(usize, usize), bool>,
+    ) -> bool {
+        let key = (value.len(), pattern.len());
+        if let Some(result) = memo.get(&key) {
+            return *result;
         }
-        let rest = if crosses_slash {
-            &pattern[2..]
+        let result = if pattern.is_empty() {
+            value.is_empty()
+        } else if pattern[0] == '*' {
+            let crosses_slash = pattern.len() > 1 && pattern[1] == '*';
+            let zero_segments = crosses_slash
+                && pattern.len() > 2
+                && pattern[2] == '/'
+                && inner(value, &pattern[3..], memo);
+            let rest = if crosses_slash {
+                &pattern[2..]
+            } else {
+                &pattern[1..]
+            };
+            zero_segments || {
+                let mut matched = false;
+                for count in 0..=value.len() {
+                    if inner(&value[count..], rest, memo) {
+                        matched = true;
+                        break;
+                    }
+                    if !crosses_slash && count < value.len() && value[count] == '/' {
+                        break;
+                    }
+                }
+                matched
+            }
+        } else if value.is_empty() {
+            false
         } else {
-            &pattern[1..]
+            match pattern[0] {
+                '?' => value[0] != '/' && inner(&value[1..], &pattern[1..], memo),
+                '[' => match match_class(pattern) {
+                    Some(((ranges, negate), rest)) => {
+                        let c = value[0];
+                        let inside = ranges.iter().any(|(lo, hi)| *lo <= c && c <= *hi);
+                        c != '/' && (inside != negate) && inner(&value[1..], rest, memo)
+                    }
+                    None => value[0] == '[' && inner(&value[1..], &pattern[1..], memo),
+                },
+                literal => value[0] == literal && inner(&value[1..], &pattern[1..], memo),
+            }
         };
-        for count in 0..=value.len() {
-            if glob_match(&value[count..], rest) {
-                return true;
-            }
-            if !crosses_slash && count < value.len() && value[count] == '/' {
-                return false;
-            }
-        }
-        return false;
+        memo.insert(key, result);
+        result
     }
-    if value.is_empty() {
-        return false;
-    }
-    match pattern[0] {
-        // `?` never matches the path separator.
-        '?' => value[0] != '/' && glob_match(&value[1..], &pattern[1..]),
-        '[' => match match_class(pattern) {
-            Some(((ranges, negate), rest)) => {
-                let c = value[0];
-                let inside = ranges.iter().any(|(lo, hi)| *lo <= c && c <= *hi);
-                // Character classes never match the path separator, negated
-                // or not.
-                c != '/' && (inside != negate) && glob_match(&value[1..], rest)
-            }
-            None => value[0] == '[' && glob_match(&value[1..], &pattern[1..]),
-        },
-        literal => value[0] == literal && glob_match(&value[1..], &pattern[1..]),
-    }
+
+    // The suffix lengths identify the same (value_index, pattern_index)
+    // subproblem. Memoizing them removes exponential repeated star branches.
+    inner(value, pattern, &mut std::collections::HashMap::new())
 }
 
 /// A parsed `[...]` class: ranges plus negation flag.
@@ -1451,6 +1461,15 @@ mod tests {
         assert!(!minimatch_nocase("openai/gpt-4o", "anthropic/*"));
         assert!(!minimatch_nocase("a/b/c", "a/*"));
         assert!(minimatch_nocase("a/b/c", "a/**"));
+    }
+
+    #[test]
+    fn test_minimatch_many_stars_terminate_without_exponential_backtracking() {
+        let value = "a".repeat(128);
+        let pattern = format!("{}b", "*a".repeat(64));
+        assert!(!minimatch_nocase(&value, &pattern));
+        assert!(minimatch_nocase("a/x/a/y/a", "**/a/**/a/**"));
+        assert!(!minimatch_nocase("a/x/a/y/b", "**/a/**/a/**/c"));
     }
 
     #[test]

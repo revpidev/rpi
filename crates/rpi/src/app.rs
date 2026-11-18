@@ -40,7 +40,10 @@ use crate::core::model_resolver::{
     ResolveCliModelOptions, ScopedModel, resolve_cli_model, resolve_model_scope_with_diagnostics,
 };
 use crate::core::model_runtime::ModelRuntime;
-use crate::core::session_cwd::{format_missing_session_cwd_error, get_missing_session_cwd_issue};
+use crate::core::session_cwd::{
+    MissingCwdDecision, format_missing_session_cwd_error, format_missing_session_cwd_prompt,
+    get_missing_session_cwd_issue, get_missing_session_cwd_options,
+};
 use crate::core::session_manager::{NewSessionOptions, SessionManager, assert_valid_session_id};
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::trust_manager::{
@@ -746,16 +749,47 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         }
     };
 
-    // Header cwd missing (main.ts:579-591): interactive prompts (T12);
-    // headless errors out.
+    // Header cwd missing (main.ts:745-768): interactive startup offers a
+    // one-shot cwd override or a persisted fork. Print/RPC fail before any
+    // session is created.
     if let Some(issue) = get_missing_session_cwd_issue(&session_manager, &cwd) {
-        if app_mode == AppMode::Interactive {
-            // T12 prompt path; unreachable until interactive lands.
+        if app_mode != AppMode::Interactive {
             let _ = writeln!(err, "{}", format_missing_session_cwd_error(&issue));
             return 1;
         }
-        let _ = writeln!(err, "{}", format_missing_session_cwd_error(&issue));
-        return 1;
+        let options = get_missing_session_cwd_options(&issue);
+        let labels: Vec<String> = options.iter().map(|option| option.label.clone()).collect();
+        let selected = crate::modes::interactive::startup_ui::run_startup_selector(
+            &startup_settings_manager,
+            &format_missing_session_cwd_prompt(&issue),
+            &labels,
+        );
+        let decision = selected
+            .as_deref()
+            .and_then(|label| options.iter().find(|option| option.label == label))
+            .and_then(|option| option.decision);
+        let Some(session_file) = issue.session_file.as_deref() else {
+            return 0;
+        };
+        let recovered = match decision {
+            Some(MissingCwdDecision::Continue) => {
+                SessionManager::open(Path::new(session_file), session_dir.as_deref(), Some(&cwd))
+            }
+            Some(MissingCwdDecision::Fork) => SessionManager::fork_from(
+                Path::new(session_file),
+                &cwd,
+                session_dir.as_deref(),
+                crate::core::session_manager::ForkOptions::default(),
+            ),
+            None => return 0,
+        };
+        match recovered {
+            Ok(manager) => session_manager = manager,
+            Err(error) => {
+                let _ = writeln!(err, "Error: {error}");
+                return 1;
+            }
+        }
     }
 
     if let Some(name) = &parsed.name {

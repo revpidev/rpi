@@ -25,7 +25,7 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use serde::Deserialize;
@@ -663,6 +663,8 @@ struct RpcState {
     /// Set by the (T15) extension `ctx.shutdown()` handler; honored on the
     /// next `agent_settled` event (rpc-mode.ts:727-730).
     shutdown_requested: AtomicBool,
+    active_commands: AtomicUsize,
+    input_ready: AtomicBool,
     /// Single ordered stdout write path for responses + events (upstream
     /// `writeRawStdout`'s promise chain, output-guard.ts:85-93). The blocking
     /// write doubles as backpressure: producers wait while the consumer's
@@ -736,6 +738,7 @@ async fn rebind_session(
         host.install_answer_channel(std::sync::Arc::new(|bus| {
             crate::modes::interactive::interactive_mode::answer_channel::install_unsupported(&bus);
         }));
+        crate::core::extension_actions::bind_session_actions(&host, &session).await;
     }
     let shutdown_state = Arc::downgrade(state);
     session
@@ -744,6 +747,16 @@ async fn rebind_session(
             shutdown: Some(Arc::new(move || {
                 if let Some(state) = shutdown_state.upgrade() {
                     state.shutdown_requested.store(true, Ordering::SeqCst);
+                    if state.input_ready.load(Ordering::SeqCst)
+                        && state.active_commands.load(Ordering::SeqCst) == 0
+                        && state
+                            .session
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_idle()
+                    {
+                        let _ = state.shutdown.send(0);
+                    }
                 }
             })),
             on_error: Some(Arc::new(move |error| {
@@ -1290,25 +1303,47 @@ async fn read_record<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result
 // Entry point
 // ============================================================================
 
-/// Register SIGTERM/SIGHUP handlers exiting 143/129 (rpc-mode.ts:365-379).
-/// Same approach as print mode: upstream kills tracked detached children
-/// (no registry in rpi, D-011) and skips the stdout flush on SIGTERM.
-fn register_signal_handlers() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownPhase {
+    Requested,
+    Draining,
+    Forced,
+}
+
+/// The first signal enters the same cleanup path as EOF. A repeated signal is
+/// the only forced exit, so a pending MCP refresh or tool result can settle.
+fn register_signal_handlers(shutdown: mpsc::UnboundedSender<i32>) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
+        let phase = Arc::new(Mutex::new(ShutdownPhase::Requested));
         for (kind, code) in [(SignalKind::terminate(), 143), (SignalKind::hangup(), 129)] {
             if let Ok(mut stream) = signal(kind) {
+                let phase = phase.clone();
+                let shutdown = shutdown.clone();
                 std::thread::spawn(move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build();
-                    if let Ok(runtime) = runtime {
-                        runtime.block_on(async move {
+                    loop {
+                        let Some(runtime) = runtime.as_ref().ok() else {
+                            return;
+                        };
+                        runtime.block_on(async {
                             stream.recv().await;
                         });
+                        let mut phase = phase.lock().unwrap_or_else(|e| e.into_inner());
+                        match *phase {
+                            ShutdownPhase::Requested => {
+                                *phase = ShutdownPhase::Draining;
+                                let _ = shutdown.send(code);
+                            }
+                            ShutdownPhase::Draining | ShutdownPhase::Forced => {
+                                *phase = ShutdownPhase::Forced;
+                                std::process::exit(code);
+                            }
+                        }
                     }
-                    std::process::exit(code);
                 });
             }
         }
@@ -1323,8 +1358,6 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
     mut input: R,
     out: Box<dyn Write + Send>,
 ) -> i32 {
-    register_signal_handlers();
-
     // Single ordered write path: all responses and events go through this
     // blocking writer, preserving emission order (upstream `writeRawStdout`,
     // output-guard.ts:85-93) and applying backpressure to producers when the
@@ -1332,6 +1365,7 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
     // task, which let slow consumers pile lines up without bound).
     let output = RawStdout::new(out);
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<i32>();
+    register_signal_handlers(shutdown_tx.clone());
 
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
     let initial_session = runtime.lock().await.session().clone();
@@ -1341,6 +1375,8 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
         unsubscribe: Mutex::new(None),
         pending_ui: ui_bridge::new_pending_ui_table(),
         shutdown_requested: AtomicBool::new(false),
+        active_commands: AtomicUsize::new(0),
+        input_ready: AtomicBool::new(false),
         output: output.clone(),
         shutdown: shutdown_tx,
         prompt_tasks: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
@@ -1365,6 +1401,10 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
     // Initial bind (rpc-mode.ts:381): also attaches the RPC UI bridge and
     // the answer channel (the same path every replacement session uses).
     rebind_session(&state, initial_session.clone(), &Arc::downgrade(&runtime)).await;
+    state.input_ready.store(true, Ordering::SeqCst);
+    if state.shutdown_requested.load(Ordering::SeqCst) && initial_session.is_idle() {
+        let _ = state.shutdown.send(0);
+    }
 
     // Input loop: each command is handled on its own task so `abort` /
     // `abort_bash` can land while a long-running `bash`/`prompt` is in
@@ -1393,7 +1433,15 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
                                 let state = state.clone();
                                 let runtime = runtime.clone();
                                 command_tasks.spawn(async move {
-                                    handle_command(state, runtime, command).await;
+                                    state.active_commands.fetch_add(1, Ordering::SeqCst);
+                                    handle_command(state.clone(), runtime, command).await;
+                                    state.active_commands.fetch_sub(1, Ordering::SeqCst);
+                                    if state.shutdown_requested.load(Ordering::SeqCst)
+                                        && state.active_commands.load(Ordering::SeqCst) == 0
+                                        && state.session.read().unwrap_or_else(|e| e.into_inner()).is_idle()
+                                    {
+                                        let _ = state.shutdown.send(0);
+                                    }
                                 });
                             }
                             ParsedLine::ExtensionUiResponse(response) => {

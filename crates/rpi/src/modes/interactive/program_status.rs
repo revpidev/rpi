@@ -173,6 +173,11 @@ impl ProgramStatusReporter {
     }
 
     /// `currentStatus()` (program-status-reporter.ts:103-110).
+    #[cfg(test)]
+    pub(crate) fn current_status_for_test(&self) -> ProgramStatus {
+        self.current_status(None)
+    }
+
     fn current_status(&self, session_name: Option<&str>) -> ProgramStatus {
         if let Some((_, blocked)) = self.blocked.last() {
             return ProgramStatus::blocked(blocked.kind, blocked.message.clone());

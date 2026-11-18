@@ -486,6 +486,8 @@ pub enum ProgressKind {
     Progress,
     Complete,
     Error,
+    /// A changed package outcome, outside the start/complete pairing.
+    Result,
 }
 
 /// `ProgressEvent["action"]`.
@@ -585,6 +587,26 @@ impl UpdatePlanEntry {
                 self.note.as_deref().unwrap_or("unknown error")
             ),
         }
+    }
+
+    pub fn update_result_message(&self, previous: Option<&str>, next: Option<&str>) -> String {
+        let format = |value: Option<&str>| match value {
+            Some(value) if self.kind == "git" => value.chars().take(7).collect::<String>(),
+            Some(value) => value.to_owned(),
+            None => "(none)".to_owned(),
+        };
+        let scope = if self.scope == SourceScope::Project {
+            " (project)"
+        } else {
+            ""
+        };
+        format!(
+            "{}{} {} -> {}",
+            self.source,
+            scope,
+            format(previous),
+            format(next)
+        )
     }
 
     /// Downgrade warning text, if this row moves backwards (an exact pin).
@@ -2254,26 +2276,37 @@ impl DefaultPackageManager {
             .unwrap_or_else(|| PathBuf::from(marker_name))
     }
 
-    /// `cleanAndInstallGitDependencies` (package-manager.ts, b06dc76fd):
-    /// `git clean -fdx`, then npm install. If clean fails, attempt to repair
-    /// missing deps (best-effort, errors swallowed) before rethrowing the
-    /// clean error so the extension isn't left in a broken state.
+    /// `cleanAndInstallGitDependencies` (package-manager.ts:2153-2178):
+    /// a locked file can make clean fail on Windows. Continue installing the
+    /// new commit's dependencies, report a warning, and retain the marker so
+    /// the next update retries the clean.
     fn clean_and_install_git_dependencies(
         &self,
         target_dir: &Path,
         marker_path: &Path,
     ) -> Result<(), String> {
-        let clean_result = self
+        let mut cleaned = true;
+        if let Err(error) = self
             .runner
-            .run(&CommandRequest::new("git", &["clean", "-fdx"]).with_cwd(target_dir));
-        if let Err(error) = clean_result {
-            let _ = self.repair_missing_git_dependencies(target_dir);
-            return Err(error);
+            .run(&CommandRequest::new("git", &["clean", "-fdx"]).with_cwd(target_dir))
+        {
+            cleaned = false;
+            self.emit_progress(&ProgressEvent {
+                kind: ProgressKind::Progress,
+                action: ProgressAction::Update,
+                source: target_dir.to_string_lossy().into_owned(),
+                message: Some(format!(
+                    "Could not remove all untracked files in {} ({error}). Files may be in use by another rpi session; close it and run the update again.",
+                    target_dir.display()
+                )),
+            });
         }
         if target_dir.join("package.json").exists() {
             self.run_npm_command(&self.get_git_dependency_install_args()?, Some(target_dir))?;
         }
-        let _ = std::fs::remove_file(marker_path);
+        if cleaned {
+            let _ = std::fs::remove_file(marker_path);
+        }
         Ok(())
     }
 
@@ -3561,6 +3594,38 @@ impl DefaultPackageManager {
         Ok(plan)
     }
 
+    fn git_head(&self, target_dir: &Path) -> Option<String> {
+        if !target_dir.exists() {
+            return None;
+        }
+        self.runner
+            .run_capture(
+                &CommandRequest::new("git", &["rev-parse", "HEAD"])
+                    .with_cwd(target_dir)
+                    .with_timeout(NETWORK_TIMEOUT),
+            )
+            .ok()
+            .map(|head| head.trim().to_owned())
+            .filter(|head| !head.is_empty())
+    }
+
+    fn installed_update_version(&self, entry: &UpdatePlanEntry) -> Option<String> {
+        if let Some(git) = &entry.git {
+            return self
+                .get_git_install_path(&git.parsed, git.scope)
+                .ok()
+                .and_then(|path| self.git_head(&path));
+        }
+        if let Some(npm) = &entry.npm {
+            return self
+                .get_managed_npm_install_path(&npm.parsed, npm.scope)
+                .ok()
+                .and_then(|path| self.get_installed_npm_version(&path));
+        }
+        self.get_installed_path(&entry.source, entry.scope)
+            .and_then(|path| extension_registry::installed_extension_version(&path))
+    }
+
     /// V18-12 FR-D: execute a plan produced by [`Self::plan_updates`].
     /// Registry/`github:` rows reuse the cached resolution; npm/git rows
     /// still go through the command runner. One failing source does not
@@ -3614,6 +3679,11 @@ impl DefaultPackageManager {
                     } else {
                         serde_json::Map::new()
                     };
+                    let previous_git_head = entry.git.as_ref().and_then(|git| {
+                        self.get_git_install_path(&git.parsed, git.scope)
+                            .ok()
+                            .and_then(|path| self.git_head(&path))
+                    });
                     let result = if let Some(npm) = &entry.npm {
                         let spec = match &npm.parsed.version {
                             Some(_) => npm.parsed.spec.clone(),
@@ -3668,7 +3738,42 @@ impl DefaultPackageManager {
                         Err(error) => Err(error),
                     };
                     match result {
-                        Ok(()) => summary.updated += 1,
+                        Ok(()) => {
+                            summary.updated += 1;
+                            let previous = if entry.git.is_some() {
+                                previous_git_head
+                            } else {
+                                entry.current.clone()
+                            };
+                            let next = self.installed_update_version(entry);
+                            if previous != next {
+                                self.emit_progress(&ProgressEvent {
+                                    kind: ProgressKind::Result,
+                                    action: ProgressAction::Update,
+                                    source: entry.source.clone(),
+                                    message: Some(entry.update_result_message(
+                                        previous.as_deref(),
+                                        next.as_deref(),
+                                    )),
+                                });
+                            } else if entry.npm.is_some()
+                                && previous.is_some()
+                                && next.is_some()
+                                && entry.target != next
+                                && let Some(target) = entry.target.as_deref()
+                            {
+                                self.emit_progress(&ProgressEvent {
+                                    kind: ProgressKind::Progress,
+                                    action: ProgressAction::Update,
+                                    source: entry.source.clone(),
+                                    message: Some(format!(
+                                        "{} is still {} (registry reports {target}); npm registry metadata may be stale, try again in a few minutes",
+                                        entry.source,
+                                        next.as_deref().unwrap_or_default()
+                                    )),
+                                });
+                            }
+                        }
                         Err(error) => {
                             summary.failed += 1;
                             self.emit_progress(&ProgressEvent {
@@ -4261,8 +4366,30 @@ impl DefaultPackageManager {
 
     /// `refreshTemporaryGitSource` (package-manager.ts:1891-1902): keep the
     /// cached temporary checkout when the refresh fails.
-    fn refresh_temporary_git_source(&self, source: &GitSource, source_str: &str) {
+    fn refresh_temporary_git_source(
+        &self,
+        source: &GitSource,
+        source_str: &str,
+        installed_path: &Path,
+    ) {
         if self.offline {
+            return;
+        }
+        if let Some(reference) = source.ref_.as_deref()
+            && (7..=64).contains(&reference.len())
+            && reference
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+            && let Ok(head) = self.runner.run_capture(
+                &CommandRequest::new("git", &["rev-parse", "HEAD"])
+                    .with_cwd(installed_path)
+                    .with_timeout(NETWORK_TIMEOUT),
+            )
+            && head
+                .trim()
+                .to_lowercase()
+                .starts_with(&reference.to_lowercase())
+        {
             return;
         }
         let _ = self.with_progress(
@@ -4751,11 +4878,8 @@ impl DefaultPackageManager {
                         if !install_missing(&mut on_missing)? {
                             continue;
                         }
-                    } else if resolved_scope == SourceScope::Temporary
-                        && !git.pinned
-                        && !self.offline
-                    {
-                        self.refresh_temporary_git_source(git, &resolved_source);
+                    } else if resolved_scope == SourceScope::Temporary && !self.offline {
+                        self.refresh_temporary_git_source(git, &resolved_source, &installed_path);
                     }
                     metadata.base_dir = Some(installed_path.clone());
                     self.collect_package_resources(
@@ -6401,6 +6525,46 @@ mod tests {
     }
 
     #[test]
+    fn test_temporary_git_skips_checked_out_commit_but_refreshes_branch() {
+        let dirs = TestDirs::new();
+        let head = "a".repeat(40);
+        let runner = FakeRunner::new(move |request| {
+            if request.command == "git"
+                && request.args.first().map(String::as_str) == Some("rev-parse")
+            {
+                Ok(head.clone())
+            } else {
+                Ok(String::new())
+            }
+        });
+        let manager = test_manager(&dirs, runner.clone());
+        let mut source = git_source(
+            "https://github.com/user/repo",
+            "github.com",
+            "user/repo",
+            Some("aaaaaaaa"),
+        );
+        let target = manager
+            .get_git_install_path(&source, SourceScope::Temporary)
+            .expect("temporary install path");
+        std::fs::create_dir_all(&target).expect("checkout");
+        manager.refresh_temporary_git_source(&source, "git:github.com/user/repo@aaaaaaaa", &target);
+        assert!(runner.find_calls("git", "fetch").is_empty());
+
+        source.ref_ = Some("feature/branch".to_owned());
+        let branch_target = manager
+            .get_git_install_path(&source, SourceScope::Temporary)
+            .expect("branch install path");
+        std::fs::create_dir_all(&branch_target).expect("branch checkout");
+        manager.refresh_temporary_git_source(
+            &source,
+            "git:github.com/user/repo@feature/branch",
+            &branch_target,
+        );
+        assert_eq!(runner.find_calls("git", "fetch").len(), 1);
+    }
+
+    #[test]
     fn test_install_git_existing_pinned_checkout_reconciles() {
         let dirs = TestDirs::new();
         let target = dirs.agent_dir.join("git/github.com/user/repo");
@@ -6621,10 +6785,9 @@ mod tests {
     }
 
     #[test]
-    fn test_install_git_clean_failure_triggers_repair_then_rethrows() {
-        // `git clean -fdx` fails during marker-resume → best-effort
-        // repair_missing_git_dependencies runs npm install, then the original
-        // clean error is rethrown (b06dc76fd).
+    fn test_install_git_clean_failure_warns_installs_and_keeps_retry_marker() {
+        // A failed clean must not prevent the new commit's dependencies from
+        // being installed (e3da248ea / #11648).
         let dirs = TestDirs::new();
         let target = dirs.agent_dir.join("git/github.com/user/repo");
         // package.json declares a dependency so has_missing_git_dependencies
@@ -6652,14 +6815,8 @@ mod tests {
         });
         let manager = test_manager(&dirs, runner.clone());
         let result = manager.install("git:github.com/user/repo@v1", false);
-        // Original clean error must be rethrown.
-        assert!(result.is_err(), "install should fail after clean failure");
-        assert!(
-            result.unwrap_err().contains("git clean failed"),
-            "rethrown error should be the clean error"
-        );
-        // repair_missing_git_dependencies should have run npm install
-        // (because has_missing_git_dependencies is true).
+        result.expect("clean failure must not fail dependency installation");
+        assert!(marker.exists(), "failed clean retains the retry marker");
         let npm_calls = runner.find_calls("npm", "install");
         assert!(
             !npm_calls.is_empty(),
@@ -7675,6 +7832,78 @@ mod update_tests {
         // Versioned (range) sources reinstall the configured spec, not
         // `name@latest` (package-manager.ts:1162).
         assert!(installs[0].args.contains(&"foo@^1.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_update_npm_reports_actual_version_change_and_stale_metadata() {
+        let changed_dirs = TestDirs::new();
+        write_installed_npm(&changed_dirs, "foo", "1.0.0");
+        let changed_root = changed_dirs.agent_dir.clone();
+        let changed_runner =
+            FakeRunner::new(
+                move |request| match request.args.first().map(String::as_str) {
+                    Some("view") => Ok(r#""1.2.0""#.to_string()),
+                    Some("install") => {
+                        let dir = changed_root.join("npm/node_modules/foo");
+                        std::fs::create_dir_all(&dir).unwrap();
+                        std::fs::write(
+                            dir.join("package.json"),
+                            r#"{"name":"foo","version":"1.2.0"}"#,
+                        )
+                        .unwrap();
+                        Ok(String::new())
+                    }
+                    _ => Ok(String::new()),
+                },
+            );
+        let mut changed = manager(&changed_dirs, changed_runner);
+        changed
+            .settings_manager
+            .set_packages(vec![PackageSource::Source("npm:foo".to_string())]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        changed.set_progress_callback(Some(Box::new(move |event| {
+            sink.lock().unwrap().push(event.clone());
+        })));
+        changed.update(None).unwrap();
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == ProgressKind::Result
+                && event.message.as_deref() == Some("npm:foo 1.0.0 -> 1.2.0")
+        }));
+        drop(events);
+
+        let stale_dirs = TestDirs::new();
+        write_installed_npm(&stale_dirs, "foo", "1.0.0");
+        let stale_runner = FakeRunner::new(|request| {
+            if request.args.first().map(String::as_str) == Some("view") {
+                return Ok(r#""1.2.0""#.to_string());
+            }
+            Ok(String::new())
+        });
+        let mut stale = manager(&stale_dirs, stale_runner);
+        stale
+            .settings_manager
+            .set_packages(vec![PackageSource::Source("npm:foo".to_string())]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        stale.set_progress_callback(Some(Box::new(move |event| {
+            sink.lock().unwrap().push(event.clone());
+        })));
+        stale.update(None).unwrap();
+        let events = events.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == ProgressKind::Result)
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == ProgressKind::Progress
+                && event
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("registry metadata may be stale"))
+        }));
     }
 
     #[test]

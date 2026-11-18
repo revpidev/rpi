@@ -590,7 +590,14 @@ impl InteractiveUi {
             1,
             Arc::clone(&lock(&self.markdown_theme)),
             None,
-            None,
+            Some(rpi_tui::components::markdown::MarkdownOptions {
+                transform: crate::modes::interactive::components::markdown_transform::create_markdown_transform(
+                    "changelog",
+                    false,
+                    self.markdown_transformers(),
+                ),
+                ..Default::default()
+            }),
         )));
         chat.children.push(Box::new(DynamicBorder::new(border)));
         self.render_handle.request_render();
@@ -848,50 +855,57 @@ impl InteractiveMode {
                     .show_status(&format!("Session imported from: {input_path}"));
             }
             Err(RpiError::MissingSessionCwd(error)) => {
-                // `promptForMissingSessionCwd` (interactive-mode.ts:2762-2768 +
-                // 6590-6608): confirm the fallback cwd, then retry the import
-                // with it; a decline cancels the import.
-                let confirmed = crate::modes::interactive::interactive_mode::commands_selectors::show_extension_selector(
-                    &self.ui_state,
-                    &format!(
-                        "Session cwd not found\n{}",
-                        crate::core::session_cwd::format_missing_session_cwd_prompt(&error.issue)
-                    ),
-                    vec!["Yes".to_string(), "No".to_string()],
-                    BlockedStatus {
-                        kind: ProgramStatusKind::Permission,
-                        message: "Session cwd not found".to_string(),
-                    },
-                )
-                .await
-                .as_deref()
-                    == Some("Yes");
-                if !confirmed {
-                    self.ui_state.show_status("Import cancelled");
-                    return;
-                }
-                let fallback_cwd = error.issue.fallback_cwd.clone();
-                match self
-                    .runtime
-                    .import_from_jsonl(&input_path, Some(&fallback_cwd))
-                    .await
-                {
-                    Ok(true) => self.ui_state.show_status("Import cancelled"),
-                    Ok(false) => {
-                        self.rebind_session_ui().await;
-                        self.ui_state
-                            .show_status(&format!("Session imported from: {input_path}"));
+                match self.prompt_for_missing_cwd(&error.issue).await {
+                    Some(crate::core::session_cwd::MissingCwdDecision::Continue) => {
+                        let fallback_cwd = error.issue.fallback_cwd.clone();
+                        match self
+                            .runtime
+                            .import_from_jsonl(&input_path, Some(&fallback_cwd))
+                            .await
+                        {
+                            Ok(true) => self.ui_state.show_status("Import cancelled"),
+                            Ok(false) => {
+                                self.rebind_session_ui().await;
+                                self.ui_state
+                                    .show_status(&format!("Session imported from: {input_path}"));
+                            }
+                            Err(RpiError::SessionImportFileNotFound(error)) => self
+                                .ui_state
+                                .show_error(&format!("Failed to import session: {error}")),
+                            Err(error) => {
+                                self.handle_fatal_runtime_error(
+                                    "Failed to import session",
+                                    &error.raw_message(),
+                                )
+                                .await
+                            }
+                        }
                     }
-                    Err(RpiError::SessionImportFileNotFound(error)) => self
-                        .ui_state
-                        .show_error(&format!("Failed to import session: {error}")),
-                    Err(error) => {
-                        self.handle_fatal_runtime_error(
-                            "Failed to import session",
-                            &error.raw_message(),
-                        )
-                        .await
+                    Some(crate::core::session_cwd::MissingCwdDecision::Fork) => {
+                        match self
+                            .switch_to_forked_session(&input_path, &error.issue.fallback_cwd, None)
+                            .await
+                        {
+                            Ok(cancelled) => {
+                                if cancelled {
+                                    self.ui_state.show_status("Import cancelled");
+                                } else {
+                                    self.rebind_session_ui().await;
+                                    self.ui_state.show_status(&format!(
+                                        "Session imported from: {input_path}"
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                self.handle_fatal_runtime_error(
+                                    "Failed to import session",
+                                    &error.raw_message(),
+                                )
+                                .await
+                            }
+                        }
                     }
+                    None => self.ui_state.show_status("Import cancelled"),
                 }
             }
             // `SessionImportFileNotFoundError` (recoverable showError,

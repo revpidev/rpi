@@ -83,6 +83,26 @@ fn canonicalize_error_message_placement(map: &mut serde_json::Map<String, Value>
     }
 }
 
+/// Canonicalize `thinkingLevel` immediately after `timestamp`, as emitted by
+/// Pi v1.5.2. Rust struct field order and JavaScript spread order differ, but
+/// JSON object key order is not part of the session-format contract.
+fn canonicalize_thinking_level_placement(map: &mut serde_json::Map<String, Value>) {
+    if !map.contains_key("timestamp") {
+        return;
+    }
+    let Some((_, thinking)) = map.shift_remove_entry("thinkingLevel") else {
+        return;
+    };
+    let previous = std::mem::take(map);
+    for (key, value) in previous {
+        let timestamp = key == "timestamp";
+        map.insert(key, value);
+        if timestamp {
+            map.insert("thinkingLevel".to_owned(), thinking.clone());
+        }
+    }
+}
+
 /// Stateful normalizer. Reuse one instance per side of a comparison so id
 /// placeholders stay consistent across lines / events of that side.
 #[derive(Debug, Default)]
@@ -145,6 +165,7 @@ impl Normalizer {
                     }
                     self.normalize_json(val);
                 }
+                canonicalize_thinking_level_placement(map);
                 canonicalize_error_message_placement(map);
             }
             Value::Array(items) => {

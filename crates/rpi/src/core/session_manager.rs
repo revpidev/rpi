@@ -1490,15 +1490,22 @@ impl SessionManager {
         Ok(())
     }
 
-    /// `_appendEntry` (session-manager.ts:1044-1049): push, index, advance
-    /// leaf, then persist the appended entry.
+    /// `_appendEntry` (session-manager.ts:1192-1207): roll back the in-memory
+    /// entry and leaf when persistence fails so later entries cannot point at
+    /// a parent that was never written.
     fn append_entry(&mut self, typed: FileEntry) -> Result<String, RpiError> {
         let record = FileEntryRecord::from_typed(typed)?;
         let id = record.entry_id().unwrap_or_default().to_owned();
-        self.by_id.insert(id.clone(), self.records.len());
-        self.leaf_id = Some(id.clone());
+        let previous_leaf_id = self.leaf_id.clone();
         self.records.push(record);
-        self.persist_appended_entry()?;
+        self.by_id.insert(id.clone(), self.records.len() - 1);
+        self.leaf_id = Some(id.clone());
+        if let Err(error) = self.persist_appended_entry() {
+            self.records.pop();
+            self.by_id.remove(&id);
+            self.leaf_id = previous_leaf_id;
+            return Err(error);
+        }
         Ok(id)
     }
 
@@ -2093,9 +2100,11 @@ impl SessionManager {
         // `from_id` records the pre-navigation leaf the summary covers,
         // not the navigation target (`parent_id` keeps that).
         let from_id = self.leaf_id.clone().unwrap_or_else(|| "root".to_owned());
+        let previous_leaf_id = self.leaf_id.clone();
         self.leaf_id = branch_from_id.map(str::to_owned);
+        let summary_id = self.next_entry_id();
         let entry = FileEntry::BranchSummary(BranchSummaryEntry {
-            id: self.next_entry_id(),
+            id: summary_id.clone(),
             parent_id: branch_from_id.map(str::to_owned),
             timestamp: now_iso8601(),
             from_id,
@@ -2104,7 +2113,11 @@ impl SessionManager {
             usage,
             from_hook,
         });
-        self.append_entry(entry)
+        if let Err(error) = self.append_entry(entry) {
+            self.leaf_id = previous_leaf_id;
+            return Err(error);
+        }
+        Ok(summary_id)
     }
 
     /// `createBranchedSession` (session-manager.ts:1412-1512): extract the
@@ -2529,26 +2542,44 @@ impl SessionManager {
         });
         let header_record = FileEntryRecord::from_typed(new_header)?;
         // `wx` exclusive create (writeFileSync flag "wx", session-manager.ts:1620).
-        let mut fd = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&new_session_file)?;
-        fd.write_all(header_record.to_line()?.as_bytes())?;
-        fd.write_all(b"\n")?;
-        for line in &copy_lines {
-            fd.write_all(line.as_bytes())?;
+        // One writer owns the complete file. A failed write/open never leaves
+        // a partial fork that a later resume could mistake for a valid copy.
+        let mut created = false;
+        let write_result = (|| -> Result<(), RpiError> {
+            let mut fd = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&new_session_file)?;
+            created = true;
+            fd.write_all(header_record.to_line()?.as_bytes())?;
             fd.write_all(b"\n")?;
+            for line in &copy_lines {
+                fd.write_all(line.as_bytes())?;
+                fd.write_all(b"\n")?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            if created {
+                let _ = std::fs::remove_file(&new_session_file);
+            }
+            return Err(error);
         }
-        drop(fd);
 
-        SessionManager::new(
+        match SessionManager::new(
             &resolved_target_cwd,
             &dir,
             Some(&new_session_file),
             true,
             None,
             None,
-        )
+        ) {
+            Ok(manager) => Ok(manager),
+            Err(error) => {
+                let _ = std::fs::remove_file(&new_session_file);
+                Err(error)
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

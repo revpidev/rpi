@@ -724,7 +724,7 @@ pub fn build_context_messages(entries: &[SessionEntry]) -> Vec<AgentMessage> {
 }
 
 /// `projectContextEntry` (session-manager.ts:519-541) over typed entries.
-fn project_context_entry(
+pub fn project_context_entry(
     entry: &SessionEntry,
     edit: Option<&ContextEditEntry>,
 ) -> Vec<AgentMessage> {

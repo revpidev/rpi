@@ -1824,6 +1824,26 @@ impl SettingsManager {
         self.save();
     }
 
+    pub fn get_extension_changelog_version(&self, key: &str) -> Option<String> {
+        self.settings
+            .nested("extensionChangelogVersions", key)
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    }
+
+    pub fn set_extension_changelog_version(&mut self, key: &str, version: &str) {
+        let mut versions = self
+            .global_settings
+            .get("extensionChangelogVersions")
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        versions.insert(key.to_owned(), Value::String(version.to_owned()));
+        self.global_settings
+            .set("extensionChangelogVersions", Value::Object(versions));
+        self.mark_modified("extensionChangelogVersions", Some(key));
+        self.save();
+    }
+
     /// `getSessionDir` (settings-manager.ts:670-673): `normalizePath` (tilde
     /// expansion) applied to a non-empty value.
     pub fn get_session_dir(&self) -> Option<String> {

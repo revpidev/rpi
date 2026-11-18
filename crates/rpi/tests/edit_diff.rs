@@ -565,3 +565,59 @@ fn test_compute_edits_diff_success() {
     assert!(result.diff.as_ref().unwrap().contains("testing"));
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+fn apply_one(original: &str, old_text: &str, new_text: &str) -> AppliedEditsResult {
+    apply_edits_to_normalized_content(
+        &normalize_to_lf(original),
+        &[EditReplacement {
+            old_text: old_text.to_owned(),
+            new_text: new_text.to_owned(),
+            edit_index: 0,
+        }],
+        "mixed.txt",
+    )
+    .expect("apply edit")
+}
+
+#[test]
+fn replacements_preserve_mixed_line_endings_and_cr_seams() {
+    let mixed = apply_one("a\nb\r\nX = 1\r\n", "X = 1", "X = 2");
+    assert_eq!(
+        apply_replacements_to_original("a\nb\r\nX = 1\r\n", &mixed.replacements),
+        "a\nb\r\nX = 2\r\n"
+    );
+
+    let inserted = apply_one("a\rb\nc", "b", "\nB");
+    let written = apply_replacements_to_original("a\rb\nc", &inserted.replacements);
+    assert_eq!(written, "a\r\n\nB\nc");
+    assert_eq!(normalize_to_lf(&written), inserted.new_content);
+    let deleted = apply_one("a\rb\nc", "b", "");
+    let deleted_text = apply_replacements_to_original("a\rb\nc", &deleted.replacements);
+    assert_eq!(deleted_text, "a\r\n\nc");
+    assert_eq!(normalize_to_lf(&deleted_text), deleted.new_content);
+    let classic_mac = apply_one("a\rb\r", "b", "x\ny");
+    assert_eq!(
+        apply_replacements_to_original("a\rb\r", &classic_mac.replacements),
+        "a\rx\ry\r"
+    );
+}
+
+#[test]
+fn edit_diff_window_matches_whole_file_oracle() {
+    let old_lines = (1..=80)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>();
+    let mut new_lines = old_lines.clone();
+    new_lines[39] = "changed line 40".to_owned();
+    let old = old_lines.join("\n");
+    let new = new_lines.join("\n");
+    let applied = apply_one(&old, "line 40", "changed line 40");
+    let windowed = generate_edit_diff("lines.txt", &old, &new, &applied.replacements, 4);
+    let whole = generate_diff_string(&old, &new, 4);
+    assert_eq!(windowed.diff, whole.diff);
+    assert_eq!(
+        windowed.patch,
+        generate_unified_patch("lines.txt", &old, &new, 4)
+    );
+    assert_eq!(windowed.first_changed_line, Some(40));
+}

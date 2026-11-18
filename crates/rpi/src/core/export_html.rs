@@ -667,6 +667,49 @@ mod tests {
     }
 
     #[test]
+    fn generate_html_handles_deep_sessions_and_system_entries() {
+        let mut data = sample_session_data();
+        data.entries = (0..5000)
+            .map(|index| {
+                if index == 0 || index == 2500 {
+                    serde_json::json!({
+                        "type": "message",
+                        "id": format!("system-{index}"),
+                        "parentId": (index > 0).then(|| format!("user-{}", index - 1)),
+                        "timestamp": "2026-11-18T00:00:00.000Z",
+                        "message": {
+                            "role": "system",
+                            "content": if index == 0 { "初始提示" } else { "更新提示" },
+                            "sections": {"preamble": "系统"},
+                            "toolsAdded": [{"name": "read", "description": "读取文件", "parameters": {"type": "object"}}],
+                            "toolsRemoved": if index == 0 { serde_json::Value::Null } else { serde_json::json!(["bash"]) },
+                            "timestamp": index
+                        }
+                    })
+                } else {
+                    serde_json::json!({
+                        "type": "message",
+                        "id": format!("user-{index}"),
+                        "parentId": (index > 0).then(|| format!("user-{}", index - 1)),
+                        "timestamp": "2026-11-18T00:00:00.000Z",
+                        "message": {"role": "user", "content": format!("消息 {index}"), "timestamp": index}
+                    })
+                }
+            })
+            .collect();
+        data.leaf_id = Some("user-4999".to_owned());
+        let html = generate_html(&data, Some("dark")).expect("deep export");
+        let decoded = decode_session_data(&html);
+        assert_eq!(decoded["entries"].as_array().expect("entries").len(), 5000);
+        assert_eq!(
+            decoded["entries"][0]["message"]["toolsAdded"][0]["name"],
+            "read"
+        );
+        assert_eq!(decoded["entries"][2500]["message"]["content"], "更新提示");
+        assert_eq!(decoded["entries"][4999]["message"]["content"], "消息 4999");
+    }
+
+    #[test]
     fn generate_html_drops_absent_state_fields() {
         let mut data = sample_session_data();
         data.system_prompt = None;

@@ -75,15 +75,55 @@ fn normalize_whitespace_lower(text: &str) -> String {
         .join(" ")
 }
 
-/// `getSessionSearchText` (session-selector-search.ts:26-28).
-fn get_session_search_text(session: &SessionInfo) -> String {
-    format!(
-        "{} {} {} {}",
-        session.id,
-        session.name.as_deref().unwrap_or(""),
-        session.all_messages_text,
-        session.cwd
-    )
+const TIER_NAME: f64 = 0.0;
+const TIER_TEXT: f64 = 1_000_000.0;
+const TIER_FUZZY: f64 = 2_000_000.0;
+
+fn match_literal_token(session: &SessionInfo, value: &str) -> Option<f64> {
+    let name = session.name.as_deref().unwrap_or("").to_lowercase();
+    if name.contains(value) {
+        return Some(TIER_NAME + fuzzy_match(value, &name).score);
+    }
+    if session.id.to_lowercase().contains(value)
+        || session.all_messages_text.to_lowercase().contains(value)
+        || session.cwd.to_lowercase().contains(value)
+    {
+        let text = format!(
+            "{} {} {}",
+            session.id, session.all_messages_text, session.cwd
+        );
+        return Some(TIER_TEXT + fuzzy_match(value, &text).score);
+    }
+    None
+}
+
+fn match_fuzzy_token(session: &SessionInfo, value: &str) -> Option<f64> {
+    let literal = match_literal_token(session, &value.to_lowercase());
+    if literal.is_some() {
+        return literal;
+    }
+    [session.name.as_deref().unwrap_or(""), session.cwd.as_str()]
+        .into_iter()
+        .filter_map(|field| {
+            let matched = fuzzy_match(value, field);
+            matched.matches.then_some(matched.score)
+        })
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|score| TIER_FUZZY + score)
+}
+
+fn match_phrase_token(session: &SessionInfo, phrase: &str) -> Option<f64> {
+    let name = normalize_whitespace_lower(session.name.as_deref().unwrap_or(""));
+    if name.contains(phrase) {
+        return Some(TIER_NAME + fuzzy_match(phrase, &name).score);
+    }
+    if session.id.to_lowercase().contains(phrase)
+        || normalize_whitespace_lower(&session.all_messages_text).contains(phrase)
+        || normalize_whitespace_lower(&session.cwd).contains(phrase)
+    {
+        return Some(TIER_TEXT);
+    }
+    None
 }
 
 /// `hasSessionName` (session-selector-search.ts:30-32).
@@ -202,16 +242,8 @@ pub fn parse_search_query(query: &str) -> ParsedSearchQuery {
     }
 }
 
-/// Char index of a byte index (JS `indexOf`/`search` return UTF-16 code-unit
-/// indices; scores are ordering hints, char indices rank identically).
-fn char_index_at(text: &str, byte_index: usize) -> usize {
-    text[..byte_index].chars().count()
-}
-
 /// `matchSession` (session-selector-search.ts:116-154).
 pub fn match_session(session: &SessionInfo, parsed: &ParsedSearchQuery) -> MatchResult {
-    let text = get_session_search_text(session);
-
     if parsed.mode == QueryMode::Regex {
         let Some(regex) = &parsed.regex else {
             return MatchResult {
@@ -219,60 +251,51 @@ pub fn match_session(session: &SessionInfo, parsed: &ParsedSearchQuery) -> Match
                 score: 0.0,
             };
         };
-        let Some(found) = regex.find(&text) else {
+        if session
+            .name
+            .as_deref()
+            .is_some_and(|name| regex.is_match(name))
+        {
             return MatchResult {
-                matches: false,
-                score: 0.0,
+                matches: true,
+                score: TIER_NAME,
             };
-        };
+        }
+        if regex.is_match(&session.id)
+            || regex.is_match(&session.all_messages_text)
+            || regex.is_match(&session.cwd)
+        {
+            return MatchResult {
+                matches: true,
+                score: TIER_TEXT,
+            };
+        }
         return MatchResult {
-            matches: true,
-            score: char_index_at(&text, found.start()) as f64 * 0.1,
-        };
-    }
-
-    if parsed.tokens.is_empty() {
-        return MatchResult {
-            matches: true,
+            matches: false,
             score: 0.0,
         };
     }
 
     let mut total_score = 0.0;
-    let mut normalized_text: Option<String> = None;
-
     for token in &parsed.tokens {
-        match token {
+        let score = match token {
             SearchToken::Phrase(phrase) => {
-                if normalized_text.is_none() {
-                    normalized_text = Some(normalize_whitespace_lower(&text));
-                }
                 let phrase = normalize_whitespace_lower(phrase);
                 if phrase.is_empty() {
                     continue;
                 }
-                let normalized = normalized_text.as_ref().expect("set above");
-                let Some(index) = normalized.find(&phrase) else {
-                    return MatchResult {
-                        matches: false,
-                        score: 0.0,
-                    };
-                };
-                total_score += char_index_at(normalized, index) as f64 * 0.1;
+                match_phrase_token(session, &phrase)
             }
-            SearchToken::Fuzzy(value) => {
-                let matched = fuzzy_match(value, &text);
-                if !matched.matches {
-                    return MatchResult {
-                        matches: false,
-                        score: 0.0,
-                    };
-                }
-                total_score += matched.score;
-            }
-        }
+            SearchToken::Fuzzy(value) => match_fuzzy_token(session, value),
+        };
+        let Some(score) = score else {
+            return MatchResult {
+                matches: false,
+                score: 0.0,
+            };
+        };
+        total_score += score;
     }
-
     MatchResult {
         matches: true,
         score: total_score,

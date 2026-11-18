@@ -1701,6 +1701,10 @@ pub fn decode_kitty_printable(data: &str) -> Option<char> {
         effective_codepoint = shifted_key;
     }
     effective_codepoint = normalize_kitty_functional_codepoint(effective_codepoint);
+    // Kitty reserves this PUA range for F13-F35, media and modifier keys.
+    if (57344..=63743).contains(&effective_codepoint) {
+        return None;
+    }
     // Drop control characters or invalid codepoints.
     if effective_codepoint < 32 {
         return None;
@@ -2341,6 +2345,14 @@ mod tests {
 
     mod decode_kitty_printable {
         use super::*;
+
+        #[test]
+        fn private_function_key_codepoints_never_become_text() {
+            let _globals = lock_globals();
+            for codepoint in [57376, 57419, 63743] {
+                assert_eq!(decode_kitty_printable(&format!("\x1b[{codepoint}u")), None);
+            }
+        }
 
         #[test]
         fn decodes_kitty_keypad_functional_keys_to_printable_characters() {

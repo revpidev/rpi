@@ -334,10 +334,7 @@ pub fn format_read_line_range(offset: Option<&Value>, limit: Option<&Value>) -> 
 /// `~` (unix `HOME`, same convention as `tools/path_utils.rs`).
 pub fn shorten_path(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
-    if !home.is_empty() && path.starts_with(&home) {
-        return format!("~{}", &path[home.len()..]);
-    }
-    path.to_string()
+    crate::tools::path_utils::shorten_home_path(path, &home)
 }
 
 /// `linkPath` (render-utils.ts:19-23): wrap the styled text in an OSC 8

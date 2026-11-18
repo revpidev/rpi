@@ -29,6 +29,16 @@ pub fn create_markdown_transform(
     is_streaming: bool,
     transformers: Vec<MarkdownTransformerFn>,
 ) -> Option<MarkdownTransformFn> {
+    create_markdown_transform_with_metadata(message_type, is_streaming, transformers, None, None)
+}
+
+pub fn create_markdown_transform_with_metadata(
+    message_type: &str,
+    is_streaming: bool,
+    transformers: Vec<MarkdownTransformerFn>,
+    message_id: Option<String>,
+    timestamp: Option<String>,
+) -> Option<MarkdownTransformFn> {
     if transformers.is_empty() {
         return None;
     }
@@ -38,9 +48,34 @@ pub fn create_markdown_transform(
             message_type: message_type.clone(),
             is_streaming,
             available_width,
+            message_id: message_id.clone(),
+            timestamp: timestamp.clone(),
         };
         apply_markdown_transformers(markdown, &context, &transformers)
     }))
+}
+
+pub fn create_header_prefixed_markdown_transform(
+    header: String,
+    message_type: &str,
+    transformers: Vec<MarkdownTransformerFn>,
+    message_id: Option<String>,
+    timestamp: Option<String>,
+) -> MarkdownTransformFn {
+    let transform = create_markdown_transform_with_metadata(
+        message_type,
+        false,
+        transformers,
+        message_id,
+        timestamp,
+    );
+    Arc::new(move |markdown, width| {
+        let transformed = transform
+            .as_ref()
+            .map(|transform| transform(markdown, width))
+            .unwrap_or_else(|| markdown.to_owned());
+        format!("{header}{transformed}")
+    })
 }
 
 /// `applyMarkdownTransformers` (markdown-transform.ts:11-29): apply each
@@ -136,5 +171,23 @@ mod tests {
         assert_eq!(transform("x", 10), "x");
         assert_eq!(transform("x", 20), "x");
         assert_eq!(counter.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn persisted_metadata_is_forwarded_and_host_header_is_not_transformed() {
+        let transform = create_header_prefixed_markdown_transform(
+            "**Summary**\n\n".to_owned(),
+            "summary",
+            vec![Arc::new(|markdown, context| {
+                assert_eq!(markdown, "body");
+                assert_eq!(context.message_id.as_deref(), Some("entry-7"));
+                assert_eq!(context.timestamp.as_deref(), Some("2026-11-18T00:00:00Z"));
+                assert_eq!(context.message_type, "summary");
+                format!("transformed({markdown})")
+            })],
+            Some("entry-7".to_owned()),
+            Some("2026-11-18T00:00:00Z".to_owned()),
+        );
+        assert_eq!(transform("body", 80), "**Summary**\n\ntransformed(body)");
     }
 }

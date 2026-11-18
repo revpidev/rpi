@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine;
@@ -491,6 +491,7 @@ struct AgentSessionInner {
     /// `abort_branch_summary` cancels it, `is_compacting` consults it
     /// (#8920 / FR-F R2).
     branch_summary_abort: crate::core::compaction_runner::AbortTokenCell,
+    navigation_generation: AtomicU64,
 
     listeners: Mutex<Vec<(u64, AgentSessionEventListener)>>,
     next_listener_id: AtomicU64,
@@ -505,6 +506,9 @@ struct AgentSessionInner {
 
     steering_messages: Mutex<Vec<String>>,
     follow_up_messages: Mutex<Vec<String>>,
+    queued_message_generations: Mutex<HashSet<i64>>,
+    last_queued_timestamp: AtomicI64,
+    image_resize_queue: tokio::sync::Mutex<()>,
     pending_next_turn_messages: Mutex<Vec<AgentMessage>>,
     /// `_pendingCustomMessages` (agent-session.ts:331): custom messages sent
     /// with `triggerTurn: false` while streaming, appended once the current
@@ -997,6 +1001,7 @@ impl AgentSession {
             compaction_abort,
             auto_compaction_abort,
             branch_summary_abort: crate::core::compaction_runner::AbortTokenCell::default(),
+            navigation_generation: AtomicU64::new(0),
             listeners: Mutex::new(Vec::new()),
             next_listener_id: AtomicU64::new(0),
             unsubscribe_agent: Mutex::new(None),
@@ -1005,6 +1010,9 @@ impl AgentSession {
             idle_notify: Notify::new(),
             steering_messages: Mutex::new(Vec::new()),
             follow_up_messages: Mutex::new(Vec::new()),
+            queued_message_generations: Mutex::new(HashSet::new()),
+            last_queued_timestamp: AtomicI64::new(0),
+            image_resize_queue: tokio::sync::Mutex::new(()),
             pending_next_turn_messages: Mutex::new(Vec::new()),
             pending_custom_messages: Mutex::new(Vec::new()),
             last_assistant_message: Mutex::new(None),
@@ -1176,6 +1184,7 @@ impl AgentSession {
         // 760-786 @ b4afdddf): a SessionManager projection becomes the
         // provider-context authority before every conversational request.
         session.install_agent_request_projection();
+        session.install_queued_message_normalization();
         // `_installAgentBoundaryHooks()` (agent-session.ts:398, 858-868):
         // `turn_end` boundary dispatch runs inside `finishTurn`.
         session.install_agent_boundary_hooks();
@@ -1481,25 +1490,43 @@ impl AgentSession {
         let recorded = crate::core::virtual_models::get_branch_selection(&typed, |provider, id| {
             runtime.get_model(provider, id)
         });
-        let Some((recorded_provider, recorded_model_id)) = recorded else {
+        if let Some((recorded_provider, recorded_model_id)) = recorded
+            && (recorded_provider != model.provider || recorded_model_id != model.id)
+        {
+            let recorded_model = self
+                .inner
+                .model_runtime
+                .get_model(&recorded_provider, &recorded_model_id);
+            let current_virtual = crate::core::virtual_models::is_virtual_model(&model);
+            let recorded_virtual = recorded_model
+                .as_ref()
+                .is_some_and(crate::core::virtual_models::is_virtual_model);
+            if (current_virtual || recorded_virtual)
+                && let Err(error) = lock(&self.inner.session_manager)
+                    .append_model_change(&model.provider, &model.id)
+            {
+                tracing::warn!("session append failed: {error}");
+            }
+        }
+
+        let recorded_level = branch.iter().rev().find_map(|entry| match entry.known() {
+            Some(SessionEntry::ThinkingLevelChange(change)) => {
+                crate::cli::args::parse_thinking_level(&change.thinking_level)
+            }
+            _ => None,
+        });
+        let Some(recorded_level) = recorded_level else {
             return;
         };
-        if recorded_provider == model.provider && recorded_model_id == model.id {
-            return;
-        }
-        let recorded_model = self
-            .inner
-            .model_runtime
-            .get_model(&recorded_provider, &recorded_model_id);
-        let current_virtual = crate::core::virtual_models::is_virtual_model(&model);
-        let recorded_virtual = recorded_model
-            .as_ref()
-            .is_some_and(crate::core::virtual_models::is_virtual_model);
-        if !current_virtual && !recorded_virtual {
-            return;
-        }
-        if let Err(error) =
-            lock(&self.inner.session_manager).append_model_change(&model.provider, &model.id)
+        let available = self.get_available_thinking_levels();
+        let effective = if available.contains(&recorded_level) {
+            recorded_level
+        } else {
+            clamp_thinking_level(&model, recorded_level)
+        };
+        if effective != self.thinking_level()
+            && let Err(error) = lock(&self.inner.session_manager)
+                .append_thinking_level_change(thinking_level_str(self.thinking_level()))
         {
             tracing::warn!("session append failed: {error}");
         }
@@ -2210,7 +2237,7 @@ impl AgentSession {
     }
 
     /// `_handleAgentEvent` (agent-session.ts:1074-1086).
-    async fn handle_agent_event(&self, event: AgentEvent) {
+    async fn handle_agent_event(&self, mut event: AgentEvent) {
         // An abort requested while the run was starting (e.g. during
         // before_agent_start) stops it when the loop starts
         // (agent-session.ts:1104-1107 @ b4afdddf). `agent_start` is awaited
@@ -2228,24 +2255,34 @@ impl AgentSession {
         // BEFORE emitting (agent-session.ts:598-616).
         if let AgentEvent::MessageStart {
             message: AgentMessage::User(user),
-        } = &event
+        } = &mut event
         {
             self.inner.compaction.lock().await.reset_overflow_recovery();
             let message_text = content_text_user(&user.content, "");
-            if !message_text.is_empty() {
-                let mut steering = lock(&self.inner.steering_messages);
-                if let Some(index) = steering.iter().position(|m| *m == message_text) {
-                    steering.remove(index);
-                    drop(steering);
-                    self.emit_queue_update();
+            let is_queued_delivery =
+                lock(&self.inner.queued_message_generations).remove(&user.timestamp);
+            let mut steering = lock(&self.inner.steering_messages);
+            let steering_index = if is_queued_delivery && !steering.is_empty() {
+                Some(0)
+            } else {
+                steering.iter().position(|m| *m == message_text)
+            };
+            if let Some(index) = steering_index {
+                steering.remove(index);
+                drop(steering);
+                self.emit_queue_update();
+            } else {
+                drop(steering);
+                let mut follow_up = lock(&self.inner.follow_up_messages);
+                let index = if is_queued_delivery && !follow_up.is_empty() {
+                    Some(0)
                 } else {
-                    drop(steering);
-                    let mut follow_up = lock(&self.inner.follow_up_messages);
-                    if let Some(index) = follow_up.iter().position(|m| *m == message_text) {
-                        follow_up.remove(index);
-                        drop(follow_up);
-                        self.emit_queue_update();
-                    }
+                    follow_up.iter().position(|m| *m == message_text)
+                };
+                if let Some(index) = index {
+                    follow_up.remove(index);
+                    drop(follow_up);
+                    self.emit_queue_update();
                 }
             }
         }
@@ -3458,12 +3495,24 @@ impl AgentSession {
     /// declarations from requests (the hidden projection lives on the agent
     /// transform chain).
     fn apply_tool_loadout(&self, tool_names: Vec<String>) -> Vec<Arc<dyn AgentTool>> {
+        let requested: HashSet<String> = tool_names.iter().cloned().collect();
+        let mut ordered_names = self
+            .get_active_tool_names()
+            .into_iter()
+            .filter(|name| requested.contains(name))
+            .collect::<Vec<_>>();
+        let mut seen: HashSet<String> = ordered_names.iter().cloned().collect();
+        ordered_names.extend(
+            tool_names
+                .into_iter()
+                .filter(|name| seen.insert(name.clone())),
+        );
         let (tools, loadout, hooks) = {
             let definitions = lock(&self.inner.tool_definitions);
             let registry = lock(&self.inner.tool_registry);
             let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
-            for name in tool_names {
+            for name in ordered_names {
                 if !seen.insert(name.clone()) {
                     continue;
                 }
@@ -4160,16 +4209,44 @@ impl AgentSession {
             && self.inner.agent.has_queued_messages()
     }
 
+    fn install_queued_message_normalization(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        self.inner
+            .agent
+            .set_prepare_queued_messages(Some(Arc::new(move |messages| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    let Some(inner) = weak.upgrade() else {
+                        return messages;
+                    };
+                    let session = AgentSession { inner };
+                    let mut normalized = Vec::with_capacity(messages.len());
+                    for mut message in messages {
+                        if let AgentMessage::User(user) = &mut message {
+                            let is_queued_image = lock(&session.inner.queued_message_generations)
+                                .contains(&user.timestamp);
+                            if is_queued_image {
+                                session.normalize_queued_message_images(user).await;
+                            }
+                        }
+                        normalized.push(message);
+                    }
+                    normalized
+                })
+            })));
+    }
+
     /// `_normalizePromptImages` (agent-session.ts:1890-1911 @ f5c946480):
     /// run prompt images through the shared `process_image` seam with the
     /// current model's resize profile before they enter the request and
     /// history. Cache-safe: resampling happens before base64 encoding, and a
     /// missing profile keeps the historical global defaults (zero-regression
     /// red line, #9631).
-    fn normalize_prompt_images(
+    async fn normalize_prompt_images(
         &self,
         images: Option<Vec<ImageContent>>,
     ) -> (Vec<ImageContent>, Vec<String>) {
+        let _queue = self.inner.image_resize_queue.lock().await;
         let Some(images) = images else {
             return (Vec::new(), Vec::new());
         };
@@ -4218,6 +4295,36 @@ impl AgentSession {
             }
         }
         (normalized_images, hints)
+    }
+
+    async fn normalize_queued_message_images(&self, message: &mut UserMessage) {
+        let UserContent::Blocks(blocks) = &mut message.content else {
+            return;
+        };
+        let Some(UserContentBlock::Text(mut first)) = blocks.first().cloned() else {
+            return;
+        };
+        let images = blocks
+            .iter()
+            .filter_map(|block| match block {
+                UserContentBlock::Image(image) => Some(image.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let (normalized, hints) = self.normalize_prompt_images(Some(images)).await;
+        if !hints.is_empty() {
+            first.text = format!("{}\n\n{}", first.text, hints.join("\n"));
+        }
+        let mut content = vec![UserContentBlock::Text(first.clone())];
+        content.extend(
+            blocks
+                .iter()
+                .filter(|block| !matches!(block, UserContentBlock::Image(_)))
+                .skip(1)
+                .cloned(),
+        );
+        content.extend(normalized.into_iter().map(UserContentBlock::Image));
+        *blocks = content;
     }
 
     /// Try to mark a run as starting (`_startRun` entry, agent-session.ts:
@@ -4325,7 +4432,8 @@ impl AgentSession {
                 // @ f5c946480): after the hook so extension-driven model
                 // selection determines the resize profile used for the
                 // request and history (#9631).
-                let (normalized_images, image_hints) = self.normalize_prompt_images(images.clone());
+                let (normalized_images, image_hints) =
+                    self.normalize_prompt_images(images.clone()).await;
                 let user_text = if image_hints.is_empty() {
                     prompt.clone()
                 } else {
@@ -4749,18 +4857,37 @@ impl AgentSession {
             .await
     }
 
+    fn queued_user_message(&self, text: &str, images: Option<Vec<ImageContent>>) -> AgentMessage {
+        let has_images = images.as_ref().is_some_and(|images| !images.is_empty());
+        let mut message = user_message(text, images);
+        let timestamp = self
+            .inner
+            .last_queued_timestamp
+            .fetch_max(now_millis(), Ordering::SeqCst)
+            + 1;
+        if let AgentMessage::User(user) = &mut message {
+            user.timestamp = timestamp;
+        }
+        if has_images {
+            lock(&self.inner.queued_message_generations).insert(timestamp);
+        }
+        message
+    }
+
     /// `_queueSteer` (agent-session.ts:1371-1383).
     async fn queue_steer(&self, text: &str, images: Option<Vec<ImageContent>>) {
         lock(&self.inner.steering_messages).push(text.to_owned());
         self.emit_queue_update();
-        self.inner.agent.steer(user_message(text, images));
+        let message = self.queued_user_message(text, images);
+        self.inner.agent.steer(message);
     }
 
     /// `_queueFollowUp` (agent-session.ts:1388-1400).
     async fn queue_follow_up(&self, text: &str, images: Option<Vec<ImageContent>>) {
         lock(&self.inner.follow_up_messages).push(text.to_owned());
         self.emit_queue_update();
-        self.inner.agent.follow_up(user_message(text, images));
+        let message = self.queued_user_message(text, images);
+        self.inner.agent.follow_up(message);
     }
 
     /// `_throwIfExtensionCommand` (agent-session.ts:1405-1415).
@@ -5693,6 +5820,9 @@ impl AgentSession {
     /// `abortBranchSummary` (agent-session.ts:2107-2108, bea67d90d/#8920):
     /// cancel an in-flight branch summary generation.
     pub fn abort_branch_summary(&self) {
+        self.inner
+            .navigation_generation
+            .fetch_add(1, Ordering::SeqCst);
         if let Some(token) = lock(&self.inner.branch_summary_abort).as_ref() {
             token.cancel();
         }
@@ -6028,6 +6158,11 @@ impl AgentSession {
             ));
         }
 
+        let navigation_generation = self
+            .inner
+            .navigation_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
         let old_leaf_id = lock(&self.inner.session_manager)
             .get_leaf_id()
             .map(str::to_owned);
@@ -6114,9 +6249,32 @@ impl AgentSession {
             // V16-12 FR-B R6: route the summary model first under a virtual
             // selection (`_getSummarizationRequestAuth`, agent-session.ts:549-568).
             let (summary_model, summary_thinking_level) = self.summarization_model().await?;
-            let model = summary_model.ok_or_else(|| {
+            let mut model = summary_model.ok_or_else(|| {
                 RpiError::Session("No model available for summarization".to_owned())
             })?;
+            let summary_auth = match self.inner.model_runtime.get_auth(&model, None).await {
+                Ok(auth) => auth,
+                Err(error) if token.is_cancelled() => return Err(RpiError::Session(error.message)),
+                Err(_) => None,
+            };
+            let (api_key, headers, env) = match summary_auth {
+                Some(result) => {
+                    if let Some(base_url) = result.auth.base_url {
+                        model.base_url = base_url;
+                    }
+                    (
+                        result.auth.api_key,
+                        result.auth.headers.map(|headers| {
+                            headers
+                                .into_iter()
+                                .filter(|(_, value)| value.is_some())
+                                .collect()
+                        }),
+                        result.env,
+                    )
+                }
+                None => (None, None, None),
+            };
             let reserve_tokens = lock(&self.inner.resource_loader)
                 .settings_manager_mut()
                 .get_branch_summary_settings()
@@ -6134,13 +6292,15 @@ impl AgentSession {
                     args: &SummarizationArgs {
                         signal: Some(token.clone()),
                         thinking_level: Some(summary_thinking_level),
+                        api_key,
+                        headers,
+                        env,
                         retry: {
                             let mut loader = lock(&self.inner.resource_loader);
                             retry_config_to_policy(
                                 loader.settings_manager_mut().get_retry_settings(),
                             )
                         },
-                        ..Default::default()
                     },
                     custom_instructions: custom_instructions.as_deref(),
                     replace_instructions,
@@ -6169,6 +6329,14 @@ impl AgentSession {
             summary_text = Some(extension_summary.summary);
             summary_details = extension_summary.details;
             summary_usage = extension_summary.usage;
+        }
+
+        if self.inner.navigation_generation.load(Ordering::SeqCst) != navigation_generation {
+            return Ok(NavigateTreeResult {
+                cancelled: true,
+                aborted: true,
+                ..Default::default()
+            });
         }
 
         // Determine the new leaf position (agent-session.ts:3013-3028).

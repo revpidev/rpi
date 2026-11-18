@@ -52,41 +52,12 @@ fn parameters() -> Value {
     })
 }
 
-/// Schema descriptions and property names, recursively.
-fn schema_text(schema: &Value, parts: &mut Vec<String>) {
-    let Some(object) = schema.as_object() else {
-        return;
-    };
-    if let Some(description) = object.get("description").and_then(Value::as_str) {
-        parts.push(description.to_owned());
-    }
-    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
-        for (name, property) in properties {
-            parts.push(name.clone());
-            schema_text(property, parts);
-        }
-    }
-    if let Some(items) = object.get("items") {
-        schema_text(items, parts);
-    }
-    for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(variants) = object.get(key).and_then(Value::as_array) {
-            for variant in variants {
-                schema_text(variant, parts);
-            }
-        }
-    }
-}
-
-/// Search text of a tool: its name, the name with `_` as spaces, its
-/// description, and its parameters' text.
+/// Search text of a tool: its description and parameters' text.
 fn search_text(tool: &ToolRegistration) -> String {
-    let mut parts: Vec<String> = vec![
-        tool.name().to_string(),
-        tool.name().replace('_', " "),
-        tool.tool.description.clone(),
-    ];
-    schema_text(&tool.tool.parameters, &mut parts);
+    let mut parts: Vec<String> = vec![tool.tool.description.clone()];
+    let schema = &tool.tool.parameters;
+    let mut seen = std::collections::HashSet::from([std::ptr::from_ref(schema) as usize]);
+    crate::search::append_schema_search_text(schema, schema, &mut seen, &mut parts);
     parts
         .into_iter()
         .filter(|part| !part.trim().is_empty())
@@ -125,6 +96,7 @@ impl ToolExecute for ToolSearchTool {
             .map(|tool| SearchDocument {
                 name: tool.name().to_string(),
                 text: search_text(tool),
+                namespace_text: None,
             })
             .collect();
         let loaded = rank_documents(&query, &documents, limit);

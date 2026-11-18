@@ -314,3 +314,25 @@ fn models_schema_includes_anthropic_message_threads_compat() {
         assert_eq!(field["type"], serde_json::json!(["boolean"]));
     }
 }
+
+#[test]
+fn extension_changelog_versions_are_string_records() {
+    let (_schema, validator) = schema("settings.schema.json");
+    assert!(validator.is_valid(&serde_json::json!({
+        "extensionChangelogVersions": {"[\"npm:demo\",\"user\"]": "1.2.0"}
+    })));
+    assert!(!validator.is_valid(&serde_json::json!({
+        "extensionChangelogVersions": {"npm:demo": 42}
+    })));
+}
+
+#[test]
+fn self_update_command_wrapper_is_not_a_supported_setting() {
+    let (settings, _validator) = schema("settings.schema.json");
+    assert!(settings["properties"].get("selfUpdateCommand").is_none());
+    assert!(
+        settings["properties"]
+            .get("extensionChangelogVersions")
+            .is_some()
+    );
+}

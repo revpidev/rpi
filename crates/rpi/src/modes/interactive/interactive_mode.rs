@@ -1627,6 +1627,8 @@ pub(crate) struct InteractiveUi {
     /// Interactive custom UI components (ADR-0024 / V14-21 C1): the native
     /// host registry behind `ui.mountComponent` … `ui.disposeComponent`.
     pub(crate) component_registry: component_registry::ComponentRegistry,
+    extension_overlays: Mutex<HashMap<u64, (OverlayHandle, bool)>>,
+    next_extension_overlay_id: AtomicU64,
 
     /// The built-in startup header (only when not quiet), for the
     /// tools-expanded linkage (interactive-mode.ts:3812-3824).
@@ -1637,6 +1639,7 @@ pub(crate) struct InteractiveUi {
     /// (None when there is nothing newer than `lastChangelogVersion`);
     /// `/changelog` renders it, falling back to the placeholder.
     pub(crate) changelog_markdown: Mutex<Option<String>>,
+    extension_changelog_updates: Mutex<Vec<ExtensionChangelogUpdate>>,
 
     /// Streaming assistant message (interactive-mode.ts:365-366).
     streaming: Mutex<Option<StreamingTrack>>,
@@ -1947,55 +1950,113 @@ fn is_anthropic_subscription_auth_key(api_key: Option<&str>) -> bool {
     api_key.is_some_and(|key| key.starts_with("sk-ant-oat"))
 }
 
-/// The `showStartupNoticesIfNeeded` body (interactive-mode.ts:856-870 @
-/// b4afdddf): the bordered condensed line or the full "What's New" block.
-/// A free function so the golden-frame snapshot tests can render the exact
-/// block without a full mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExtensionChangelogUpdate {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) markdown: String,
+}
+
+/// The `showStartupNoticesIfNeeded` body (interactive-mode.ts:856-887 @
+/// b4afdddf): host and extension changelogs in one bordered notice.
 pub(crate) fn startup_notice_components(
-    changelog_markdown: &str,
+    changelog_markdown: Option<&str>,
+    extension_updates: &[ExtensionChangelogUpdate],
     collapse_changelog: bool,
     theme: &crate::modes::interactive::components::ThemeHandle,
     markdown_theme: &Mutex<Arc<MarkdownTheme>>,
+    markdown_transformers: Vec<rpi_ext_host::types::MarkdownTransformerFn>,
 ) -> Vec<Box<dyn rpi_tui::tui::Component>> {
     let border_theme = Arc::clone(&lock(theme));
     let border = Box::new(move |text: &str| border_theme.fg("border", text));
     let mut components: Vec<Box<dyn rpi_tui::tui::Component>> = Vec::new();
     components.push(Box::new(DynamicBorder::new(border.clone())));
-    if collapse_changelog {
-        // `##\s+\[?(\d+\.\d+\.\d+)\]?` (interactive-mode.ts:858): the
-        // first version heading in the markdown; fallback = current version.
-        let version = crate::core::changelog::parse_changelog(changelog_markdown)
-            .first()
-            .map(|entry| format!("{}.{}.{}", entry.major, entry.minor, entry.patch))
-            .unwrap_or_else(|| VERSION.to_owned());
-        components.push(Box::new(Text::new(
-            format!(
-                "Updated to v{version}. Use {} to view full changelog.",
-                Theme::bold("/changelog")
-            ),
-            1,
-            0,
-            None,
-        )));
-    } else {
-        components.push(Box::new(
-            crate::modes::interactive::components::ThemedText::new(
-                Arc::clone(theme),
-                |theme| Theme::bold(&theme.fg("accent", "What's New")),
+    if let Some(changelog_markdown) = changelog_markdown {
+        if collapse_changelog {
+            let version = crate::core::changelog::parse_changelog(changelog_markdown)
+                .first()
+                .map(|entry| format!("{}.{}.{}", entry.major, entry.minor, entry.patch))
+                .unwrap_or_else(|| VERSION.to_owned());
+            components.push(Box::new(Text::new(
+                format!(
+                    "Updated to v{version}. Use {} to view full changelog.",
+                    Theme::bold("/changelog")
+                ),
                 1,
                 0,
-            ),
-        ));
-        components.push(Box::new(Spacer::new(1)));
-        components.push(Box::new(Markdown::new(
-            changelog_markdown.trim().to_owned(),
-            1,
-            0,
-            Arc::clone(&lock(markdown_theme)),
-            None,
-            None,
-        )));
-        components.push(Box::new(Spacer::new(1)));
+                None,
+            )));
+        } else {
+            components.push(Box::new(
+                crate::modes::interactive::components::ThemedText::new(
+                    Arc::clone(theme),
+                    |theme| Theme::bold(&theme.fg("accent", "What's New")),
+                    1,
+                    0,
+                ),
+            ));
+            components.push(Box::new(Spacer::new(1)));
+            components.push(Box::new(Markdown::new(
+                changelog_markdown.trim().to_owned(),
+                1,
+                0,
+                Arc::clone(&lock(markdown_theme)),
+                None,
+                Some(rpi_tui::components::markdown::MarkdownOptions {
+                    transform: crate::modes::interactive::components::markdown_transform::create_markdown_transform(
+                        "changelog",
+                        false,
+                        markdown_transformers.clone(),
+                    ),
+                    ..Default::default()
+                }),
+            )));
+            components.push(Box::new(Spacer::new(1)));
+        }
+    }
+    if !extension_updates.is_empty() {
+        if changelog_markdown.is_some() {
+            components.push(Box::new(Spacer::new(1)));
+        }
+        if collapse_changelog {
+            let text = extension_updates
+                .iter()
+                .map(|update| format!("Updated {} to v{}.", update.name, update.version))
+                .collect::<Vec<_>>()
+                .join("\n");
+            components.push(Box::new(Text::new(text, 1, 0, None)));
+        } else {
+            components.push(Box::new(
+                crate::modes::interactive::components::ThemedText::new(
+                    Arc::clone(theme),
+                    |theme| Theme::bold(&theme.fg("accent", "Extension Updates")),
+                    1,
+                    0,
+                ),
+            ));
+            components.push(Box::new(Spacer::new(1)));
+            let markdown = extension_updates
+                .iter()
+                .map(|update| update.markdown.clone())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            components.push(Box::new(Markdown::new(
+                markdown,
+                1,
+                0,
+                Arc::clone(&lock(markdown_theme)),
+                None,
+                Some(rpi_tui::components::markdown::MarkdownOptions {
+                    transform: crate::modes::interactive::components::markdown_transform::create_markdown_transform(
+                        "changelog",
+                        false,
+                        markdown_transformers,
+                    ),
+                    ..Default::default()
+                }),
+            )));
+            components.push(Box::new(Spacer::new(1)));
+        }
     }
     components.push(Box::new(DynamicBorder::new(border)));
     components
@@ -2368,6 +2429,7 @@ impl InteractiveUi {
         // grace. The rest of the host-forced matrix — tool abort
         // (`PendingToolAborts` watcher), session shutdown (`shutdown`),
         // extension unload (`clear_ui`/`reload`) — landed with C3 (V14-23).
+        self.reset_extension_overlays();
         self.component_registry
             .dispose_active(rpi_ext_host::interactive_ui::DisposeReason::SessionReload);
         *self
@@ -3332,7 +3394,15 @@ impl InteractiveUi {
     /// (interactive-mode.ts:2690-2745). The dialog joins the selector stack;
     /// closing it restores the previous frame.
     pub(crate) fn show_dialog(&self, entry: SharedComponent, blocked: BlockedStatus) {
-        self.push_selector(entry, true, Some(blocked), true);
+        self.show_dialog_with_blocked(entry, Some(blocked));
+    }
+
+    pub(crate) fn show_dialog_with_blocked(
+        &self,
+        entry: SharedComponent,
+        blocked: Option<BlockedStatus>,
+    ) {
+        self.push_selector(entry, true, blocked, true);
     }
 
     /// Mount an inline editor-region component (`setEditorComponent`): it
@@ -3340,6 +3410,15 @@ impl InteractiveUi {
     /// `ui.hasOverlay`.
     pub(crate) fn show_inline_selector(&self, entry: SharedComponent) {
         self.push_selector(entry, false, None, false);
+    }
+
+    pub(crate) fn defer_inline_selector(&self, entry: SharedComponent) {
+        lock(&self.selector_stack).push(SelectorFrame {
+            entry,
+            dialog: false,
+            blocked: None,
+            push: false,
+        });
     }
 
     /// Push one selector frame and make it visible. Lock order is
@@ -3422,9 +3501,12 @@ impl InteractiveUi {
             return;
         };
         let was_top = index + 1 == stack.len();
+        let active_was_removed = lock(&self.active_selector)
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, entry));
         let removed = stack.remove(index);
         drop(stack);
-        if was_top {
+        if was_top || active_was_removed {
             self.finish_selector_removal(Some(removed));
         } else {
             self.sync_dialog_state_after_removal(removed.dialog);
@@ -3895,26 +3977,87 @@ impl InteractiveUi {
         self.ui.request_render(false);
     }
 
-    /// `showStartupNoticesIfNeeded` (interactive-mode.ts:843-871 @
-    /// b4afdddf): render the new-entry changelog block once per mode
-    /// instance. Resumed sessions never have `changelog_markdown`
-    /// (`getChangelogForDisplay` skips sessions with messages), so the
-    /// early return keeps the restore path unchanged.
+    fn get_extension_changelog_updates(&self, has_messages: bool) -> Vec<ExtensionChangelogUpdate> {
+        if has_messages {
+            return Vec::new();
+        }
+        let session = self.session();
+        let Some(host) =
+            crate::core::extension_host_adapter::host_of_runner(&session.extension_runner())
+        else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::new();
+        let mut updates = Vec::new();
+        for info in host.get_extension_source_infos() {
+            if info.origin != rpi_ext_host::types::SourceOrigin::Package {
+                continue;
+            }
+            let Some(base_dir) = info.base_dir.as_deref() else {
+                continue;
+            };
+            let key =
+                serde_json::to_string(&(info.source.as_str(), info.scope)).unwrap_or_default();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let Some(package) =
+                crate::core::changelog::extension_package_metadata(std::path::Path::new(base_dir))
+            else {
+                continue;
+            };
+            let last_version =
+                session.settings_manager(|settings| settings.get_extension_changelog_version(&key));
+            let Some(last_version) = last_version else {
+                session.settings_manager(|settings| {
+                    settings.set_extension_changelog_version(&key, &package.version);
+                });
+                continue;
+            };
+            let Some(markdown) = crate::core::changelog::extension_changelog_for_display(
+                &package,
+                &info.source,
+                &last_version,
+            ) else {
+                continue;
+            };
+            session.settings_manager(|settings| {
+                settings.set_extension_changelog_version(&key, &package.version);
+            });
+            updates.push(ExtensionChangelogUpdate {
+                name: if package.name.is_empty() {
+                    info.source.clone()
+                } else {
+                    package.name.clone()
+                },
+                version: package.version,
+                markdown,
+            });
+        }
+        updates
+    }
+
+    /// `showStartupNoticesIfNeeded` (interactive-mode.ts:843-887 @
+    /// b4afdddf): render new host and extension changelog entries once.
     pub(crate) fn show_startup_notices_if_needed(&self) {
         if self.startup_notices_shown.swap(true, Ordering::SeqCst) {
             return;
         }
-        let Some(changelog_markdown) = lock(&self.changelog_markdown).clone() else {
+        let changelog_markdown = lock(&self.changelog_markdown).clone();
+        let extension_updates = lock(&self.extension_changelog_updates).clone();
+        if changelog_markdown.is_none() && extension_updates.is_empty() {
             return;
-        };
+        }
         let collapse_changelog = self
             .session()
             .settings_manager(|settings| settings.get_collapse_changelog());
         let components = startup_notice_components(
-            &changelog_markdown,
+            changelog_markdown.as_deref(),
+            &extension_updates,
             collapse_changelog,
             &self.theme,
             &self.markdown_theme,
+            self.markdown_transformers(),
         );
         let mut chat = lock(&self.chat_container);
         if !chat.children.is_empty() {
@@ -4620,7 +4763,14 @@ impl InteractiveUi {
                     color: Some(muted),
                     ..Default::default()
                 }),
-                None,
+                Some(rpi_tui::components::markdown::MarkdownOptions {
+                    transform: crate::modes::interactive::components::markdown_transform::create_markdown_transform(
+                        "changelog",
+                        false,
+                        self.markdown_transformers(),
+                    ),
+                    ..Default::default()
+                }),
             )));
             self.add_chat_child(Box::new(Spacer::new(1)));
         }
@@ -4792,7 +4942,7 @@ impl InteractiveUi {
     /// mermaid transformer first (interactive-mode.ts:447-450), then the
     /// extension-registered width-aware Markdown transform chain, in
     /// extension load order.
-    fn markdown_transformers(&self) -> Vec<rpi_ext_host::types::MarkdownTransformerFn> {
+    pub(crate) fn markdown_transformers(&self) -> Vec<rpi_ext_host::types::MarkdownTransformerFn> {
         let session = self.session();
         let mermaid =
             crate::modes::interactive::components::mermaid::create_mermaid_markdown_transformer(
@@ -4815,7 +4965,18 @@ impl InteractiveUi {
 
     /// `addMessageToChat` (interactive-mode.ts:3236-3338).
     fn add_message_to_chat(&self, message: AgentMessage, populate_history: bool) {
+        self.add_message_to_chat_with_metadata(message, populate_history, None);
+    }
+
+    fn add_message_to_chat_with_metadata(
+        &self,
+        message: AgentMessage,
+        populate_history: bool,
+        metadata: Option<(&str, &str)>,
+    ) {
         let markdown_transformers = self.markdown_transformers();
+        let message_id = metadata.map(|metadata| metadata.0.to_owned());
+        let timestamp = metadata.map(|metadata| metadata.1.to_owned());
         match &message {
             // #9548: prompt/tool state entries are not user-visible chat
             // messages (upstream interactive-mode.ts:3711 `case "system": break`).
@@ -4870,6 +5031,11 @@ impl InteractiveUi {
                         markdown_theme,
                         self.output_pad.load(Ordering::Relaxed),
                     );
+                    component.set_markdown_context(
+                        markdown_transformers.clone(),
+                        message_id.clone(),
+                        timestamp.clone(),
+                    );
                     component.set_expanded(*lock(&self.tool_output_expanded));
                     self.add_chat_child(Box::new(component));
                 }
@@ -4883,6 +5049,11 @@ impl InteractiveUi {
                     Arc::clone(&lock(&self.markdown_theme)),
                     self.output_pad.load(Ordering::Relaxed),
                 );
+                component.set_markdown_context(
+                    markdown_transformers.clone(),
+                    message_id.clone(),
+                    timestamp.clone(),
+                );
                 component.set_expanded(*lock(&self.tool_output_expanded));
                 self.add_chat_child(Box::new(component));
             }
@@ -4894,6 +5065,11 @@ impl InteractiveUi {
                     Arc::clone(&lock(&self.theme)),
                     Arc::clone(&lock(&self.markdown_theme)),
                     self.output_pad.load(Ordering::Relaxed),
+                );
+                component.set_markdown_context(
+                    markdown_transformers.clone(),
+                    message_id.clone(),
+                    timestamp.clone(),
                 );
                 component.set_expanded(*lock(&self.tool_output_expanded));
                 self.add_chat_child(Box::new(component));
@@ -4921,27 +5097,36 @@ impl InteractiveUi {
                         Arc::clone(&lock(&self.markdown_theme)),
                         self.output_pad.load(Ordering::Relaxed),
                     );
+                    skill_component.set_markdown_context(
+                        markdown_transformers.clone(),
+                        message_id.clone(),
+                        timestamp.clone(),
+                    );
                     skill_component.set_expanded(*lock(&self.tool_output_expanded));
                     chat.children.push(Box::new(skill_component));
                     if let Some(user_message) = &skill_block.user_message {
                         chat.children
                             .push(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
-                        chat.children.push(Box::new(UserMessageComponent::new(
+                        let mut component = UserMessageComponent::new(
                             user_message.clone(),
                             Arc::clone(&lock(&self.theme)),
                             Arc::clone(&lock(&self.markdown_theme)),
                             self.output_pad.load(Ordering::Relaxed),
                             markdown_transformers.clone(),
-                        )));
+                        );
+                        component.set_message_metadata(message_id.clone(), timestamp.clone());
+                        chat.children.push(Box::new(component));
                     }
                 } else {
-                    chat.children.push(Box::new(UserMessageComponent::new(
+                    let mut component = UserMessageComponent::new(
                         text_content.clone(),
                         Arc::clone(&lock(&self.theme)),
                         Arc::clone(&lock(&self.markdown_theme)),
                         self.output_pad.load(Ordering::Relaxed),
                         markdown_transformers.clone(),
-                    )));
+                    );
+                    component.set_message_metadata(message_id.clone(), timestamp.clone());
+                    chat.children.push(Box::new(component));
                 }
                 drop(chat);
                 if populate_history {
@@ -4949,7 +5134,7 @@ impl InteractiveUi {
                 }
             }
             AgentMessage::Assistant(assistant) => {
-                let component =
+                let mut component =
                     crate::modes::interactive::components::AssistantMessageComponent::new(
                         Some(assistant.clone()),
                         *lock(&self.hide_thinking_block),
@@ -4959,6 +5144,7 @@ impl InteractiveUi {
                         self.output_pad.load(Ordering::Relaxed),
                         markdown_transformers,
                     );
+                component.set_message_metadata(message_id, timestamp);
                 self.add_chat_child(Box::new(component));
             }
             AgentMessage::ToolResult(_) => {
@@ -5036,7 +5222,11 @@ impl InteractiveUi {
             let has_messages = !messages.is_empty();
             for message in messages {
                 if let AgentMessage::Assistant(assistant) = &message {
-                    self.add_message_to_chat(message.clone(), options.populate_history);
+                    self.add_message_to_chat_with_metadata(
+                        message.clone(),
+                        options.populate_history,
+                        Some((stored_entry.id(), stored_entry.timestamp())),
+                    );
                     // Render tool-call components
                     // (interactive-mode.ts:3367-3401).
                     for content in &assistant.content {
@@ -5097,7 +5287,11 @@ impl InteractiveUi {
                             .update_result(tool_result_state_from_message(tool_result), false);
                     }
                 } else {
-                    self.add_message_to_chat(message.clone(), options.populate_history);
+                    self.add_message_to_chat_with_metadata(
+                        message.clone(),
+                        options.populate_history,
+                        Some((stored_entry.id(), stored_entry.timestamp())),
+                    );
                 }
             }
             if has_messages && let Some((kind, usage)) = summary_cost {
@@ -5450,6 +5644,47 @@ impl InteractiveUi {
         self.report_program_status();
     }
 
+    pub(crate) fn register_extension_overlay(
+        &self,
+        handle: OverlayHandle,
+        blocked: Option<BlockedStatus>,
+    ) -> u64 {
+        let id = self
+            .next_extension_overlay_id
+            .fetch_add(1, Ordering::SeqCst);
+        let has_blocked = blocked.is_some();
+        lock(&self.extension_overlays).insert(id, (handle, has_blocked));
+        if let Some(blocked) = blocked {
+            self.set_program_status_blocked(&format!("extension-overlay:{id}"), Some(blocked));
+        }
+        id
+    }
+
+    pub(crate) fn close_extension_overlay(&self, id: u64) {
+        let Some((handle, has_blocked)) = lock(&self.extension_overlays).remove(&id) else {
+            return;
+        };
+        handle.hide();
+        if has_blocked {
+            self.set_program_status_blocked(&format!("extension-overlay:{id}"), None);
+        }
+    }
+
+    pub(crate) fn reset_extension_overlays(&self) {
+        let mut ids = lock(&self.extension_overlays)
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        ids.sort_unstable_by(|left, right| right.cmp(left));
+        for id in ids {
+            self.close_extension_overlay(id);
+        }
+    }
+
+    pub(crate) fn has_open_extension_dialog(&self) -> bool {
+        lock(&self.selector_stack).iter().any(|frame| frame.dialog)
+    }
+
     /// `programStatus.reset()` (interactive-mode.ts:2095): forget the previous
     /// session's run on rebind.
     pub(crate) fn reset_program_status(&self) {
@@ -5467,6 +5702,47 @@ impl InteractiveUi {
             ui.invalidate();
             ui.request_render(false);
         });
+    }
+
+    fn model_scope_notice(
+        scoped_models: &[crate::core::model_resolver::ScopedModel],
+        show_details: bool,
+        theme: &Theme,
+    ) -> Option<String> {
+        if scoped_models.is_empty() || !show_details {
+            return None;
+        }
+        let models = scoped_models
+            .iter()
+            .map(|scoped| {
+                let suffix = match scoped.thinking_level {
+                    Some(rpi_agent::types::ThinkingLevel::Minimal) => ":minimal",
+                    Some(rpi_agent::types::ThinkingLevel::Low) => ":low",
+                    Some(rpi_agent::types::ThinkingLevel::Medium) => ":medium",
+                    Some(rpi_agent::types::ThinkingLevel::High) => ":high",
+                    Some(rpi_agent::types::ThinkingLevel::Xhigh) => ":xhigh",
+                    Some(rpi_agent::types::ThinkingLevel::Max) => ":max",
+                    Some(rpi_agent::types::ThinkingLevel::Off) | None => "",
+                };
+                format!("{}{suffix}", scoped.model.id)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let keys = key_display_text("app.model.cycleForward");
+        let hint = if keys.is_empty() {
+            String::new()
+        } else {
+            theme.fg("muted", &format!(" ({keys} to cycle)"))
+        };
+        Some(theme.fg("dim", &format!("Model scope: {models}{hint}")))
+    }
+
+    fn get_model_scope_notice(&self, show_details: bool) -> Option<String> {
+        Self::model_scope_notice(
+            &self.session().scoped_models(),
+            show_details,
+            &lock(&self.theme),
+        )
     }
 
     /// `updateAvailableProviderCount` (interactive-mode.ts:4364-4371).
@@ -6276,7 +6552,10 @@ impl InteractiveMode {
             self_arc: Mutex::new(None),
             extension_ui_bridge: Mutex::new(None),
             component_registry: component_registry::ComponentRegistry::new(),
+            extension_overlays: Mutex::new(HashMap::new()),
+            next_extension_overlay_id: AtomicU64::new(1),
             changelog_markdown: Mutex::new(None),
+            extension_changelog_updates: Mutex::new(Vec::new()),
             built_in_header: Mutex::new(None),
             streaming: Mutex::new(None),
             pending_tools: Mutex::new(HashMap::new()),
@@ -6478,6 +6757,8 @@ impl InteractiveMode {
                 )
             })
         };
+        *lock(&self.ui_state.extension_changelog_updates) =
+            self.ui_state.get_extension_changelog_updates(has_messages);
         let report = self.session.settings_manager(|settings| {
             crate::core::telemetry::prepare_install_report(settings, VERSION, has_messages)
         });
@@ -6723,13 +7004,17 @@ impl InteractiveMode {
 
         // Header (interactive-mode.ts:731-791 @ f29ea3deb): `quietStartup:
         // true` hides the header; `"header"` keeps it but suppresses the
-        // details (the loaded-resource listing; rpi has no model-scope line,
-        // [N/A-struct]).
+        // model-scope notice and loaded-resource details.
         let quiet_startup = self
             .session
             .settings_manager(|settings| settings.get_quiet_startup());
         let show_header = self.options.verbose || !quiet_startup.hides_header();
         let show_details = self.options.verbose || quiet_startup.shows_details();
+        if self.ui.mode() != TuiMode::Fullscreen
+            && let Some(notice) = self.ui_state.get_model_scope_notice(show_details)
+        {
+            println!("{notice}");
+        }
         let expanded = self.options.verbose || *lock(&ui_state.tool_output_expanded);
         let (header, expandable) =
             build_builtin_header(Arc::clone(&ui_state.theme), VERSION, expanded, show_details);
@@ -6740,6 +7025,24 @@ impl InteractiveMode {
                 .push(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
         }
         header_container.children.push(header);
+        if self.ui.mode() == TuiMode::Fullscreen
+            && let Some(notice) = self.ui_state.get_model_scope_notice(show_details)
+        {
+            let scoped_models = self.session.scoped_models();
+            let theme = Arc::clone(&ui_state.theme);
+            header_container.children.push(Box::new(
+                crate::modes::interactive::components::ThemedText::new(
+                    theme,
+                    move |theme| {
+                        InteractiveUi::model_scope_notice(&scoped_models, show_details, theme)
+                            .unwrap_or_else(|| notice.clone())
+                    },
+                    1,
+                    0,
+                ),
+            ));
+            header_container.children.push(Box::new(Spacer::new(1)));
+        }
         if show_header {
             header_container
                 .children
@@ -7640,49 +7943,10 @@ impl InteractiveMode {
                 session_path,
                 with_session,
             } => {
-                // Same cross-cwd trust prompt as `/resume`
-                // (ADR-0006/D-044 closure).
-                let ui_weak = Arc::downgrade(&self.ui_state);
-                let trust_factory = Arc::new(move |_cwd: &std::path::Path| {
-                    let ui_weak = ui_weak.clone();
-                    crate::core::trust_manager::ProjectTrustContext {
-                        has_ui: true,
-                        select: None,
-                        select_async: Some(Arc::new(move |title: String, options: Vec<String>| {
-                            let ui_weak = ui_weak.clone();
-                            Box::pin(async move {
-                                use rpi_ext_host::api::UiBridge;
-                                let ui = ui_weak.upgrade()?;
-                                ui_bridge::InteractiveUiBridge::new(&ui)
-                                    .select(&title, &options, None)
-                                    .await
-                            })
-                                as futures::future::BoxFuture<'static, Option<String>>
-                        })),
-                    }
-                });
                 let with_session = crate::core::extension_context::map_with_session(with_session)
                     .map(|callback| Box::new(callback) as _);
-                match self
-                    .runtime
-                    .switch_session(&session_path, None, with_session, Some(trust_factory))
-                    .await
-                {
-                    Ok(cancelled) => {
-                        if cancelled {
-                            return;
-                        }
-                        self.rebind_session_ui().await;
-                        self.ui_state.show_status("Resumed session");
-                    }
-                    Err(error) => {
-                        self.handle_fatal_runtime_error(
-                            "Failed to resume session",
-                            &error.raw_message(),
-                        )
-                        .await
-                    }
-                }
+                self.handle_resume_session_path(&session_path, with_session)
+                    .await;
             }
             ExtensionSessionCommand::Reload => self.ui_state.handle_reload_command(),
         }
@@ -7785,6 +8049,7 @@ impl InteractiveMode {
         // component up front, while the extension runtime still works. The
         // mode does not wait for the guest (design §3.6 宿主退出不等待组件):
         // the grace timer force-unmounts on its own schedule.
+        self.ui_state.reset_extension_overlays();
         self.ui_state
             .component_registry
             .dispose_active(rpi_ext_host::interactive_ui::DisposeReason::SessionShutdown);
@@ -15653,7 +15918,7 @@ mod tests {
         let ui = Arc::clone(&mode.ui_state);
         let feeder = async move {
             answer_mounted_dialog(&ui, &terminal, "Import session", &["\r"]).await;
-            answer_mounted_dialog(&ui, &terminal, "Session cwd not found", &["\r"]).await;
+            answer_mounted_dialog(&ui, &terminal, "Session cwd does not exist", &["\r"]).await;
         };
         let command = format!("/import {}", source.display());
         let (_, ()) = tokio::join!(mode.dispatch_slash_command(&command), feeder);
@@ -15795,5 +16060,167 @@ mod tests {
             mode.ui_state.session().session_name().as_deref(),
             Some("my session")
         );
+    }
+
+    fn overlay_test_status(ui: &Arc<InteractiveUi>) -> rpi_tui::program_status::ProgramStatus {
+        lock(&ui.program_status).current_status_for_test()
+    }
+
+    #[tokio::test]
+    async fn custom_inline_is_unblocked_by_default_and_overlays_reset_independently() {
+        use rpi_ext_host::api::UiBridge;
+        use rpi_tui::program_status::ProgramStatusState;
+
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = Arc::clone(&mode.ui_state);
+        let bridge = Arc::new(
+            crate::modes::interactive::interactive_mode::ui_bridge::InteractiveUiBridge::new(&ui),
+        );
+        let tree = serde_json::json!({
+            "type": "text",
+            "props": {"text": "answer", "done": true}
+        });
+        let inline = {
+            let bridge = Arc::clone(&bridge);
+            let tree = tree.clone();
+            tokio::spawn(async move { bridge.custom(tree, None).await })
+        };
+        tokio::task::yield_now().await;
+        assert_ne!(overlay_test_status(&ui).state, ProgramStatusState::Blocked);
+        lock(&ui.ui.get_focused_component().expect("inline focus")).handle_input("\r");
+        assert_eq!(
+            inline.await.expect("inline settled"),
+            Some(serde_json::json!(true))
+        );
+
+        let blocking = {
+            let bridge = Arc::clone(&bridge);
+            let tree = tree.clone();
+            tokio::spawn(async move {
+                bridge
+                    .custom(
+                        tree,
+                        Some(serde_json::json!({
+                            "overlay": true,
+                            "blocked": {"kind": "question", "message": "Pick a color"}
+                        })),
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let status = overlay_test_status(&ui);
+        assert_eq!(status.state, ProgramStatusState::Blocked);
+        assert_eq!(status.message.as_deref(), Some("Pick a color"));
+
+        let plain = {
+            let bridge = Arc::clone(&bridge);
+            let tree = tree.clone();
+            tokio::spawn(async move {
+                bridge
+                    .custom(tree, Some(serde_json::json!({"overlay": true})))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(
+            overlay_test_status(&ui).message.as_deref(),
+            Some("Pick a color")
+        );
+        lock(&ui.ui.get_focused_component().expect("plain overlay focus")).handle_input("\r");
+        assert_eq!(
+            plain.await.expect("plain settled"),
+            Some(serde_json::json!(true))
+        );
+        assert_eq!(
+            overlay_test_status(&ui).message.as_deref(),
+            Some("Pick a color")
+        );
+
+        ui.reset_extension_overlays();
+        assert_ne!(overlay_test_status(&ui).state, ProgramStatusState::Blocked);
+        assert!(!ui.has_overlay().visible);
+        blocking.abort();
+    }
+
+    #[tokio::test]
+    async fn editor_replacement_waits_for_open_dialog() {
+        use rpi_ext_host::api::UiBridge;
+
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = Arc::clone(&mode.ui_state);
+        let bridge = Arc::new(
+            crate::modes::interactive::interactive_mode::ui_bridge::InteractiveUiBridge::new(&ui),
+        );
+        let dialog = {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move {
+                bridge
+                    .custom(
+                        serde_json::json!({
+                            "type": "text",
+                            "props": {"text": "still open", "done": true}
+                        }),
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        bridge.set_editor_component(Some(serde_json::json!({
+            "type": "text",
+            "props": {"text": "replacement editor"}
+        })));
+        assert!(
+            ui.editor_region_render(60)
+                .join("\n")
+                .contains("still open")
+        );
+        lock(&ui.ui.get_focused_component().expect("dialog focus")).handle_input("\r");
+        assert_eq!(
+            dialog.await.expect("dialog settled"),
+            Some(serde_json::json!(true))
+        );
+        let rendered = ui.editor_region_render(60).join("\n");
+        assert!(
+            rendered.contains("replacement editor"),
+            "rendered: {rendered}; stack={}",
+            lock(&ui.selector_stack).len()
+        );
+    }
+
+    #[tokio::test]
+    async fn fullscreen_header_carries_model_scope_and_quiet_details_hide_it() {
+        install_global_keybindings();
+        let harness = build_test_session().await;
+        let terminal = Arc::new(TestTerminal::new());
+        let session = harness.session.clone();
+        let mut mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions {
+                tui_mode: TuiMode::Fullscreen,
+                ..InteractiveModeOptions::default()
+            },
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        install_noop_product_transports(&mode);
+        let model = session.model().expect("test model");
+        let model_id = model.id.clone();
+        let scoped = vec![crate::core::model_resolver::ScopedModel {
+            model,
+            thinking_level: Some(rpi_agent::types::ThinkingLevel::High),
+        }];
+        assert!(
+            InteractiveUi::model_scope_notice(&scoped, false, &lock(&mode.ui_state.theme))
+                .is_none()
+        );
+        session.set_scoped_models(scoped);
+        mode.init().await;
+        let rendered = lock(&mode.ui_state.header_container).render(100).join("\n");
+        assert!(
+            rendered.contains(&format!("Model scope: {model_id}:high")),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Ctrl+P to cycle"), "{rendered}");
     }
 }

@@ -38,6 +38,11 @@ const CLIENT_METADATA_BASE_URL: &str = "https://revpi.dev/oauth";
 const FALLBACK_REDIRECT_URL: &str = "http://127.0.0.1/callback";
 /// Access tokens this close to expiry are refreshed before they are sent.
 const REFRESH_SKEW_MS: f64 = 30_000.0;
+
+fn http_url(value: &str) -> Option<Url> {
+    rpi_ai::auth::oauth::trusted_url::trusted_http_url(value)
+        .and_then(|value| Url::parse(&value).ok())
+}
 /// Bounds each request to the authorization server (`OAUTH_REQUEST_TIMEOUT_MS`,
 /// oauth.ts), so an unresponsive one cannot hold the refresh lock, delay
 /// shutdown, or keep a sign-in waiting for long.
@@ -79,10 +84,7 @@ impl McpOAuthSettings {
             scope: oauth.scope.clone(),
             client_name: oauth.client_name.clone(),
             client_registration: oauth.client_registration.clone(),
-            auth_server_metadata_url: oauth
-                .auth_server_metadata_url
-                .as_deref()
-                .and_then(|url| Url::parse(url).ok()),
+            auth_server_metadata_url: oauth.auth_server_metadata_url.as_deref().and_then(http_url),
         }
     }
 }
@@ -787,7 +789,7 @@ impl McpAuthProvider {
                         resource_metadata_url: challenge
                             .as_ref()
                             .and_then(|challenge| challenge.resource_metadata_url.as_deref())
-                            .and_then(|url| Url::parse(url).ok()),
+                            .and_then(http_url),
                         authorization_server_metadata_url: settings
                             .auth_server_metadata_url
                             .clone(),
@@ -1297,6 +1299,25 @@ mod tests {
                 .is_none()
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn metadata_urls_only_allow_http_and_https() {
+        assert_eq!(
+            http_url("https://example.com/a b").expect("https").as_str(),
+            "https://example.com/a%20b"
+        );
+        assert_eq!(
+            http_url("http://127.0.0.1/metadata")
+                .expect("http")
+                .as_str(),
+            "http://127.0.0.1/metadata"
+        );
+        for value in ["file:///tmp/metadata", "javascript:alert(1)"] {
+            assert!(http_url(value).is_none(), "{value}");
+        }
+        let escaped = http_url("https://example.com/\u{1b}]0;title").expect("escaped URL");
+        assert!(!escaped.as_str().contains('\u{1b}'));
     }
 
     #[test]

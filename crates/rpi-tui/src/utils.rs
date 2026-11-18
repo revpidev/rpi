@@ -1920,6 +1920,29 @@ pub struct GraphemeCellRange {
     pub end: usize,
 }
 
+/// Strip OSC 133 prompt markers at the start of a rendered line. OSC 7501
+/// program status is deliberately preserved.
+pub fn strip_osc133_zone_prefix(line: &str) -> String {
+    let mut rest = line;
+    while let Some(kind) = rest.strip_prefix("\x1b]133;") {
+        let Some(first) = kind.chars().next() else {
+            break;
+        };
+        if !matches!(first, 'A' | 'B' | 'C') {
+            break;
+        }
+        let after_kind = &kind[first.len_utf8()..];
+        if let Some(after) = after_kind.strip_prefix('\x07') {
+            rest = after;
+        } else if let Some(after) = after_kind.strip_prefix("\x1b\\") {
+            rest = after;
+        } else {
+            break;
+        }
+    }
+    rest.to_owned()
+}
+
 /// Remove ANSI, OSC, and APC control sequences while preserving visible text
 /// (`stripTerminalSequences`, utils.ts:297-312 @ 4181f66). Unlike
 /// `visible_width`, tabs are NOT expanded here.

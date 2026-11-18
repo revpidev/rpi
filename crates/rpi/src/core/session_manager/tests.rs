@@ -4027,3 +4027,48 @@ fn path_to_root_or_compaction_parent_id_cycle_stops_at_revisit() {
         "cycle walked once, root-to-leaf order"
     );
 }
+
+#[test]
+fn append_fault_rolls_back_leaf_index_and_branch_summary_position() {
+    let tmp = TempDir::new();
+    let mut session =
+        SessionManager::create(tmp.path(), Some(tmp.path()), NewSessionOptions::default())
+            .expect("create");
+    let first = session.append_message(user_msg("first")).expect("first");
+    let file = session.get_session_file().expect("file").to_path_buf();
+    let original = std::fs::read(&file).expect("original bytes");
+
+    std::fs::remove_file(&file).expect("remove file");
+    std::fs::create_dir(&file).expect("fault directory");
+    session
+        .append_message(user_msg("not persisted"))
+        .expect_err("append must fail");
+    assert_eq!(session.get_leaf_id(), Some(first.as_str()));
+    assert_eq!(session.entry_count(), 1);
+    assert!(session.get_branch(None).iter().all(|entry| {
+        !matches!(entry.known(), Some(SessionEntry::Message(message))
+            if message.message == user_msg("not persisted"))
+    }));
+
+    session
+        .branch_with_summary(Some(&first), "also not persisted", None, None, None)
+        .expect_err("summary append must fail");
+    assert_eq!(session.get_leaf_id(), Some(first.as_str()));
+    assert_eq!(session.entry_count(), 1);
+
+    std::fs::remove_dir(&file).expect("remove fault directory");
+    std::fs::write(&file, original).expect("restore original bytes");
+    let second = session.append_message(user_msg("second")).expect("second");
+    assert_eq!(
+        session
+            .get_entry(&second)
+            .expect("second entry")
+            .parent_id(),
+        Some(first.as_str())
+    );
+
+    let reopened = SessionManager::open(&file, Some(tmp.path()), None).expect("reopen");
+    assert_eq!(reopened.entry_count(), 2);
+    assert_eq!(reopened.get_leaf_id(), Some(second.as_str()));
+    assert_eq!(reopened.get_tree().len(), 1);
+}

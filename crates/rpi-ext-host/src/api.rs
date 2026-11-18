@@ -517,18 +517,32 @@ pub struct SendUserMessageOptions {
     pub expand_prompt_templates: Option<bool>,
 }
 
-/// `ExecOptions` (exec.ts:11-18). `signal` is not serializable; cancellation
-/// support lands with the W3 binding.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `ExecOptions` (exec.ts:11-28 @ b4afdddf). `signal` stays process-local;
+/// `maxBuffer` is additive on the JSON ABI and defaults to the shared cap.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_buffer: Option<usize>,
+    #[serde(skip)]
+    pub signal: Option<CancellationToken>,
 }
 
-/// `ExecResult` (exec.ts:23-28).
+impl PartialEq for ExecOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.timeout == other.timeout
+            && self.cwd == other.cwd
+            && self.max_buffer == other.max_buffer
+    }
+}
+
+impl Eq for ExecOptions {}
+
+/// `ExecResult` (exec.ts:31-41 @ b4afdddf).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecResult {
@@ -536,6 +550,8 @@ pub struct ExecResult {
     pub stderr: String,
     pub code: i32,
     pub killed: bool,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// `ExecuteToolOptions` (types.ts:368-373 @ b4afdddf) for
@@ -2414,9 +2430,9 @@ pub struct LoadedExtension {
     commands: RwLock<InsertionMap<RegisteredCommand>>,
     flags: RwLock<InsertionMap<ExtensionFlag>>,
     shortcuts: RwLock<InsertionMap<ExtensionShortcut>>,
-    /// `extension.markdownTransformer` (types.ts:1703 @ 4181f66): one
-    /// transformer per extension, chained in load order by the runner.
-    markdown_transformer: RwLock<Option<crate::types::MarkdownTransformerFn>>,
+    /// `extension.markdownTransformer` (types.ts:1762 @ b4afdddf): one
+    /// registration per extension, chained in load order by the runner.
+    markdown_transformer: RwLock<Option<crate::types::MarkdownTransformerRegistration>>,
     /// The live wasm guest backing this extension (L1; T15 W6). Owns the
     /// guest thread; dropping the extension shuts it down.
     wasm_guest: RwLock<Option<crate::wasm::WasmGuest>>,
@@ -2661,15 +2677,33 @@ impl LoadedExtension {
             .is_some_and(|handlers| !handlers.is_empty())
     }
 
-    /// `extension.markdownTransformer = transformer` (loader.ts:309-312
-    /// @ 4181f66). One per extension — last call wins.
+    /// One registration per extension — last call wins. This legacy setter
+    /// keeps the original three surfaces.
     pub fn set_markdown_transformer(&self, transformer: crate::types::MarkdownTransformerFn) {
-        *write(&self.markdown_transformer) = Some(transformer);
+        self.set_markdown_transformer_registration(
+            crate::types::MarkdownTransformerRegistration::new(
+                transformer,
+                crate::types::MarkdownTransformerOptions::default(),
+            ),
+        );
     }
 
-    /// `getMarkdownTransformers()` flatMap source (runner.ts:589-591
-    /// @ 4181f66).
+    pub fn set_markdown_transformer_registration(
+        &self,
+        registration: crate::types::MarkdownTransformerRegistration,
+    ) {
+        *write(&self.markdown_transformer) = Some(registration);
+    }
+
     pub fn markdown_transformer(&self) -> Option<crate::types::MarkdownTransformerFn> {
+        read(&self.markdown_transformer)
+            .as_ref()
+            .map(|registration| registration.transformer.clone())
+    }
+
+    pub fn markdown_transformer_registration(
+        &self,
+    ) -> Option<crate::types::MarkdownTransformerRegistration> {
         read(&self.markdown_transformer).clone()
     }
 
@@ -3399,17 +3433,29 @@ impl ExtensionApi {
         Ok(())
     }
 
-    /// `pi.registerMarkdownTransformer(transformer)` (loader.ts:309-312,
-    /// types.ts:1292 @ 4181f66). One transformer per extension; chained in
-    /// load order by `runner.getMarkdownTransformers()`. TUI rendering
-    /// wiring is T29.
+    /// `pi.registerMarkdownTransformer(transformer)` keeps the original
+    /// user/assistant/thinking surfaces.
     pub fn register_markdown_transformer(
         &self,
         transformer: crate::types::MarkdownTransformerFn,
     ) -> Result<(), ExtError> {
+        self.register_markdown_transformer_with_options(
+            transformer,
+            crate::types::MarkdownTransformerOptions::default(),
+        )
+    }
+
+    /// `pi.registerMarkdownTransformer(transformer, options)` @ b4afdddf.
+    pub fn register_markdown_transformer_with_options(
+        &self,
+        transformer: crate::types::MarkdownTransformerFn,
+        options: crate::types::MarkdownTransformerOptions,
+    ) -> Result<(), ExtError> {
         self.assert_api_active()?;
         self.runtime.assert_active()?;
-        self.extension.set_markdown_transformer(transformer);
+        self.extension.set_markdown_transformer_registration(
+            crate::types::MarkdownTransformerRegistration::new(transformer, options),
+        );
         Ok(())
     }
 

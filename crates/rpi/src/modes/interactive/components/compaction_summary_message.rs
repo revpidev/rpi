@@ -14,6 +14,7 @@ use std::boxed::Box as StdBox;
 use std::sync::Arc;
 
 use rpi_agent::messages::CompactionSummaryMessage;
+use rpi_ext_host::types::MarkdownTransformerFn;
 use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 use rpi_tui::components::spacer::Spacer;
@@ -23,6 +24,7 @@ use rpi_tui::tui::Component;
 use crate::core::themes::Theme;
 
 use super::keybinding_hints::key_text;
+use super::markdown_transform::create_header_prefixed_markdown_transform;
 use super::util::to_locale_string;
 
 /// Component that renders a compaction message with collapsed/expanded state
@@ -36,6 +38,9 @@ pub struct CompactionSummaryMessageComponent {
     content_box: TuiBox,
     /// `outputPad` (compaction-summary-message.ts:15, #10557).
     output_pad: usize,
+    markdown_transformers: Vec<MarkdownTransformerFn>,
+    message_id: Option<String>,
+    timestamp: Option<String>,
 }
 
 impl CompactionSummaryMessageComponent {
@@ -52,9 +57,24 @@ impl CompactionSummaryMessageComponent {
             theme,
             content_box: TuiBox::new(0, 0, None),
             output_pad,
+            markdown_transformers: Vec::new(),
+            message_id: None,
+            timestamp: None,
         };
         component.update_display();
         component
+    }
+
+    pub fn set_markdown_context(
+        &mut self,
+        transformers: Vec<MarkdownTransformerFn>,
+        message_id: Option<String>,
+        timestamp: Option<String>,
+    ) {
+        self.markdown_transformers = transformers;
+        self.message_id = message_id;
+        self.timestamp = timestamp;
+        self.update_display();
     }
 
     /// `setOutputPad` (compaction-summary-message.ts:28-30 @ 18336987a,
@@ -92,7 +112,7 @@ impl CompactionSummaryMessageComponent {
                 Box::new(move |t: &str| theme.fg("customMessageText", t))
             };
             content_box.add_child(StdBox::new(Markdown::new(
-                format!("{header}{}", self.message.summary),
+                self.message.summary.clone(),
                 0,
                 0,
                 Arc::clone(&self.markdown_theme),
@@ -100,7 +120,16 @@ impl CompactionSummaryMessageComponent {
                     color: Some(color),
                     ..Default::default()
                 }),
-                None,
+                Some(rpi_tui::components::markdown::MarkdownOptions {
+                    transform: Some(create_header_prefixed_markdown_transform(
+                        header,
+                        "summary",
+                        self.markdown_transformers.clone(),
+                        self.message_id.clone(),
+                        self.timestamp.clone(),
+                    )),
+                    ..Default::default()
+                }),
             )));
         } else {
             let text = format!(

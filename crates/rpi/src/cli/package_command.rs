@@ -931,13 +931,26 @@ pub async fn run_update_in(
                 builtin_extensions: Vec::new(),
             },
         );
-        manager.set_progress_callback(Some(Box::new(|event| {
-            // Upstream prints `start` messages dim to stdout
-            // (package-manager-cli.ts:758-762).
+        let update_results = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let reported_results = Arc::clone(&update_results);
+        manager.set_progress_callback(Some(Box::new(move |event| {
             if event.kind == crate::core::package_manager::ProgressKind::Start
                 && let Some(message) = &event.message
             {
                 println!("{message}");
+            }
+            if event.kind == crate::core::package_manager::ProgressKind::Progress
+                && let Some(message) = &event.message
+            {
+                println!("{message}");
+            }
+            if event.kind == crate::core::package_manager::ProgressKind::Result
+                && let Some(message) = &event.message
+            {
+                reported_results
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(message.clone());
             }
             // Rpi-specific: a multi-extension batch continues past a
             // failing source (per-extension errors surface here, not
@@ -976,6 +989,13 @@ pub async fn run_update_in(
         }
         print_update_plan(&plan, update_channel);
         let (summary, error) = manager.apply_update_plan(&plan);
+        for result in update_results
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+        {
+            println!("  {result}");
+        }
         print_update_summary(&summary);
         if let Some(message) = error {
             eprintln!("Error: {message}");

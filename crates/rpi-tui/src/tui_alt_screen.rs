@@ -131,7 +131,7 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// terminal emulator. Fullscreen owns mouse selection, so mirror common
 /// terminal word-selection behavior by keeping paths and kebab-case tokens
 /// whole.
-const TERMINAL_WORD_SELECTION_JOINERS: [&str; 2] = ["/", "-"];
+const TERMINAL_WORD_SELECTION_JOINERS: [&str; 7] = ["/", "-", "+", "\\", "~", "_", "."];
 /// The selection auto-scroll `setInterval` period (tui-alt-screen.ts:737).
 const AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -2339,6 +2339,19 @@ impl TuiAltScreenInner {
                 }
                 return Some(consume());
             }
+        }
+        let is_viewport_key = keybindings.matches(data, Keybinding::AltScreenPageUp)
+            || keybindings.matches(data, Keybinding::AltScreenPageDown)
+            || keybindings.matches(data, Keybinding::AltScreenHalfPageUp)
+            || keybindings.matches(data, Keybinding::AltScreenHalfPageDown);
+        if is_viewport_key
+            && self
+                .base
+                .focused_component
+                .as_ref()
+                .is_some_and(|component| lock_component(component).captures_viewport_input())
+        {
+            return None;
         }
         // The active-search overlay exception (tui-alt-screen.ts:644-645
         // second conjunct, V14-15): a focused search overlay still lets

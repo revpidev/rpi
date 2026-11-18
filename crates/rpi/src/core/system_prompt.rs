@@ -522,7 +522,7 @@ pub fn build_system_prompt_sections(options: &BuildSystemPromptOptions) -> Syste
         None => {
             prompt_sections.push((
                 "preamble".to_owned(),
-                "You are an expert coding assistant operating inside rpi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files."
+                "You are a coding assistant running inside rpi, a coding agent harness. Help users inspect files, run commands, and modify code."
                     .to_owned(),
             ));
             let snippet = |name: &str| -> Option<&str> {
@@ -549,9 +549,7 @@ pub fn build_system_prompt_sections(options: &BuildSystemPromptOptions) -> Syste
             };
             prompt_sections.push((
                 "tools".to_owned(),
-                format!(
-                    "{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project."
-                ),
+                format!("{tools_list}\n\nAdditional tools may be available."),
             ));
             prompt_sections.push((
                 "rules".to_owned(),
@@ -565,7 +563,7 @@ pub fn build_system_prompt_sections(options: &BuildSystemPromptOptions) -> Syste
                 prompt_sections.push((
                     "docs".to_owned(),
                     format!(
-                        "Rpi documentation (read only when the user asks about rpi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: {}\n- Additional docs: {}\n- Examples: {} (extensions, custom tools, SDK)\n- When reading rpi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), rpi packages (docs/packages.md), environment variables (docs/environment-variables.md)\n- When working on rpi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read rpi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)",
+                        "Rpi documentation (read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: {}\n- Additional docs: {}\n- Examples: {} (extensions, custom tools, SDK)\n- When reading rpi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)\n- Before implementing harness changes, read the relevant docs and examples in full, following related cross-references.",
                         doc_paths.readme_path, doc_paths.docs_path, doc_paths.examples_path
                     ),
                 ));
@@ -787,7 +785,7 @@ mod tests {
         // Only snippet-bearing tools are listed (edit/write have none) —
         // inside the `<tools>` section (#9548).
         assert!(prompt.contains(
-            "<tools>\n- read: Read a file\n- bash: Run a command\n\nIn addition to the tools above"
+            "<tools>\n- read: Read a file\n- bash: Run a command\n\nAdditional tools may be available."
         ));
         // Default tools include bash but not grep/find/ls → exploration
         // guideline, inside `<rules>`.
@@ -886,7 +884,9 @@ mod tests {
         };
         let prompt = build_system_prompt(&options);
         assert!(
-            prompt.contains("Rpi documentation (read only when the user asks about rpi itself")
+            prompt.contains(
+                "Rpi documentation (read only when the user asks about the harness itself"
+            )
         );
         assert!(prompt.contains("- Main documentation: /pkg/README.md\n"));
         assert!(prompt.contains("- Examples: /pkg/examples (extensions, custom tools, SDK)\n"));
@@ -937,7 +937,7 @@ mod tests {
             cwd: PathBuf::from("/repo"),
             ..Default::default()
         };
-        assert!(build_system_prompt(&options).starts_with("You are an expert coding assistant"));
+        assert!(build_system_prompt(&options).starts_with("You are a coding assistant"));
     }
 
     // ---- #9548: section patches (system-prompt-updates.test.ts) ----------

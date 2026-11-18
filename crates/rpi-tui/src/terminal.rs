@@ -86,7 +86,7 @@
 //!   (`forwardInputSequence`, terminal.ts:317-327 @ 4181f66);
 //!   `is_native_modifier_pressed` now queries CoreGraphics on macOS
 //!   (V17-10 #69) and keeps the helper-unavailable fallback elsewhere —
-//!   notably the win32 modifier query, which the port does not implement
+//!   Windows uses `GetAsyncKeyState`; other platforms keep the fallback
 //!   (see `native_modifiers.rs`; ADR-0004).
 //! - `drain_input` observes pending input by consuming and discarding queued
 //!   channel events; upstream attaches a side listener that only timestamps
@@ -289,7 +289,7 @@ pub fn normalize_native_shift_enter_input<'a>(
     should_detect_native_shift_enter: bool,
     is_shift_pressed: bool,
 ) -> Cow<'a, str> {
-    if should_detect_native_shift_enter && data == "\r" && is_shift_pressed {
+    if should_detect_native_shift_enter && matches!(data, "\r" | "\x1b\r") && is_shift_pressed {
         return Cow::Borrowed(NATIVE_SHIFT_ENTER_SEQUENCE);
     }
     Cow::Borrowed(data)
@@ -1844,10 +1844,12 @@ mod tests {
 
     #[test]
     fn rewrites_apple_terminal_return_to_csi_u_shift_enter_when_shift_pressed() {
-        assert_eq!(
-            normalize_apple_terminal_input("\r", true, true),
-            "\x1b[13;2u"
-        );
+        for input in ["\r", "\x1b\r"] {
+            assert_eq!(
+                normalize_apple_terminal_input(input, true, true),
+                "\x1b[13;2u"
+            );
+        }
     }
 
     #[test]

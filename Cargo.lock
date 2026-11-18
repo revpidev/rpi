@@ -3371,6 +3371,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "unicode-segmentation",
  "url",
  "uuid",
 ]
@@ -3470,6 +3471,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "unicode-normalization",
+ "unicode-segmentation",
  "uuid",
 ]
 
@@ -3516,6 +3518,7 @@ name = "rpi-ext-plan-mode"
 version = "0.1.8"
 dependencies = [
  "abi_stable",
+ "regex",
  "rpi-ext-host",
  "rpi-test-env",
  "serde",

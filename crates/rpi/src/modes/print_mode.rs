@@ -9,8 +9,8 @@
 //!
 //! Signal handling (print-mode.ts:50-66): upstream kills tracked detached
 //! children, disposes the runtime, then exits 143 (SIGTERM) / 129 (SIGHUP).
-//! rpi has no detached-child registry (D-011); the handler exits directly
-//! with the same codes — abort tokens do not outlive process death.
+//! rpi has no detached-child registry (D-011). The first signal requests an
+//! abort and lets cleanup finish; only a repeated signal exits immediately.
 
 use std::io::Write;
 
@@ -41,25 +41,39 @@ pub struct PrintModeOptions {
     pub initial_images: Option<Vec<ImageContent>>,
 }
 
-/// Register SIGTERM/SIGHUP handlers exiting 143/129 (print-mode.ts:47-63).
-fn register_signal_handlers() {
+/// First signal aborts the active run and lets dispose settle; a repeated
+/// signal exits 143/129 without waiting (print-mode.ts:47-63).
+fn register_signal_handlers(
+    session: crate::core::agent_session::AgentSession,
+    exit_code: std::sync::Arc<std::sync::atomic::AtomicI32>,
+) {
     #[cfg(unix)]
     {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::signal::unix::{SignalKind, signal};
+        let signal_count = std::sync::Arc::new(AtomicUsize::new(0));
         for (kind, code) in [(SignalKind::terminate(), 143), (SignalKind::hangup(), 129)] {
             if let Ok(mut stream) = signal(kind) {
+                let session = session.clone();
+                let exit_code = exit_code.clone();
+                let signal_count = signal_count.clone();
                 std::thread::spawn(move || {
-                    // Dedicated thread with a tiny runtime: the handler must
-                    // fire even while the main runtime is parked on I/O.
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build();
-                    if let Ok(runtime) = runtime {
-                        runtime.block_on(async move {
+                    loop {
+                        let Some(runtime) = runtime.as_ref().ok() else {
+                            return;
+                        };
+                        runtime.block_on(async {
                             stream.recv().await;
                         });
+                        if signal_count.fetch_add(1, Ordering::SeqCst) > 0 {
+                            std::process::exit(code);
+                        }
+                        session.request_abort();
+                        exit_code.store(code, Ordering::SeqCst);
                     }
-                    std::process::exit(code);
                 });
             }
         }
@@ -114,8 +128,7 @@ pub async fn run_print_mode(
     out: RawStdout,
     err: &mut dyn Write,
 ) -> i32 {
-    register_signal_handlers();
-
+    let signal_exit_code = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
     let mut exit_code = 0;
 
     // JSON mode: header line first (print-mode.ts:122-127).
@@ -129,6 +142,7 @@ pub async fn run_print_mode(
 
     // bindExtensions + event subscription (print-mode.ts:71-109).
     let session = runtime.session().clone();
+    register_signal_handlers(session.clone(), signal_exit_code.clone());
     let print_mode = match options.mode {
         PrintOutputMode::Json => ExtensionMode::Json,
         PrintOutputMode::Text => ExtensionMode::Print,
@@ -267,6 +281,10 @@ pub async fn run_print_mode(
         }
     }
 
+    let signal_code = signal_exit_code.load(std::sync::atomic::Ordering::SeqCst);
+    if signal_code != 0 {
+        exit_code = signal_code;
+    }
     runtime.dispose().await;
     // `flushRawStdout` (print-mode.ts:167).
     out.flush();

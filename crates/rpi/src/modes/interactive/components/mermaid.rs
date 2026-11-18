@@ -115,26 +115,31 @@ fn mermaid_styles(theme: &Theme) -> MermaidStyles {
     MermaidStyles {
         border: Style {
             fg: theme_fg(theme, "borderMuted"),
+            bg: None,
             bold: false,
             italic: false,
         },
         node_text: Style {
             fg: theme_fg(theme, "text"),
+            bg: None,
             bold: false,
             italic: false,
         },
         edge: Style {
             fg: theme_fg(theme, "accent"),
+            bg: None,
             bold: false,
             italic: false,
         },
         edge_label: Style {
             fg: theme_fg(theme, "muted"),
+            bg: None,
             bold: false,
             italic: false,
         },
         title: Style {
             fg: theme_fg(theme, "accent"),
+            bg: None,
             bold: true,
             italic: false,
         },
@@ -199,7 +204,10 @@ pub fn create_mermaid_markdown_transformer(
     Arc::new(move |markdown: String, context: MarkdownTransformContext| {
         let mode = get_mode();
         if mode == MermaidRenderingMode::Off
-            || context.message_type == "assistant-thinking"
+            || !matches!(
+                context.message_type.as_str(),
+                "user" | "assistant" | "summary"
+            )
             || (context.is_streaming && mode != MermaidRenderingMode::Streaming)
         {
             return markdown;
@@ -288,6 +296,7 @@ mod tests {
                 message_type: message_type.to_string(),
                 is_streaming,
                 available_width,
+                ..Default::default()
             },
         )
     }

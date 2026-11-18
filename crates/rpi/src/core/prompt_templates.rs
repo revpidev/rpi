@@ -94,45 +94,53 @@ const JS_WS_CLASS: &str = " \\t\\n\\x0b\\x0c\\r\\u{a0}\\u{1680}\\u{2000}-\\u{200
 /// `parseCommandArgs` (prompt-templates.ts:24-55): parse command arguments
 /// respecting quoted strings (bash-style). `"`/`'` quotes pair up, JS-`\s`
 /// separates tokens, quoted content is preserved without the quote
-/// characters. An unterminated quote swallows the rest of the input.
+/// characters. Quotes open only at a token boundary; escaped matching quotes
+/// stay literal. An unterminated quote is re-read as literal text.
 pub fn parse_command_args(args_string: &str) -> Vec<String> {
-    let mut args: Vec<String> = Vec::new();
+    let chars: Vec<char> = args_string.chars().collect();
+    let mut args = Vec::new();
     let mut current = String::new();
-    let mut in_quote: Option<char> = None;
-    // Tracks whether a token has started, so quoted empty strings (`""` or
-    // `''`) keep their position as empty arguments (#10867).
+    let mut in_quote = None;
+    let mut quote_start = 0;
     let mut has_token = false;
+    let mut index = 0;
 
-    for c in args_string.chars() {
-        match in_quote {
-            Some(q) => {
-                if c == q {
-                    in_quote = None;
-                } else {
-                    current.push(c);
-                }
+    while index < chars.len() {
+        let character = chars[index];
+        if let Some(quote) = in_quote {
+            if character == '\\' && chars.get(index + 1) == Some(&quote) {
+                current.push(quote);
+                index += 1;
+            } else if character == quote {
+                in_quote = None;
+            } else {
+                current.push(character);
             }
-            None => {
-                if c == '"' || c == '\'' {
-                    in_quote = Some(c);
-                    has_token = true;
-                } else if is_js_whitespace(c) {
-                    if has_token {
-                        args.push(std::mem::take(&mut current));
-                        has_token = false;
-                    }
-                } else {
-                    current.push(c);
-                    has_token = true;
-                }
+        } else if matches!(character, '"' | '\'') && !has_token {
+            in_quote = Some(character);
+            quote_start = index;
+            has_token = true;
+        } else if is_js_whitespace(character) {
+            if has_token {
+                args.push(std::mem::take(&mut current));
+                has_token = false;
             }
+        } else {
+            current.push(character);
+            has_token = true;
         }
-    }
 
+        if in_quote.is_some() && index + 1 == chars.len() {
+            in_quote = None;
+            current.clear();
+            current.push(chars[quote_start]);
+            index = quote_start;
+        }
+        index += 1;
+    }
     if has_token {
         args.push(current);
     }
-
     args
 }
 
@@ -595,15 +603,23 @@ mod tests {
     fn parse_args_quotes() {
         assert_eq!(parse_command_args(r#"a "b c" d"#), args(&["a", "b c", "d"]));
         assert_eq!(parse_command_args("'x y' z"), args(&["x y", "z"]));
-        // Quotes preserved mid-token, removed from the result.
         assert_eq!(
             parse_command_args(r#"pre"mid dle"post"#),
-            args(&["premid dlepost"])
+            args(&["pre\"mid", "dle\"post"])
+        );
+        assert_eq!(
+            parse_command_args("doesn't stop"),
+            args(&["doesn't", "stop"])
+        );
+        assert_eq!(
+            parse_command_args(r#""say \"hi\"""#),
+            args(&[r#"say "hi""#])
         );
         // Mixed quote kinds: the opening kind closes.
         assert_eq!(parse_command_args(r#""it's" ok"#), args(&["it's", "ok"]));
-        // Unterminated quote swallows the rest.
-        assert_eq!(parse_command_args(r#"a "bc"#), args(&["a", "bc"]));
+        // Unterminated quotes remain literal, including their spaces.
+        assert_eq!(parse_command_args(r#"a "bc"#), args(&["a", "\"bc"]));
+        assert_eq!(parse_command_args(r#""one two"#), args(&["\"one", "two"]));
         // Quoted empty strings keep their position as empty arguments
         // (#10867: otherwise later positional args shift).
         assert_eq!(parse_command_args(r#"a "" b"#), args(&["a", "", "b"]));

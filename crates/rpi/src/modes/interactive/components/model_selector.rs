@@ -495,6 +495,10 @@ impl ModelSelectorComponent {
                             state.refresh_status_success = true;
                         }
                     }
+                    let selected_model = state
+                        .filtered_models
+                        .get(state.selected_index)
+                        .map(|item| item.model.clone());
                     load_models_from_snapshot(
                         &mut state,
                         &runtime,
@@ -503,6 +507,14 @@ impl ModelSelectorComponent {
                     );
                     let query = state.search_value.clone();
                     apply_model_filter(&mut state, &query, default_model.as_ref());
+                    if query.is_empty()
+                        && let Some(selected_model) = selected_model
+                        && let Some(index) = state.filtered_models.iter().position(|item| {
+                            models_are_equal(Some(&selected_model), Some(&item.model))
+                        })
+                    {
+                        state.selected_index = index;
+                    }
                     drop(state);
                     tui.request_render(false);
                 });
@@ -562,6 +574,10 @@ impl Drop for ModelSelectorComponent {
 }
 
 impl Component for ModelSelectorComponent {
+    fn captures_viewport_input(&self) -> bool {
+        true
+    }
+
     fn handle_input(&mut self, data: &str) {
         // Keybinding matching runs inside a block so the read guard is
         // dropped before the fall-through forwards to the search input:
@@ -590,6 +606,18 @@ impl Component for ModelSelectorComponent {
                         self.default_model.as_ref(),
                     );
                 }
+                return;
+            }
+            let selected_index = lock(&self.state).selected_index;
+            let item_count = lock(&self.state).filtered_models.len();
+            if let Some(index) = rpi_tui::keybindings::get_select_page_index(
+                &read,
+                data,
+                selected_index,
+                item_count,
+                10,
+            ) {
+                lock(&self.state).selected_index = index;
                 return;
             }
             // Up arrow — wrap to bottom when at top (model-selector.ts:321-325).

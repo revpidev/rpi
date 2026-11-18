@@ -195,6 +195,20 @@ pub fn resolve_path(input: &str, base_dir: &Path) -> PathBuf {
     }
 }
 
+/// Replace an absolute home-directory prefix at a path-component boundary.
+pub fn shorten_home_path(path: &str, home_dir: &str) -> String {
+    if home_dir.is_empty() || !Path::new(path).is_absolute() {
+        return path.to_owned();
+    }
+    if path == home_dir {
+        return "~".to_owned();
+    }
+    match path.strip_prefix(home_dir) {
+        Some(rest) if rest.starts_with('/') || rest.starts_with('\\') => format!("~{rest}"),
+        _ => path.to_owned(),
+    }
+}
+
 // -----------------------------------------------------------------------
 // expandPath / resolveToCwd (path-utils.ts:40-50)
 // -----------------------------------------------------------------------
@@ -319,7 +333,21 @@ mod tests {
     use super::*;
     use crate::tools::test_helpers::TempDir;
 
-    // Port of "should expand ~ to home directory"
+    #[test]
+    fn home_shortening_requires_a_component_boundary() {
+        assert_eq!(shorten_home_path("/home/me", "/home/me"), "~");
+        assert_eq!(
+            shorten_home_path("/home/me/project", "/home/me"),
+            "~/project"
+        );
+        assert_eq!(
+            shorten_home_path("/home/me2/project", "/home/me"),
+            "/home/me2/project"
+        );
+        assert_eq!(shorten_home_path("relative/me", "relative"), "relative/me");
+        assert_eq!(shorten_home_path("/home/me", ""), "/home/me");
+    }
+
     #[test]
     fn test_expand_tilde_alone() {
         let result = expand_path("~");
