@@ -2,6 +2,8 @@
 //! (`rpc-entry.ts` @ pi 0.82.1).
 
 fn main() {
+    rpi::core::early_init::initialize();
+
     // Marker env for child processes/extensions (rpc-entry.ts:7-8).
     // SAFETY: process start; the tokio runtime and its worker threads do
     // not exist yet, so no concurrent env readers can race this write.

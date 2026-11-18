@@ -217,6 +217,7 @@ Configuration lives in `~/.rpi/agent/` (or `RPI_CODING_AGENT_DIR`); project-loca
 | `RPI_TUI_COLOR_TIMEOUT` | 100ms local / 500ms SSH | Terminal color-query deadline in milliseconds (issue #77 escape hatch) |
 | `RPI_CLIPBOARD_OSC52` | — | `1` also sends copies through OSC 52, for remote clients that leave no SSH markers (multiplexer attaches, IDE daemons) |
 | `RPI_HYPERLINKS` / `RPI_IMAGE_PROTOCOL` / `RPI_TRUE_COLOR` | auto-detect | Terminal capability overrides |
+| `MALLOC_ARENA_MAX` | `1` on Linux GNU; libc default elsewhere | Positive 32-bit integer override for glibc malloc arenas; invalid values warn and fall back to `1`. The default is applied with `mallopt` and is not exported to child processes |
 
 The same URLs can be set as `versionCheckUrl`, `modelCatalogUrl`, `telemetryUrl`, and `registryUrl` in `settings.json`; environment variables take precedence.
 

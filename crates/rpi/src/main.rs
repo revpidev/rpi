@@ -1,6 +1,8 @@
 //! `rpi` binary entry point (T10: headless modes; interactive lands in T12).
 
 fn main() {
+    rpi::core::early_init::initialize();
+
     // Marker env for child processes/extensions (cli.ts:13-14).
     // SAFETY: process start; the tokio runtime and its worker threads do
     // not exist yet, so no concurrent env readers can race this write.

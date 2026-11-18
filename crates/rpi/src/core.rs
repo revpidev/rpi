@@ -12,6 +12,7 @@ pub mod config_schemas;
 pub mod crash_attribution;
 pub mod deprecated_extensions;
 pub mod download;
+pub mod early_init;
 pub mod environment;
 pub mod export_html;
 pub mod extension_actions;

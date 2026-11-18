@@ -2,14 +2,15 @@
 
 ## [Unreleased]
 
-### v0.1.9 draft — V19-01
+### v0.1.9 draft — implementation in progress
 
-This section covers the V19-01 implementation work. M06 awaits V19-02's M06-IN handoff; the V19-08 release gate is still pending.
+This section covers the V19-01 implementation work and V19-02 slices completed so far. V19-01 M06 awaits V19-02's M06-IN handoff, the remaining V19-02 B/C/D work is pending, and the V19-08 release gate is still pending.
 
 ### Main line
 
 - **Upstream parity to Pi v1.5.2** (ADR-0048): the behavioral gold standard moves from `4a080252f` to `b4afdddf`. The regenerated catalog contains 43 providers and 1815 entries (1667 chat, 72 image, 76 classifier), the v1.5.2 defaults, Azure long-context pricing, GLM allowlists, OpenCode protocol endpoints and `qwen-token-plan-individual-cn`. Manifest `2026-11-17T03:17:54.693Z`; all 43 provider model lists match rpi-pages after unwrapping the site's public `models` envelope.
 - **Schema and startup memory** (ADR-0049): `jsonschema` 0.61.2 `macros` compiles the native meta-validator, while catalog generations share immutable model data with COW overrides. Schema-only VmRSS falls 76484→9800 KiB; the default-extension empty-session replay falls from 101352 KiB to roughly 39.7 MiB (about 61%) with identical output, bounded read-only code-page growth, and complete mapping-level source attribution. `Model` is 1064→480 bytes and `AnyModel` 1064→904 bytes.
+- **Linux malloc arenas** (ADR-0049): `rpi` and `rpi-rpc` default glibc's `M_ARENA_MAX` to 1 before argument parsing and runtime/worker creation on Linux GNU. A positive 32-bit `MALLOC_ARENA_MAX` overrides it; invalid values warn and fall back to 1. The default is process-local `mallopt` state, not an environment value inherited by tool children. Other platforms are unchanged.
 - **Providers and auth**: Anthropic message threads/effort binding, idle cache warming, provider-reported costs, OpenAI compatibility controls, strict-tool fallback, OpenRouter BYOK/latest aliases and safer context clamps, K3.1/GPT tool metadata, Bedrock/Gemini schema fixes, Copilot Microsoft-Decision-1, structured catalog-refresh warnings, HTTP(S)-only login URLs opened without a shell, auth-file/lock hardening and shutdown credential-write draining.
 - **MCP and codemode**: bounded bodies and linear SSE/stdio framing with close cancellation and process-group/direct-child cleanup, caller-owned `McpPipe`, two-phase OAuth with refresh-only reuse and prompt cancellation with background token persistence, shared naming/schema/output-limit/config helpers, safe local JSON Pointer resolution, and `NaN`/`Infinity` in console and thrown values instead of `null`.
 

@@ -56,7 +56,7 @@ Every repeat is a fresh process. The logical cwd is `<sandbox-root>/<scenario>` 
 
 Reports include process CPU/wall medians, `CPU/rendered_frame`, `CPU/input_delta`, pooled pure-compute p95, frame-interval p95, input-to-visible p95, statusline worker CPU when the named thread exists, and VirtualTerminal cost. `/proc/<pid>/task` samples preserve tid/comm/jiffies for attribution instead of guessing at worker cost. The VirtualTerminal is in-process, so its cost is measured by `terminal_io_ns`, not assigned to a fictitious external process.
 
-For an arena attribution run, pass `--arena 1`, `--arena 2` or `--arena 4`; this sets the standard `MALLOC_ARENA_MAX` value for that child only. The default run does not set it.
+For an arena attribution run, pass `--arena 1`, `--arena 2` or `--arena 4`; this sets the standard `MALLOC_ARENA_MAX` value for that child only. The default run does not set it. V19-02's replay binary applies the same early `mallopt(M_ARENA_MAX, 1)` default as the production entries, so an unset variable now measures the explicit default-1 behavior. Set `RPI_V19_ARENA_PROBE=1` to run the development-only early-entry heap/child-environment probe instead of a replay; `cargo test -p rpi --features v19-benchmark --test arena_early_init_test` exercises its default/override/invalid matrix.
 
 Run the complete CPU or memory matrix sequentially:
 

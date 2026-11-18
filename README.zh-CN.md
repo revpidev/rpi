@@ -217,6 +217,7 @@ rpi auth check|print-api-key|print-bearer-token ...  # 查看 provider 凭据
 | `RPI_TUI_COLOR_TIMEOUT` | 本地 100ms / SSH 500ms | 终端颜色查询超时（毫秒；issue #77 调优入口） |
 | `RPI_CLIPBOARD_OSC52` | — | 设为 `1` 时复制内容同时走 OSC 52，适用于没有 SSH 标记的远程客户端（多路复用器接入、IDE 守护进程） |
 | `RPI_HYPERLINKS` / `RPI_IMAGE_PROTOCOL` / `RPI_TRUE_COLOR` | 自动探测 | 终端能力覆盖 |
+| `MALLOC_ARENA_MAX` | Linux GNU 为 `1`；其他平台沿用 libc 默认值 | 以 32 位正整数覆盖 glibc malloc arena 上限；非法值会警告并回退为 `1`。默认值通过 `mallopt` 设置，不会导出给子进程 |
 
 同样的 URL 也可在 `settings.json` 中以 `versionCheckUrl`、`modelCatalogUrl`、`telemetryUrl`、`registryUrl` 设置；环境变量优先。
 
