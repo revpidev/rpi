@@ -1030,7 +1030,7 @@
       ]
     },
     "CacheWarmingMode": {
-      "description": "`CacheWarmingMode = \"off\" | \"streaming\" | \"idle\"` (#9668,\nc596d09d9; settings-manager.ts:77-78) — default `\"streaming\"`. Global\nsetting only because each refresh costs money (settings-manager.ts:955).",
+      "description": "`CacheWarmingMode = \"off\" | \"streaming\" | \"idle\"` (#9668,\nc596d09d9; settings-manager.ts:77-78) — default `\"idle\"` (v1.5.2). Global\nsetting only because each refresh costs money (settings-manager.ts:955).",
       "type": "string",
       "enum": [
         "off",

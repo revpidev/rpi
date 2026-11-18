@@ -193,6 +193,7 @@ fn usage_sample() -> Usage {
             cache_read: 0.3,
             cache_write: 0.4,
             total: 1.0,
+            total_from_provider: None,
         },
     }
 }

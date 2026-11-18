@@ -24,7 +24,7 @@ The result starts with `Script completed` or `Script failed`, the wall time, and
 | `tools.<name>(args)` | Call a tool. See [Call tools](#call-tools). |
 | `text(value)` | Add a text item to the output. Strings are added as is, other values as JSON. |
 | `image(value)` | Add an image to the output: a base64 `data:` URL, an `{ image_url }` object, or an image block `{ type: "image", data, mimeType }` such as those returned by MCP tools and `models.generateImages()`. Remote URLs are not supported. PNG, JPEG, GIF, and WebP are accepted. Each image is also saved to a temp file, and the result names the path before the image. |
-| `console.log(...)` | Add a line to the `<console_output>` block after the other output. Arguments are joined with spaces; `info`, `warn`, `error`, and `debug` do the same. |
+| `console.log(...)` | Add a line to the `<console_output>` block after the other output. Arguments are joined with spaces; `info`, `warn`, `error`, and `debug` do the same. Top-level numbers print as numbers, including `NaN` and `Infinity`; numbers nested inside JSON objects still follow JSON's `null` rule. |
 | `return value` | A top-level `return` adds the value like `text()`. |
 | `exit()` | End the script successfully. |
 | `store(key, value)` / `load(key)` | Keep small JSON values across `codemode` calls. See [Store values](#store-values). |

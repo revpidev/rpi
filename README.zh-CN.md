@@ -102,6 +102,12 @@ cargo build --release
 
 Kimi Code 使用 OpenAI Chat Completions，官方 base URL 为 `https://api.kimi.com/coding/v1`。`models.json` 或扩展服务商配置中的自定义 `baseUrl` 必须显式包含完整的 `/v1` 路径段。请将旧的 `https://api.kimi.com/coding` 改为 `https://api.kimi.com/coding/v1`，或使用代理本身明确的 `/v1` URL；rpi 不会自动追加后缀、改写 URL 或回退到旧传输协议。
 
+### 服务商兼容性
+
+`models.json` 与扩展模型可携带 `compat` 覆盖项。OpenAI 兼容请求默认省略空 `tools` 数组，仅旧代理需要时才设置 `requiresToolsWithToolHistory: true`。`promptCacheKeyMode` 支持 `auto`、`enabled`、`disabled`，`requiresNonNullAssistantContent` 会把 null assistant 内容改为空字符串。Anthropic 官方 origin 默认使用 message threads 进行增量续接；设置 `supportsMessageThreads: false` 可强制全量请求，单次 replay 也可使用 `StreamOptions.disable_continuation`。代理默认仍走全量请求。缓存预热默认模式为 `idle`；设置 `cacheWarming: "streaming"` 可恢复旧行为，设为 `off` 则关闭。
+
+Rust 调用方请注意：`Model.compat` 的类型为 `Option<Box<ModelCompat>>`，已有 compat 值需用 `Box::new(compat)` 包装。`models.json` 与扩展 wire 形状不变。
+
 ### 更新
 
 ```bash

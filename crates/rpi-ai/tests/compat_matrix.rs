@@ -475,23 +475,19 @@ fn test_catalog_together_reasoning_variants_baked() {
 }
 
 #[test]
-fn test_catalog_openrouter_cache_control_baked() {
-    // "~anthropic/..." ids bypass runtime detection (detect keys on an
-    // "anthropic/" prefix); the generator bakes cacheControlFormat instead.
+fn test_catalog_openrouter_latest_alias_and_cache_control() {
+    // v1.5.2 routes `~anthropic/claude-*-latest` through Anthropic Messages,
+    // so the OpenAI Completions cache-control compatibility no longer applies.
     let tilde = get_builtin_model("openrouter", "~anthropic/claude-fable-latest").expect("tilde");
+    assert_eq!(tilde.api.as_str(), "anthropic-messages");
     assert_eq!(
         tilde.compat.as_ref().and_then(|c| c.cache_control_format),
-        Some(CacheControlFormat::Anthropic)
-    );
-    assert_eq!(
-        get_compat(tilde).cache_control_format,
-        Some(CacheControlFormat::Anthropic)
+        None
     );
 
-    // Plain "anthropic/..." ids resolve through detection as well.
-    // (2026-10-01 v6 snapshot: `claude-3-haiku` left the OpenRouter
-    // catalog; the current Claude line id covers the same detection face.)
-    let plain = get_builtin_model("openrouter", "anthropic/claude-fable-5").expect("plain");
+    // Claude batch variants stay on OpenAI Completions and retain cache control.
+    let plain = get_builtin_model("openrouter", "anthropic/claude-fable-5:batch").expect("plain");
+    assert_eq!(plain.api.as_str(), "openai-completions");
     assert_eq!(
         get_compat(plain).cache_control_format,
         Some(CacheControlFormat::Anthropic)

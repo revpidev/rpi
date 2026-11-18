@@ -36,6 +36,7 @@ def main() -> int:
     parser.add_argument("--include-smoke", action="store_true")
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--overlay-sha256", required=True)
+    parser.add_argument("--cargo-lock", type=Path)
     args = parser.parse_args()
 
     subprocess.run(
@@ -142,7 +143,8 @@ def main() -> int:
         "overlaySha256": args.overlay_sha256,
         "binary": str(binary),
         "binarySha256": hash_file(binary),
-        "cargoLockSha256": hash_file(ROOT / "Cargo.lock"),
+        "cargoLock": str((args.cargo_lock or ROOT / "Cargo.lock").resolve()),
+        "cargoLockSha256": hash_file(args.cargo_lock or ROOT / "Cargo.lock"),
         "buildProfile": "release",
         "fixedCadence": True,
         "adaptiveBackpressure": "disabled-by-test-switch",

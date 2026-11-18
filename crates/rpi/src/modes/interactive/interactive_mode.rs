@@ -11735,6 +11735,7 @@ mod tests {
                 cache_read: 0.0,
                 cache_write: cost_cache_write,
                 total: 0.0,
+                total_from_provider: None,
             },
             ..Default::default()
         };

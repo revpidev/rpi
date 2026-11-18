@@ -2638,22 +2638,7 @@ impl McpSignInPrompt for NotifySignInPrompt {
 
 /// Best-effort platform browser opener (upstream `openBrowser`).
 fn open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let command = "open";
-    #[cfg(target_os = "windows")]
-    let command = "cmd";
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let command = "xdg-open";
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new(command)
-            .args(["/c", "start", "", url])
-            .spawn();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::process::Command::new(command).arg(url).spawn();
-    }
+    crate::utils::open_browser::open_browser(url);
 }
 
 #[cfg(test)]

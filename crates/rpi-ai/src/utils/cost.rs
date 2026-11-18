@@ -39,6 +39,7 @@ pub fn calculate_cost_for(cost: &crate::types::ModelCost, usage: &mut Usage) -> 
         / 1_000_000.0;
     usage.cost.total =
         usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
+    usage.cost.total_from_provider = Some(false);
     usage.cost.clone()
 }
 

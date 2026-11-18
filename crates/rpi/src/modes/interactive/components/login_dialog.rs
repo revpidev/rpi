@@ -78,6 +78,10 @@ pub enum LoginDialogState {
         user_code: String,
         verification_uri: String,
         waiting: Option<String>,
+        open_browser_on_confirm: bool,
+        copy_code_on_confirm: bool,
+        action_pending: bool,
+        action_status: Option<String>,
     },
     /// `showManualInput` (login-dialog.ts:136-148).
     ManualInput { prompt: String },
@@ -115,6 +119,14 @@ pub enum LoginDialogState {
 /// `onSelect` callback (select prompt resolution).
 pub type SelectCallback = Box<dyn FnMut(&str) + Send>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceCodeConfirmation {
+    pub user_code: String,
+    pub verification_uri: String,
+    pub open_browser: bool,
+    pub copy_code: bool,
+}
+
 pub struct LoginDialogComponent {
     theme: Arc<Theme>,
     title: String,
@@ -135,6 +147,7 @@ pub struct LoginDialogComponent {
     pub on_begin_oauth: Option<Box<dyn FnMut() + Send>>,
     /// Fired by [`Self::show_device_code`]; no upstream equivalent.
     pub on_begin_device_code: Option<Box<dyn FnMut() + Send>>,
+    pub on_device_code_confirm: Option<Box<dyn FnMut(DeviceCodeConfirmation) + Send>>,
     /// Submit of a manual-input prompt (login-dialog.ts:144-147).
     #[allow(clippy::type_complexity)] // mirrors the upstream callback type
     pub on_submit_manual: Option<Box<dyn FnMut(&str) + Send>>,
@@ -205,6 +218,7 @@ impl LoginDialogComponent {
             focused: false,
             on_begin_oauth: None,
             on_begin_device_code: None,
+            on_device_code_confirm: None,
             on_submit_manual: None,
             on_prompt_confirm: None,
             on_select: None,
@@ -249,16 +263,40 @@ impl LoginDialogComponent {
         verification_uri: &str,
         waiting: Option<&str>,
     ) {
+        self.show_device_code_with_options(user_code, verification_uri, waiting, None, None);
+    }
+
+    pub fn show_device_code_with_options(
+        &mut self,
+        user_code: &str,
+        verification_uri: &str,
+        waiting: Option<&str>,
+        open_browser_on_confirm: Option<bool>,
+        copy_code_on_confirm: Option<bool>,
+    ) {
+        let open_browser_on_confirm = open_browser_on_confirm.unwrap_or(true);
+        let copy_code_on_confirm = copy_code_on_confirm.unwrap_or(true);
         self.state = Some(LoginDialogState::DeviceCode {
             user_code: user_code.to_string(),
             verification_uri: verification_uri.to_string(),
             waiting: waiting.map(str::to_string),
+            open_browser_on_confirm,
+            copy_code_on_confirm,
+            action_pending: open_browser_on_confirm || copy_code_on_confirm,
+            action_status: None,
         });
         self.submitted = None;
         if let Some(on_begin_device_code) = self.on_begin_device_code.as_mut() {
             on_begin_device_code();
         }
         self.notify_state_change();
+    }
+
+    pub fn set_device_code_action_status(&mut self, status: &str) {
+        if let Some(LoginDialogState::DeviceCode { action_status, .. }) = self.state.as_mut() {
+            *action_status = Some(status.to_owned());
+            self.notify_state_change();
+        }
     }
 
     /// `showManualInput` (login-dialog.ts:136-148).
@@ -397,6 +435,10 @@ impl LoginDialogComponent {
                 user_code,
                 verification_uri,
                 waiting,
+                open_browser_on_confirm,
+                copy_code_on_confirm,
+                action_pending,
+                action_status,
             }) => {
                 lines.extend(Spacer::new(1).render(width));
                 let linked_url = osc8_link(verification_uri, verification_uri);
@@ -432,6 +474,26 @@ impl LoginDialogComponent {
                         )
                         .render(width),
                     );
+                }
+                if *action_pending {
+                    let action = match (*open_browser_on_confirm, *copy_code_on_confirm) {
+                        (true, true) => "to open browser and copy code",
+                        (true, false) => "to open browser",
+                        (false, true) => "to copy code",
+                        (false, false) => "",
+                    };
+                    lines.extend(
+                        Text::new(
+                            format!("({})", key_hint(&self.theme, "tui.select.confirm", action)),
+                            1,
+                            0,
+                            None,
+                        )
+                        .render(width),
+                    );
+                }
+                if let Some(status) = action_status {
+                    lines.extend(Text::new(self.theme.fg("dim", status), 1, 0, None).render(width));
                 }
             }
             Some(LoginDialogState::ManualInput { prompt }) => {
@@ -617,6 +679,42 @@ impl Component for LoginDialogComponent {
                     on_select(&id);
                 }
             }
+            return;
+        }
+
+        let confirmation = match self.state.as_mut() {
+            Some(LoginDialogState::DeviceCode {
+                user_code,
+                verification_uri,
+                open_browser_on_confirm,
+                copy_code_on_confirm,
+                action_pending,
+                action_status,
+                ..
+            }) if *action_pending
+                && self.focused
+                && (kb.matches_id(data, "tui.select.confirm") || data == "\n") =>
+            {
+                *action_pending = false;
+                *action_status = Some(if *copy_code_on_confirm {
+                    "Copying code...".to_owned()
+                } else {
+                    "Browser open requested".to_owned()
+                });
+                Some(DeviceCodeConfirmation {
+                    user_code: user_code.clone(),
+                    verification_uri: verification_uri.clone(),
+                    open_browser: *open_browser_on_confirm,
+                    copy_code: *copy_code_on_confirm,
+                })
+            }
+            _ => None,
+        };
+        if let Some(confirmation) = confirmation {
+            if let Some(on_device_code_confirm) = self.on_device_code_confirm.as_mut() {
+                on_device_code_confirm(confirmation);
+            }
+            self.notify_state_change();
             return;
         }
 
@@ -842,6 +940,54 @@ mod tests {
         assert!(rendered.contains("Waiting for authentication..."));
         assert!(rendered.contains("Enter code: ABC-123"));
         assert!(rendered.contains("to cancel"));
+    }
+
+    #[test]
+    fn device_code_confirmation_defaults_to_both_actions_and_runs_once() {
+        install_global_keybindings();
+        let confirmations = Arc::new(Mutex::new(Vec::new()));
+        let confirmations_cb = Arc::clone(&confirmations);
+        let mut component = dialog();
+        component.set_focused(true);
+        component.on_device_code_confirm = Some(Box::new(move |confirmation| {
+            confirmations_cb.lock().unwrap().push(confirmation);
+        }));
+        component.show_device_code("ABC-123", "https://example.com/device", None);
+        assert!(
+            component
+                .render(100)
+                .join("\n")
+                .contains("to open browser and copy code")
+        );
+        component.handle_input("\r");
+        component.handle_input("\r");
+        let confirmations = confirmations.lock().unwrap();
+        assert_eq!(confirmations.len(), 1);
+        assert_eq!(confirmations[0].user_code, "ABC-123");
+        assert!(confirmations[0].open_browser);
+        assert!(confirmations[0].copy_code);
+    }
+
+    #[test]
+    fn device_code_provider_can_disable_confirmation_actions() {
+        install_global_keybindings();
+        let confirmed = Arc::new(Mutex::new(0usize));
+        let confirmed_cb = Arc::clone(&confirmed);
+        let mut component = dialog();
+        component.set_focused(true);
+        component.on_device_code_confirm = Some(Box::new(move |_| {
+            *confirmed_cb.lock().unwrap() += 1;
+        }));
+        component.show_device_code_with_options(
+            "ABC-123",
+            "file:///tmp/not-a-web-url",
+            None,
+            Some(false),
+            Some(false),
+        );
+        assert!(!component.render(100).join("\n").contains("to open browser"));
+        component.handle_input("\r");
+        assert_eq!(*confirmed.lock().unwrap(), 0);
     }
 
     #[test]

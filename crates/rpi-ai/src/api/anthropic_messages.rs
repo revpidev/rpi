@@ -26,8 +26,9 @@
 //! - SSE events are decoded with the shared [`crate::api::sse::SseDecoder`]
 //!   (ported from this file upstream).
 
+use sha2::Digest;
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -139,6 +140,7 @@ fn get_beta_features(
     context: &TranscriptContext,
     is_oauth_token: bool,
     native_tool_changes: bool,
+    message_threads: bool,
     options: &AnthropicOptions,
 ) -> Vec<String> {
     // :985-1000 — explicit `anthropic-beta` overrides the computed set.
@@ -207,6 +209,9 @@ fn get_beta_features(
     if native_tool_changes {
         features.push(INLINE_TOOLS_BETA.to_owned());
     }
+    if message_threads {
+        features.push(MESSAGE_THREADS_BETA.to_owned());
+    }
     // :1017 — `[...new Set(features)]` (already unique by construction;
     // kept for parity with the upstream dedup step).
     features
@@ -214,8 +219,8 @@ fn get_beta_features(
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Stealth mode: mimic Claude Code's version in the OAuth user agent
-/// (3a624b82d: `2.1.251` → `2.1.280`, anthropic-messages.ts:87).
-pub const CLAUDE_CODE_VERSION: &str = "2.1.280";
+/// (a05e3a077: `2.1.280` → `2.1.322`, anthropic-messages.ts:87).
+pub const CLAUDE_CODE_VERSION: &str = "2.1.322";
 
 /// Claude Code 2.x tool names (canonical casing).
 /// Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
@@ -357,6 +362,7 @@ pub struct ResolvedAnthropicCompat {
     /// #9548: the transport accepts `tool_addition`/`tool_removal` blocks
     /// (first-party Anthropic only; proxies reject them).
     pub supports_mid_convo_tool_changes: bool,
+    pub supports_message_threads: bool,
 }
 
 /// `getAnthropicCompat` (#9102, bbb61e34a: OpenRouter endpoints derive
@@ -394,7 +400,278 @@ pub fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
         supports_mid_convo_tool_changes: compat
             .and_then(|c| c.supports_mid_convo_tool_changes)
             .unwrap_or(false),
+        supports_message_threads: compat.and_then(|c| c.supports_message_threads).unwrap_or(
+            model.provider == "anthropic" && model.base_url.contains("api.anthropic.com"),
+        ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Message threads
+// ---------------------------------------------------------------------------
+
+const MESSAGE_THREADS_BETA: &str = "message-threads-2026-08-12";
+const MAX_THREAD_STATE_ENTRIES: usize = 10_000;
+const NEW_THREAD_ERRORS: [&str; 4] = [
+    "thread_not_found",
+    "thread_already_continued",
+    "thread_continue_in_flight",
+    "thread_fingerprint_mismatch",
+];
+
+#[derive(Clone)]
+struct ThreadEntry {
+    prefix_count: usize,
+    prefix_hash: String,
+    reply_id: String,
+}
+
+#[derive(Clone)]
+enum ThreadState {
+    Entry(ThreadEntry),
+    Off,
+}
+
+struct ThreadStore(Vec<(String, ThreadState)>);
+
+impl ThreadStore {
+    fn get(&self, session_id: &str) -> Option<&ThreadState> {
+        self.0
+            .iter()
+            .find(|(id, _)| id == session_id)
+            .map(|(_, state)| state)
+    }
+
+    fn remove(&mut self, session_id: &str) {
+        self.0.retain(|(id, _)| id != session_id);
+    }
+
+    fn set(&mut self, session_id: &str, state: ThreadState) {
+        self.remove(session_id);
+        self.0.push((session_id.to_owned(), state));
+        if self.0.len() > MAX_THREAD_STATE_ENTRIES {
+            self.0.remove(0);
+        }
+    }
+}
+
+fn has_exceeded_strict_tool_limits(session_id: Option<&str>) -> bool {
+    crate::api::strict_tool_limits::anthropic_has_exceeded(session_id)
+}
+
+fn mark_strict_tool_limit_rejected(session_id: &str) {
+    crate::api::strict_tool_limits::anthropic_mark_exceeded(session_id);
+}
+
+static THREAD_STATE: LazyLock<Mutex<ThreadStore>> = LazyLock::new(|| {
+    crate::session_resources::register_session_resource_cleanup(|session_id| {
+        let mut state = THREAD_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(session_id) = session_id {
+            state.remove(session_id);
+        } else {
+            state.0.clear();
+        }
+    });
+    Mutex::new(ThreadStore(Vec::new()))
+});
+
+fn set_thread_state(session_id: &str, state: ThreadState) {
+    THREAD_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .set(session_id, state);
+}
+
+#[derive(Clone)]
+struct PreparedThreadRequest {
+    session_id: String,
+    body: Value,
+}
+
+fn create_thread_request(session_id: &str, params: &Value) -> PreparedThreadRequest {
+    let mut body = params.clone();
+    body["thread"] = json!({"type": "create"});
+    PreparedThreadRequest {
+        session_id: session_id.to_owned(),
+        body,
+    }
+}
+
+fn normalize_thread_message_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.iter().map(normalize_thread_message_value).collect())
+        }
+        Value::Object(object) => object
+            .iter()
+            .filter_map(|(key, value)| {
+                if key == "cache_control" {
+                    return None;
+                }
+                let value = if key == "content" && value.is_string() {
+                    json!([{"type": "text", "text": value}])
+                } else {
+                    normalize_thread_message_value(value)
+                };
+                Some((key.clone(), value))
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into(),
+        _ => value.clone(),
+    }
+}
+
+fn hash_thread_prefix(model: &Model, params: &Value, messages: &[Value]) -> String {
+    let settings = json!([
+        model.provider.as_str(),
+        model.base_url.as_str(),
+        params["model"],
+        params["system"],
+        params["tools"],
+        params["thinking"],
+        params["output_config"],
+        params["tool_choice"],
+        params["betas"],
+        params["fallbacks"],
+    ]);
+    let conversation = normalize_thread_message_value(&Value::Array(messages.to_vec()));
+    format!(
+        "{:x}",
+        sha2::Sha256::digest(serde_json::to_vec(&(settings, conversation)).unwrap_or_default())
+    )
+}
+
+fn prepare_thread_request(
+    model: &Model,
+    session_id: &str,
+    params: &Value,
+) -> Option<PreparedThreadRequest> {
+    let state = THREAD_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(session_id)
+        .cloned();
+    if matches!(state, Some(ThreadState::Off)) {
+        return None;
+    }
+    let messages = params["messages"].as_array().cloned().unwrap_or_default();
+    if let Some(ThreadState::Entry(entry)) = state
+        && messages.len() > entry.prefix_count
+        && hash_thread_prefix(model, params, &messages[..entry.prefix_count]) == entry.prefix_hash
+    {
+        THREAD_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(session_id);
+        let mut body = params.clone();
+        if let Some(object) = body.as_object_mut() {
+            object.remove("system");
+            object.remove("tools");
+        }
+        body["messages"] = Value::Array(messages[entry.prefix_count..].to_vec());
+        body["thread"] = json!({
+            "type": "continue",
+            "previous_message_id": entry.reply_id,
+        });
+        return Some(PreparedThreadRequest {
+            session_id: session_id.to_owned(),
+            body,
+        });
+    }
+    Some(create_thread_request(session_id, params))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadErrorAction {
+    NewThread,
+    Unsupported,
+}
+
+fn thread_error_code(error: &crate::utils::provider_retry::ProviderErrorInfo) -> Option<String> {
+    error
+        .json_error()?
+        .get("error")?
+        .get("details")?
+        .get("error_code")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+fn thread_error_action(
+    error: &crate::utils::provider_retry::RetryError,
+) -> Option<(ThreadErrorAction, String)> {
+    let crate::utils::provider_retry::RetryError::Provider(error) = error else {
+        return None;
+    };
+    let code = thread_error_code(error);
+    if let Some(code) = code
+        .as_deref()
+        .filter(|code| NEW_THREAD_ERRORS.contains(code))
+    {
+        return Some((ThreadErrorAction::NewThread, code.to_owned()));
+    }
+    match code.as_deref() {
+        Some("thread_unsupported_request") => Some((
+            ThreadErrorAction::Unsupported,
+            "thread_unsupported_request".to_owned(),
+        )),
+        Some(_) => None,
+        None if error.status == Some(400) && error.message.contains("thread") => {
+            Some((ThreadErrorAction::Unsupported, "400".to_owned()))
+        }
+        None => None,
+    }
+}
+
+fn record_thread_reply(
+    model: &Model,
+    thread: PreparedThreadRequest,
+    params: &Value,
+    output: &AssistantMessage,
+    is_oauth_token: bool,
+    allow_empty_signature: bool,
+) {
+    let Some(reply_id) = &output.response_id else {
+        return;
+    };
+    let reply_id = reply_id.clone();
+    if output.response_model.is_some() {
+        return;
+    }
+    let transformed = transform_messages(
+        std::slice::from_ref(&Message::Assistant(output.clone())),
+        model,
+        Some(
+            &mut |id: &str, _model: &Model, _message: &AssistantMessage| normalize_tool_call_id(id),
+        ),
+    );
+    let Ok(converted) = convert_messages(
+        &transformed,
+        is_oauth_token,
+        None,
+        allow_empty_signature,
+        None,
+        None,
+    ) else {
+        return;
+    };
+    let mut messages = params["messages"].as_array().cloned().unwrap_or_default();
+    messages.extend(
+        converted
+            .messages
+            .into_iter()
+            .filter(|message| message["role"] == "assistant"),
+    );
+    set_thread_state(
+        &thread.session_id,
+        ThreadState::Entry(ThreadEntry {
+            prefix_count: messages.len(),
+            prefix_hash: hash_thread_prefix(model, params, &messages),
+            reply_id,
+        }),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -503,7 +780,14 @@ fn build_request_headers(
     // (4e69b0c28) — OAuth/Claude-Code identity headers still gate on the
     // token shape.
     let is_oauth = api_key.is_some_and(is_oauth_token);
-    let beta_features = get_beta_features(model, context, is_oauth, native_tool_changes, options);
+    let beta_features = get_beta_features(
+        model,
+        context,
+        is_oauth,
+        native_tool_changes,
+        compat.supports_message_threads && session_id.is_some(),
+        options,
+    );
     let beta_header = (!beta_features.is_empty()).then(|| beta_features.join(","));
 
     let dynamic_headers: Option<ProviderHeaders> = dynamic_headers.map(|headers| {
@@ -1134,14 +1418,7 @@ fn convert_tools_with_disable(
 }
 
 fn is_preferred_strict_tool(tool: &Tool) -> bool {
-    matches!(
-        tool.constrained_sampling,
-        Some(crate::types::ConstrainedSampling::Config(
-            crate::types::ConstrainedSamplingConfig::JsonSchema {
-                strict: crate::types::ConstrainedSamplingStrict::Prefer,
-            }
-        ))
-    )
+    crate::api::constrained_sampling::prefers_json_schema_strict_sampling(tool)
 }
 
 fn is_preferred_strict_tool_rejection(error: &crate::utils::provider_retry::RetryError) -> bool {
@@ -1150,13 +1427,7 @@ fn is_preferred_strict_tool_rejection(error: &crate::utils::provider_retry::Retr
     };
     error.status == Some(400)
         && error.message.contains("invalid_request_error")
-        && [
-            "The compiled grammar is too large",
-            "Too many strict tools (",
-            "Schemas contains too many parameters with union types (",
-        ]
-        .iter()
-        .any(|message| error.message.contains(message))
+        && crate::api::strict_tool_limits::is_strict_tool_limit_error_message(&error.message)
 }
 
 #[cfg(test)]
@@ -1416,7 +1687,9 @@ fn build_params_inner(
             "display": display,
             "block_binding": {"prefix_mismatch_behavior": "drop_block"},
         });
-        params["output_config"] = json!({"effort": "high"});
+        // The top-level effort is fixed so organizations with a lower cap
+        // never reject the cached prefix; per-message efforts may still vary.
+        params["output_config"] = json!({"effort": "low"});
     } else if model.reasoning {
         if options.thinking_enabled == Some(true) {
             // Default to "summarized" so Opus 4.7 and Mythos Preview behave
@@ -2181,7 +2454,8 @@ async fn run(
         federation_token.as_deref(),
     );
 
-    let mut disable_preferred_strict_tools = false;
+    let mut disable_preferred_strict_tools =
+        has_exceeded_strict_tool_limits(options.stream.session_id.as_deref());
     let response = loop {
         if options
             .stream
@@ -2210,6 +2484,19 @@ async fn run(
             params = next_params;
         }
 
+        let full_params = params.clone();
+        let prepared = if compat.supports_message_threads
+            && options.stream.disable_continuation != Some(true)
+        {
+            cache_session_id
+                .and_then(|session_id| prepare_thread_request(model, session_id, &params))
+        } else {
+            None
+        };
+        if let Some(prepared) = &prepared {
+            params = prepared.body.clone();
+        }
+
         let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
         let header_map = provider_headers_to_header_map(&headers)?;
         let mut client_builder =
@@ -2230,107 +2517,172 @@ async fn run(
             max_retry_delay_ms: options.stream.max_retry_delay_ms,
             ..Default::default()
         };
-        let initial_federation_token = federation_token.clone();
-        let attempt = retry_provider_request(
-        || {
+        let send_request = |body: Value| {
             let client = client.clone();
             let url = url.clone();
-            let params = params.clone();
             let header_map = header_map.clone();
             let federation = federation.clone();
             let signal = options.stream.signal.clone();
             let fetch = options.stream.fetch.clone();
             let timeout_ms = options.stream.timeout_ms;
-            let mut authorization = initial_federation_token
-                .as_deref()
-                .map(|token| format!("Bearer {token}"));
+            let retry_options = retry_options.clone();
+            let initial_federation_token = federation_token.clone();
             async move {
-                let mut did_refresh_for_401 = false;
-                loop {
-                    let mut request_headers = header_map.clone();
-                    if let Some(value) = &authorization {
-                        match reqwest::header::HeaderValue::from_str(value) {
-                            Ok(value) => {
-                                // `insert` replaces the mapped header so the
-                                // retried request carries exactly one token.
-                                request_headers.insert(reqwest::header::AUTHORIZATION, value);
-                            }
-                            Err(header_error) => {
+                retry_provider_request(
+                    || {
+                        let client = client.clone();
+                        let url = url.clone();
+                        let body = body.clone();
+                        let header_map = header_map.clone();
+                        let federation = federation.clone();
+                        let signal = signal.clone();
+                        let fetch = fetch.clone();
+                        let mut authorization = initial_federation_token
+                            .as_deref()
+                            .map(|token| format!("Bearer {token}"));
+                        async move {
+                            let mut did_refresh_for_401 = false;
+                            loop {
+                                let mut request_headers = header_map.clone();
+                                if let Some(value) = &authorization {
+                                    match reqwest::header::HeaderValue::from_str(value) {
+                                        Ok(value) => {
+                                            request_headers
+                                                .insert(reqwest::header::AUTHORIZATION, value);
+                                        }
+                                        Err(header_error) => {
+                                            return Err(ProviderErrorInfo {
+                                                status: None,
+                                                headers: None,
+                                                message: format!(
+                                                    "Invalid federation authorization header: {header_error}"
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                                let request =
+                                    client.post(&url).headers(request_headers).json(&body);
+                                let result = send_provider_request(
+                                    request,
+                                    fetch.as_ref(),
+                                    signal.as_ref(),
+                                    timeout_ms,
+                                )
+                                .await;
+                                let response = match result {
+                                    Ok(response) => response,
+                                    Err(error) => return Err(error.into_provider_error_info()),
+                                };
+                                let status = response.status();
+                                if status == reqwest::StatusCode::UNAUTHORIZED
+                                    && !did_refresh_for_401
+                                    && let Some(config) = &federation
+                                {
+                                    did_refresh_for_401 = true;
+                                    crate::auth::anthropic_federation::invalidate_access_token(
+                                        config,
+                                    )
+                                    .await;
+                                    match crate::auth::anthropic_federation::get_access_token(
+                                        config,
+                                    )
+                                    .await
+                                    {
+                                        Ok(token) => {
+                                            authorization = Some(format!("Bearer {token}"));
+                                            continue;
+                                        }
+                                        Err(refresh_error) => {
+                                            return Err(ProviderErrorInfo {
+                                                status: Some(401),
+                                                headers: None,
+                                                message: refresh_error.message,
+                                            });
+                                        }
+                                    }
+                                }
+                                if status.is_success() {
+                                    return Ok(response);
+                                }
+                                let status = status.as_u16();
+                                let response_headers = headers_to_record(response.headers());
+                                let body = response.text().await.unwrap_or_default();
+                                let normalized = NormalizedProviderError::new(
+                                    Some(status),
+                                    Some(body),
+                                    format!("Request failed with status {status}"),
+                                );
                                 return Err(ProviderErrorInfo {
-                                    status: None,
-                                    headers: None,
-                                    message: format!(
-                                        "Invalid federation authorization header: {header_error}"
-                                    ),
+                                    status: Some(status),
+                                    headers: Some(response_headers),
+                                    message: format_provider_error(&normalized, None),
                                 });
                             }
                         }
-                    }
-                    let request = client.post(&url).headers(request_headers).json(&params);
-                    // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
-                    // keeps the reqwest default path unchanged.
-                    let result =
-                        send_provider_request(request, fetch.as_ref(), signal.as_ref(), timeout_ms)
-                            .await;
-                    let response = match result {
-                        Ok(response) => response,
-                        Err(error) => return Err(error.into_provider_error_info()),
-                    };
-                    let status = response.status();
-                    // Reactive refresh (SDK `shouldRetry`): a 401 from a
-                    // token-authenticated request invalidates the cache and
-                    // retries once with a freshly exchanged token.
-                    if status == reqwest::StatusCode::UNAUTHORIZED
-                        && !did_refresh_for_401
-                        && let Some(config) = &federation
-                    {
-                        did_refresh_for_401 = true;
-                        crate::auth::anthropic_federation::invalidate_access_token(config).await;
-                        match crate::auth::anthropic_federation::get_access_token(config).await {
-                            Ok(token) => {
-                                authorization = Some(format!("Bearer {token}"));
-                                continue;
+                    },
+                    retry_options,
+                    signal.as_ref(),
+                )
+                .await
+            }
+        };
+        let (attempt, prepared) = if let Some(thread) = prepared {
+            match send_request(thread.body.clone()).await {
+                Ok(response) => (Ok(response), Some(thread)),
+                Err(error) => {
+                    if let Some((action, reason)) = thread_error_action(&error) {
+                        output.with_mut(|output| {
+                            output.diagnostics.get_or_insert_with(Vec::new).push(
+                                crate::types::AssistantMessageDiagnostic {
+                                    kind: "anthropic_thread_fallback".to_owned(),
+                                    timestamp: now_ms(),
+                                    error: Some(crate::types::DiagnosticErrorInfo {
+                                        name: Some("ProviderError".to_owned()),
+                                        message: error.message(),
+                                        stack: None,
+                                        code: None,
+                                    }),
+                                    details: Some(serde_json::Map::from_iter([(
+                                        "reason".to_owned(),
+                                        json!(reason),
+                                    )])),
+                                },
+                            );
+                        });
+                        match action {
+                            ThreadErrorAction::NewThread => {
+                                let created =
+                                    create_thread_request(&thread.session_id, &full_params);
+                                (send_request(created.body.clone()).await, Some(created))
                             }
-                            Err(refresh_error) => {
-                                return Err(ProviderErrorInfo {
-                                    status: Some(401),
-                                    headers: None,
-                                    message: refresh_error.message,
-                                });
+                            ThreadErrorAction::Unsupported => {
+                                let resent = send_request(full_params.clone()).await;
+                                if resent.is_ok() {
+                                    set_thread_state(&thread.session_id, ThreadState::Off);
+                                }
+                                (resent, None)
                             }
                         }
+                    } else {
+                        (Err(error), Some(thread))
                     }
-                    if status.is_success() {
-                        return Ok(response);
-                    }
-                    let status = status.as_u16();
-                    let response_headers = headers_to_record(response.headers());
-                    let body = response.text().await.unwrap_or_default();
-                    let normalized = NormalizedProviderError::new(
-                        Some(status),
-                        Some(body),
-                        format!("Request failed with status {status}"),
-                    );
-                    return Err(ProviderErrorInfo {
-                        status: Some(status),
-                        headers: Some(response_headers),
-                        message: format_provider_error(&normalized, None),
-                    });
                 }
             }
-        },
-        retry_options.clone(),
-        options.stream.signal.as_ref(),
-    )
-    .await;
+        } else {
+            (send_request(params.clone()).await, None)
+        };
         match attempt {
-            Ok(response) => break response,
+            Ok(response) => break (response, prepared, full_params),
             Err(error) => {
                 let message = error.message();
                 if !disable_preferred_strict_tools
                     && has_preferred_strict_tools
                     && is_preferred_strict_tool_rejection(&error)
                 {
+                    if let Some(session_id) = options.stream.session_id.as_deref() {
+                        mark_strict_tool_limit_rejected(session_id);
+                    }
                     disable_preferred_strict_tools = true;
                     output.with_mut(|output| {
                         output.diagnostics.get_or_insert_with(Vec::new).push(
@@ -2356,6 +2708,8 @@ async fn run(
             }
         }
     };
+
+    let (response, prepared, full_params) = response;
 
     if let Some(on_response) = &options.stream.on_response {
         on_response(
@@ -2409,7 +2763,18 @@ async fn run(
     for sse in decoder.finish()? {
         processor.handle_sse(&sse, events)?;
     }
-    processor.finish(options.stream.signal.as_ref())
+    let reason = processor.finish(options.stream.signal.as_ref())?;
+    if let Some(thread) = prepared {
+        record_thread_reply(
+            model,
+            thread,
+            &full_params,
+            &output.snapshot(),
+            is_oauth_token,
+            compat.allow_empty_signature,
+        );
+    }
+    Ok(reason)
 }
 
 /// `stream` (anthropic-messages). The provider-facing transcript is
@@ -2868,10 +3233,10 @@ pub(crate) mod tests {
             headers.get("anthropic-version").and_then(|v| v.as_deref()),
             Some(ANTHROPIC_VERSION)
         );
-        // Interleaved-thinking beta is requested by default.
+        // Interleaved thinking and message threads are requested by default.
         assert_eq!(
             headers.get("anthropic-beta").and_then(|v| v.as_deref()),
-            Some(INTERLEAVED_THINKING_BETA)
+            Some("interleaved-thinking-2025-05-14,message-threads-2026-08-12")
         );
         // sendSessionAffinityHeaders defaults to false.
         assert!(!headers.contains_key("x-session-affinity"));
@@ -2910,8 +3275,8 @@ pub(crate) mod tests {
         assert_eq!(
             headers.get("user-agent").and_then(|v| v.as_deref()),
             // 3a624b82d: the reported version follows upstream
-            // `claudeCodeVersion` (`2.1.280`, anthropic-messages.ts:87).
-            Some("claude-cli/2.1.280")
+            // `claudeCodeVersion` (`2.1.322`, a05e3a077).
+            Some("claude-cli/2.1.322")
         );
         assert_eq!(headers.get("x-app").and_then(|v| v.as_deref()), Some("cli"));
         let beta = headers
@@ -4537,7 +4902,7 @@ mod mid_convo_effort_tests {
         let params = build_params(&unsupported, &ctx, false, false, &options).expect("params");
         assert_eq!(params["thinking"]["type"], json!("adaptive"));
         assert!(params["thinking"].get("block_binding").is_some());
-        assert_eq!(params["output_config"], json!({"effort": "high"}));
+        assert_eq!(params["output_config"], json!({"effort": "low"}));
         assert!(!effort_markers(&params).is_empty());
         let message = stream(&unsupported, &ctx, options)
             .result()
@@ -4596,8 +4961,8 @@ mod mid_convo_effort_tests {
             }))
         );
         // Request-level controls are pinned regardless of the turn's effort.
-        assert_eq!(first["output_config"], json!({"effort": "high"}));
-        assert_eq!(second["output_config"], json!({"effort": "high"}));
+        assert_eq!(first["output_config"], json!({"effort": "low"}));
+        assert_eq!(second["output_config"], json!({"effort": "low"}));
         assert_eq!(
             second["thinking"],
             json!({
@@ -4729,6 +5094,7 @@ mod mid_convo_effort_tests {
             &crate::utils::transcript::normalize_context(&Context::default()),
             false,
             false,
+            false,
             &options,
         );
         assert!(betas.contains(&"mid-conversation-output-config-2026-07-01".to_owned()));
@@ -4768,6 +5134,7 @@ mod mid_convo_effort_tests {
             &crate::utils::transcript::normalize_context(&Context::default()),
             false,
             false,
+            false,
             &AnthropicOptions::default(),
         );
         assert!(betas.contains(&SERVER_SIDE_FALLBACK_BETA.to_owned()));
@@ -4777,6 +5144,7 @@ mod mid_convo_effort_tests {
             let betas = get_beta_features(
                 &model,
                 &crate::utils::transcript::normalize_context(&Context::default()),
+                false,
                 false,
                 false,
                 &AnthropicOptions::default(),
@@ -4808,7 +5176,7 @@ mod mid_convo_effort_tests {
                 .collect(),
         );
         assert_eq!(
-            get_beta_features(&with_model_headers, &base, false, false, &options),
+            get_beta_features(&with_model_headers, &base, false, false, false, &options),
             vec!["a".to_owned(), "b".to_owned()]
         );
 
@@ -4824,7 +5192,7 @@ mod mid_convo_effort_tests {
             thinking_enabled: Some(true),
             ..Default::default()
         };
-        assert!(get_beta_features(&model, &base, false, false, &null_options).is_empty());
+        assert!(get_beta_features(&model, &base, false, false, false, &null_options).is_empty());
 
         // options beat model headers; dedup keeps first occurrence.
         let mut model_headers = managed_model("anthropic");
@@ -4849,7 +5217,14 @@ mod mid_convo_effort_tests {
             ..Default::default()
         };
         assert_eq!(
-            get_beta_features(&model_headers, &base, false, false, &override_options),
+            get_beta_features(
+                &model_headers,
+                &base,
+                false,
+                false,
+                false,
+                &override_options
+            ),
             vec!["b".to_owned(), "a".to_owned()]
         );
     }
@@ -5613,5 +5988,232 @@ mod transcript_tool_changes_tests {
             .map(|message| message["role"].as_str().expect("role"))
             .collect();
         assert_eq!(roles, vec!["user"]);
+    }
+
+    #[test]
+    fn message_threads_continue_only_with_an_identical_prefix() {
+        let model = make_model(json!({}));
+        let session = "thread-prefix-test";
+        THREAD_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(session);
+        let first_params = json!({
+            "model": model.id,
+            "system": "same",
+            "messages": [{"role": "user", "content": "first"}]
+        });
+        let first = prepare_thread_request(&model, session, &first_params).expect("first thread");
+        assert_eq!(first.body["thread"]["type"], "create");
+        let mut first_output = initial_output(&model);
+        first_output.response_id = Some("reply-1".to_owned());
+        record_thread_reply(&model, first, &first_params, &first_output, false, false);
+
+        let second_params = json!({
+            "model": model.id,
+            "system": "same",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "user", "content": "second"}
+            ]
+        });
+        let stored = THREAD_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(session)
+            .cloned();
+        let Some(ThreadState::Entry(entry)) = stored else {
+            panic!("missing recorded thread state")
+        };
+        assert_eq!(
+            hash_thread_prefix(
+                &model,
+                &second_params,
+                &second_params["messages"].as_array().expect("messages")[..1]
+            ),
+            entry.prefix_hash
+        );
+        let continuation =
+            prepare_thread_request(&model, session, &second_params).expect("continuation");
+        assert_eq!(continuation.body["thread"]["type"], "continue");
+        assert_eq!(
+            continuation.body["thread"]["previous_message_id"],
+            "reply-1"
+        );
+        assert_eq!(
+            continuation.body["messages"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert!(continuation.body.get("system").is_none());
+        assert!(continuation.body.get("tools").is_none());
+
+        let mut second_output = initial_output(&model);
+        second_output.response_id = Some("reply-2".to_owned());
+        record_thread_reply(
+            &model,
+            continuation,
+            &second_params,
+            &second_output,
+            false,
+            false,
+        );
+        let mut changed = second_params.clone();
+        changed["system"] = json!("different");
+        if let Some(messages) = changed["messages"].as_array_mut() {
+            messages.push(json!({"role": "user", "content": "third"}));
+        }
+        let new_thread = prepare_thread_request(&model, session, &changed)
+            .expect("changed prefix starts a new thread");
+        assert_eq!(new_thread.body["thread"]["type"], "create");
+        assert_eq!(
+            new_thread.body["messages"].as_array().map(Vec::len),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn message_threads_record_converted_tool_replies_and_normalize_cache_markers() {
+        let model = make_model(json!({}));
+        let session = "thread-tool-reply-test";
+        THREAD_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(session);
+        let first_params = json!({
+            "model": model.id,
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "first", "cache_control": {"type": "ephemeral"}}]
+            }]
+        });
+        let first = prepare_thread_request(&model, session, &first_params).expect("first thread");
+        let mut output = initial_output(&model);
+        output.response_id = Some("reply-tool".to_owned());
+        output.content =
+            vec![serde_json::from_value(json!({
+            "type": "toolCall", "id": "toolu_1", "name": "lookup", "arguments": {"value": "x"}
+        }))
+        .expect("tool call")];
+        record_thread_reply(&model, first, &first_params, &output, false, false);
+
+        let next_params = json!({
+            "model": model.id,
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"value": "x"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "toolu_1", "content": "result", "is_error": false
+                }]}
+            ]
+        });
+        let continuation =
+            prepare_thread_request(&model, session, &next_params).expect("continuation");
+        assert_eq!(continuation.body["thread"]["type"], "continue");
+        assert_eq!(
+            continuation.body["thread"]["previous_message_id"],
+            "reply-tool"
+        );
+        assert_eq!(
+            continuation.body["messages"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            continuation.body["messages"][0]["content"][0]["type"],
+            "tool_result"
+        );
+    }
+
+    #[test]
+    fn message_threads_beta_is_limited_to_enabled_sessions() {
+        let model = make_model(json!({}));
+        let betas = get_beta_features(
+            &model,
+            &crate::utils::transcript::normalize_context(&crate::types::Context::default()),
+            false,
+            false,
+            true,
+            &AnthropicOptions::default(),
+        );
+        assert!(betas.contains(&MESSAGE_THREADS_BETA.to_owned()));
+        assert!(get_anthropic_compat(&model).supports_message_threads);
+        let proxy = make_model(json!({
+            "provider": "other", "baseUrl": "https://proxy.example.com"
+        }));
+        assert!(!get_anthropic_compat(&proxy).supports_message_threads);
+    }
+
+    #[test]
+    fn strict_limit_rejections_are_remembered_and_cleaned_per_session() {
+        let session = "strict-limit-test";
+        assert!(!has_exceeded_strict_tool_limits(Some(session)));
+        mark_strict_tool_limit_rejected(session);
+        assert!(has_exceeded_strict_tool_limits(Some(session)));
+        assert!(!has_exceeded_strict_tool_limits(Some("other-session")));
+        crate::session_resources::cleanup_session_resources(Some(session))
+            .expect("cleanup strict-limit state");
+        assert!(!has_exceeded_strict_tool_limits(Some(session)));
+    }
+
+    #[test]
+    fn thread_errors_use_the_structured_code_before_message_fallback() {
+        let error = |code: &str| {
+            crate::utils::provider_retry::RetryError::Provider(
+                crate::utils::provider_retry::ProviderErrorInfo {
+                    status: Some(400),
+                    headers: None,
+                    message: format!(
+                        "Bad Request: {}",
+                        json!({"error": {"details": {"error_code": code}}})
+                    ),
+                },
+            )
+        };
+        assert!(thread_error_action(&error("thread_limit_exceeded")).is_none());
+        assert_eq!(
+            thread_error_action(&error("thread_unsupported_request")),
+            Some((
+                ThreadErrorAction::Unsupported,
+                "thread_unsupported_request".to_owned()
+            ))
+        );
+        assert_eq!(
+            thread_error_action(&error("thread_not_found")),
+            Some((ThreadErrorAction::NewThread, "thread_not_found".to_owned()))
+        );
+        let trailing = crate::utils::provider_retry::RetryError::Provider(
+            crate::utils::provider_retry::ProviderErrorInfo {
+                status: Some(400),
+                headers: None,
+                message: format!(
+                    "Bad Request: {} trailing proxy text",
+                    json!({"error": {"details": {"error_code": "thread_not_found"}}})
+                ),
+            },
+        );
+        assert_eq!(
+            thread_error_action(&trailing),
+            Some((ThreadErrorAction::NewThread, "thread_not_found".to_owned()))
+        );
+    }
+
+    #[test]
+    fn non_strict_tools_preserve_root_definitions() {
+        let tool: Tool = serde_json::from_value(json!({
+            "name": "t", "description": "d",
+            "parameters": {
+                "$defs": {"A": {"type": "string"}},
+                "definitions": {"B": {"type": "integer"}},
+                "type": "object",
+                "properties": {"a": {"$ref": "#/$defs/A"}}
+            }
+        }))
+        .expect("tool");
+        let parameters = get_json_schema_tool_parameters(&tool, None).expect("parameters");
+        assert!(parameters.get("$defs").is_some());
+        assert!(parameters.get("definitions").is_some());
+        assert_eq!(parameters["$defs"]["A"]["type"], "string");
+        assert_eq!(parameters["definitions"]["B"]["type"], "integer");
     }
 }

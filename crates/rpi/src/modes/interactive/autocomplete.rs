@@ -199,7 +199,7 @@ fn auth_type_order(auth_type: AuthType) -> u8 {
 
 /// `getLoginProviderCompletionOptions` (interactive-mode.ts:386-407): merge
 /// the per-method selector rows into one entry per provider id (auth types
-/// deduped and ordered), sorted by display name.
+/// deduped and ordered), preferred partners first and then display name.
 pub(crate) fn get_login_provider_completion_options(
     provider_options: &[AuthSelectorProvider],
 ) -> Vec<LoginProviderCompletionOption> {
@@ -221,7 +221,9 @@ pub(crate) fn get_login_provider_completion_options(
             subscription: provider.subscription,
         });
     }
-    options.sort_by(|a, b| a.name.cmp(&b.name));
+    options.sort_by(|a, b| {
+        crate::core::preferred_providers::compare_providers(&a.id, &a.name, &b.id, &b.name)
+    });
     options
 }
 

@@ -153,6 +153,10 @@ fn combine_usage(first: &Usage, second: &Usage) -> Usage {
             cache_read: first.cost.cache_read + second.cost.cache_read,
             cache_write: first.cost.cache_write + second.cost.cache_write,
             total: first.cost.total + second.cost.total,
+            total_from_provider: Some(
+                first.cost.total_from_provider == Some(true)
+                    && second.cost.total_from_provider == Some(true),
+            ),
         },
     }
 }

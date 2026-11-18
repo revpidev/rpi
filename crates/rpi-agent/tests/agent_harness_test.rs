@@ -120,7 +120,10 @@ fn create_usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> U
         cache_write1h: None,
         reasoning: None,
         total_tokens: input + output + cache_read + cache_write,
-        cost: UsageCost::default(),
+        cost: UsageCost {
+            total_from_provider: Some(false),
+            ..Default::default()
+        },
     }
 }
 

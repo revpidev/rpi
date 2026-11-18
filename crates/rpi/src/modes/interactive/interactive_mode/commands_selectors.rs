@@ -1064,12 +1064,66 @@ fn login_dialog_with_interaction(
             state_cancel.signal.cancel();
             state_cancel.resolve(Err(login_cancelled()));
         }));
+        let dialog_action = Arc::downgrade(&dialog);
+        let ui_action = Arc::clone(ui);
+        dialog_guard.on_device_code_confirm = Some(Box::new(move |confirmation| {
+            let dialog_action = dialog_action.clone();
+            let ui_action = Arc::clone(&ui_action);
+            spawn_async(async move {
+                let copied = if confirmation.copy_code {
+                    let ui_copy = Arc::clone(&ui_action);
+                    let user_code = confirmation.user_code.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let env = ui_copy.clipboard_env();
+                        let mut runner_guard = lock(&ui_copy.clipboard_runner_override);
+                        let runner = runner_guard.as_mut();
+                        ui_copy.ui.with_terminal(|terminal| {
+                            crate::modes::interactive::clipboard::copy_to_clipboard_with_runner(
+                                &user_code,
+                                &env,
+                                runner,
+                                &mut |payload| {
+                                    terminal.write(payload);
+                                },
+                            )
+                        })
+                    })
+                    .await
+                    .map(|result| result.is_ok())
+                    .unwrap_or(false)
+                } else {
+                    false
+                };
+                if confirmation.open_browser {
+                    open_login_url(&confirmation.verification_uri);
+                }
+                if let Some(dialog) = dialog_action.upgrade() {
+                    let status = if confirmation.copy_code {
+                        if copied {
+                            "Code copied to clipboard"
+                        } else {
+                            "Copy code manually"
+                        }
+                    } else {
+                        "Browser open requested"
+                    };
+                    lock(&dialog).set_device_code_action_status(status);
+                }
+            });
+        }));
     }
     let interaction = LoginDialogInteraction {
         dialog: dialog.clone(),
         state,
     };
     (dialog, interaction)
+}
+
+fn open_login_url(url: &str) {
+    let Some(url) = rpi_ai::auth::oauth::trusted_url::trusted_http_url(url) else {
+        return;
+    };
+    crate::utils::open_browser::open_browser(&url);
 }
 
 /// Mount the dialog in place of the editor (upstream
@@ -1153,15 +1207,19 @@ impl AuthInteraction for LoginDialogInteraction {
             AuthEvent::DeviceCode {
                 user_code,
                 verification_uri,
+                open_browser_on_confirm,
+                copy_code_on_confirm,
                 ..
             } => {
                 // Upstream calls showDeviceCode + showWaiting
                 // (interactive-mode.ts:5264-5266); the port folds the
                 // waiting line into the device-code state.
-                dialog.show_device_code(
+                dialog.show_device_code_with_options(
                     &user_code,
                     &verification_uri,
                     Some("Waiting for authentication..."),
+                    open_browser_on_confirm,
+                    copy_code_on_confirm,
                 );
             }
             AuthEvent::Info { message, links } => {
@@ -2365,7 +2423,9 @@ impl InteractiveUi {
                 }
             })
             .collect();
-        providers.sort_by(|a, b| a.name.cmp(&b.name));
+        providers.sort_by(|a, b| {
+            crate::core::preferred_providers::compare_providers(&a.id, &a.name, &b.id, &b.name)
+        });
 
         let select_ui = Arc::clone(ui);
         let selector = Arc::new(Mutex::new(OAuthSelectorComponent::new(

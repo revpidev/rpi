@@ -489,6 +489,7 @@ fn parse_usage(raw: &RawUsage, model: &ImagesModel) -> Usage {
         cache_read: (rates.cache_read / 1_000_000.0) * cache_read_tokens as f64,
         cache_write: (rates.cache_write / 1_000_000.0) * cache_write_tokens as f64,
         total: 0.0,
+        total_from_provider: Some(false),
     };
     let total_tokens = input + output + cache_read_tokens + cache_write_tokens;
     Usage {

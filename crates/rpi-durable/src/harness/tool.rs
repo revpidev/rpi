@@ -1178,7 +1178,7 @@ fn structured_output_error(
                 .iter_errors(value)
                 .next()
                 .map(|error| {
-                    let path = error.instance_path.to_string();
+                    let path = error.instance_path().to_string();
                     let path = path.trim_start_matches('/').replace('/', ".");
                     let path = if path.is_empty() {
                         "root".to_string()

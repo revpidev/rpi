@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use crate::api::mistral_conversations::MistralConversations;
 use crate::auth::{ProviderAuth, env_api_key_auth};
-use crate::generated::get_builtin_models;
 use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `mistralProvider()`.
@@ -21,7 +20,7 @@ pub fn mistral_provider() -> Arc<dyn Provider> {
             ))),
             oauth: None,
         },
-        models: get_builtin_models("mistral").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared("mistral")),
         api: ProviderApi::Single(Arc::new(MistralConversations)),
         ..Default::default()
     })

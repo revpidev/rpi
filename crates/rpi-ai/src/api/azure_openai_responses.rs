@@ -357,7 +357,13 @@ pub fn build_params(
     });
     // Upstream sets `prompt_cache_key` unconditionally in the literal; an
     // undefined value is dropped by JSON.stringify, so only Some lands here.
-    if let Some(key) = clamp_openai_prompt_cache_key(options.stream.session_id.as_deref()) {
+    if model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.prompt_cache_key_mode)
+        != Some(crate::types::PromptCacheKeyMode::Disabled)
+        && let Some(key) = clamp_openai_prompt_cache_key(options.stream.session_id.as_deref())
+    {
         params["prompt_cache_key"] = json!(key);
     }
     params["store"] = json!(false);

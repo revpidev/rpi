@@ -18,7 +18,8 @@ tokio-util.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
-reqwest.workspace = true
+# JSON request/response helpers previously inherited `json` from jsonschema's reqwest 0.12.
+reqwest = { workspace = true, features = ["json"] }
 http.workspace = true
 bytes.workspace = true
 jsonschema.workspace = true

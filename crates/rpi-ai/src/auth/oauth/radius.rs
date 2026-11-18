@@ -337,7 +337,7 @@ impl RadiusOAuth {
         discovery
             .get("authorizationEndpoint")
             .and_then(Value::as_str)
-            .map(str::to_owned)
+            .and_then(super::trusted_url::trusted_http_url)
             .ok_or_else(|| error(format!("Invalid Radius OAuth config from {}", self.gateway)))
     }
 
@@ -396,10 +396,16 @@ impl RadiusOAuth {
                     && !verification_uri.is_empty()
                     && expires_in != 0.0 =>
             {
+                let Some(verification_uri) = super::trusted_url::trusted_http_url(verification_uri)
+                else {
+                    return Err(error(
+                        "Untrusted verification_uri in Radius OAuth device authorization response",
+                    ));
+                };
                 Ok(DeviceAuthorizationResponse {
                     device_code: device_code.to_owned(),
                     user_code: user_code.to_owned(),
-                    verification_uri: verification_uri.to_owned(),
+                    verification_uri,
                     expires_in,
                     interval,
                 })
@@ -421,6 +427,8 @@ impl RadiusOAuth {
         interaction.notify(AuthEvent::DeviceCode {
             user_code: device.user_code.clone(),
             verification_uri: device.verification_uri.clone(),
+            open_browser_on_confirm: None,
+            copy_code_on_confirm: None,
             interval_seconds: device.interval.map(|interval| interval as u64),
             expires_in_seconds: Some(device.expires_in as u64),
         });
@@ -883,6 +891,8 @@ mod tests {
             &[AuthEvent::DeviceCode {
                 user_code: "ABCD-1234".to_owned(),
                 verification_uri: "https://radius-ui.example/pair".to_owned(),
+                open_browser_on_confirm: None,
+                copy_code_on_confirm: None,
                 interval_seconds: Some(5),
                 expires_in_seconds: Some(600),
             }]

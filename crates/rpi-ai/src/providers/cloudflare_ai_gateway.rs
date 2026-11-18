@@ -16,7 +16,8 @@ use crate::api::openai_completions::OpenAiCompletions;
 use crate::api::openai_responses::OpenAiResponses;
 use crate::auth::ProviderAuth;
 use crate::auth::cloudflare_auth::cloudflare_ai_gateway_auth;
-use crate::generated::get_builtin_models;
+#[cfg(test)]
+use crate::generated::get_builtin_chat_models;
 use crate::models::{
     CreateProviderOptions, Provider, ProviderApi, ProviderStreams, create_provider,
 };
@@ -35,7 +36,9 @@ pub fn cloudflare_ai_gateway_provider() -> Arc<dyn Provider> {
             api_key: Some(cloudflare_ai_gateway_auth()),
             oauth: None,
         },
-        models: get_builtin_models("cloudflare-ai-gateway").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared(
+            "cloudflare-ai-gateway",
+        )),
         api: ProviderApi::Map(api_map()),
         ..Default::default()
     })
@@ -67,7 +70,7 @@ mod tests {
     fn api_map_covers_the_three_catalog_apis() {
         let map = api_map();
         assert_eq!(map.len(), 3);
-        for model in get_builtin_models("cloudflare-ai-gateway") {
+        for model in get_builtin_chat_models("cloudflare-ai-gateway") {
             assert!(
                 map.contains_key(model.api.as_str()),
                 "catalog model {} has undispatched api {}",
@@ -79,7 +82,7 @@ mod tests {
 
     #[test]
     fn catalog_base_urls_carry_the_gateway_placeholders() {
-        for model in get_builtin_models("cloudflare-ai-gateway") {
+        for model in get_builtin_chat_models("cloudflare-ai-gateway") {
             assert!(
                 model.base_url.contains("{CLOUDFLARE_ACCOUNT_ID}"),
                 "{}: {}",

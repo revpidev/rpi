@@ -367,10 +367,10 @@ mod tests {
         assert!(!is_replayable(&budget, Some(&ThinkingLevel::Medium)));
         assert!(is_replayable(&budget, None));
         let mut adaptive_thinking = adaptive.clone();
-        adaptive_thinking.compat = Some(rpi_ai::types::ModelCompat {
+        adaptive_thinking.compat = Some(Box::new(rpi_ai::types::ModelCompat {
             force_adaptive_thinking: Some(true),
             ..Default::default()
-        });
+        }));
         assert!(is_replayable(
             &adaptive_thinking,
             Some(&ThinkingLevel::Medium)

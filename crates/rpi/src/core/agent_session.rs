@@ -2618,6 +2618,11 @@ impl AgentSession {
             "This extension ctx is stale after session replacement or reload. Do not use a captured rpi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
         );
         lock(&self.inner.listeners).clear();
+        if let Err(error) =
+            rpi_ai::session_resources::cleanup_session_resources(Some(&self.session_id()))
+        {
+            tracing::warn!(error = %error, "Failed to clean up session resources");
+        }
     }
 
     // ==================================================================
@@ -7054,5 +7059,22 @@ mod recovery_omission_tests {
                 .any(|message| matches!(message, AgentMessage::ToolResult(result) if result.tool_call_id == "call-truncated")),
             "orphaned result omitted"
         );
+    }
+}
+
+#[cfg(test)]
+mod disposal_tests {
+    #[tokio::test]
+    async fn dispose_cleans_session_provider_resources() {
+        let fixture = crate::modes::interactive::test_support::build_test_session().await;
+        let session_id = fixture.session.session_id();
+        rpi_ai::api::strict_tool_limits::anthropic_mark_exceeded(&session_id);
+        assert!(rpi_ai::api::strict_tool_limits::anthropic_has_exceeded(
+            Some(&session_id)
+        ));
+        fixture.session.dispose();
+        assert!(!rpi_ai::api::strict_tool_limits::anthropic_has_exceeded(
+            Some(&session_id)
+        ));
     }
 }

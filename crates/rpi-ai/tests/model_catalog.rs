@@ -55,7 +55,7 @@ fn test_vendored_files_match_manifest_sha256() {
     )
     .expect("manifest json");
     let files = manifest["files"].as_object().expect("files");
-    assert_eq!(files.len(), 42);
+    assert_eq!(files.len(), 43);
     for (name, hash) in files {
         let bytes = std::fs::read(data_dir().join(name)).expect("vendored file");
         assert_eq!(
@@ -203,9 +203,9 @@ fn test_catalog_field_by_field_roundtrip() {
             total += 1;
         }
     }
-    // v1.4.0 generator @ 4a080252f, snapshot 2026-11-07T06:35:18.361Z:
-    // 1615 chat + 66 image + 60 classifier entries.
-    assert_eq!(total, 1741);
+    // v1.5.2 generator @ b4afdddf, snapshot 2026-11-17T03:17:54.693Z:
+    // 1667 chat + 72 image + 76 classifier entries.
+    assert_eq!(total, 1815);
 }
 
 /// FR-E R2 (V14-09): every `compat` key present in the vendored JSON must
@@ -259,10 +259,10 @@ fn test_catalog_accessors_and_generated_at() {
         }
     }
     // Pinned to the vendored .manifest.json generatedAt
-    // (2026-11-07T06:35:18.361Z); update on catalog refresh.
+    // (2026-11-17T03:17:54.693Z); update on catalog refresh.
     assert_eq!(
         get_builtin_model_data_generated_at(),
-        Some(1_794_033_318_361)
+        Some(1_794_885_474_693)
     );
 }
 
@@ -320,6 +320,80 @@ fn test_v18_required_catalog_walk() {
     );
 }
 
+/// V19-01 R2-A01: required v1.5.2 catalog walk, generated from the pinned
+/// provider definitions and models.dev v2 inputs rather than hand-edited JSON.
+#[test]
+fn test_v19_required_catalog_walk() {
+    let terra = get_model("openai", "gpt-6.1-terra");
+    assert_eq!(terra.api.as_str(), "openai-responses");
+    assert_eq!(terra.cost.rates.input, 1.0);
+    assert_eq!(terra.cost.rates.output, 5.0);
+
+    let fable = get_model("anthropic", "claude-fable-5-2");
+    assert_eq!(fable.api.as_str(), "anthropic-messages");
+    assert_eq!(fable.context_window, 1_000_000);
+    assert!(fable.reasoning);
+
+    let azure = get_model("azure", "gpt-6.1-sol");
+    assert_eq!(azure.context_window, 1_050_000);
+    let tiers = azure.cost.tiers.as_ref().expect("Azure long-context tier");
+    assert_eq!(tiers.len(), 1);
+    assert_eq!(tiers[0].input_tokens_above, 272_000);
+    assert_eq!(tiers[0].rates.input, 4.0);
+    assert_eq!(tiers[0].rates.output, 15.0);
+    assert_eq!(tiers[0].rates.cache_read, 0.2);
+    assert_eq!(tiers[0].rates.cache_write, 5.0);
+
+    let individual = get_builtin_models("qwen-token-plan-individual-cn");
+    assert_eq!(individual.len(), 10);
+    assert!(individual.iter().any(|model| model.id == "glm-5.3"));
+
+    assert!(get_builtin_model("openai", "gpt-4o-realtime-preview").is_none());
+    assert!(get_builtin_model("openrouter", "openai/gpt-image-1").is_none());
+    assert!(
+        rpi_ai::generated::get_builtin_image_models("openrouter")
+            .iter()
+            .any(|model| model.id == "openai/gpt-image-1")
+    );
+}
+
+#[test]
+fn test_v19_provider_request_metadata() {
+    for id in ["gpt-5.4", "gpt-5.5"] {
+        let model = get_model("openai", id);
+        let compat = model.compat.as_ref().expect("compat");
+        assert_eq!(compat.supports_mid_convo_system_messages, Some(true));
+        assert_ne!(compat.supports_additional_tools, Some(true), "{id}");
+        assert_ne!(compat.supports_tool_search, Some(true), "{id}");
+    }
+    let dynamic = get_model("openai", "gpt-5.6-luna");
+    let compat = dynamic.compat.as_ref().expect("dynamic compat");
+    assert_eq!(compat.supports_additional_tools, Some(true));
+    assert_eq!(compat.supports_tool_search, Some(true));
+
+    for (provider, id) in [("kimi-coding", "k3.1-pro"), ("moonshotai", "kimi-k3.1-pro")] {
+        let model = get_model(provider, id);
+        assert!(model.reasoning);
+        assert_eq!(model.max_tokens, 1_048_576);
+        assert_eq!(model.cost.rates.input, 2.0);
+        assert_eq!(model.cost.rates.output, 10.0);
+        assert_eq!(model.cost.rates.cache_read, 0.2);
+        assert_eq!(model.cost.rates.cache_write, 0.0);
+        let compat = model.compat.as_ref().expect("K3.1 compat");
+        assert_eq!(compat.supports_mid_convo_tool_additions, Some(true));
+        assert_eq!(compat.thinking_format, Some(ThinkingFormat::Openai));
+    }
+
+    let deepseek = get_model("opencode", "deepseek-v4.1-flash");
+    assert_eq!(
+        deepseek
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.supports_long_cache_retention),
+        Some(false)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T26: Baseten golden tests (port of baseten-models.test.ts @ c1019d920)
 // ---------------------------------------------------------------------------
@@ -328,7 +402,13 @@ fn get_model(provider: &str, id: &str) -> rpi_ai::types::Model {
     get_builtin_models(provider)
         .iter()
         .find(|m| m.id == id)
-        .unwrap_or_else(|| panic!("model {provider}/{id} not found"))
+        .unwrap_or_else(|| {
+            let available: Vec<&str> = get_builtin_models(provider)
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect();
+            panic!("model {provider}/{id} not found; available: {available:?}")
+        })
         .clone()
 }
 
@@ -448,11 +528,9 @@ fn test_baseten_deprecated_models_filtered() {
 // (port of generate-models-strict.test.ts @ c03d78bdc)
 // ---------------------------------------------------------------------------
 
-/// The upstream `QWEN_TOKEN_PLAN_INDIVIDUAL_MODEL_IDS` whitelist has exactly 9
-/// IDs; the vendored catalog must match. Upstream drift = explicit failure.
-/// Port of `assertExactModelIds` intent (generate-models-strict.test.ts).
-/// V14-09: deepseek-v4-pro-0813 added by 6db110e6f, qwen3.8-flash by
-/// 265a33393 (whitelist at generate-models.ts:309-319 @ 9841914).
+/// The upstream Individual whitelist has exactly 10 IDs in the v1.5.2
+/// snapshot; the vendored catalog must match. Upstream drift = explicit failure.
+/// Port of `assertExactModelIds` intent (qwen-token-plan-models.test.ts).
 #[test]
 fn test_qwen_token_plan_individual_whitelist_exact() {
     const EXPECTED: &[&str] = &[
@@ -460,6 +538,7 @@ fn test_qwen_token_plan_individual_whitelist_exact() {
         "deepseek-v4-pro",
         "deepseek-v4-pro-0813",
         "glm-5.2",
+        "glm-5.3",
         "qwen3.6-flash",
         "qwen3.7-max",
         "qwen3.7-plus",
@@ -475,7 +554,7 @@ fn test_qwen_token_plan_individual_whitelist_exact() {
         actual, expected,
         "qwen-token-plan-individual whitelist diverged"
     );
-    assert_eq!(models.len(), 9);
+    assert_eq!(models.len(), 10);
 }
 
 /// Individual variant shares QWEN_TOKEN_PLAN_API_KEY and the international
@@ -495,6 +574,27 @@ fn test_qwen_token_plan_individual_shares_api_key() {
     assert_eq!(
         first.base_url,
         "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+    );
+}
+
+/// The Individual CN variant carries the same 10-model whitelist on the China
+/// endpoint and uses QWEN_TOKEN_PLAN_CN_API_KEY (qwen-token-plan-models.test.ts
+/// @ b4afdddf).
+#[test]
+fn test_qwen_token_plan_individual_cn_catalog_and_api_key() {
+    let models = get_builtin_models("qwen-token-plan-individual-cn");
+    assert_eq!(models.len(), 10);
+    assert!(models.iter().any(|model| model.id == "glm-5.3"));
+    assert!(models.iter().any(|model| model.id == "qwen3.8-max"));
+    assert!(
+        models
+            .iter()
+            .all(|model| model.base_url.contains("cn-beijing.maas.aliyuncs.com"))
+    );
+    let env = ProviderEnv::from([("QWEN_TOKEN_PLAN_CN_API_KEY".to_owned(), "cn-key".to_owned())]);
+    assert_eq!(
+        find_env_keys("qwen-token-plan-individual-cn", Some(&env)),
+        Some(vec!["QWEN_TOKEN_PLAN_CN_API_KEY".to_owned()])
     );
 }
 

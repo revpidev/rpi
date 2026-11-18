@@ -110,6 +110,7 @@ fn test_usage() -> Usage {
             cache_read: 0.0,
             cache_write: 0.0,
             total: 0.03,
+            total_from_provider: None,
         },
     }
 }

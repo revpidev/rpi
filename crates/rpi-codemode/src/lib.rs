@@ -17,7 +17,8 @@ pub mod wasm;
 
 pub use declarations::{
     DEFAULT_INPUT_SCHEMA_MAX_CHARS, RenderDeclarationsOptions, render_declarations,
-    render_tool_output_type, render_tool_sample, render_tool_signature, schema_to_type,
+    render_tool_output_type, render_tool_sample, render_tool_signature, resolve_schema_ref,
+    schema_to_type,
 };
 pub use identifier::to_codemode_identifier;
 pub use runtime::host::CodemodeSandbox;

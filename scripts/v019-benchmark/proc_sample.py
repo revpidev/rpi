@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-MAPPING_RE = re.compile(r"^[0-9a-f]+-[0-9a-f]+\s+(\S+)\s+\S+\s+\S+\s+\S+(?:\s+(.*))?$")
+MAPPING_RE = re.compile(r"^[0-9a-f]+-[0-9a-f]+\s+(\S+)\s+\S+\s+(\S+)\s+(\S+)(?:\s+(.*))?$")
 METRIC_RE = re.compile(r"^([A-Za-z0-9_]+):\s+(\d+)(?:\s+kB)?\s*$")
 STATUS_FIELDS = (
     "VmSize",
@@ -52,10 +52,12 @@ def parse_smaps(text: str) -> list[dict[str, object]]:
     for line in text.splitlines():
         match = MAPPING_RE.match(line)
         if match:
-            pathname = (match.group(2) or "[anonymous]").strip() or "[anonymous]"
+            pathname = (match.group(4) or "[anonymous]").strip() or "[anonymous]"
             current = {
                 "path": pathname,
                 "permissions": match.group(1),
+                "device": match.group(2),
+                "inode": int(match.group(3)),
                 "rssKib": 0,
                 "pssKib": 0,
                 "sharedKib": 0,
@@ -79,14 +81,21 @@ def parse_smaps(text: str) -> list[dict[str, object]]:
 
 
 def aggregate_mappings(mappings: list[dict[str, object]]) -> list[dict[str, object]]:
-    grouped: dict[tuple[str, str], dict[str, object]] = {}
+    grouped: dict[tuple[str, str, str, int], dict[str, object]] = {}
     for mapping in mappings:
-        key = (str(mapping["path"]), str(mapping["permissions"]))
+        key = (
+            str(mapping["path"]),
+            str(mapping["permissions"]),
+            str(mapping.get("device", "")),
+            int(mapping.get("inode", 0)),
+        )
         entry = grouped.setdefault(
             key,
             {
                 "path": key[0],
                 "permissions": key[1],
+                "device": key[2],
+                "inode": key[3],
                 "rssKib": 0,
                 "pssKib": 0,
                 "sharedKib": 0,
@@ -219,16 +228,82 @@ def load_mappings(path: Path) -> list[dict[str, object]]:
     raise ValueError(f"no mappings in {path}")
 
 
-def compare(baseline: Path, candidate: Path) -> dict[str, object]:
-    before = {(str(m["path"]), str(m["permissions"])): m for m in load_mappings(baseline)}
-    after = {(str(m["path"]), str(m["permissions"])): m for m in load_mappings(candidate)}
+def comparison_mappings(mappings: list[dict[str, object]]) -> dict[tuple[str, str], dict[str, object]]:
+    grouped: dict[tuple[str, str], dict[str, object]] = {}
+    for mapping in mappings:
+        key = (str(mapping["path"]), str(mapping["permissions"]))
+        entry = grouped.setdefault(key, {"identities": set()})
+        for field in ("sharedKib", "rssKib", "pssKib"):
+            entry[field] = int(entry.get(field, 0)) + int(mapping.get(field, 0))
+        entry["identities"].add((str(mapping.get("device", "")), int(mapping.get("inode", 0))))
+    return grouped
+
+
+def load_attribution(path: Path) -> dict[str, object]:
+    document = json.loads(path.read_text())
+    if not isinstance(document, dict):
+        raise ValueError(f"attribution must be a JSON object: {path}")
+    return document
+
+
+def apply_attribution(report: dict[str, object], attribution: dict[str, object]) -> None:
+    for slot in ("jsonschemaCodegen", "otherV019ReadOnlyCode"):
+        source = attribution.get(slot, {}).get("source")
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError(f"missing source attribution for {slot}")
+    for slot in ("existingMappings", "newNonCodeMappings"):
+        if not isinstance(attribution.get(slot), list):
+            raise ValueError(f"missing mapping attribution list for {slot}")
+    for delta in report["deltas"]:
+        if int(delta["sharedKibDelta"]) <= 0:
+            continue
+        if delta["existing"]:
+            slot = "existingMappings"
+        elif not delta["readOnlyCode"]:
+            slot = "newNonCodeMappings"
+        else:
+            continue
+        entries = attribution[slot]
+        if not any(
+            entry.get("path") == delta["path"]
+            and entry.get("permissions") == delta["permissions"]
+            and isinstance(entry.get("reason"), str)
+            and entry["reason"].strip()
+            for entry in entries
+        ):
+            raise ValueError(
+                f"missing attribution for {slot}: {delta['path']} {delta['permissions']}"
+            )
+    report["budgetAttribution"] = attribution
+    report["attributionComplete"] = True
+
+
+def compare(
+    baseline: Path,
+    candidate: Path,
+    attribution: dict[str, object] | None = None,
+) -> dict[str, object]:
+    baseline_mappings = load_mappings(baseline)
+    candidate_mappings = load_mappings(candidate)
+    include_inode = all(
+        "inode" in mapping and "device" in mapping
+        for mapping in (*baseline_mappings, *candidate_mappings)
+    )
+    before = comparison_mappings(baseline_mappings)
+    after = comparison_mappings(candidate_mappings)
     deltas = []
     for key in sorted(set(before) | set(after)):
         old = before.get(key, {})
         new = after.get(key, {})
+        old_identities = old.get("identities", set())
+        new_identities = new.get("identities", set())
+        replacement = include_inode and key in before and old_identities != new_identities
         delta = {
             "path": key[0],
             "permissions": key[1],
+            "baselineIdentities": sorted(old_identities),
+            "candidateIdentities": sorted(new_identities),
+            "replacement": replacement,
             "sharedKibDelta": int(new.get("sharedKib", 0)) - int(old.get("sharedKib", 0)),
             "rssKibDelta": int(new.get("rssKib", 0)) - int(old.get("rssKib", 0)),
             "rssFileKibDelta": (
@@ -237,12 +312,12 @@ def compare(baseline: Path, candidate: Path) -> dict[str, object]:
                 else 0
             ),
             "pssKibDelta": int(new.get("pssKib", 0)) - int(old.get("pssKib", 0)),
-            "existing": key in before,
+            "existing": key in before and not replacement,
             "readOnlyCode": key[1].startswith("r") and "x" in key[1],
         }
         deltas.append(delta)
     report = {
-        "schema": "rpi-v19-mapping-delta-v1",
+        "schema": "rpi-v19-mapping-delta-v2",
         "baseline": str(baseline),
         "candidate": str(candidate),
         "deltas": deltas,
@@ -259,6 +334,8 @@ def compare(baseline: Path, candidate: Path) -> dict[str, object]:
         # The caller writes the report before returning non-zero, preserving
         # the offending mapping evidence instead of losing it on failure.
         report["budgetError"] = str(error)
+    if attribution is not None:
+        apply_attribution(report, attribution)
     return report
 
 
@@ -302,13 +379,15 @@ def main() -> int:
     cmp.add_argument("--baseline", type=Path, required=True)
     cmp.add_argument("--candidate", type=Path, required=True)
     cmp.add_argument("--output", type=Path, required=True)
+    cmp.add_argument("--attribution", type=Path)
     check = sub.add_parser("check-budget")
     check.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "capture":
         capture(args.pid, args.label, args.output)
     elif args.command == "compare":
-        report = compare(args.baseline, args.candidate)
+        attribution = load_attribution(args.attribution) if args.attribution else None
+        report = compare(args.baseline, args.candidate, attribution)
         args.output.write_text(json.dumps(report, indent=2) + "\n")
         if "budgetError" in report:
             raise ValueError(str(report["budgetError"]))

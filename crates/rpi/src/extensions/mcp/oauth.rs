@@ -14,10 +14,11 @@ use std::sync::Arc;
 use fs2::FileExt;
 use rpi_mcp::auth_provider::UnauthorizedContext;
 use rpi_mcp::oauth::{
-    AuthorizationServerMetadata, ClientMetadataDocumentFn, McpOAuthProvider,
-    McpOAuthProviderOptions, McpOAuthState, McpOAuthStateStore, OAuthChallenge,
-    OAuthClientInformation, OAuthClientMetadataDocument, OAuthClientProvider, OAuthFlowOptions,
-    OAuthFlowResult, OAuthTokens, authorize_mcp, parse_www_authenticate, step_up_scope,
+    AuthorizationServerMetadata, ClientMetadataDocumentFn, McpOAuthClientOptions, McpOAuthProvider,
+    McpOAuthProviderOptions, McpOAuthState, McpOAuthStateStore, McpSignInOptions, McpSignInStart,
+    OAuthChallenge, OAuthClientInformation, OAuthClientMetadataDocument, OAuthFlowOptions,
+    OAuthFlowResult, OAuthTokens, authorize_mcp, complete_mcp_sign_in, parse_www_authenticate,
+    start_mcp_sign_in,
 };
 use rpi_mcp::{AuthProvider, McpError};
 use serde_json::Value;
@@ -431,20 +432,12 @@ impl McpOAuthServerStore {
         .map_err(|error| error.to_string())
     }
 
-    /// `withRefreshLock` (oauth.ts): a lock file per server, released on
-    /// drop, so another process can take over after a crash.
-    ///
-    /// Lock acquisition failures fail closed: upstream's proper-lockfile
-    /// throws and the refresh aborts; proceeding unlocked could race a
-    /// rotating refresh token (v0.1.6 review P2-3). The lock directory is
-    /// created 0700 like upstream `mkdirSync(..., { mode: 0o700 })`.
-    pub async fn with_refresh_lock<T, F, Fut>(&self, action: F) -> Result<T, RefreshLockFailure>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = T>,
-    {
+    pub async fn acquire_refresh_lock(
+        &self,
+        signal: Option<&CancellationToken>,
+    ) -> Result<Option<std::fs::File>, RefreshLockFailure> {
         let Some(lock_dir) = &self.lock_dir else {
-            return Ok(action().await);
+            return Ok(None);
         };
         #[cfg(unix)]
         {
@@ -473,24 +466,41 @@ impl McpOAuthServerStore {
             tokio::time::Instant::now() + std::time::Duration::from_millis(REFRESH_LOCK_WAIT_MS);
         loop {
             match lock.try_lock_exclusive() {
-                Ok(()) => break,
+                Ok(()) => return Ok(Some(lock)),
                 Err(error) if is_lock_contended(&error) => {
                     if tokio::time::Instant::now() >= deadline {
-                        // A lock that is never released must not stall the
-                        // flow forever; upstream's retry budget is exhausted
-                        // here and the refresh fails closed.
                         return Err(RefreshLockFailure::Held);
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(REFRESH_LOCK_RETRY_MS))
-                        .await;
+                    let sleep =
+                        tokio::time::sleep(std::time::Duration::from_millis(REFRESH_LOCK_RETRY_MS));
+                    match signal {
+                        Some(signal) => tokio::select! {
+                            biased;
+                            () = signal.cancelled() => return Err(RefreshLockFailure::Held),
+                            () = sleep => {}
+                        },
+                        None => sleep.await,
+                    }
                 }
                 Err(error) => {
                     return Err(RefreshLockFailure::Unavailable(error.to_string()));
                 }
             }
         }
+    }
+
+    /// `withRefreshLock` (oauth.ts): a lock file per server, released on
+    /// drop, so another process can take over after a crash.
+    pub async fn with_refresh_lock<T, F, Fut>(&self, action: F) -> Result<T, RefreshLockFailure>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let lock = self.acquire_refresh_lock(None).await?;
         let result = action().await;
-        let _ = FileExt::unlock(&lock);
+        if let Some(lock) = lock {
+            let _ = FileExt::unlock(&lock);
+        }
         Ok(result)
     }
 
@@ -722,6 +732,7 @@ impl McpAuthProvider {
             store: Some(Arc::new(StoreAdapter(
                 self.store.key.clone(),
                 self.store.path.clone(),
+                self.store.lock_dir.clone(),
             ))),
             on_redirect,
         })
@@ -784,6 +795,7 @@ impl McpAuthProvider {
                             .as_ref()
                             .and_then(|challenge| challenge.scope.clone()),
                         client,
+                        refresh_only: true,
                         ..Default::default()
                     },
                 )
@@ -811,7 +823,7 @@ impl McpAuthProvider {
 
 /// Adapter making the server store's key the state store key used by
 /// [`McpOAuthProvider`] (the provider itself is keyed by URL).
-struct StoreAdapter(String, PathBuf);
+struct StoreAdapter(String, PathBuf, Option<PathBuf>);
 
 #[async_trait::async_trait]
 impl McpOAuthStateStore for StoreAdapter {
@@ -839,6 +851,31 @@ impl McpOAuthStateStore for StoreAdapter {
             // additionally verifies the persisted tokens before reporting
             // success.
             tracing::warn!(%error, path = %self.1.display(), "MCP: OAuth credentials could not be persisted");
+        }
+    }
+
+    async fn acquire_refresh_lock(
+        &self,
+        signal: Option<&CancellationToken>,
+    ) -> Result<rpi_mcp::oauth::McpRefreshLockGuard, rpi_mcp::oauth::OAuthFlowError> {
+        let store = McpOAuthServerStore {
+            path: self.1.clone(),
+            lock_dir: self.2.clone(),
+            key: self.0.clone(),
+            legacy_key: self.0.clone(),
+        };
+        let guard = store
+            .acquire_refresh_lock(signal)
+            .await
+            .map_err(|failure| match failure {
+                RefreshLockFailure::Held => rpi_mcp::oauth::OAuthFlowError::RefreshLockBusy,
+                RefreshLockFailure::Unavailable(detail) => rpi_mcp::oauth::OAuthFlowError::Invalid(
+                    format!("the credential refresh lock is unavailable: {detail}"),
+                ),
+            })?;
+        match guard {
+            Some(file) => Ok(Box::new(file)),
+            None => Ok(Box::new(())),
         }
     }
 }
@@ -1056,10 +1093,6 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
         return Err(McpSignInCancelledError.to_string());
     }
     let stored = store.load().await;
-    let step_up = challenge
-        .as_ref()
-        .and_then(|challenge| challenge.error.as_deref())
-        == Some("insufficient_scope");
     let callback_options = callback_settings(&settings);
     // Reuse the port of the registered redirect URI so the registered client
     // stays valid.
@@ -1092,34 +1125,6 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
         .clone()
         .unwrap_or_else(|| callback.redirect_url().to_owned());
     let result = async {
-        if let Some(stored) = &stored {
-            let mut next = stored.clone();
-            // Every sign-in gets a fresh `state` parameter.
-            next.oauth_state = None;
-            // A registered client cannot use another redirect URI, and its
-            // tokens belong to it. A Client ID Metadata Document is not
-            // stored, so with one, a stored client was registered before
-            // and is replaced (oauth.ts).
-            let keep_client = settings.client_id.is_some()
-                || if cimd {
-                    stored.client_information.is_none()
-                } else {
-                    registered_redirect_urls(stored.client_information.as_ref())
-                        .contains(&redirect_url)
-                };
-            if !keep_client {
-                next.client_information = None;
-                next.tokens = None;
-                next.tokens_expire_at = None;
-            }
-            store
-                .save(next)
-                .await
-                .map_err(|error| format!("the stored OAuth state could not be saved: {error}"))?;
-        }
-        let authorization_url: Arc<std::sync::Mutex<Option<Url>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        let captured = authorization_url.clone();
         let client_metadata_document: Option<ClientMetadataDocumentFn> = if cimd {
             let document_server_url = server_url.clone();
             let document_redirect = redirect_url.clone();
@@ -1131,9 +1136,18 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
         } else {
             None
         };
-        let provider = McpOAuthProvider::new(McpOAuthProviderOptions {
+        let client = McpOAuthClientOptions {
             server_url: server_url.clone(),
-            redirect_url: redirect_url.clone(),
+            settings: rpi_mcp::oauth::McpOAuthSettings {
+                client_id: settings.client_id.clone(),
+                client_secret: settings.client_secret.clone(),
+                callback_port: settings.callback_port,
+                callback_url: settings.callback_url.clone(),
+                scope: settings.scope.clone(),
+                client_name: settings.client_name.clone(),
+                client_registration: settings.client_registration.clone(),
+                auth_server_metadata_url: settings.auth_server_metadata_url.clone(),
+            },
             client_metadata: rpi_mcp::oauth::OAuthClientMetadata {
                 client_name: Some(
                     settings
@@ -1144,96 +1158,50 @@ pub async fn sign_in_mcp_server(options: SignInOptions<'_>) -> Result<(), String
                 ..Default::default()
             },
             client_metadata_document,
-            client_id: settings.client_id.clone(),
-            client_secret: settings.client_secret.clone(),
-            store: Some(Arc::new(StoreAdapter(
+            store: Arc::new(StoreAdapter(
                 store.key.clone(),
                 store.path.clone(),
-            ))),
-            on_redirect: Arc::new(move |url| {
-                *captured.lock().unwrap_or_else(|error| error.into_inner()) = Some(url);
-            }),
-        });
-        let granted_scope = stored
-            .as_ref()
-            .and_then(|state| state.tokens.as_ref())
-            .and_then(|tokens| tokens.scope.as_deref());
-        let challenge_scope: Option<String> = if step_up {
-            challenge
-                .as_ref()
-                .and_then(|challenge| step_up_scope(granted_scope, challenge.scope.as_deref()))
-        } else {
-            challenge
-                .as_ref()
-                .and_then(|challenge| challenge.scope.clone())
-        };
-        let flow_scope = merge_scopes(&[settings.scope.as_deref(), challenge_scope.as_deref()]);
-        let flow = OAuthFlowOptions {
-            server_url: server_url.clone(),
-            resource_metadata_url: challenge
-                .as_ref()
-                .and_then(|challenge| challenge.resource_metadata_url.as_deref())
-                .and_then(|url| Url::parse(url).ok()),
-            authorization_server_metadata_url: settings.auth_server_metadata_url.clone(),
-            scope: flow_scope,
-            skip_refresh: step_up,
-            // Requests to the authorization server are time-limited
-            // (`timedFetch`, oauth.ts).
+                store.lock_dir.clone(),
+            )),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_millis(OAUTH_REQUEST_TIMEOUT_MS))
                 .build()
                 .ok(),
-            signal: signal.clone(),
-            ..Default::default()
         };
-        if authorize_mcp(&provider, &flow)
+        let sign_in = McpSignInOptions {
+            client,
+            redirect_url,
+            challenge,
+            signal: signal.clone(),
+        };
+        let authorization = match start_mcp_sign_in(&sign_in)
             .await
             .map_err(|error| error.to_string())?
-            == OAuthFlowResult::Authorized
         {
-            return verify_sign_in_persisted(store).await;
-        }
-        let authorization_url = authorization_url
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
-            .ok_or_else(|| "OAuth flow did not produce an authorization URL".to_owned())?;
-        let state = provider
-            .state()
-            .await
-            .ok_or_else(|| "OAuth flow did not produce a state parameter".to_owned())?;
-        // The flow picks the redirect URI, which may be specific to the MCP
-        // server (oauth.ts).
-        let authorization_redirect_url = authorization_url
-            .query_pairs()
-            .find(|(key, _)| key == "redirect_uri")
-            .map(|(_, value)| value.into_owned())
-            .and_then(|value| Url::parse(&value).ok())
-            .unwrap_or_else(|| {
-                Url::parse(&redirect_url).unwrap_or_else(|_| {
-                    // A compile-time constant that always parses.
-                    Url::parse(FALLBACK_REDIRECT_URL).expect("valid fallback")
-                })
-            });
+            McpSignInStart::Authorized => return verify_sign_in_persisted(store).await,
+            McpSignInStart::Redirect(authorization) => authorization,
+        };
+        let authorization_url =
+            Url::parse(&authorization.authorization_url).map_err(|error| error.to_string())?;
+        let authorization_redirect_url =
+            Url::parse(&authorization.redirect_url).map_err(|error| error.to_string())?;
         prompt.show_authorization_url(authorization_url);
-        let (code, iss) = wait_for_authorization_response(
+        let response = wait_for_authorization_response(
             &callback,
-            &state,
+            &authorization.state,
             &authorization_redirect_url,
             prompt,
             signal.clone(),
         )
         .await?;
-        authorize_mcp(
-            &provider,
-            &OAuthFlowOptions {
-                authorization_code: Some(code),
-                iss,
-                ..flow
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        let response = rpi_mcp::oauth::OAuthCallback {
+            code: response.0,
+            state: authorization.state.clone(),
+            iss: response.1,
+        };
+        complete_mcp_sign_in(&sign_in, &authorization, &response)
+            .await
+            .map_err(|error| error.to_string())?;
         verify_sign_in_persisted(store).await
     }
     .await;

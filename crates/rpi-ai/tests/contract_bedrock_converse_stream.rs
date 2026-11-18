@@ -28,7 +28,7 @@ use rpi_ai::api::bedrock_converse_stream::{
 };
 use rpi_ai::types::{
     ApiKind, AssistantMessage, AssistantMessageDiagnostic, Context, DoneReason, Message, Model,
-    ProviderEnv, StopReason, StreamEvent, StreamOptions, ThinkingLevel, ToolResultMessage,
+    ProviderEnv, StopReason, StreamEvent, StreamOptions, ThinkingLevel, Tool, ToolResultMessage,
     ToolResultRole,
 };
 use serde_json::{Value, json};
@@ -108,6 +108,38 @@ async fn serve_with_headers(
             .await
             .expect("write head");
         socket.write_all(&body).await.expect("write body");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+async fn serve_sequence(
+    responses: Vec<(u16, &'static str, Vec<u8>)>,
+) -> (String, mpsc::Receiver<CapturedRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (tx, rx) = mpsc::channel(responses.len());
+    tokio::spawn(async move {
+        for (status, content_type, body) in responses {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_request(&mut socket).await;
+            tx.send(request).await.expect("send captured request");
+            let reason = if status == 200 { "OK" } else { "Bad Request" };
+            let mut response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\nx-amzn-requestid: req-123\r\n"
+            );
+            if status == 400 {
+                response.push_str("x-amzn-errortype: ValidationException\r\n");
+            }
+            response.push_str(&format!(
+                "content-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            ));
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write head");
+            socket.write_all(&body).await.expect("write body");
+        }
     });
     (format!("http://{addr}"), rx)
 }
@@ -2582,4 +2614,96 @@ fn test_format_bedrock_error_prefixes_and_retention_hint() {
     );
     assert!(message.starts_with("Validation error: "), "{message}");
     assert!(message.contains("data-retention.html"), "{message}");
+}
+
+#[tokio::test]
+async fn preferred_strict_tool_limit_falls_back_once_and_is_remembered() {
+    fn tool(name: &str, strict: &str) -> Tool {
+        serde_json::from_value(json!({
+            "name": name,
+            "description": "test tool",
+            "parameters": {"type": "object", "properties": {"value": {"type": "string"}}},
+            "constrainedSampling": {"type": "json_schema", "strict": strict}
+        }))
+        .expect("tool")
+    }
+
+    let session = "bedrock-strict-fallback-test";
+    rpi_ai::session_resources::cleanup_session_resources(Some(session)).expect("clean session");
+    let tools = vec![tool("preferred", "prefer"), tool("required", "require")];
+    let ctx = rpi_ai::utils::transcript::normalize_context(&Context {
+        system_prompt: None,
+        messages: vec![user_text("hi")],
+        tools: Some(tools),
+    });
+    let options = BedrockOptions {
+        bearer_token: Some("test-token".to_owned()),
+        stream: StreamOptions {
+            request: rpi_ai::ProviderRequestOptions {
+                max_retries: Some(0),
+                ..Default::default()
+            },
+            session_id: Some(session.to_owned()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (base_url, mut rx) = serve_sequence(vec![
+        (
+            400,
+            "application/json",
+            br#"{"message":"The compiled grammar is too large, which would cause performance issues."}"#.to_vec(),
+        ),
+        (200, "application/vnd.amazon.eventstream", minimal_stream_body()),
+    ])
+    .await;
+    let model = make_model(
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "Claude Sonnet",
+        &base_url,
+        json!({"compat": {"supportsStrictMode": true}}),
+    );
+    let events: Vec<StreamEvent> = stream(&model, &ctx, options.clone()).collect().await;
+    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+        panic!("strict fallback must succeed: {events:?}")
+    };
+    assert_eq!(
+        message.diagnostics.as_ref().map(|diagnostics| diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.kind.as_str())
+            .collect::<Vec<_>>()),
+        Some(vec!["bedrock_strict_tools_fallback"])
+    );
+    let first = rx.recv().await.expect("first request");
+    let second = rx.recv().await.expect("retry request");
+    let first: Value = serde_json::from_slice(&first.body).expect("first payload");
+    let second: Value = serde_json::from_slice(&second.body).expect("retry payload");
+    assert_eq!(first["toolConfig"]["tools"][0]["toolSpec"]["strict"], true);
+    assert_eq!(first["toolConfig"]["tools"][1]["toolSpec"]["strict"], true);
+    assert!(
+        second["toolConfig"]["tools"][0]["toolSpec"]
+            .get("strict")
+            .is_none()
+    );
+    assert_eq!(second["toolConfig"]["tools"][1]["toolSpec"]["strict"], true);
+
+    let (next_url, mut next_rx) = serve(
+        200,
+        "application/vnd.amazon.eventstream",
+        minimal_stream_body(),
+    )
+    .await;
+    let mut next_model = model;
+    next_model.base_url = next_url;
+    let events: Vec<StreamEvent> = stream(&next_model, &ctx, options).collect().await;
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    let next = next_rx.recv().await.expect("next session request");
+    let next: Value = serde_json::from_slice(&next.body).expect("next payload");
+    assert!(
+        next["toolConfig"]["tools"][0]["toolSpec"]
+            .get("strict")
+            .is_none()
+    );
+    assert_eq!(next["toolConfig"]["tools"][1]["toolSpec"]["strict"], true);
+    rpi_ai::session_resources::cleanup_session_resources(Some(session)).expect("cleanup session");
 }

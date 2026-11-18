@@ -9,9 +9,8 @@
 //!   used for `method?.name` in the fuzzy search text (oauth-selector.ts:107).
 //! - [`AuthSelectorProvider::from_provider`] mirrors upstream
 //!   `getLoginProviderOptions` (interactive-mode.ts:4845-4875): one entry per
-//!   configured auth method (a provider offering both methods appears twice)
-//!   and the entries are sorted by name (byte order; upstream
-//!   `localeCompare`).
+//!   configured auth method (a provider offering both methods appears twice).
+//!   Preferred partners come first; the remaining entries are sorted by name.
 //! - `on_select` receives the full selected [`AuthSelectorProvider`] (the
 //!   row carries `auth_type` / `method_name`); upstream passes
 //!   `(providerId, authType)`, oauth-selector.ts:202. The login wiring uses
@@ -66,7 +65,8 @@ pub struct AuthSelectorProvider {
 impl AuthSelectorProvider {
     /// Mirror of upstream `getLoginProviderOptions`
     /// (interactive-mode.ts:4845-4875): one entry per configured auth method
-    /// (`oauth` first, then `api_key`), sorted by name. `status` is whatever
+    /// (`oauth` first, then `api_key`), with preferred partners first and
+    /// other providers sorted by name. `status` is whatever
     /// the caller already resolved (e.g. `ModelRuntime::check_auth`).
     pub fn from_provider(provider: &Arc<dyn Provider>, status: Option<AuthCheck>) -> Vec<Self> {
         let mut options = Vec::new();
@@ -104,7 +104,9 @@ impl AuthSelectorProvider {
                 subscription,
             });
         }
-        options.sort_by(|a, b| a.name.cmp(&b.name));
+        options.sort_by(|a, b| {
+            crate::core::preferred_providers::compare_providers(&a.id, &a.name, &b.id, &b.name)
+        });
         options
     }
 }
@@ -310,6 +312,12 @@ impl OAuthSelectorComponent {
     fn render_provider_row(&self, provider: &AuthSelectorProvider, index: usize) -> String {
         let is_selected = index == self.selected_index;
         let status_indicator = self.format_status_indicator(provider);
+        let partner_marker =
+            if crate::core::preferred_providers::is_preferred_provider(&provider.id) {
+                self.theme.fg("muted", " ✦")
+            } else {
+                String::new()
+            };
         let auth_type_label = if self.show_auth_type_labels {
             self.theme.fg(
                 "muted",
@@ -324,10 +332,10 @@ impl OAuthSelectorComponent {
         if is_selected {
             let prefix = self.theme.fg("accent", "→ ");
             let text = self.theme.fg("accent", &provider.name);
-            format!("{prefix}{text}{auth_type_label}{status_indicator}")
+            format!("{prefix}{text}{partner_marker}{auth_type_label}{status_indicator}")
         } else {
             let text = format!("  {}", self.theme.fg("text", &provider.name));
-            format!("{text}{auth_type_label}{status_indicator}")
+            format!("{text}{partner_marker}{auth_type_label}{status_indicator}")
         }
     }
 

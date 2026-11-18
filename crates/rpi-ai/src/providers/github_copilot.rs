@@ -23,14 +23,15 @@ use serde_json::Value;
 use crate::api::anthropic_messages::AnthropicMessages;
 use crate::api::openai_completions::OpenAiCompletions;
 use crate::api::openai_responses::OpenAiResponses;
+use crate::api::typesafe_system_one::typesafe_system_one_api;
 use crate::auth::oauth::github_copilot_oauth;
 use crate::auth::{Credential, ProviderAuth, env_api_key_auth};
-use crate::generated::get_builtin_models;
 use crate::models::{
     CreateProviderOptions, Provider, ProviderApi, ProviderStreams, create_provider,
 };
 use crate::types::{
-    ApiKind, Model, ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext,
+    ApiKind, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult, Model,
+    ProviderClassifier, ProviderHeaders, SimpleStreamOptions, StreamOptions, TranscriptContext,
 };
 use crate::utils::event_stream::AssistantMessageEventStream;
 
@@ -49,11 +50,37 @@ pub fn github_copilot_provider() -> Arc<dyn Provider> {
                 ))),
                 oauth: Some(github_copilot_oauth()),
             },
-            models: get_builtin_models("github-copilot").to_vec(),
+            shared_all_models: Some(crate::generated::get_builtin_all_models_shared(
+                "github-copilot",
+            )),
+            classifiers: HashMap::from([(
+                "typesafe-system-one".to_owned(),
+                Arc::new(CopilotSystemOne {
+                    inner: typesafe_system_one_api(),
+                }) as Arc<dyn ProviderClassifier>,
+            )]),
             api: ProviderApi::Map(api_map()),
             ..Default::default()
         }),
     })
+}
+
+struct CopilotSystemOne {
+    inner: Arc<dyn ProviderClassifier>,
+}
+
+impl ProviderClassifier for CopilotSystemOne {
+    fn classify(
+        &self,
+        model: &ClassifierModel,
+        context: &ClassifierContext,
+        options: Option<&ClassifierOptions>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ClassifierResult> + Send + 'static>>
+    {
+        let mut model = model.clone();
+        model.base_url = format!("{}/v1", model.base_url.trim_end_matches('/'));
+        self.inner.classify(&model, context, options)
+    }
 }
 
 /// Mixed-API dispatch table (github-copilot.ts:28-33).
@@ -125,6 +152,33 @@ impl Provider for GithubCopilotProvider {
         self.inner.get_models()
     }
 
+    fn get_models_shared(&self) -> Arc<[Model]> {
+        self.inner.get_models_shared()
+    }
+
+    fn get_all_models(&self) -> Vec<crate::types::AnyModel> {
+        self.inner.get_all_models()
+    }
+
+    fn get_all_models_shared(&self) -> Arc<[crate::types::AnyModel]> {
+        self.inner.get_all_models_shared()
+    }
+
+    fn classify(
+        &self,
+        model: &ClassifierModel,
+        context: &ClassifierContext,
+        options: Option<&ClassifierOptions>,
+    ) -> Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = ClassifierResult> + Send + 'static>>,
+    > {
+        self.inner.classify(model, context, options)
+    }
+
+    fn classifier(&self, api: &str) -> Option<Arc<dyn ProviderClassifier>> {
+        self.inner.classifier(api)
+    }
+
     fn filter_models(&self, models: Vec<Model>, credential: Option<&Credential>) -> Vec<Model> {
         filter_models(models, credential)
     }
@@ -178,7 +232,7 @@ mod tests {
         }
         assert_eq!(map.len(), 3);
         // Every catalog model dispatches to a map entry.
-        for model in get_builtin_models("github-copilot") {
+        for model in crate::generated::get_builtin_chat_models("github-copilot") {
             assert!(
                 map.contains_key(model.api.as_str()),
                 "catalog model {} has undispatched api {}",
@@ -222,5 +276,23 @@ mod tests {
         let filtered = provider.filter_models(models.clone(), Some(&valid));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, models[0].id);
+    }
+
+    #[test]
+    fn classifier_stays_available_when_oauth_lists_only_chat_models() {
+        let provider = github_copilot_provider();
+        let all = provider.get_all_models();
+        assert!(all.iter().any(|model| matches!(
+            model,
+            crate::types::AnyModel::Classifier(classifier)
+                if classifier.id == "microsoft-decision-1"
+        )));
+        let credential = oauth_credential_with_available_ids(serde_json::json!(["gpt-6.1-sol"]));
+        let filtered = provider.filter_all_models(all, Some(&credential));
+        assert!(filtered.iter().any(|model| matches!(
+            model,
+            crate::types::AnyModel::Classifier(classifier)
+                if classifier.id == "microsoft-decision-1"
+        )));
     }
 }

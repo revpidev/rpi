@@ -317,7 +317,14 @@ impl OAuthCallbackServer {
         }
         let serve = lock(&self.serve).take();
         if let Some(serve) = serve {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), serve).await;
+            tokio::pin!(serve);
+            if tokio::time::timeout(std::time::Duration::from_secs(1), &mut serve)
+                .await
+                .is_err()
+            {
+                serve.abort();
+                let _ = serve.await;
+            }
         }
     }
 }
@@ -365,6 +372,26 @@ mod tests {
         assert_eq!(callback.iss.as_deref(), Some("https://as.example"));
         assert!(state.await.unwrap().contains("Authorization complete"));
         server.close().await;
+    }
+
+    #[tokio::test]
+    async fn close_aborts_idle_keepalive_connections() {
+        let server = OAuthCallbackServer::listen(OAuthCallbackServerOptions::default())
+            .await
+            .unwrap();
+        let url = url::Url::parse(server.redirect_url()).unwrap();
+        let mut socket =
+            tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+                .await
+                .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server.close())
+            .await
+            .expect("idle connection must not block close");
+        let mut buffer = [0u8; 1];
+        let read = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer)
+            .await
+            .expect("read closed socket");
+        assert_eq!(read, 0);
     }
 
     #[tokio::test]

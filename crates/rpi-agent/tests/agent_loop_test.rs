@@ -532,6 +532,10 @@ async fn handles_tool_calls_and_results() {
         cache_read: 3,
         cache_write: 4,
         total_tokens: 10,
+        cost: rpi_ai::types::UsageCost {
+            total_from_provider: Some(false),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let patched_tool_usage = Usage {
@@ -540,6 +544,10 @@ async fn handles_tool_calls_and_results() {
         cache_read: 7,
         cache_write: 8,
         total_tokens: 26,
+        cost: rpi_ai::types::UsageCost {
+            total_from_provider: Some(false),
+            ..Default::default()
+        },
         ..Default::default()
     };
 

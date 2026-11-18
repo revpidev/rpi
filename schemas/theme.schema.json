@@ -15,7 +15,7 @@
       "default": ""
     },
     "appearance": {
-      "description": "`appearance` (theme.ts:96-100 @ 4a080252f): the background the theme\nis designed for; detected from the theme colors when omitted.",
+      "description": "`appearance` (theme.ts:96-100 @ b4afdddf): the background the theme\nis designed for; detected from the theme colors when omitted.",
       "$ref": "#/$defs/ThemeAppearance"
     },
     "vars": {

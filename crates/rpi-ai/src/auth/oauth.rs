@@ -18,6 +18,7 @@ pub mod openai_codex;
 pub mod openrouter;
 pub mod pkce;
 pub mod radius;
+pub mod trusted_url;
 pub mod xai;
 
 pub use anthropic::anthropic_oauth;

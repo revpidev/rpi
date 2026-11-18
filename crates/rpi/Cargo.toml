@@ -18,6 +18,11 @@ name = "rpi-v19-replay"
 path = "src/bin/rpi_v19_replay.rs"
 required-features = ["v19-benchmark"]
 
+[[bin]]
+name = "rpi-v19-schema-probe"
+path = "src/bin/rpi_v19_schema_probe.rs"
+required-features = ["v19-benchmark"]
+
 [features]
 v19-benchmark = ["rpi-tui/v19-benchmark"]
 

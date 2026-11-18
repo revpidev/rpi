@@ -9,6 +9,7 @@
 //! goes (`auth` is global-only).
 
 use std::path::Path;
+use std::sync::Arc;
 
 use rpi_ext_host::types::ToolExposure;
 use serde::{Deserialize, Serialize};
@@ -263,7 +264,7 @@ pub struct LoadedMcpConfig {
 
 /// `mcpNamespace` (mcp-servers.ts): `mcp__<server>` with `-` → `_`.
 pub fn mcp_namespace(server: &str) -> String {
-    format!("mcp__{}", server.replace('-', "_"))
+    rpi_mcp::mcp_namespace(server)
 }
 
 /// `getMcpToolExposure` (mcp-servers.ts): an exact `toolExposure` key
@@ -305,26 +306,7 @@ fn is_loopback_host(host: &str) -> bool {
 /// `isLoopbackRedirectUri` (mcp-servers.ts): an http URI on a loopback
 /// host without query or fragment.
 pub fn is_loopback_redirect_uri(value: &str) -> bool {
-    let Ok(url) = url::Url::parse(value) else {
-        return false;
-    };
-    url.scheme() == "http"
-        && is_loopback_host(url.host_str().unwrap_or_default())
-        && url.query().is_none()
-        && url.fragment().is_none()
-}
-
-fn is_server_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.chars().all(|character| {
-            character.is_ascii_alphanumeric() || character == '_' || character == '-'
-        })
-}
-
-fn is_string_record(value: &Value) -> bool {
-    value
-        .as_object()
-        .is_some_and(|map| map.values().all(Value::is_string))
+    rpi_mcp::is_loopback_redirect_uri(value)
 }
 
 fn is_exposure(value: &Value) -> bool {
@@ -355,104 +337,6 @@ fn resolve_exposure_aliases(mut value: Map<String, Value>) -> Map<String, Value>
     value
 }
 
-fn validate_oauth(value: Option<&Value>) -> Result<(), String> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let Some(map) = value.as_object() else {
-        return Err("oauth must be an object".to_owned());
-    };
-    if map.get("clientId").is_some_and(|value| !value.is_string()) {
-        return Err("oauth.clientId must be a string".to_owned());
-    }
-    if map
-        .get("clientSecret")
-        .is_some_and(|value| !value.is_string())
-    {
-        return Err("oauth.clientSecret must be a string".to_owned());
-    }
-    let port = map.get("callbackPort");
-    if let Some(port) = port {
-        let valid = port
-            .as_u64()
-            .is_some_and(|port| (1..=65535).contains(&port));
-        if !valid {
-            return Err("oauth.callbackPort must be a port number".to_owned());
-        }
-    }
-    if let Some(callback_url) = map.get("callbackUrl") {
-        let Some(callback_url) = callback_url.as_str() else {
-            return Err("oauth.callbackUrl must be an http URI on localhost, 127.0.0.1, or [::1] without query or fragment".to_owned());
-        };
-        if !is_loopback_redirect_uri(callback_url) {
-            return Err("oauth.callbackUrl must be an http URI on localhost, 127.0.0.1, or [::1] without query or fragment".to_owned());
-        }
-        let url_port = url::Url::parse(callback_url)
-            .ok()
-            .and_then(|url| url.port());
-        if let (Some(url_port), Some(port)) = (url_port, port.and_then(Value::as_u64))
-            && url_port as u64 != port
-        {
-            return Err("oauth.callbackUrl and oauth.callbackPort name different ports".to_owned());
-        }
-    }
-    if map.get("scope").is_some_and(|value| !value.is_string()) {
-        return Err("oauth.scope must be a string".to_owned());
-    }
-    if let Some(client_name) = map.get("clientName") {
-        let valid = client_name
-            .as_str()
-            .is_some_and(|name| !name.trim().is_empty());
-        if !valid {
-            return Err("oauth.clientName must be a non-empty string".to_owned());
-        }
-    }
-    // `clientRegistration` (mcp-servers.ts): values are `dcr` and
-    // `cimd`; `cimd` identifies with the metadata document, so it cannot
-    // combine with a registered client and needs the default callback path
-    // on a loopback host.
-    if let Some(client_registration) = map.get("clientRegistration")
-        && client_registration.as_str() != Some("dcr")
-    {
-        if client_registration.as_str() != Some("cimd") {
-            return Err("oauth.clientRegistration must be \"dcr\" or \"cimd\"".to_owned());
-        }
-        if map.contains_key("clientId") || map.contains_key("clientName") {
-            return Err(
-                "oauth.clientRegistration \"cimd\" cannot be combined with oauth.clientId or oauth.clientName"
-                    .to_owned(),
-            );
-        }
-        if let Some(callback_url) = map.get("callbackUrl").and_then(Value::as_str)
-            && let Ok(url) = url::Url::parse(callback_url)
-        {
-            let hostname = url.host_str().unwrap_or_default();
-            if hostname == "[::1]" || url.path() != "/callback" {
-                return Err(
-                    "oauth.clientRegistration \"cimd\" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback"
-                        .to_owned(),
-                );
-            }
-        }
-    }
-    if let Some(metadata_url) = map.get("authServerMetadataUrl") {
-        let url = metadata_url
-            .as_str()
-            .and_then(|value| url::Url::parse(value).ok());
-        let valid = url.as_ref().is_some_and(|url| {
-            url.scheme() == "https"
-                || (url.scheme() == "http" && is_loopback_host(url.host_str().unwrap_or_default()))
-        });
-        if !valid {
-            return Err(
-                "oauth.authServerMetadataUrl must be an https URL, or http on localhost, 127.0.0.1, or [::1]"
-                    .to_owned(),
-            );
-        }
-    }
-    Ok(())
-}
-
 /// `OVERRIDE_KEYS` (config.ts): the only keys a project override may
 /// set.
 const OVERRIDE_KEYS: [&str; 3] = ["enabled", "exposure", "toolExposure"];
@@ -460,27 +344,45 @@ const OVERRIDE_KEYS: [&str; 3] = ["enabled", "exposure", "toolExposure"];
 /// `isOverride` (config.ts): an entry without `command`, `url`, and
 /// `type` overrides a server defined elsewhere instead of defining one.
 fn is_override(value: &Map<String, Value>) -> bool {
-    !value.contains_key("command") && !value.contains_key("url") && !value.contains_key("type")
+    rpi_mcp::is_mcp_server_override(value)
 }
 
-/// `validateMcpServerConfig` (mcp-servers.ts): a validated copy with
-/// exposure aliases resolved, or an error message.
+/// `validateMcpServerConfig` (mcp-servers.ts): shared transport and OAuth
+/// validation, followed by rpi's exposure and auth-provider checks.
 pub fn validate_mcp_server_config(name: &str, raw: &Value) -> Result<McpServerConfig, String> {
-    if !is_server_name(name) {
-        return Err(format!(
-            "invalid server name \"{name}\" (use letters, digits, \"_\" and \"-\")"
-        ));
-    }
     let Some(raw) = raw.as_object() else {
         return Err(format!("server \"{name}\" must be an object"));
     };
     let value = resolve_exposure_aliases(raw.clone());
-    let kind = value.get("type").and_then(Value::as_str);
-    if kind == Some("sse") {
-        return Err(format!(
-            "server \"{name}\": legacy SSE transport is not supported; use the streamable HTTP URL"
-        ));
-    }
+    let options = rpi_mcp::McpServerConfigOptions {
+        check_metadata_document_callback: Some(Arc::new(|callback_url| {
+            let path = callback_url
+                .and_then(|url| url::Url::parse(url).ok())
+                .map(|url| {
+                    (
+                        url.host_str().unwrap_or_default().to_owned(),
+                        url.path().to_owned(),
+                    )
+                });
+            if path
+                .as_ref()
+                .is_some_and(|(host, path)| host == "[::1]" || path != "/callback")
+            {
+                Some(
+                    "oauth.clientRegistration \"cimd\" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback"
+                        .to_owned(),
+                )
+            } else {
+                None
+            }
+        })),
+    };
+    let raw = Value::Object(value.clone());
+    let (transport, raw) = match rpi_mcp::validate_mcp_server_config(name, &raw, &options) {
+        rpi_mcp::McpServerConfigResult::Http(raw) => (true, raw),
+        rpi_mcp::McpServerConfigResult::Stdio(raw) => (false, raw),
+        rpi_mcp::McpServerConfigResult::Invalid(error) => return Err(error),
+    };
     let exposures = "\"codemode\", \"deferred\", \"direct\", \"hidden\"";
     if let Some(exposure) = value.get("exposure")
         && !is_exposure(exposure)
@@ -503,98 +405,35 @@ pub fn validate_mcp_server_config(name: &str, raw: &Value) -> Result<McpServerCo
             }
         }
     }
-    if value
-        .get("enabled")
-        .is_some_and(|value| !value.is_boolean())
-    {
-        return Err(format!("server \"{name}\": enabled must be a boolean"));
-    }
-    if value
-        .get("description")
-        .is_some_and(|value| !value.is_string())
-    {
-        return Err(format!("server \"{name}\": description must be a string"));
-    }
-    if let Some(timeout) = value.get("timeout") {
-        let valid = timeout.as_f64().is_some_and(|timeout| timeout > 0.0);
+    if transport && let Some(auth) = value.get("auth") {
+        let valid = auth
+            .as_object()
+            .and_then(|auth| auth.get("provider"))
+            .and_then(Value::as_str)
+            .is_some_and(|provider| !provider.is_empty());
         if !valid {
             return Err(format!(
-                "server \"{name}\": timeout must be a positive number of seconds"
+                "server \"{name}\": auth.provider must be a provider name"
             ));
         }
-    }
-    // HTTP: a URL with an optional `"http"`/`"streamable-http"` type.
-    let is_http = value.get("url").is_some_and(Value::is_string)
-        && matches!(kind, None | Some("http") | Some("streamable-http"));
-    if is_http {
         let url = value.get("url").and_then(Value::as_str).unwrap_or_default();
-        let valid = url::Url::parse(url)
-            .ok()
-            .is_some_and(|url| matches!(url.scheme(), "http" | "https"));
-        if !valid {
+        let url = url::Url::parse(url).expect("validated above");
+        let loopback = is_loopback_host(url.host_str().unwrap_or_default());
+        if url.scheme() != "https" && !loopback {
             return Err(format!(
-                "server \"{name}\": url must be an http or https URL"
+                "server \"{name}\": auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]"
             ));
         }
-        if let Some(headers) = value.get("headers")
-            && !is_string_record(headers)
-        {
-            return Err(format!(
-                "server \"{name}\": headers must map names to strings"
-            ));
-        }
-        validate_oauth(value.get("oauth"))
-            .map_err(|error| format!("server \"{name}\": {error}"))?;
-        if let Some(auth) = value.get("auth") {
-            let valid = auth
-                .as_object()
-                .and_then(|auth| auth.get("provider"))
-                .and_then(Value::as_str)
-                .is_some_and(|provider| !provider.is_empty());
-            if !valid {
-                return Err(format!(
-                    "server \"{name}\": auth.provider must be a provider name"
-                ));
-            }
-            let url = url::Url::parse(url).expect("validated above");
-            let loopback = is_loopback_host(url.host_str().unwrap_or_default());
-            if url.scheme() != "https" && !loopback {
-                return Err(format!(
-                    "server \"{name}\": auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]"
-                ));
-            }
-        }
-        let config: McpHttpServerConfig = serde_json::from_value(Value::Object(value))
-            .map_err(|error| format!("server \"{name}\": {error}"))?;
-        return Ok(McpServerConfig::Http(config));
     }
-    // stdio: a command with an optional `"stdio"` type.
-    if value.get("command").is_some_and(Value::is_string) && matches!(kind, None | Some("stdio")) {
-        if let Some(args) = value.get("args") {
-            let valid = args
-                .as_array()
-                .is_some_and(|args| args.iter().all(Value::is_string));
-            if !valid {
-                return Err(format!(
-                    "server \"{name}\": args must be an array of strings"
-                ));
-            }
-        }
-        if let Some(env) = value.get("env")
-            && !is_string_record(env)
-        {
-            return Err(format!("server \"{name}\": env must map names to strings"));
-        }
-        if value.get("cwd").is_some_and(|value| !value.is_string()) {
-            return Err(format!("server \"{name}\": cwd must be a string"));
-        }
-        let config: McpStdioServerConfig = serde_json::from_value(Value::Object(value))
-            .map_err(|error| format!("server \"{name}\": {error}"))?;
-        return Ok(McpServerConfig::Stdio(config));
+    if transport {
+        let config: McpHttpServerConfig =
+            serde_json::from_value(raw).map_err(|error| format!("server \"{name}\": {error}"))?;
+        Ok(McpServerConfig::Http(config))
+    } else {
+        let config: McpStdioServerConfig =
+            serde_json::from_value(raw).map_err(|error| format!("server \"{name}\": {error}"))?;
+        Ok(McpServerConfig::Stdio(config))
     }
-    Err(format!(
-        "server \"{name}\" needs either \"command\" (stdio) or \"url\" (streamable HTTP)"
-    ))
 }
 
 /// Strip a UTF-8 BOM before parsing (#11191).
@@ -1065,11 +904,11 @@ mod tests {
         for (oauth, needle) in [
             (
                 json!({"clientRegistration": "other"}),
-                "must be \"dcr\" or \"cimd\"",
+                "must be \"auto\", \"dcr\", or \"cimd\"",
             ),
             (
                 json!({"clientRegistration": 5}),
-                "must be \"dcr\" or \"cimd\"",
+                "must be \"auto\", \"dcr\", or \"cimd\"",
             ),
             (
                 json!({"clientRegistration": "cimd", "clientId": "id"}),

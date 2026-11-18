@@ -35,6 +35,9 @@ fn non_retryable_provider_limit_error_pattern() -> &'static Regex {
             // which resets after hours rather than seconds (`02eed88fd`).
             "subscription_sharing_usage_limit_exceeded",
             "subscription_sharing_workplace_individual_usage_limit_exceeded",
+            // Zhipu code 1308 is a plan usage cap, not a transient 429. Match
+            // the JSON field rather than a number elsewhere in the message.
+            "\"code\"\\s*:\\s*\"?1308(?:\\D|$)",
         ])
     });
     &PATTERN
@@ -95,6 +98,7 @@ fn retryable_provider_error_pattern() -> &'static Regex {
             "stream ended before a terminal response event",
             "http2 request did not get a response",
             "stream disconnected before completion",
+            "cut short after the reply had begun",
             // #10379 (5b6c792b4): Node ERR_HTTP2_STREAM_CANCEL — the HTTP/2
             // session died before the request was sent, e.g. after the
             // Bedrock SDK's 5-minute session timeout.
@@ -343,6 +347,26 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn provider_limit_and_dropped_stream_classification_matches_target() {
+        assert!(!is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("429 {\"code\":\"1308\",\"message\":\"usage cap reached\"}")
+        )));
+        assert!(!is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("429 {\"code\":1308}")
+        )));
+        assert!(is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("429 {\"code\":13080}")
+        )));
+        assert!(is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("Claude Code's stream from Anthropic was cut short after the reply had begun")
+        )));
     }
 
     /// #10278 (3874b3e98) / #10543 (8b5708dbb) / #10379 (5b6c792b4):

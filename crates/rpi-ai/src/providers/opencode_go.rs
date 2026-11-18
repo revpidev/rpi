@@ -19,7 +19,6 @@ use crate::api::openai_completions::OpenAiCompletions;
 use crate::api::openai_responses::OpenAiResponses;
 use crate::api::session_affinity::with_opencode_session_header;
 use crate::auth::{ProviderAuth, env_api_key_auth};
-use crate::generated::get_builtin_models;
 use crate::models::{
     CreateProviderOptions, Provider, ProviderApi, ProviderStreams, create_provider,
 };
@@ -39,7 +38,9 @@ pub fn opencode_go_provider() -> Arc<dyn Provider> {
             ))),
             oauth: None,
         },
-        models: get_builtin_models("opencode-go").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared(
+            "opencode-go",
+        )),
         api: ProviderApi::Map(api_map()),
         ..Default::default()
     })
@@ -85,7 +86,7 @@ mod tests {
             assert!(map.contains_key(key), "missing dispatch key {key}");
         }
         assert_eq!(map.len(), 4);
-        for model in get_builtin_models("opencode-go") {
+        for model in crate::generated::get_builtin_chat_models("opencode-go") {
             assert!(
                 map.contains_key(model.api.as_str()),
                 "catalog model {} has undispatched api {}",
@@ -95,10 +96,16 @@ mod tests {
         }
         let gemini = get_builtin_model("opencode-go", "gemini-4-argon").expect("Gemini");
         assert_eq!(gemini.api, ApiKind::GOOGLE_GENERATIVE_AI.into());
-        assert_eq!(gemini.base_url, "https://opencode.ai/inference/go/v1");
+        assert_eq!(
+            gemini.base_url,
+            "https://opencode.ai/inference/go/google/v1beta"
+        );
         let minimax = get_builtin_model("opencode-go", "minimax-m3").expect("MiniMax");
         assert_eq!(minimax.api, ApiKind::ANTHROPIC_MESSAGES.into());
-        assert_eq!(minimax.base_url, "https://opencode.ai/inference/go");
+        assert_eq!(
+            minimax.base_url,
+            "https://opencode.ai/inference/go/anthropic"
+        );
     }
 
     /// #9326 (561a2e066): provider dispatch wraps every adapter with the

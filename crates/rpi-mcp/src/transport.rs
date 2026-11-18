@@ -2,6 +2,8 @@
 //! `packages/mcp/src/transports/transport.ts` @ b4afdddf).
 
 pub mod in_memory;
+mod lines;
+pub mod pipe;
 pub mod stdio;
 pub mod streamable_http;
 

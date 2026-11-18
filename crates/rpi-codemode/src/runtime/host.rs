@@ -1046,6 +1046,52 @@ mod tests {
         let _ = running.await.expect("join");
     }
 
+    #[tokio::test]
+    async fn non_finite_numbers_print_in_console_and_thrown_values() {
+        let sandbox = CodemodeSandbox::new(CodemodeSandboxOptions {
+            timeout_ms: CodemodeTimeout::Milliseconds(60_000),
+            ..Default::default()
+        })
+        .expect("sandbox");
+        let result = sandbox
+            .execute(
+                "console.log('avg', 0/0, 1/0, -1/0, -0, { nested: 0/0 }); text(0/0);",
+                CodemodeExecuteOptions::default(),
+            )
+            .await
+            .expect("execution");
+        let CodemodeResult::Ok { output, .. } = result else {
+            panic!("expected ok, got {result:?}")
+        };
+        assert!(output.iter().any(|item| matches!(
+            item,
+            CodemodeOutputItem::Text { text, console: true }
+                if text == "avg NaN Infinity -Infinity 0 {\"nested\":null}"
+        )));
+        assert!(output.iter().any(|item| matches!(
+            item,
+            CodemodeOutputItem::Text { text, console: false } if text == "NaN"
+        )));
+        for value in ["NaN", "Infinity", "-Infinity"] {
+            let result = sandbox
+                .execute(
+                    &format!("throw {value};"),
+                    CodemodeExecuteOptions::default(),
+                )
+                .await
+                .expect("execution");
+            let CodemodeResult::Err { error, .. } = result else {
+                panic!("expected thrown {value}, got {result:?}")
+            };
+            assert!(error.message.contains(value), "{}: {value}", error.message);
+            assert!(
+                !error.message.contains("null"),
+                "{}: {value}",
+                error.message
+            );
+        }
+    }
+
     /// Round-2: the depth-disabled deserializer still requires one complete
     /// JSON document; trailing garbage must be rejected.
     #[test]

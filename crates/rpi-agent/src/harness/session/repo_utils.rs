@@ -635,6 +635,7 @@ pub(crate) mod test_support {
                 cache_read: 0.0,
                 cache_write: 0.0,
                 total: cost_total,
+                total_from_provider: None,
             },
         }
     }

@@ -365,6 +365,17 @@ pub fn get_json_schema_tool_parameters(tool: &Tool, strict: Option<bool>) -> Res
     }
 }
 
+pub fn prefers_json_schema_strict_sampling(tool: &Tool) -> bool {
+    matches!(
+        tool.constrained_sampling,
+        Some(ConstrainedSampling::Config(
+            ConstrainedSamplingConfig::JsonSchema {
+                strict: ConstrainedSamplingStrict::Prefer,
+            }
+        ))
+    )
+}
+
 /// `resolveJsonSchemaStrictSampling` (:214-222 @ 295cc72b0): `None` = the
 /// tool keeps its unconverted schema; `Some(true)` = strict conversion;
 /// `prefer` falls back to non-strict for unsupported constructs, `require`

@@ -465,14 +465,14 @@ impl FauxProvider {
                 Some(previous) => {
                     let cached_chars = common_prompt_prefix_length(previous, &prompt);
                     cache_read = estimate_len_tokens(cached_chars);
-                    cache_write = estimate_len_tokens(prompt_length - cached_chars);
-                    input = prompt_tokens.saturating_sub(cache_read);
+                    cache_write = prompt_tokens.saturating_sub(cache_read);
                 }
                 None => {
                     cache_write = prompt_tokens;
                 }
             }
             inner.prompt_cache.insert(session_id.clone(), prompt);
+            input = 0;
         }
 
         Usage {
@@ -1171,7 +1171,7 @@ mod tests {
         // prompt "user:12345678" = 13 chars → ceil(13/4) = 4 tokens.
         assert_eq!(m1.usage.cache_write, 4);
         assert_eq!(m1.usage.cache_read, 0);
-        assert_eq!(m1.usage.input, 4);
+        assert_eq!(m1.usage.input, 0);
         assert_eq!(m1.usage.output, 1); // "abcd" = 4 chars → 1 token
 
         let e2 = collect(provider.stream_fn()(
@@ -1245,7 +1245,7 @@ mod tests {
         };
         assert_eq!(m2.usage.cache_read, 4);
         assert_eq!(m2.usage.cache_write, 3);
-        assert_eq!(m2.usage.input, 3); // ceil(27/4) - 4
+        assert_eq!(m2.usage.input, 0);
     }
 
     #[tokio::test]

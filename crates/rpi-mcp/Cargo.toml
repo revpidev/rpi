@@ -10,6 +10,11 @@ license.workspace = true
 name = "mcp-test-server"
 path = "tests/fixtures/mcp-test-server.rs"
 
+# Test-only host that exits without closing its MCP transport.
+[[bin]]
+name = "mcp-process-guard-host"
+path = "tests/fixtures/mcp-process-guard-host.rs"
+
 [dependencies]
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }

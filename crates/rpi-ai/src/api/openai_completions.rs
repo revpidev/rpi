@@ -202,6 +202,9 @@ pub struct ResolvedOpenAICompletionsCompat {
     pub supports_mid_convo_tool_additions: bool,
     pub session_affinity_format: SessionAffinityFormat,
     pub supports_long_cache_retention: bool,
+    pub requires_tools_with_tool_history: bool,
+    pub requires_non_null_assistant_content: bool,
+    pub prompt_cache_key_mode: crate::types::PromptCacheKeyMode,
 }
 
 /// `detectCompat`: auto-detect compatibility settings from provider name and
@@ -341,6 +344,9 @@ pub fn detect_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
             || is_cloudflare_ai_gateway
             || is_nvidia
             || is_ant_ling),
+        requires_tools_with_tool_history: false,
+        requires_non_null_assistant_content: false,
+        prompt_cache_key_mode: crate::types::PromptCacheKeyMode::Auto,
     }
 }
 
@@ -423,6 +429,15 @@ pub fn get_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
         supports_long_cache_retention: compat
             .supports_long_cache_retention
             .unwrap_or(detected.supports_long_cache_retention),
+        requires_tools_with_tool_history: compat
+            .requires_tools_with_tool_history
+            .unwrap_or(detected.requires_tools_with_tool_history),
+        requires_non_null_assistant_content: compat
+            .requires_non_null_assistant_content
+            .unwrap_or(detected.requires_non_null_assistant_content),
+        prompt_cache_key_mode: compat
+            .prompt_cache_key_mode
+            .unwrap_or(detected.prompt_cache_key_mode),
     }
 }
 
@@ -678,7 +693,9 @@ pub fn convert_messages(
                 // Some providers don't accept null content, use empty string instead.
                 assistant_msg.insert(
                     "content".to_owned(),
-                    if compat.requires_assistant_after_tool_result {
+                    if compat.requires_assistant_after_tool_result
+                        || compat.requires_non_null_assistant_content
+                    {
                         json!("")
                     } else {
                         Value::Null
@@ -925,7 +942,9 @@ pub fn convert_messages(
                 }
 
                 if !image_blocks.is_empty() {
-                    if compat.requires_assistant_after_tool_result {
+                    if compat.requires_assistant_after_tool_result
+                        || compat.requires_non_null_assistant_content
+                    {
                         params.push(json!({
                             "role": "assistant",
                             "content": "I have processed the tool results.",
@@ -1331,9 +1350,7 @@ pub fn build_params(
     let request_tools = transcript_tools.request_tools;
     let mut tools: Option<Vec<Value>> = if !request_tools.is_empty() {
         Some(convert_tools(&request_tools, compat)?)
-    } else if has_tool_history(&context.messages) {
-        // Anthropic (via LiteLLM/proxy) requires tools param when the
-        // conversation has tool_calls/tool_results.
+    } else if compat.requires_tools_with_tool_history && has_tool_history(&context.messages) {
         Some(Vec::new())
     } else {
         None
@@ -1348,10 +1365,14 @@ pub fn build_params(
     params.insert("messages".to_owned(), Value::Array(messages));
     params.insert("stream".to_owned(), json!(true));
 
-    let prompt_cache_key = if (model.base_url.contains("api.openai.com")
-        && cache_retention != CacheRetention::None)
-        || (cache_retention == CacheRetention::Long && compat.supports_long_cache_retention)
-    {
+    let prompt_cache_key_mode = compat.prompt_cache_key_mode;
+    let supports_prompt_cache_key = prompt_cache_key_mode
+        == crate::types::PromptCacheKeyMode::Enabled
+        || (prompt_cache_key_mode == crate::types::PromptCacheKeyMode::Auto
+            && (model.base_url.contains("api.openai.com")
+                || (cache_retention == CacheRetention::Long
+                    && compat.supports_long_cache_retention)));
+    let prompt_cache_key = if cache_retention != CacheRetention::None && supports_prompt_cache_key {
         clamp_openai_prompt_cache_key(options.stream.session_id.as_deref())
     } else {
         None
@@ -1690,6 +1711,9 @@ pub fn parse_chunk_usage(raw_usage: &Value, model: &Model) -> Usage {
         cost: Default::default(),
     };
     calculate_cost(model, &mut usage);
+    if crate::utils::openrouter_cost::is_openrouter_model(model) {
+        crate::utils::openrouter_cost::apply_openrouter_reported_cost(&mut usage, raw_usage);
+    }
     usage
 }
 
@@ -4478,8 +4502,8 @@ mod build_and_stream_tests {
             "no tools key without tools: {params}"
         );
 
-        // tools=[] with tool history: `params.tools = []` is still sent and
-        // the explicit choice stays (upstream :846-849/:855-857).
+        // v1.5.2 omits empty tools unless the legacy compat explicitly asks
+        // for them; the explicit tool choice still stays.
         let history = v14_06_assistant(vec![AssistantContent::ToolCall(ToolCall {
             id: "call_1".to_owned(),
             name: "bash".to_owned(),
@@ -4505,8 +4529,75 @@ mod build_and_stream_tests {
             &no_grammar(),
         )
         .expect("params");
+        assert!(params.get("tools").is_none());
+        assert_eq!(params["tool_choice"], json!("none"));
+
+        let legacy = make_model(json!({"compat": {"requiresToolsWithToolHistory": true}}));
+        let params = build_params(
+            &legacy,
+            &ctx,
+            &options,
+            &get_compat(&legacy),
+            CacheRetention::Short,
+            &no_grammar(),
+        )
+        .expect("params");
         assert_eq!(params["tools"], json!([]));
         assert_eq!(params["tool_choice"], json!("none"));
+    }
+
+    #[test]
+    fn test_non_null_assistant_content_and_prompt_cache_key_mode() {
+        let model = make_model(json!({"compat": {"requiresNonNullAssistantContent": true}}));
+        let ctx = context(
+            vec![same_model_assistant(json!([
+                {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {}}
+            ]))],
+            None,
+        );
+        let params = build_params(
+            &model,
+            &ctx,
+            &OpenAICompletionsOptions::default(),
+            &get_compat(&model),
+            CacheRetention::Short,
+            &no_grammar(),
+        )
+        .expect("params");
+        assert_eq!(params["messages"][0]["content"], json!(""));
+
+        let default_model = make_model(json!({}));
+        let params = build_params(
+            &default_model,
+            &ctx,
+            &OpenAICompletionsOptions::default(),
+            &get_compat(&default_model),
+            CacheRetention::Short,
+            &no_grammar(),
+        )
+        .expect("params");
+        assert!(params["messages"][0]["content"].is_null());
+
+        let disabled = make_model(json!({"compat": {"promptCacheKeyMode": "disabled"}}));
+        let mut options = options(StreamOptions::default());
+        options.stream.session_id = Some("s".to_owned());
+        let params = params_for(
+            &disabled,
+            &context(vec![user_text("hi")], None),
+            &options,
+            CacheRetention::Long,
+        );
+        assert!(params.get("prompt_cache_key").is_none());
+        let other = make_model(
+            json!({"baseUrl": "https://example.com/v1", "compat": {"promptCacheKeyMode": "enabled"}}),
+        );
+        let params = params_for(
+            &other,
+            &context(vec![user_text("hi")], None),
+            &options,
+            CacheRetention::Short,
+        );
+        assert_eq!(params["prompt_cache_key"], json!("s"));
     }
 
     /// Kimi usage fallback (#8119): top-level `cached_tokens` is the third
@@ -4791,6 +4882,24 @@ mod build_and_stream_tests {
     }
 
     #[test]
+    fn opencode_deepseek_v41_omits_long_cache_retention() {
+        let model = make_model(json!({
+            "id": "deepseek-v4.1-flash",
+            "provider": "opencode",
+            "baseUrl": "https://opencode.ai/inference/openai/v1",
+            "compat": {"supportsLongCacheRetention": false}
+        }));
+        let ctx = context(vec![user_text("hi")], None);
+        let params = params_for(
+            &model,
+            &ctx,
+            &options(StreamOptions::default()),
+            CacheRetention::Long,
+        );
+        assert!(params.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
     fn test_build_params_max_tokens_field() {
         let ctx = context(vec![user_text("hi")], None);
         let opts = options(StreamOptions {
@@ -5055,7 +5164,7 @@ mod build_and_stream_tests {
         let params = params_for(&zai, &ctx, &opts, CacheRetention::Short);
         assert_eq!(params["tool_stream"], json!(true));
 
-        // Tool history without tools → empty tools array.
+        // Empty tools are omitted by default and restored only by the legacy compat.
         let history_ctx = context(
             vec![same_model_assistant(json!([
                 {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {}}
@@ -5063,6 +5172,9 @@ mod build_and_stream_tests {
             None,
         );
         let params = params_for(&model, &history_ctx, &opts, CacheRetention::Short);
+        assert!(params.get("tools").is_none());
+        let legacy = make_model(json!({"compat": {"requiresToolsWithToolHistory": true}}));
+        let params = params_for(&legacy, &history_ctx, &opts, CacheRetention::Short);
         assert_eq!(params["tools"], json!([]));
     }
 
@@ -6057,5 +6169,29 @@ mod build_and_stream_tests {
             ModelThinkingLevel::High
         );
         let _ = ThinkingBudgets::default();
+    }
+
+    #[test]
+    fn openrouter_reported_cost_replaces_catalog_estimate() {
+        let model = make_model(json!({
+            "provider": "openrouter",
+            "baseUrl": "https://openrouter.ai/api/v1"
+        }));
+        let usage = parse_chunk_usage(
+            &json!({
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "cost": 1.25,
+                "is_byok": true,
+                "cost_details": {
+                    "upstream_inference_cost": 0.75,
+                    "upstream_inference_prompt_cost": 0,
+                    "upstream_inference_completions_cost": 0
+                }
+            }),
+            &model,
+        );
+        assert_eq!(usage.cost.total, 2.0);
+        assert_eq!(usage.cost.total_from_provider, Some(true));
     }
 }

@@ -192,18 +192,29 @@ impl FileAuthStorageBackend {
     /// over the target — a crash mid-write can no longer truncate the store
     /// to a partial file. The temp file inherits the EXISTING file's
     /// permission bits when one exists (admin-configured modes/ACLs must
-    /// survive the rewrite, auth-storage.ts:24-25 @ c49906ec7, #7779); a
-    /// new file is created 0o600.
+    /// survive the rewrite, auth-storage.ts:36-37 @ c49906ec7, #7779); a
+    /// new file is created 0o600. A symlink is resolved before the atomic
+    /// rename so the link and its target keep one lock/read identity. A
+    /// dangling symlink returns `NotFound` instead of creating its target,
+    /// matching upstream `realpath` behavior.
     fn write_file(&self, content: &str) -> std::io::Result<()> {
         use std::io::Write;
 
-        let parent = self
-            .auth_path
+        let target_path = std::fs::canonicalize(&self.auth_path).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound
+                && !std::fs::symlink_metadata(&self.auth_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                Ok(self.auth_path.clone())
+            } else {
+                Err(error)
+            }
+        })?;
+        let parent = target_path
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let file_name = self
-            .auth_path
+        let file_name = target_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "auth.json".to_string());
@@ -226,14 +237,14 @@ impl FileAuthStorageBackend {
         #[cfg(unix)]
         {
             // Preserve an existing file's permission bits (see doc note).
-            if let Ok(existing) = std::fs::metadata(&self.auth_path) {
+            if let Ok(existing) = std::fs::metadata(&target_path) {
                 let _ = std::fs::set_permissions(&tmp_path, existing.permissions());
             }
         }
 
         // Rename is atomic within the same directory; the old contents
         // stay intact until the new ones are fully on disk.
-        std::fs::rename(&tmp_path, &self.auth_path)?;
+        std::fs::rename(&tmp_path, &target_path)?;
 
         // Best-effort directory fsync so the rename itself is durable
         // (directory fsync is unsupported via std on some platforms —
@@ -1156,6 +1167,117 @@ mod tests {
                 "anthropic": { "type": "api_key", "key": "stored" },
                 "openai": { "type": "api_key", "key": "new" }
             })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_auth_paths_share_the_file_lock() {
+        let dir = temp_dir();
+        let real = dir.join("shared-auth.json");
+        let alias = dir.join("auth.json");
+        write_auth_json(&real, json!({}));
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+        let backend = FileAuthStorageBackend::with_retry_config(
+            &alias,
+            RetryConfig {
+                retries: 0,
+                factor: 1,
+                min_timeout: Duration::from_millis(1),
+                max_timeout: Duration::from_millis(1),
+                randomize: false,
+            },
+        );
+        let storage = FileCredentialStore::with_backend_for_tests(Backend::File(backend), None);
+        let blocker = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&real)
+            .expect("open real auth");
+        blocker.try_lock_exclusive().expect("lock real auth");
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_callback = called.clone();
+        let error = storage
+            .modify(
+                "openai",
+                modify_fn(move |_| {
+                    called_callback.store(true, Ordering::SeqCst);
+                    Ok(None)
+                }),
+                None,
+            )
+            .await
+            .expect_err("alias must wait for the real file lock");
+        assert!(
+            error
+                .message
+                .contains("Failed to acquire auth storage lock")
+        );
+        assert!(!called.load(Ordering::SeqCst));
+        blocker.unlock().expect("unlock");
+        drop(blocker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn modify_preserves_the_symlink_target_and_lock_identity() {
+        let dir = temp_dir();
+        let real = dir.join("shared-auth.json");
+        let alias = dir.join("auth.json");
+        write_auth_json(
+            &real,
+            json!({ "anthropic": { "type": "api_key", "key": "old" } }),
+        );
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+        let storage = FileCredentialStore::new(&alias);
+        storage
+            .modify(
+                "anthropic",
+                modify_fn(|_| Ok(Some(api_key_credential("new")))),
+                None,
+            )
+            .await
+            .expect("modify through symlink");
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .expect("alias")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(read_file_json(&real)["anthropic"]["key"], "new");
+        assert_eq!(read_file_json(&alias)["anthropic"]["key"], "new");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&alias).expect("alias metadata").ino(),
+            std::fs::metadata(&real).expect("real metadata").ino()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_symlinks_do_not_create_the_missing_target() {
+        let dir = temp_dir();
+        let real = dir.join("missing-auth.json");
+        let alias = dir.join("auth.json");
+        std::os::unix::fs::symlink(&real, &alias).expect("dangling symlink");
+        let storage = FileCredentialStore::new(&alias);
+        storage
+            .modify(
+                "anthropic",
+                modify_fn(|_| Ok(Some(api_key_credential("new")))),
+                None,
+            )
+            .await
+            .expect_err("dangling symlink must not be replaced");
+        assert!(!real.exists());
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .expect("alias")
+                .file_type()
+                .is_symlink()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

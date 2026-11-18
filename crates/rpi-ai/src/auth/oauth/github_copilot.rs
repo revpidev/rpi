@@ -33,7 +33,7 @@
 //!   JS `parseFloat` prefix semantics (a "120abc"-style value would parse in
 //!   JS; servers send clean numbers);
 //! - the known-models list for policy-enable is the vendored catalog
-//!   (`get_builtin_models("github-copilot")` — the same
+//!   (`get_builtin_chat_models("github-copilot")` — the same
 //!   `github-copilot.json` upstream flattens into `GITHUB_COPILOT_MODELS`).
 
 use std::sync::Arc;
@@ -47,7 +47,7 @@ use super::super::types::{LoginOptions, ModelAuth, OAuthAuth, OAuthCredential};
 use super::device_code::{
     DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
-use crate::generated::get_builtin_models;
+use crate::generated::get_builtin_chat_models;
 
 /// `CLIENT_ID` — upstream: `decode("SXYxLmI1MDdhMDhjODdlY2ZlOTg=")` (base64/atob).
 const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -213,10 +213,11 @@ fn parse_github_copilot_model_catalog(
     let Some(data) = data else {
         return Err(error("Invalid Copilot models response"));
     };
-    let known_model_ids: std::collections::HashSet<&str> = get_builtin_models("github-copilot")
-        .iter()
-        .map(|model| model.id.as_str())
-        .collect();
+    let known_model_ids: std::collections::HashSet<&str> =
+        get_builtin_chat_models("github-copilot")
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
     let mut account_models: Vec<AccountModel> = Vec::new();
     for item in data {
         let tool_calls = item
@@ -384,21 +385,14 @@ impl GitHubCopilotOAuth {
             return Err(error("Invalid device code response fields"));
         }
 
-        // The verification URI is opened in the user's browser and to prevent
-        // the launcher from opening an executable or similar, we force it to
-        // be a URL (and serialize the parsed form back out, like `.href`).
-        let parsed_uri = match url::Url::parse(verification_uri) {
-            Ok(parsed_uri) => parsed_uri,
-            Err(_) => return Err(error("Untrusted verification_uri in device code response")),
-        };
-        if parsed_uri.scheme() != "https" && parsed_uri.scheme() != "http" {
+        let Some(verification_uri) = super::trusted_url::trusted_http_url(verification_uri) else {
             return Err(error("Untrusted verification_uri in device code response"));
-        }
+        };
 
         Ok(DeviceCodeResponse {
             device_code: device_code.to_owned(),
             user_code: user_code.to_owned(),
-            verification_uri: parsed_uri.to_string(),
+            verification_uri,
             interval,
             expires_in,
         })
@@ -784,6 +778,8 @@ impl GitHubCopilotOAuth {
         interaction.notify(AuthEvent::DeviceCode {
             user_code: device.user_code.clone(),
             verification_uri: device.verification_uri.clone(),
+            open_browser_on_confirm: None,
+            copy_code_on_confirm: None,
             interval_seconds: device.interval.map(|interval| interval as u64),
             expires_in_seconds: Some(device.expires_in as u64),
         });
@@ -1280,7 +1276,7 @@ mod tests {
     /// claude-sonnet-4 / -4.5 disappeared from the regenerated catalog).
     #[test]
     fn parse_model_catalog_policy_enable_candidates() {
-        let known: Vec<&str> = get_builtin_models("github-copilot")
+        let known: Vec<&str> = get_builtin_chat_models("github-copilot")
             .iter()
             .map(|model| model.id.as_str())
             .collect();
@@ -1444,6 +1440,7 @@ mod tests {
                 verification_uri,
                 interval_seconds,
                 expires_in_seconds,
+                ..
             } => {
                 assert_eq!(user_code, "ABCD-EFGH");
                 assert_eq!(verification_uri, "https://github.com/login/device");
@@ -1521,7 +1518,7 @@ mod tests {
     /// claude-sonnet-4.5 was retired from the catalog by the V14-09 regen).
     #[tokio::test]
     async fn login_enables_unconfigured_known_models_sequentially() {
-        let unconfigured: String = get_builtin_models("github-copilot")[0].id.clone();
+        let unconfigured: String = get_builtin_chat_models("github-copilot")[0].id.clone();
         let models_response = json!({
             "data": [
                 { "id": "gpt-4.1", "model_picker_enabled": true },

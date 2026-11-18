@@ -353,7 +353,10 @@ pub(crate) fn transport_error(error: &reqwest::Error) -> LlamaError {
     if error.is_timeout() {
         LlamaError::connection("request timeout")
     } else if error.is_connect() {
-        LlamaError::connection(format!("connection failed: {error}"))
+        LlamaError::connection(format!(
+            "connection failed: {}",
+            rpi_ai::utils::transport_error::format_reqwest_error(error)
+        ))
     } else {
         LlamaError::new(format!("request failed: {error}"))
     }
@@ -415,6 +418,24 @@ impl LlamaClient {
         &self.server_url
     }
 
+    async fn send_server(
+        &self,
+        request: reqwest::RequestBuilder,
+        signal: Option<&CancellationToken>,
+    ) -> Result<reqwest::Response, LlamaError> {
+        send_with_signal(request, signal)
+            .await
+            .map_err(|mut error| {
+                if error.connection {
+                    error.message = format!(
+                        "Could not reach llama.cpp server at {}: {}",
+                        self.server_url, error.message
+                    );
+                }
+                error
+            })
+    }
+
     /// `request(path, init)` (client.ts:165-180).
     async fn request(
         &self,
@@ -435,7 +456,7 @@ impl LlamaClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = send_with_signal(request, signal).await?;
+        let response = self.send_server(request, signal).await?;
         let status = response.status();
         let payload: Option<Value> = response.json().await.ok();
         if !status.is_success() {
@@ -578,14 +599,7 @@ impl LlamaClient {
         if let Some(api_key) = &self.api_key {
             request = request.bearer_auth(api_key);
         }
-        let send = request.send();
-        let response = match signal {
-            Some(token) => tokio::select! {
-                () = token.cancelled() => return Err(LlamaError::cancelled()),
-                response = send => response.map_err(|error| transport_error(&error))?,
-            },
-            None => send.await.map_err(|error| transport_error(&error))?,
-        };
+        let response = self.send_server(request, signal).await?;
         if !response.status().is_success() {
             return Err(LlamaError::new(format!(
                 "llama.cpp SSE returned HTTP {}",
@@ -973,6 +987,34 @@ mod tests {
         assert_eq!(
             parse_download_progress(Some(&serde_json::json!({ "a": { "done": 1 } }))),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_errors_name_the_server_and_underlying_cause() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let url = format!("http://127.0.0.1:{port}");
+        let client = LlamaClient::new(&url, None).expect("client");
+        let error = client.list(false, None).await.expect_err("closed port");
+        assert!(
+            error
+                .message
+                .starts_with(&format!("Could not reach llama.cpp server at {url}:")),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("Connection error."),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.to_lowercase().contains("refused"),
+            "{}",
+            error.message
         );
     }
 

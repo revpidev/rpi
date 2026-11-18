@@ -15,6 +15,7 @@ pub mod headers;
 pub mod http_proxy;
 pub mod identity;
 pub mod json_parse;
+pub mod openrouter_cost;
 pub mod overflow;
 pub mod provider_env;
 pub mod provider_retry;

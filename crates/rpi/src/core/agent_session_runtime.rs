@@ -651,13 +651,15 @@ impl AgentSessionRuntime {
         Ok(false)
     }
 
-    /// `dispose` (agent-session-runtime.ts:395-402).
+    /// `dispose` (agent-session-runtime.ts:395-402), including the #11692
+    /// credential-write drain before process exit.
     pub async fn dispose(&self) {
         self.session
             .extension_runner()
             .emit("session_shutdown")
             .await;
         self.session.dispose();
+        self.services.model_runtime.settle_credential_writes().await;
     }
 }
 

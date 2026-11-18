@@ -141,6 +141,7 @@ pub enum RpiMessagesEvent {
         reason: DoneReason,
         usage: Usage,
         response_id: Option<String>,
+        response_model: Option<String>,
         provider_thinking_level: Option<String>,
         rewrite: Option<RpiMessagesRewriteImpact>,
     },
@@ -150,6 +151,7 @@ pub enum RpiMessagesEvent {
         usage: Usage,
         error_message: Option<String>,
         response_id: Option<String>,
+        response_model: Option<String>,
         provider_thinking_level: Option<String>,
         rewrite: Option<RpiMessagesRewriteImpact>,
     },
@@ -378,6 +380,7 @@ impl EventConverter {
                 reason,
                 usage,
                 response_id,
+                response_model,
                 provider_thinking_level,
                 rewrite,
             } => {
@@ -391,6 +394,7 @@ impl EventConverter {
                 };
                 partial.usage = usage;
                 partial.response_id = response_id;
+                partial.response_model = response_model;
                 if let Some(level) = provider_thinking_level {
                     partial.provider_thinking_level = Some(level);
                 }
@@ -405,6 +409,7 @@ impl EventConverter {
                 usage,
                 error_message,
                 response_id,
+                response_model,
                 provider_thinking_level,
                 rewrite,
             } => {
@@ -415,6 +420,7 @@ impl EventConverter {
                 partial.usage = usage;
                 partial.error_message = error_message;
                 partial.response_id = response_id;
+                partial.response_model = response_model;
                 if let Some(level) = provider_thinking_level {
                     partial.provider_thinking_level = Some(level);
                 }
@@ -1091,6 +1097,36 @@ mod tests {
             parse_rpi_messages_event("event: something\ndata: {\"type\":\"start\"}\ndata: {}")
                 .expect("parses");
         assert_eq!(event, Some(RpiMessagesEvent::Start));
+    }
+
+    #[test]
+    fn test_terminal_events_preserve_response_model() {
+        let model: Model = serde_json::from_value(json!({
+            "id": "requested", "name": "requested", "api": "rpi-messages", "provider": "radius",
+            "baseUrl": "https://example.com", "reasoning": false, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 1000, "maxTokens": 100
+        }))
+        .expect("model");
+        let usage = json!({
+            "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
+        });
+        for (kind, reason) in [("done", "stop"), ("error", "error")] {
+            let event: RpiMessagesEvent = serde_json::from_value(json!({
+                "type": kind,
+                "reason": reason,
+                "usage": usage,
+                "responseModel": "served-model"
+            }))
+            .expect("terminal event");
+            let mut converter = EventConverter::new(&model);
+            let _ = converter.convert(event);
+            assert_eq!(
+                converter.partial.snapshot().response_model.as_deref(),
+                Some("served-model")
+            );
+        }
     }
 
     #[test]

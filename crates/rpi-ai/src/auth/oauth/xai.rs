@@ -379,6 +379,8 @@ impl XaiOAuth {
                 .verification_uri_complete
                 .clone()
                 .unwrap_or_else(|| device.verification_uri.clone()),
+            open_browser_on_confirm: None,
+            copy_code_on_confirm: None,
             interval_seconds: device.interval_seconds.map(|interval| interval as u64),
             expires_in_seconds: Some(device.expires_in_seconds as u64),
         });
@@ -830,6 +832,7 @@ mod tests {
                     verification_uri,
                     interval_seconds,
                     expires_in_seconds,
+                    ..
                 },
             ] => {
                 assert_eq!(user_code, "ABCD-1234");

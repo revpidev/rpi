@@ -1049,7 +1049,7 @@ mod tests {
         ui.handle_session_command();
         let rendered = strip_ansi(&chat_render(ui));
         assert!(rendered.contains("Cache Warming"), "rendered: {rendered}");
-        assert!(rendered.contains("Mode: streaming"), "rendered: {rendered}");
+        assert!(rendered.contains("Mode: idle"), "rendered: {rendered}");
         // The test session goes through sdk assembly, so a warmer exists;
         // before any request it reports "waiting for first request"
         // (cache-warmer.ts:180).

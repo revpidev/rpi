@@ -314,6 +314,8 @@ async fn kimi_coding_device_login_runs_end_to_end() {
         &[AuthEvent::DeviceCode {
             user_code: "ABCD-1234".to_owned(),
             verification_uri: "https://www.kimi.com/code?user_code=ABCD-1234".to_owned(),
+            open_browser_on_confirm: None,
+            copy_code_on_confirm: None,
             interval_seconds: Some(1),
             expires_in_seconds: Some(600),
         }]
@@ -371,6 +373,8 @@ async fn xai_device_login_runs_end_to_end() {
         &[AuthEvent::DeviceCode {
             user_code: "ABCD-1234".to_owned(),
             verification_uri: "https://accounts.x.ai/oauth2/device".to_owned(),
+            open_browser_on_confirm: None,
+            copy_code_on_confirm: None,
             interval_seconds: Some(1),
             expires_in_seconds: Some(900),
         }]

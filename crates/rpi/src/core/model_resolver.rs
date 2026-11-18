@@ -19,12 +19,12 @@ pub const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::Medium;
 /// `defaultModelPerProvider` (model-resolver.ts:20-62 @ b4afdddf) — ids
 /// pinned to the upstream commit; unknown providers fall through to
 /// "first available".
-pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 41] = [
-    ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
+pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 42] = [
+    ("amazon-bedrock", "us.anthropic.claude-opus-5-5"),
     ("ant-ling", "Ring-2.6-1T"),
-    ("anthropic", "claude-opus-4-8"),
-    ("openai", "gpt-5.5"),
-    ("azure", "gpt-5.4"),
+    ("anthropic", "claude-opus-5-5"),
+    ("openai", "gpt-6.1-sol"),
+    ("azure", "gpt-6.1-sol"),
     ("openai-codex", "gpt-6.1-sol"),
     // `balanced` since 9767ba275 (select Radius models after catalog
     // discovery); post-login selection falls back to catalog order when the
@@ -32,37 +32,38 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 41] = [
     ("radius", "balanced"),
     ("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b"),
     ("deepseek", "deepseek-v4-pro"),
-    ("google", "gemini-3.1-pro-preview"),
-    ("google-vertex", "gemini-3.1-pro-preview"),
+    ("google", "gemini-4-argon"),
+    ("google-vertex", "gemini-4-argon"),
     ("github-copilot", "gpt-6.1-sol"),
-    ("openrouter", "moonshotai/kimi-k2.6"),
-    ("vercel-ai-gateway", "zai/glm-5.1"),
+    ("openrouter", "moonshotai/kimi-k2.7-code"),
+    ("vercel-ai-gateway", "zai/glm-5.3"),
     ("xai", "grok-4.7"),
     ("groq", "openai/gpt-oss-120b"),
     ("cerebras", "gpt-oss-120b"),
     ("zai", "glm-5.3"),
     ("zai-coding-cn", "glm-5.3"),
     ("mistral", "devstral-medium-latest"),
-    ("minimax", "MiniMax-M2.7"),
-    ("minimax-cn", "MiniMax-M2.7"),
-    ("moonshotai", "kimi-k2.6"),
-    ("moonshotai-cn", "kimi-k2.6"),
-    ("huggingface", "moonshotai/Kimi-K2.6"),
+    ("minimax", "MiniMax-M3"),
+    ("minimax-cn", "MiniMax-M3"),
+    ("moonshotai", "kimi-k2.7-code"),
+    ("moonshotai-cn", "kimi-k2.7-code"),
+    ("huggingface", "moonshotai/Kimi-K2.7-Code"),
     ("fireworks", "accounts/fireworks/models/kimi-k3"),
     ("together", "moonshotai/Kimi-K3"),
-    ("baseten", "zai-org/GLM-5.2"),
-    ("opencode", "kimi-k2.6"),
-    ("opencode-go", "kimi-k3"),
+    ("baseten", "zai-org/GLM-5.3"),
+    ("opencode", "kimi-k2.7-code"),
+    ("opencode-go", "kimi-k3.1-pro"),
     ("kimi-coding", "kimi-for-coding"),
     ("meta", "muse-spark-1.3"),
-    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
+    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.7-code"),
     (
         "cloudflare-ai-gateway",
-        "workers-ai/@cf/moonshotai/kimi-k2.6",
+        "workers-ai/@cf/moonshotai/kimi-k2.7-code",
     ),
-    ("qwen-token-plan", "qwen3.7-max"),
-    ("qwen-token-plan-cn", "qwen3.7-max"),
+    ("qwen-token-plan", "qwen3.8-max"),
+    ("qwen-token-plan-cn", "qwen3.8-max"),
     ("qwen-token-plan-individual", "qwen3.8-max"),
+    ("qwen-token-plan-individual-cn", "qwen3.8-max"),
     ("xiaomi", "mimo-v2.6-pro"),
     ("xiaomi-token-plan-cn", "mimo-v2.6-pro"),
     ("xiaomi-token-plan-ams", "mimo-v2.6-pro"),
@@ -100,6 +101,38 @@ fn is_alias(id: &str) -> bool {
     !(tail[0] == b'-' && tail[1..].iter().all(|b| b.is_ascii_digit()))
 }
 
+fn split_provider_prefix(text: &str, models: &[Model]) -> Option<(String, String)> {
+    let lower = text.to_lowercase();
+    let mut best: Option<(String, String)> = None;
+    for model in models {
+        let prefix = model.provider.trim().to_lowercase();
+        if prefix.is_empty()
+            || best
+                .as_ref()
+                .is_some_and(|(provider, _)| provider.len() >= model.provider.len())
+        {
+            continue;
+        }
+        let Some(slash_index) = lower
+            .get(prefix.len()..)
+            .and_then(|suffix| suffix.find('/').map(|index| index + prefix.len()))
+        else {
+            continue;
+        };
+        if lower.get(..slash_index).map(str::trim) != Some(prefix.as_str()) {
+            continue;
+        }
+        let model_text = text
+            .get(slash_index + 1..)
+            .map(str::trim)
+            .unwrap_or_default();
+        if !model_text.is_empty() {
+            best = Some((model.provider.clone(), model_text.to_owned()));
+        }
+    }
+    best
+}
+
 /// `findExactModelReferenceMatch` (model-resolver.ts:79-121).
 pub fn find_exact_model_reference_match(
     model_reference: &str,
@@ -122,23 +155,19 @@ pub fn find_exact_model_reference_match(
         return None;
     }
 
-    if let Some(slash_index) = trimmed.find('/') {
-        let provider = trimmed[..slash_index].trim();
-        let model_id = trimmed[slash_index + 1..].trim();
-        if !provider.is_empty() && !model_id.is_empty() {
-            let provider_matches: Vec<&Model> = available_models
-                .iter()
-                .filter(|model| {
-                    model.provider.to_lowercase() == provider.to_lowercase()
-                        && model.id.to_lowercase() == model_id.to_lowercase()
-                })
-                .collect();
-            if provider_matches.len() == 1 {
-                return Some(provider_matches[0].clone());
-            }
-            if provider_matches.len() > 1 {
-                return None;
-            }
+    if let Some((provider, model_id)) = split_provider_prefix(trimmed, available_models) {
+        let provider_matches: Vec<&Model> = available_models
+            .iter()
+            .filter(|model| {
+                model.provider.eq_ignore_ascii_case(&provider)
+                    && model.id.eq_ignore_ascii_case(&model_id)
+            })
+            .collect();
+        if provider_matches.len() == 1 {
+            return Some(provider_matches[0].clone());
+        }
+        if provider_matches.len() > 1 {
+            return None;
         }
     }
 
@@ -424,21 +453,17 @@ fn exact_reference_candidates(reference: &str, models: &[Model]) -> Vec<Model> {
     if !canonical.is_empty() {
         return canonical;
     }
-    if let Some(slash) = reference.find('/') {
-        let provider = reference[..slash].trim();
-        let model_id = reference[slash + 1..].trim();
-        if !provider.is_empty() && !model_id.is_empty() {
-            let named: Vec<Model> = models
-                .iter()
-                .filter(|model| {
-                    model.provider.eq_ignore_ascii_case(provider)
-                        && model.id.eq_ignore_ascii_case(model_id)
-                })
-                .cloned()
-                .collect();
-            if !named.is_empty() {
-                return named;
-            }
+    if let Some((provider, model_id)) = split_provider_prefix(reference, models) {
+        let named: Vec<Model> = models
+            .iter()
+            .filter(|model| {
+                model.provider.eq_ignore_ascii_case(&provider)
+                    && model.id.eq_ignore_ascii_case(&model_id)
+            })
+            .cloned()
+            .collect();
+        if !named.is_empty() {
+            return named;
         }
     }
     models
@@ -698,14 +723,11 @@ pub fn resolve_cli_model(options: ResolveCliModelOptions) -> ResolveCliModelResu
     let mut inferred_provider = false;
 
     if provider.is_none()
-        && let Some(slash_index) = cli_model.find('/')
+        && let Some((canonical, model_text)) = split_provider_prefix(cli_model, &available_models)
     {
-        let maybe_provider = &cli_model[..slash_index];
-        if let Some(canonical) = lookup(maybe_provider) {
-            provider = Some(canonical);
-            pattern = cli_model[slash_index + 1..].to_owned();
-            inferred_provider = true;
-        }
+        provider = Some(canonical);
+        pattern = model_text;
+        inferred_provider = true;
     }
 
     // No provider inferred: try exact matches without provider inference
@@ -1476,10 +1498,14 @@ mod tests {
         assert_eq!(default_model_for_provider("xai"), Some("grok-4.7"));
         assert_eq!(
             default_model_for_provider("baseten"),
-            Some("zai-org/GLM-5.2")
+            Some("zai-org/GLM-5.3")
         );
         assert_eq!(
             default_model_for_provider("qwen-token-plan-individual"),
+            Some("qwen3.8-max")
+        );
+        assert_eq!(
+            default_model_for_provider("qwen-token-plan-individual-cn"),
             Some("qwen3.8-max")
         );
     }
@@ -1622,6 +1648,40 @@ mod tests {
         });
         assert_eq!(result.model.map(|m| m.id).as_deref(), Some("alpha-1"));
         assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn exact_provider_prefix_prefers_the_named_model_over_a_raw_slash_id() {
+        let models = vec![
+            model("provider-a", "model", "Named", false),
+            model("provider-b", "provider-a/model", "Raw slash id", false),
+        ];
+        let resolved = find_exact_model_reference_match("provider-a/model", &models)
+            .expect("named provider match");
+        assert_eq!(resolved.provider, "provider-a");
+        assert_eq!(resolved.id, "model");
+    }
+
+    #[test]
+    fn provider_prefix_matching_prefers_the_longest_id_with_slashes() {
+        let models = vec![
+            model("llama=http:", "other", "Other", false),
+            model(
+                "llama=http://host:10800",
+                "unsloth/qwen-gguf:BF16",
+                "Qwen",
+                false,
+            ),
+        ];
+        let (provider, model_id) =
+            split_provider_prefix("llama=http://host:10800/unsloth/qwen-gguf:BF16", &models)
+                .expect("provider prefix");
+        assert_eq!(provider, "llama=http://host:10800");
+        assert_eq!(model_id, "unsloth/qwen-gguf:BF16");
+        let matches =
+            exact_reference_candidates("llama=http://host:10800/unsloth/qwen-gguf:BF16", &models);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "Qwen");
     }
 
     #[tokio::test]

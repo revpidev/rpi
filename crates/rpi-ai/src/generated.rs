@@ -23,9 +23,9 @@
 //!   surface via `builtin_catalog()` (never panic).
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-use crate::types::{AnyModel, ClassifierModel, ImageModel, Model, ModelType, is_model_type};
+use crate::types::{AnyModel, ClassifierModel, ImageModel, Model, ModelType};
 
 include!(concat!(env!("OUT_DIR"), "/models_generated.rs"));
 
@@ -60,16 +60,44 @@ pub struct CatalogManifest {
     pub files: BTreeMap<String, String>,
 }
 
+struct ProviderCatalog {
+    all_models: Arc<[AnyModel]>,
+    models: OnceLock<Arc<[Model]>>,
+}
+
+impl ProviderCatalog {
+    fn new(models: Vec<AnyModel>) -> Self {
+        Self {
+            all_models: Arc::from(models),
+            models: OnceLock::new(),
+        }
+    }
+
+    fn shared_all_models(&self) -> Arc<[AnyModel]> {
+        Arc::clone(&self.all_models)
+    }
+
+    fn models(&self) -> &[Model] {
+        self.models
+            .get_or_init(|| {
+                self.all_models
+                    .iter()
+                    .filter_map(|model| model.as_chat().cloned())
+                    .collect()
+            })
+            .as_ref()
+    }
+}
+
 /// Parsed built-in catalog: provider id → models in upstream catalog order
 /// (schema v6 vendored JSONs are written in the generator's insertion order;
 /// `serde_json` `preserve_order` keeps that order at parse time).
 ///
-/// `models` is chat-only (the v6 `getBuiltinModels` face); `all_models`
-/// carries every type (chat/image/classifier) for the v6 getters.
+/// The all-type generation is the sole eager model representation. The legacy
+/// chat-only slice is materialized lazily only for callers of the old getter.
 pub struct BuiltinCatalog {
     providers: Vec<&'static str>,
-    models: BTreeMap<&'static str, Vec<Model>>,
-    all_models: BTreeMap<&'static str, Vec<AnyModel>>,
+    catalog: BTreeMap<&'static str, ProviderCatalog>,
     manifest: CatalogManifest,
 }
 
@@ -85,15 +113,25 @@ impl BuiltinCatalog {
     /// `all.ts` `getBuiltinModels(provider)` — chat-only (schema v6 keeps
     /// the legacy getter chat-only; see the image/classifier getters below).
     pub fn models(&self, provider: &str) -> &[Model] {
-        self.models.get(provider).map(Vec::as_slice).unwrap_or(&[])
+        self.catalog
+            .get(provider)
+            .map(ProviderCatalog::models)
+            .unwrap_or(&[])
     }
 
     /// Schema v6 all-type read — every `AnyModel` for the provider.
     pub fn all_models(&self, provider: &str) -> &[AnyModel] {
-        self.all_models
+        self.catalog
             .get(provider)
-            .map(Vec::as_slice)
+            .map(|catalog| catalog.all_models.as_ref())
             .unwrap_or(&[])
+    }
+
+    pub fn shared_all_models(&self, provider: &str) -> Arc<[AnyModel]> {
+        self.catalog
+            .get(provider)
+            .map(ProviderCatalog::shared_all_models)
+            .unwrap_or_else(|| Arc::from(Vec::new()))
     }
 
     /// Schema v6 `getBuiltinImageModels(provider)`.
@@ -121,9 +159,9 @@ impl BuiltinCatalog {
     /// `all.ts` `getBuiltinModel(provider, modelId)` — chat-only, matching
     /// the legacy lookup face (typed per-type getters arrive with V16-06).
     pub fn model(&self, provider: &str, model_id: &str) -> Option<&Model> {
-        self.models
-            .get(provider)?
+        self.all_models(provider)
             .iter()
+            .filter_map(AnyModel::as_chat)
             .find(|model| model.id == model_id)
     }
 
@@ -157,8 +195,7 @@ fn load_catalog() -> Result<BuiltinCatalog, CatalogError> {
     let manifest: CatalogManifest =
         serde_json::from_str(CATALOG_MANIFEST_JSON).map_err(CatalogError::Manifest)?;
     let mut providers = Vec::with_capacity(CATALOG_PROVIDER_DATA.len());
-    let mut models = BTreeMap::new();
-    let mut all_models = BTreeMap::new();
+    let mut catalog = BTreeMap::new();
     for (provider, json) in CATALOG_PROVIDER_DATA {
         // Catalog files group models by API
         // (`{ "<api>": { "<type>:<id>": AnyModel } }`, schema v6 composite
@@ -188,19 +225,12 @@ fn load_catalog() -> Result<BuiltinCatalog, CatalogError> {
                 all.push(model);
             }
         }
-        let chat: Vec<Model> = all
-            .iter()
-            .filter(|model| is_model_type(model, ModelType::Chat))
-            .filter_map(|model| model.as_chat().cloned())
-            .collect();
         providers.push(*provider);
-        models.insert(*provider, chat);
-        all_models.insert(*provider, all);
+        catalog.insert(*provider, ProviderCatalog::new(all));
     }
     Ok(BuiltinCatalog {
         providers,
-        models,
-        all_models,
+        catalog,
         manifest,
     })
 }
@@ -244,6 +274,21 @@ pub fn get_builtin_all_models(provider: &str) -> &'static [AnyModel] {
     builtin_catalog()
         .map(|catalog| catalog.all_models(provider))
         .unwrap_or(&[])
+}
+
+/// Shared all-type generation for provider baselines and runtime composition.
+pub fn get_builtin_all_models_shared(provider: &str) -> Arc<[AnyModel]> {
+    builtin_catalog()
+        .map(|catalog| catalog.shared_all_models(provider))
+        .unwrap_or_else(|_| Arc::from(Vec::new()))
+}
+
+/// Borrowed chat view that does not materialize the legacy owned chat slice.
+pub fn get_builtin_chat_models(provider: &str) -> Vec<&'static Model> {
+    get_builtin_all_models(provider)
+        .iter()
+        .filter_map(AnyModel::as_chat)
+        .collect()
 }
 
 /// `getBuiltinModel(provider, modelId)`.
@@ -296,15 +341,15 @@ mod tests {
     fn test_catalog_loads_all_vendored_providers() {
         let catalog = builtin_catalog().expect("vendored catalog parses");
         assert_eq!(catalog.providers().len(), CATALOG_PROVIDER_DATA.len());
-        assert_eq!(catalog.providers().len(), 42);
+        assert_eq!(catalog.providers().len(), 43);
         let total: usize = catalog
             .providers()
             .iter()
             .map(|provider| catalog.models(provider).len())
             .sum();
-        // Schema v6 regen with the v1.4.0 generator @ 4a080252f; public
-        // catalog snapshot 2026-11-07T06:35:18.361Z.
-        assert_eq!(total, 1615);
+        // Schema v6 regen with the v1.5.2 generator @ b4afdddf; public
+        // catalog snapshot 2026-11-17T03:17:54.693Z.
+        assert_eq!(total, 1667);
         let images: usize = catalog
             .providers()
             .iter()
@@ -315,8 +360,8 @@ mod tests {
             .iter()
             .map(|provider| catalog.classifier_models(provider).len())
             .sum();
-        assert_eq!(images, 66);
-        assert_eq!(classifiers, 60);
+        assert_eq!(images, 72);
+        assert_eq!(classifiers, 76);
         // Radius ships its static public catalog since 4d38031fb; the
         // gateway overlay lives in `providers::radius`.
         assert!(catalog.providers().contains(&"radius"));
@@ -354,6 +399,22 @@ mod tests {
             .any_model("openrouter", ModelType::Classifier, "~typesafe/jev-latest")
             .expect("jev classifier");
         assert_eq!(classifier.model_type(), ModelType::Classifier);
+    }
+
+    #[test]
+    fn test_shared_all_models_reuse_one_catalog_generation() {
+        let first = get_builtin_all_models_shared("openrouter");
+        let second = get_builtin_all_models_shared("openrouter");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.as_ref(), get_builtin_all_models("openrouter"));
+        let chat = get_builtin_chat_models("openrouter");
+        assert_eq!(
+            chat.len(),
+            first
+                .iter()
+                .filter(|model| model.as_chat().is_some())
+                .count()
+        );
     }
 
     #[test]

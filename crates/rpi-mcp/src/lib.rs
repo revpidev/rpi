@@ -1,8 +1,8 @@
 //! Standalone MCP client: port of `@earendil-works/pi-mcp`
 //! (`packages/mcp` @ b4afdddf).
 //!
-//! The crate has no dependency on the rpi host: it carries the two
-//! transports (stdio child processes and streamable HTTP), a hand-written
+//! The crate has no dependency on the rpi host: it carries stdio child
+//! processes, caller-owned pipes and streamable HTTP, a hand-written
 //! JSON-RPC layer, the client session (initialize/tools/resources,
 //! notifications, progress, cancellation) and OAuth 2.1 (PKCE, dynamic
 //! client registration, loopback callback, cross-process refresh locks stay
@@ -10,8 +10,12 @@
 
 pub mod auth_provider;
 pub mod client;
+pub mod config;
 pub mod content;
+pub mod input_schema;
+pub mod naming;
 pub mod oauth;
+pub mod output_limit;
 pub mod protocol;
 pub mod transport;
 pub mod types;
@@ -21,13 +25,25 @@ pub use client::{
     ClientState, DEFAULT_REQUEST_TIMEOUT_MS, ListenerGuard, McpClient, McpClientOptions,
     McpRequestOptions,
 };
+pub use config::{
+    McpServerConfigOptions, McpServerConfigResult, is_loopback_redirect_uri,
+    is_mcp_server_override, validate_mcp_server_config,
+};
 pub use content::{LlmContent, block_to_llm_content, to_llm_content};
+pub use input_schema::normalize_mcp_input_schema;
+pub use naming::{MAX_TOOL_NAME_LENGTH, create_mcp_tool_name, mcp_namespace};
+pub use output_limit::{
+    LimitedMcpContent, MCP_OUTPUT_MAX_BYTES, McpOutputData, McpOutputSaver, limit_mcp_content,
+};
 pub use protocol::{
     JSON_RPC_ERROR_INTERNAL, JSON_RPC_ERROR_INVALID_REQUEST, JSON_RPC_ERROR_METHOD_NOT_FOUND,
     JSON_RPC_ERROR_PARSE, JsonRpcErrorObject, JsonRpcId, JsonRpcMessage, McpError,
     is_json_rpc_notification, is_json_rpc_request, is_json_rpc_response, parse_json_rpc_message,
 };
 pub use transport::in_memory::{InMemoryTransport, create_in_memory_transport_pair};
+pub use transport::pipe::{
+    McpPipe, McpPipeHandlers, McpPipeOutputHandler, PipeOpenFn, PipeTransport, PipeTransportOptions,
+};
 pub use transport::stdio::{StderrMode, StdioTransport, StdioTransportOptions};
 pub use transport::streamable_http::{
     SseEvent, StreamableHttpReconnectOptions, StreamableHttpTransport,

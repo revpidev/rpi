@@ -383,6 +383,9 @@ async fn refresh_model_catalogs() -> Result<(), String> {
     if result.aborted {
         return Err("Model catalog refresh timed out.".to_owned());
     }
+    for (provider, message) in &result.warnings {
+        eprintln!("Warning: could not refresh model catalog for {provider}: {message}");
+    }
     if !result.errors.is_empty() {
         let details: Vec<String> = result
             .errors

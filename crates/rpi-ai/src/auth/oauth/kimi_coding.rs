@@ -83,12 +83,7 @@ fn resolve_oauth_host(seam: Option<&str>) -> String {
 /// only http(s) URLs are trusted. Returns the parsed-and-serialized form
 /// (JS `url.href`).
 fn trusted_http_url(value: Option<&Value>) -> Option<String> {
-    let raw = value?.as_str().filter(|value| !value.is_empty())?;
-    let url = url::Url::parse(raw).ok()?;
-    match url.scheme() {
-        "https" | "http" => Some(url.to_string()),
-        _ => None,
-    }
+    super::trusted_url::trusted_http_url(value?.as_str()?)
 }
 
 /// `readJson` — parse JSON, or `null` for unparseable bodies. JS
@@ -485,6 +480,8 @@ impl KimiCodingOAuth {
         interaction.notify(AuthEvent::DeviceCode {
             user_code: device.user_code.clone(),
             verification_uri: device.verification_uri_complete.clone(),
+            open_browser_on_confirm: None,
+            copy_code_on_confirm: None,
             interval_seconds: Some(device.interval_seconds as u64),
             expires_in_seconds: Some(device.expires_in_seconds as u64),
         });
@@ -883,6 +880,7 @@ mod tests {
                     verification_uri,
                     interval_seconds,
                     expires_in_seconds,
+                    ..
                 },
             ] => {
                 assert_eq!(user_code, "ABCD-1234");

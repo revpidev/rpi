@@ -112,6 +112,10 @@ pub struct OAuthFlowOptions {
     /// Go straight to the authorization redirect instead of refreshing
     /// stored tokens (a refresh keeps the old scope).
     pub skip_refresh: bool,
+    /// Only reuse stored client/tokens; never register or prepare a new sign-in.
+    pub refresh_only: bool,
+    /// Redirect URI used by the authorization request, checked before exchange.
+    pub authorization_redirect_url: Option<String>,
 }
 
 /// `OAuthFlowResult` (flow.ts:99).
@@ -730,6 +734,9 @@ async fn run_flow(
         });
     }
     if client.is_none() {
+        if options.refresh_only {
+            return Ok(OAuthFlowResult::Redirect);
+        }
         if options.authorization_code.is_some() {
             return Err(OAuthFlowError::Invalid(
                 "OAuth client information is missing during code exchange".to_owned(),
@@ -757,6 +764,14 @@ async fn run_flow(
         .as_ref()
         .map(|document| document.redirect_url.clone())
         .unwrap_or_else(|| provider.redirect_url());
+    if options.authorization_code.is_some()
+        && let Some(expected) = options.authorization_redirect_url.as_ref()
+        && expected != &redirect_url
+    {
+        return Err(OAuthFlowError::Invalid(format!(
+            "The code exchange would use the redirect URI {redirect_url}, but the authorization request used {expected}"
+        )));
+    }
     let token_options = TokenRequestOptions {
         metadata: metadata.clone(),
         client_information: client.clone(),
@@ -839,6 +854,9 @@ async fn run_flow(
             },
         }
     }
+    if options.refresh_only {
+        return Ok(OAuthFlowResult::Redirect);
+    }
     let state = provider.state().await;
     let (authorization_url, code_verifier) = start_authorization(
         &discovered.authorization_server_url,
@@ -862,12 +880,36 @@ pub async fn authorize_mcp(
     provider: &dyn OAuthClientProvider,
     options: &OAuthFlowOptions,
 ) -> Result<OAuthFlowResult, OAuthFlowError> {
+    let stored_client_id = provider
+        .client_information()
+        .await
+        .map(|client| client.client_id);
     match run_flow(provider, options).await {
         Ok(result) => Ok(result),
         Err(error) => {
             if let Some(code) = error.oauth_code() {
                 if code == "invalid_client" || code == "unauthorized_client" {
-                    provider.invalidate_credentials(CredentialKind::All).await;
+                    if options.refresh_only {
+                        if provider
+                            .client_information()
+                            .await
+                            .as_ref()
+                            .map(|client| &client.client_id)
+                            == stored_client_id.as_ref()
+                        {
+                            provider
+                                .invalidate_credentials(CredentialKind::Client)
+                                .await;
+                            provider
+                                .invalidate_credentials(CredentialKind::Tokens)
+                                .await;
+                            provider
+                                .invalidate_credentials(CredentialKind::Discovery)
+                                .await;
+                        }
+                    } else {
+                        provider.invalidate_credentials(CredentialKind::All).await;
+                    }
                     return run_flow(provider, options).await;
                 }
                 if code == "invalid_grant" {

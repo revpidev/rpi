@@ -32,6 +32,16 @@ pub struct ProviderErrorInfo {
 }
 
 impl ProviderErrorInfo {
+    /// Parses the provider's JSON error body without rejecting transport
+    /// prefixes or text that follows the body.
+    pub fn json_error(&self) -> Option<serde_json::Value> {
+        let start = self.message.find('{')?;
+        serde_json::Deserializer::from_str(&self.message[start..])
+            .into_iter::<serde_json::Value>()
+            .next()?
+            .ok()
+    }
+
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .as_ref()

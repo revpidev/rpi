@@ -212,7 +212,7 @@ impl MermaidRenderingMode {
 }
 
 /// `CacheWarmingMode = "off" | "streaming" | "idle"` (#9668,
-/// c596d09d9; settings-manager.ts:77-78) — default `"streaming"`. Global
+/// c596d09d9; settings-manager.ts:77-78) — default `"idle"` (v1.5.2). Global
 /// setting only because each refresh costs money (settings-manager.ts:955).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
@@ -220,9 +220,9 @@ impl MermaidRenderingMode {
 pub enum CacheWarmingMode {
     #[serde(rename = "off")]
     Off,
-    #[default]
     #[serde(rename = "streaming")]
     Streaming,
+    #[default]
     #[serde(rename = "idle")]
     Idle,
 }
@@ -2216,7 +2216,7 @@ impl SettingsManager {
     /// `getCacheWarmingMode` (#9668, c596d09d9; settings-manager.ts:955-959):
     /// read from global settings only because warming costs money —
     /// project `cacheWarming` is ignored; invalid values fall back to
-    /// `"streaming"`.
+    /// `"idle"`.
     pub fn get_cache_warming_mode(&self) -> CacheWarmingMode {
         CacheWarmingMode::from_setting(self.global_settings.get("cacheWarming"))
     }
@@ -4181,33 +4181,32 @@ mod tests {
     // describe("cacheWarming") — #9668 (V15-05 FR-A)
     // =======================================================================
 
-    // Port of "defaults to streaming and ignores project settings"
-    // (settings-manager.test.ts:397-408): global-only because each refresh
-    // costs money.
+    // Port of the v1.5.2 idle default; project settings stay ignored because
+    // each refresh costs money. Explicit streaming/off remain unchanged.
     #[test]
-    fn test_cache_warming_defaults_to_streaming_and_ignores_project() {
+    fn test_cache_warming_defaults_to_idle_and_ignores_project() {
         let dirs = test_dirs();
-        assert_eq!(
-            create(&dirs).get_cache_warming_mode(),
-            CacheWarmingMode::Streaming
-        );
-
-        write_json(&project_path(&dirs), json!({"cacheWarming": "idle"}));
-        assert_eq!(
-            create(&dirs).get_cache_warming_mode(),
-            CacheWarmingMode::Streaming
-        );
-
-        write_json(&global_path(&dirs), json!({"cacheWarming": "idle"}));
         assert_eq!(
             create(&dirs).get_cache_warming_mode(),
             CacheWarmingMode::Idle
         );
 
-        write_json(&global_path(&dirs), json!({"cacheWarming": "bogus"}));
+        write_json(&project_path(&dirs), json!({"cacheWarming": "off"}));
+        assert_eq!(
+            create(&dirs).get_cache_warming_mode(),
+            CacheWarmingMode::Idle
+        );
+
+        write_json(&global_path(&dirs), json!({"cacheWarming": "streaming"}));
         assert_eq!(
             create(&dirs).get_cache_warming_mode(),
             CacheWarmingMode::Streaming
+        );
+
+        write_json(&global_path(&dirs), json!({"cacheWarming": "bogus"}));
+        assert_eq!(
+            create(&dirs).get_cache_warming_mode(),
+            CacheWarmingMode::Idle
         );
     }
 

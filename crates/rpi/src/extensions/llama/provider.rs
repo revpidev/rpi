@@ -20,7 +20,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rpi_ai::api::openai_completions::OpenAiCompletions;
 use rpi_ai::api::typesafe_system_one::{TYPESAFE_SYSTEM_ONE_API, typesafe_system_one_api};
@@ -231,7 +231,7 @@ fn to_rpi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, Llama
         context_window,
         max_tokens: context_window,
         headers: None,
-        compat: Some(ModelCompat {
+        compat: Some(Box::new(ModelCompat {
             supports_store: Some(false),
             supports_developer_role: Some(false),
             supports_reasoning_effort: Some(false),
@@ -242,7 +242,7 @@ fn to_rpi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, Llama
             max_tokens_field: Some(MaxTokensField::MaxTokens),
             supports_strict_mode: Some(false),
             ..Default::default()
-        }),
+        })),
         sampling_params: None,
         sampling_params_by_thinking_level: None,
     })
@@ -258,14 +258,41 @@ pub struct LlamaSetCatalogOptions {
     pub router_autoload: bool,
 }
 
+struct LlamaCatalogGeneration {
+    models: Arc<[Model]>,
+    classifiers: Arc<[ClassifierModel]>,
+    all_models: OnceLock<Arc<[AnyModel]>>,
+}
+
+impl LlamaCatalogGeneration {
+    fn new(models: Vec<Model>, classifiers: Vec<ClassifierModel>) -> Self {
+        Self {
+            models: models.into(),
+            classifiers: classifiers.into(),
+            all_models: OnceLock::new(),
+        }
+    }
+
+    fn empty() -> Self {
+        Self::new(Vec::new(), Vec::new())
+    }
+
+    fn all_models(&self) -> Arc<[AnyModel]> {
+        self.all_models
+            .get_or_init(|| {
+                let mut all: Vec<AnyModel> =
+                    self.models.iter().cloned().map(AnyModel::Chat).collect();
+                all.extend(self.classifiers.iter().cloned().map(AnyModel::Classifier));
+                all.into()
+            })
+            .clone()
+    }
+}
+
 /// `LlamaProvider` — the `Provider` implementation behind
 /// `createLlamaProvider` (provider.ts:58-131).
 pub struct LlamaProvider {
-    models: Mutex<Vec<Model>>,
-    /// `classifiers` (provider.ts:96-112/179): the decision models the
-    /// catalog reports, registered as `typesafe-system-one` classifier
-    /// entries (`getAllModels` exposes chat + classifiers).
-    classifiers: Mutex<Vec<ClassifierModel>>,
+    catalog: Mutex<LlamaCatalogGeneration>,
     base_url: String,
     auth: ProviderAuth,
     api: Arc<dyn ProviderStreams>,
@@ -274,8 +301,7 @@ pub struct LlamaProvider {
 impl LlamaProvider {
     fn new() -> Self {
         LlamaProvider {
-            models: Mutex::new(Vec::new()),
-            classifiers: Mutex::new(Vec::new()),
+            catalog: Mutex::new(LlamaCatalogGeneration::empty()),
             // `DEFAULT_LLAMA_SERVER_URL` is a valid http URL, so the fallback
             // is exactly what `llamaInferenceUrl` would produce.
             base_url: llama_inference_url(DEFAULT_LLAMA_SERVER_URL)
@@ -314,8 +340,7 @@ impl LlamaProvider {
                 classifiers.push(to_rpi_classifier_model(model, server_url)?);
             }
         }
-        *lock(&self.models) = models;
-        *lock(&self.classifiers) = classifiers;
+        *lock(&self.catalog) = LlamaCatalogGeneration::new(models, classifiers);
         Ok(())
     }
 }
@@ -342,24 +367,21 @@ impl Provider for LlamaProvider {
     }
 
     fn get_models(&self) -> Vec<Model> {
-        lock(&self.models).clone()
+        self.get_models_shared().to_vec()
+    }
+
+    fn get_models_shared(&self) -> Arc<[Model]> {
+        lock(&self.catalog).models.clone()
     }
 
     /// `getAllModels: () => [...models, ...classifiers]` (provider.ts:230 @
     /// f6127a1bf): chat entries first, then the decision classifier entries.
     fn get_all_models(&self) -> Vec<AnyModel> {
-        let mut all: Vec<AnyModel> = lock(&self.models)
-            .iter()
-            .cloned()
-            .map(AnyModel::Chat)
-            .collect();
-        all.extend(
-            lock(&self.classifiers)
-                .iter()
-                .cloned()
-                .map(AnyModel::Classifier),
-        );
-        all
+        self.get_all_models_shared().to_vec()
+    }
+
+    fn get_all_models_shared(&self) -> Arc<[AnyModel]> {
+        lock(&self.catalog).all_models()
     }
 
     /// The classifier implementation behind this provider's entries
@@ -384,7 +406,7 @@ impl Provider for LlamaProvider {
             // (models.ts:375-383 @ 4181f66) — no async read needed.
             let stored = context.stored.clone();
             if let Some(stored) = &stored {
-                *lock(&this.models) = stored
+                let models = stored
                     .models
                     .iter()
                     .filter_map(AnyModel::as_chat)
@@ -398,7 +420,7 @@ impl Provider for LlamaProvider {
                 // (provider.ts:239): only this provider's decision
                 // classifiers are restored — the chat-model fallback
                 // classifier arm is not ported.
-                *lock(&this.classifiers) = stored
+                let classifiers = stored
                     .models
                     .iter()
                     .filter_map(|model| match model {
@@ -411,6 +433,7 @@ impl Provider for LlamaProvider {
                     })
                     .cloned()
                     .collect();
+                *lock(&this.catalog) = LlamaCatalogGeneration::new(models, classifiers);
             }
 
             let network_allowed = context.allow_network
@@ -440,10 +463,7 @@ impl Provider for LlamaProvider {
             )
             .map_err(auth_error)?;
             if !context.signal.is_cancelled() {
-                let models = lock(&this.models).clone();
-                let classifiers = lock(&this.classifiers).clone();
-                let mut published: Vec<AnyModel> = models.into_iter().map(AnyModel::Chat).collect();
-                published.extend(classifiers.into_iter().map(AnyModel::Classifier));
+                let published = lock(&this.catalog).all_models().to_vec();
                 context
                     .publish
                     .publish(rpi_ai::models::ModelsPublication {
@@ -881,6 +901,12 @@ mod tests {
 
         // All models: chat first, then the selectable decision classifiers.
         let all = controller.provider().get_all_models();
+        let shared = controller.provider().get_all_models_shared();
+        assert!(Arc::ptr_eq(
+            &shared,
+            &controller.provider().get_all_models_shared()
+        ));
+        assert_eq!(shared.as_ref(), all.as_slice());
         let types: Vec<ModelType> = all.iter().map(AnyModel::model_type).collect();
         assert_eq!(
             types,

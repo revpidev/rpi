@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+### v0.1.9 draft — V19-01
+
+This section covers the V19-01 implementation work. M06 awaits V19-02's M06-IN handoff; the V19-08 release gate is still pending.
+
+### Main line
+
+- **Upstream parity to Pi v1.5.2** (ADR-0048): the behavioral gold standard moves from `4a080252f` to `b4afdddf`. The regenerated catalog contains 43 providers and 1815 entries (1667 chat, 72 image, 76 classifier), the v1.5.2 defaults, Azure long-context pricing, GLM allowlists, OpenCode protocol endpoints and `qwen-token-plan-individual-cn`. Manifest `2026-11-17T03:17:54.693Z`; all 43 provider model lists match rpi-pages after unwrapping the site's public `models` envelope.
+- **Schema and startup memory** (ADR-0049): `jsonschema` 0.61.2 `macros` compiles the native meta-validator, while catalog generations share immutable model data with COW overrides. Schema-only VmRSS falls 76484→9800 KiB; the default-extension empty-session replay falls from 101352 KiB to roughly 39.7 MiB (about 61%) with identical output, bounded read-only code-page growth, and complete mapping-level source attribution. `Model` is 1064→480 bytes and `AnyModel` 1064→904 bytes.
+- **Providers and auth**: Anthropic message threads/effort binding, idle cache warming, provider-reported costs, OpenAI compatibility controls, strict-tool fallback, OpenRouter BYOK/latest aliases and safer context clamps, K3.1/GPT tool metadata, Bedrock/Gemini schema fixes, Copilot Microsoft-Decision-1, structured catalog-refresh warnings, HTTP(S)-only login URLs opened without a shell, auth-file/lock hardening and shutdown credential-write draining.
+- **MCP and codemode**: bounded bodies and linear SSE/stdio framing with close cancellation and process-group/direct-child cleanup, caller-owned `McpPipe`, two-phase OAuth with refresh-only reuse and prompt cancellation with background token persistence, shared naming/schema/output-limit/config helpers, safe local JSON Pointer resolution, and `NaN`/`Infinity` in console and thrown values instead of `null`.
+
+### Breaking changes
+
+- **Rust model representation**: `Model.compat` is now `Option<Box<ModelCompat>>`; Rust constructors must box the compat value. models.json and the wire schema are unchanged.
+- **Validation semantics**: plain JSON Schema follows final pi-schema coercion and local unresolved-`$ref` behavior. `BigInt`/`Undefined` accept and preserve JSON input; `Void` always rejects. Validation error paths/messages migrate accordingly.
+- **Anthropic continuation**: official origins use message threads by default, with full-request fallback on changed prefixes or thread failures. Disable through `compat.supportsMessageThreads: false` or `StreamOptions.disable_continuation`; proxies stay off and cache-warming never touches thread state.
+- **Cache warming**: the default `cacheWarming` mode is now `idle` (also for missing or invalid values); explicit `streaming` and `off` are unchanged.
+- **OpenAI compatibility**: empty `tools` arrays are omitted by default. Legacy proxies can use `compat.requiresToolsWithToolHistory`; `promptCacheKeyMode` and `requiresNonNullAssistantContent` are also available in models.json.
+
+### Fixed
+
+- Catalog refresh no longer refreshes OAuth for configured-only sources; stale credential failures become warnings while other providers continue, and non-auth errors stay fatal. Bedrock strict fallback preserves required tools and isolates session state. Gemini preserves literal/default/example/`__proto__` subtrees, and faux cache writes no longer double-count input.
+- MCP OAuth refresh reuses stored client/state, separates lock busy from other errors and aborts idle callback connections. Relative root `$id`, bad percent escapes, missing and cyclic references are handled safely. OpenAI Responses uses `session-id`; Zhipu 1308/workspace limits are not retried, LiteLLM overflow is recognized, and dropped streams are retryable.
+
+### Internal
+
+- The seven first-party extensions remain on `rpiAbi: 1`; Session JSONL outer framing and durable default isolation are unchanged. R2-A14 belongs to V19-05; durable `structuredOutput` shared-validator wiring belongs to V19-02 D16, and R2-M06 remains blocked until V19-02 registers M06-IN. No distribution or endpoint update is implied. Offline fixture/loopback evidence and the fresh-context review verdict are recorded in the task file.
+
 ## [0.1.8] - 2026-11-12
 
 ### Main line

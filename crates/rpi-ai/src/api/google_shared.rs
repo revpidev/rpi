@@ -567,8 +567,72 @@ fn sanitize_for_open_api(schema: &Value) -> Value {
         .into()
 }
 
+const JSON_SCHEMA_NAME_MAPS: [&str; 6] = [
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "dependencies",
+];
+const JSON_SCHEMA_SUBSCHEMAS: [&str; 16] = [
+    "additionalProperties",
+    "unevaluatedProperties",
+    "propertyNames",
+    "items",
+    "prefixItems",
+    "additionalItems",
+    "unevaluatedItems",
+    "contains",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contentSchema",
+];
+
+fn rewrite_const_as_enum(schema: &Value, is_name_map: bool) -> Value {
+    match schema {
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| rewrite_const_as_enum(value, false))
+                .collect(),
+        ),
+        Value::Object(object) => {
+            let mut result = object
+                .iter()
+                .map(|(key, value)| {
+                    let value = if is_name_map || JSON_SCHEMA_SUBSCHEMAS.contains(&key.as_str()) {
+                        rewrite_const_as_enum(value, false)
+                    } else if JSON_SCHEMA_NAME_MAPS.contains(&key.as_str()) {
+                        rewrite_const_as_enum(value, true)
+                    } else {
+                        value.clone()
+                    };
+                    (key.clone(), value)
+                })
+                .collect::<serde_json::Map<String, Value>>();
+            if !is_name_map
+                && !result.contains_key("enum")
+                && let Some(literal @ (Value::String(_) | Value::Number(_))) =
+                    result.get("const").cloned()
+            {
+                result.remove("const");
+                result.insert("enum".to_owned(), json!([literal]));
+            }
+            result.into()
+        }
+        _ => schema.clone(),
+    }
+}
+
 /// `convertTools`: tools to Gemini function-declaration format. By default
-/// uses `parametersJsonSchema` (full JSON Schema); `use_parameters` selects
+/// uses `parametersJsonSchema`, rewriting string and number `const` keywords
+/// to single-value `enum`s; `use_parameters` selects
 /// the legacy OpenAPI 3.03 `parameters` field with meta keys stripped (Cloud
 /// Code Assist with Claude models). `None` for an empty tool list.
 pub fn convert_tools(
@@ -596,7 +660,7 @@ pub fn convert_tools(
                 json!({
                     "name": tool.name,
                     "description": tool.description,
-                    "parametersJsonSchema": parameters,
+                    "parametersJsonSchema": rewrite_const_as_enum(&parameters, false),
                 })
             };
             Ok(declaration)
@@ -897,6 +961,58 @@ mod tests {
         assert_eq!(
             get_disabled_google_thinking_config(&model),
             serde_json::json!({"thinkingBudget": 0})
+        );
+    }
+
+    #[test]
+    fn gemini_const_rewrite_preserves_literal_data_and_proto_names() {
+        let parameters = json!({
+            "type": "object",
+            "properties": {
+                "origin": {"type": "string", "const": "zq-src-7"},
+                "level": {"const": 1},
+                "flag": {"type": "boolean", "const": true},
+                "__proto__": {"const": "property-schema"},
+                "literal": {
+                    "default": {"const": "default-data"},
+                    "example": {"const": "example-data"},
+                    "examples": [{"const": "examples-data"}],
+                    "enum": [{"const": "enum-data"}]
+                }
+            },
+            "$defs": {"__proto__": {"const": "definition-schema"}},
+            "__proto__": {"const": "literal-root-data"},
+            "additionalProperties": {"const": "additional"}
+        });
+        let original = parameters.clone();
+        let tools: Vec<Tool> = serde_json::from_value(json!([{
+            "name": "t", "description": "d", "parameters": parameters
+        }]))
+        .expect("tool");
+        let converted = convert_tools(&tools, false, false)
+            .expect("convert tools")
+            .expect("declarations");
+        let schema = &converted[0]["functionDeclarations"][0]["parametersJsonSchema"];
+        assert_eq!(schema["properties"]["origin"]["enum"], json!(["zq-src-7"]));
+        assert!(schema["properties"]["origin"].get("const").is_none());
+        assert_eq!(schema["properties"]["level"]["enum"], json!([1]));
+        assert_eq!(schema["properties"]["flag"]["const"], json!(true));
+        assert_eq!(
+            schema["properties"]["__proto__"]["enum"],
+            json!(["property-schema"])
+        );
+        assert_eq!(
+            schema["$defs"]["__proto__"]["enum"],
+            json!(["definition-schema"])
+        );
+        assert_eq!(
+            schema["properties"]["literal"],
+            original["properties"]["literal"]
+        );
+        assert_eq!(schema["__proto__"], original["__proto__"]);
+        assert_eq!(
+            schema["additionalProperties"]["enum"],
+            json!(["additional"])
         );
     }
 

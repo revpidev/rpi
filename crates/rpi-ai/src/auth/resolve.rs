@@ -202,7 +202,7 @@ async fn refresh_stored_oauth_credential_with_timeout(
                             {
                                 Ok(Ok(refreshed)) => Ok(Some(Credential::OAuth(refreshed))),
                                 Ok(Err(error)) => Err(ModelsError::with_cause(
-                                    ModelsErrorCode::Oauth,
+                                    error.code,
                                     format!("OAuth refresh failed for {provider_id}"),
                                     &error.message,
                                 )),

@@ -26,9 +26,9 @@
 //! asserts the embedded string still matches, so any edit must be a
 //! deliberate re-port.
 
-/// sha256 of the upstream `PRELUDE_SOURCE` text (v1.1.0 `prelude-source.ts`).
+/// sha256 of the upstream `PRELUDE_SOURCE` text (v1.5.2, including #11901).
 pub const PRELUDE_SOURCE_SHA256: &str =
-    "224cd74082a03a57105af78e1fe205bda692f096252ff4202121016dd78f6228";
+    "2f35729e1ce4264c29d39fee1e8d5e9c0c85919b6b60988cf0f45ad96bbbc25c";
 
 /// The prelude evaluated with the filename `codemode-prelude.js` (the
 /// prelude filters its own frames by that name).
@@ -160,6 +160,7 @@ pub const PRELUDE_SOURCE: &str = r####"(function (bridge, toolsJson, globalsJson
 	function format(value) {
 		if (typeof value === "string") return value;
 		if (value instanceof ErrorCtor) return errorText(value);
+		if (typeof value === "number") return String(value);
 		try {
 			const json = stringify(value);
 			return json === undefined ? String(value) : json;

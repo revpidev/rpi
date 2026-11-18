@@ -50,6 +50,10 @@ pub enum OAuthFlowError {
     /// Network failures (upstream `TypeError` from fetch).
     #[error("{0}")]
     Network(String),
+    #[error("Another process is refreshing the MCP server's tokens")]
+    RefreshLockBusy,
+    #[error("Sign-in cancelled")]
+    SignInCancelled,
 }
 
 impl OAuthFlowError {

@@ -102,6 +102,12 @@ Set your API key via the standard environment variable for your provider (e.g. `
 
 Kimi Code uses OpenAI Chat Completions. Its official base URL is `https://api.kimi.com/coding/v1`; any custom `baseUrl` in `models.json` or extension provider configuration must explicitly include `/v1` as a complete path segment. Update a legacy `https://api.kimi.com/coding` override to `https://api.kimi.com/coding/v1` or your proxy's explicit `/v1` URL. rpi does not append the suffix, rewrite the URL, or fall back to the old transport.
 
+### Provider compatibility
+
+`models.json` and extension models can carry `compat` overrides. OpenAI-compatible requests omit an empty `tools` array by default; set `requiresToolsWithToolHistory: true` only for legacy proxies that require it. `promptCacheKeyMode` accepts `auto`, `enabled`, or `disabled`, and `requiresNonNullAssistantContent` converts a null assistant body to an empty string. Official Anthropic origins use message threads for incremental continuation; set `supportsMessageThreads: false` to force full requests, or use `StreamOptions.disable_continuation` for one replay. Proxies default to full requests. Cache warming defaults to `idle`; set `cacheWarming` to `streaming` for the previous behavior or `off` to disable it.
+
+For Rust callers, `Model.compat` is `Option<Box<ModelCompat>>`; wrap an existing compat value with `Box::new(compat)`. The models.json and extension wire shapes are unchanged.
+
 ### Updating
 
 ```bash

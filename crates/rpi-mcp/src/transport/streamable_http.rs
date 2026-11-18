@@ -140,7 +140,7 @@ where
         options: &mut ConsumeSseOptions<'_>,
     ) -> Result<(), McpTransportError> {
         let raw_line = String::from_utf8_lossy(raw_line);
-        let line = raw_line.strip_suffix('\r').unwrap_or(&raw_line);
+        let line = raw_line.as_ref();
         if line.is_empty() {
             dispatch(event_name, event_id, data_lines, data_bytes, options);
             return Ok(());
@@ -184,16 +184,64 @@ where
         Ok(())
     }
 
+    fn consume_complete_lines(
+        buffered: &mut Vec<u8>,
+        skip_leading_lf: &mut bool,
+        event_name: &mut Option<String>,
+        event_id: &mut Option<String>,
+        data_lines: &mut Vec<String>,
+        data_bytes: &mut usize,
+        options: &mut ConsumeSseOptions<'_>,
+    ) -> Result<(), McpTransportError> {
+        let mut start = 0;
+        let mut index = 0;
+        while index < buffered.len() {
+            let delimiter = buffered[index];
+            if !matches!(delimiter, b'\r' | b'\n') {
+                index += 1;
+                continue;
+            }
+            process_line(
+                &buffered[start..index],
+                event_name,
+                event_id,
+                data_lines,
+                data_bytes,
+                options,
+            )?;
+            if delimiter == b'\r' {
+                if buffered.get(index + 1) == Some(&b'\n') {
+                    index += 1;
+                } else if index + 1 == buffered.len() {
+                    *skip_leading_lf = true;
+                }
+            }
+            index += 1;
+            start = index;
+        }
+        if start > 0 {
+            buffered.drain(..start);
+        }
+        Ok(())
+    }
+
     let mut stream = stream;
     let mut buffered: Vec<u8> = Vec::new();
     let mut at_stream_start = true;
+    let mut skip_leading_lf = false;
     let mut event_name: Option<String> = None;
     let mut event_id: Option<String> = None;
     let mut data_lines: Vec<String> = Vec::new();
     let mut data_bytes = 0usize;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+        let mut chunk = chunk?;
+        if skip_leading_lf && !chunk.is_empty() {
+            if chunk.first() == Some(&b'\n') {
+                chunk = chunk.slice(1..);
+            }
+            skip_leading_lf = false;
+        }
         buffered.extend_from_slice(&chunk);
         if at_stream_start && buffered.len() >= 3 {
             // A leading UTF-8 BOM would otherwise turn the first `data`
@@ -205,17 +253,15 @@ where
             }
             at_stream_start = false;
         }
-        while let Some(newline) = buffered.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = buffered.drain(..=newline).collect();
-            process_line(
-                &line[..line.len() - 1],
-                &mut event_name,
-                &mut event_id,
-                &mut data_lines,
-                &mut data_bytes,
-                options,
-            )?;
-        }
+        consume_complete_lines(
+            &mut buffered,
+            &mut skip_leading_lf,
+            &mut event_name,
+            &mut event_id,
+            &mut data_lines,
+            &mut data_bytes,
+            options,
+        )?;
         if buffered.len() > options.max_event_bytes {
             return Err(McpTransportError::Other(format!(
                 "MCP SSE event exceeds {} bytes",
@@ -223,6 +269,18 @@ where
             )));
         }
     }
+    if skip_leading_lf && buffered.first() == Some(&b'\n') {
+        buffered.remove(0);
+    }
+    consume_complete_lines(
+        &mut buffered,
+        &mut skip_leading_lf,
+        &mut event_name,
+        &mut event_id,
+        &mut data_lines,
+        &mut data_bytes,
+        options,
+    )?;
     if !buffered.is_empty() {
         process_line(
             &buffered,
@@ -277,10 +335,19 @@ fn needs_authorization(response: &reqwest::Response) -> bool {
     if response.status() != reqwest::StatusCode::FORBIDDEN {
         return false;
     }
-    www_authenticate(response)
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .contains("insufficient_scope")
+    www_authenticate(response).is_some_and(|header| insufficient_scope_challenge(&header))
+}
+
+fn insufficient_scope_challenge(header: &str) -> bool {
+    header
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter_map(|part| part.split_once('='))
+        .any(|(name, value)| {
+            name.eq_ignore_ascii_case("error")
+                && value
+                    .trim_matches('"')
+                    .eq_ignore_ascii_case("insufficient_scope")
+        })
 }
 
 fn www_authenticate(response: &reqwest::Response) -> Option<String> {
@@ -342,6 +409,43 @@ fn body_stream(response: reqwest::Response) -> BodyStream {
             .bytes_stream()
             .map(|chunk| chunk.map_err(map_reqwest_error)),
     )
+}
+
+#[derive(Default)]
+struct BodyText {
+    text: String,
+    truncated: bool,
+}
+
+async fn read_body_text_stream(
+    mut stream: BodyStream,
+    max_bytes: usize,
+) -> Result<BodyText, McpTransportError> {
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        if chunk.len() > remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    drop(stream);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.starts_with('\u{feff}') {
+        text.drain(..'\u{feff}'.len_utf8());
+    }
+    Ok(BodyText { text, truncated })
+}
+
+async fn read_body_text(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<BodyText, McpTransportError> {
+    read_body_text_stream(body_stream(response), max_bytes).await
 }
 
 /// State shared between the transport and the detached stream readers.
@@ -440,7 +544,11 @@ impl HttpShared {
             if let Some(body) = &body {
                 request = request.body(body.clone());
             }
-            let response = request.send().await.map_err(map_reqwest_error)?;
+            let response = tokio::select! {
+                biased;
+                () = self.controller.cancelled() => return Err(McpTransportError::ConnectionClosed),
+                result = request.send() => result.map_err(map_reqwest_error)?,
+            };
             let provider = self.options.auth_provider.clone();
             if attempt > 0 || provider.is_none() || !needs_authorization(&response) {
                 return Ok(response);
@@ -465,6 +573,18 @@ impl HttpShared {
         }
     }
 
+    async fn read_body(
+        &self,
+        response: reqwest::Response,
+        max_bytes: usize,
+    ) -> Result<BodyText, McpTransportError> {
+        tokio::select! {
+            biased;
+            () = self.controller.cancelled() => Err(McpTransportError::ConnectionClosed),
+            result = read_body_text(response, max_bytes) => result,
+        }
+    }
+
     /// `checkResponse` (streamable-http.ts:354).
     async fn check_response(
         &self,
@@ -475,13 +595,10 @@ impl HttpShared {
         }
         let status = response.status().as_u16();
         let headers = response.headers().clone();
-        let body = response
-            .bytes()
+        let body = self
+            .read_body(response, MAX_ERROR_BODY_BYTES)
             .await
-            .map(|bytes| {
-                let bytes = bytes.slice(..bytes.len().min(MAX_ERROR_BODY_BYTES));
-                String::from_utf8_lossy(&bytes).into_owned()
-            })
+            .map(|body| body.text)
             .unwrap_or_default();
         if status == 401 {
             return Err(McpTransportError::AuthRequired {
@@ -608,7 +725,11 @@ impl HttpShared {
                 on_id: &mut |id| *last_event_id = Some(id.to_owned()),
                 on_retry: &mut |delay| *retry_ms = Some(delay),
             };
-            consume_sse_stream(stream, &mut options).await?;
+            tokio::select! {
+                biased;
+                () = self.controller.cancelled() => return Err(McpTransportError::ConnectionClosed),
+                result = consume_sse_stream(stream, &mut options) => result?,
+            }
         }
         for error in parse_errors {
             self.events.emit_error(&error);
@@ -888,7 +1009,19 @@ impl McpTransport for StreamableHttpTransport {
         let content_type = content_type(&response);
         match content_type.as_deref() {
             Some("application/json") => {
-                let body: serde_json::Value = response.json().await.map_err(map_reqwest_error)?;
+                let max_bytes = self
+                    .shared
+                    .options
+                    .max_message_bytes
+                    .unwrap_or(DEFAULT_MAX_MESSAGE_BYTES);
+                let body = self.shared.read_body(response, max_bytes).await?;
+                if body.truncated {
+                    return Err(McpTransportError::Other(format!(
+                        "MCP JSON response exceeds {max_bytes} bytes"
+                    )));
+                }
+                let body: serde_json::Value = serde_json::from_str(&body.text)
+                    .map_err(|error| McpTransportError::Other(error.to_string()))?;
                 let messages = match body {
                     serde_json::Value::Array(items) => items,
                     other => vec![other],
@@ -992,6 +1125,25 @@ mod tests {
     }
 
     #[test]
+    fn insufficient_scope_requires_an_exact_error_field() {
+        for header in [
+            r#"Bearer error="insufficient_scope""#,
+            "Bearer realm=\"mcp\", error=insufficient_scope",
+            "bearer ERROR=INSUFFICIENT_SCOPE",
+        ] {
+            assert!(insufficient_scope_challenge(header), "{header}");
+        }
+        for header in [
+            r#"Bearer error="not_insufficient_scope""#,
+            r#"Bearer not_error="insufficient_scope""#,
+            r#"Bearer error="insufficient_scope_extra""#,
+            "Bearer realm=\"insufficient_scope\"",
+        ] {
+            assert!(!insufficient_scope_challenge(header), "{header}");
+        }
+    }
+
+    #[test]
     fn parses_sse_events_like_upstream() {
         let (events, ids, retries) = collect_events(
             b": comment\nevent: message\ndata: {\"a\":\nid: 7\nretry: 250\ndata: 1}\n\n",
@@ -1066,6 +1218,153 @@ mod tests {
             runtime
                 .block_on(consume_sse_stream(Box::pin(stream), &mut options))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn body_reader_bounds_owned_text_and_decodes_split_utf8() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let chunks = vec![
+            Bytes::from_static(b"\xef"),
+            Bytes::from_static(b"\xbb\xbf{\"text\":\"\xc3"),
+            Bytes::from_static(b"\xa9\xe2\x82\xac\"}"),
+        ];
+        let body = runtime
+            .block_on(read_body_text_stream(
+                Box::pin(futures::stream::iter(
+                    chunks.into_iter().map(Ok::<_, McpTransportError>),
+                )),
+                128,
+            ))
+            .expect("body text");
+        assert!(!body.truncated);
+        assert_eq!(body.text, "{\"text\":\"é€\"}");
+
+        let body = runtime
+            .block_on(read_body_text_stream(
+                Box::pin(futures::stream::iter(vec![
+                    Ok::<_, McpTransportError>(Bytes::from_static(b"abc")),
+                    Ok::<_, McpTransportError>(Bytes::from_static(b"def")),
+                ])),
+                4,
+            ))
+            .expect("bounded body");
+        assert!(body.truncated);
+        assert_eq!(body.text, "abcd");
+    }
+
+    #[test]
+    fn sse_recognizes_cr_lf_and_crlf_at_every_split() {
+        for separator in ["\n", "\r\n", "\r"] {
+            let text = ["id: 1", "data: a", "data: b", "", "data: c", "", ""].join(separator);
+            for chunk_size in [1, text.len()] {
+                let chunks: Vec<Result<Bytes, McpTransportError>> = text
+                    .as_bytes()
+                    .chunks(chunk_size)
+                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                    .collect();
+                let mut events = Vec::new();
+                let mut options = ConsumeSseOptions {
+                    max_event_bytes: 1024,
+                    on_event: &mut |event| events.push(event),
+                    on_id: &mut |_| {},
+                    on_retry: &mut |_| {},
+                };
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                runtime
+                    .block_on(consume_sse_stream(
+                        Box::pin(futures::stream::iter(chunks)),
+                        &mut options,
+                    ))
+                    .expect("SSE line endings");
+                assert_eq!(events.len(), 2, "{separator:?} at {chunk_size}");
+                assert_eq!(events[0].data, "a\nb");
+                assert_eq!(events[0].id.as_deref(), Some("1"));
+                assert_eq!(events[1].data, "c");
+            }
+        }
+    }
+
+    struct DropTrackedStream {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        sent: bool,
+    }
+
+    impl Drop for DropTrackedStream {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Stream for DropTrackedStream {
+        type Item = Result<Bytes, McpTransportError>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if self.sent {
+                std::task::Poll::Pending
+            } else {
+                self.sent = true;
+                std::task::Poll::Ready(Some(Ok(Bytes::from_static(b"data: oversized\n\n"))))
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_sse_drops_the_open_stream() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream = DropTrackedStream {
+            dropped: dropped.clone(),
+            sent: false,
+        };
+        let mut options = ConsumeSseOptions {
+            max_event_bytes: 4,
+            on_event: &mut |_| {},
+            on_id: &mut |_| {},
+            on_retry: &mut |_| {},
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        assert!(
+            runtime
+                .block_on(consume_sse_stream(Box::pin(stream), &mut options))
+                .is_err()
+        );
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn close_cancels_an_open_sse_stream() {
+        let transport = StreamableHttpTransport::new(StreamableHttpTransportOptions::new(
+            "http://127.0.0.1:1/mcp",
+        ))
+        .expect("transport");
+        let shared = transport.shared.clone();
+        let stream: BodyStream = Box::pin(futures::stream::pending());
+        let consumer = tokio::spawn(async move {
+            let mut cursor = StreamCursor::default();
+            shared.consume_sse(stream, &mut cursor, None).await
+        });
+        tokio::task::yield_now().await;
+        transport.close().await.expect("close");
+        let result = tokio::time::timeout(Duration::from_secs(1), consumer)
+            .await
+            .expect("SSE stops on close")
+            .expect("consumer task");
+        assert!(
+            matches!(result, Err(McpTransportError::ConnectionClosed)),
+            "{result:?}"
         );
     }
 

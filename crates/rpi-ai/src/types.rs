@@ -501,6 +501,9 @@ pub struct StreamOptions {
     pub websocket_connect_timeout_ms: Option<u64>,
     /// Optional metadata; providers extract the fields they understand.
     pub metadata: Option<serde_json::Map<String, Value>>,
+    /// Disable provider continuation state, including Anthropic message
+    /// threads. Cache warming always sets this to keep replay prefixes stable.
+    pub disable_continuation: Option<bool>,
 }
 
 impl std::ops::Deref for StreamOptions {
@@ -846,6 +849,10 @@ pub struct UsageCost {
     pub cache_read: f64,
     pub cache_write: f64,
     pub total: f64,
+    /// Whether every monetary component came from the provider rather than
+    /// the catalog's estimated rates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_from_provider: Option<bool>,
 }
 
 impl Usage {
@@ -872,6 +879,10 @@ impl Usage {
                 cache_read: self.cost.cache_read + other.cost.cache_read,
                 cache_write: self.cost.cache_write + other.cost.cache_write,
                 total: self.cost.total + other.cost.total,
+                total_from_provider: Some(
+                    self.cost.total_from_provider == Some(true)
+                        && other.cost.total_from_provider == Some(true),
+                ),
             },
         }
     }
@@ -2078,8 +2089,9 @@ pub struct Model {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Compatibility overrides; which fields apply is governed by `api`
     /// (upstream types this conditionally per API; see file header note).
+    /// Boxing keeps catalog entries compact without changing their JSON shape.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub compat: Option<ModelCompat>,
+    pub compat: Option<Box<ModelCompat>>,
 }
 
 /// `ModelType` (types.ts:1158-1165 @ b4afdddf, schema v6): what a catalog
@@ -2161,10 +2173,8 @@ pub struct ClassifierModel {
 /// chat), so each variant is unambiguous; unknown types are rejected and
 /// skipped by callers (catalog/remote parse).
 ///
-/// The chat variant is intentionally much larger than the image/classifier
-/// variants (upstream `AnyModel` is a plain TS union); boxing would force
-/// allocations through the hot chat path, so the size difference is
-/// accepted here.
+/// Variants retain owned values so the public serde and Provider surfaces stay
+/// unchanged; compact representations are applied within each model type.
 fn image_model_type() -> ModelType {
     ModelType::Image
 }
@@ -2385,6 +2395,18 @@ pub enum SystemOneImageInput {
     StateImageUrls,
 }
 
+/// `OpenAIResponsesCompat.promptCacheKeyMode`.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptCacheKeyMode {
+    #[default]
+    Auto,
+    Enabled,
+    Disabled,
+}
+
 /// Merged compat settings for OpenAI-completions / OpenAI-responses /
 /// Anthropic-messages / Bedrock / System One APIs (see file header note for
 /// why this is one flat struct). All fields optional; absent fields are
@@ -2497,6 +2519,18 @@ pub struct ModelCompat {
     /// OpenAIResponsesCompat and AnthropicMessagesCompat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_long_cache_retention: Option<bool>,
+    /// Restore legacy proxies that require an empty tools array when the
+    /// conversation already contains tool calls or results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires_tools_with_tool_history: Option<bool>,
+    /// Whether assistant messages without text must use an empty string
+    /// instead of JSON null content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires_non_null_assistant_content: Option<bool>,
+    /// Prompt-cache key emission policy. `auto` keeps endpoint/retention
+    /// detection; `enabled` and `disabled` are explicit overrides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key_mode: Option<PromptCacheKeyMode>,
 
     // --- OpenAIResponsesCompat only ---
     /// Whether the model supports message-anchored `additional_tools` input
@@ -2561,6 +2595,10 @@ pub struct ModelCompat {
     /// (first-party Anthropic only; proxies reject them).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_mid_convo_tool_changes: Option<bool>,
+    /// Whether the endpoint supports Anthropic message threads. Official
+    /// Anthropic origins default to true; proxies default to false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_message_threads: Option<bool>,
 
     // --- SystemOneCompat ---
     /// How a System One service accepts classifier images.
@@ -3765,5 +3803,57 @@ mod tests {
         );
         let back: Model = serde_json::from_value(wire).expect("model");
         assert_eq!(back.input_limits, model.input_limits);
+    }
+
+    #[test]
+    fn test_usage_total_from_provider_merge_and_serde() {
+        let with_source = |total_from_provider| Usage {
+            cost: UsageCost {
+                input: 0.25,
+                output: 0.5,
+                cache_read: 0.125,
+                cache_write: 0.125,
+                total: 1.0,
+                total_from_provider,
+            },
+            ..Usage::default()
+        };
+        assert_eq!(
+            with_source(Some(true))
+                .combined(&with_source(Some(true)))
+                .cost
+                .total_from_provider,
+            Some(true)
+        );
+        for combined in [
+            with_source(Some(true)).combined(&with_source(Some(false))),
+            with_source(Some(false)).combined(&with_source(Some(true))),
+            with_source(Some(false)).combined(&with_source(Some(false))),
+            with_source(Some(true)).combined(&with_source(None)),
+        ] {
+            assert_eq!(combined.cost.total_from_provider, Some(false));
+            assert_eq!(combined.cost.total, 2.0);
+        }
+        assert_eq!(
+            serde_json::to_value(with_source(Some(true))).expect("serialize")["cost"]["totalFromProvider"],
+            true
+        );
+        assert_eq!(
+            serde_json::to_value(with_source(Some(false))).expect("serialize")["cost"]["totalFromProvider"],
+            false
+        );
+        assert!(
+            serde_json::to_value(with_source(None)).expect("serialize")["cost"]
+                .get("totalFromProvider")
+                .is_none()
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_model_compat_boxing_compacts_model_types() {
+        assert_eq!(std::mem::size_of::<ModelCompat>(), 592);
+        assert_eq!(std::mem::size_of::<Model>(), 480);
+        assert_eq!(std::mem::size_of::<AnyModel>(), 904);
     }
 }

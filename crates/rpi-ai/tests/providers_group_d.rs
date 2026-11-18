@@ -93,7 +93,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.fireworks.ai/inference",
         "Fireworks API key",
         "FIREWORKS_API_KEY",
-        29, // 2026-10-27 snapshot: expanded Fireworks public catalog
+        27, // 2026-11-17 snapshot: expanded Fireworks public catalog
     ),
     spec(
         groq_provider,
@@ -111,7 +111,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://router.huggingface.co/v1",
         "Hugging Face token",
         "HF_TOKEN",
-        78, // 2026-10-12 rules regen @ abe508e1b (+MiniMax-M1-80k, +Qwen3-VL-30B-A3B-Instruct)
+        82, // 2026-11-17 snapshot: current Hugging Face tool-capable catalog
     ),
     spec(
         nvidia_provider,
@@ -120,7 +120,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://integrate.api.nvidia.com/v1",
         "NVIDIA API key",
         "NVIDIA_API_KEY",
-        20, // 2026-11-07 snapshot: 84 live NVIDIA NIM ids after filtering
+        13, // 2026-11-17 snapshot: current NVIDIA NIM ids after filtering
     ),
     spec(
         together_provider,
@@ -358,14 +358,14 @@ fn together_kimi_k3_catalog_entry() {
     );
     assert_eq!(model.input, [InputModality::Text, InputModality::Image]);
     assert_eq!(model.context_window, 1048576);
-    assert_eq!(model.max_tokens, 131072);
+    assert_eq!(model.max_tokens, 1048576);
     assert_eq!(model.cost.rates.input, 3.0);
     assert_eq!(model.cost.rates.output, 15.0);
     assert_eq!(model.cost.rates.cache_read, 0.3);
     assert_eq!(model.cost.rates.cache_write, 0.0);
     assert_eq!(
         model.compat,
-        Some(ModelCompat {
+        Some(Box::new(ModelCompat {
             supports_store: Some(false),
             supports_developer_role: Some(false),
             supports_reasoning_effort: Some(false),
@@ -374,7 +374,7 @@ fn together_kimi_k3_catalog_entry() {
             supports_strict_mode: Some(false),
             supports_long_cache_retention: Some(false),
             ..ModelCompat::default()
-        })
+        }))
     );
 }
 
