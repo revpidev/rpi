@@ -11,12 +11,13 @@ use rpi_durable::ids::{DocumentId, EntryId, ROOT_CONVERSATION_ID, id_from_number
 use rpi_durable::storage::{
     CURRENT_SQLITE_SCHEMA_VERSION, DEFAULT_SQLITE_SCHEMA, NodeSqliteStorageOptions, SqliteDatabase,
     SqliteDatabaseOptions, SqliteMigration, SqliteStorage, SqliteValue, apply_sqlite_migrations,
-    create_sqlite_migrations, open_node_sqlite_storage, sqlite_migrations,
+    create_sqlite_migrations, open_node_sqlite_database, open_node_sqlite_storage,
+    sqlite_migrations,
 };
 use rpi_durable::testing::run_storage_conformance;
 use rpi_durable::types::{
     ConversationRecord, DocumentContent, DocumentCreate, DocumentScope, EntryRecord, JoinPolicy,
-    Storage, StorageWrite, TaskRecord, TaskState,
+    Storage, StorageExt, StorageWrite, TaskRecord, TaskState,
 };
 use test_support::{ReopeningStorage, TempDir, cleanup_temp_dirs};
 
@@ -27,6 +28,60 @@ async fn open_sqlite(temp: &TempDir) -> SqliteStorage {
     )
     .await
     .expect("open storage")
+}
+
+#[tokio::test]
+async fn batched_commit_128_conversations_and_run_counted() {
+    let temp = TempDir::new("sqlite-benchmark");
+    let database = open_node_sqlite_database(
+        &temp.path().join("benchmark.sqlite").to_string_lossy(),
+        SqliteDatabaseOptions::default(),
+    )
+    .await
+    .expect("open database");
+    let storage = SqliteStorage::open(database.clone_handle())
+        .await
+        .expect("open storage");
+    let writes = (2..=129)
+        .map(|id| StorageWrite::Conversation {
+            value: ConversationRecord {
+                id: rpi_durable::ids::id_from_number(id),
+                parent: None,
+                owner: None,
+            },
+        })
+        .collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let mut receipts = Vec::new();
+    let result = storage
+        .commit(
+            &[writes],
+            &mut |index, seq| receipts.push((index, seq)),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("commit 128 conversations");
+    assert_eq!(result.stored, 1);
+    assert!(result.refused.is_none());
+    assert_eq!(receipts.len(), 1);
+    let count = database
+        .get_i64("SELECT COUNT(*) FROM conversations", vec![])
+        .await
+        .expect("count conversations")
+        .expect("count row");
+    assert_eq!(count, 128);
+    let affected = database
+        .run_counted(
+            "UPDATE durable_metadata SET next_id = next_id WHERE singleton = 1",
+            vec![],
+        )
+        .await
+        .expect("run counted");
+    assert_eq!(affected, 1);
+    println!(
+        "128-conversation batch: conversations=128, receipts=1, run_counted=1, elapsed={:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -175,8 +230,8 @@ async fn two_namespaced_storages_commit_concurrently_in_one_database() {
             value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "second"),
         },
     ];
-    let commit_first = first.commit(&first_writes, &BACKGROUND_CONTEXT);
-    let commit_second = second.commit(&second_writes, &BACKGROUND_CONTEXT);
+    let commit_first = first.commit_one(&first_writes, &BACKGROUND_CONTEXT);
+    let commit_second = second.commit_one(&second_writes, &BACKGROUND_CONTEXT);
     let (first_result, second_result) = tokio::join!(commit_first, commit_second);
     first_result.expect("first commit");
     second_result.expect("second commit");
@@ -257,7 +312,7 @@ async fn namespaced_storage_shares_a_database_with_host_tables_and_other_prefixe
         .await
         .expect("open rpi_ storage");
     storage
-        .commit(
+        .commit_one(
             &[
                 StorageWrite::Conversation {
                     value: ConversationRecord {
@@ -318,7 +373,7 @@ async fn namespaced_storage_shares_a_database_with_host_tables_and_other_prefixe
         "another prefix must not see rpi_ entries"
     );
     other
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: ROOT_CONVERSATION_ID,
@@ -482,7 +537,7 @@ async fn survives_kill_minus_nine_and_continues_after_reopen() {
     let next: EntryId = id_from_number(storage.mint_id().await.expect("mint"));
     assert!(next.get() > entry_id.get());
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Entry {
                 value: EntryRecord::new(next, ROOT_CONVERSATION_ID, "after-crash"),
             }],
@@ -729,7 +784,7 @@ async fn version_one_database_migrates_and_keeps_tasks_and_indexes() {
             .await
             .expect("read task")
             .expect("task retained");
-        assert_eq!(stored, task);
+        assert_eq!(stored.as_ref(), &task);
         storage.close(&BACKGROUND_CONTEXT).await.expect("close");
     }
 
@@ -958,7 +1013,7 @@ async fn document_reads_observe_one_committed_state_across_replacements() {
     );
     let id: DocumentId = id_from_number(storage.mint_id().await.expect("mint"));
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::DocumentCreate {
                 record: DocumentCreate {
                     id,
@@ -991,7 +1046,7 @@ async fn document_reads_observe_one_committed_state_across_replacements() {
             .await
     });
     let replace = storage
-        .commit(
+        .commit_one(
             &[StorageWrite::DocumentChange {
                 id,
                 content: DocumentContent::Base {
@@ -1192,7 +1247,7 @@ async fn facade_defers_ids_until_commit_settles() {
         .expect("open");
     let entry_id: EntryId = id_from_number(100);
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Entry {
                 value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "settled"),
             }],
@@ -1218,7 +1273,7 @@ async fn facade_publication_is_atomic_with_secondary_indexes() {
         .await
         .expect("open");
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: ROOT_CONVERSATION_ID,
@@ -1232,7 +1287,7 @@ async fn facade_publication_is_atomic_with_secondary_indexes() {
         .expect("root");
     let entry_id: EntryId = id_from_number(storage.mint_id().await.expect("mint"));
     let result = storage
-        .commit(
+        .commit_one(
             &[
                 StorageWrite::Entry {
                     value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "transient"),
@@ -1386,7 +1441,7 @@ async fn admitted_multi_query_reads_finish_before_storage_closes() {
             .expect("open"),
     );
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: ROOT_CONVERSATION_ID,
@@ -1400,7 +1455,7 @@ async fn admitted_multi_query_reads_finish_before_storage_closes() {
         .expect("root");
     let entry_id: EntryId = id_from_number(storage.mint_id().await.expect("mint"));
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Entry {
                 value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "probe"),
             }],

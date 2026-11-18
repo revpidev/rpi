@@ -1,6 +1,6 @@
 # Rpi Parity Fixtures
 
-> Landing directory and runbook for the parity/contract test baseline data (golden fixtures).Upstream reference: the five scenario goldens under `generated/` (`single-turn`/`tool-calls`/`abort`/`length-truncation`/`steering-followup`) are recorded against `external/pi` @ **`19451accdeec671c1f4da9eafac8fc270f510ef4`** (v0.86.1+1) — re-recorded in v0.1.5 V15-06 (#9548: the leading system declaration entry joins the transcript; usage numbers shift with the new faux `serializeContext` shape; diff-time `normalize_system_declaration` in `parity_headless_test.rs` absorbs the documented rpi packaging deltas: brand wording, no bundled `docs` section, tool declarations compared as a name set). **All other committed goldens** (resources/themes/mcp/subagents tracks) **remain recorded against their previously documented pins** — for the v0.1.4-era baselines that is `9841914c71a74d81abe07f751aefd271fd924e63` (v0.85.0+, v0.1.4 M5; previously `4181f66` / v0.11 T18, `2efa728` / v0.1). The current pin always lives in `UPSTREAM.md`; regenerating fixtures that match the committed data requires the submodule checked out at the recording pin.The v0.1.4 re-record accompanied the eb3e9feed theme-validation split (rpi `themes.rs`: lenient library cast + app-installed validator; the `themes` golden dropped its `pendingSplitCases` meta and every case is compared — the `resource-loader-e2e` theme diagnostics now pin the lenient path's raw TypeError wording). Diff-time canonicalization: the normalizer moves an `errorMessage` key that shares an object with `timestamp` to the object end — upstream's key order is construction-path dependent (fresh literals vs spread-appended abort messages) and not part of the session-format contract.Note: `events.jsonl` holds the **internal** AgentSession event transcript (with cumulative `message`/`partial` on `message_update`); the delta-only wire shape (`toJsonEvent`, json-event.ts @ 9841914) applies only at the print/json + RPC stdout boundary and is covered by the print/RPC tests, not by these fixtures.
+> Landing directory and runbook for the parity/contract test baseline data (golden fixtures).Upstream reference: the five scenario goldens under `generated/` (`single-turn`/`tool-calls`/`abort`/`length-truncation`/`steering-followup`) are recorded against `external/pi` @ **`b4afdddf44e059c67ccf5097e5317d913521b470`** (v1.5.2) — selectively re-recorded in v0.1.9 V19-02 (the target preamble and edit guidelines; the historical V15-06 #9548 entry: the leading system declaration entry joins the transcript; usage numbers shift with the new faux `serializeContext` shape; diff-time `normalize_system_declaration` in `parity_headless_test.rs` absorbs the documented rpi packaging deltas: brand wording, no bundled `docs` section, tool declarations compared as a name set). **The remaining committed goldens** (resource-loader/themes/mcp/subagents tracks; prompt-dsl was selectively re-recorded with the five scenarios) **remain recorded against their previously documented pins** — for the v0.1.4-era baselines that is `9841914c71a74d81abe07f751aefd271fd924e63` (v0.85.0+, v0.1.4 M5; previously `4181f66` / v0.11 T18, `2efa728` / v0.1). The current pin always lives in `UPSTREAM.md`; regenerating fixtures that match the committed data requires the submodule checked out at the recording pin.The v0.1.4 re-record accompanied the eb3e9feed theme-validation split (rpi `themes.rs`: lenient library cast + app-installed validator; the `themes` golden dropped its `pendingSplitCases` meta and every case is compared — the `resource-loader-e2e` theme diagnostics now pin the lenient path's raw TypeError wording). Diff-time canonicalization: the normalizer moves an `errorMessage` key that shares an object with `timestamp` to the object end — upstream's key order is construction-path dependent (fresh literals vs spread-appended abort messages) and not part of the session-format contract.Note: `events.jsonl` holds the **internal** AgentSession event transcript (with cumulative `message`/`partial` on `message_update`); the delta-only wire shape (`toJsonEvent`, json-event.ts @ 9841914) applies only at the print/json + RPC stdout boundary and is covered by the print/RPC tests, not by these fixtures.
 >
 > The **shared normalization and diff implementation** lives in `rpi-test-support` (`normalize.rs` / `diff.rs`). In addition, each parity test strips numeric keys (`usage`/`details` etc., see the `STRIPPED_KEYS` list at the top of each test file — currently a local implementation in three test files) before diffing.Fixtures store **raw bytes**; timestamp / uuid / session id / cwd stripping happens at diff time, not at generation time.
 
@@ -63,18 +63,13 @@ Prerequisites (one-time; `node_modules/` and `dist/` are both in `.gitignore`, s
 
 ```bash
 cd external/pi
-git rev-parse HEAD   # must match the recording pin (19451accdeec671c1f4da9eafac8fc270f510ef4
-                     # for the five generated/ scenarios; see the note at the top of this file)
+git rev-parse HEAD   # must match the recording pin (b4afdddf44e059c67ccf5097e5317d913521b470
+                     # for the five generated/ scenarios and prompt-dsl; see the note at the top of this file)
 npm ci --ignore-scripts
-# Build order matters (workspace deps); pi-ai uses build:offline so the
-# network-fetching generate-models step does not rewrite pinned sources.
-npm run build --workspace @earendil-works/pi-telemetry
-npm run build --workspace @earendil-works/pi-tui
-npm run build:offline --workspace @earendil-works/pi-ai
-npm run build --workspace @earendil-works/pi-protocol
-npm run build --workspace @earendil-works/pi-client
-npm run build --workspace @earendil-works/pi-agent-core
-npm run build --workspace @earendil-works/pi-coding-agent
+# Hydrate ignored model data, then build all workspace dependencies in order.
+# The offline build does not rewrite the pinned generated TypeScript catalog.
+npm run hydrate:model-data
+npm run build:offline
 ```
 
 Generate (from this repository root):
@@ -129,7 +124,7 @@ node fixtures/generate-resources-golden.mjs themes settings  # single group
 | Case group | Input | Contract covered |
 |------------|-------|------------------|
 | `skills-battery` | Upstream `test/fixtures/skills/` 13-case directory + read-only copy of `skills-collision/` (`input/`, never modifies external/) | `loadSkills()` name/description/filePath/baseDir/sourceInfo/disableModelInvocation + warning/collision diagnostic shapes; first-come-first-served conflicts |
-| `prompt-dsl` | 22 embedded (template body, args string) cases in the script; re-recorded at the v0.1.8 pin (`4a080252f`, v1.4.0) | `parseCommandArgs` quote awareness (empty quotes keep their position, #10867) + all `substituteArgs` forms (`$1..$N`/`$@`/`$ARGUMENTS`/`${N:-d}`/`${@:-d}`/`${ARGUMENTS:-d}`/`${@:N}`/`${@:N:L}`, missing slots → empty string, no recursion) |
+| `prompt-dsl` | 24 embedded (template body, args string) cases in the script; selectively re-recorded at the v0.1.9 pin (`b4afdddf`, v1.5.2) | `parseCommandArgs` token-leading quote awareness (empty quotes keep their position, #10867; literal unmatched quotes and escaped matching quotes, Pi v1.5.2) + all `substituteArgs` forms (`$1..$N`/`$@`/`$ARGUMENTS`/`${N:-d}`/`${@:-d}`/`${ARGUMENTS:-d}`/`${@:N}`/`${@:N:L}`, missing slots → empty string, no recursion) |
 | `themes` | 11 embedded custom theme JSONs + built-in dark/light | ANSI color tables after `loadThemeFromPath` parses both color modes (truecolor/256color): vars references, 256-color integers, `""` defaults, thinkingMax fallback, invalid-value diagnostics; color table snapshot of parsed built-in themes |
 | `keybindings` | 5 embedded legacy key-name configs | `migrateKeybindingsConfig`: legacy name migration, new name wins on new/old conflict, definition order + extras alphabetical order, raw values pass through |
 | `settings` | 5 embedded deepMerge cases + 8 migration cases | `deepMergeSettings` (single-level shallow merge for nesting / replacement at depth ≥ 2 / arrays and scalars replaced, observed through the `SettingsManager.fromStorage` getter surface) + 4 legacy-format migrations (queueMode/websockets/skills object/retry.maxDelayMs) |

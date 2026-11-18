@@ -343,6 +343,19 @@ impl SqliteExecutor {
         .await
     }
 
+    /// Execute one statement and return the number of affected rows.
+    pub async fn run_counted(&self, sql: &str, params: Vec<SqliteValue>) -> StorageResult<usize> {
+        self.with_connection({
+            let sql = sql.to_string();
+            move |conn| {
+                let mut statement = conn.prepare_cached(&sql)?;
+                let bindings = rusqlite_params(&params);
+                Ok(statement.execute(rusqlite::params_from_iter(bindings.iter()))?)
+            }
+        })
+        .await
+    }
+
     /// Run one statement with positional bindings and read the first row as JSON.
     pub async fn get<T: DeserializeOwned + Send + 'static>(
         &self,
@@ -428,6 +441,12 @@ impl SqliteTransaction {
     pub async fn run(&self, sql: &str, params: Vec<SqliteValue>) -> StorageResult<()> {
         self.assert_active()?;
         self.executor.run(sql, params).await
+    }
+
+    /// See [`SqliteExecutor::run_counted`].
+    pub async fn run_counted(&self, sql: &str, params: Vec<SqliteValue>) -> StorageResult<usize> {
+        self.assert_active()?;
+        self.executor.run_counted(sql, params).await
     }
 
     /// See [`SqliteExecutor::get`].
@@ -519,6 +538,7 @@ impl SqliteDatabase {
                     }
                 };
                 let configured = (|| -> StorageResult<()> {
+                    connection.set_prepared_statement_cache_capacity(256);
                     connection.busy_timeout(std::time::Duration::from_millis(timeout))?;
                     connection.execute_batch("PRAGMA journal_mode = WAL")?;
                     connection.execute_batch("PRAGMA synchronous = NORMAL")?;
@@ -604,6 +624,17 @@ impl SqliteDatabase {
         let _guard = self.inner.access.lock().await;
         self.assert_open()?;
         self.inner.executor.run(sql, params).await
+    }
+
+    /// See [`SqliteExecutor::run_counted`].
+    pub async fn run_counted(&self, sql: &str, params: Vec<SqliteValue>) -> StorageResult<usize> {
+        self.assert_open()?;
+        if in_transaction() {
+            return Err(StorageError::TransactionReentrant);
+        }
+        let _guard = self.inner.access.lock().await;
+        self.assert_open()?;
+        self.inner.executor.run_counted(sql, params).await
     }
 
     /// See [`SqliteExecutor::get`].

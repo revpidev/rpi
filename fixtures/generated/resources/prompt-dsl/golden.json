@@ -1,5 +1,5 @@
 {
-  "upstream": "external/pi @ 4a080252f (v1.4.0), dist build",
+  "upstream": "external/pi @ b4afdddf (v1.5.2), dist build",
   "cases": [
     {
       "name": "positional",
@@ -161,13 +161,34 @@
       "expected": "hello world|it's|x"
     },
     {
-      "name": "unterminated_quote_swallows_rest",
-      "content": "[$1]",
+      "name": "unterminated_quote_is_literal",
+      "content": "[$1][$2]",
       "argsString": "\"abc def",
       "args": [
-        "abc def"
+        "\"abc",
+        "def"
       ],
-      "expected": "[abc def]"
+      "expected": "[\"abc][def]"
+    },
+    {
+      "name": "quotes_only_open_at_token_start",
+      "content": "$1|$2|$3",
+      "argsString": "doesn't stop \"unterminated",
+      "args": [
+        "doesn't",
+        "stop",
+        "\"unterminated"
+      ],
+      "expected": "doesn't|stop|\"unterminated"
+    },
+    {
+      "name": "quoted_matching_escape",
+      "content": "[$1]",
+      "argsString": "\"say \\\"hi\\\"\"",
+      "args": [
+        "say \"hi\""
+      ],
+      "expected": "[say \"hi\"]"
     },
     {
       "name": "empty_quotes_keep_position",

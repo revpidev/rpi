@@ -2,10 +2,9 @@
 /**
  * Rpi fixtures generator (runbook step: see fixtures/README.md §2).
  *
- * Runs the pinned upstream Pi (recording pin: pi v0.85.0+, external/pi @
- * 9841914 — see the pin note in fixtures/README.md; the current repo pin
- * lives in UPSTREAM.md) with the
- * faux provider and fixed prompt scripts over the SDK (`createAgentSession`),
+ * Runs the pinned upstream Pi from UPSTREAM.md (currently Pi v1.5.2,
+ * external/pi @ b4afdddf) with the faux provider and fixed prompt scripts over
+ * the SDK (`createAgentSession`),
  * then exports, per scenario:
  *   - `session.jsonl`  — the real on-disk session file (file-backed SessionManager)
  *   - `events.jsonl`   — the INTERNAL AgentSession event transcript (with
@@ -14,13 +13,7 @@
  *
  * Prerequisites (one-time, see fixtures/README.md):
  *   cd external/pi && npm ci --ignore-scripts \
- *     && npm run build --workspace @earendil-works/pi-telemetry \
- *     && npm run build --workspace @earendil-works/pi-tui \
- *     && npm run build:offline --workspace @earendil-works/pi-ai \
- *     && npm run build --workspace @earendil-works/pi-protocol \
- *     && npm run build --workspace @earendil-works/pi-client \
- *     && npm run build --workspace @earendil-works/pi-agent-core \
- *     && npm run build --workspace @earendil-works/pi-coding-agent
+ *     && npm run hydrate:model-data && npm run build:offline
  *
  * Usage:  node fixtures/generate-fixtures.mjs [scenario ...]
  * Default: regenerate all scenarios. Deterministic: fixed scripts, fixed faux

@@ -34,9 +34,11 @@ pub mod scheduler;
 pub mod submissions;
 pub mod task_graph;
 pub mod tool;
+pub mod transcript;
 pub mod types;
 pub mod usage;
 pub mod util;
+pub mod view;
 
 pub use crate::chord::telemetry::{
     TelemetryCarrier, TelemetryContext, TelemetrySink, TelemetrySpan, TelemetrySpanSink,
@@ -93,24 +95,31 @@ pub use tool::{
     NESTED_CALL_DOC, NestedCallState, ToolCheckpoint, ToolTask, ToolTaskInput, ToolTaskResult,
     append_tool_result, harness_error,
 };
+pub use transcript::{ConversationTranscript, EntryLoader, TranscriptItem, TranscriptView};
 pub use types::{
-    AfterFailedRun, Agent, AgentChange, AgentState, AnyTask, AnyTaskDef, BlockedReason,
-    CompactionPolicy, CompactionReason, CompactionResult, ContinueInput, Conversation,
-    ConversationAbortOptions, ConversationCreateOptions, ConversationHandle, ConversationInit,
-    DeferredOption, DeferredWindow, EnvFactory, EnvTarget, ExecutionEnv, Extension,
-    ExtensionsChange, ExtensionsEdit, ExtensionsSelection, GenerationHooks, Harness,
-    HarnessInspection, HarnessOptions, HarnessSettings, HookApi, HookHandlers, HookRegistration,
-    InputEntry, InputSubmissionDraft, Migration, ModelRef, ModelToolsChange, ModelToolsSelection,
-    ModelsSource, NestedCallOptions, NestedCallParent, NestedToolExecutionResult, NextTaskState,
-    PromptInput, PromptRender, PromptSection, QueueMode, Registry, RegistryError, RegistryListener,
-    RegistryReader, RegistrySnapshot, ReportFn, ReportInfo, ReportInfoFn, ReportKind,
-    RequestMessages, RestartLimit, RetainedOutput, RootOptions, RunningTask, Scheduling, SetTimer,
-    Settings, SettingsSource, SettledSubmissionRecord, SettledTask, Submission, SubmissionAbort,
-    SubmissionAbortResult, SubmissionDraft, TaskAbort, TaskCommitFn, TaskDefinition,
-    TaskInspection, TaskInspectionState, TaskRuntime, TimerDisarm, TimerOptions, ToolCaller,
-    ToolCommitFn, ToolControl, ToolDiagnostic, ToolExecute, ToolExecuteError, ToolExecutionApi,
-    ToolExecutionMode, ToolExecutionResult, ToolHookCall, ToolRegistration, ToolReplay,
-    ToolsChange, ToolsSelection, UserInput, Wake, WakeFn, WhenBusy, Wrap, WriteSubmissionDraft,
+    AfterFailedRun, Agent, AgentChange, AgentState, AnyTask, AnyTaskDef, BeforeToolResult,
+    BlockedReason, CompactionPolicy, CompactionReason, CompactionResult, ContinueInput,
+    ContinueSubmissionDraft, Conversation, ConversationAbortOptions, ConversationCreateOptions,
+    ConversationHandle, ConversationInit, DeferredOption, DeferredWindow, EnvFactory, EnvTarget,
+    ExecutionEnv, Extension, ExtensionsChange, ExtensionsEdit, ExtensionsSelection,
+    GenerationHooks, Harness, HarnessInspection, HarnessOptions, HarnessSettings, HookApi,
+    HookHandlers, HookRegistration, InputEntry, InputSubmissionDraft, Migration, ModelRef,
+    ModelToolsChange, ModelToolsSelection, ModelsSource, NestedCallOptions, NestedCallParent,
+    NestedToolExecutionResult, NextTaskState, PromptInput, PromptRender, PromptSection,
+    ProviderRequest, QueueMode, Registry, RegistryError, RegistryListener, RegistryReader,
+    RegistrySnapshot, Report, ReportFn, ReportFrom, ReportInfo, ReportKind, ReportTask,
+    RequestMessages, RestartLimit, RetainedOutput, RootOptions, RunEndReason, RunEndTask,
+    RunEndTasks, RunSummary, RunningTask, Scheduling, SetTimer, Settings, SettingsSource,
+    SettledSubmissionRecord, SettledTask, Submission, SubmissionAbort, SubmissionAbortResult,
+    SubmissionDraft, TaskAbort, TaskCommitFn, TaskDefinition, TaskInspection, TaskInspectionState,
+    TaskRuntime, TimerDisarm, TimerOptions, ToolCaller, ToolCommitFn, ToolControl, ToolDiagnostic,
+    ToolExecute, ToolExecuteError, ToolExecutionApi, ToolExecutionMode, ToolExecutionResult,
+    ToolHookCall, ToolHooks, ToolRegistration, ToolReplay, ToolsChange, ToolsSelection, UserInput,
+    Wake, WakeFn, WhenBusy, WhenIdle, Wrap, WriteSubmissionDraft,
 };
 pub use usage::{USAGE_DOC, UsageBucket, UsageState, add_usage, add_usage_state, record_usage};
 pub use util::{WaitError, WaitFuture, Waiters, closed_error, scan_all};
+pub use view::{
+    ConversationView, ConversationViews, ConversationWatch, ConversationWatchListener,
+    ConversationWindow,
+};

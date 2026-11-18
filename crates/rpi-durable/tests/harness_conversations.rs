@@ -315,7 +315,10 @@ async fn open_jsonl_storage(dir: &TempDir) -> Arc<dyn Storage> {
     let storage = rpi_durable::storage::JsonlStorage::open(
         &directory,
         fs,
-        rpi_durable::storage::JsonlStorageOptions { fsync: false },
+        rpi_durable::storage::JsonlStorageOptions {
+            fsync: false,
+            read_only: false,
+        },
         &context(),
     )
     .await

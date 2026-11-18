@@ -111,7 +111,10 @@ async fn jsonl_harness_resumes_after_a_crash() {
             JsonlStorage::open(
                 &directory,
                 Arc::clone(&fs),
-                JsonlStorageOptions { fsync: false },
+                JsonlStorageOptions {
+                    fsync: false,
+                    read_only: false,
+                },
                 &context(),
             )
             .await
@@ -126,7 +129,10 @@ async fn jsonl_harness_resumes_after_a_crash() {
         JsonlStorage::open(
             &directory,
             fs,
-            JsonlStorageOptions { fsync: false },
+            JsonlStorageOptions {
+                fsync: false,
+                read_only: false,
+            },
             &context(),
         )
         .await

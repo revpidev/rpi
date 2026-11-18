@@ -28,7 +28,8 @@ use crate::harness::types::BlockedReason;
 use crate::ids::{ConversationId, TaskId};
 use crate::session::observation::{CommittedStateSource, CommittedWatch};
 use crate::session::{
-    CommitChange, CommitPublication, SessionError, SessionImpl, SessionResult, Subscription,
+    CommitChange, CommitPublication, Observation, SessionError, SessionImpl, SessionResult,
+    Subscription,
 };
 use crate::types::{
     ConversationQuery, ConversationRecord, Page, Storage, StorageWrite, TaskOutcome, TaskQuery,
@@ -94,7 +95,7 @@ pub struct TaskGraphNode {
     pub state: TaskGraphState,
     /// Why it cannot run here, when it cannot: no registered definition takes it
     /// (`missing_task`, `task_too_old`, `migration_failed`), or the restart
-    /// limit parked it (`restart_limit`). Follows registry changes.
+    /// limit ended it (`restart_limit`). Follows registry changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<BlockedReason>,
     /// Conversations this task owns, in ID order.
@@ -120,6 +121,7 @@ const LIVE_STATUSES: [TaskStatus; 5] = [
 ];
 const SCAN_PAGE_SIZE: usize = 256;
 
+#[derive(Clone)]
 enum Observer {
     State(Arc<CommittedStateSource>),
     Watch(u64, CommittedWatch),
@@ -190,7 +192,33 @@ impl TaskGraphView {
         let Some(mount) = guard.as_mut() else {
             return;
         };
-        advance(mount, publication, context, &*self.blocked);
+        let delivery = advance(mount, publication, context, &*self.blocked);
+        drop(guard);
+        self.deliver(delivery);
+    }
+
+    fn deliver(
+        &self,
+        delivery: Option<(
+            Vec<Observer>,
+            JsonValue,
+            Vec<crate::chord::delta::Op>,
+            Context,
+        )>,
+    ) {
+        let Some((observers, value, ops, context)) = delivery else {
+            return;
+        };
+        for observer in observers {
+            match observer {
+                Observer::State(source) => {
+                    source.advance(value.clone(), ops.clone(), context.clone())
+                }
+                Observer::Watch(_, watch) => {
+                    watch.advance(value.clone(), ops.clone(), false, context.clone())
+                }
+            }
+        }
     }
 
     fn close_session(&self) {
@@ -238,6 +266,66 @@ impl TaskGraphView {
                 Box::pin(async move { this.attach_watch(&read_context).await })
             })
             .await
+    }
+
+    /// Attach a synchronous observer to the committed graph.
+    pub async fn observe(
+        self: &Arc<Self>,
+        observer: Arc<dyn crate::session::Observer<TaskGraph>>,
+        context: &Context,
+    ) -> SessionResult<Observation<TaskGraph>> {
+        struct Adapter {
+            observer: Arc<dyn crate::session::Observer<TaskGraph>>,
+        }
+        impl crate::session::Observer<crate::session::ObservedDocumentValue> for Adapter {
+            fn advance(
+                &self,
+                call: crate::session::WatchCall<crate::session::ObservedDocumentValue>,
+                context: &Context,
+            ) {
+                let call = match call {
+                    crate::session::WatchCall::Value {
+                        value,
+                        ops,
+                        retired,
+                    } => crate::session::WatchCall::Value {
+                        value: serde_json::from_value(
+                            value.map(JsonValue::Object).unwrap_or(JsonValue::Null),
+                        )
+                        .expect("task graph frame"),
+                        ops,
+                        retired,
+                    },
+                    crate::session::WatchCall::Failed { error } => {
+                        crate::session::WatchCall::Failed { error }
+                    }
+                };
+                self.observer.advance(call, context);
+            }
+
+            fn end(&self, end: crate::session::WatchEnd) {
+                self.observer.end(end);
+            }
+        }
+        let watch = self.watch(context).await?;
+        let value = serde_json::from_value(
+            watch
+                .value()
+                .map(JsonValue::Object)
+                .unwrap_or(JsonValue::Null),
+        )
+        .map_err(|error| SessionError::message(error.to_string()))?;
+        let session = Arc::downgrade(&self.session);
+        let reporter = Arc::new(move |message: String, context: Option<Context>| {
+            if let Some(session) = session.upgrade() {
+                session.report_listener_error(message, context);
+            }
+        });
+        let attached = watch.observe(Arc::new(Adapter { observer }), reporter);
+        Ok(Observation {
+            value,
+            detach: attached.detach,
+        })
     }
 
     async fn attach_state(
@@ -394,9 +482,18 @@ impl TaskGraphView {
                 changed = true;
             }
         }
-        if changed {
-            publish(mount, next, &crate::chord::context::BACKGROUND_CONTEXT);
-        }
+        let delivery = changed.then(|| {
+            let ops = diff_json(&graph_json(&mount.value), &graph_json(&next));
+            mount.value = next;
+            (
+                mount.observers.clone(),
+                graph_json(&mount.value),
+                ops,
+                crate::chord::context::BACKGROUND_CONTEXT.clone(),
+            )
+        });
+        drop(guard);
+        self.deliver(delivery);
     }
 
     async fn build(
@@ -490,7 +587,12 @@ fn advance(
     publication: &CommitPublication,
     context: &Context,
     blocked: &(dyn Fn(&BlockedSubject) -> Option<BlockedReason> + Send + Sync),
-) {
+) -> Option<(
+    Vec<Observer>,
+    JsonValue,
+    Vec<crate::chord::delta::Op>,
+    Context,
+)> {
     let mut next = mount.value.clone();
     for change in &publication.changes {
         if let CommitChange::Table(StorageWrite::Task { value }) = change {
@@ -535,28 +637,32 @@ fn advance(
             }
         }
     }
-    publish(mount, next, context);
+    publish(mount, next, context)
 }
 
-/// Apply a recomputed graph and hand the revision to every observer.
-fn publish(mount: &mut Mount, next: TaskGraph, context: &Context) {
+/// Apply a recomputed graph and prepare its observer callbacks.
+fn publish(
+    mount: &mut Mount,
+    next: TaskGraph,
+    context: &Context,
+) -> Option<(
+    Vec<Observer>,
+    JsonValue,
+    Vec<crate::chord::delta::Op>,
+    Context,
+)> {
     if next == mount.value {
-        return;
+        return None;
     }
     let ops = diff_json(&graph_json(&mount.value), &graph_json(&next));
     mount.value = next;
     let value = graph_json(&mount.value);
-    let frame_context = without_abort_signal(context);
-    for observer in &mount.observers {
-        match observer {
-            Observer::State(source) => {
-                source.advance(value.clone(), ops.clone(), frame_context.clone())
-            }
-            Observer::Watch(_, watch) => {
-                watch.advance(value.clone(), ops.clone(), frame_context.clone())
-            }
-        }
-    }
+    Some((
+        mount.observers.clone(),
+        value,
+        ops,
+        without_abort_signal(context),
+    ))
 }
 
 fn node_of(

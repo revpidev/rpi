@@ -55,7 +55,13 @@ impl Timers {
 
     fn fall_back(&self, message: &str) {
         if !self.reported_fallback.swap(true, Ordering::SeqCst) {
-            (self.report)(message.to_string());
+            (self.report)(crate::harness::types::Report::new(
+                crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::HostError,
+                )
+                .with_callback("setTimer"),
+                message.to_string(),
+            ));
         }
     }
 
@@ -95,7 +101,13 @@ impl Timers {
         })) {
             Ok(disarm) => disarm,
             Err(_) => {
-                (self.report)("HarnessOptions.setTimer threw for a background timer".to_string());
+                (self.report)(crate::harness::types::Report::new(
+                    crate::harness::types::ReportInfo::new(
+                        crate::harness::types::ReportKind::HostError,
+                    )
+                    .with_callback("setTimer"),
+                    "HarnessOptions.setTimer threw for a background timer".to_string(),
+                ));
                 None
             }
         }

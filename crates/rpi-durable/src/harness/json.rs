@@ -131,6 +131,49 @@ mod tests {
     }
 
     #[test]
+    fn partial_arguments_merge_own_keys_without_touching_reserved_names() {
+        let mut target = json!({
+            "generation": {
+                "message": {
+                    "content": [{
+                        "type": "toolCall",
+                        "id": "c1",
+                        "name": "demo",
+                        "arguments": "{\"city\":\"Par",
+                        "__proto__": { "polluted": false }
+                    }]
+                }
+            }
+        });
+        assign_json(
+            &mut target["generation"]["message"]["content"][0],
+            "arguments",
+            json!("{\"city\":\"Paris\",\"count\":1}"),
+        );
+        assign_json(
+            &mut target["generation"]["message"]["content"][0],
+            "__proto__",
+            json!({ "polluted": true }),
+        );
+        assert_eq!(
+            target["generation"]["message"]["content"][0]["arguments"],
+            json!("{\"city\":\"Paris\",\"count\":1}")
+        );
+        assert_eq!(
+            target["generation"]["message"]["content"][0]["__proto__"],
+            json!({ "polluted": true })
+        );
+        assert_eq!(
+            target["generation"]["message"]["content"][0]["id"],
+            json!("c1")
+        );
+        assert_eq!(
+            target["generation"]["message"]["content"][0]["name"],
+            json!("demo")
+        );
+    }
+
+    #[test]
     fn json_equality_ignores_object_key_order() {
         assert!(json_equal(
             &json!({"a": 1, "b": [2]}),

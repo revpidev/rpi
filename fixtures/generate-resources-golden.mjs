@@ -224,7 +224,9 @@ const PROMPT_DSL_CASES = [
 	{ name: "slice_zero_is_one", content: "all: ${@:0}", argsString: "a b" },
 	{ name: "slice_beyond_end", content: "none: [${@:5}]", argsString: "a b" },
 	{ name: "quotes_single_and_double", content: "$1|$2|$3", argsString: "'hello world' \"it's\" x" },
-	{ name: "unterminated_quote_swallows_rest", content: "[$1]", argsString: '"abc def' },
+	{ name: "unterminated_quote_is_literal", content: "[$1][$2]", argsString: '"abc def' },
+	{ name: "quotes_only_open_at_token_start", content: "$1|$2|$3", argsString: 'doesn\'t stop "unterminated' },
+	{ name: "quoted_matching_escape", content: "[$1]", argsString: '"say \\"hi\\""' },
 	{ name: "empty_quotes_keep_position", content: "[$1]", argsString: '""' },
 	{ name: "two_digit_index", content: "ten: $10", argsString: "1 2 3 4 5 6 7 8 9 ten" },
 	{ name: "mixed_dsl_forms", content: "$1 then ${2:-none} then ${@:3}", argsString: "a b c d" },
@@ -236,10 +238,10 @@ function generatePromptDsl() {
 		const args = parseCommandArgs(c.argsString);
 		return { ...c, args, expected: substituteArgs(c.content, args) };
 	});
-	// Re-recorded at the v0.1.8 pin: #10867 keeps empty quoted arguments, so
-	// the old `empty_quotes_are_dropped` recording no longer applies.
+	// Re-recorded at the v0.1.9 pin: only token-leading quotes open a quoted
+	// argument, and an unmatched quote is parsed again as literal text.
 	writeGolden("prompt-dsl", {
-		upstream: "external/pi @ 4a080252f (v1.4.0), dist build",
+		upstream: "external/pi @ b4afdddf (v1.5.2), dist build",
 		cases,
 	});
 }

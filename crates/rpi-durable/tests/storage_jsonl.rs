@@ -18,7 +18,7 @@ use rpi_durable::storage::{JsonlStorage, JsonlStorageOptions};
 use rpi_durable::testing::run_storage_conformance;
 use rpi_durable::types::{
     ConversationRecord, DocumentContent, DocumentCreate, DocumentScope, EntryRecord, Storage,
-    StorageWrite, TaskRecord, TaskState,
+    StorageExt, StorageWrite, TaskRecord, TaskState,
 };
 use test_support::{ReopeningStorage, TempDir, cleanup_temp_dirs};
 
@@ -31,7 +31,10 @@ fn open_jsonl(dir: &TempDir, fsync: bool) -> OpenFuture<'_> {
         let storage = JsonlStorage::open(
             &directory,
             fs,
-            JsonlStorageOptions { fsync },
+            JsonlStorageOptions {
+                fsync,
+                read_only: false,
+            },
             &BACKGROUND_CONTEXT,
         )
         .await?;
@@ -143,7 +146,10 @@ async fn open_storage(dir: &TempDir, fsync: bool) -> JsonlStorage {
     JsonlStorage::open(
         &dir.path_str(),
         fs,
-        JsonlStorageOptions { fsync },
+        JsonlStorageOptions {
+            fsync,
+            read_only: false,
+        },
         &BACKGROUND_CONTEXT,
     )
     .await
@@ -240,7 +246,7 @@ async fn publishes_every_commit_before_reclaiming_sidecars() {
     let dir = TempDir::new("rpi-durable-jsonl-reclaim");
     let storage = open_storage(&dir, false).await;
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: ROOT_CONVERSATION_ID,
@@ -255,7 +261,7 @@ async fn publishes_every_commit_before_reclaiming_sidecars() {
     let task_id: TaskId = id_from_number(storage.mint_id().await.expect("mint"));
     let document_id: DocumentId = id_from_number(storage.mint_id().await.expect("mint"));
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Task {
                 value: task_record(task_id, "ready", false),
             }],
@@ -264,7 +270,7 @@ async fn publishes_every_commit_before_reclaiming_sidecars() {
         .await
         .expect("task");
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::DocumentCreate {
                 record: session_document(document_id, "test.document"),
                 content: DocumentContent::Base {
@@ -280,7 +286,7 @@ async fn publishes_every_commit_before_reclaiming_sidecars() {
         .await
         .expect("document");
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::DocumentChange {
                 id: document_id,
                 content: DocumentContent::Delta {
@@ -293,7 +299,7 @@ async fn publishes_every_commit_before_reclaiming_sidecars() {
         .await
         .expect("delta");
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::DocumentChange {
                 id: document_id,
                 content: DocumentContent::Base {
@@ -318,14 +324,14 @@ async fn publishes_every_commit_before_reclaiming_sidecars() {
     );
 
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::DocumentRetire { id: document_id }],
             &BACKGROUND_CONTEXT,
         )
         .await
         .expect("retire");
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Task {
                 value: task_record(task_id, "ready", true),
             }],
@@ -346,7 +352,7 @@ async fn removes_torn_unconfirmed_tail_on_reopen() {
     let dir = TempDir::new("rpi-durable-jsonl-torn");
     let storage = open_storage(&dir, false).await;
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: ROOT_CONVERSATION_ID,
@@ -360,7 +366,7 @@ async fn removes_torn_unconfirmed_tail_on_reopen() {
         .expect("root");
     let task_id: TaskId = id_from_number(storage.mint_id().await.expect("mint"));
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Task {
                 value: task_record(task_id, "first", false),
             }],
@@ -410,7 +416,7 @@ async fn corrupt_main_marker_rejects_open() {
     let dir = TempDir::new("rpi-durable-jsonl-corrupt");
     let storage = open_storage(&dir, false).await;
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: ROOT_CONVERSATION_ID,
@@ -547,14 +553,17 @@ async fn fsync_order(dir: &TempDir, fsync: bool) -> Vec<String> {
     let storage = JsonlStorage::open(
         &dir.path_str(),
         fs,
-        JsonlStorageOptions { fsync },
+        JsonlStorageOptions {
+            fsync,
+            read_only: false,
+        },
         &BACKGROUND_CONTEXT,
     )
     .await
     .expect("open");
     let task_id: TaskId = id_from_number(storage.mint_id().await.expect("mint"));
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Task {
                 value: task_record(task_id, "ready", false),
             }],
@@ -598,7 +607,7 @@ async fn indexes_entries_and_reports_entry_commit_sequence() {
     let dir = TempDir::new("rpi-durable-jsonl-entry");
     let storage = open_storage(&dir, false).await;
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: ROOT_CONVERSATION_ID,
@@ -612,7 +621,7 @@ async fn indexes_entries_and_reports_entry_commit_sequence() {
         .expect("root");
     let entry_id: EntryId = id_from_number(storage.mint_id().await.expect("mint"));
     let seq = storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Entry {
                 value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "message"),
             }],

@@ -252,6 +252,38 @@ pub fn with_context_value<T: Clone + Send + Sync + 'static>(
     Context::with_value_boxed(parent.clone(), key.id, Arc::new(value))
 }
 
+/// Run work in a child telemetry span while retaining the other context values.
+pub async fn trace_in<Fut, T>(
+    start: crate::chord::json::JsonObject,
+    run: impl FnOnce(Context) -> Fut,
+    context: &Context,
+) -> T
+where
+    Fut: Future<Output = T>,
+{
+    let name = start
+        .get("name")
+        .and_then(crate::chord::json::JsonValue::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "span".to_string());
+    let links = start
+        .get("links")
+        .and_then(crate::chord::json::JsonValue::as_array)
+        .map(|links| {
+            links
+                .iter()
+                .filter_map(crate::chord::json::JsonValue::as_object)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let span = context.telemetry().start_span(&name, start, links);
+    let child = with_context_value(&TELEMETRY_CONTEXT_KEY, span.context(), context);
+    let result = run(child).await;
+    span.end(crate::chord::json::JsonObject::new());
+    result
+}
+
 /// Derive a context cancelled by either the parent signal or `signal`.
 ///
 /// The parent context remains unchanged.
@@ -337,5 +369,81 @@ pub async fn await_with_context<F: Future>(
         biased;
         _ = signal.cancelled() => Err(Aborted),
         output = future => Ok(output),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct TraceSink(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl crate::chord::telemetry::TelemetrySink for TraceSink {
+        fn start_span(
+            &self,
+            name: &str,
+            _attributes: crate::chord::json::JsonObject,
+            _links: Vec<crate::chord::telemetry::TelemetryCarrier>,
+        ) -> Option<Arc<dyn crate::chord::telemetry::TelemetrySpanSink>> {
+            self.0.lock().expect("spans").push(format!("start:{name}"));
+            Some(Arc::new(TraceSink(Arc::clone(&self.0))))
+        }
+
+        fn set_attributes(&self, _attributes: crate::chord::json::JsonObject) {}
+        fn add_event(&self, _name: &str, _attributes: crate::chord::json::JsonObject) {}
+        fn add_link(&self, _carrier: crate::chord::json::JsonValue) {}
+        fn record_metric(
+            &self,
+            _name: &str,
+            _value: f64,
+            _attributes: crate::chord::json::JsonObject,
+        ) {
+        }
+    }
+
+    impl crate::chord::telemetry::TelemetrySpanSink for TraceSink {
+        fn end_span(
+            &self,
+            _attributes: crate::chord::json::JsonObject,
+            status: &str,
+            _message: Option<&str>,
+        ) {
+            self.0.lock().expect("spans").push(format!("end:{status}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_in_preserves_context_values_and_closes_the_span() {
+        let sink = Arc::new(TraceSink::default());
+        let key = create_context_key::<String>("owner");
+        let base = with_context_value(&key, "owner".to_string(), &BACKGROUND_CONTEXT);
+        let base = with_context_value(
+            &TELEMETRY_CONTEXT_KEY,
+            crate::chord::telemetry::TelemetryContext::new(sink.clone()),
+            &base,
+        );
+        let (base, cancel) = with_cancel(&base);
+        let result = trace_in(
+            serde_json::json!({ "name": "child" })
+                .as_object()
+                .expect("attributes")
+                .clone(),
+            |child| async move {
+                assert_eq!(child.value(&key).as_deref(), Some("owner"));
+                assert!(child.telemetry().enabled());
+                assert!(!child.abort_signal().expect("signal").is_cancelled());
+                42
+            },
+            &base,
+        )
+        .await;
+        assert_eq!(result, 42);
+        cancel.cancel();
+        assert!(cancel.is_cancelled());
+        assert_eq!(
+            sink.0.lock().expect("spans").as_slice(),
+            &["start:child", "end:ok"]
+        );
     }
 }

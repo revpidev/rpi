@@ -18,7 +18,8 @@ use rpi_ai::types::{
 use rpi_durable::chord::context::Context;
 use rpi_durable::harness::compaction::create_compaction;
 use rpi_durable::harness::types::{
-    CompactionPolicyPatch, ConversationRetryPolicyPatch, DiagnosticSeverity, ToolExecuteError,
+    CompactionPolicyPatch, ConversationRetryPolicyPatch, DiagnosticSeverity, ToolControl,
+    ToolExecuteError,
 };
 use rpi_durable::harness::{
     CompactionReason, ContinueInput, Extension, GenerationHooks, HarnessSettings, HookApi,
@@ -27,7 +28,7 @@ use rpi_durable::harness::{
 };
 use rpi_durable::ids::{ConversationId, EntryId, TaskId};
 use rpi_durable::session::{DocOwner, EntryDraft};
-use rpi_durable::types::{EntryRecord, InputSubmissionStatus, SubmissionRecord};
+use rpi_durable::types::{EntryRecord, InputSubmissionStatus, StorageExt, SubmissionRecord};
 
 use generation_support::{
     Script, context, entries, error_message, open, open_with_sources, open_with_storage,
@@ -195,7 +196,7 @@ async fn run_task_id(
 fn input_status(record: &SubmissionRecord) -> Option<&InputSubmissionStatus> {
     match record {
         SubmissionRecord::Input { status, .. } => Some(status),
-        SubmissionRecord::Write { .. } => None,
+        SubmissionRecord::Continue { .. } | SubmissionRecord::Write { .. } => None,
     }
 }
 
@@ -616,6 +617,434 @@ async fn a_reopened_harness_resumes_deferred_polling() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+async fn wait_for_phase(opened: &generation_support::Opened, id: TaskId, phase: &str) {
+    for _ in 0..200 {
+        let record = opened
+            .harness
+            .get_task(id, &context())
+            .await
+            .expect("task")
+            .expect("record");
+        let current = match &record.state {
+            rpi_durable::types::TaskState::Pending { checkpoint }
+            | rpi_durable::types::TaskState::Running { checkpoint }
+            | rpi_durable::types::TaskState::Waiting { checkpoint, .. }
+            | rpi_durable::types::TaskState::Sleeping { checkpoint, .. } => {
+                checkpoint.get("phase").and_then(|value| value.as_str())
+            }
+            _ => None,
+        };
+        if current == Some(phase) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("task did not reach phase {phase}");
+}
+
+async fn simulate_crash(opened: &generation_support::Opened, id: TaskId, restarts: Option<u32>) {
+    let mut record = opened
+        .harness
+        .get_task(id, &context())
+        .await
+        .expect("task")
+        .expect("record");
+    let checkpoint = match &record.state {
+        rpi_durable::types::TaskState::Pending { checkpoint }
+        | rpi_durable::types::TaskState::Running { checkpoint }
+        | rpi_durable::types::TaskState::Waiting { checkpoint, .. }
+        | rpi_durable::types::TaskState::Sleeping { checkpoint, .. } => checkpoint.clone(),
+        _ => panic!("crash fixture needs a live task"),
+    };
+    record.state = rpi_durable::types::TaskState::Running { checkpoint };
+    record.restarts = restarts;
+    opened
+        .storage
+        .commit_one(
+            &[rpi_durable::types::StorageWrite::Task { value: record }],
+            &context(),
+        )
+        .await
+        .expect("simulate crash record");
+}
+
+#[tokio::test]
+async fn a_crashed_request_ends_interrupted_without_retry() {
+    let settings = HarnessSettings {
+        retry: Some(ConversationRetryPolicyPatch {
+            enabled: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let opened = open(
+        Vec::new(),
+        Some(settings.clone()),
+        test_models(vec![Script::Pending("partial".to_string())]),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    let task = run_task_id(&opened, conversation.id()).await.expect("run");
+    wait_for_phase(&opened, task, "request").await;
+    simulate_crash(&opened, task, None).await;
+
+    let reopened = open_with_storage(
+        Arc::clone(&opened.storage),
+        Vec::new(),
+        Some(settings),
+        test_models(Vec::new()),
+    )
+    .await;
+    let settled = reopened
+        .harness
+        .wait_for_task(task, &context())
+        .await
+        .expect("settled");
+    let rpi_durable::types::TaskState::Terminal {
+        outcome: rpi_durable::types::TaskOutcome::Failed { error, .. },
+    } = settled.record.state
+    else {
+        panic!("expected interrupted failure")
+    };
+    assert_eq!(
+        error
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.get("reason")),
+        Some(&serde_json::json!("interrupted"))
+    );
+    let recovered = reopened
+        .harness
+        .submission(submission.id(), &context())
+        .await
+        .expect("submission")
+        .expect("present");
+    let settled = recovered.wait(&context()).await.expect("wait");
+    assert!(matches!(
+        input_status(&settled),
+        Some(InputSubmissionStatus::Unanswered { reason, .. }) if reason == "interrupted"
+    ));
+    reopened.harness.close(&context()).await.expect("close");
+}
+
+#[tokio::test]
+async fn a_crashed_generation_uses_its_terminal_restart_limit() {
+    let opened = open(
+        Vec::new(),
+        None,
+        test_models(vec![Script::Pending("partial".to_string())]),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let _submission = submit_input(&conversation, "hi").await;
+    let task = run_task_id(&opened, conversation.id()).await.expect("run");
+    wait_for_phase(&opened, task, "request").await;
+    simulate_crash(&opened, task, Some(4)).await;
+
+    let reopened = open_with_storage(
+        Arc::clone(&opened.storage),
+        Vec::new(),
+        None,
+        test_models(Vec::new()),
+    )
+    .await;
+    let settled = reopened
+        .harness
+        .wait_for_task(task, &context())
+        .await
+        .expect("settled");
+    assert!(matches!(
+        settled.record.state,
+        rpi_durable::types::TaskState::Terminal {
+            outcome: rpi_durable::types::TaskOutcome::Failed { ref error, .. }
+        } if error.detail.as_ref().and_then(|detail| detail.get("reason")) == Some(&serde_json::json!("restart_limit"))
+    ));
+    reopened.harness.close(&context()).await.expect("close");
+}
+
+#[tokio::test]
+async fn a_crashed_deferred_fetch_retries_the_same_response_after_clock_rollback() {
+    let clock = Arc::new(AtomicU64::new(0));
+    let now = Arc::clone(&clock);
+    let settings = HarnessSettings {
+        retry: Some(ConversationRetryPolicyPatch {
+            base_delay_ms: Some(1),
+            max_retries: Some(1),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (models, deferred, requests) = generation_support::test_models_with_recovery_log(vec![
+        Script::Message(deferred_message("same-response", Some(60_000))),
+        Script::Pending("interrupted fetch".to_string()),
+        Script::Message(text_message("recovered", StopReason::Stop)),
+    ]);
+    let opened = open_with_timing(
+        Arc::new(rpi_durable::storage::MemoryStorage::new()),
+        Vec::new(),
+        Some(settings.clone().into()),
+        models.clone().into(),
+        None,
+        Some(Arc::new(move || now.load(Ordering::SeqCst) as f64)),
+        None,
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    let task = run_task_id(&opened, conversation.id()).await.expect("run");
+    wait_for_sleeping(&opened, task).await;
+    clock.store(60_000, Ordering::SeqCst);
+    opened.harness.resume().expect("resume original poll");
+    for _ in 0..200 {
+        if deferred.lock().expect("deferred").len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(deferred.lock().expect("deferred").len(), 1);
+    simulate_crash(&opened, task, None).await;
+
+    clock.store(0, Ordering::SeqCst);
+    let now = Arc::clone(&clock);
+    let reopened = open_with_timing(
+        Arc::clone(&opened.storage),
+        Vec::new(),
+        Some(settings.into()),
+        models.into(),
+        None,
+        Some(Arc::new(move || now.load(Ordering::SeqCst) as f64)),
+        None,
+    )
+    .await;
+    let recovered = reopened
+        .harness
+        .submission(submission.id(), &context())
+        .await
+        .expect("submission")
+        .expect("present");
+    let waiting = {
+        let recovered = Arc::clone(&recovered);
+        tokio::spawn(async move { recovered.wait(&context()).await })
+    };
+    for _ in 0..200 {
+        let record = reopened
+            .harness
+            .get_task(task, &context())
+            .await
+            .expect("task")
+            .expect("record");
+        if matches!(record.state, rpi_durable::types::TaskState::Sleeping { .. }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    clock.store(1, Ordering::SeqCst);
+    reopened.harness.resume().expect("resume recovered poll");
+    let settled = match tokio::time::timeout(Duration::from_secs(5), waiting).await {
+        Ok(settled) => settled.expect("join").expect("wait"),
+        Err(_) => {
+            let record = reopened.harness.get_task(task, &context()).await;
+            panic!(
+                "deferred recovery timed out: {record:?}; requests={requests:?}; deferred={deferred:?}"
+            )
+        }
+    };
+    assert!(matches!(
+        input_status(&settled),
+        Some(InputSubmissionStatus::Done { .. })
+    ));
+    assert_eq!(
+        deferred.lock().expect("deferred").as_slice(),
+        &["fetch:same-response", "fetch:same-response"]
+    );
+    assert_eq!(requests.lock().expect("requests").as_slice(), &["request"]);
+    reopened.harness.close(&context()).await.expect("close");
+}
+
+struct CountToolHooks(Arc<AtomicUsize>);
+
+#[async_trait]
+impl rpi_durable::harness::ToolHooks for CountToolHooks {
+    async fn before_tool(
+        &self,
+        _call: &rpi_durable::harness::ToolHookCall,
+        _api: &dyn HookApi,
+        _context: &Context,
+    ) -> Option<rpi_durable::harness::BeforeToolResult> {
+        None
+    }
+
+    async fn after_tool(
+        &self,
+        _call: &rpi_durable::harness::ToolHookCall,
+        _result: ToolExecutionResult,
+        _api: &dyn HookApi,
+        _context: &Context,
+    ) -> Option<ToolExecutionResult> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+}
+
+fn count_tool_hooks(calls: Arc<AtomicUsize>) -> Extension {
+    Extension {
+        name: "count-hooks".to_string(),
+        hooks: vec![HookRegistration {
+            task: "pi.tool".to_string(),
+            handlers: HookHandlers::Tool(Arc::new(CountToolHooks(calls))),
+        }],
+        ..Extension::default()
+    }
+}
+
+#[tokio::test]
+async fn tool_restart_limit_controls_the_last_after_tool_opportunity() {
+    for (previous_restarts, expected_hooks) in [(4, 1), (5, 0)] {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let hooks = Arc::new(AtomicUsize::new(0));
+        let opened = open(
+            vec![
+                blocking_extension(Arc::clone(&started), Arc::clone(&release)),
+                count_tool_hooks(Arc::clone(&hooks)),
+            ],
+            None,
+            test_models(vec![
+                Script::Message(tool_use_message("block", "c1", serde_json::json!({}))),
+                Script::Pending("not requested".to_string()),
+            ]),
+        )
+        .await;
+        let conversation = root_ready(&opened.harness).await;
+        let _submission = submit_input(&conversation, "hi").await;
+        started.notified().await;
+        let task = opened
+            .harness
+            .inspect(&context())
+            .await
+            .expect("inspect")
+            .tasks
+            .into_iter()
+            .find(|task| task.record.kind == "pi.tool")
+            .expect("tool task")
+            .record
+            .id;
+        simulate_crash(&opened, task, Some(previous_restarts)).await;
+        let reopened = open_with_storage(
+            Arc::clone(&opened.storage),
+            vec![
+                blocking_extension(
+                    Arc::new(tokio::sync::Notify::new()),
+                    Arc::new(tokio::sync::Notify::new()),
+                ),
+                count_tool_hooks(Arc::clone(&hooks)),
+            ],
+            None,
+            test_models(Vec::new()),
+        )
+        .await;
+        let settled = reopened
+            .harness
+            .wait_for_task(task, &context())
+            .await
+            .expect("tool settles");
+        assert!(matches!(
+            settled.record.state,
+            rpi_durable::types::TaskState::Terminal {
+                outcome: rpi_durable::types::TaskOutcome::Failed { ref error, .. }
+            } if error.detail.as_ref().and_then(|detail| detail.get("reason"))
+                == Some(&serde_json::json!("restart_limit"))
+        ));
+        assert_eq!(hooks.load(Ordering::SeqCst), expected_hooks);
+        reopened.harness.close(&context()).await.expect("close");
+    }
+}
+
+#[tokio::test]
+async fn compaction_restart_limit_writes_compaction_failure() {
+    let (models, _, requests) =
+        generation_support::test_models_with_recovery_log(vec![Script::Pending(
+            "summarizing".to_string(),
+        )]);
+    let settings = HarnessSettings {
+        compaction: Some(CompactionPolicyPatch {
+            keep_recent_tokens: Some(1),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let opened = open(Vec::new(), Some(settings), models).await;
+    let conversation = root_ready(&opened.harness).await;
+    let conversation_id = conversation.id();
+    for index in 0..4 {
+        opened
+            .harness
+            .session()
+            .commit(
+                rpi_durable::session::commit_fn(move |tx| {
+                    Box::pin(async move {
+                        let mut draft = EntryDraft::new(rpi_durable::entries::USER_ENTRY);
+                        draft.model = Some(vec![Message::User(rpi_ai::types::UserMessage {
+                            role: rpi_ai::types::UserRole::User,
+                            content: rpi_ai::types::UserContent::Text(format!("message {index}")),
+                            timestamp: index,
+                        })]);
+                        tx.append_entry(conversation_id, draft).await?;
+                        Ok(())
+                    })
+                }),
+                &context(),
+            )
+            .await
+            .expect("compaction input");
+    }
+    let task = opened
+        .harness
+        .session()
+        .commit(
+            rpi_durable::session::commit_fn(move |tx| {
+                Box::pin(async move {
+                    create_compaction(tx, conversation_id, CompactionReason::Manual, None, None)
+                        .await
+                })
+            }),
+            &context(),
+        )
+        .await
+        .expect("compaction");
+    opened.harness.resume().expect("resume compaction");
+    for _ in 0..200 {
+        if requests.lock().expect("requests").len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(requests.lock().expect("requests").len(), 1);
+    simulate_crash(&opened, task, Some(4)).await;
+    let reopened = open_with_storage(
+        Arc::clone(&opened.storage),
+        Vec::new(),
+        None,
+        test_models(Vec::new()),
+    )
+    .await;
+    let settled = reopened
+        .harness
+        .wait_for_task(task, &context())
+        .await
+        .expect("compaction settles");
+    assert!(matches!(
+        settled.record.state,
+        rpi_durable::types::TaskState::Terminal {
+            outcome: rpi_durable::types::TaskOutcome::Failed { ref error, .. }
+        } if error.detail.as_ref().and_then(|detail| detail.get("reason"))
+            == Some(&serde_json::json!("restart_limit"))
+    ));
+    assert_eq!(requests.lock().expect("requests").len(), 1);
+    reopened.harness.close(&context()).await.expect("close");
+}
+
 /// Generation partials are committed only when the host timer fires.
 #[tokio::test]
 async fn partial_progress_uses_the_harness_timer() {
@@ -626,6 +1055,7 @@ async fn partial_progress_uses_the_harness_timer() {
         progress: Some(rpi_durable::harness::types::ProgressPolicyPatch {
             partial_interval_ms: Some(500),
             output_interval_ms: None,
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -713,6 +1143,7 @@ async fn continuous_partials_commit_latest_live_state_without_rearming() {
         progress: Some(rpi_durable::harness::types::ProgressPolicyPatch {
             partial_interval_ms: Some(INTERVAL),
             output_interval_ms: None,
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -815,6 +1246,7 @@ async fn zero_partial_interval_does_not_arm_without_pending_output() {
         progress: Some(rpi_durable::harness::types::ProgressPolicyPatch {
             partial_interval_ms: Some(0),
             output_interval_ms: None,
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -1029,15 +1461,27 @@ async fn on_yield_continuation_hands_over() {
         ..Extension::default()
     };
     let opened = open(
-        vec![hooks],
+        vec![hooks, echo_extension()],
         None,
         test_models(vec![
+            Script::Message(tool_use_message("echo", "c1", serde_json::json!({}))),
             Script::Message(text_message("first", StopReason::Stop)),
+            Script::Message(tool_use_message("echo", "c2", serde_json::json!({}))),
             Script::Message(text_message("second", StopReason::Stop)),
         ]),
     )
     .await;
     let conversation = root_ready(&opened.harness).await;
+    conversation
+        .configure(
+            rpi_durable::harness::AgentChange {
+                max_turns: Some(Some(2)),
+                ..Default::default()
+            },
+            &context(),
+        )
+        .await
+        .expect("maxTurns");
     let submission = submit_input(&conversation, "hi").await;
     let settled = submission.wait(&context()).await.expect("wait");
     assert!(
@@ -1048,7 +1492,7 @@ async fn on_yield_continuation_hands_over() {
         "expected Done, got {settled:?}"
     );
     let entries = entries(&conversation).await;
-    assert_eq!(assistant_texts(&entries), vec!["first", "second"]);
+    assert_eq!(assistant_texts(&entries), vec!["", "first", "", "second"]);
     let users: Vec<String> = entries
         .iter()
         .flat_map(|entry| entry.model.iter().flatten())
@@ -1353,6 +1797,288 @@ async fn dynamic_settings_source_is_read_for_each_use() {
     assert!(calls.load(Ordering::SeqCst) >= 1);
 }
 
+struct ControlledTool {
+    name: String,
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    control: ToolControl,
+}
+
+#[async_trait]
+impl ToolExecute for ControlledTool {
+    async fn execute(
+        &self,
+        _args: rpi_durable::chord::json::JsonObject,
+        api: &dyn ToolExecutionApi,
+        _context: &Context,
+    ) -> Result<ToolExecutionResult, ToolExecuteError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        api.output(self.name.as_bytes(), None).expect("output");
+        Ok(ToolExecutionResult {
+            control: Some(self.control.clone()),
+            ..Default::default()
+        })
+    }
+}
+
+fn controlled_extension(
+    name: &str,
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    control: ToolControl,
+) -> Extension {
+    Extension {
+        name: "controlled".to_string(),
+        tools: vec![ToolRegistration {
+            tool: AiTool {
+                name: name.to_string(),
+                description: name.to_string(),
+                parameters: serde_json::json!({ "type": "object", "properties": {} }),
+                constrained_sampling: None,
+            },
+            replay: ToolReplay::Safe,
+            execution_mode: None,
+            prepare_arguments: None,
+            output_limits: None,
+            structured_output_schema: None,
+            callers: None,
+            deferred: false,
+            execute: Arc::new(ControlledTool {
+                name: name.to_string(),
+                started,
+                release,
+                control,
+            }),
+        }],
+        ..Extension::default()
+    }
+}
+
+async fn queue_steering(
+    conversation: &Arc<dyn rpi_durable::harness::Conversation>,
+    content: &str,
+) -> Arc<dyn rpi_durable::harness::Submission> {
+    conversation
+        .submit(
+            rpi_durable::harness::SubmissionDraft::Input(
+                rpi_durable::harness::InputSubmissionDraft {
+                    request_id: None,
+                    content: rpi_ai::types::UserContent::Text(content.to_string()),
+                    when_busy: Some(rpi_durable::harness::WhenBusy::Steer),
+                    when_idle: None,
+                    entry: None,
+                },
+            ),
+            &context(),
+        )
+        .await
+        .expect("queue steering")
+}
+
+async fn queue_entry_write(
+    conversation: &Arc<dyn rpi_durable::harness::Conversation>,
+    entry: EntryDraft,
+) -> Arc<dyn rpi_durable::harness::Submission> {
+    conversation
+        .submit(
+            rpi_durable::harness::SubmissionDraft::Write(
+                rpi_durable::harness::WriteSubmissionDraft {
+                    request_id: None,
+                    entry,
+                },
+            ),
+            &context(),
+        )
+        .await
+        .expect("queue write")
+}
+
+#[tokio::test]
+async fn handoff_resets_before_selected_items_and_preserves_the_run() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release_tool = Arc::new(tokio::sync::Notify::new());
+    let release_answer = Arc::new(tokio::sync::Notify::new());
+    let (models, _, requests) = generation_support::test_models_with_recovery_log(vec![
+        Script::Message(tool_use_message("handoff", "c1", serde_json::json!({}))),
+        Script::GatedMessage {
+            message: text_message("after handoff", StopReason::Stop),
+            gate: Arc::clone(&release_answer),
+        },
+        Script::Message(text_message("after follow-up", StopReason::Stop)),
+    ]);
+    let opened = open(
+        vec![controlled_extension(
+            "handoff",
+            Arc::clone(&started),
+            Arc::clone(&release_tool),
+            ToolControl {
+                handoff: Some("new context".to_string()),
+                ..Default::default()
+            },
+        )],
+        None,
+        models,
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let running = submit_input(&conversation, "hi").await;
+    started.notified().await;
+    let initial_task = run_task_id(&opened, conversation.id()).await.expect("run");
+    let steering = queue_steering(&conversation, "steer").await;
+    let mut passive = EntryDraft::new("test.write");
+    passive.model = Some(vec![Message::User(rpi_ai::types::UserMessage {
+        role: rpi_ai::types::UserRole::User,
+        content: rpi_ai::types::UserContent::Text("passive".to_string()),
+        timestamp: 0,
+    })]);
+    let write = queue_entry_write(&conversation, passive).await;
+    let follow_up = queue_follow_up(&conversation, "follow up").await;
+    release_tool.notify_one();
+    for _ in 0..200 {
+        if requests.lock().expect("requests").len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(requests.lock().expect("requests").len(), 2);
+    let successor = run_task_id(&opened, conversation.id())
+        .await
+        .expect("handed run");
+    assert_ne!(
+        successor, initial_task,
+        "the generation is replaced, not the run's history"
+    );
+    release_answer.notify_one();
+    for submission in [&running, &steering, &follow_up] {
+        let settled = submission.wait(&context()).await.expect("settled input");
+        assert_eq!(settled.status(), "done");
+    }
+    write.wait(&context()).await.expect("write");
+    let entries = entries(&conversation).await;
+    let position = |kind: &str, text: &str| {
+        entries
+            .iter()
+            .position(|entry| {
+                entry.kind == kind
+                    && (text.is_empty()
+                        || entry.model.iter().flatten().any(|message| {
+                            serde_json::to_string(message)
+                                .unwrap_or_default()
+                                .contains(text)
+                        }))
+            })
+            .unwrap_or_else(|| panic!("missing {kind} containing {text}"))
+    };
+    let reset = position(rpi_durable::entries::RESET_ENTRY, "new context");
+    let passive = position("test.write", "");
+    let steer = position(rpi_durable::entries::USER_ENTRY, "steer");
+    let follow = position(rpi_durable::entries::USER_ENTRY, "follow up");
+    assert!(
+        reset < passive && passive < steer && steer < follow,
+        "reset={reset} passive={passive} steer={steer} follow={follow}: {entries:#?}"
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.kind == "test.write")
+            .count(),
+        1
+    );
+    assert_eq!(requests.lock().expect("requests").len(), 3);
+    opened.harness.close(&context()).await.expect("close");
+}
+
+#[tokio::test]
+async fn a_selected_reset_settles_the_old_run_unanswered() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release_tool = Arc::new(tokio::sync::Notify::new());
+    let (models, _, requests) = generation_support::test_models_with_recovery_log(vec![
+        Script::Message(tool_use_message("plain", "c1", serde_json::json!({}))),
+        Script::Message(text_message("after reset", StopReason::Stop)),
+    ]);
+    let opened = open(
+        vec![controlled_extension(
+            "plain",
+            Arc::clone(&started),
+            Arc::clone(&release_tool),
+            ToolControl::default(),
+        )],
+        None,
+        models,
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let running = submit_input(&conversation, "hi").await;
+    started.notified().await;
+    let steering = queue_steering(&conversation, "new start").await;
+    let mut reset = EntryDraft::new(rpi_durable::entries::RESET_ENTRY);
+    reset.head = Some(rpi_durable::session::EntryHead::This);
+    queue_entry_write(&conversation, reset).await;
+    release_tool.notify_one();
+    let settled = running.wait(&context()).await.expect("old run");
+    assert!(matches!(
+        input_status(&settled),
+        Some(InputSubmissionStatus::Unanswered { reason, .. }) if reason == "reset"
+    ));
+    assert_eq!(
+        steering.wait(&context()).await.expect("new run").status(),
+        "done"
+    );
+    assert!(
+        entries(&conversation)
+            .await
+            .iter()
+            .any(|entry| entry.kind == rpi_durable::entries::RESET_ENTRY)
+    );
+    assert_eq!(requests.lock().expect("requests").len(), 2);
+    opened.harness.close(&context()).await.expect("close");
+}
+
+#[tokio::test]
+async fn only_terminate_ends_the_tool_run_done() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release_tool = Arc::new(tokio::sync::Notify::new());
+    let (models, _, requests) =
+        generation_support::test_models_with_recovery_log(vec![Script::Message(tool_use_message(
+            "stop",
+            "c1",
+            serde_json::json!({}),
+        ))]);
+    let opened = open(
+        vec![controlled_extension(
+            "stop",
+            Arc::clone(&started),
+            Arc::clone(&release_tool),
+            ToolControl {
+                terminate: Some(true),
+                handoff: Some("last reset".to_string()),
+                ..Default::default()
+            },
+        )],
+        None,
+        models,
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let running = submit_input(&conversation, "hi").await;
+    started.notified().await;
+    release_tool.notify_one();
+    assert_eq!(
+        running.wait(&context()).await.expect("done").status(),
+        "done"
+    );
+    assert_eq!(requests.lock().expect("requests").len(), 1);
+    assert!(run_task_id(&opened, conversation.id()).await.is_none());
+    assert!(
+        entries(&conversation)
+            .await
+            .iter()
+            .any(|entry| entry.kind == rpi_durable::entries::RESET_ENTRY)
+    );
+    opened.harness.close(&context()).await.expect("close");
+}
+
 // ---------------------------------------------------------------------------
 // afterFailedRun (V18-06 FR-H R4)
 // ---------------------------------------------------------------------------
@@ -1414,6 +2140,7 @@ async fn queue_follow_up(
                 request_id: None,
                 content: rpi_ai::types::UserContent::Text(content.to_string()),
                 when_busy: Some(WhenBusy::FollowUp),
+                when_idle: None,
                 entry: None,
             }),
             &context(),

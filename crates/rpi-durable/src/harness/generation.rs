@@ -40,7 +40,8 @@ use crate::harness::compaction::{
     create_compaction, estimate_context, reasoning_level, request_stream_options, select_cut,
 };
 use crate::harness::inbox::{
-    BoundaryAt, INBOX_DOC, InboxItem, InboxState, QueueModes, apply_boundary, prepare_boundary,
+    BoundaryAt, INBOX_DOC, InboxItem, InboxState, QueueModes, apply_boundary, has_queued_reset,
+    prepare_boundary,
 };
 use crate::harness::json::assign_json;
 use crate::harness::live::{
@@ -66,6 +67,16 @@ use crate::types::{EntryQuery, JoinPolicy, TaskOutcome, TaskOutcomeError};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationInput {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeferredPoll {
+    model: ModelRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking_level: Option<ModelThinkingLevel>,
+    cutoff: EntryId,
+    handle: rpi_ai::types::DeferredHandle,
+}
 
 /// Durable generation checkpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,6 +124,9 @@ enum GenerationCheckpoint {
         compacted: Option<TaskId>,
         /// Wall-clock time of the next attempt.
         until: f64,
+        /// Retry the same provider response instead of issuing a new request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        poll: Option<DeferredPoll>,
     },
     /// Polling a provider-side deferred response.
     #[serde(rename = "poll")]
@@ -124,6 +138,9 @@ enum GenerationCheckpoint {
         compacted: Option<TaskId>,
         /// Resolved model.
         model: ModelRef,
+        /// Absent only in checkpoints written before thinking levels were retained.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking_level: Option<ModelThinkingLevel>,
         /// Newest entry included in the request.
         cutoff: EntryId,
         /// Provider handle persisted across restarts.
@@ -142,6 +159,14 @@ enum GenerationCheckpoint {
         /// Calls of a sequential round not started yet, in call order.
         pending: Vec<String>,
     },
+    /// Ask after-run hooks for children after the answer is durable.
+    #[serde(rename = "finish")]
+    Finish {
+        run: crate::harness::types::RunSummary,
+    },
+    /// Wait for after-run children before the final boundary.
+    #[serde(rename = "drain")]
+    Drain { answer: EntryId, tasks: Vec<TaskId> },
 }
 
 /// What classification needs from the request that produced a message.
@@ -149,6 +174,7 @@ struct Request {
     attempt: u64,
     compacted: Option<TaskId>,
     model: ModelRef,
+    thinking_level: Option<ModelThinkingLevel>,
     cutoff: EntryId,
     /// Previous poll time, used to keep repeated polls strictly increasing.
     poll_at: Option<f64>,
@@ -181,7 +207,20 @@ impl TaskDefinition for GenerationTask {
     }
 
     fn version(&self) -> u64 {
-        1
+        2
+    }
+
+    fn migrate(
+        &self,
+        input: JsonValue,
+        checkpoint: JsonValue,
+        from_version: u64,
+    ) -> Option<crate::harness::types::Migration> {
+        (from_version < 2).then_some(crate::harness::types::Migration { input, checkpoint })
+    }
+
+    fn has_migration(&self) -> bool {
+        true
     }
 
     fn initial(&self) -> JsonValue {
@@ -195,13 +234,29 @@ impl TaskDefinition for GenerationTask {
         runtime: &dyn TaskRuntime,
         context: &Context,
     ) -> SessionResult<()> {
+        if runtime.signal().is_cancelled() {
+            return Err(SessionError::Aborted);
+        }
         let checkpoint = parse_checkpoint(task.checkpoint())?;
+        if cut_off_too_often(&task, runtime) {
+            match &checkpoint {
+                GenerationCheckpoint::Finish { run } => {
+                    return end_answered_cut_off(&task, runtime, run.answer, context).await;
+                }
+                GenerationCheckpoint::Drain { answer, .. } => {
+                    return end_answered_cut_off(&task, runtime, *answer, context).await;
+                }
+                _ => return end_cut_off(&task, runtime, context).await,
+            }
+        }
         match phase {
             "prepare" => prepare(&task, runtime, context, checkpoint).await,
-            "request" => request(runtime, context, checkpoint).await,
+            "request" => request(&task, runtime, context, checkpoint).await,
             "retry" => retry(runtime, context, checkpoint).await,
-            "poll" => poll(runtime, context, checkpoint).await,
+            "poll" => poll(&task, runtime, context, checkpoint).await,
             "tools" => tools(runtime, context, checkpoint).await,
+            "finish" => finish(runtime, context, checkpoint).await,
+            "drain" => drain(runtime, context, checkpoint).await,
             _ => Ok(()),
         }
     }
@@ -213,6 +268,12 @@ impl TaskDefinition for GenerationTask {
         context: &Context,
     ) -> SessionResult<()> {
         let checkpoint = parse_checkpoint(task.checkpoint())?;
+        if let GenerationCheckpoint::Finish { run } = &checkpoint {
+            return end_answered_run(runtime, run.answer, context).await;
+        }
+        if let GenerationCheckpoint::Drain { answer, .. } = &checkpoint {
+            return end_answered_run(runtime, *answer, context).await;
+        }
         if let GenerationCheckpoint::Poll {
             model: reference,
             handle,
@@ -253,9 +314,19 @@ impl TaskDefinition for GenerationTask {
                     .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
                     .await?;
                 convert_partial(tx, &live).await?;
+                let slots = read_state::<LiveState>(&live)?.tools.unwrap_or_default();
                 for call in &unstarted {
-                    let result =
-                        harness_error("aborted", &format!("Tool {} was aborted", call.name));
+                    let unoffered = slots.iter().any(|slot| {
+                        slot.progress.call_id == call.id && slot.unoffered == Some(true)
+                    });
+                    let result = if unoffered {
+                        harness_error(
+                            "tool_unavailable",
+                            &format!("Tool {} is not available", call.name),
+                        )
+                    } else {
+                        harness_error("aborted", &format!("Tool {} was aborted", call.name))
+                    };
                     append_tool_result(tx, conversation_id, call, &result, now, None).await?;
                 }
                 end_run(
@@ -380,6 +451,15 @@ async fn prepare(
     }
     let conversation_id = runtime.conversation_id();
     let view = runtime.context(conversation_id, context, None).await?;
+    if !view
+        .messages
+        .iter()
+        .rev()
+        .find(|message| !matches!(message, Message::System(_)))
+        .is_some_and(|message| matches!(message, Message::User(_) | Message::ToolResult(_)))
+    {
+        return fail_nothing_to_answer(runtime, context).await;
+    }
     let shown = replay_sections(&view.messages);
     let shown: BTreeMap<String, String> = shown
         .into_iter()
@@ -396,7 +476,11 @@ async fn prepare(
                 crate::harness::types::ReportInfo::new(
                     crate::harness::types::ReportKind::HostError,
                 )
-                .with_task(runtime.task_id(), GENERATION_TASK_NAME)
+                .with_task(crate::harness::types::ReportTask::new(
+                    runtime.task_id(),
+                    GENERATION_TASK_NAME,
+                    runtime.conversation_id(),
+                ))
                 .with_callback("env"),
             );
             None
@@ -544,10 +628,14 @@ fn threshold_compaction(
 // ---------------------------------------------------------------------------
 
 async fn request(
+    task: &RunningTask,
     runtime: &dyn TaskRuntime,
     context: &Context,
     checkpoint: GenerationCheckpoint,
 ) -> SessionResult<()> {
+    if task.record.restarts.is_some() {
+        return interrupted(runtime, checkpoint, context).await;
+    }
     let (attempt, compacted, reference, thinking_level, stream_options, cutoff) = match checkpoint {
         GenerationCheckpoint::Request {
             attempt,
@@ -613,7 +701,7 @@ async fn request(
     }
     let session_id = runtime.provider_session_id(context).await?;
     let stream = request_stream_options(&stream_options, runtime.signal(), session_id);
-    let simple = SimpleStreamOptions {
+    let mut simple = SimpleStreamOptions {
         stream,
         reasoning: reasoning_level(thinking_level),
         thinking_budgets: None,
@@ -624,11 +712,13 @@ async fn request(
         messages,
         tools: None,
     };
+    simple.stream.request.on_payload = provider_payload(runtime, &agent, &model, context);
     let message = stream_response(runtime, &model, model_context, simple, attempt, context).await?;
     let request = Request {
         attempt,
         compacted,
         model: reference,
+        thinking_level: Some(thinking_level),
         cutoff,
         poll_at: None,
         messages: view.messages,
@@ -636,17 +726,70 @@ async fn request(
     classify(runtime, request, message, context).await
 }
 
+fn provider_payload(
+    runtime: &dyn TaskRuntime,
+    agent: &crate::harness::types::Agent,
+    model: &rpi_ai::types::Model,
+    context: &Context,
+) -> Option<rpi_ai::types::OnPayloadCallback> {
+    let handlers = agent_hooks(agent, GENERATION_TASK_NAME);
+    if handlers.is_empty() {
+        return None;
+    }
+    let runtime = runtime.handle();
+    let model = model.clone();
+    let context = context.clone();
+    Some(Arc::new(move |payload, _provider_model| {
+        let handlers = handlers.clone();
+        let runtime = Arc::clone(&runtime);
+        let model = model.clone();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut payload = payload;
+            for handler in handlers {
+                let HookHandlers::Generation(hooks) = handler else {
+                    continue;
+                };
+                let api = crate::harness::types::RuntimeHookApi {
+                    runtime: runtime.as_ref(),
+                };
+                let request = crate::harness::types::ProviderRequest {
+                    model: model.clone(),
+                    payload: payload.clone(),
+                };
+                if let Some(replaced) = crate::harness::types::contain_hook(
+                    hooks.before_provider_request(request, &api, &context),
+                    runtime.as_ref(),
+                    "beforeProviderRequest",
+                    "pi.generation",
+                )
+                .await
+                .flatten()
+                {
+                    payload = replaced.payload;
+                }
+            }
+            Some(payload)
+        })
+    }))
+}
+
 const DEFAULT_POLL_AFTER_MS: u64 = 5_000;
 
 async fn poll(
+    task: &RunningTask,
     runtime: &dyn TaskRuntime,
     context: &Context,
     checkpoint: GenerationCheckpoint,
 ) -> SessionResult<()> {
+    if task.record.restarts.is_some() {
+        return interrupted(runtime, checkpoint, context).await;
+    }
     let GenerationCheckpoint::Poll {
         attempt,
         compacted,
         model: reference,
+        thinking_level,
         cutoff,
         handle,
         poll_at,
@@ -659,6 +802,7 @@ async fn poll(
             attempt,
             compacted,
             model: reference,
+            thinking_level,
             cutoff,
             handle,
             poll_at,
@@ -699,6 +843,7 @@ async fn poll(
         attempt,
         compacted,
         model: reference,
+        thinking_level,
         cutoff,
         poll_at: Some(poll_at),
         messages: view.messages,
@@ -813,6 +958,264 @@ async fn commit_partial(
             Ok(None)
         })
     });
+    runtime
+        .commit_with_options(
+            change,
+            context,
+            crate::session::CommitOptions {
+                persistence: Some(crate::session::CommitPersistence::Deferred { within_ms: None }),
+            },
+        )
+        .await
+}
+
+fn cut_off_too_often(task: &RunningTask, runtime: &dyn TaskRuntime) -> bool {
+    runtime
+        .settings()
+        .restart_limit
+        .limit()
+        .is_some_and(|limit| task.record.restarts.unwrap_or(0) as u64 >= limit)
+}
+
+async fn end_answered_cut_off(
+    task: &RunningTask,
+    runtime: &dyn TaskRuntime,
+    answer: EntryId,
+    context: &Context,
+) -> SessionResult<()> {
+    let restarts = task.record.restarts.unwrap_or(0);
+    runtime.report_info(
+        crate::harness::types::ReportInfo::new(crate::harness::types::ReportKind::TaskInterrupted)
+            .with_task(crate::harness::types::ReportTask::new(
+                task.id(),
+                GENERATION_TASK_NAME,
+                task.record.conversation_id,
+            ))
+            .with_reason("restart_limit")
+            .with_restarts(restarts),
+    );
+    let conversation_id = runtime.conversation_id();
+    let task_id = runtime.task_id();
+    let change: TaskCommitFn = Arc::new(move |tx, _current| {
+        Box::pin(async move {
+            let live = tx
+                .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
+                .await?;
+            end_run(tx, &live, task_id, SubmissionSettlement::Done { answer }).await?;
+            Ok(Some(NextTaskState::Terminal {
+                outcome: TaskOutcome::Completed {
+                    result: serde_json::json!({ "entryId": answer }),
+                },
+            }))
+        })
+    });
+    runtime.commit(change, context).await
+}
+
+async fn end_cut_off(
+    task: &RunningTask,
+    runtime: &dyn TaskRuntime,
+    context: &Context,
+) -> SessionResult<()> {
+    let phase = task.phase().unwrap_or("unknown").to_string();
+    let restarts = task.record.restarts.unwrap_or(0);
+    let text = format!("The generation was interrupted {restarts} times in its {phase} phase");
+    let salvage = runtime
+        .settings()
+        .restart_limit
+        .limit()
+        .is_some_and(|limit| restarts as u64 <= limit);
+    runtime.report_info(
+        crate::harness::types::ReportInfo::new(crate::harness::types::ReportKind::TaskInterrupted)
+            .with_task(crate::harness::types::ReportTask::new(
+                task.id(),
+                GENERATION_TASK_NAME,
+                task.record.conversation_id,
+            ))
+            .with_reason("restart_limit")
+            .with_restarts(restarts),
+    );
+    let conversation_id = runtime.conversation_id();
+    let task_id = runtime.task_id();
+    let settings = runtime.settings();
+    let modes = QueueModes {
+        steering_mode: settings.steering_mode,
+        follow_up_mode: settings.follow_up_mode,
+    };
+    let after = settings.after_failed_run;
+    let now = runtime.now()?;
+    let change: TaskCommitFn = Arc::new(move |tx, _current| {
+        let text = text.clone();
+        Box::pin(async move {
+            let prepared = if after == AfterFailedRun::Continue {
+                Some(prepare_boundary(tx, conversation_id, modes).await?)
+            } else {
+                None
+            };
+            let live = tx
+                .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
+                .await?;
+            if salvage {
+                convert_partial(tx, &live).await?;
+            }
+            end_run(
+                tx,
+                &live,
+                task_id,
+                SubmissionSettlement::Unanswered {
+                    reason: "restart_limit".to_string(),
+                    detail: Some(JsonValue::String(text.clone())),
+                },
+            )
+            .await?;
+            apply_after_failed_run(tx, conversation_id, &live, after, modes, now, prepared).await?;
+            Ok(Some(NextTaskState::Terminal {
+                outcome: TaskOutcome::Failed {
+                    error: TaskOutcomeError {
+                        message: text,
+                        detail: Some(serde_json::json!({ "reason": "restart_limit" })),
+                    },
+                    result: None,
+                },
+            }))
+        })
+    });
+    runtime.commit(change, context).await
+}
+
+async fn interrupted(
+    runtime: &dyn TaskRuntime,
+    checkpoint: GenerationCheckpoint,
+    context: &Context,
+) -> SessionResult<()> {
+    let (attempt, compacted) = match &checkpoint {
+        GenerationCheckpoint::Request {
+            attempt, compacted, ..
+        }
+        | GenerationCheckpoint::Poll {
+            attempt, compacted, ..
+        } => (*attempt, *compacted),
+        _ => return Ok(()),
+    };
+    let polled = match checkpoint {
+        GenerationCheckpoint::Poll {
+            model,
+            thinking_level,
+            cutoff,
+            handle,
+            ..
+        } => Some(DeferredPoll {
+            model,
+            thinking_level,
+            cutoff,
+            handle,
+        }),
+        GenerationCheckpoint::Request { .. } => None,
+        _ => return Ok(()),
+    };
+    let policy = runtime.settings().retry;
+    let retry = policy.enabled && attempt <= policy.max_retries as u64;
+    let until = if retry {
+        runtime.now()?
+            + retry_delay_ms(
+                policy.base_delay_ms,
+                policy.max_agent_delay_ms,
+                attempt as u32,
+            ) as f64
+    } else {
+        0.0
+    };
+    let text = if polled.is_some() {
+        format!("The host stopped while the deferred answer was fetched, on attempt {attempt}")
+    } else {
+        format!("The host stopped while the model was answering, on attempt {attempt}")
+    };
+    if !retry
+        && let Some(polled) = &polled
+        && let Some(model) = runtime
+            .models()
+            .get_model(&polled.model.provider, &polled.model.model_id)
+    {
+        let options = ModelsDeferredCancelOptions::from(rpi_ai::types::StreamOptions {
+            request: ProviderRequestOptions {
+                signal: Some(runtime.signal()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        if let Err(error) = runtime
+            .models()
+            .cancel_deferred(&model, &polled.handle, Some(options))
+            .await
+        {
+            let _ = runtime.report(error.message);
+        }
+    }
+    let conversation_id = runtime.conversation_id();
+    let task_id = runtime.task_id();
+    let settings = runtime.settings();
+    let after = settings.after_failed_run;
+    let modes = QueueModes {
+        steering_mode: settings.steering_mode,
+        follow_up_mode: settings.follow_up_mode,
+    };
+    let now = runtime.now()?;
+    let change: TaskCommitFn = Arc::new(move |tx, _current| {
+        let text = text.clone();
+        let polled = polled.clone();
+        Box::pin(async move {
+            let prepared = if !retry && after == AfterFailedRun::Continue {
+                Some(prepare_boundary(tx, conversation_id, modes).await?)
+            } else {
+                None
+            };
+            let live = tx
+                .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
+                .await?;
+            convert_partial(tx, &live).await?;
+            if retry {
+                let mut state: LiveState = read_state(&live)?;
+                state.generation = Some(crate::harness::live::LiveGeneration {
+                    attempt,
+                    retry: Some(crate::harness::live::RetryStatus {
+                        at: until,
+                        error: text,
+                    }),
+                    ..Default::default()
+                });
+                write_state(&live, &state)?;
+                return Ok(Some(NextTaskState::Sleeping {
+                    checkpoint: to_checkpoint(GenerationCheckpoint::Retry {
+                        attempt,
+                        compacted,
+                        until,
+                        poll: polled,
+                    }),
+                    until,
+                }));
+            }
+            end_run(
+                tx,
+                &live,
+                task_id,
+                SubmissionSettlement::Unanswered {
+                    reason: "interrupted".to_string(),
+                    detail: Some(JsonValue::String(text.clone())),
+                },
+            )
+            .await?;
+            apply_after_failed_run(tx, conversation_id, &live, after, modes, now, prepared).await?;
+            Ok(Some(NextTaskState::Terminal {
+                outcome: TaskOutcome::Failed {
+                    error: TaskOutcomeError {
+                        message: text,
+                        detail: Some(serde_json::json!({ "reason": "interrupted" })),
+                    },
+                    result: None,
+                },
+            }))
+        })
+    });
     runtime.commit(change, context).await
 }
 
@@ -825,12 +1228,13 @@ async fn retry(
     context: &Context,
     checkpoint: GenerationCheckpoint,
 ) -> SessionResult<()> {
-    let (attempt, compacted, until) = match checkpoint {
+    let (attempt, compacted, until, poll) = match checkpoint {
         GenerationCheckpoint::Retry {
             attempt,
             compacted,
             until,
-        } => (attempt, compacted, until),
+            poll,
+        } => (attempt, compacted, until, poll),
         _ => return Ok(()),
     };
     if until > runtime.now()? {
@@ -838,31 +1242,53 @@ async fn retry(
             attempt,
             compacted,
             until,
+            poll,
         });
         runtime.sleep_until(until, checkpoint, context).await?;
         return Ok(());
     }
     let conversation_id = runtime.conversation_id();
     let next = attempt + 1;
+    let retry_poll_at = runtime.now()?;
     let change: TaskCommitFn = Arc::new(move |tx, _current| {
+        let poll = poll.clone();
         Box::pin(async move {
             let live = tx
                 .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
                 .await?;
-            let mut state: LiveState = crate::harness::types::read_state(&live)?;
-            state.generation = Some(crate::harness::live::LiveGeneration {
-                attempt: next,
-                ..Default::default()
-            });
-            crate::harness::types::write_state(&live, &state)?;
-            Ok(Some(NextTaskState::Running {
-                checkpoint: to_checkpoint(GenerationCheckpoint::Prepare {
+            let checkpoint = if let Some(polled) = poll {
+                let poll_at = retry_poll_at;
+                let mut state: LiveState = crate::harness::types::read_state(&live)?;
+                state.generation = Some(crate::harness::live::LiveGeneration {
+                    attempt: next,
+                    deferred: Some(crate::harness::live::DeferredStatus { poll_at }),
+                    ..Default::default()
+                });
+                crate::harness::types::write_state(&live, &state)?;
+                to_checkpoint(GenerationCheckpoint::Poll {
+                    attempt: next,
+                    compacted,
+                    model: polled.model,
+                    thinking_level: polled.thinking_level,
+                    cutoff: polled.cutoff,
+                    handle: polled.handle,
+                    poll_at,
+                })
+            } else {
+                let mut state: LiveState = crate::harness::types::read_state(&live)?;
+                state.generation = Some(crate::harness::live::LiveGeneration {
+                    attempt: next,
+                    ..Default::default()
+                });
+                crate::harness::types::write_state(&live, &state)?;
+                to_checkpoint(GenerationCheckpoint::Prepare {
                     attempt: next,
                     compacted,
                     overflow: None,
                     threshold: None,
-                }),
-            }))
+                })
+            };
+            Ok(Some(NextTaskState::Running { checkpoint }))
         })
     });
     runtime.commit(change, context).await
@@ -875,7 +1301,7 @@ async fn retry(
 async fn classify(
     runtime: &dyn TaskRuntime,
     request: Request,
-    message: AssistantMessage,
+    mut message: AssistantMessage,
     context: &Context,
 ) -> SessionResult<()> {
     if runtime.signal().is_cancelled() {
@@ -887,10 +1313,14 @@ async fn classify(
         attempt,
         compacted,
         model: reference,
+        thinking_level,
         cutoff,
         poll_at: previous_poll_at,
         messages,
     } = request;
+    if let Some(thinking_level) = thinking_level {
+        message.thinking_level = Some(thinking_level);
+    }
     if message.stop_reason == StopReason::Deferred
         && let Some(handle) = message.deferred.clone()
     {
@@ -905,6 +1335,7 @@ async fn classify(
             attempt,
             compacted,
             model: reference,
+            thinking_level,
             cutoff,
             handle: *handle,
             poll_at,
@@ -1063,6 +1494,7 @@ async fn classify(
                         attempt,
                         compacted,
                         until,
+                        poll: None,
                     }),
                 }));
             }
@@ -1128,6 +1560,9 @@ async fn answer(
     };
     let now = runtime.now()?;
     let message = message.clone();
+    let after_run = agent_hooks(&agent, GENERATION_TASK_NAME)
+        .iter()
+        .any(|handlers| matches!(handlers, HookHandlers::Generation(_)));
     let change: TaskCommitFn = Arc::new(move |tx, _current| {
         let message = message.clone();
         let continuation = continuation.clone();
@@ -1137,11 +1572,15 @@ async fn answer(
                 .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
                 .await?;
             let entry = append_assistant(tx, conversation_id, &message).await?;
-            let result = apply_boundary(tx, boundary, BoundaryAt::Final, now).await?;
-            if let Some(continue_input) = continuation
-                && result.users.is_empty()
-                && !result.reset
-            {
+            let queued: InboxState = read_state(&boundary.inbox)?;
+            let takes_continuation = continuation.is_some()
+                && !queued.items.iter().any(|item| {
+                    matches!(item, InboxItem::Steer { .. } | InboxItem::FollowUp { .. })
+                })
+                && !has_queued_reset(&queued.items);
+            if takes_continuation {
+                let continue_input = continuation.expect("checked continuation");
+                let _ = apply_boundary(tx, boundary, BoundaryAt::Final, now).await?;
                 let mut draft = EntryDraft::new(USER_ENTRY);
                 draft.model = Some(vec![Message::User(UserMessage {
                     role: UserRole::User,
@@ -1158,6 +1597,9 @@ async fn answer(
                 .await?;
                 hand_over(&live, task_id, next)?;
                 let mut state: LiveState = crate::harness::types::read_state(&live)?;
+                if let Some(run) = state.run.as_mut() {
+                    run.turns = 0;
+                }
                 state.generation = None;
                 crate::harness::types::write_state(&live, &state)?;
                 return Ok(Some(NextTaskState::Terminal {
@@ -1166,6 +1608,31 @@ async fn answer(
                     },
                 }));
             }
+            if after_run {
+                let mut state: LiveState = crate::harness::types::read_state(&live)?;
+                if let Some(run) = state.run.as_mut()
+                    && run.task_id == task_id
+                {
+                    for id in std::mem::take(&mut run.inputs) {
+                        tx.settle_submission(id, SubmissionSettlement::Done { answer: entry.id })?;
+                    }
+                    let summary = crate::harness::types::RunSummary {
+                        reason: crate::harness::types::RunEndReason::Answer,
+                        first: Some(run.first.unwrap_or(entry.id)),
+                        answer: entry.id,
+                        last: entry.id,
+                    };
+                    run.after_run = Some(crate::harness::live::AfterRun { tasks: None });
+                    state.generation = None;
+                    state.tools = None;
+                    state.nested_tools = None;
+                    crate::harness::types::write_state(&live, &state)?;
+                    return Ok(Some(NextTaskState::Running {
+                        checkpoint: to_checkpoint(GenerationCheckpoint::Finish { run: summary }),
+                    }));
+                }
+            }
+            let result = apply_boundary(tx, boundary, BoundaryAt::Final, now).await?;
             end_run(
                 tx,
                 &live,
@@ -1174,11 +1641,156 @@ async fn answer(
             )
             .await?;
             if !result.users.is_empty() {
-                start_run(tx, conversation_id, &live, result.users).await?;
+                start_run(tx, conversation_id, &live, result.users, result.first).await?;
             }
             Ok(Some(NextTaskState::Terminal {
                 outcome: TaskOutcome::Completed {
                     result: serde_json::json!({ "entryId": entry.id }),
+                },
+            }))
+        })
+    });
+    runtime.commit(change, context).await
+}
+
+async fn finish(
+    runtime: &dyn TaskRuntime,
+    context: &Context,
+    checkpoint: GenerationCheckpoint,
+) -> SessionResult<()> {
+    let GenerationCheckpoint::Finish { run } = checkpoint else {
+        return Ok(());
+    };
+    let agent = runtime.agent(context).await?;
+    let mut prepared = Vec::new();
+    for handlers in agent_hooks(&agent, GENERATION_TASK_NAME) {
+        let HookHandlers::Generation(hooks) = handlers else {
+            continue;
+        };
+        let api = crate::harness::types::RuntimeHookApi { runtime };
+        let Some(requested) = crate::harness::types::contain_hook(
+            hooks.after_run(run.clone(), &api, context),
+            runtime,
+            "afterRun",
+            "pi.generation",
+        )
+        .await
+        .flatten() else {
+            continue;
+        };
+        for requested in requested.tasks {
+            let name = requested.task.name();
+            if name.starts_with("pi.") {
+                let _ = runtime.report(format!(
+                    "An afterRun hook cannot start the built-in task {name}"
+                ));
+                continue;
+            }
+            let Some(definition) = runtime.registry().task(name) else {
+                let _ = runtime.report(format!("Task {name} is not installed"));
+                continue;
+            };
+            let checkpoint = definition.initial();
+            if checkpoint
+                .get("phase")
+                .and_then(JsonValue::as_str)
+                .is_none()
+            {
+                let _ = runtime.report(format!("Task {name} has no initial phase"));
+                continue;
+            }
+            prepared.push((definition, requested.input, checkpoint));
+        }
+    }
+    if prepared.is_empty() {
+        return end_answered_run(runtime, run.answer, context).await;
+    }
+    let conversation_id = runtime.conversation_id();
+    let task_id = runtime.task_id();
+    let answer = run.answer;
+    let change: TaskCommitFn = Arc::new(move |tx, _current| {
+        let prepared = prepared.clone();
+        Box::pin(async move {
+            let mut tasks = Vec::new();
+            for (definition, input, checkpoint) in prepared {
+                tasks.push(
+                    tx.create_task(TaskCreate {
+                        kind: definition.name().to_string(),
+                        version: definition.version(),
+                        input,
+                        checkpoint,
+                        ownership: TaskOwnership::Task(task_id),
+                        conversation_id: Some(conversation_id),
+                        background: false,
+                        abandon_on_restart: false,
+                        trace: crate::session::TaskTrace::Inherit,
+                        links: Vec::new(),
+                    })
+                    .await?,
+                );
+            }
+            let live = tx
+                .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
+                .await?;
+            let mut state: LiveState = read_state(&live)?;
+            if let Some(run) = state.run.as_mut()
+                && run.task_id == task_id
+                && let Some(after_run) = run.after_run.as_mut()
+            {
+                after_run.tasks = Some(tasks.clone());
+            }
+            write_state(&live, &state)?;
+            Ok(Some(NextTaskState::Waiting {
+                checkpoint: to_checkpoint(GenerationCheckpoint::Drain {
+                    answer,
+                    tasks: tasks.clone(),
+                }),
+                on: tasks,
+                policy: JoinPolicy::AllSettled,
+            }))
+        })
+    });
+    runtime.commit(change, context).await
+}
+
+async fn drain(
+    runtime: &dyn TaskRuntime,
+    context: &Context,
+    checkpoint: GenerationCheckpoint,
+) -> SessionResult<()> {
+    let GenerationCheckpoint::Drain { answer, .. } = checkpoint else {
+        return Ok(());
+    };
+    end_answered_run(runtime, answer, context).await
+}
+
+async fn end_answered_run(
+    runtime: &dyn TaskRuntime,
+    answer: EntryId,
+    context: &Context,
+) -> SessionResult<()> {
+    let conversation_id = runtime.conversation_id();
+    let task_id = runtime.task_id();
+    let settings = runtime.settings();
+    let modes = QueueModes {
+        steering_mode: settings.steering_mode,
+        follow_up_mode: settings.follow_up_mode,
+    };
+    let now = runtime.now()?;
+    let change: TaskCommitFn = Arc::new(move |tx, _current| {
+        Box::pin(async move {
+            let boundary = prepare_boundary(tx, conversation_id, modes).await?;
+            let live = tx
+                .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
+                .await?;
+            let result = apply_boundary(tx, boundary, BoundaryAt::Final, now).await?;
+            end_run(tx, &live, task_id, SubmissionSettlement::Done { answer }).await?;
+            if !result.users.is_empty() {
+                start_run(tx, conversation_id, &live, result.users, result.first).await?;
+            }
+            Ok(Some(NextTaskState::Terminal {
+                outcome: TaskOutcome::Completed {
+                    result: serde_json::json!({ "entryId": answer }),
                 },
             }))
         })
@@ -1218,7 +1830,6 @@ async fn start_tool_round(
                     .and_then(|tool| tool.execution_mode)
                     == Some(ToolExecutionMode::Sequential)
         });
-    let now = runtime.now()? as i64;
     let message = message.clone();
     let calls = calls.to_vec();
     let change: TaskCommitFn = Arc::new(move |tx, _current| {
@@ -1234,26 +1845,6 @@ async fn start_tool_round(
             let mut tool_tasks: Vec<TaskId> = Vec::new();
             let mut pending: Vec<String> = Vec::new();
             for call in &calls {
-                if !offered.contains(&call.name) {
-                    let unavailable = harness_error(
-                        "tool_unavailable",
-                        &format!("Tool {} is not available", call.name),
-                    );
-                    let result =
-                        append_tool_result(tx, conversation_id, call, &unavailable, now, None)
-                            .await?;
-                    slots.push(ToolSlot {
-                        progress: SlotProgress {
-                            call_id: call.id.clone(),
-                            name: call.name.clone(),
-                            status: ToolSlotStatus::Done,
-                            ..Default::default()
-                        },
-                        entry: Some(result.id),
-                        ..Default::default()
-                    });
-                    continue;
-                }
                 if sequential && !tool_tasks.is_empty() {
                     pending.push(call.id.clone());
                     slots.push(ToolSlot {
@@ -1263,12 +1854,32 @@ async fn start_tool_round(
                             status: ToolSlotStatus::Pending,
                             ..Default::default()
                         },
+                        unoffered: (!offered.contains(&call.name)).then_some(true),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+                if !offered.contains(&call.name) {
+                    let tool_task =
+                        create_tool_task(tx, conversation_id, task_id, entry.id, &call.id, true)
+                            .await?;
+                    tool_tasks.push(tool_task);
+                    slots.push(ToolSlot {
+                        progress: SlotProgress {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            status: ToolSlotStatus::Pending,
+                            ..Default::default()
+                        },
+                        task_id: Some(tool_task),
+                        unoffered: Some(true),
                         ..Default::default()
                     });
                     continue;
                 }
                 let tool_task =
-                    create_tool_task(tx, conversation_id, task_id, entry.id, &call.id).await?;
+                    create_tool_task(tx, conversation_id, task_id, entry.id, &call.id, false)
+                        .await?;
                 tool_tasks.push(tool_task);
                 slots.push(ToolSlot {
                     progress: SlotProgress {
@@ -1282,6 +1893,11 @@ async fn start_tool_round(
                 });
             }
             let mut state: LiveState = crate::harness::types::read_state(&live)?;
+            if let Some(run) = state.run.as_mut()
+                && run.task_id == task_id
+            {
+                run.turns = run.turns.saturating_add(1);
+            }
             state.generation = None;
             state.tools = Some(slots);
             crate::harness::types::write_state(&live, &state)?;
@@ -1326,8 +1942,17 @@ async fn tools(
             let live = tx
                 .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
                 .await?;
+            let unoffered = read_state::<LiveState>(&live)?
+                .tools
+                .and_then(|slots| {
+                    slots
+                        .into_iter()
+                        .find(|slot| slot.progress.call_id == next)
+                        .and_then(|slot| slot.unoffered)
+                })
+                .unwrap_or(false);
             let tool_task =
-                create_tool_task(tx, conversation_id, task_id, assistant, &next).await?;
+                create_tool_task(tx, conversation_id, task_id, assistant, &next, unoffered).await?;
             let mut state: LiveState = crate::harness::types::read_state(&live)?;
             if let Some(slots) = state.tools.as_mut()
                 && let Some(slot) = slots
@@ -1405,6 +2030,11 @@ async fn finish_tool_round(
             }
         }
     }
+    let max_turns = agent.max_turns;
+    let after_run = terminate
+        && agent_hooks(&agent, GENERATION_TASK_NAME)
+            .iter()
+            .any(|handlers| matches!(handlers, HookHandlers::Generation(_)));
     let settings = runtime.settings();
     let modes = QueueModes {
         steering_mode: settings.steering_mode,
@@ -1414,6 +2044,7 @@ async fn finish_tool_round(
     let change: TaskCommitFn = Arc::new(move |tx, _current| {
         let added = added.clone();
         let handoff = handoff.clone();
+        let results = results.clone();
         Box::pin(async move {
             let mut boundary = prepare_boundary(tx, conversation_id, modes).await?;
             if !added.is_empty() {
@@ -1422,18 +2053,54 @@ async fn finish_tool_round(
             let live = tx
                 .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
                 .await?;
-            if terminate || handoff.is_some() {
-                if let Some(handoff) = handoff {
+            let mut last = results
+                .iter()
+                .copied()
+                .fold(assistant, |newest, id| newest.max(id));
+            if let Some(handoff) = handoff {
+                last = last.max({
                     let mut draft = EntryDraft::new(RESET_ENTRY);
                     draft.head = Some(EntryHead::This);
                     draft.model = Some(vec![Message::User(UserMessage {
                         role: UserRole::User,
-                        content: rpi_ai::types::UserContent::Text(handoff),
+                        content: rpi_ai::types::UserContent::Text(handoff.clone()),
                         timestamp: now as i64,
                     })]);
                     let record = tx.append_entry(conversation_id, draft).await?;
                     boundary.head = Some(record.id);
+                    record.id
+                });
+            }
+            let turns = read_state::<LiveState>(&live)?
+                .run
+                .filter(|run| run.task_id == task_id)
+                .map(|run| run.turns)
+                .unwrap_or(0);
+            if after_run {
+                let mut state: LiveState = read_state(&live)?;
+                if let Some(run) = state.run.as_mut()
+                    && run.task_id == task_id
+                {
+                    for id in std::mem::take(&mut run.inputs) {
+                        tx.settle_submission(id, SubmissionSettlement::Done { answer: assistant })?;
+                    }
+                    let summary = crate::harness::types::RunSummary {
+                        reason: crate::harness::types::RunEndReason::Terminate,
+                        first: Some(run.first.unwrap_or(assistant)),
+                        answer: assistant,
+                        last,
+                    };
+                    run.after_run = Some(crate::harness::live::AfterRun { tasks: None });
+                    state.generation = None;
+                    state.tools = None;
+                    state.nested_tools = None;
+                    write_state(&live, &state)?;
+                    return Ok(Some(NextTaskState::Running {
+                        checkpoint: to_checkpoint(GenerationCheckpoint::Finish { run: summary }),
+                    }));
                 }
+            }
+            if terminate {
                 let result = apply_boundary(tx, boundary, BoundaryAt::Final, now).await?;
                 end_run(
                     tx,
@@ -1443,8 +2110,34 @@ async fn finish_tool_round(
                 )
                 .await?;
                 if !result.users.is_empty() {
-                    start_run(tx, conversation_id, &live, result.users).await?;
+                    start_run(tx, conversation_id, &live, result.users, result.first).await?;
                 }
+            } else if max_turns.is_some_and(|limit| turns >= limit) {
+                let text = if turns == 1 {
+                    "1 turn".to_string()
+                } else {
+                    format!("{turns} turns")
+                };
+                end_run(
+                    tx,
+                    &live,
+                    task_id,
+                    SubmissionSettlement::Unanswered {
+                        reason: "turn_limit".to_string(),
+                        detail: Some(JsonValue::String(text)),
+                    },
+                )
+                .await?;
+                apply_after_failed_run(
+                    tx,
+                    conversation_id,
+                    &live,
+                    settings.after_failed_run,
+                    modes,
+                    now,
+                    None,
+                )
+                .await?;
             } else {
                 let result = apply_boundary(tx, boundary, BoundaryAt::PostTools, now).await?;
                 if result.reset {
@@ -1459,7 +2152,14 @@ async fn finish_tool_round(
                     )
                     .await?;
                     if !result.users.is_empty() {
-                        start_run(tx, conversation_id, &live, result.users).await?;
+                        start_run_after_failure(
+                            tx,
+                            conversation_id,
+                            &live,
+                            result.users,
+                            result.first,
+                        )
+                        .await?;
                     }
                 } else {
                     let mut state: LiveState = crate::harness::types::read_state(&live)?;
@@ -1513,6 +2213,51 @@ async fn append_assistant(
     let mut draft = EntryDraft::new(ASSISTANT_ENTRY);
     draft.model = Some(vec![Message::Assistant(message.clone())]);
     tx.append_entry(conversation_id, draft).await
+}
+
+async fn fail_nothing_to_answer(runtime: &dyn TaskRuntime, context: &Context) -> SessionResult<()> {
+    let conversation_id = runtime.conversation_id();
+    let task_id = runtime.task_id();
+    let settings = runtime.settings();
+    let after = settings.after_failed_run;
+    let modes = QueueModes {
+        steering_mode: settings.steering_mode,
+        follow_up_mode: settings.follow_up_mode,
+    };
+    let now = runtime.now()?;
+    let change: TaskCommitFn = Arc::new(move |tx, _current| {
+        Box::pin(async move {
+            let prepared = if after == AfterFailedRun::Continue {
+                Some(prepare_boundary(tx, conversation_id, modes).await?)
+            } else {
+                None
+            };
+            let live = tx
+                .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
+                .await?;
+            end_run(
+                tx,
+                &live,
+                task_id,
+                SubmissionSettlement::Unanswered {
+                    reason: "nothing_to_answer".to_string(),
+                    detail: None,
+                },
+            )
+            .await?;
+            apply_after_failed_run(tx, conversation_id, &live, after, modes, now, prepared).await?;
+            Ok(Some(NextTaskState::Terminal {
+                outcome: TaskOutcome::Failed {
+                    error: TaskOutcomeError {
+                        message: "The conversation has nothing to answer".to_string(),
+                        detail: Some(serde_json::json!({ "reason": "nothing_to_answer" })),
+                    },
+                    result: None,
+                },
+            }))
+        })
+    });
+    runtime.commit(change, context).await
 }
 
 async fn fail_model_error(
@@ -1668,7 +2413,8 @@ async fn apply_after_failed_run(
             }
             let result = apply_boundary(tx, boundary, BoundaryAt::Final, now).await?;
             if !result.users.is_empty() {
-                start_run(tx, conversation_id, live, result.users).await?;
+                start_run_after_failure(tx, conversation_id, live, result.users, result.first)
+                    .await?;
             }
             Ok(())
         }
@@ -1694,11 +2440,17 @@ async fn create_tool_task(
     owner: TaskId,
     assistant: EntryId,
     call_id: &str,
+    unoffered: bool,
 ) -> SessionResult<TaskId> {
     tx.create_task(TaskCreate {
         kind: TOOL_TASK_NAME.to_string(),
-        version: 2,
-        input: serde_json::json!({ "kind": "model", "assistant": assistant, "callId": call_id }),
+        version: 3,
+        input: serde_json::json!({
+            "kind": "model",
+            "assistant": assistant,
+            "callId": call_id,
+            "unoffered": unoffered.then_some(true),
+        }),
         checkpoint: serde_json::json!({ "phase": "call" }),
         ownership: TaskOwnership::Task(owner),
         conversation_id: Some(conversation_id),
@@ -1717,11 +2469,41 @@ pub async fn start_run(
     conversation_id: ConversationId,
     live: &DocDraft,
     inputs: Vec<SubmissionId>,
+    first: Option<EntryId>,
+) -> SessionResult<()> {
+    start_run_impl(tx, conversation_id, live, inputs, first, false).await
+}
+
+async fn start_run_after_failure(
+    tx: &mut Transaction,
+    conversation_id: ConversationId,
+    live: &DocDraft,
+    inputs: Vec<SubmissionId>,
+    first: Option<EntryId>,
+) -> SessionResult<()> {
+    start_run_impl(tx, conversation_id, live, inputs, first, true).await
+}
+
+async fn start_run_impl(
+    tx: &mut Transaction,
+    conversation_id: ConversationId,
+    live: &DocDraft,
+    inputs: Vec<SubmissionId>,
+    first: Option<EntryId>,
+    keep_failure: bool,
 ) -> SessionResult<()> {
     let (trace, links) = tx.task_trace(&inputs).await?;
     let task_id = create_generation(tx, conversation_id, trace, links).await?;
     let mut state: LiveState = crate::harness::types::read_state(live)?;
-    state.run = Some(crate::harness::live::LiveRun { task_id, inputs });
+    state.run = Some(crate::harness::live::LiveRun {
+        task_id,
+        inputs,
+        first,
+        ..Default::default()
+    });
+    if !keep_failure {
+        state.run_failure = None;
+    }
     crate::harness::types::write_state(live, &state)
 }
 
@@ -1734,7 +2516,7 @@ async fn create_generation(
 ) -> SessionResult<TaskId> {
     tx.create_task(TaskCreate {
         kind: GENERATION_TASK_NAME.to_string(),
-        version: 1,
+        version: 2,
         input: serde_json::json!({}),
         checkpoint: serde_json::json!({ "phase": "prepare", "attempt": 1 }),
         ownership: TaskOwnership::Conversation(conversation_id),

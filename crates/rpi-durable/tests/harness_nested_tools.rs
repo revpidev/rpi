@@ -290,7 +290,7 @@ impl ToolExecute for TextTool {
 }
 
 #[test]
-fn a_version_one_tool_task_migrates_to_a_model_issued_v2_task() {
+fn a_version_one_tool_task_migrates_to_a_model_issued_v3_task() {
     use rpi_durable::harness::{TaskDefinition, ToolTask};
 
     let task = ToolTask;
@@ -305,7 +305,7 @@ fn a_version_one_tool_task_migrates_to_a_model_issued_v2_task() {
         migrated.input,
         serde_json::json!({ "kind": "model", "assistant": 7, "callId": "c1" })
     );
-    assert_eq!(task.version(), 2);
+    assert_eq!(task.version(), 3);
 }
 
 #[test]
@@ -413,7 +413,7 @@ async fn open_with_telemetry(
         set_timer: None,
         on_wake: None,
         on_report: None,
-        on_report_info: None,
+        read_only: false,
     };
     let storage: Arc<dyn rpi_durable::types::Storage> =
         Arc::new(rpi_durable::storage::MemoryStorage::new());
@@ -699,7 +699,7 @@ async fn v1_migration_nested_replay_then_sleep_is_one_chain() {
         set_timer: None,
         on_wake: None,
         on_report: None,
-        on_report_info: None,
+        read_only: false,
     };
     let factory: rpi_durable::harness::SchedulerFactory = Arc::new(|deps| {
         TaskScheduler::new(deps) as Arc<dyn rpi_durable::harness::SchedulerService>
@@ -803,7 +803,7 @@ async fn v1_migration_nested_replay_then_sleep_is_one_chain() {
         1,
         "the journal answered the nested call"
     );
-    assert_eq!(settled.record.version, 2, "the v1 task migrated to v2");
+    assert_eq!(settled.record.version, 3, "the v1 task migrated to v3");
     assert!(matches!(
         settled.record.input,
         JsonValue::Object(ref input) if input.get("kind").and_then(JsonValue::as_str) == Some("model")
@@ -985,7 +985,7 @@ async fn end_to_end_v1_migration_nested_and_sleep() {
         set_timer: None,
         on_wake: None,
         on_report: None,
-        on_report_info: None,
+        read_only: false,
     };
     let factory: rpi_durable::harness::SchedulerFactory = Arc::new(|deps| {
         TaskScheduler::new(deps) as Arc<dyn rpi_durable::harness::SchedulerService>
@@ -1051,7 +1051,7 @@ async fn end_to_end_v1_migration_nested_and_sleep() {
         .wait_for_task(tool_task, &context())
         .await
         .expect("tool task");
-    assert_eq!(tool.record.version, 2, "v1 task migrated");
+    assert_eq!(tool.record.version, 3, "v1 task migrated");
     assert!(matches!(tool.record.state, TaskState::Terminal { .. }));
     assert_eq!(runs.load(Ordering::SeqCst), 1);
     let sleep = harness

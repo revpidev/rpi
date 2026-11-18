@@ -370,6 +370,21 @@ pub enum InputSubmissionStatus {
     },
 }
 
+/// Lifecycle of a continue, which places no entry of its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum ContinueSubmissionStatus {
+    Placed,
+    Done {
+        answer: EntryId,
+    },
+    Unanswered {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<JsonValue>,
+    },
+}
+
 /// Lifecycle state of a passive write submission.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
@@ -413,6 +428,23 @@ pub enum SubmissionRecord {
         #[serde(flatten)]
         status: InputSubmissionStatus,
     },
+    /// Continue the last run without an entry of its own.
+    #[serde(rename = "continue")]
+    Continue {
+        /// Identity.
+        id: SubmissionId,
+        /// Conversation the submission belongs to.
+        conversation_id: ConversationId,
+        /// Adapter-owned context of the admission span; absent without
+        /// propagation (upstream `trace`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace: Option<TelemetryCarrier>,
+        /// Host-provided deduplication key, scoped to the conversation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(flatten)]
+        status: ContinueSubmissionStatus,
+    },
     /// Passive write submission.
     Write {
         /// Identity.
@@ -435,7 +467,9 @@ impl SubmissionRecord {
     /// Identity.
     pub fn id(&self) -> SubmissionId {
         match self {
-            SubmissionRecord::Input { id, .. } | SubmissionRecord::Write { id, .. } => *id,
+            SubmissionRecord::Input { id, .. }
+            | SubmissionRecord::Continue { id, .. }
+            | SubmissionRecord::Write { id, .. } => *id,
         }
     }
 
@@ -443,6 +477,9 @@ impl SubmissionRecord {
     pub fn conversation_id(&self) -> ConversationId {
         match self {
             SubmissionRecord::Input {
+                conversation_id, ..
+            }
+            | SubmissionRecord::Continue {
                 conversation_id, ..
             }
             | SubmissionRecord::Write {
@@ -455,6 +492,7 @@ impl SubmissionRecord {
     pub fn request_id(&self) -> Option<&str> {
         match self {
             SubmissionRecord::Input { request_id, .. }
+            | SubmissionRecord::Continue { request_id, .. }
             | SubmissionRecord::Write { request_id, .. } => request_id.as_deref(),
         }
     }
@@ -462,9 +500,9 @@ impl SubmissionRecord {
     /// Adapter-owned admission trace.
     pub fn trace(&self) -> Option<&TelemetryCarrier> {
         match self {
-            SubmissionRecord::Input { trace, .. } | SubmissionRecord::Write { trace, .. } => {
-                trace.as_ref()
-            }
+            SubmissionRecord::Input { trace, .. }
+            | SubmissionRecord::Continue { trace, .. }
+            | SubmissionRecord::Write { trace, .. } => trace.as_ref(),
         }
     }
 
@@ -472,6 +510,7 @@ impl SubmissionRecord {
     pub fn set_trace(&mut self, trace: Option<TelemetryCarrier>) {
         match self {
             SubmissionRecord::Input { trace: slot, .. }
+            | SubmissionRecord::Continue { trace: slot, .. }
             | SubmissionRecord::Write { trace: slot, .. } => *slot = trace,
         }
     }
@@ -484,6 +523,11 @@ impl SubmissionRecord {
                 InputSubmissionStatus::Placed { .. } => "placed",
                 InputSubmissionStatus::Done { .. } => "done",
                 InputSubmissionStatus::Unanswered { .. } => "unanswered",
+            },
+            SubmissionRecord::Continue { status, .. } => match status {
+                ContinueSubmissionStatus::Placed => "placed",
+                ContinueSubmissionStatus::Done { .. } => "done",
+                ContinueSubmissionStatus::Unanswered { .. } => "unanswered",
             },
             SubmissionRecord::Write { status, .. } => match status {
                 WriteSubmissionStatus::Queued => "queued",
@@ -963,19 +1007,27 @@ pub struct StoredEntry {
 // Storage trait
 // ---------------------------------------------------------------------------
 
+/// Number of durable batches and the first validation refusal, if any.
+#[derive(Debug)]
+pub struct CommitResult {
+    pub stored: usize,
+    pub refused: Option<StorageError>,
+}
+
 /// Async durable storage contract (upstream `Storage`, `types.ts:1015`).
 ///
 /// The trait is object safe so the shared conformance suite can run any backend
 /// behind `Arc<dyn Storage>`; typed ID minting lives on [`StorageExt`].
 #[async_trait]
 pub trait Storage: Send + Sync {
-    /// Atomically persist one batch and return its sequence. Once resolved,
-    /// later reads through this storage observe it.
+    /// Persist ordered batches, stopping before the first validation refusal.
+    /// Receipts are durability confirmations, not Session publication.
     async fn commit(
         &self,
-        writes: &[StorageWrite],
+        batches: &[Vec<StorageWrite>],
+        receive: &mut (dyn FnMut(usize, Seq) + Send),
         context: &crate::chord::context::Context,
-    ) -> StorageResult<Seq>;
+    ) -> StorageResult<CommitResult>;
 
     /// Return a fresh ID from the session-global numeric namespace.
     async fn mint_id(&self) -> StorageResult<u64>;
@@ -985,7 +1037,7 @@ pub trait Storage: Send + Sync {
         &self,
         id: ConversationId,
         context: &crate::chord::context::Context,
-    ) -> StorageResult<Option<ConversationRecord>>;
+    ) -> StorageResult<Option<std::sync::Arc<ConversationRecord>>>;
 
     /// Scan conversations in `query.order` (default ascending) by ID.
     async fn scan_conversations(
@@ -1034,7 +1086,7 @@ pub trait Storage: Send + Sync {
         &self,
         id: TaskId,
         context: &crate::chord::context::Context,
-    ) -> StorageResult<Option<TaskRecord>>;
+    ) -> StorageResult<Option<std::sync::Arc<TaskRecord>>>;
 
     /// Scan task records matching every supplied filter.
     async fn scan_tasks(
@@ -1050,7 +1102,7 @@ pub trait Storage: Send + Sync {
         &self,
         id: SubmissionId,
         context: &crate::chord::context::Context,
-    ) -> StorageResult<Option<SubmissionRecord>>;
+    ) -> StorageResult<Option<std::sync::Arc<SubmissionRecord>>>;
 
     /// Scan submissions matching every supplied filter.
     async fn scan_submissions(
@@ -1067,7 +1119,7 @@ pub trait Storage: Send + Sync {
         conversation_id: ConversationId,
         request_id: &str,
         context: &crate::chord::context::Context,
-    ) -> StorageResult<Option<SubmissionRecord>>;
+    ) -> StorageResult<Option<std::sync::Arc<SubmissionRecord>>>;
 
     /// Resolve the incarnation occupying one exact logical address at the selected point.
     async fn find_document(
@@ -1101,6 +1153,26 @@ pub trait Storage: Send + Sync {
 /// Typed helpers layered over [`Storage`] (upstream generic `mintId<I>()`).
 #[async_trait]
 pub trait StorageExt: Storage {
+    /// Commit one ordinary batch and return its sequence.
+    async fn commit_one(
+        &self,
+        writes: &[StorageWrite],
+        context: &crate::chord::context::Context,
+    ) -> StorageResult<Seq> {
+        let batches = vec![writes.to_vec()];
+        let mut seq = None;
+        let result = self
+            .commit(&batches, &mut |_, received| seq = Some(received), context)
+            .await?;
+        if let Some(refused) = result.refused {
+            return Err(refused);
+        }
+        if result.stored != 1 {
+            return Err(StorageError::message("Storage did not store the commit"));
+        }
+        seq.ok_or_else(|| StorageError::message("Storage omitted the durability receipt"))
+    }
+
     /// Mint an ID branded for record kind `T`.
     async fn mint_id_as<T>(&self) -> StorageResult<Id<T>> {
         Ok(Id::from_number(self.mint_id().await?))

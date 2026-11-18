@@ -597,6 +597,16 @@ fn diff_into(previous: &JsonValue, next: &JsonValue, path: &mut Path, ops: &mut 
                 items: next_items.clone(),
             });
         }
+        (JsonValue::String(previous), JsonValue::String(next)) if next.starts_with(previous) => {
+            if path.is_empty() {
+                ops.push(Op::Replace(JsonValue::String(next.clone())));
+            } else {
+                ops.push(Op::Append {
+                    path: path.clone(),
+                    value: next[previous.len()..].to_string(),
+                });
+            }
+        }
         (_, value) => {
             if path.is_empty() {
                 ops.push(Op::Replace(value.clone()));
@@ -607,5 +617,246 @@ fn diff_into(previous: &JsonValue, next: &JsonValue, path: &mut Path, ops: &mut 
                 });
             }
         }
+    }
+}
+
+/// Maximum exact pending operations before a consumer needs a root replacement.
+pub const MAX_PENDING_OPS: usize = 10_000;
+
+/// Result of draining a pending operation queue.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PendingTake {
+    Ops(Vec<Op>),
+    Replace,
+}
+
+/// Fold operations while one consumer is busy.
+#[derive(Debug, Default)]
+pub struct PendingOps {
+    state: PendingState,
+}
+
+#[derive(Debug, Default)]
+enum PendingState {
+    #[default]
+    Empty,
+    Batch(Vec<Op>),
+    Folding {
+        ops: Vec<Op>,
+        leaves: std::collections::HashMap<String, usize>,
+    },
+    Replace,
+}
+
+impl PendingOps {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, operations: &[Op]) {
+        if operations.is_empty() {
+            return;
+        }
+        if matches!(operations.first(), Some(Op::Replace(_))) {
+            self.state = PendingState::Batch(operations.to_vec());
+            return;
+        }
+        let mut folding = match std::mem::replace(&mut self.state, PendingState::Empty) {
+            PendingState::Empty => PendingState::Folding {
+                ops: Vec::new(),
+                leaves: std::collections::HashMap::new(),
+            },
+            PendingState::Batch(previous) => {
+                let mut folding = PendingState::Folding {
+                    ops: Vec::new(),
+                    leaves: std::collections::HashMap::new(),
+                };
+                if !Self::fold(&mut folding, &previous) {
+                    self.state = PendingState::Replace;
+                    return;
+                }
+                folding
+            }
+            PendingState::Folding { ops, leaves } => PendingState::Folding { ops, leaves },
+            PendingState::Replace => {
+                self.state = PendingState::Replace;
+                return;
+            }
+        };
+        self.state = if Self::fold(&mut folding, operations) {
+            folding
+        } else {
+            PendingState::Replace
+        };
+    }
+
+    fn fold(state: &mut PendingState, operations: &[Op]) -> bool {
+        let PendingState::Folding { ops, leaves } = state else {
+            return false;
+        };
+        for operation in operations {
+            match operation {
+                Op::Replace(_) => {
+                    ops.clear();
+                    leaves.clear();
+                }
+                Op::Set { value, .. } if value.is_object() || value.is_array() => {
+                    leaves.clear();
+                    ops.push(operation.clone());
+                }
+                Op::Set { .. } | Op::Append { .. } => {
+                    if !merge_leaf(ops, leaves, operation) {
+                        ops.push(operation.clone());
+                    }
+                }
+                _ => {
+                    leaves.clear();
+                    ops.push(operation.clone());
+                }
+            }
+            if ops.len() > MAX_PENDING_OPS {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.state {
+            PendingState::Empty => 0,
+            PendingState::Batch(ops) => ops.len(),
+            PendingState::Folding { ops, .. } => ops.len(),
+            PendingState::Replace => 1,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn take(&mut self) -> PendingTake {
+        match std::mem::replace(&mut self.state, PendingState::Empty) {
+            PendingState::Empty => PendingTake::Ops(Vec::new()),
+            PendingState::Batch(ops) | PendingState::Folding { ops, .. } => PendingTake::Ops(ops),
+            PendingState::Replace => PendingTake::Replace,
+        }
+    }
+}
+
+fn merge_leaf(
+    ops: &mut [Op],
+    leaves: &mut std::collections::HashMap<String, usize>,
+    next: &Op,
+) -> bool {
+    let path = match next {
+        Op::Set { path, .. } | Op::Append { path, .. } => path,
+        _ => return false,
+    };
+    let key = path_to_json(path).to_string();
+    if let Some(index) = leaves.get(&key).copied() {
+        match (&mut ops[index], next) {
+            (previous, Op::Set { .. }) => {
+                *previous = next.clone();
+                return true;
+            }
+            (
+                Op::Append {
+                    value: previous, ..
+                },
+                Op::Append { value, .. },
+            ) => {
+                previous.push_str(value);
+                return true;
+            }
+            (
+                Op::Set {
+                    value: previous, ..
+                },
+                Op::Append { value, .. },
+            ) if previous.is_string() => {
+                *previous =
+                    JsonValue::String(format!("{}{}", previous.as_str().unwrap_or(""), value));
+                return true;
+            }
+            _ => {}
+        }
+    }
+    leaves.insert(key, ops.len());
+    false
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+    use crate::chord::delta::PathSegment;
+
+    fn leaf(value: u64) -> Op {
+        Op::Set {
+            path: vec![PathSegment::Key("value".into())],
+            value: JsonValue::from(value),
+        }
+    }
+
+    #[test]
+    fn folds_busy_leaf_operations_and_overflows_to_replacement() {
+        let mut pending = PendingOps::new();
+        pending.push(&[leaf(1), leaf(2)]);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.take(), PendingTake::Ops(vec![leaf(2)]));
+        for value in 0..=MAX_PENDING_OPS as u64 {
+            pending.push(&[Op::Set {
+                path: vec![PathSegment::Key(value.to_string())],
+                value: JsonValue::from(value),
+            }]);
+        }
+        assert_eq!(pending.take(), PendingTake::Replace);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn folds_commuting_leaves_and_resets_structure_without_aliasing_paths() {
+        let mut pending = PendingOps::new();
+        for value in 0..3 {
+            pending.push(&[Op::Set {
+                path: vec![PathSegment::Key("a".into())],
+                value: JsonValue::from(value),
+            }]);
+            pending.push(&[Op::Set {
+                path: vec![PathSegment::Key("b".into())],
+                value: JsonValue::from(value),
+            }]);
+        }
+        let PendingTake::Ops(ops) = pending.take() else {
+            panic!("folded leaves")
+        };
+        assert_eq!(ops.len(), 2);
+        pending.push(&[Op::Set {
+            path: vec![PathSegment::Key("a.b".into())],
+            value: JsonValue::from(1),
+        }]);
+        pending.push(&[Op::Set {
+            path: vec![PathSegment::Key("a".into()), PathSegment::Key("b".into())],
+            value: JsonValue::from(2),
+        }]);
+        let PendingTake::Ops(ops) = pending.take() else {
+            panic!("distinct paths")
+        };
+        assert_eq!(ops.len(), 2);
+        pending.push(&[Op::Set {
+            path: vec![PathSegment::Key("a".into())],
+            value: JsonValue::from(1),
+        }]);
+        pending.push(&[Op::Set {
+            path: vec![PathSegment::Key("parent".into())],
+            value: serde_json::json!({ "replacement": true }),
+        }]);
+        pending.push(&[Op::Set {
+            path: vec![PathSegment::Key("a".into())],
+            value: JsonValue::from(2),
+        }]);
+        let PendingTake::Ops(ops) = pending.take() else {
+            panic!("structural reset")
+        };
+        assert_eq!(ops.len(), 3);
     }
 }

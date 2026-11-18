@@ -34,6 +34,8 @@ The result starts with `Script completed` or `Script failed`, the wall time, and
 | `describeNamespace(name)` | Resolves to `{ name, description?, instructions?, tools }` for a namespace such as an MCP server, or `undefined`. Accepts a canonical namespace name or one of its `aliases`. |
 | `models` | List and run non-LLM models. See [Models](#models). |
 
+`searchTools` ranks name and full-name matches above namespace instructions, uses NFC-aware Unicode tokenization, and does not penalize long descriptions. Local `$ref` resolution expands only referenced definitions and stops on cycles; malformed percent escapes and unresolved references return `unknown`. These are not claims of every `Intl.Segmenter` dictionary behavior.
+
 ## Call tools
 
 Every tool the session can call is a method of `tools`, named by its identifier: characters that are not valid in a JavaScript identifier become `_`, so the MCP tool `mcp__dev-radius__search` is `tools.mcp__dev_radius__search`. Each method takes one object with the tool's arguments.

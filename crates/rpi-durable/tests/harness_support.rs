@@ -115,16 +115,13 @@ async fn create_owned_task(
 
 #[async_trait]
 impl SchedulerService for RecordingScheduler {
-    fn resume(&self) {
+    fn resume(&self) -> SessionResult<()> {
         self.resumed.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     fn wake(&self) -> rpi_durable::harness::Wake {
         rpi_durable::harness::Wake::default()
-    }
-
-    async fn retry_task(&self, _id: TaskId, _context: &Context) -> SessionResult<()> {
-        Ok(())
     }
 
     async fn open(&self, _context: &Context) -> SessionResult<()> {
@@ -141,12 +138,15 @@ impl SchedulerService for RecordingScheduler {
         conversation_id: ConversationId,
         live: &DocDraft,
         inputs: Vec<SubmissionId>,
+        _first: Option<rpi_durable::ids::EntryId>,
     ) -> SessionResult<()> {
         let task_id = create_owned_task(tx, conversation_id, GENERATION).await?;
         let mut state = read_live(live)?;
         state.run = Some(LiveRun {
             task_id,
             inputs: inputs.clone(),
+            first: _first,
+            ..Default::default()
         });
         write_live(live, &state)?;
         self.started
@@ -228,7 +228,7 @@ pub fn options() -> HarnessOptions {
         set_timer: None,
         on_wake: None,
         on_report: None,
-        on_report_info: None,
+        read_only: false,
     }
 }
 
@@ -307,6 +307,7 @@ pub fn input(
         request_id: request_id.map(str::to_string),
         content: UserContent::Text(content.to_string()),
         when_busy,
+        when_idle: None,
         entry: None,
     })
 }
@@ -321,6 +322,7 @@ pub fn input_with_entry(
         request_id: None,
         content: UserContent::Text(content.to_string()),
         when_busy,
+        when_idle: None,
         entry: Some(entry),
     })
 }

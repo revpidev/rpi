@@ -172,7 +172,11 @@ rpi update [self|--all|--extensions|--models] [--rc]
 rpi config                 # resource-configuration TUI (Tab switches global/project scope)
 rpi mcp add|remove|list|login|logout ...   # manage MCP servers outside a session
 rpi auth check|print-api-key|print-bearer-token ...  # inspect provider credentials
+rpi auth login <provider>    # sign in with an API key, device code, or copy-code flow
+rpi auth logout <provider>   # remove a provider credential
 ```
+
+Update notices record previous/next version-or-commit and a changelog source, collapse to one line per package, and remember last-seen extension versions in `extensionChangelogVersions`. If an interactive session's original cwd no longer exists, startup/resume/import/switch explicitly offers Continue, Fork, or Cancel; Continue is not persisted, startup Fork uses the current cwd, and print/RPC still fails with `MissingSessionCwdError`. Summary and changelog surfaces share the assistant Markdown/Mermaid transformer, including pie, author styles, and clickable labels.
 
 ### Built-in tools and extensions
 

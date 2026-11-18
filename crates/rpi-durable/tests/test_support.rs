@@ -99,12 +99,17 @@ impl ReopeningStorage {
 
 #[async_trait::async_trait]
 impl Storage for ReopeningStorage {
-    async fn commit(&self, writes: &[StorageWrite], context: &Context) -> StorageResult<Seq> {
+    async fn commit(
+        &self,
+        batches: &[Vec<StorageWrite>],
+        receive: &mut (dyn FnMut(usize, Seq) + Send),
+        context: &Context,
+    ) -> StorageResult<rpi_durable::types::CommitResult> {
         let mut guard = self.inner.lock().await;
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
-            return guard.commit(writes, context).await;
+            return guard.commit(batches, receive, context).await;
         }
-        let result = guard.commit(writes, context).await;
+        let result = guard.commit(batches, receive, context).await;
         // Upstream reopens in `finally`, so rejected commits are covered too.
         guard.close(context).await?;
         let reopened = (self.reopen)().await?;
@@ -120,7 +125,7 @@ impl Storage for ReopeningStorage {
         &self,
         id: ConversationId,
         context: &Context,
-    ) -> StorageResult<Option<ConversationRecord>> {
+    ) -> StorageResult<Option<Arc<ConversationRecord>>> {
         self.inner.lock().await.conversation(id, context).await
     }
 
@@ -182,7 +187,7 @@ impl Storage for ReopeningStorage {
             .await
     }
 
-    async fn task(&self, id: TaskId, context: &Context) -> StorageResult<Option<TaskRecord>> {
+    async fn task(&self, id: TaskId, context: &Context) -> StorageResult<Option<Arc<TaskRecord>>> {
         self.inner.lock().await.task(id, context).await
     }
 
@@ -204,7 +209,7 @@ impl Storage for ReopeningStorage {
         &self,
         id: SubmissionId,
         context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         self.inner.lock().await.submission(id, context).await
     }
 
@@ -227,7 +232,7 @@ impl Storage for ReopeningStorage {
         conversation_id: ConversationId,
         request_id: &str,
         context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         self.inner
             .lock()
             .await

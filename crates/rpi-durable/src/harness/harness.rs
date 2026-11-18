@@ -107,6 +107,7 @@ pub struct HarnessImpl {
     tasks: Arc<dyn SchedulerService>,
     submissions: Arc<Submissions>,
     task_graph: Arc<TaskGraphView>,
+    conversation_views: Arc<crate::harness::view::ConversationViews>,
     closed: AtomicBool,
 }
 
@@ -160,29 +161,11 @@ impl HarnessImpl {
             ),
             None => None,
         };
-        let report_info: crate::harness::types::ReportInfoFn = {
-            let host = self.options.on_report_info.clone();
-            let telemetry = self.options.telemetry.clone().unwrap_or_default();
-            let context = context.clone();
-            Arc::new(move |info| {
-                if info.kind == crate::harness::types::ReportKind::ExtensionError {
-                    crate::harness::scheduler::emit_report_telemetry(
-                        &telemetry,
-                        &info,
-                        Some(&context),
-                    );
-                }
-                if let Some(host) = &host {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host(info)));
-                }
-            })
-        };
         Ok(resolve_agent(
             state.as_ref(),
             registry.as_ref(),
             &self.current_settings(),
             &self.report,
-            Some(&report_info),
         ))
     }
 
@@ -223,7 +206,7 @@ impl HarnessImpl {
     /// Enable task scheduling (idempotent; errors after close).
     pub fn resume(&self) -> SessionResult<()> {
         self.assert_open()?;
-        self.tasks.resume();
+        self.tasks.resume()?;
         Ok(())
     }
 
@@ -238,7 +221,13 @@ impl HarnessImpl {
         let read_context = context.clone();
         session
             .read_on_line(move || {
-                Box::pin(async move { Ok(job_session.storage().task(id, &read_context).await?) })
+                Box::pin(async move {
+                    Ok(job_session
+                        .storage()
+                        .task(id, &read_context)
+                        .await?
+                        .map(|record| (*record).clone()))
+                })
             })
             .await
     }
@@ -319,6 +308,40 @@ impl HarnessImpl {
         self.task_graph.watch(context).await
     }
 
+    /// Synchronously observe the live task graph.
+    pub async fn observe_task_graph(
+        self: &Arc<Self>,
+        observer: Arc<dyn crate::session::Observer<crate::harness::task_graph::TaskGraph>>,
+        context: &Context,
+    ) -> SessionResult<crate::session::Observation<crate::harness::task_graph::TaskGraph>> {
+        self.task_graph.observe(observer, context).await
+    }
+
+    /// Watch one conversation with an independently bounded entry window.
+    pub fn watch_conversation(
+        self: &Arc<Self>,
+        id: ConversationId,
+        window: crate::harness::view::ConversationWindow,
+        context: &Context,
+    ) -> crate::session::SessionFuture<'_, crate::harness::view::ConversationWatch> {
+        self.conversation_views.watch(id, window, context)
+    }
+
+    /// Synchronously observe one conversation with an independent entry window.
+    pub fn observe_conversation(
+        self: &Arc<Self>,
+        id: ConversationId,
+        observer: Arc<dyn crate::session::Observer<crate::harness::view::ConversationView>>,
+        window: crate::harness::view::ConversationWindow,
+        context: &Context,
+    ) -> crate::session::SessionFuture<
+        '_,
+        crate::session::Observation<crate::harness::view::ConversationView>,
+    > {
+        self.conversation_views
+            .observe(id, observer, window, context)
+    }
+
     /// Return the reserved root conversation, creating it when absent.
     pub async fn root(
         self: &Arc<Self>,
@@ -381,7 +404,7 @@ impl HarnessImpl {
 
     /// Commit the abort mark and join an active run invocation.
     pub async fn abort_task(&self, id: TaskId, context: &Context) -> SessionResult<TaskAbort> {
-        self.tasks.resume();
+        self.tasks.resume()?;
         self.tasks.abort(id, context).await
     }
 
@@ -391,14 +414,14 @@ impl HarnessImpl {
         id: TaskId,
         context: &Context,
     ) -> SessionResult<SettledTask<JsonValue>> {
-        self.tasks.resume();
+        self.tasks.resume()?;
         self.tasks.wait_for_task(id, context).await
     }
 
     /// Resolve when the ordinary ownership scope of every ownerless conversation
     /// is idle.
     pub async fn wait_for_idle(&self, context: &Context) -> SessionResult<()> {
-        self.tasks.resume();
+        self.tasks.resume()?;
         self.tasks.wait_for_idle(None, context).await
     }
 
@@ -590,7 +613,7 @@ impl ConversationImpl {
         context: &Context,
     ) -> SessionResult<TaskId> {
         self.harness.assert_open()?;
-        self.harness.tasks.resume();
+        self.harness.tasks.resume()?;
         let tasks = Arc::clone(&self.harness.tasks);
         let id = self.id;
         self.harness
@@ -699,7 +722,7 @@ impl ConversationImpl {
         context: &Context,
         options: ConversationAbortOptions,
     ) -> SessionResult<()> {
-        self.harness.tasks.resume();
+        self.harness.tasks.resume()?;
         self.harness
             .tasks
             .abort_conversation(self.id, options.background, context)
@@ -708,7 +731,7 @@ impl ConversationImpl {
 
     /// Resolve when the ordinary ownership scope is idle.
     pub async fn wait_for_idle(&self, context: &Context) -> SessionResult<()> {
-        self.harness.tasks.resume();
+        self.harness.tasks.resume()?;
         self.harness
             .tasks
             .wait_for_idle(Some(self.id), context)
@@ -895,10 +918,6 @@ impl Harness for HarnessImpl {
     fn wake(&self) -> crate::harness::types::Wake {
         self.tasks.wake()
     }
-
-    async fn retry_task(&self, id: TaskId, context: &Context) -> SessionResult<()> {
-        self.tasks.retry_task(id, context).await
-    }
 }
 
 /// Invocation-bound handle for tasks and tools. Every operation, and every
@@ -1042,10 +1061,6 @@ pub async fn open_harness_with_scheduler(
     scheduler_factory: SchedulerFactory,
     context: &Context,
 ) -> SessionResult<Arc<HarnessImpl>> {
-    // The scheduler emits telemetry for every report it makes itself, so its
-    // callback only reaches the host. Reports that bypass the scheduler emit
-    // their fixed telemetry at their own call sites (upstream `safeReport`).
-    let scheduler_report_info = options.on_report_info.clone();
     if context
         .abort_signal()
         .is_some_and(|signal| signal.is_cancelled())
@@ -1079,14 +1094,35 @@ pub async fn open_harness_with_scheduler(
     // `safeReport`): the failure surface never propagates into a commit line.
     let report: crate::harness::types::ReportFn = {
         let host = options.on_report.clone();
-        Arc::new(move |message: String| {
+        Arc::new(move |report: crate::harness::types::Report| {
             let Some(host) = host.as_ref() else {
                 return;
             };
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host(message)));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host(report)));
         })
     };
-    let session = SessionImpl::new(Arc::clone(&storage), Some(Arc::clone(&now)));
+    let cached = (!options.read_only)
+        .then(|| Arc::new(crate::session::CachedStorage::new(Arc::clone(&storage))));
+    let storage = cached.as_ref().map_or_else(
+        || Arc::clone(&storage),
+        |cached| Arc::clone(cached) as Arc<dyn Storage>,
+    );
+    let session = SessionImpl::new_with_options(
+        Arc::clone(&storage),
+        Some(Arc::clone(&now)),
+        options.read_only,
+    );
+    if let Some(cached) = cached {
+        session.subscribe_internal_commits(Arc::new(move |publication, _context| {
+            cached.published(&publication.changes);
+        }));
+    }
+    session.set_persist_within_ms(
+        crate::harness::agent::resolve_settings(settings_source.current().as_ref())
+            .progress
+            .persist_within_ms
+            .map(|value| value as f64),
+    );
     session.set_document_timer(options.set_timer.clone(), Arc::clone(&report));
     session.set_conversation_created_hook(conversation_created_hook(
         options.conversation_created.clone(),
@@ -1119,32 +1155,24 @@ pub async fn open_harness_with_scheduler(
     };
     session.set_failure_reporter(Arc::new({
         let report = Arc::clone(&report);
-        let report_info = options.on_report_info.clone();
         let telemetry = options.telemetry.clone().unwrap_or_default();
         move |message, context| {
-            report(message);
             let info = crate::harness::types::ReportInfo::new(
-                crate::harness::types::ReportKind::SessionFailed,
+                crate::harness::types::ReportKind::StorageFailed,
             );
             crate::harness::scheduler::emit_report_telemetry(&telemetry, &info, context.as_ref());
-            if let Some(report) = &report_info {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(info)));
-            }
+            report(crate::harness::types::Report::new(info, message));
         }
     }));
     session.set_listener_reporter(Arc::new({
         let report = Arc::clone(&report);
-        let report_info = options.on_report_info.clone();
         let telemetry = options.telemetry.clone().unwrap_or_default();
         move |message, context| {
-            report(message);
             let info = crate::harness::types::ReportInfo::new(
                 crate::harness::types::ReportKind::ListenerError,
             );
             crate::harness::scheduler::emit_report_telemetry(&telemetry, &info, context.as_ref());
-            if let Some(report) = &report_info {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(info)));
-            }
+            report(crate::harness::types::Report::new(info, message));
         }
     }));
     let scheduler = scheduler_factory(SchedulerDeps {
@@ -1158,13 +1186,14 @@ pub async fn open_harness_with_scheduler(
         settings: settings_source.clone(),
         env: options.env.clone(),
         report: Arc::clone(&report),
-        report_info: scheduler_report_info,
         now: Arc::clone(&now),
         context: without_abort_signal(context),
     });
     let resume: Arc<dyn Fn() + Send + Sync> = {
         let scheduler = Arc::clone(&scheduler);
-        Arc::new(move || scheduler.resume())
+        Arc::new(move || {
+            let _ = scheduler.resume();
+        })
     };
     let queue_modes: Box<dyn Fn() -> QueueModes + Send + Sync> = {
         let settings = settings_source.clone();
@@ -1194,6 +1223,7 @@ pub async fn open_harness_with_scheduler(
         Arc::clone(&storage),
         Arc::clone(&scheduler),
     );
+    let conversation_views = crate::harness::view::ConversationViews::new(Arc::clone(&session));
     let harness = Arc::new_cyclic(|weak| HarnessImpl {
         weak: weak.clone(),
         session,
@@ -1204,13 +1234,19 @@ pub async fn open_harness_with_scheduler(
         tasks: scheduler,
         submissions,
         task_graph,
+        conversation_views,
         closed: AtomicBool::new(false),
     });
     if let Err(error) = harness.tasks.open(context).await {
         // The caller's context may be what failed open: close without it, and
         // rethrow the open error.
         if let Err(close_error) = harness.close(&without_abort_signal(context)).await {
-            (harness.report)(close_error.to_string());
+            (harness.report)(crate::harness::types::Report::new(
+                crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::StorageFailed,
+                ),
+                close_error.to_string(),
+            ));
         }
         return Err(error);
     }

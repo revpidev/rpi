@@ -1,13 +1,12 @@
 //! Detached in-memory reference implementation of [`Storage`]
 //! (port of `src/storage/memory.ts` @ `b4afdddf`).
 //!
-//! Reads and retained writes are cloned intentionally to match the ownership
-//! boundary of serialization-backed stores. This is backend conformance, not
-//! validation.
+//! Backends decode records into owned values; the Session cache shares hot
+//! records as immutable `Arc` values. This is backend conformance, not validation.
 
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::chord::context::Context;
 use crate::chord::delta::{Op, apply_immutable_batches};
@@ -862,10 +861,42 @@ fn visible_entries_ascending(
 
 #[async_trait]
 impl Storage for MemoryStorage {
-    async fn commit(&self, writes: &[StorageWrite], _context: &Context) -> StorageResult<Seq> {
+    async fn commit(
+        &self,
+        batches: &[Vec<StorageWrite>],
+        receive: &mut (dyn FnMut(usize, Seq) + Send),
+        _context: &Context,
+    ) -> StorageResult<crate::types::CommitResult> {
         let mut inner = self.lock()?;
-        let mut prepared = prepare(&mut inner, writes.to_vec(), None)?;
-        apply_prepared_inner(&mut inner, &mut prepared)
+        MemoryStorage::assert_open(&inner)?;
+        let mut seqs = Vec::new();
+        let mut refused = None;
+        let mut failure = None;
+        for writes in batches {
+            match prepare(&mut inner, writes.clone(), None) {
+                Ok(mut prepared) => match apply_prepared_inner(&mut inner, &mut prepared) {
+                    Ok(seq) => seqs.push(seq),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                },
+                Err(error) => {
+                    refused = Some(error);
+                    break;
+                }
+            }
+        }
+        for (index, seq) in seqs.iter().copied().enumerate() {
+            receive(index, seq);
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(crate::types::CommitResult {
+            stored: seqs.len(),
+            refused,
+        })
     }
 
     async fn mint_id(&self) -> StorageResult<u64> {
@@ -883,10 +914,10 @@ impl Storage for MemoryStorage {
         &self,
         id: ConversationId,
         _context: &Context,
-    ) -> StorageResult<Option<ConversationRecord>> {
+    ) -> StorageResult<Option<Arc<ConversationRecord>>> {
         let inner = self.lock()?;
         MemoryStorage::assert_open(&inner)?;
-        Ok(inner.state.conversations.get(&id).cloned())
+        Ok(inner.state.conversations.get(&id).cloned().map(Arc::new))
     }
 
     async fn scan_conversations(
@@ -1080,10 +1111,10 @@ impl Storage for MemoryStorage {
         })
     }
 
-    async fn task(&self, id: TaskId, _context: &Context) -> StorageResult<Option<StoredTask>> {
+    async fn task(&self, id: TaskId, _context: &Context) -> StorageResult<Option<Arc<StoredTask>>> {
         let inner = self.lock()?;
         MemoryStorage::assert_open(&inner)?;
-        Ok(inner.state.tasks.get(&id).cloned())
+        Ok(inner.state.tasks.get(&id).cloned().map(Arc::new))
     }
 
     async fn scan_tasks(
@@ -1145,10 +1176,10 @@ impl Storage for MemoryStorage {
         &self,
         id: SubmissionId,
         _context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         let inner = self.lock()?;
         MemoryStorage::assert_open(&inner)?;
-        Ok(inner.state.submissions.get(&id).cloned())
+        Ok(inner.state.submissions.get(&id).cloned().map(Arc::new))
     }
 
     async fn scan_submissions(
@@ -1200,7 +1231,7 @@ impl Storage for MemoryStorage {
         conversation_id: ConversationId,
         request_id: &str,
         _context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         let inner = self.lock()?;
         MemoryStorage::assert_open(&inner)?;
         let Some(id) = inner
@@ -1211,7 +1242,7 @@ impl Storage for MemoryStorage {
         else {
             return Ok(None);
         };
-        Ok(inner.state.submissions.get(id).cloned())
+        Ok(inner.state.submissions.get(id).cloned().map(Arc::new))
     }
 
     async fn find_document(

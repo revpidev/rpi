@@ -68,13 +68,14 @@ pub use documents::{
     materialize_document, materialize_document_value, resolve_address,
 };
 pub use session::{
-    CloseListener, CommitChange, CommitFn, CommitListener, CommitPublication, CommittedStateSource,
-    CommittedWatch, ConversationCreatedHook, ConversationDocumentView, ConversationOwnership,
-    DocDraft, DocOwner, DocumentChange, DocumentCopyChange, EntryDraft, EntryHead,
-    ForkDocumentCopy, LoadedDocument, NowFn, ObservedDocumentValue, SessionError, SessionFuture,
-    SessionImpl, SessionResult, Subscription, TaskCreate, TaskOwnership, Transaction,
-    TransactionScope, WatchEnd, WatchListener, commit_fn, create_session,
-    prepare_fork_document_copies, watch_listener,
+    CloseListener, CommitChange, CommitFn, CommitListener, CommitObservation, CommitObserver,
+    CommitOptions, CommitPersistence, CommitPublication, CommittedStateSource, CommittedWatch,
+    ConversationCreatedHook, ConversationDocumentView, ConversationOwnership, DocDraft, DocOwner,
+    DocumentChange, DocumentCopyChange, EntryDraft, EntryHead, ForkDocumentCopy, LoadedDocument,
+    NowFn, Observation, ObservedDocumentValue, Observer, SessionError, SessionFuture, SessionImpl,
+    SessionResult, Subscription, TaskCreate, TaskOwnership, Transaction, TransactionScope,
+    WatchCall, WatchEnd, WatchListener, commit_fn, create_session, prepare_fork_document_copies,
+    watch_listener,
 };
 
 // Code mode (port of `packages/durable/src/codemode` @ `b4afdddf`).

@@ -2,14 +2,14 @@
 //! (port of `src/storage/sqlite/storage.ts` @ `b4afdddf`).
 
 use async_trait::async_trait;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::chord::context::Context;
 use crate::chord::delta::{Op, apply_immutable_batches};
 use crate::chord::json::{JsonObject, JsonValue};
 use crate::chord::sqlite::database::{SqliteDatabase, SqliteTransaction, SqliteValue};
 use crate::errors::{StorageError, StorageResult};
-use crate::ids::{ConversationId, DocumentId, EntryId, Seq, SubmissionId, TaskId, id_from_number};
+use crate::ids::{ConversationId, DocumentId, EntryId, Seq, SubmissionId, TaskId};
 use crate::storage::scan::{ScanStart, scan_start};
 use crate::storage::sqlite::migrations::{
     apply_sqlite_migrations_for_schema, create_sqlite_migrations,
@@ -499,53 +499,61 @@ impl SqliteStorage {
         tx: &SqliteTransaction,
         writes: &[StorageWrite],
     ) -> StorageResult<()> {
-        let mut claimed: std::collections::HashMap<u64, &'static str> =
-            std::collections::HashMap::new();
-        for write in writes {
-            let Some(table) = write.table_name() else {
-                continue;
-            };
-            let id = write.write_id().expect("table implies id");
-            let existing = tx
-                .get_text(
-                    &format!(
-                        "SELECT record_type FROM {} WHERE id = ?",
-                        self.schema.tables.record_ids
-                    ),
-                    vec![id.into()],
-                )
-                .await?;
-            let earlier = claimed.get(&id).copied();
-            if table == "conversation" || table == "entry" || table == "document" {
-                if let Some(existing) = existing {
-                    return Err(StorageError::message(format!(
-                        "ID {id} already belongs to {existing}"
-                    )));
+        let sql = format!(
+            "SELECT record_type FROM {} WHERE id = ?",
+            self.schema.tables.record_ids
+        );
+        let claims = writes
+            .iter()
+            .filter_map(|write| {
+                Some((
+                    write.write_id()?,
+                    write.table_name().expect("ID implies table"),
+                ))
+            })
+            .collect::<Vec<_>>();
+        tx.with_connection(move |conn| {
+            let mut statement = conn.prepare_cached(&sql)?;
+            let mut claimed = std::collections::HashMap::new();
+            for (id, table) in claims {
+                let existing = statement
+                    .query(rusqlite::params![id as i64])?
+                    .next()?
+                    .map(|row| row.get::<_, String>(0))
+                    .transpose()?;
+                let earlier = claimed.get(&id).copied();
+                if matches!(table, "conversation" | "entry" | "document") {
+                    if let Some(existing) = existing {
+                        return Err(StorageError::message(format!(
+                            "ID {id} already belongs to {existing}"
+                        )));
+                    }
+                    if earlier.is_some() {
+                        return Err(StorageError::message(format!(
+                            "ID {id} is written more than once"
+                        )));
+                    }
+                } else {
+                    if let Some(existing) = existing
+                        && existing != table
+                    {
+                        return Err(StorageError::message(format!(
+                            "ID {id} already belongs to {existing}"
+                        )));
+                    }
+                    if let Some(earlier) = earlier
+                        && earlier != table
+                    {
+                        return Err(StorageError::message(format!(
+                            "ID {id} is written as two record types"
+                        )));
+                    }
                 }
-                if earlier.is_some() {
-                    return Err(StorageError::message(format!(
-                        "ID {id} is written more than once"
-                    )));
-                }
-            } else {
-                if let Some(existing) = existing
-                    && existing != table
-                {
-                    return Err(StorageError::message(format!(
-                        "ID {id} already belongs to {existing}"
-                    )));
-                }
-                if let Some(earlier) = earlier
-                    && earlier != table
-                {
-                    return Err(StorageError::message(format!(
-                        "ID {id} is written as two record types"
-                    )));
-                }
+                claimed.insert(id, table);
             }
-            claimed.insert(id, table);
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     fn prepare_document_actions(
@@ -615,186 +623,243 @@ impl SqliteStorage {
         Ok(actions)
     }
 
-    async fn current_document_id(
-        &self,
-        tx: &SqliteTransaction,
-        parts: &AddressParts,
-    ) -> StorageResult<Option<DocumentId>> {
-        let id = tx
-            .get_i64(
-                &format!(
-                    "SELECT id FROM {} WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ? AND retired_at IS NULL LIMIT 1",
-                    self.schema.tables.documents
-                ),
-                vec![
-                    parts.kind.as_str().into(),
-                    parts.scope_kind.into(),
-                    parts.owner_id.into(),
-                    parts.family.into(),
-                    parts.key_value.as_str().into(),
-                ],
-            )
-            .await?;
-        Ok(id.map(|value| id_from_number(value as u64)))
-    }
-
     async fn check_document_actions(
         &self,
         tx: &SqliteTransaction,
         actions: &[(DocumentId, DocumentAction)],
     ) -> StorageResult<()> {
-        let mut live_counts: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        for (id, action) in actions {
-            if let Some(copy) = &action.copy
-                && actions.iter().any(|(other, _)| other == &copy.id)
-            {
-                return Err(StorageError::Request(
-                    crate::errors::StorageRequestError::new(format!(
-                        "Document copy {id} source is changed in the copy batch"
-                    )),
-                ));
-            }
-            let existing: Option<DocumentRecord> = tx
-                .get(
-                    &format!(
-                        "SELECT record FROM {} WHERE id = ?",
-                        self.schema.tables.documents
-                    ),
-                    vec![id.get().into()],
-                )
-                .await?;
-            if action.create.is_none() && existing.is_none() {
-                return Err(StorageError::message(format!("Unknown document: {id}")));
-            }
-            if action.create.is_some() && existing.is_some() {
-                return Err(StorageError::message(format!(
-                    "Document {id} already exists"
-                )));
-            }
-            if let Some(existing) = &existing
-                && existing.retired_at.is_some()
-            {
-                return Err(StorageError::message(format!("Document {id} is retired")));
-            }
-            if let Some(DocumentContent::Delta { version, .. }) = &action.content {
-                let previous: Option<i64> = tx
-                    .get_i64(
-                        &format!(
-                            "SELECT version FROM {} WHERE document_id = ? ORDER BY seq DESC LIMIT 1",
-                            self.schema.tables.document_revisions
-                        ),
-                        vec![id.get().into()],
-                    )
-                    .await?;
-                let Some(previous) = previous else {
+        let documents_sql = format!(
+            "SELECT record FROM {} WHERE id = ?",
+            self.schema.tables.documents
+        );
+        let revisions_sql = format!(
+            "SELECT version FROM {} WHERE document_id = ? ORDER BY seq DESC LIMIT 1",
+            self.schema.tables.document_revisions
+        );
+        let current_sql = format!(
+            "SELECT id FROM {} WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ? AND retired_at IS NULL LIMIT 1",
+            self.schema.tables.documents
+        );
+        let actions = actions.to_vec();
+        tx.with_connection(move |conn| {
+            let mut document_query = conn.prepare_cached(&documents_sql)?;
+            let mut revision_query = conn.prepare_cached(&revisions_sql)?;
+            let mut current_query = conn.prepare_cached(&current_sql)?;
+            let mut live_counts = std::collections::HashMap::new();
+            for (id, action) in &actions {
+                if let Some(copy) = &action.copy
+                    && actions.iter().any(|(other, _)| other == &copy.id)
+                {
+                    return Err(StorageError::Request(
+                        crate::errors::StorageRequestError::new(format!(
+                            "Document copy {id} source is changed in the copy batch"
+                        )),
+                    ));
+                }
+                let existing = document_query
+                    .query(rusqlite::params![id.get() as i64])?
+                    .next()?
+                    .map(|row| row.get::<_, String>(0))
+                    .transpose()?
+                    .map(|record| serde_json::from_str::<DocumentRecord>(&record))
+                    .transpose()?;
+                if action.create.is_none() && existing.is_none() {
+                    return Err(StorageError::message(format!("Unknown document: {id}")));
+                }
+                if action.create.is_some() && existing.is_some() {
                     return Err(StorageError::message(format!(
-                        "Document {id} delta has no base"
+                        "Document {id} already exists"
                     )));
+                }
+                if existing
+                    .as_ref()
+                    .is_some_and(|record| record.retired_at.is_some())
+                {
+                    return Err(StorageError::message(format!("Document {id} is retired")));
+                }
+                if let Some(DocumentContent::Delta { version, .. }) = &action.content {
+                    let previous = revision_query
+                        .query(rusqlite::params![id.get() as i64])?
+                        .next()?
+                        .map(|row| row.get::<_, i64>(0))
+                        .transpose()?;
+                    let Some(previous) = previous else {
+                        return Err(StorageError::message(format!(
+                            "Document {id} delta has no base"
+                        )));
+                    };
+                    if previous as u64 != *version {
+                        return Err(StorageError::message(format!(
+                            "Document {id} version transition requires a base"
+                        )));
+                    }
+                }
+                let parts = match (&action.create, &existing) {
+                    (Some(create), _) => {
+                        address_parts(&create.kind, &create.scope, create.key.as_deref())
+                    }
+                    (None, Some(existing)) => {
+                        address_parts(&existing.kind, &existing.scope, existing.key.as_deref())
+                    }
+                    (None, None) => {
+                        return Err(StorageError::message(format!(
+                            "Document {id} has neither a create record nor an existing version"
+                        )));
+                    }
                 };
-                if previous as u64 != *version {
-                    return Err(StorageError::message(format!(
-                        "Document {id} version transition requires a base"
-                    )));
+                let key = serde_json::to_string(&[
+                    parts.kind.as_str(),
+                    parts.scope_kind,
+                    &parts.owner_id.to_string(),
+                    &parts.family.to_string(),
+                    parts.key_value.as_str(),
+                ])
+                .unwrap_or_default();
+                let current_id = current_query
+                    .query(rusqlite::params![
+                        parts.kind.as_str(),
+                        parts.scope_kind,
+                        parts.owner_id as i64,
+                        parts.family as i64,
+                        parts.key_value.as_str()
+                    ])?
+                    .next()?
+                    .is_some();
+                let mut live = live_counts
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(i64::from(current_id));
+                if action.retire && existing.is_some() {
+                    live -= 1;
+                }
+                if action.create.is_some() && !action.retire {
+                    live += 1;
+                }
+                live_counts.insert(key, live);
+            }
+            for live in live_counts.values() {
+                if *live > 1 {
+                    return Err(StorageError::message(
+                        "Document address already has a current incarnation",
+                    ));
                 }
             }
-            let parts = match (&action.create, &existing) {
-                (Some(create), _) => {
-                    address_parts(&create.kind, &create.scope, create.key.as_deref())
-                }
-                (None, Some(existing)) => {
-                    address_parts(&existing.kind, &existing.scope, existing.key.as_deref())
-                }
-                (None, None) => {
-                    return Err(StorageError::message(format!(
-                        "Document {id} has neither a create record nor an existing version"
-                    )));
-                }
-            };
-            let key = serde_json::to_string(&[
-                parts.kind.as_str(),
-                parts.scope_kind,
-                &parts.owner_id.to_string(),
-                &parts.family.to_string(),
-                parts.key_value.as_str(),
-            ])
-            .unwrap_or_default();
-            let current_id = self.current_document_id(tx, &parts).await?;
-            let mut live = live_counts
-                .get(&key)
-                .copied()
-                .unwrap_or(i64::from(current_id.is_some()));
-            if action.retire && existing.is_some() {
-                live -= 1;
-            }
-            if action.create.is_some() && !action.retire {
-                live += 1;
-            }
-            live_counts.insert(key, live);
-        }
-        for live in live_counts.values() {
-            if *live > 1 {
-                return Err(StorageError::message(
-                    "Document address already has a current incarnation",
-                ));
-            }
-        }
+            Ok(())
+        })
+        .await
+    }
+
+    fn rows(count: usize, columns: usize) -> String {
+        let row = format!(
+            "({})",
+            (0..columns).map(|_| "?").collect::<Vec<_>>().join(", ")
+        );
+        (0..count)
+            .map(|_| row.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn execute_values(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        values: Vec<SqliteValue>,
+    ) -> StorageResult<()> {
+        let values = values
+            .into_iter()
+            .map(|value| match value {
+                SqliteValue::Null => rusqlite::types::Value::Null,
+                SqliteValue::Integer(value) => rusqlite::types::Value::Integer(value),
+                SqliteValue::Real(value) => rusqlite::types::Value::Real(value),
+                SqliteValue::Text(value) => rusqlite::types::Value::Text(value),
+                SqliteValue::Blob(value) => rusqlite::types::Value::Blob(value),
+            })
+            .collect::<Vec<_>>();
+        conn.prepare_cached(sql)?
+            .execute(rusqlite::params_from_iter(values.iter()))?;
         Ok(())
     }
 
-    async fn apply_table_write(
+    async fn apply_table_writes(
         &self,
         tx: &SqliteTransaction,
-        write: &StorageWrite,
+        writes: &[StorageWrite],
         seq: Seq,
     ) -> StorageResult<()> {
-        let tables = &self.schema.tables;
-        match write {
-            StorageWrite::Conversation { value } => {
-                self.claim_id(tx, value.id.get(), "conversation").await?;
-                tx.run(
+        let record_ids = self.schema.tables.record_ids.clone();
+        let conversations = self.schema.tables.conversations.clone();
+        let entries = self.schema.tables.entries.clone();
+        let tasks = self.schema.tables.tasks.clone();
+        let submissions = self.schema.tables.submissions.clone();
+        let writes = writes.to_vec();
+        tx.with_connection(move |conn| {
+            let mut ids = Vec::new();
+            for write in &writes {
+                if let (Some(id), Some(table)) = (write.write_id(), write.table_name()) {
+                    ids.push(SqliteValue::from(id));
+                    ids.push(SqliteValue::from(table));
+                }
+            }
+            if !ids.is_empty() {
+                Self::execute_values(
+                    conn,
                     &format!(
-                        "INSERT INTO {} (id, owner_conversation_id, owner_task_id, record) VALUES (?, ?, ?, ?)",
-                        tables.conversations
+                        "INSERT OR IGNORE INTO {record_ids} (id, record_type) VALUES {}",
+                        Self::rows(ids.len() / 2, 2)
                     ),
-                    vec![
+                    ids,
+                )?;
+            }
+
+            let mut values = Vec::new();
+            for write in &writes {
+                if let StorageWrite::Conversation { value } = write {
+                    values.extend([
                         value.id.get().into(),
                         value.owner.as_ref().map(|owner| owner.conversation_id.get() as i64).into(),
                         value.owner.as_ref().map(|owner| owner.task_id.get() as i64).into(),
                         encode_json(value)?.into(),
-                    ],
-                )
-                .await
+                    ]);
+                }
             }
-            StorageWrite::Entry { value } => {
-                self.claim_id(tx, value.id.get(), "entry").await?;
-                tx.run(
+            if !values.is_empty() {
+                Self::execute_values(
+                    conn,
                     &format!(
-                        "INSERT INTO {} (id, conversation_id, head, commit_seq, record) VALUES (?, ?, ?, ?, ?)",
-                        tables.entries
+                        "INSERT INTO {conversations} (id, owner_conversation_id, owner_task_id, record) VALUES {}",
+                        Self::rows(values.len() / 4, 4)
                     ),
-                    vec![
+                    values,
+                )?;
+            }
+
+            let mut values = Vec::new();
+            for write in &writes {
+                if let StorageWrite::Entry { value } = write {
+                    values.extend([
                         value.id.get().into(),
                         value.conversation_id.get().into(),
                         value.head.map(EntryId::get).into(),
                         seq.0.into(),
                         encode_json(value)?.into(),
-                    ],
-                )
-                .await
+                    ]);
+                }
             }
-            StorageWrite::Task { value } => {
-                self.claim_id(tx, value.id.get(), "task").await?;
-                tx.run(
+            if !values.is_empty() {
+                Self::execute_values(
+                    conn,
                     &format!(
-                        "INSERT INTO {} (id, conversation_id, kind, status, abort_requested, background, record)
-						VALUES (?, ?, ?, ?, ?, ?, ?)
-						ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id, kind = excluded.kind,
-						status = excluded.status, abort_requested = excluded.abort_requested,
-						background = excluded.background, record = excluded.record",
-                        tables.tasks
+                        "INSERT INTO {entries} (id, conversation_id, head, commit_seq, record) VALUES {}",
+                        Self::rows(values.len() / 5, 5)
                     ),
-                    vec![
+                    values,
+                )?;
+            }
+
+            let mut values = Vec::new();
+            for write in &writes {
+                if let StorageWrite::Task { value } = write {
+                    values.extend([
                         value.id.get().into(),
                         value.conversation_id.get().into(),
                         encode_indexed_string(&value.kind).into(),
@@ -802,34 +867,50 @@ impl SqliteStorage {
                         value.abort_requested.into(),
                         value.background.into(),
                         encode_json(value)?.into(),
-                    ],
-                )
-                .await
+                    ]);
+                }
             }
-            StorageWrite::Submission { value } => {
-                self.claim_id(tx, value.id().get(), "submission").await?;
-                tx.run(
+            if !values.is_empty() {
+                Self::execute_values(
+                    conn,
                     &format!(
-                        "INSERT INTO {} (id, conversation_id, request_id, status, record) VALUES (?, ?, ?, ?, ?)
-						ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id,
-						request_id = excluded.request_id, status = excluded.status, record = excluded.record",
-                        tables.submissions
+                        "INSERT INTO {tasks} (id, conversation_id, kind, status, abort_requested, background, record) VALUES {}
+                         ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id, kind = excluded.kind,
+                         status = excluded.status, abort_requested = excluded.abort_requested,
+                         background = excluded.background, record = excluded.record",
+                        Self::rows(values.len() / 7, 7)
                     ),
-                    vec![
+                    values,
+                )?;
+            }
+
+            let mut values = Vec::new();
+            for write in &writes {
+                if let StorageWrite::Submission { value } = write {
+                    values.extend([
                         value.id().get().into(),
                         value.conversation_id().get().into(),
                         value.request_id().map(encode_indexed_string).into(),
                         value.status().into(),
                         encode_json(value)?.into(),
-                    ],
-                )
-                .await
+                    ]);
+                }
             }
-            StorageWrite::DocumentCreate { .. }
-            | StorageWrite::DocumentCopy { .. }
-            | StorageWrite::DocumentChange { .. }
-            | StorageWrite::DocumentRetire { .. } => Ok(()),
-        }
+            if !values.is_empty() {
+                Self::execute_values(
+                    conn,
+                    &format!(
+                        "INSERT INTO {submissions} (id, conversation_id, request_id, status, record) VALUES {}
+                         ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id,
+                         request_id = excluded.request_id, status = excluded.status, record = excluded.record",
+                        Self::rows(values.len() / 5, 5)
+                    ),
+                    values,
+                )?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn claim_id(
@@ -1100,53 +1181,103 @@ impl SqliteStorage {
 
 #[async_trait]
 impl Storage for SqliteStorage {
-    async fn commit(&self, writes: &[StorageWrite], _context: &Context) -> StorageResult<Seq> {
+    async fn commit(
+        &self,
+        batches: &[Vec<StorageWrite>],
+        receive: &mut (dyn FnMut(usize, Seq) + Send),
+        _context: &Context,
+    ) -> StorageResult<crate::types::CommitResult> {
         self.assert_open()?;
-        let actions = Self::prepare_document_actions(writes)?;
-        let candidate_next_id = self.candidate_next_id(writes)?;
-        let seq = self
-            .db
-            .transaction(move |tx| async move {
-                let metadata = &self.schema.tables.durable_metadata;
-                let metadata_next_id = tx
-                    .get_text(
-                        &format!("SELECT next_id FROM {metadata} WHERE singleton = 1"),
-                        vec![],
-                    )
-                    .await?
-                    .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?;
-                let committed_seq = tx
-                    .get_i64(
-                        &format!("SELECT next_seq FROM {metadata} WHERE singleton = 1"),
-                        vec![],
-                    )
-                    .await?
-                    .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?
-                    as u64;
-                let committed_seq = Seq(committed_seq);
-                self.check_global_ids(&tx, writes).await?;
-                self.check_document_actions(&tx, &actions).await?;
-                for write in writes {
-                    self.apply_table_write(&tx, write, committed_seq).await?;
+        let mut seqs = Vec::new();
+        let outcome = async {
+        for writes in batches {
+            let (actions, candidate_next_id) = match Self::prepare_document_actions(writes)
+                .and_then(|actions| {
+                    self.candidate_next_id(writes)
+                        .map(|candidate| (actions, candidate))
+                }) {
+                Ok(prepared) => prepared,
+                Err(refused) => {
+                    return Ok(crate::types::CommitResult {
+                        stored: seqs.len(),
+                        refused: Some(refused),
+                    });
                 }
-                self.apply_document_actions(&tx, &actions, committed_seq)
+            };
+            let refusal = Arc::new(Mutex::new(None));
+            let refusal_in_tx = Arc::clone(&refusal);
+            let seq = self
+                .db
+                .transaction(move |tx| async move {
+                    let metadata = &self.schema.tables.durable_metadata;
+                    let metadata_next_id = tx
+                        .get_text(
+                            &format!("SELECT next_id FROM {metadata} WHERE singleton = 1"),
+                            vec![],
+                        )
+                        .await?
+                        .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?;
+                    let committed_seq = tx
+                        .get_i64(
+                            &format!("SELECT next_seq FROM {metadata} WHERE singleton = 1"),
+                            vec![],
+                        )
+                        .await?
+                        .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?
+                        as u64;
+                    let committed_seq = Seq(committed_seq);
+                    let checked = match self.check_global_ids(&tx, writes).await {
+                        Ok(()) => self.check_document_actions(&tx, &actions).await,
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = checked {
+                        *refusal_in_tx
+                            .lock()
+                            .map_err(|_| StorageError::message("SQLite refusal lock poisoned"))? =
+                            Some(error);
+                        return Err(StorageError::message("Durable batch refused"));
+                    }
+                    self.apply_table_writes(&tx, writes, committed_seq).await?;
+                    self.apply_document_actions(&tx, &actions, committed_seq)
+                        .await?;
+                    let current_next_id = metadata_next_id
+                        .parse::<u64>()
+                        .map_err(|_| StorageError::message("Durable SQLite metadata is missing"))?;
+                    tx.run(
+                        &format!("UPDATE {metadata} SET next_id = ?, next_seq = ? WHERE singleton = 1"),
+                        vec![
+                            current_next_id.max(candidate_next_id).to_string().into(),
+                            (committed_seq.0 + 1).into(),
+                        ],
+                    )
                     .await?;
-                let current_next_id = metadata_next_id
-                    .parse::<u64>()
-                    .map_err(|_| StorageError::message("Durable SQLite metadata is missing"))?;
-                tx.run(
-                    &format!("UPDATE {metadata} SET next_id = ?, next_seq = ? WHERE singleton = 1"),
-                    vec![
-                        current_next_id.max(candidate_next_id).to_string().into(),
-                        (committed_seq.0 + 1).into(),
-                    ],
-                )
-                .await?;
-                Ok(committed_seq)
-            })
-            .await?;
-        self.advance_next_id(candidate_next_id)?;
-        Ok(seq)
+                    Ok(committed_seq)
+                })
+                .await;
+            let refused = refusal
+                .lock()
+                .map_err(|_| StorageError::message("SQLite refusal lock poisoned"))?
+                .take();
+            if let Some(refused) = refused {
+                return Ok(crate::types::CommitResult {
+                    stored: seqs.len(),
+                    refused: Some(refused),
+                });
+            }
+            let seq = seq?;
+            seqs.push(seq);
+            self.advance_next_id(candidate_next_id)?;
+        }
+        Ok(crate::types::CommitResult {
+            stored: seqs.len(),
+            refused: None,
+        })
+        }
+        .await;
+        for (index, seq) in seqs.iter().copied().enumerate() {
+            receive(index, seq);
+        }
+        outcome
     }
 
     async fn mint_id(&self) -> StorageResult<u64> {
@@ -1167,9 +1298,11 @@ impl Storage for SqliteStorage {
         &self,
         id: ConversationId,
         _context: &Context,
-    ) -> StorageResult<Option<ConversationRecord>> {
+    ) -> StorageResult<Option<Arc<ConversationRecord>>> {
         self.assert_open()?;
-        self.read_conversation(id).await
+        self.read_conversation(id)
+            .await
+            .map(|value| value.map(Arc::new))
     }
 
     async fn scan_conversations(
@@ -1252,9 +1385,10 @@ impl Storage for SqliteStorage {
         }
     }
 
-    async fn task(&self, id: TaskId, _context: &Context) -> StorageResult<Option<TaskRecord>> {
+    async fn task(&self, id: TaskId, _context: &Context) -> StorageResult<Option<Arc<TaskRecord>>> {
         self.assert_open()?;
-        self.db
+        let value: Option<TaskRecord> = self
+            .db
             .get(
                 &format!(
                     "SELECT record FROM {} WHERE id = ?",
@@ -1262,7 +1396,8 @@ impl Storage for SqliteStorage {
                 ),
                 vec![id.get().into()],
             )
-            .await
+            .await?;
+        Ok(value.map(Arc::new))
     }
 
     async fn scan_tasks(
@@ -1317,9 +1452,10 @@ impl Storage for SqliteStorage {
         &self,
         id: SubmissionId,
         _context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         self.assert_open()?;
-        self.db
+        let value: Option<SubmissionRecord> = self
+            .db
             .get(
                 &format!(
                     "SELECT record FROM {} WHERE id = ?",
@@ -1327,7 +1463,8 @@ impl Storage for SqliteStorage {
                 ),
                 vec![id.get().into()],
             )
-            .await
+            .await?;
+        Ok(value.map(Arc::new))
     }
 
     async fn scan_submissions(
@@ -1371,9 +1508,10 @@ impl Storage for SqliteStorage {
         conversation_id: ConversationId,
         request_id: &str,
         _context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         self.assert_open()?;
-        self.db
+        let value: Option<SubmissionRecord> = self
+            .db
             .get(
                 &format!(
                     "SELECT record FROM {} WHERE conversation_id = ? AND request_id = ?",
@@ -1384,7 +1522,8 @@ impl Storage for SqliteStorage {
                     encode_indexed_string(request_id).into(),
                 ],
             )
-            .await
+            .await?;
+        Ok(value.map(Arc::new))
     }
 
     async fn find_document(

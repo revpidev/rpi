@@ -172,7 +172,11 @@ rpi update [self|--all|--extensions|--models] [--rc]
 rpi config                 # 资源配置 TUI（Tab 切换全局/项目作用域）
 rpi mcp add|remove|list|login|logout ...   # 在会话外管理 MCP 服务器
 rpi auth check|print-api-key|print-bearer-token ...  # 查看 provider 凭据
+rpi auth login <provider>    # 通过 API key、设备码或复制代码流程登录
+rpi auth logout <provider>   # 删除 provider 凭据
 ```
+
+更新提示会记录 previous/next version-or-commit 与 changelog 来源，按插件折叠为一行，并通过 `extensionChangelogVersions` 记忆各插件已读版本。交互式会话的原 cwd 不存在时，启动、恢复、导入和切换会明确提供 Continue、Fork、Cancel；Continue 不持久化，启动时的 Fork 使用当前 cwd，print/RPC 仍报告 `MissingSessionCwdError`。摘要和 changelog 与 assistant 共用 Markdown/Mermaid 转换管线，包括 pie、作者样式和可点击标签。
 
 ### 内置工具与扩展
 

@@ -16,7 +16,8 @@ use rpi_durable::documents::{DocDefinition, DocScope, DocToken, define_doc, defi
 use rpi_durable::errors::{StorageError, StorageRequestError};
 use rpi_durable::ids::EntryId;
 use rpi_durable::session::{
-    DocOwner, SessionEnd, SessionError, WatchEnd, commit_fn, watch_listener,
+    CommitOptions, CommitPersistence, DocOwner, SessionEnd, SessionError, WatchCall, WatchEnd,
+    commit_fn, watch_listener,
 };
 use rpi_durable::types::{DocumentFork, DocumentHistory};
 use tokio_util::sync::CancellationToken;
@@ -516,6 +517,19 @@ async fn retires_and_recreates_at_same_address() {
         })
     })
     .await;
+    let kinds: Vec<rpi_durable::session::DocumentChangeKind> = harness
+        .publications
+        .lock()
+        .expect("publications")
+        .iter()
+        .flat_map(|publication| publication.changes.iter())
+        .filter_map(|change| match change {
+            rpi_durable::session::CommitChange::Document(document) => Some(document.kind),
+            _ => None,
+        })
+        .collect();
+    assert!(kinds.contains(&rpi_durable::session::DocumentChangeKind::Change));
+    assert!(kinds.contains(&rpi_durable::session::DocumentChangeKind::Retire));
     let writes = harness.storage.last_commit().unwrap();
     assert!(writes.iter().any(|write| matches!(
         write,
@@ -1019,6 +1033,49 @@ async fn fork_copies_every_family_member_across_pages() {
     assert_eq!(copies.len(), 260);
 }
 
+#[tokio::test]
+async fn commit_outcomes_are_bounded_to_256() {
+    let harness = open_test_session();
+    commit(&harness.session, |tx| {
+        Box::pin(async move { tx.doc(counter(), DocOwner::Session, None).await.map(|_| ()) })
+    })
+    .await;
+    let gate = harness.storage.hold_commits();
+    let mut jobs = Vec::new();
+    for value in 0..300u64 {
+        let session = Arc::clone(&harness.session);
+        jobs.push(tokio::spawn(async move {
+            session
+                .commit(
+                    commit_fn(move |tx| {
+                        Box::pin(async move {
+                            tx.doc(counter(), DocOwner::Session, None).await?.write()?["count"] =
+                                serde_json::json!(value);
+                            Ok(())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }));
+    }
+    let mut reached = false;
+    for _ in 0..200 {
+        if harness.session.outstanding_commit_count() == 256 {
+            reached = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(reached, "admission did not reach the 256-outcome limit");
+    assert!(!jobs[299].is_finished(), "work past the limit was admitted");
+    gate.release();
+    for job in jobs {
+        job.await.expect("join").expect("commit");
+    }
+    assert_eq!(harness.session.outstanding_commit_count(), 0);
+}
+
 // ─── Group 6: watches ─────────────────────────────────────────────────────
 
 type DeliveryLog = Arc<Mutex<Vec<(Option<JsonObject>, Vec<Op>)>>>;
@@ -1027,9 +1084,9 @@ fn delivery_log() -> DeliveryLog {
     Arc::new(Mutex::new(Vec::new()))
 }
 
-/// session-watches.test.ts:48 delivers exact committed frames, serialized.
+/// D03: an idle listener receives each committed frame in order.
 #[tokio::test]
-async fn watch_delivers_exact_frames_in_order() {
+async fn watch_delivers_unfolded_frames_in_order() {
     let harness = open_test_session();
     commit(&harness.session, |tx| {
         Box::pin(async move { tx.doc(counter(), DocOwner::Session, None).await.map(|_| ()) })
@@ -1044,10 +1101,12 @@ async fn watch_delivers_exact_frames_in_order() {
     let log = delivery_log();
     let log_for_listener = Arc::clone(&log);
     watch
-        .start(watch_listener(move |value, ops, _context| {
+        .start(watch_listener(move |call, _context| {
             let log = Arc::clone(&log_for_listener);
             Box::pin(async move {
-                log.lock().unwrap().push((value, ops));
+                if let WatchCall::Value { value, ops, .. } = call {
+                    log.lock().unwrap().push((value, ops));
+                }
                 Ok(())
             })
         }))
@@ -1061,8 +1120,8 @@ async fn watch_delivers_exact_frames_in_order() {
             })
         })
         .await;
+        flush().await;
     }
-    flush().await;
     let delivered = log.lock().unwrap().clone();
     assert_eq!(delivered.len(), 2);
     assert_eq!(
@@ -1077,7 +1136,7 @@ async fn watch_delivers_exact_frames_in_order() {
     assert_eq!(watch.stop().await, WatchEnd::Stopped);
 }
 
-/// session-watches.test.ts:142 collapses 101 pending commits to one root replacement.
+/// Past 10,000 pending operations, only one root replacement remains.
 #[tokio::test]
 async fn watch_overflow_collapses_to_root_replacement() {
     let harness = open_test_session();
@@ -1091,11 +1150,11 @@ async fn watch_overflow_collapses_to_root_replacement() {
         .await
         .unwrap()
         .unwrap();
-    for value in 1..=101 {
+    for value in 1..=rpi_durable::chord::delta::MAX_PENDING_OPS as u64 + 1 {
         commit(&harness.session, move |tx| {
             Box::pin(async move {
-                tx.doc(counter(), DocOwner::Session, None).await?.write()?["count"] =
-                    serde_json::json!(value);
+                tx.doc(counter(), DocOwner::Session, None).await?.write()?
+                    [format!("count{value}")] = serde_json::json!(value);
                 Ok(())
             })
         })
@@ -1104,10 +1163,12 @@ async fn watch_overflow_collapses_to_root_replacement() {
     let log = delivery_log();
     let log_for_listener = Arc::clone(&log);
     watch
-        .start(watch_listener(move |value, ops, _context| {
+        .start(watch_listener(move |call, _context| {
             let log = Arc::clone(&log_for_listener);
             Box::pin(async move {
-                log.lock().unwrap().push((value, ops));
+                if let WatchCall::Value { value, ops, .. } = call {
+                    log.lock().unwrap().push((value, ops));
+                }
                 Ok(())
             })
         }))
@@ -1116,16 +1177,24 @@ async fn watch_overflow_collapses_to_root_replacement() {
     let delivered = log.lock().unwrap().clone();
     assert_eq!(delivered.len(), 1);
     assert_eq!(
-        delivered[0].0.as_ref().unwrap()["count"],
-        serde_json::json!(101)
+        delivered[0]
+            .0
+            .as_ref()
+            .unwrap()
+            .get(&format!(
+                "count{}",
+                rpi_durable::chord::delta::MAX_PENDING_OPS + 1
+            ))
+            .and_then(JsonValue::as_u64),
+        Some((rpi_durable::chord::delta::MAX_PENDING_OPS + 1) as u64)
     );
     assert!(matches!(delivered[0].1.as_slice(), [Op::Replace(_)]));
     let _ = watch.stop().await;
 }
 
-/// session-watches.test.ts:279 delivers retirement and does not follow recreation.
+/// Retirement is a value call; recreation at the same address keeps the watch alive.
 #[tokio::test]
-async fn watch_retirement_is_terminal() {
+async fn watch_retirement_continues_through_recreation() {
     let harness = open_test_session();
     commit(&harness.session, |tx| {
         Box::pin(async move { tx.doc(counter(), DocOwner::Session, None).await.map(|_| ()) })
@@ -1140,10 +1209,12 @@ async fn watch_retirement_is_terminal() {
     let log = delivery_log();
     let log_for_listener = Arc::clone(&log);
     watch
-        .start(watch_listener(move |value, ops, _context| {
+        .start(watch_listener(move |call, _context| {
             let log = Arc::clone(&log_for_listener);
             Box::pin(async move {
-                log.lock().unwrap().push((value, ops));
+                if let WatchCall::Value { value, ops, .. } = call {
+                    log.lock().unwrap().push((value, ops));
+                }
                 Ok(())
             })
         }))
@@ -1152,11 +1223,27 @@ async fn watch_retirement_is_terminal() {
         Box::pin(async move { tx.retire_doc(counter(), DocOwner::Session).await })
     })
     .await;
-    assert_eq!(watch.closed().await, WatchEnd::Retired);
+    flush().await;
+    assert_eq!(log.lock().unwrap().len(), 1);
+    assert!(watch.value().is_some());
+    assert!(!watch.is_closed());
+    commit(&harness.session, |tx| {
+        Box::pin(async move {
+            tx.doc(counter(), DocOwner::Session, None).await?.write()?["count"] =
+                serde_json::json!(7);
+            Ok(())
+        })
+    })
+    .await;
+    flush().await;
     let delivered = log.lock().unwrap().clone();
-    assert_eq!(delivered.len(), 1);
-    assert!(delivered[0].0.is_none());
-    assert!(watch.value().is_none());
+    assert_eq!(delivered.len(), 2);
+    assert_eq!(
+        delivered[1].0.as_ref().unwrap()["count"],
+        serde_json::json!(7)
+    );
+    watch.close_session(None);
+    assert_eq!(watch.closed().await, WatchEnd::Ended);
 }
 
 /// session-watches.test.ts:315 Session close is terminal.
@@ -1174,7 +1261,7 @@ async fn watch_close_is_terminal() {
         .unwrap()
         .unwrap();
     harness.session.close(&BACKGROUND_CONTEXT).await.unwrap();
-    assert_eq!(watch.closed().await, WatchEnd::SessionClosed);
+    assert_eq!(watch.closed().await, WatchEnd::Ended);
 }
 
 /// A failed Session::close must leave the cleanup flag retryable.
@@ -1213,13 +1300,12 @@ async fn watch_cancellation_is_terminal() {
         .unwrap()
         .unwrap();
     cancel.cancel();
-    assert_eq!(watch.closed().await, WatchEnd::Cancelled);
+    assert_eq!(watch.closed().await, WatchEnd::Aborted);
 }
 
-/// session-watches.test.ts:83 serializes callbacks and buffers exact frames
-/// while one is in flight.
+/// D03: callbacks do not overlap, and busy frames coalesce to the latest value.
 #[tokio::test]
-async fn watch_serializes_delivery() {
+async fn watch_serializes_and_coalesces_busy_delivery() {
     let harness = open_test_session();
     commit(&harness.session, |tx| {
         Box::pin(async move { tx.doc(counter(), DocOwner::Session, None).await.map(|_| ()) })
@@ -1243,7 +1329,11 @@ async fn watch_serializes_delivery() {
     );
     let (active_l, max_l) = (Arc::clone(&active), Arc::clone(&max_active));
     watch
-        .start(watch_listener(move |value, _ops, _context| {
+        .start(watch_listener(move |call, _context| {
+            let value = match call {
+                WatchCall::Value { value, .. } => value,
+                WatchCall::Failed { .. } => None,
+            };
             let entered = Arc::clone(&entered_l);
             let release = Arc::clone(&release_l);
             let values = Arc::clone(&values_l);
@@ -1290,7 +1380,7 @@ async fn watch_serializes_delivery() {
     release.notify_one();
     flush().await;
     let delivered = values.lock().unwrap().clone();
-    assert_eq!(delivered, vec![1, 2, 3, 4, 5]);
+    assert_eq!(delivered, vec![1, 5]);
     assert_eq!(
         max_active.load(Ordering::SeqCst),
         1,
@@ -1964,7 +2054,7 @@ async fn failed_session_ends_watch_with_session_failed() {
     harness.session.fail("platform reset");
     assert_eq!(
         watch.closed().await,
-        WatchEnd::SessionFailed {
+        WatchEnd::Failed {
             error: "platform reset".to_string()
         }
     );
@@ -2669,4 +2759,107 @@ async fn document_retention_touches_documents_after_slow_storage_commit() {
         .expect("snapshot")
         .expect("document");
     assert_eq!(value["message"], "slow");
+}
+
+fn deferred_options(within_ms: Option<f64>) -> CommitOptions {
+    CommitOptions {
+        persistence: Some(CommitPersistence::Deferred { within_ms }),
+    }
+}
+
+async fn write_live_deferred(
+    session: &Arc<rpi_durable::session::SessionImpl>,
+    conversation: rpi_durable::ids::ConversationId,
+    message: &'static str,
+    within_ms: Option<f64>,
+) {
+    session
+        .commit_with_options(
+            commit_fn(move |tx| {
+                Box::pin(async move {
+                    tx.doc(live(), DocOwner::Conversation(conversation), None)
+                        .await?
+                        .write()?["message"] = serde_json::json!(message);
+                    Ok(())
+                })
+            }),
+            &BACKGROUND_CONTEXT,
+            None,
+            deferred_options(within_ms),
+        )
+        .await
+        .expect("deferred write");
+}
+
+#[tokio::test]
+async fn deferred_progress_merges_and_flushes_on_read_and_close() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    let initial = harness.storage.commits.lock().unwrap().len();
+    write_live_deferred(&harness.session, conversation, "a", None).await;
+    assert_eq!(
+        harness.storage.commits.lock().unwrap().len(),
+        initial + 1,
+        "initial base is immediate"
+    );
+    write_live_deferred(&harness.session, conversation, "ab", None).await;
+    write_live_deferred(&harness.session, conversation, "abc", None).await;
+    assert_eq!(
+        harness.storage.commits.lock().unwrap().len(),
+        initial + 1,
+        "consecutive deltas stay held"
+    );
+    commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            tx.doc(live(), DocOwner::Conversation(conversation), None)
+                .await
+                .map(|_| ())
+        })
+    })
+    .await;
+    assert_eq!(
+        harness.storage.commits.lock().unwrap().len(),
+        initial + 2,
+        "read flushes the merged delta"
+    );
+    write_live_deferred(&harness.session, conversation, "abcd", None).await;
+    harness.session.close(&BACKGROUND_CONTEXT).await.unwrap();
+    assert_eq!(
+        harness.storage.commits.lock().unwrap().len(),
+        initial + 3,
+        "close flushes the last delta"
+    );
+}
+
+#[tokio::test]
+async fn deferred_deadline_zero_and_retirement_flush_at_the_right_boundaries() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    write_live_deferred(&harness.session, conversation, "a", Some(0.0)).await;
+    assert_eq!(
+        harness.storage.commits.lock().unwrap().len(),
+        2,
+        "withinMs=0 is immediate"
+    );
+    write_live_deferred(&harness.session, conversation, "ab", Some(10.0)).await;
+    assert_eq!(harness.storage.commits.lock().unwrap().len(), 2);
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    assert_eq!(
+        harness.storage.commits.lock().unwrap().len(),
+        3,
+        "deadline flushes"
+    );
+    write_live_deferred(&harness.session, conversation, "abc", None).await;
+    commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            tx.retire_doc(live(), DocOwner::Conversation(conversation))
+                .await
+        })
+    })
+    .await;
+    assert_eq!(
+        harness.storage.commits.lock().unwrap().len(),
+        5,
+        "held delta and retirement both persist"
+    );
 }

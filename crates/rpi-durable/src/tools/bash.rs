@@ -336,6 +336,16 @@ struct PowerShellTool {
 /// Output in UTF-8 whatever the console's code page, as the coding agent's
 /// `powershell` tool does.
 const UTF8_OUTPUT: &str = "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}";
+const WINDOWS_POWERSHELL_EXIT_SUFFIX: &str = "\n;\nif ($?) { exit 0 }\nif (($LASTEXITCODE -eq 0) -and (\"$($Error[0].FullyQualifiedErrorId)\" -like \"NativeCommandError*\")) { exit 0 }\nexit 1";
+
+fn powershell_exit_suffix(program: &str, command: &str) -> &'static str {
+    let basename = program.rsplit(['\\', '/']).next().unwrap_or(program);
+    if basename.eq_ignore_ascii_case("powershell.exe") && !command.ends_with('`') {
+        WINDOWS_POWERSHELL_EXIT_SUFFIX
+    } else {
+        ""
+    }
+}
 const POWERSHELL_ARGS: [&str; 5] = [
     "-NoProfile",
     "-NonInteractive",
@@ -359,17 +369,18 @@ impl ToolExecute for PowerShellTool {
         let timeout = args.get("timeout").and_then(Value::as_f64);
         validate_timeout(timeout)?;
         let execution = prepare_execution(command, &self.options, api, context).await?;
-        let script = format!("{UTF8_OUTPUT}\n{}", execution.command);
         let commands = self
             .programs
             .iter()
             .map(|program| {
+                let suffix = powershell_exit_suffix(program, &execution.command);
+                let script = format!("{UTF8_OUTPUT}\n{}{suffix}", execution.command);
                 let mut argv = Vec::with_capacity(POWERSHELL_ARGS.len() + 2);
                 argv.push(program.clone());
                 for argument in POWERSHELL_ARGS {
                     argv.push(argument.to_string());
                 }
-                argv.push(script.clone());
+                argv.push(script);
                 ShellCommand::Argv(argv)
             })
             .collect();
@@ -429,5 +440,25 @@ pub fn create_power_shell_tool(options: Option<PowerShellToolOptions>) -> ToolRe
                 .programs
                 .unwrap_or_else(|| vec!["pwsh".to_string(), "powershell".to_string()]),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn powershell_51_suffix_preserves_native_exit_and_parse_errors() {
+        assert_eq!(
+            powershell_exit_suffix("powershell.exe", "git push 2>&1"),
+            WINDOWS_POWERSHELL_EXIT_SUFFIX
+        );
+        assert_eq!(powershell_exit_suffix("pwsh.exe", "git push 2>&1"), "");
+        assert_eq!(
+            powershell_exit_suffix("powershell.exe", "Get-ChildItem `"),
+            ""
+        );
+        assert!(WINDOWS_POWERSHELL_EXIT_SUFFIX.contains("NativeCommandError*"));
+        assert!(WINDOWS_POWERSHELL_EXIT_SUFFIX.contains("$LASTEXITCODE -eq 0"));
     }
 }

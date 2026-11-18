@@ -66,6 +66,9 @@ pub struct ToolSlot {
     /// Owning tool task; absent for a call not started yet and for an unoffered call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
+    /// The request did not offer this tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unoffered: Option<bool>,
     /// Result entry once done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<EntryId>,
@@ -187,6 +190,45 @@ pub struct LiveState {
     /// The newest compaction failure, kept until a summary is produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_failure: Option<CompactionFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_failure: Option<RunFailure>,
+}
+
+/// Why the newest run ended without an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunFailureReason {
+    ModelError,
+    NoModel,
+    Aborted,
+    Reset,
+    Faulted,
+    Orphaned,
+    Interrupted,
+    RestartLimit,
+    NothingToAnswer,
+    TurnLimit,
+}
+
+/// Terminal run failure retained after the run ends.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunFailure {
+    pub task_id: TaskId,
+    pub inputs: Vec<SubmissionId>,
+    pub reason: RunFailureReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first: Option<EntryId>,
+}
+
+/// Tasks created by after-run hooks before the run finally ends.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AfterRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Vec<TaskId>>,
 }
 
 /// Run control of one busy conversation.
@@ -197,6 +239,24 @@ pub struct LiveRun {
     pub task_id: TaskId,
     /// Inputs the run consumes.
     pub inputs: Vec<SubmissionId>,
+    #[serde(default)]
+    pub turns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first: Option<EntryId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_run: Option<AfterRun>,
+}
+
+impl Default for LiveRun {
+    fn default() -> Self {
+        Self {
+            task_id: TaskId::from_number(0),
+            inputs: Vec::new(),
+            turns: 0,
+            first: None,
+            after_run: None,
+        }
+    }
 }
 
 /// Presentation of the current generation attempt.
@@ -232,17 +292,54 @@ fn initial() -> JsonObject {
     }
 }
 
+fn rename_reason(value: &JsonValue) -> JsonValue {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let mut migrated = object.clone();
+    if let Some(reason) = migrated.remove("reason")
+        && !reason.is_null()
+        && migrated.get("trigger").is_none_or(JsonValue::is_null)
+    {
+        migrated.insert("trigger".to_string(), reason);
+    }
+    JsonValue::Object(migrated)
+}
+
+fn migrate_live(value: &JsonValue, _version: u64) -> JsonValue {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let mut migrated = object.clone();
+    if let Some(run) = migrated.get_mut("run").and_then(JsonValue::as_object_mut) {
+        let turns = run.get("turns").and_then(JsonValue::as_u64).unwrap_or(0);
+        run.insert("turns".to_string(), JsonValue::from(turns));
+    }
+    if let Some(compactions) = migrated
+        .get_mut("compactions")
+        .and_then(JsonValue::as_array_mut)
+    {
+        for status in compactions {
+            *status = rename_reason(status);
+        }
+    }
+    if let Some(failure) = migrated.get_mut("compactionFailure") {
+        *failure = rename_reason(failure);
+    }
+    JsonValue::Object(migrated)
+}
+
 /// Built-in live document (`pi.live`), conversation scope, history latest.
 pub static LIVE_DOC: LazyLock<DocToken> = LazyLock::new(|| {
     define_doc(DocDefinition {
         kind: "pi.live".to_string(),
-        version: 1,
+        version: 3,
         scope: DocScope::Conversation,
         history: Some(DocumentHistory::Latest),
         fork: Some(DocumentFork::Initial),
         family: false,
         initial: Arc::new(|_seed| initial()),
-        migrate: None,
+        migrate: Some(Arc::new(migrate_live)),
         // A complete base whenever nothing runs (spec §8.2): no generation and no
         // running tool slot.
         checkpoint_when: Arc::new(|value, _ops, _revision| {
@@ -279,6 +376,37 @@ pub async fn end_run(
     if state.run.as_ref().map(|run| run.task_id) == Some(task_id)
         && let Some(run) = state.run.take()
     {
+        if let SubmissionSettlement::Unanswered { reason, detail } = &settlement {
+            let reason = match reason.as_str() {
+                "model_error" => Some(RunFailureReason::ModelError),
+                "no_model" => Some(RunFailureReason::NoModel),
+                "aborted" => Some(RunFailureReason::Aborted),
+                "reset" => Some(RunFailureReason::Reset),
+                "faulted" => Some(RunFailureReason::Faulted),
+                "interrupted" => Some(RunFailureReason::Interrupted),
+                "restart_limit" => Some(RunFailureReason::RestartLimit),
+                "nothing_to_answer" => Some(RunFailureReason::NothingToAnswer),
+                "turn_limit" => Some(RunFailureReason::TurnLimit),
+                "missing_task" | "task_too_old" | "migration_failed" | "incompatible_task" => {
+                    Some(RunFailureReason::Orphaned)
+                }
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                state.run_failure = Some(RunFailure {
+                    task_id,
+                    inputs: run.inputs.clone(),
+                    reason,
+                    detail: detail.as_ref().map(|detail| match detail {
+                        JsonValue::String(text) => text.clone(),
+                        other => other.to_string(),
+                    }),
+                    first: run.first,
+                });
+            }
+        } else {
+            state.run_failure = None;
+        }
         for id in run.inputs {
             tx.settle_submission(id, settlement.clone())?;
         }
@@ -754,6 +882,7 @@ mod tests {
                                 run: Some(LiveRun {
                                     task_id,
                                     inputs: vec![submission.id()],
+                                    ..Default::default()
                                 }),
                                 generation: Some(LiveGeneration {
                                     attempt: 1,

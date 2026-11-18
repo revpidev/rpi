@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rpi_durable::harness::{
-    BlockedReason, Extension, Registry, ReportInfo, ReportKind, TaskAbort, TaskInspectionState,
+    BlockedReason, Extension, Registry, ReportKind, TaskAbort, TaskInspectionState,
 };
 use rpi_durable::storage::MemoryStorage;
 use rpi_durable::types::{Storage, TaskStatus};
@@ -387,7 +387,18 @@ async fn abort_owned_waits_for_the_child_and_lists_it_first() {
         Spec::owned("test.parent", serde_json::json!({})),
     )
     .await;
-    let settled = opened.harness.wait_for_task(id, &context()).await.unwrap();
+    let settled = match tokio::time::timeout(
+        Duration::from_secs(5),
+        opened.harness.wait_for_task(id, &context()),
+    )
+    .await
+    {
+        Ok(settled) => settled.unwrap(),
+        Err(error) => {
+            eprintln!("inspection: {:?}", opened.harness.inspect(&context()).await);
+            panic!("abortOwned timeout: {error}");
+        }
+    };
     assert_eq!(settled.result["ownedBefore"], serde_json::json!(1));
     assert_eq!(settled.result["childTerminal"], serde_json::json!(true));
     opened.harness.close(&context()).await.unwrap();
@@ -639,8 +650,8 @@ async fn an_outdated_definition_reports_once_per_invocation() {
         Arc::new(MemoryStorage::new()),
         vec![Arc::new(SlowTask(Arc::clone(&phases)))],
         None,
-        Some(Arc::new(move |info: ReportInfo| {
-            sink.lock().expect("reports").push(info.kind);
+        Some(Arc::new(move |report: rpi_durable::harness::Report| {
+            sink.lock().expect("reports").push(report.info.kind);
         })),
     )
     .await;
@@ -822,11 +833,21 @@ async fn abort_request_upgrades_a_restart_mark_down_the_tree() {
     // A request on the top task reaches the leaf and replaces its restart mark.
     reopened.harness.abort_task(top, &context()).await.unwrap();
     for (id, expected) in [(leaf, "orphaned"), (middle, "aborted"), (top, "aborted")] {
-        let settled = reopened
-            .harness
-            .wait_for_task(id, &context())
-            .await
-            .unwrap();
+        let settled = match tokio::time::timeout(
+            Duration::from_secs(5),
+            reopened.harness.wait_for_task(id, &context()),
+        )
+        .await
+        {
+            Ok(settled) => settled.unwrap(),
+            Err(error) => {
+                eprintln!(
+                    "task {id}; inspection: {:?}",
+                    reopened.harness.inspect(&context()).await
+                );
+                panic!("abort request timeout: {error}");
+            }
+        };
         let actual = match settled.record.state {
             TaskState::Terminal { outcome } => match outcome {
                 TaskOutcome::Orphaned { .. } => "orphaned",

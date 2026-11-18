@@ -50,9 +50,17 @@ pub enum StorageError {
     #[error("Conversation {0} is busy")]
     ConversationBusy(ConversationId),
 
+    /// An input required an active run, but the conversation is idle.
+    #[error("Conversation {0} is idle")]
+    ConversationIdle(ConversationId),
+
     /// Corrupt complete JSONL line or marker.
     #[error("{0}")]
     JsonlCorruption(String),
+
+    /// A JSONL storage opened read-only rejected a write.
+    #[error("JSONL storage is read-only")]
+    JsonlStorageReadOnlyError,
 
     /// A JSONL storage whose write path failed and which must be reopened.
     #[error("JSONL storage is poisoned and must be reopened")]

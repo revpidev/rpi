@@ -64,6 +64,8 @@ async fn record(harness: &Arc<HarnessImpl>, id: TaskId) -> TaskRecord {
         .await
         .expect("task")
         .expect("present")
+        .as_ref()
+        .clone()
 }
 
 async fn set_state(harness: &Arc<HarnessImpl>, id: TaskId, state: TaskState) {
@@ -177,7 +179,11 @@ async fn watch_reports_the_latest_committed_revision() {
     let watch = harness.watch_task_graph(&context).await.expect("watch");
     let log: Arc<Mutex<Vec<JsonValue>>> = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&log);
-    let listener = rpi_durable::session::watch_listener(move |value, _ops, _context| {
+    let listener = rpi_durable::session::watch_listener(move |call, _context| {
+        let value = match call {
+            rpi_durable::session::WatchCall::Value { value, .. } => value,
+            rpi_durable::session::WatchCall::Failed { .. } => None,
+        };
         let captured = Arc::clone(&captured);
         Box::pin(async move {
             captured
@@ -208,6 +214,115 @@ async fn watch_reports_the_latest_committed_revision() {
     let _ = watch.stop().await;
 }
 
+struct GraphObserver {
+    values: Arc<Mutex<Vec<rpi_durable::harness::task_graph::TaskGraph>>>,
+    ends: Arc<Mutex<Vec<rpi_durable::session::WatchEnd>>>,
+    panic_on_advance: bool,
+}
+
+impl rpi_durable::session::Observer<rpi_durable::harness::task_graph::TaskGraph> for GraphObserver {
+    fn advance(
+        &self,
+        call: rpi_durable::session::WatchCall<rpi_durable::harness::task_graph::TaskGraph>,
+        _context: &rpi_durable::chord::context::Context,
+    ) {
+        if self.panic_on_advance {
+            panic!("observer failure fixture");
+        }
+        if let rpi_durable::session::WatchCall::Value { value, .. } = call {
+            self.values.lock().expect("values").push(value);
+        }
+    }
+
+    fn end(&self, end: rpi_durable::session::WatchEnd) {
+        self.ends.lock().expect("ends").push(end);
+    }
+}
+
+#[tokio::test]
+async fn synchronous_observers_attach_atomically_detach_and_close_as_failed() {
+    let (harness, _scheduler) = open_recording().await;
+    let context = context();
+    let conversation = root(&harness).await;
+    let task = create_task(&harness, conversation, "pi.generation").await;
+    let values = Arc::new(Mutex::new(Vec::new()));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let observer = Arc::new(GraphObserver {
+        values: Arc::clone(&values),
+        ends: Arc::clone(&ends),
+        panic_on_advance: false,
+    });
+    let observation = harness
+        .observe_task_graph(observer, &context)
+        .await
+        .expect("observe");
+    assert!(
+        observation
+            .value
+            .tasks
+            .contains_key(&task.get().to_string())
+    );
+    set_state(
+        &harness,
+        task,
+        TaskState::Running {
+            checkpoint: serde_json::json!({ "phase": "request" }),
+        },
+    )
+    .await;
+    assert_eq!(values.lock().expect("values").len(), 1);
+    harness.close(&context).await.expect("close");
+    assert_eq!(
+        ends.lock().expect("ends").as_slice(),
+        &[rpi_durable::session::WatchEnd::Failed {
+            error: "Session is closed".to_string(),
+        }]
+    );
+    observation.detach.unsubscribe();
+}
+
+#[tokio::test]
+async fn a_panicking_task_graph_observer_reports_listener_error_and_detaches() {
+    let (harness, _scheduler) = open_recording().await;
+    let context = context();
+    let conversation = root(&harness).await;
+    let task = create_task(&harness, conversation, "pi.generation").await;
+    let reports = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&reports);
+    harness
+        .session()
+        .set_listener_reporter(Arc::new(move |message, _| {
+            captured.lock().expect("reports").push(message);
+        }));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let observation = harness
+        .observe_task_graph(
+            Arc::new(GraphObserver {
+                values: Arc::new(Mutex::new(Vec::new())),
+                ends: Arc::clone(&ends),
+                panic_on_advance: true,
+            }),
+            &context,
+        )
+        .await
+        .expect("observe");
+    set_state(
+        &harness,
+        task,
+        TaskState::Running {
+            checkpoint: serde_json::json!({ "phase": "request" }),
+        },
+    )
+    .await;
+    assert!(harness.session().failure().is_none());
+    assert!(reports.lock().expect("reports")[0].contains("listener_error"));
+    assert!(matches!(
+        ends.lock().expect("ends").as_slice(),
+        [rpi_durable::session::WatchEnd::ListenerError { .. }]
+    ));
+    observation.detach.unsubscribe();
+}
+
 #[tokio::test]
 async fn a_noop_commit_publishes_no_revision() {
     let (harness, _scheduler) = open_recording().await;
@@ -229,7 +344,7 @@ async fn a_noop_commit_publishes_no_revision() {
 mod scheduler_support;
 
 use rpi_durable::harness::BlockedReason;
-use rpi_durable::harness::{Extension, Harness, Registry, TaskInspectionState};
+use rpi_durable::harness::{Extension, Harness, Registry};
 use scheduler_support::{
     FakeTask, Spec, add_task, all_tasks, context as scheduler_context, open_with, stamp_task,
 };
@@ -297,10 +412,9 @@ async fn the_graph_reports_missing_and_registered_definitions() {
         .expect("close");
 }
 
-/// R-D7: a parked task is blocked in the graph, consistent with inspect(), and
-/// retryTask() clears both.
+/// R-D7: the restart limit ends the task instead of parking it for retry.
 #[tokio::test]
-async fn the_graph_reports_and_clears_the_restart_limit() {
+async fn the_graph_reports_the_restart_limit_as_terminal() {
     let opened = open_with(all_tasks()).await;
     let conversation = scheduler_support::root(&opened.harness).await;
     let id = add_task(
@@ -323,32 +437,19 @@ async fn the_graph_reports_and_clears_the_restart_limit() {
         .task_graph(&scheduler_context())
         .await
         .expect("graph");
-    assert_eq!(
-        blocked(&state.value(), id),
-        Some(BlockedReason::RestartLimit)
-    );
+    assert_eq!(blocked(&state.value(), id), None);
     state.dispose();
-    let inspection = opened
+    let settled = opened
         .harness
-        .inspect(&scheduler_context())
+        .wait_for_task(id, &scheduler_context())
         .await
-        .expect("inspect");
-    let inspected = inspection
-        .tasks
-        .iter()
-        .find(|task| task.record.id == id)
-        .expect("inspected task")
-        .state
-        .clone();
+        .expect("terminal task");
     assert!(matches!(
-        inspected,
-        TaskInspectionState::Blocked {
-            reason: BlockedReason::RestartLimit,
-            ..
-        }
+        settled.record.state,
+        rpi_durable::types::TaskState::Terminal { .. }
     ));
-    // A parked task waits for retryTask(), so a host may idle. Reconcile work
-    // from the stamping commit may still be in flight; wait for it to land.
+    // A terminal task must not keep the host awake. Reconcile work from the
+    // stamping commit may still be in flight; wait for it to land.
     for _ in 0..100 {
         if !opened.harness.wake().active {
             break;
@@ -357,21 +458,9 @@ async fn the_graph_reports_and_clears_the_restart_limit() {
     }
     assert!(
         !opened.harness.wake().active,
-        "a parked task must not keep the host awake"
+        "a terminal task must not keep the host awake"
     );
 
-    opened
-        .harness
-        .retry_task(id, &scheduler_context())
-        .await
-        .expect("retry");
-    let state = opened
-        .harness
-        .task_graph(&scheduler_context())
-        .await
-        .expect("graph");
-    assert_eq!(blocked(&state.value(), id), None);
-    state.dispose();
     opened
         .harness
         .close(&scheduler_context())

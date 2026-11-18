@@ -165,6 +165,8 @@ pub enum BoundaryAt {
 pub struct BoundaryResult {
     /// Placed user submission IDs.
     pub users: Vec<SubmissionId>,
+    /// First entry this boundary placed, when it placed one.
+    pub first: Option<EntryId>,
     /// Whether a reset was placed.
     pub reset: bool,
 }
@@ -235,6 +237,7 @@ pub async fn apply_boundary(
     users.sort_unstable();
 
     // `append_entry()` copies the drafts' values; the items are removed only afterwards.
+    let mut first = None;
     for index in &writes {
         let (id, entry_json) = match &items[*index] {
             InboxItem::Write { id, entry } => (*id, entry.clone()),
@@ -255,6 +258,7 @@ pub async fn apply_boundary(
         let record = tx
             .append_entry(boundary.conversation_id, draft.clone())
             .await?;
+        first.get_or_insert(record.id);
         if let Some(next_head) = draft.head {
             boundary.head = Some(match next_head {
                 EntryHead::This => record.id,
@@ -284,6 +288,9 @@ pub async fn apply_boundary(
         draft.model = Some(vec![message]);
         draft.data = data;
         let record = tx.append_entry(boundary.conversation_id, draft).await?;
+        if first.is_none() {
+            first = Some(record.id);
+        }
         tx.place_submission(id, record.id)?;
         placed.push(id);
     }
@@ -296,6 +303,7 @@ pub async fn apply_boundary(
     write_state(&boundary.inbox, &InboxState { items })?;
     Ok(BoundaryResult {
         users: placed,
+        first,
         reset,
     })
 }

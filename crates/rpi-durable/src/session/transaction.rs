@@ -31,7 +31,8 @@ use crate::ids::{
 };
 use crate::session::session::SessionImpl;
 use crate::session::{
-    CommitChange, DocOwner, DocumentChange, DocumentCopyChange, SessionError, SessionResult,
+    CommitChange, CommitPersistence, DocOwner, DocumentChange, DocumentCopyChange, SessionError,
+    SessionResult,
 };
 use crate::types::{
     ContextEdit, ConversationParent, ConversationQuery, ConversationRecord, Cursor,
@@ -114,6 +115,13 @@ pub enum SubmissionCreate {
         /// Host deduplication key.
         request_id: Option<String>,
     },
+    /// Continue the last run without appending an input entry.
+    Continue {
+        /// Owning conversation.
+        conversation_id: ConversationId,
+        /// Host deduplication key.
+        request_id: Option<String>,
+    },
     /// A passive write submission.
     Write {
         /// Owning conversation.
@@ -127,6 +135,9 @@ impl SubmissionCreate {
     fn conversation_id(&self) -> ConversationId {
         match self {
             SubmissionCreate::Input {
+                conversation_id, ..
+            }
+            | SubmissionCreate::Continue {
                 conversation_id, ..
             }
             | SubmissionCreate::Write {
@@ -151,6 +162,16 @@ impl SubmissionCreate {
                 trace,
                 request_id,
                 status: InputSubmissionStatus::Queued,
+            },
+            SubmissionCreate::Continue {
+                conversation_id,
+                request_id,
+            } => SubmissionRecord::Continue {
+                id,
+                conversation_id,
+                trace,
+                request_id,
+                status: crate::types::ContinueSubmissionStatus::Placed,
             },
             SubmissionCreate::Write {
                 conversation_id,
@@ -392,6 +413,7 @@ pub struct Transaction {
     context: Context,
     scope: TransactionScope,
     sealed: bool,
+    persistence: CommitPersistence,
     has_table_write: bool,
     writes: Vec<StorageWrite>,
     created_conversation_ids: std::collections::BTreeSet<ConversationId>,
@@ -406,12 +428,18 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub(crate) fn new(host: Arc<SessionImpl>, context: Context, scope: TransactionScope) -> Self {
+    pub(crate) fn new(
+        host: Arc<SessionImpl>,
+        context: Context,
+        scope: TransactionScope,
+        persistence: CommitPersistence,
+    ) -> Self {
         Self {
             host,
             context,
             scope,
             sealed: false,
+            persistence,
             has_table_write: false,
             writes: Vec::new(),
             created_conversation_ids: Default::default(),
@@ -426,6 +454,34 @@ impl Transaction {
         }
     }
 
+    pub(crate) fn can_defer(&self) -> bool {
+        !self.has_table_write
+            && !self.plans.is_empty()
+            && self.plans.iter().all(|plan| {
+                let eligible_record = match &plan.record {
+                    PlanRecord::Committed(record) => {
+                        matches!(record.scope, DocumentScope::Conversation { .. })
+                            && record.history == Some(crate::types::DocumentHistory::Latest)
+                            && record.fork == Some(crate::types::DocumentFork::Initial)
+                    }
+                    PlanRecord::Create(_) => false,
+                };
+                eligible_record
+                    && !plan.retire
+                    && plan
+                        .change
+                        .as_ref()
+                        .is_some_and(|change| change.loaded.is_some())
+                    && matches!(
+                        plan.content,
+                        Some(StorageWrite::DocumentChange {
+                            content: crate::types::DocumentContent::Delta { .. },
+                            ..
+                        })
+                    )
+            })
+    }
+
     // ─── Table reads ────────────────────────────────────────────────────────
 
     /// Look up one conversation by exact ID.
@@ -434,7 +490,12 @@ impl Transaction {
         id: ConversationId,
     ) -> SessionResult<Option<ConversationRecord>> {
         self.read("conversation")?;
-        Ok(self.host.storage().conversation(id, &self.context).await?)
+        Ok(self
+            .host
+            .storage()
+            .conversation(id, &self.context)
+            .await?
+            .map(|record| (*record).clone()))
     }
 
     /// Look up one global entry and the sequence that persisted it.
@@ -529,7 +590,12 @@ impl Transaction {
     /// Committed submission record.
     pub async fn submission(&self, id: SubmissionId) -> SessionResult<Option<SubmissionRecord>> {
         self.read("submission")?;
-        Ok(self.host.storage().submission(id, &self.context).await?)
+        Ok(self
+            .host
+            .storage()
+            .submission(id, &self.context)
+            .await?
+            .map(|record| (*record).clone()))
     }
 
     /// The telemetry context of this commit (the admission or phase span).
@@ -549,7 +615,12 @@ impl Transaction {
         for (index, id) in inputs.iter().enumerate() {
             let record = match self.submissions.get(id) {
                 Some(record) => Some(record.clone()),
-                None => self.host.storage().submission(*id, &self.context).await?,
+                None => self
+                    .host
+                    .storage()
+                    .submission(*id, &self.context)
+                    .await?
+                    .map(|record| (*record).clone()),
             };
             let carrier = record.as_ref().and_then(|record| record.trace().cloned());
             if index == 0 {
@@ -572,7 +643,8 @@ impl Transaction {
             .host
             .storage()
             .submission_by_request(conversation_id, request_id, &self.context)
-            .await?)
+            .await?
+            .map(|record| (*record).clone()))
     }
 
     // ─── Table writes ───────────────────────────────────────────────────────
@@ -915,6 +987,9 @@ impl Transaction {
         self.assert_open()?;
         let definition = Arc::clone(&token.definition);
         let resolved = resolve_address(&definition, doc_target(&definition, owner))?;
+        if self.persistence == CommitPersistence::Immediate {
+            self.host.flush_deferred_on_line().await?;
+        }
         self.assert_task_documents_open(&resolved.address)?;
         let skip_load = self
             .latest_index(&resolved.id)
@@ -1079,6 +1154,7 @@ impl Transaction {
         self.assert_open()?;
         let definition = Arc::clone(&token.definition);
         let resolved = resolve_address(&definition, doc_target(&definition, owner))?;
+        self.host.flush_deferred_on_line().await?;
         if let Some(index) = self.latest_index(&resolved.id) {
             if self.documents[index].retire_on_commit {
                 return Ok(());
@@ -1239,6 +1315,7 @@ impl Transaction {
                     self.host.evict(&plan.address_id, record.id);
                 }
                 publications.push(CommitChange::Document(DocumentChange {
+                    kind: crate::session::DocumentChangeKind::Retire,
                     record,
                     conversation_id: plan.conversation_id,
                     version: None,
@@ -1261,6 +1338,7 @@ impl Transaction {
                 };
                 let value = change.prepared.value().as_object().cloned();
                 publications.push(CommitChange::Document(DocumentChange {
+                    kind: crate::session::DocumentChangeKind::Change,
                     record,
                     conversation_id: plan.conversation_id,
                     version: Some(change.version),
@@ -1543,6 +1621,7 @@ impl Transaction {
                     .storage()
                     .submission(*id, &self.context)
                     .await?
+                    .map(|record| (*record).clone())
                     .ok_or_else(|| {
                         SessionError::message(format!("Submission {id} does not exist"))
                     })?,
@@ -1659,7 +1738,12 @@ impl Transaction {
         {
             return Ok(cached.clone());
         }
-        let loaded = self.host.storage().task(id, &self.context).await?;
+        let loaded = self
+            .host
+            .storage()
+            .task(id, &self.context)
+            .await?
+            .map(|record| (*record).clone());
         self.tasks.entry(id).or_default().committed_read = Some(loaded.clone());
         Ok(loaded)
     }
@@ -1881,6 +1965,11 @@ fn apply_submission_change(
             status,
             InputSubmissionStatus::Done { .. } | InputSubmissionStatus::Unanswered { .. }
         ),
+        SubmissionRecord::Continue { status, .. } => matches!(
+            status,
+            crate::types::ContinueSubmissionStatus::Done { .. }
+                | crate::types::ContinueSubmissionStatus::Unanswered { .. }
+        ),
         SubmissionRecord::Write { status, .. } => {
             matches!(
                 status,
@@ -1967,6 +2056,38 @@ fn apply_submission_change(
                     },
                 })
             }
+            (
+                SubmissionRecord::Continue {
+                    id,
+                    conversation_id,
+                    trace,
+                    request_id,
+                    status: crate::types::ContinueSubmissionStatus::Placed,
+                },
+                SubmissionSettlement::Done { answer },
+            ) => Ok(SubmissionRecord::Continue {
+                id,
+                conversation_id,
+                trace,
+                request_id,
+                status: crate::types::ContinueSubmissionStatus::Done { answer },
+            }),
+            (
+                SubmissionRecord::Continue {
+                    id,
+                    conversation_id,
+                    trace,
+                    request_id,
+                    ..
+                },
+                SubmissionSettlement::Unanswered { reason, detail },
+            ) => Ok(SubmissionRecord::Continue {
+                id,
+                conversation_id,
+                trace,
+                request_id,
+                status: crate::types::ContinueSubmissionStatus::Unanswered { reason, detail },
+            }),
             (
                 SubmissionRecord::Write {
                     id,

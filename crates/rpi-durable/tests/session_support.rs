@@ -4,7 +4,7 @@
 //! observable commits, gated calls, injected failures, and helpers to open a
 //! session and create conversations (port of `test/session-support.ts`).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -73,13 +73,18 @@ pub struct ControlledStorage {
     pub mint_count: AtomicU64,
     /// Number of document materialization reads.
     pub document_read_count: AtomicU64,
+    pub conversation_read_count: AtomicU64,
+    pub task_read_count: AtomicU64,
+    pub task_scan_count: AtomicU64,
     commit_gate: Mutex<Option<Arc<Held>>>,
+    conversation_gate: Mutex<Option<Arc<Held>>>,
     find_gate: Mutex<Option<Arc<Held>>>,
     commit_failure: Mutex<Option<StorageError>>,
     mint_failure: Mutex<Option<StorageError>>,
     read_failure: Mutex<Option<StorageError>>,
     close_failure: Mutex<Option<StorageError>>,
     close_gate: Mutex<Option<Arc<Held>>>,
+    close_backend: AtomicBool,
 }
 
 impl Default for ControlledStorage {
@@ -96,13 +101,18 @@ impl ControlledStorage {
             commits: Mutex::new(Vec::new()),
             mint_count: AtomicU64::new(0),
             document_read_count: AtomicU64::new(0),
+            conversation_read_count: AtomicU64::new(0),
+            task_read_count: AtomicU64::new(0),
+            task_scan_count: AtomicU64::new(0),
             commit_gate: Mutex::new(None),
+            conversation_gate: Mutex::new(None),
             find_gate: Mutex::new(None),
             commit_failure: Mutex::new(None),
             mint_failure: Mutex::new(None),
             read_failure: Mutex::new(None),
             close_failure: Mutex::new(None),
             close_gate: Mutex::new(None),
+            close_backend: AtomicBool::new(true),
         }
     }
 
@@ -110,6 +120,13 @@ impl ControlledStorage {
     pub fn hold_commits(&self) -> Gate {
         let (gate, held) = Gate::new();
         *self.commit_gate.lock().expect("gate") = Some(held);
+        gate
+    }
+
+    /// Hold one uncached conversation read and report when it arrives.
+    pub fn hold_conversation(&self) -> Gate {
+        let (gate, held) = Gate::new();
+        *self.conversation_gate.lock().expect("gate") = Some(held);
         gate
     }
 
@@ -147,6 +164,11 @@ impl ControlledStorage {
         *self.close_failure.lock().expect("close failure") = Some(error);
     }
 
+    /// Keep the shared in-memory backend usable when a simulated crashed Session closes.
+    pub fn keep_open_on_close(&self) {
+        self.close_backend.store(false, Ordering::SeqCst);
+    }
+
     /// Every committed batch, most recent last.
     pub fn last_commit(&self) -> Option<Vec<StorageWrite>> {
         self.commits.lock().expect("commits").last().cloned()
@@ -164,8 +186,16 @@ impl ControlledStorage {
 
 #[async_trait]
 impl Storage for ControlledStorage {
-    async fn commit(&self, writes: &[StorageWrite], context: &Context) -> StorageResult<Seq> {
-        self.commits.lock().expect("commits").push(writes.to_vec());
+    async fn commit(
+        &self,
+        batches: &[Vec<StorageWrite>],
+        receive: &mut (dyn FnMut(usize, Seq) + Send),
+        context: &Context,
+    ) -> StorageResult<rpi_durable::types::CommitResult> {
+        self.commits
+            .lock()
+            .expect("commits")
+            .extend(batches.iter().cloned());
         let held = self.commit_gate.lock().expect("gate").take();
         if let Some(held) = held {
             held.wait().await;
@@ -173,7 +203,7 @@ impl Storage for ControlledStorage {
         if let Some(error) = self.commit_failure.lock().expect("failure").take() {
             return Err(error);
         }
-        self.inner.commit(writes, context).await
+        self.inner.commit(batches, receive, context).await
     }
 
     async fn mint_id(&self) -> StorageResult<u64> {
@@ -188,7 +218,12 @@ impl Storage for ControlledStorage {
         &self,
         id: ConversationId,
         context: &Context,
-    ) -> StorageResult<Option<ConversationRecord>> {
+    ) -> StorageResult<Option<Arc<ConversationRecord>>> {
+        self.conversation_read_count.fetch_add(1, Ordering::SeqCst);
+        let held = self.conversation_gate.lock().expect("gate").take();
+        if let Some(held) = held {
+            held.wait().await;
+        }
         self.inner.conversation(id, context).await
     }
 
@@ -240,7 +275,8 @@ impl Storage for ControlledStorage {
         self.inner.scan_entries(query, limit, cursor, context).await
     }
 
-    async fn task(&self, id: TaskId, context: &Context) -> StorageResult<Option<TaskRecord>> {
+    async fn task(&self, id: TaskId, context: &Context) -> StorageResult<Option<Arc<TaskRecord>>> {
+        self.task_read_count.fetch_add(1, Ordering::SeqCst);
         self.inner.task(id, context).await
     }
 
@@ -251,6 +287,7 @@ impl Storage for ControlledStorage {
         cursor: Option<Cursor>,
         context: &Context,
     ) -> StorageResult<Page<TaskRecord>> {
+        self.task_scan_count.fetch_add(1, Ordering::SeqCst);
         self.inner.scan_tasks(query, limit, cursor, context).await
     }
 
@@ -258,7 +295,7 @@ impl Storage for ControlledStorage {
         &self,
         id: SubmissionId,
         context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         self.inner.submission(id, context).await
     }
 
@@ -279,7 +316,7 @@ impl Storage for ControlledStorage {
         conversation_id: ConversationId,
         request_id: &str,
         context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         self.inner
             .submission_by_request(conversation_id, request_id, context)
             .await
@@ -331,7 +368,11 @@ impl Storage for ControlledStorage {
         if let Some(error) = self.close_failure.lock().expect("close failure").take() {
             return Err(error);
         }
-        self.inner.close(context).await
+        if self.close_backend.load(Ordering::SeqCst) {
+            self.inner.close(context).await
+        } else {
+            Ok(())
+        }
     }
 }
 

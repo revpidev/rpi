@@ -146,8 +146,14 @@ impl GuardedStorage {
 
 #[async_trait]
 impl Storage for GuardedStorage {
-    async fn commit(&self, writes: &[StorageWrite], context: &Context) -> StorageResult<Seq> {
-        self.call(None, self.inner.commit(writes, context)).await
+    async fn commit(
+        &self,
+        batches: &[Vec<StorageWrite>],
+        receive: &mut (dyn FnMut(usize, Seq) + Send),
+        context: &Context,
+    ) -> StorageResult<crate::types::CommitResult> {
+        self.call(None, self.inner.commit(batches, receive, context))
+            .await
     }
 
     async fn mint_id(&self) -> StorageResult<u64> {
@@ -158,7 +164,7 @@ impl Storage for GuardedStorage {
         &self,
         id: ConversationId,
         context: &Context,
-    ) -> StorageResult<Option<ConversationRecord>> {
+    ) -> StorageResult<Option<Arc<ConversationRecord>>> {
         self.call(Some(context), self.inner.conversation(id, context))
             .await
     }
@@ -224,7 +230,7 @@ impl Storage for GuardedStorage {
         .await
     }
 
-    async fn task(&self, id: TaskId, context: &Context) -> StorageResult<Option<TaskRecord>> {
+    async fn task(&self, id: TaskId, context: &Context) -> StorageResult<Option<Arc<TaskRecord>>> {
         self.call(Some(context), self.inner.task(id, context)).await
     }
 
@@ -246,7 +252,7 @@ impl Storage for GuardedStorage {
         &self,
         id: SubmissionId,
         context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         self.call(Some(context), self.inner.submission(id, context))
             .await
     }
@@ -270,7 +276,7 @@ impl Storage for GuardedStorage {
         conversation_id: ConversationId,
         request_id: &str,
         context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         self.call(
             Some(context),
             self.inner

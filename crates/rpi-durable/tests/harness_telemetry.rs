@@ -24,7 +24,7 @@ use rpi_durable::harness::{
 use rpi_durable::ids::{ConversationId, TaskId};
 use rpi_durable::session::{DocOwner, TaskCreate, TaskOwnership, TaskTrace, commit_fn};
 use rpi_durable::storage::MemoryStorage;
-use rpi_durable::types::{Storage, TaskStatus};
+use rpi_durable::types::{Storage, StorageExt, TaskStatus};
 use scheduler_support::{
     Spec, add_task, all_tasks, context, open_with_telemetry, open_with_telemetry_and_extensions,
     root,
@@ -1052,9 +1052,8 @@ async fn a_wrapper_rename_from_a_task_emits_one_extension_error() {
     );
 }
 
-/// R-D9: `pi.durable.report` carries only the fixed attributes of its kind
-/// (upstream `safeReport`): `reason` is a fixed enum value and only
-/// `task_faulted`/`task_outdated` have it.
+/// D15: `pi.durable.report` carries only the fixed attributes of its kind;
+/// restart-limited extension tasks report `task_faulted` with their reason and task ID.
 #[tokio::test]
 async fn report_events_carry_only_their_kind_attributes() {
     let recorder = Recorder::default();
@@ -1068,20 +1067,27 @@ async fn report_events_carry_only_their_kind_attributes() {
         Spec::owned("test.count", serde_json::json!({ "phases": 3 })),
     )
     .await;
-    // Five crash-loops park it, and the park reports `task_parked`.
-    for _ in 0..6 {
-        let mut record = opened
-            .harness
-            .get_task(id, &context())
-            .await
-            .expect("task")
-            .expect("record");
-        record.state = rpi_durable::types::TaskState::Running {
-            checkpoint: scheduler_support::checkpoint(&record),
-        };
-        scheduler_support::stamp_task(&opened.harness, record).await;
-        opened = open_with_telemetry(Arc::clone(&storage), all_tasks(), telemetry()).await;
-    }
+    // A fifth recovery of the same attempt faults the extension task.
+    let mut record = opened
+        .harness
+        .get_task(id, &context())
+        .await
+        .expect("task")
+        .expect("record");
+    record.state = rpi_durable::types::TaskState::Running {
+        checkpoint: scheduler_support::checkpoint(&record),
+    };
+    record.restarts = Some(4);
+    storage
+        .commit_one(
+            &[rpi_durable::types::StorageWrite::Task { value: record }],
+            &context(),
+        )
+        .await
+        .expect("running checkpoint");
+    opened = open_with_telemetry(Arc::clone(&storage), all_tasks(), telemetry()).await;
+    opened.harness.resume().expect("resume");
+    wait_terminal(&opened.harness, id).await;
     let mut events: Vec<JsonObject> = recorder
         .0
         .spans
@@ -1106,18 +1112,18 @@ async fn report_events_carry_only_their_kind_attributes() {
             .all(|event| { event.get("type").and_then(JsonValue::as_str) != Some("task_parked") })
     );
     let metrics = recorder.0.metrics.lock().expect("metrics").clone();
-    let parked: Vec<_> = metrics
+    let interrupted: Vec<_> = metrics
         .iter()
         .filter(|(name, _, attributes)| {
             name == "pi.durable.reports"
-                && attributes.get("type").and_then(JsonValue::as_str) == Some("task_parked")
+                && attributes.get("type").and_then(JsonValue::as_str) == Some("task_faulted")
         })
         .collect();
-    assert!(!parked.is_empty(), "task_parked metric: {metrics:?}");
-    assert!(parked.iter().all(|(_, value, attributes)| {
+    assert!(!interrupted.is_empty(), "restart_limit metric: {metrics:?}");
+    assert!(interrupted.iter().all(|(_, value, attributes)| {
         *value == 1.0 && attributes.keys().cloned().collect::<Vec<_>>() == vec!["type".to_string()]
     }));
-    drop(parked);
+    drop(interrupted);
     drop(metrics);
     // A faulted task carries the fixed reason; a host error carries none.
     assert!(events.iter().all(|event| {
@@ -1219,7 +1225,7 @@ fn recorder_storage() -> Arc<dyn Storage> {
     Arc::new(MemoryStorage::new())
 }
 
-/// R-D9: a host `onReport` info callback that throws is contained. A report
+/// D15: a host `onReport` callback that throws is contained. A report
 /// without a context records its metric but no event (upstream `safeReport`).
 #[tokio::test]
 async fn a_panicking_report_callback_is_contained_and_still_reported() {
@@ -1230,7 +1236,7 @@ async fn a_panicking_report_callback_is_contained_and_still_reported() {
         Arc::clone(&storage),
         all_tasks(),
         telemetry,
-        Some(Arc::new(|_info: rpi_durable::harness::ReportInfo| {
+        Some(Arc::new(|_report: rpi_durable::harness::Report| {
             panic!("host report callback");
         })),
     )
@@ -1246,7 +1252,7 @@ async fn a_panicking_report_callback_is_contained_and_still_reported() {
             .iter()
             .any(|(name, attributes)| {
                 name == "pi.durable.report"
-                    && attributes.get("type").and_then(JsonValue::as_str) == Some("session_failed")
+                    && attributes.get("type").and_then(JsonValue::as_str) == Some("storage_failed")
             })
     );
     let metrics = recorder.0.metrics.lock().expect("metrics");
@@ -1254,10 +1260,10 @@ async fn a_panicking_report_callback_is_contained_and_still_reported() {
         .iter()
         .filter(|(name, _, attributes)| {
             name == "pi.durable.reports"
-                && attributes.get("type").and_then(JsonValue::as_str) == Some("session_failed")
+                && attributes.get("type").and_then(JsonValue::as_str) == Some("storage_failed")
         })
         .collect();
-    assert_eq!(reports.len(), 1, "one session_failed metric: {metrics:?}");
+    assert_eq!(reports.len(), 1, "one storage_failed metric: {metrics:?}");
     assert_eq!(reports[0].1, 1.0);
     assert_eq!(
         reports[0].2.keys().cloned().collect::<Vec<_>>(),
