@@ -4,7 +4,7 @@
 
 ### v0.1.9 draft — implementation in progress
 
-This section covers the V19-01 implementation work including its M06-OUT handoff, plus the V19-02 B/C/D implementation and the completed M06-CHECK. V19-02's final review and the V19-08 release gate are still pending.
+This section covers the V19-01 implementation work including its M06-OUT handoff, plus the V19-02 B/C/D implementation and the completed M06-CHECK. V19-02's final task review passed on 2026-11-19; the V19-08 release gate is still pending.
 
 ### Main line
 
