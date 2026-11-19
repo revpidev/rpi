@@ -2948,6 +2948,7 @@ impl AgentSession {
             scope: crate::core::skills::SourceScope::Temporary,
             origin: crate::core::skills::SourceOrigin::TopLevel,
             base_dir: None,
+            changelog_path: None,
         }
     }
 

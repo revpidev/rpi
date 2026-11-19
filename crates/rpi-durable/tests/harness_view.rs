@@ -108,6 +108,64 @@ async fn observers_have_independent_bounded_windows() {
     watch.stop().await;
 }
 
+#[tokio::test]
+async fn a_custom_max_bounds_the_initial_from_window() {
+    let session = create_session(Arc::new(MemoryStorage::new()), None);
+    let context = BACKGROUND_CONTEXT.clone();
+    let conversation = session
+        .commit(
+            commit_fn(|tx| {
+                Box::pin(async move {
+                    Ok(tx
+                        .create_conversation(ConversationOwnership::Ownerless)
+                        .await?
+                        .id)
+                })
+            }),
+            &context,
+        )
+        .await
+        .expect("conversation");
+    for index in 0..5 {
+        session
+            .commit(
+                commit_fn(move |tx| {
+                    Box::pin(async move {
+                        tx.append_entry(conversation, EntryDraft::new(format!("entry-{index}")))
+                            .await?;
+                        Ok(())
+                    })
+                }),
+                &context,
+            )
+            .await
+            .expect("append");
+    }
+    let views = ConversationViews::new(Arc::clone(&session));
+    let recording = Arc::new(Mutex::new(Vec::new()));
+    let observation = views
+        .observe(
+            conversation,
+            Arc::new(RecordingObserver {
+                values: Arc::clone(&recording),
+            }),
+            ConversationWindow {
+                // Entries 3..7 exist; from entry 4 leaves four, above max=3.
+                from: Some(id_from_number(4)),
+                min: Some(2),
+                max: Some(3),
+            },
+            &context,
+        )
+        .await
+        .expect("observe");
+    // Upstream falls back to the newest min=2 and reports the entry before
+    // them; using min*2 would have returned all four and exceeded max.
+    assert_eq!(observation.value.entries.len(), 2);
+    assert_eq!(observation.value.before, Some(id_from_number(5)));
+    observation.detach.unsubscribe();
+}
+
 fn entry(id: u64) -> EntryRecord {
     EntryRecord::new(
         id_from_number::<rpi_durable::ids::Entry>(id),

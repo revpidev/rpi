@@ -668,14 +668,22 @@ mod tests {
 
     #[test]
     fn generate_html_handles_deep_sessions_and_system_entries() {
+        const DEPTH: usize = 20_000;
         let mut data = sample_session_data();
-        data.entries = (0..5000)
+        data.entries = (0..DEPTH)
             .map(|index| {
                 if index == 0 || index == 2500 {
                     serde_json::json!({
                         "type": "message",
                         "id": format!("system-{index}"),
-                        "parentId": (index > 0).then(|| format!("user-{}", index - 1)),
+                        "parentId": (index > 0).then(|| {
+                            let previous = index - 1;
+                            if previous == 0 || previous == 2500 {
+                                format!("system-{previous}")
+                            } else {
+                                format!("user-{previous}")
+                            }
+                        }),
                         "timestamp": "2026-11-18T00:00:00.000Z",
                         "message": {
                             "role": "system",
@@ -690,24 +698,89 @@ mod tests {
                     serde_json::json!({
                         "type": "message",
                         "id": format!("user-{index}"),
-                        "parentId": (index > 0).then(|| format!("user-{}", index - 1)),
+                        "parentId": (index > 0).then(|| {
+                            let previous = index - 1;
+                            if previous == 0 || previous == 2500 {
+                                format!("system-{previous}")
+                            } else {
+                                format!("user-{previous}")
+                            }
+                        }),
                         "timestamp": "2026-11-18T00:00:00.000Z",
                         "message": {"role": "user", "content": format!("消息 {index}"), "timestamp": index}
                     })
                 }
             })
             .collect();
-        data.leaf_id = Some("user-4999".to_owned());
+        data.leaf_id = Some(format!("user-{}", DEPTH - 1));
         let html = generate_html(&data, Some("dark")).expect("deep export");
         let decoded = decode_session_data(&html);
-        assert_eq!(decoded["entries"].as_array().expect("entries").len(), 5000);
+        assert_eq!(decoded["entries"].as_array().expect("entries").len(), DEPTH);
         assert_eq!(
             decoded["entries"][0]["message"]["toolsAdded"][0]["name"],
             "read"
         );
         assert_eq!(decoded["entries"][2500]["message"]["content"], "更新提示");
-        assert_eq!(decoded["entries"][4999]["message"]["content"], "消息 4999");
+        assert_eq!(
+            decoded["entries"][DEPTH - 1]["message"]["content"],
+            "消息 19999"
+        );
+
+        let tmp = TempDir::new();
+        let html_path = tmp.path().join("deep.html");
+        std::fs::write(&html_path, html).expect("write deep export");
+        let output = std::process::Command::new("node")
+            .arg("--input-type=module")
+            .arg("--eval")
+            .arg(DEEP_VIEWER_TEST)
+            .arg(&html_path)
+            .output()
+            .expect("run the exported viewer with Node.js");
+        assert!(
+            output.status.success(),
+            "deep viewer failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("viewer depth 20000"));
     }
+
+    const DEEP_VIEWER_TEST: &str = r#"
+import { readFileSync } from "node:fs";
+import { createContext, runInContext } from "node:vm";
+
+const html = readFileSync(process.argv.at(-1), "utf8");
+const sessionData = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
+const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
+const viewer = scripts.pop();
+if (!sessionData || !viewer) throw new Error("Missing exported session data or viewer script");
+const context = createContext({
+    atob,
+    TextDecoder,
+    URLSearchParams,
+    document: { getElementById: () => ({ textContent: sessionData }), querySelector: () => null },
+    window: { location: { search: "" } },
+});
+const api = runInContext(
+    viewer.replace(
+        "let treeNodeMap = null;",
+        "let treeNodeMap = null; return { buildTree, buildActivePathIds, flattenTree, findNewestLeaf, getPath };",
+    ),
+    context,
+);
+const tree = api.buildTree();
+const leafId = "user-19999";
+const flat = api.flattenTree(tree, api.buildActivePathIds(leafId));
+const path = api.getPath(leafId);
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+assert(tree.length === 1, `expected one root, got ${tree.length}`);
+assert(flat.length === 20000, `expected 20000 flattened nodes, got ${flat.length}`);
+assert(flat.at(-1).node.entry.id === leafId, "wrong flattened leaf");
+assert(api.findNewestLeaf("system-0") === leafId, "wrong newest leaf");
+assert(path.length === 20000, `expected path depth 20000, got ${path.length}`);
+assert(path[0].id === "system-0" && path.at(-1).id === leafId, "wrong active path endpoints");
+console.log(`viewer depth ${flat.length}`);
+"#;
 
     #[test]
     fn generate_html_drops_absent_state_fields() {

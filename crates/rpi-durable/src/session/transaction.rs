@@ -29,6 +29,7 @@ use crate::ids::{
     ConversationId, DocumentId, EntryId, ROOT_CONVERSATION_ID, Seq, SubmissionId, TaskId,
     id_from_number,
 };
+use crate::session::keys::{document_key, incarnation_key, scope_key, table_keys};
 use crate::session::session::SessionImpl;
 use crate::session::{
     CommitChange, CommitPersistence, DocOwner, DocumentChange, DocumentCopyChange, SessionError,
@@ -452,6 +453,27 @@ impl Transaction {
             latest_document_by_address: Default::default(),
             plans: Vec::new(),
         }
+    }
+
+    /// Incarnations written by this transaction's document plans.
+    pub(crate) fn document_ids(&self) -> Vec<crate::ids::DocumentId> {
+        self.plans.iter().map(|plan| plan.record_id()).collect()
+    }
+
+    pub(crate) fn write_keys(&self, writes: &[StorageWrite]) -> Vec<String> {
+        let mut keys = Vec::new();
+        table_keys(writes, &mut keys);
+        for plan in &self.plans {
+            if plan.content.is_none() && !plan.retire {
+                continue;
+            }
+            keys.push(document_key(&plan.address_id));
+            keys.push(incarnation_key(plan.record_id()));
+            if plan.retire || matches!(plan.record, PlanRecord::Create(_)) {
+                keys.push(scope_key(&plan.scope()));
+            }
+        }
+        keys
     }
 
     pub(crate) fn can_defer(&self) -> bool {
@@ -1186,6 +1208,9 @@ impl Transaction {
     async fn find_retirement(&mut self, index: usize) -> SessionResult<()> {
         let address_id = self.documents[index].address_id.clone();
         let address = self.documents[index].address.clone();
+        self.host
+            .wait_for_writer(&document_key(&address_id))
+            .await?;
         let cached = self.host.cached(&address_id);
         let record = match cached {
             Some(loaded) => Some(loaded.record.clone()),

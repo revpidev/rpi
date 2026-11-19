@@ -2,9 +2,9 @@
 //! `packages/durable/src/session/*` @ `b4afdddf`: `session.ts`, `transaction.ts`,
 //! `observation.ts`, `forks.ts`).
 //!
-//! The kernel owns one **mutation line**: every commit callback, storage
-//! settlement, adoption and publication runs serialized while the line is held;
-//! only committed state is observable. This module root carries the shared error
+//! The kernel owns one **mutation line**: commit callbacks and settlement are
+//! serialized, then the Writer stores admitted batches off the line and
+//! publishes them in admission order; only committed state is observable. This module root carries the shared error
 //! surface and the public value types; [`session`] carries the single-line
 //! [`session::SessionImpl`], [`transaction`] the staging [`transaction::Transaction`],
 //! [`observation`] the async watch/state bridge, and [`forks`] the conversation
@@ -29,13 +29,16 @@ use crate::types::{DocumentCopySource, DocumentRecord, StorageWrite};
 
 pub mod cached_storage;
 pub mod forks;
+mod gated;
 pub mod guarded;
+mod keys;
 pub mod observation;
 // The design keeps the kernel in `session/session.rs` (frozen layout); Clippy's
 // `module_inception` is a style lint for the resulting `session::session` path.
 #[allow(clippy::module_inception)]
 pub mod session;
 pub mod transaction;
+mod writer;
 
 pub use cached_storage::{CachedStorage, CachedStorageSizes};
 pub use forks::{ForkDocumentCopy, prepare_fork_document_copies};
@@ -274,6 +277,9 @@ pub(crate) struct DeferredCommit {
     pub within_ms: Option<f64>,
     pub writes: Vec<StorageWrite>,
     pub changes: Vec<CommitChange>,
+    pub keys: Vec<String>,
+    /// Documents held by this deferred commit; never evicted until flushed.
+    pub pinned: Vec<crate::ids::DocumentId>,
 }
 
 /// Synchronous observer of value calls and one terminal end.
@@ -319,6 +325,28 @@ pub fn observed_operations(
     }
     observed_version.store(version, Ordering::SeqCst);
     vec![Op::Replace(change.frame_value())]
+}
+
+/// Like [`observed_operations`], but also treats a new document incarnation
+/// as a root replacement. A watch follows the address, so a retire/recreate
+/// must not deliver the new value with the old incarnation's (empty) ops.
+pub fn observed_operations_for(
+    observed_id: &std::sync::atomic::AtomicU64,
+    observed_version: &std::sync::atomic::AtomicU64,
+    change: &DocumentChange,
+) -> Vec<Op> {
+    use std::sync::atomic::Ordering;
+    if change.is_retirement() {
+        return RETIREMENT_OPERATIONS.to_vec();
+    }
+    let id = change.record.id.get();
+    let version = change.version.unwrap_or(0);
+    if id != observed_id.load(Ordering::SeqCst) {
+        observed_id.store(id, Ordering::SeqCst);
+        observed_version.store(version, Ordering::SeqCst);
+        return vec![Op::Replace(change.frame_value())];
+    }
+    observed_operations(observed_version, change)
 }
 
 /// Default wall clock (upstream `Date.now`).

@@ -1854,6 +1854,7 @@ mod tests {
                 SourceScope::User => dirs.agent_dir.clone(),
                 _ => dirs.cwd.join(CONFIG_DIR_NAME),
             }),
+            changelog_path: None,
         }
     }
 
@@ -1992,6 +1993,7 @@ mod tests {
             scope: SourceScope::User,
             origin: SourceOrigin::TopLevel,
             base_dir: None,
+            changelog_path: None,
         };
         let project_metadata = ResourcePathMetadata {
             scope: SourceScope::Project,
@@ -2066,6 +2068,7 @@ mod tests {
             scope: SourceScope::User,
             origin: SourceOrigin::Package,
             base_dir: Some(package_root.clone()),
+            changelog_path: None,
         };
         let paths = ScopedResolvedPaths {
             global: ResolvedPaths {
@@ -2173,6 +2176,7 @@ mod tests {
             scope: SourceScope::User,
             origin: SourceOrigin::Package,
             base_dir: Some(package_root.clone()),
+            changelog_path: None,
         };
         let skill_resource = resource(
             package_root.join("skills/tool/SKILL.md"),

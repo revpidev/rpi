@@ -122,6 +122,7 @@ fn extension_source_info(source: &str, path: &Path) -> SourceInfo {
         scope: SourceScope::Temporary,
         origin: SourceOrigin::TopLevel,
         base_dir: Some(path.to_path_buf()),
+        changelog_path: None,
     }
 }
 
@@ -632,6 +633,7 @@ fn extend_resources_preserves_package_source_metadata_after_reload() {
         enabled: true,
         scope: SourceScope::User,
         base_dir: None,
+        changelog_path: None,
     });
     let mut loader = DefaultResourceLoader::new(options);
     loader.reload();
@@ -995,6 +997,8 @@ fn package_resources_merge_at_lowest_precedence() {
         &skill_md("cli-vs-pkg", "cli"),
     );
 
+    let package_changelog = fixture._tmp.path().join("pkg-skills").join("CHANGELOG.md");
+    write(&package_changelog, "## [1.0.0]\n\n- Initial release\n");
     let mut options = fixture.options();
     options.package_resources = PackageResourcePaths {
         prompt_paths: vec![PackageResource {
@@ -1002,12 +1006,14 @@ fn package_resources_merge_at_lowest_precedence() {
             enabled: true,
             scope: SourceScope::User,
             base_dir: None,
+            changelog_path: None,
         }],
         skill_paths: vec![PackageResource {
             path: package_skill_dir.clone(),
             enabled: true,
             scope: SourceScope::User,
             base_dir: None,
+            changelog_path: Some(package_changelog.clone()),
         }],
         ..PackageResourcePaths::default()
     };
@@ -1035,6 +1041,10 @@ fn package_resources_merge_at_lowest_precedence() {
         .expect("cli-vs-pkg skill");
     assert_eq!(skill.description, "package");
     assert_eq!(skill.source_info.origin, SourceOrigin::Package);
+    assert_eq!(
+        skill.source_info.changelog_path.as_deref(),
+        Some(package_changelog.as_path())
+    );
 }
 
 // ---------------------------------------------------------------------------

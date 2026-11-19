@@ -611,6 +611,7 @@ fn loaded_resources_scope_groups() {
         scope,
         origin: SourceOrigin::TopLevel,
         base_dir: None,
+        changelog_path: None,
     };
     let items = vec![
         (

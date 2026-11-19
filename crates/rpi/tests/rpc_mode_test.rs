@@ -1560,7 +1560,15 @@ fn signal_exit_code(signal: libc::c_int, expected_code: i32, repeat_signal: bool
             libc::kill(child.id() as libc::pid_t, signal);
         }
     }
+    // Keep stdin open for the single-signal case: `Child::wait` closes it,
+    // which would race the signal with the EOF path (exit 0 instead of 143).
+    let held_stdin = if repeat_signal {
+        None
+    } else {
+        child.stdin.take()
+    };
     let status = child.wait().expect("wait");
+    drop(held_stdin);
     if let Some(writer) = output_writer {
         writer.join().expect("output writer");
     }
@@ -1582,7 +1590,7 @@ fn rpc_mode_sighup_exits_129() {
 #[cfg(unix)]
 #[test]
 fn rpc_mode_first_sigterm_finishes_cleanup() {
-    signal_exit_code(libc::SIGTERM, 0, false);
+    signal_exit_code(libc::SIGTERM, 143, false);
 }
 
 #[test]

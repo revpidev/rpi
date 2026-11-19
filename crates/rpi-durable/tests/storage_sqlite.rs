@@ -52,6 +52,7 @@ async fn batched_commit_128_conversations_and_run_counted() {
         })
         .collect::<Vec<_>>();
     let started = std::time::Instant::now();
+    let queries_before = database.query_count();
     let mut receipts = Vec::new();
     let result = storage
         .commit(
@@ -64,6 +65,11 @@ async fn batched_commit_128_conversations_and_run_counted() {
     assert_eq!(result.stored, 1);
     assert!(result.refused.is_none());
     assert_eq!(receipts.len(), 1);
+    let queries = database.query_count() - queries_before;
+    assert!(
+        queries <= 16,
+        "128-conversation commit used {queries} SQL operations (expected <= 16)"
+    );
     let count = database
         .get_i64("SELECT COUNT(*) FROM conversations", vec![])
         .await
@@ -82,6 +88,78 @@ async fn batched_commit_128_conversations_and_run_counted() {
         "128-conversation batch: conversations=128, receipts=1, run_counted=1, elapsed={:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test]
+async fn corrupt_document_record_is_a_storage_error_not_a_refusal() {
+    let dir = TempDir::new("rpi-durable-sqlite-bad-document");
+    let path = dir
+        .path()
+        .join("storage.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    let storage = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
+        .await
+        .expect("open storage");
+    let id: DocumentId = id_from_number(storage.mint_id().await.expect("mint"));
+    storage
+        .commit_one(
+            &[StorageWrite::DocumentCreate {
+                record: DocumentCreate {
+                    id,
+                    kind: "corrupt".to_string(),
+                    key: None,
+                    scope: DocumentScope::Session,
+                    history: None,
+                    fork: None,
+                },
+                content: DocumentContent::Base {
+                    version: 1,
+                    value: serde_json::json!({ "value": 1 })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+            }],
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("create");
+    let database = open_node_sqlite_database(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("database");
+    database
+        .run(
+            "UPDATE documents SET record = '{}' WHERE id = ?",
+            vec![id.get().into()],
+        )
+        .await
+        .expect("corrupt record");
+    let result = storage
+        .commit_one(
+            &[StorageWrite::DocumentChange {
+                id,
+                content: DocumentContent::Base {
+                    version: 1,
+                    value: serde_json::json!({ "value": 2 })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+            }],
+            &BACKGROUND_CONTEXT,
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(StorageError::Json(_)) | Err(StorageError::Message(_))
+        ),
+        "corrupt document must be a storage error, not a refusal: {result:?}"
+    );
+    database.close().await.expect("close database");
+    storage.close(&BACKGROUND_CONTEXT).await.expect("close");
+    cleanup_temp_dirs("rpi-durable-sqlite-bad-document");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

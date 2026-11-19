@@ -3,8 +3,8 @@
 //!
 //! [`TaskScheduler`] mirrors every committed non-terminal task (`pending`,
 //! `running`, `waiting`, `completing`) in memory; the synchronous commit
-//! listener updates that mirror on the Session line, so code running on the line
-//! reads exactly the committed state. Tasks and conversations form one ownership
+//! listener updates that mirror in Writer publication order, so a decision
+//! after its publication barrier reads exactly the committed state. Tasks and conversations form one ownership
 //! tree; walks up it decide cascades, idle scopes, and whether a task's ordinary
 //! owned work is live (which holds its outcome as `completing` and delays its
 //! abort handler).
@@ -1186,6 +1186,7 @@ impl SchedulerInner {
                     let this = Arc::clone(&this);
                     let ids = ids.clone();
                     Box::pin(async move {
+                        this.session.wait_for_all_writers().await?;
                         for id in ids {
                             let record = this
                                 .live
@@ -1259,6 +1260,7 @@ impl SchedulerInner {
         id: TaskId,
         keep_restart: bool,
     ) -> SessionResult<AbortCommit> {
+        self.session.wait_for_all_writers().await?;
         let Some(current) = tx.task(id).await? else {
             return Err(SessionError::message(format!("Task {id} does not exist")));
         };
@@ -1388,6 +1390,7 @@ impl SchedulerInner {
                 commit_fn(move |tx| {
                     let this = Arc::clone(&this);
                     Box::pin(async move {
+                        this.session.wait_for_all_writers().await?;
                         let queued = this.load_scopes(true).await?;
                         let scope = Scope::Conversation(conversation_id);
                         let mut reached: Vec<TaskId> = Vec::new();
@@ -2127,6 +2130,7 @@ impl SchedulerInner {
         cascade: bool,
         checks: Vec<TaskId>,
     ) -> SessionResult<()> {
+        self.session.wait_for_all_writers().await?;
         if self.closing.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -2766,6 +2770,7 @@ impl SchedulerInner {
         out: &Arc<Mutex<Vec<Reservation>>>,
         faulted: &Arc<Mutex<Vec<(TaskRecord, String)>>>,
     ) -> SessionResult<()> {
+        self.session.wait_for_all_writers().await?;
         if !self.enabled.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -3529,6 +3534,7 @@ impl SchedulerInner {
                     let decider = decider.clone();
                     let telemetry_context = telemetry_context.clone();
                     Box::pin(async move {
+                        this.session.wait_for_all_writers().await?;
                         let found = this
                             .live
                             .lock()
@@ -3792,13 +3798,7 @@ impl SchedulerInner {
             .live
             .lock()
             .ok()
-            .and_then(|live| live.get(&invocation.task_id).cloned())
-            .is_some_and(|record| {
-                matches!(
-                    record.state,
-                    TaskState::Pending { .. } | TaskState::Running { .. }
-                )
-            });
+            .is_some_and(|live| live.contains_key(&invocation.task_id));
         if ready && let Ok(mut runnable) = self.runnable.lock() {
             runnable.insert(invocation.task_id);
         }
@@ -4039,6 +4039,7 @@ impl InvocationRuntime {
                     let invocation = Arc::clone(&invocation);
                     let change = Arc::clone(&change);
                     Box::pin(async move {
+                        inner.session.wait_for_all_writers().await?;
                         if invocation.ended.load(Ordering::SeqCst) {
                             return Err(ended_error(invocation.task_id));
                         }

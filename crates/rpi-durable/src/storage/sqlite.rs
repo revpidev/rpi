@@ -1,6 +1,7 @@
 //! SQLite backend: asynchronous facade, schema identifiers, migrations and
 //! storage.
 
+mod commit_state;
 pub mod database;
 pub mod migrations;
 pub mod node;

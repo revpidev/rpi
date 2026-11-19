@@ -133,17 +133,23 @@ pub fn web_url(value: &str) -> Option<String> {
     rpi_ai::auth::oauth::trusted_url::trusted_http_url(value)
 }
 
+/// Replace each run of C0/C1 control characters with one space
+/// (upstream `replaceControlCharacters`, tui/utils.ts:372-377).
 pub fn replace_control_characters(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|character| {
-            if character.is_control() {
-                character.escape_default().collect::<Vec<_>>()
-            } else {
-                vec![character]
+    let mut out = String::with_capacity(value.len());
+    let mut in_run = false;
+    for character in value.chars() {
+        if character.is_control() {
+            if !in_run {
+                out.push(' ');
+                in_run = true;
             }
-        })
-        .collect()
+        } else {
+            out.push(character);
+            in_run = false;
+        }
+    }
+    out
 }
 
 pub fn display_url(value: &str) -> String {
@@ -162,5 +168,6 @@ mod tests {
         );
         assert_eq!(web_url("javascript:alert(1)"), None);
         assert!(!display_url("https://example.com/\u{1b}]0;title").contains('\u{1b}'));
+        assert_eq!(replace_control_characters("a\u{1b}]0;x\u{7}b"), "a ]0;x b");
     }
 }

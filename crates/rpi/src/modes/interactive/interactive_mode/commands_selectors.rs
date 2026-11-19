@@ -4816,6 +4816,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_session_closes_open_host_selectors() {
+        let (mode, _terminal, session, _tmp) = mode_harness().await;
+        InteractiveUi::show_session_selector(&mode.ui_state);
+        assert!(selector_mounted(&mode.ui_state), "session selector mounted");
+        mode.ui_state.set_session(session);
+        assert!(
+            !selector_mounted(&mode.ui_state),
+            "session rebind must close the outgoing selector stack"
+        );
+    }
+
+    #[tokio::test]
     async fn trust_selector_saves_decision() {
         let (mut mode, terminal, _session, _tmp) = mode_harness().await;
         // The driver must be running to dispatch input: `on_select` →
@@ -5393,6 +5405,89 @@ mod tests {
             imported_cwd, expected_cwd,
             "imported under the fallback cwd"
         );
+        // The failed first copy must not survive the Continue retry: exactly
+        // one imported file, not `imported.jsonl` + `imported-1.jsonl`.
+        let imported_files: Vec<_> = std::fs::read_dir(tmp.path().join("sessions"))
+            .expect("session dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("imported"))
+            .collect();
+        assert_eq!(
+            imported_files.len(),
+            1,
+            "failed import left a stray copy: {:?}",
+            imported_files
+                .iter()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_command_missing_cwd_continue_uses_fallback_without_rewriting() {
+        let (mut mode, terminal, _session, tmp) = switchable_harness_with_session_dir().await;
+        mode.init().await;
+        let path = tmp.path().join("sessions").join("resume.jsonl");
+        write_import_file(&path, &tmp.path().join("gone-cwd"));
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(&ui, &terminal, "Session cwd does not exist", &["\r"]).await;
+        };
+        let command = path.display().to_string();
+        let (_, ()) = tokio::join!(mode.handle_resume_command(&command), feeder);
+
+        let manager = mode.ui_state.session().session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(manager.get_cwd(), tmp.path().join("cwd"));
+        assert_eq!(manager.get_session_file(), Some(path.as_path()));
+        drop(manager);
+        let header = std::fs::read_to_string(&path).expect("session kept");
+        assert!(
+            header
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("gone-cwd")),
+            "Continue must not rewrite the stored cwd: {header}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_command_missing_cwd_fork_creates_a_new_session_and_keeps_the_original() {
+        let (mut mode, terminal, session, tmp) = switchable_harness_with_session_dir().await;
+        mode.init().await;
+        let path = tmp.path().join("sessions").join("resume.jsonl");
+        write_import_file(&path, &tmp.path().join("gone-cwd"));
+        let original = std::fs::read(&path).expect("session bytes");
+        let old_session_id = session.session_id();
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(
+                &ui,
+                &terminal,
+                "Session cwd does not exist",
+                &["\x1b[B", "\r"],
+            )
+            .await;
+        };
+        let command = path.display().to_string();
+        let (_, ()) = tokio::join!(mode.handle_resume_command(&command), feeder);
+
+        let manager = mode.ui_state.session().session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(manager.get_cwd(), tmp.path().join("cwd"));
+        assert_ne!(manager.get_session_id(), old_session_id);
+        let forked = manager
+            .get_session_file()
+            .expect("forked file")
+            .to_path_buf();
+        drop(manager);
+        assert_ne!(forked, path);
+        assert!(forked.exists(), "forked session file exists");
+        assert_eq!(
+            std::fs::read(&path).expect("original kept"),
+            original,
+            "fork keeps the original session file"
+        );
     }
 
     #[tokio::test]
@@ -5568,6 +5663,33 @@ mod tests {
 
     /// #63 /import: declining the missing-cwd prompt cancels the import and
     /// keeps the current session.
+    #[tokio::test]
+    async fn resume_command_missing_cwd_cancel_keeps_session_and_original_file() {
+        let (mut mode, terminal, _session, tmp) = switchable_harness_with_session_dir().await;
+        mode.init().await;
+        let path = tmp.path().join("sessions").join("resume.jsonl");
+        write_import_file(&path, &tmp.path().join("gone-cwd"));
+        let original = std::fs::read(&path).expect("session bytes");
+        let session_id_before = mode.ui_state.session().session_id();
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(
+                &ui,
+                &terminal,
+                "Session cwd does not exist",
+                &["\x1b[B", "\x1b[B", "\r"],
+            )
+            .await;
+        };
+        let command = path.display().to_string();
+        let (_, ()) = tokio::join!(mode.handle_resume_command(&command), feeder);
+
+        let chat = rendered_chat(&mode.ui_state);
+        assert!(chat.contains("Resume cancelled"), "chat: {chat}");
+        assert_eq!(mode.ui_state.session().session_id(), session_id_before);
+        assert_eq!(std::fs::read(&path).expect("original kept"), original);
+    }
+
     #[tokio::test]
     async fn import_command_missing_cwd_cancel_keeps_session() {
         let (mut mode, terminal, _session, tmp) = switchable_harness_with_session_dir().await;

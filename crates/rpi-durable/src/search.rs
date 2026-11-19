@@ -94,7 +94,10 @@ pub fn tokenize(text: &str) -> Vec<String> {
 }
 
 fn is_mark(character: char) -> bool {
-    matches!(character, '\u{0300}'..='\u{036f}' | '\u{1ab0}'..='\u{1aff}' | '\u{1dc0}'..='\u{1dff}' | '\u{20d0}'..='\u{20ff}' | '\u{fe20}'..='\u{fe2f}')
+    // Every Unicode combining mark (Mn/Mc/Me), not a hand-picked range list:
+    // Thai/Devanagari/Arabic marks must stay attached to their base letter
+    // (upstream `\p{M}`, search.ts:147).
+    unicode_normalization::char::is_combining_mark(character)
 }
 
 fn normalize_name(name: &str) -> String {
@@ -363,7 +366,13 @@ mod tests {
         );
         assert_eq!(tokenize("讀取"), vec!["讀", "取"]);
         assert_eq!(tokenize("Cafe\u{301}"), tokenize("Café"));
-        assert!(!tokenize("อ่านไฟล์").is_empty());
+        // Combining marks stay attached (upstream `\p{M}`); UAX #29 still
+        // splits Thai into clusters without Intl.Segmenter's dictionary.
+        assert_eq!(
+            tokenize("อ่านไฟล์"),
+            vec!["อ\u{e48}", "า", "น", "ไ", "ฟ", "ล\u{e4c}"]
+        );
+        assert_eq!(tokenize("नमस्ते"), vec!["नमस्ते"]);
     }
 
     #[test]

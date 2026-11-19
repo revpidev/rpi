@@ -69,6 +69,8 @@ pub struct ControlledStorage {
     inner: MemoryStorage,
     /// Detached batches for value assertions.
     pub commits: Mutex<Vec<Vec<StorageWrite>>>,
+    /// Storage calls with their original batch grouping.
+    pub commit_calls: Mutex<Vec<Vec<Vec<StorageWrite>>>>,
     /// Number of ID mint calls.
     pub mint_count: AtomicU64,
     /// Number of document materialization reads.
@@ -80,6 +82,8 @@ pub struct ControlledStorage {
     conversation_gate: Mutex<Option<Arc<Held>>>,
     find_gate: Mutex<Option<Arc<Held>>>,
     commit_failure: Mutex<Option<StorageError>>,
+    commit_failure_after_receipt: Mutex<Option<StorageError>>,
+    commit_panic: Mutex<Option<String>>,
     mint_failure: Mutex<Option<StorageError>>,
     read_failure: Mutex<Option<StorageError>>,
     close_failure: Mutex<Option<StorageError>>,
@@ -99,6 +103,7 @@ impl ControlledStorage {
         Self {
             inner: MemoryStorage::new(),
             commits: Mutex::new(Vec::new()),
+            commit_calls: Mutex::new(Vec::new()),
             mint_count: AtomicU64::new(0),
             document_read_count: AtomicU64::new(0),
             conversation_read_count: AtomicU64::new(0),
@@ -108,6 +113,8 @@ impl ControlledStorage {
             conversation_gate: Mutex::new(None),
             find_gate: Mutex::new(None),
             commit_failure: Mutex::new(None),
+            commit_failure_after_receipt: Mutex::new(None),
+            commit_panic: Mutex::new(None),
             mint_failure: Mutex::new(None),
             read_failure: Mutex::new(None),
             close_failure: Mutex::new(None),
@@ -144,9 +151,19 @@ impl ControlledStorage {
         gate
     }
 
+    /// Inject one commit failure after the backend delivered its receipt.
+    pub fn fail_next_commit_after_receipt(&self, error: StorageError) {
+        *self.commit_failure_after_receipt.lock().expect("failure") = Some(error);
+    }
+
     /// Inject one commit failure.
     pub fn fail_next_commit(&self, error: StorageError) {
         *self.commit_failure.lock().expect("failure") = Some(error);
+    }
+
+    /// Panic inside the next storage commit call.
+    pub fn panic_next_commit(&self, message: impl Into<String>) {
+        *self.commit_panic.lock().expect("panic") = Some(message.into());
     }
 
     /// Inject one ID-mint failure.
@@ -192,6 +209,10 @@ impl Storage for ControlledStorage {
         receive: &mut (dyn FnMut(usize, Seq) + Send),
         context: &Context,
     ) -> StorageResult<rpi_durable::types::CommitResult> {
+        self.commit_calls
+            .lock()
+            .expect("commit calls")
+            .push(batches.to_vec());
         self.commits
             .lock()
             .expect("commits")
@@ -200,10 +221,22 @@ impl Storage for ControlledStorage {
         if let Some(held) = held {
             held.wait().await;
         }
+        if let Some(message) = self.commit_panic.lock().expect("panic").take() {
+            panic!("{message}");
+        }
         if let Some(error) = self.commit_failure.lock().expect("failure").take() {
             return Err(error);
         }
-        self.inner.commit(batches, receive, context).await
+        let result = self.inner.commit(batches, receive, context).await?;
+        if let Some(error) = self
+            .commit_failure_after_receipt
+            .lock()
+            .expect("failure")
+            .take()
+        {
+            return Err(error);
+        }
+        Ok(result)
     }
 
     async fn mint_id(&self) -> StorageResult<u64> {

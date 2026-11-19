@@ -175,6 +175,8 @@ pub struct PackageResource {
     pub scope: SourceScope,
     /// Base directory of the resource inside the package, when known.
     pub base_dir: Option<PathBuf>,
+    /// Resolved package changelog path (`PathMetadata.changelogPath`).
+    pub changelog_path: Option<PathBuf>,
 }
 
 /// Pre-resolved resources from installed packages (`settings.packages`),
@@ -479,6 +481,7 @@ impl DefaultResourceLoader {
                     scope: info.scope,
                     origin: info.origin,
                     base_dir: info.base_dir.clone(),
+                    changelog_path: info.changelog_path.clone(),
                 },
             );
         }
@@ -996,6 +999,7 @@ fn create_source_info(path: &Path, metadata: &PathMetadata) -> SourceInfo {
         scope: metadata.scope,
         origin: metadata.origin,
         base_dir: metadata.base_dir.clone(),
+        changelog_path: metadata.changelog_path.clone(),
     }
 }
 
@@ -1009,6 +1013,7 @@ fn package_source_info(package: &PackageResource) -> SourceInfo {
         scope: package.scope,
         origin: SourceOrigin::Package,
         base_dir: package.base_dir.clone(),
+        changelog_path: package.changelog_path.clone(),
     }
 }
 
@@ -1308,6 +1313,7 @@ fn discover_file_resource_paths(options: &FileResourceDiscovery) -> Vec<Resolved
                 scope: package.scope,
                 origin: SourceOrigin::Package,
                 base_dir: package.base_dir.clone(),
+                changelog_path: package.changelog_path.clone(),
             },
         });
     }
@@ -1318,6 +1324,7 @@ fn discover_file_resource_paths(options: &FileResourceDiscovery) -> Vec<Resolved
         scope: SourceScope::Project,
         origin: SourceOrigin::TopLevel,
         base_dir: None,
+        changelog_path: None,
     };
     for entry in resolve_local_file_entries(
         options.project_settings_entries,
@@ -1332,6 +1339,7 @@ fn discover_file_resource_paths(options: &FileResourceDiscovery) -> Vec<Resolved
         scope: SourceScope::User,
         origin: SourceOrigin::TopLevel,
         base_dir: None,
+        changelog_path: None,
     };
     for entry in resolve_local_file_entries(
         options.global_settings_entries,
@@ -1349,6 +1357,7 @@ fn discover_file_resource_paths(options: &FileResourceDiscovery) -> Vec<Resolved
             scope: SourceScope::Project,
             origin: SourceOrigin::TopLevel,
             base_dir: Some(project_base_dir.clone()),
+            changelog_path: None,
         };
         for path in collect_auto_file_entries(&project_dir, options.kind) {
             let enabled =
@@ -1367,6 +1376,7 @@ fn discover_file_resource_paths(options: &FileResourceDiscovery) -> Vec<Resolved
         scope: SourceScope::User,
         origin: SourceOrigin::TopLevel,
         base_dir: Some(global_base_dir.clone()),
+        changelog_path: None,
     };
     for path in collect_auto_file_entries(&user_dir, options.kind) {
         let enabled =
@@ -1923,6 +1933,7 @@ mod tests {
             scope: SourceScope::User,
             origin: SourceOrigin::TopLevel,
             base_dir: None,
+            changelog_path: None,
         };
 
         // Plain dir entry + force-exclude pattern.
@@ -2034,6 +2045,7 @@ mod tests {
             enabled: true,
             scope: SourceScope::User,
             base_dir: None,
+            changelog_path: None,
         };
         let discovery = FileResourceDiscovery {
             cwd: &cwd,
@@ -2070,6 +2082,7 @@ mod tests {
             scope: SourceScope::Temporary,
             origin: SourceOrigin::TopLevel,
             base_dir: Some(PathBuf::from("/ext/skills")),
+            changelog_path: None,
         };
         let extra = vec![(PathBuf::from("/ext/skills"), info)];
         let found = find_source_info_for_path(Path::new("/ext/skills/foo/SKILL.md"), &extra, &[])

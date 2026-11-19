@@ -641,6 +641,7 @@ pub(crate) fn prompt_template_source_info(
         scope,
         origin: SourceOrigin::TopLevel,
         base_dir: Some(base_dir),
+        changelog_path: None,
     }
 }
 
@@ -1270,10 +1271,9 @@ async fn handle_command(
         Err(message) => state.emit_value(&error_response(&id, command_type, &message)),
     }
 
-    // `checkShutdownRequested` after each command (rpc-mode.ts:771).
-    if state.shutdown_requested.load(Ordering::SeqCst) {
-        let _ = state.shutdown.send(0);
-    }
+    // `checkShutdownRequested` runs after the command task decrements
+    // `active_commands` (rpc-mode.ts:763-771); this path must not bypass the
+    // active/idle guards.
 }
 
 // ============================================================================

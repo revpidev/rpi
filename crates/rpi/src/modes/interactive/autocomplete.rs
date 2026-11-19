@@ -754,6 +754,7 @@ mod tests {
             scope,
             origin: SourceOrigin::TopLevel,
             base_dir: None,
+            changelog_path: None,
         }
     }
 

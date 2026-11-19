@@ -313,6 +313,25 @@ pub type ResizeHandler = Box<dyn FnMut() + Send>;
 
 /// Minimal terminal interface for the TUI (upstream `Terminal`,
 /// terminal.ts:52-94).
+/// Replace each run of C0/C1 control characters with one space
+/// (upstream `replaceControlCharacters`, tui/utils.ts:372-377).
+pub fn replace_control_characters(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut in_run = false;
+    for character in value.chars() {
+        if character.is_control() {
+            if !in_run {
+                out.push(' ');
+                in_run = true;
+            }
+        } else {
+            out.push(character);
+            in_run = false;
+        }
+    }
+    out
+}
+
 pub trait Terminal {
     /// Start the terminal with input and resize handlers (upstream
     /// `start(onInput, onResize)`).
@@ -1435,8 +1454,11 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
     }
 
     fn set_title(&mut self, title: &str) {
-        // OSC 0;title BEL - set terminal window title.
-        self.write_direct(&format!("\x1b]0;{title}\x07"));
+        // OSC 0;title BEL - set terminal window title. A BEL/ESC in the title
+        // would end the sequence early and send the rest to the terminal as
+        // escape sequences (session names come from session files), so each
+        // run of C0/C1 controls becomes one space (terminal.ts:600-604).
+        self.write_direct(&format!("\x1b]0;{}\x07", replace_control_characters(title)));
     }
 
     fn set_progress(&mut self, active: bool) {
@@ -2495,6 +2517,17 @@ mod tests {
                 "\x1b]0;hi\x07",
             ]
         );
+    }
+
+    #[test]
+    fn title_replaces_control_character_runs_with_one_space() {
+        let writer = SharedWriter::default();
+        let mut terminal = ProcessTerminal::with_writer(writer.clone());
+
+        terminal.set_title("safe\nname\u{7}");
+
+        assert_eq!(writer.writes(), ["\x1b]0;safe name \x07"]);
+        assert_eq!(replace_control_characters("a\u{1b}[31mred"), "a [31mred");
     }
 
     #[test]

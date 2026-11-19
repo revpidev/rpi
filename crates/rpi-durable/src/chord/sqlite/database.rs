@@ -309,6 +309,8 @@ fn in_transaction() -> bool {
 /// Asynchronous SQL executor shared by a database and its transaction handles.
 pub struct SqliteExecutor {
     worker: Arc<Worker>,
+    /// Number of statements/connection operations issued (D02 evidence).
+    queries: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SqliteExecutor {
@@ -405,10 +407,17 @@ impl SqliteExecutor {
     }
 
     /// Escape hatch for statements that need the raw rusqlite connection.
+    /// Number of statements/connection operations issued so far.
+    pub fn query_count(&self) -> u64 {
+        self.queries.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub async fn with_connection<T: Send + 'static>(
         &self,
         op: impl FnOnce(&Connection) -> StorageResult<T> + Send + 'static,
     ) -> StorageResult<T> {
+        self.queries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let worker = Arc::clone(&self.worker);
         tokio::task::spawn_blocking(move || worker.run(op))
             .await
@@ -576,12 +585,20 @@ impl SqliteDatabase {
         });
         Ok(Self {
             inner: Arc::new(DbInner {
-                executor: SqliteExecutor { worker },
+                executor: SqliteExecutor {
+                    worker,
+                    queries: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                },
                 access: tokio::sync::Mutex::new(()),
                 closed: AtomicBool::new(false),
                 broken: Arc::new(AtomicBool::new(false)),
             }),
         })
+    }
+
+    /// Number of statements/connection operations issued so far.
+    pub fn query_count(&self) -> u64 {
+        self.inner.executor.query_count()
     }
 
     /// Clone the database handle (shared worker and close state).
@@ -727,6 +744,7 @@ impl SqliteDatabase {
         let transaction = SqliteTransaction {
             executor: SqliteExecutor {
                 worker: Arc::clone(&self.inner.executor.worker),
+                queries: Arc::clone(&self.inner.executor.queries),
             },
             active: Arc::clone(&active),
         };

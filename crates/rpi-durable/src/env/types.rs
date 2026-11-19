@@ -158,13 +158,13 @@ pub struct ExcludeOptions {
 
 /// What changed: paths, an uncertain-coverage overflow, or a stopped watcher.
 #[derive(Debug, Clone, PartialEq)]
-pub enum WatchChange {
+pub enum FileChange {
     /// Something at or below each path may have changed.
     Paths(Vec<String>),
     /// Coverage was uncertain for a while; rescan everything.
     Overflow,
     /// The watcher stopped.
-    Error(FileError),
+    Failed(FileError),
 }
 
 /// How a watcher reports changes.
@@ -182,7 +182,7 @@ pub trait FileWatcher: Send + Sync {
     /// How this watcher reports changes.
     fn mode(&self) -> WatchMode;
     /// Stop watching; no callback starts after this resolves. Idempotent.
-    async fn close(&self, context: &Context);
+    async fn stop(&self, context: &Context);
 }
 
 /// One page of a directory's entries (`DirReader.next`).

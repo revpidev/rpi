@@ -617,14 +617,24 @@ impl AgentSessionRuntime {
             copy_exclusive(&resolved_path, &destination_path)?;
         }
 
-        let session_manager = SessionManager::open(
-            &destination_path,
-            Some(&session_dir),
-            cwd_override.map(Path::new),
-        )?;
-        // Keep the typed `MissingSessionCwdError` for `/import`'s
-        // prompt/recovery arm (V17-08 #63; interactive-mode.ts:6589-6600).
-        assert_session_cwd_exists(&session_manager, self.cwd()).map_err(RpiError::from)?;
+        let session_manager = {
+            let session_manager = SessionManager::open(
+                &destination_path,
+                Some(&session_dir),
+                cwd_override.map(Path::new),
+            )?;
+            // Keep the typed `MissingSessionCwdError` for `/import`'s
+            // prompt/recovery arm (V17-08 #63; interactive-mode.ts:6589-6600).
+            // The import did not happen; drop the copy so a retry with a cwd
+            // override or a fork leaves no stray file (agent-session-runtime.ts:390-396).
+            if let Err(error) = assert_session_cwd_exists(&session_manager, self.cwd()) {
+                if !source_already_stored {
+                    let _ = std::fs::remove_file(&destination_path);
+                }
+                return Err(error.into());
+            }
+            session_manager
+        };
         let new_cwd = session_manager.get_cwd().to_path_buf();
         let target_file = session_manager
             .get_session_file()
@@ -653,6 +663,9 @@ impl AgentSessionRuntime {
     /// `dispose` (agent-session-runtime.ts:395-402), including the #11692
     /// credential-write drain before process exit.
     pub async fn dispose(&self) {
+        // Settle the active turn before extensions observe `session_shutdown`
+        // (agent-session-runtime.ts:417-423).
+        self.session.abort().await;
         self.session
             .extension_runner()
             .emit("session_shutdown")

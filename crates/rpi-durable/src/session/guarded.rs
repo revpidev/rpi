@@ -152,8 +152,14 @@ impl Storage for GuardedStorage {
         receive: &mut (dyn FnMut(usize, Seq) + Send),
         context: &Context,
     ) -> StorageResult<crate::types::CommitResult> {
-        self.call(None, self.inner.commit(batches, receive, context))
-            .await
+        // The commit caller adopts and publishes before failing the Session
+        // (D12): do not fail here, or observers would end before the
+        // publication that the storage receipt already made durable.
+        self.assert_healthy()?;
+        let _call = self.begin_call()?;
+        let result = self.inner.commit(batches, receive, context).await;
+        self.assert_healthy()?;
+        result
     }
 
     async fn mint_id(&self) -> StorageResult<u64> {

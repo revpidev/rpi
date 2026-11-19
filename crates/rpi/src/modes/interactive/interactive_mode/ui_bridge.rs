@@ -51,10 +51,7 @@ use crate::modes::interactive::program_status::BlockedStatus;
 use rpi_tui::program_status::ProgramStatusKind;
 
 fn sanitized_terminal_title(title: &str) -> String {
-    rpi_tui::utils::strip_terminal_sequences(title)
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect()
+    rpi_tui::terminal::replace_control_characters(title)
 }
 
 /// TUI entry wrapper forwarding component calls and focus (the
@@ -1075,8 +1072,12 @@ mod tests {
     #[test]
     fn terminal_title_cannot_inject_control_sequences() {
         assert_eq!(sanitized_terminal_title("plain"), "plain");
-        assert_eq!(sanitized_terminal_title("bad\nname\u{7}"), "badname");
-        assert_eq!(sanitized_terminal_title("\u{1b}]0;other\u{7}"), "");
-        assert_eq!(sanitized_terminal_title("\u{1b}[<0;31mred"), "red");
+        assert_eq!(sanitized_terminal_title("bad\nname\u{7}"), "bad name ");
+        assert_eq!(
+            sanitized_terminal_title("\u{1b}]0;other\u{7}"),
+            " ]0;other "
+        );
+        assert_eq!(sanitized_terminal_title("\u{1b}[<0;31mred"), " [<0;31mred");
+        assert_eq!(sanitized_terminal_title("a\n\u{7}\u{85}b"), "a b");
     }
 }

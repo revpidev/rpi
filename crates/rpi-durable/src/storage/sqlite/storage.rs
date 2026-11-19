@@ -11,6 +11,7 @@ use crate::chord::sqlite::database::{SqliteDatabase, SqliteTransaction, SqliteVa
 use crate::errors::{StorageError, StorageResult};
 use crate::ids::{ConversationId, DocumentId, EntryId, Seq, SubmissionId, TaskId};
 use crate::storage::scan::{ScanStart, scan_start};
+use crate::storage::sqlite::commit_state::{CommitRefusal, CommitState, CopyResolution};
 use crate::storage::sqlite::migrations::{
     apply_sqlite_migrations_for_schema, create_sqlite_migrations,
 };
@@ -59,15 +60,15 @@ fn scope_columns(scope: &DocumentScope) -> ScopeColumns {
     }
 }
 
-struct AddressParts {
-    kind: String,
-    scope_kind: &'static str,
-    owner_id: i64,
-    family: i64,
-    key_value: String,
+pub(super) struct AddressParts {
+    pub(super) kind: String,
+    pub(super) scope_kind: &'static str,
+    pub(super) owner_id: i64,
+    pub(super) family: i64,
+    pub(super) key_value: String,
 }
 
-fn address_parts(kind: &str, scope: &DocumentScope, key: Option<&str>) -> AddressParts {
+pub(super) fn address_parts(kind: &str, scope: &DocumentScope, key: Option<&str>) -> AddressParts {
     let scope = scope_columns(scope);
     AddressParts {
         kind: encode_indexed_string(kind),
@@ -98,11 +99,11 @@ fn scan_sql(start: ScanStart) -> (&'static str, i64, &'static str) {
 }
 
 #[derive(Debug, Clone, Default)]
-struct DocumentAction {
-    create: Option<DocumentCreate>,
-    content: Option<DocumentContent>,
-    copy: Option<crate::types::DocumentCopySource>,
-    retire: bool,
+pub(super) struct DocumentAction {
+    pub(super) create: Option<DocumentCreate>,
+    pub(super) content: Option<DocumentContent>,
+    pub(super) copy: Option<crate::types::DocumentCopySource>,
+    pub(super) retire: bool,
 }
 
 #[derive(Default)]
@@ -114,7 +115,7 @@ struct Admission {
 /// Portable SQLite implementation of the storage contract.
 pub struct SqliteStorage {
     db: SqliteDatabase,
-    schema: SqliteSchema,
+    pub(super) schema: SqliteSchema,
     next_id: Mutex<u64>,
     admission: Mutex<Admission>,
     drained: tokio::sync::Notify,
@@ -494,6 +495,7 @@ impl SqliteStorage {
         Ok(next)
     }
 
+    #[allow(dead_code)]
     async fn check_global_ids(
         &self,
         tx: &SqliteTransaction,
@@ -623,6 +625,7 @@ impl SqliteStorage {
         Ok(actions)
     }
 
+    #[allow(dead_code)]
     async fn check_document_actions(
         &self,
         tx: &SqliteTransaction,
@@ -929,7 +932,7 @@ impl SqliteStorage {
         .await
     }
 
-    async fn materialize_document(
+    pub(super) async fn materialize_document(
         &self,
         tx: &SqliteTransaction,
         id: DocumentId,
@@ -1188,96 +1191,91 @@ impl Storage for SqliteStorage {
         _context: &Context,
     ) -> StorageResult<crate::types::CommitResult> {
         self.assert_open()?;
-        let mut seqs = Vec::new();
-        let outcome = async {
-        for writes in batches {
-            let (actions, candidate_next_id) = match Self::prepare_document_actions(writes)
-                .and_then(|actions| {
-                    self.candidate_next_id(writes)
-                        .map(|candidate| (actions, candidate))
-                }) {
-                Ok(prepared) => prepared,
-                Err(refused) => {
-                    return Ok(crate::types::CommitResult {
-                        stored: seqs.len(),
-                        refused: Some(refused),
-                    });
-                }
-            };
-            let refusal = Arc::new(Mutex::new(None));
-            let refusal_in_tx = Arc::clone(&refusal);
-            let seq = self
-                .db
-                .transaction(move |tx| async move {
-                    let metadata = &self.schema.tables.durable_metadata;
-                    let metadata_next_id = tx
-                        .get_text(
-                            &format!("SELECT next_id FROM {metadata} WHERE singleton = 1"),
-                            vec![],
-                        )
-                        .await?
-                        .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?;
-                    let committed_seq = tx
-                        .get_i64(
-                            &format!("SELECT next_seq FROM {metadata} WHERE singleton = 1"),
-                            vec![],
-                        )
-                        .await?
-                        .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?
-                        as u64;
-                    let committed_seq = Seq(committed_seq);
-                    let checked = match self.check_global_ids(&tx, writes).await {
-                        Ok(()) => self.check_document_actions(&tx, &actions).await,
-                        Err(error) => Err(error),
+        let batches = batches.to_vec();
+        let (seqs, refused, candidate_next_id) = self
+            .db
+            .transaction(move |tx| async move {
+                let tables = &self.schema.tables;
+                let metadata = &tables.durable_metadata;
+                let metadata_next_id = tx
+                    .get_text(
+                        &format!("SELECT next_id FROM {metadata} WHERE singleton = 1"),
+                        vec![],
+                    )
+                    .await?
+                    .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?
+                    .parse::<u64>()
+                    .map_err(|_| StorageError::message("Durable SQLite metadata is missing"))?;
+                let mut next_seq = tx
+                    .get_i64(
+                        &format!("SELECT next_seq FROM {metadata} WHERE singleton = 1"),
+                        vec![],
+                    )
+                    .await?
+                    .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?
+                    as u64;
+                // D02: read every batch's check state before checking any batch.
+                // A malformed document record fails the whole call (Err), not a
+                // refusal.
+                let mut state = CommitState::read(&tx, &self, &batches).await?;
+                let mut seqs = Vec::new();
+                let mut refused: Option<CommitRefusal> = None;
+                let mut candidate_next_id = self.next_id_snapshot()?;
+                for writes in &batches {
+                    let mut actions = match Self::prepare_document_actions(writes) {
+                        Ok(actions) => actions,
+                        Err(error) => {
+                            refused = Some(CommitRefusal::from_storage(error));
+                            break;
+                        }
                     };
-                    if let Err(error) = checked {
-                        *refusal_in_tx
-                            .lock()
-                            .map_err(|_| StorageError::message("SQLite refusal lock poisoned"))? =
-                            Some(error);
-                        return Err(StorageError::message("Durable batch refused"));
+                    if let Err(error) = state.check(writes, &actions) {
+                        refused = Some(error);
+                        break;
                     }
-                    self.apply_table_writes(&tx, writes, committed_seq).await?;
-                    self.apply_document_actions(&tx, &actions, committed_seq)
-                        .await?;
-                    let current_next_id = metadata_next_id
-                        .parse::<u64>()
-                        .map_err(|_| StorageError::message("Durable SQLite metadata is missing"))?;
+                    // A copy resolves against the database; the source may be
+                    // a batch before this one, which was already applied above.
+                    if actions.iter().any(|(_, action)| action.copy.is_some()) {
+                        match self.resolve_copies(&tx, &mut actions).await {
+                            Ok(()) => {}
+                            Err(CopyResolution::Refused(error)) => {
+                                refused = Some(error);
+                                break;
+                            }
+                            Err(CopyResolution::Storage(error)) => return Err(error),
+                        }
+                    }
+                    let seq = Seq(next_seq);
+                    next_seq += 1;
+                    self.apply_table_writes(&tx, writes, seq).await?;
+                    self.apply_document_actions(&tx, &actions, seq).await?;
+                    state.apply(writes, &actions, seq);
+                    seqs.push(seq);
+                    candidate_next_id = candidate_next_id.max(self.candidate_next_id(writes)?);
+                }
+                if !seqs.is_empty() {
                     tx.run(
-                        &format!("UPDATE {metadata} SET next_id = ?, next_seq = ? WHERE singleton = 1"),
+                        &format!(
+                            "UPDATE {metadata} SET next_id = ?, next_seq = ? WHERE singleton = 1"
+                        ),
                         vec![
-                            current_next_id.max(candidate_next_id).to_string().into(),
-                            (committed_seq.0 + 1).into(),
+                            metadata_next_id.max(candidate_next_id).to_string().into(),
+                            next_seq.into(),
                         ],
                     )
                     .await?;
-                    Ok(committed_seq)
-                })
-                .await;
-            let refused = refusal
-                .lock()
-                .map_err(|_| StorageError::message("SQLite refusal lock poisoned"))?
-                .take();
-            if let Some(refused) = refused {
-                return Ok(crate::types::CommitResult {
-                    stored: seqs.len(),
-                    refused: Some(refused),
-                });
-            }
-            let seq = seq?;
-            seqs.push(seq);
-            self.advance_next_id(candidate_next_id)?;
-        }
-        Ok(crate::types::CommitResult {
-            stored: seqs.len(),
-            refused: None,
-        })
-        }
-        .await;
+                }
+                Ok((seqs, refused.map(|refusal| refusal.0), candidate_next_id))
+            })
+            .await?;
+        self.advance_next_id(candidate_next_id)?;
         for (index, seq) in seqs.iter().copied().enumerate() {
             receive(index, seq);
         }
-        outcome
+        Ok(crate::types::CommitResult {
+            stored: seqs.len(),
+            refused,
+        })
     }
 
     async fn mint_id(&self) -> StorageResult<u64> {

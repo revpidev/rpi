@@ -22,11 +22,11 @@ pub use node::{NodeExecutionEnv, NodeExecutionEnvOptions};
 pub use node_watch::{NodeFileWatcher, NodeWatchMode, NodeWatchOptions};
 pub use types::{
     BinaryReader, CreateDirOptions, CreateTempFileOptions, DirPage, DirReader, ExcludeOptions,
-    ExecutionEnv, ExecutionError, ExecutionErrorCode, FileContent, FileInfo, FileKind, FileSystem,
-    FileWatcher, LineScan, OpenBinaryReaderOptions, ReadTextLinesOptions, RemoveOptions,
-    ScanLinesOptions, Shell, ShellCommand, ShellExecOptions, ShellExecResult, ShellOutputInfo,
-    ShellOutputSkip, ShellOutputWindow, ShellSpillOptions, ShellStream, TextLine, TextLineReader,
-    WatchChange, WatchMode, WatchTarget,
+    ExecutionEnv, ExecutionError, ExecutionErrorCode, FileChange, FileContent, FileInfo, FileKind,
+    FileSystem, FileWatcher, LineScan, OpenBinaryReaderOptions, ReadTextLinesOptions,
+    RemoveOptions, ScanLinesOptions, Shell, ShellCommand, ShellExecOptions, ShellExecResult,
+    ShellOutputInfo, ShellOutputSkip, ShellOutputWindow, ShellSpillOptions, ShellStream, TextLine,
+    TextLineReader, WatchMode, WatchTarget,
 };
 
 pub use crate::errors::{FileError, FileErrorCode};
@@ -34,7 +34,7 @@ pub use crate::errors::{FileError, FileErrorCode};
 use crate::chord::context::Context;
 
 /// Change callback installed by [`FileSystem::watch`].
-pub type WatchCallback = std::sync::Arc<dyn Fn(WatchChange) + Send + Sync>;
+pub type WatchCallback = std::sync::Arc<dyn Fn(FileChange) + Send + Sync>;
 
 /// Abort marker embedded in environment callbacks (upstream `AbortError`).
 pub const ABORTED_MESSAGE: &str = "aborted";

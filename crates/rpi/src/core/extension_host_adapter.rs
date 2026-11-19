@@ -103,6 +103,7 @@ fn convert_source_info(info: &ext::ExtSourceInfo) -> SourceInfo {
             ext::SourceOrigin::TopLevel => SourceOrigin::TopLevel,
         },
         base_dir: info.base_dir.as_ref().map(PathBuf::from),
+        changelog_path: None,
     }
 }
 
@@ -239,6 +240,7 @@ fn build_extension_resource_paths(entries: Vec<(String, String)>) -> Vec<Resourc
                     scope: SourceScope::Temporary,
                     origin: SourceOrigin::TopLevel,
                     base_dir,
+                    changelog_path: None,
                 },
             }
         })

@@ -699,6 +699,9 @@ impl PendingOps {
                 Op::Replace(_) => {
                     ops.clear();
                     leaves.clear();
+                    // Upstream `#fold` pushes after the switch, so a replace
+                    // stays pending as the first op (chord/delta/pending.ts:113-133).
+                    ops.push(operation.clone());
                 }
                 Op::Set { value, .. } if value.is_object() || value.is_array() => {
                     leaves.clear();
@@ -858,5 +861,18 @@ mod pending_tests {
             panic!("structural reset")
         };
         assert_eq!(ops.len(), 3);
+    }
+
+    #[test]
+    fn folding_keeps_a_pending_replace_before_later_operations() {
+        let mut pending = PendingOps::new();
+        pending.push(&[Op::Replace(JsonValue::from(1))]);
+        pending.push(&[leaf(2)]);
+        let PendingTake::Ops(ops) = pending.take() else {
+            panic!("replace + leaf")
+        };
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], Op::Replace(_)));
+        assert_eq!(ops[1], leaf(2));
     }
 }

@@ -27,7 +27,7 @@
 //! `ctx.ui.custom()` (`types.ts:197-212`, `tui.ts:111-135` @ `9841914`).
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -149,7 +149,7 @@ pub(crate) struct MountState {
     capturing: bool,
     disposing: AtomicBool,
     closed: AtomicBool,
-    dialog_open: AtomicBool,
+    dialog_depth: AtomicUsize,
     blur_for_dialog: AtomicBool,
     done: Mutex<Option<Value>>,
     last_resize: Mutex<Option<(usize, usize)>>,
@@ -193,7 +193,7 @@ impl MountState {
             capturing,
             disposing: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            dialog_open: AtomicBool::new(false),
+            dialog_depth: AtomicUsize::new(0),
             blur_for_dialog: AtomicBool::new(false),
             done: Mutex::new(None),
             last_resize: Mutex::new(None),
@@ -461,7 +461,7 @@ impl MountState {
     /// Apply the requested visibility to the mount point (R-U4.3).
     /// Idempotent per `mounted`; skipped while a dialog owns the screen.
     fn apply_visibility(&self) {
-        if self.is_closed() || self.dialog_open.load(Ordering::SeqCst) {
+        if self.is_closed() || self.dialog_depth.load(Ordering::SeqCst) > 0 {
             return;
         }
         let hidden = self.hidden.load(Ordering::SeqCst);
@@ -504,7 +504,7 @@ impl MountState {
 
     /// Host dialog opened (R-U2.2): the component loses focus and is told so.
     fn dialog_opened(&self) {
-        if self.is_closed() || self.dialog_open.swap(true, Ordering::SeqCst) {
+        if self.is_closed() || self.dialog_depth.fetch_add(1, Ordering::SeqCst) > 0 {
             return;
         }
         // Editor-region components lose their mount to the dialog (the region
@@ -531,7 +531,13 @@ impl MountState {
     /// component was focused before AND is still visible. A component that
     /// became visible while the dialog was open is mounted now.
     fn dialog_closed(&self) {
-        if !self.dialog_open.swap(false, Ordering::SeqCst) || self.is_closed() {
+        let previous = self
+            .dialog_depth
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |depth| {
+                Some(depth.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        if previous != 1 || self.is_closed() {
             return;
         }
         let restore_focus = self.blur_for_dialog.swap(false, Ordering::SeqCst);
@@ -834,7 +840,7 @@ impl Focusable for HostComponentProxy {
             // The TUI is the authority on keyboard focus; the flag is used
             // only to decide blur/focus event delivery (R-U2.2). No events
             // are emitted here — the host dialog hooks own that contract.
-            if focused || !state.dialog_open.load(Ordering::SeqCst) {
+            if focused || state.dialog_depth.load(Ordering::SeqCst) == 0 {
                 state.focused.store(focused, Ordering::SeqCst);
             }
         }
@@ -995,6 +1001,9 @@ pub(crate) struct ComponentRegistry {
     /// ADR-0043: host verdict callback for unprocessed external answers
     /// (delivered but never polled before the mount closes).
     answer_verdict_sink: Mutex<Option<AnswerVerdictSink>>,
+    /// Number of nested host dialogs currently owning the screen. New mounts
+    /// defer their editor region until every dialog has closed.
+    dialog_depth: AtomicUsize,
 }
 
 impl Default for ComponentRegistry {
@@ -1018,6 +1027,7 @@ impl ComponentRegistry {
             dispose_grace,
             lifecycle_limit: None,
             answer_verdict_sink: Mutex::new(None),
+            dialog_depth: AtomicUsize::new(0),
         }
     }
 
@@ -1253,6 +1263,7 @@ impl ComponentRegistry {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id);
         }
 
+        let dialog_depth = self.dialog_depth.load(Ordering::SeqCst);
         if options.overlay {
             let terminal_width = mount.terminal_size().0;
             let geometry = overlay_options(options.overlay_options.as_ref(), terminal_width);
@@ -1262,9 +1273,10 @@ impl ComponentRegistry {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(overlay);
             }
-        } else {
+        } else if dialog_depth == 0 {
             mount.show_editor_region(Arc::clone(&entry));
         }
+        state.dialog_depth.store(dialog_depth, Ordering::SeqCst);
         if let Some(sink) = self
             .answer_verdict_sink
             .lock()
@@ -1273,9 +1285,11 @@ impl ComponentRegistry {
         {
             state.set_answer_verdict_sink(sink);
         }
-        state.mounted.store(true, Ordering::SeqCst);
+        state
+            .mounted
+            .store(dialog_depth == 0 || options.overlay, Ordering::SeqCst);
         state.focused.store(
-            capturing && options.overlay || !options.overlay,
+            dialog_depth == 0 && (capturing && options.overlay || !options.overlay),
             Ordering::SeqCst,
         );
         state.log("mount", options.label.clone());
@@ -1438,12 +1452,22 @@ impl ComponentRegistry {
 
     /// Host dialog opened/closed hooks (R-U2.2 / R-U10).
     pub(crate) fn dialog_opened(&self) {
+        self.dialog_depth.fetch_add(1, Ordering::SeqCst);
         for state in self.states() {
             state.dialog_opened();
         }
     }
 
     pub(crate) fn dialog_closed(&self) {
+        let previous = self
+            .dialog_depth
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |depth| {
+                Some(depth.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        if previous == 0 {
+            return;
+        }
         for state in self.states() {
             state.dialog_closed();
         }
@@ -2249,6 +2273,80 @@ mod interactive_component {
     }
 
     // -- §4.4 input / focus / hidden / dialog matrix -----------------------
+
+    #[tokio::test]
+    async fn component_registry_defers_an_inline_mount_while_a_dialog_is_open() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        registry.dialog_opened();
+        let handle = mount_overlay(
+            &registry,
+            &mount,
+            MountOptions {
+                overlay: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            mount.editor_shows.load(Ordering::SeqCst),
+            0,
+            "an inline component must not cover an open dialog"
+        );
+        assert!(
+            !registry
+                .lookup("ext", handle)
+                .expect("state")
+                .mounted
+                .load(Ordering::SeqCst)
+        );
+        registry.dialog_closed();
+        assert_eq!(
+            mount.editor_shows.load(Ordering::SeqCst),
+            1,
+            "dialog close lands the deferred inline mount"
+        );
+        assert_eq!(
+            registry.poll("ext", handle).await.unwrap(),
+            ComponentEvent::Focus
+        );
+    }
+
+    #[tokio::test]
+    async fn component_registry_nested_dialogs_keep_inline_mount_deferred_until_all_close() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        registry.dialog_opened();
+        registry.dialog_opened();
+        let handle = mount_overlay(
+            &registry,
+            &mount,
+            MountOptions {
+                overlay: false,
+                ..Default::default()
+            },
+        );
+        registry.dialog_closed();
+        assert_eq!(
+            mount.editor_shows.load(Ordering::SeqCst),
+            0,
+            "closing one nested dialog must not expose the inline mount"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                registry.poll("ext", handle)
+            )
+            .await
+            .is_err(),
+            "focus must stay with the remaining dialog"
+        );
+        registry.dialog_closed();
+        assert_eq!(mount.editor_shows.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry.poll("ext", handle).await.unwrap(),
+            ComponentEvent::Focus
+        );
+    }
 
     #[tokio::test]
     async fn component_registry_input_focus_and_dialog_matrix() {

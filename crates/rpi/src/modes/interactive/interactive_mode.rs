@@ -2429,6 +2429,9 @@ impl InteractiveUi {
         // grace. The rest of the host-forced matrix — tool abort
         // (`PendingToolAborts` watcher), session shutdown (`shutdown`),
         // extension unload (`clear_ui`/`reload`) — landed with C3 (V14-23).
+        // Host dialogs belong to the outgoing session too; close the whole
+        // selector stack before swapping it (upstream `resetExtensionUI`).
+        self.reset_selectors();
         self.reset_extension_overlays();
         self.component_registry
             .dispose_active(rpi_ext_host::interactive_ui::DisposeReason::SessionReload);
@@ -5667,6 +5670,15 @@ impl InteractiveUi {
         handle.hide();
         if has_blocked {
             self.set_program_status_blocked(&format!("extension-overlay:{id}"), None);
+        }
+    }
+
+    /// Close every host selector/dialog frame (session rebind/reload). The
+    /// frames belong to the outgoing session; restoring the editor once is
+    /// enough, so pop until the stack is empty.
+    pub(crate) fn reset_selectors(&self) {
+        while !lock(&self.selector_stack).is_empty() {
+            self.hide_selector();
         }
     }
 
@@ -11845,6 +11857,7 @@ mod tests {
             scope,
             origin: SourceOrigin::TopLevel,
             base_dir: None,
+            changelog_path: None,
         };
         let items = vec![
             (

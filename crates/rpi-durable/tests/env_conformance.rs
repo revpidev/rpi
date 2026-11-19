@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use rpi_durable::chord::context::{BACKGROUND_CONTEXT, Context, with_abort_signal};
 use rpi_durable::env::node::{NodeExecutionEnv, NodeExecutionEnvOptions};
 use rpi_durable::env::types::{
-    CreateDirOptions, DirPage, ExecutionErrorCode, FileContent, FileKind, FileSystem,
+    CreateDirOptions, DirPage, ExecutionErrorCode, FileChange, FileContent, FileKind, FileSystem,
     ListFilesOptions, RemoveOptions, ScanLinesOptions, Shell, ShellCommand, ShellExecOptions,
-    ShellExecResult, ShellOutputInfo, ShellOutputWindow, ShellStream, WatchChange, WatchTarget,
+    ShellExecResult, ShellOutputInfo, ShellOutputWindow, ShellStream, WatchTarget,
 };
 use rpi_durable::errors::{FileError, FileErrorCode};
 use tokio_util::sync::CancellationToken;
@@ -385,11 +385,11 @@ async fn directory_reader_skips_entries_removed_during_enumeration() {
 // Watch
 // ---------------------------------------------------------------------------
 
-fn covers(change: &WatchChange, path: &str) -> bool {
+fn covers(change: &FileChange, path: &str) -> bool {
     match change {
-        WatchChange::Overflow => true,
-        WatchChange::Error(_) => false,
-        WatchChange::Paths(paths) => paths.iter().any(|reported| {
+        FileChange::Overflow => true,
+        FileChange::Failed(_) => false,
+        FileChange::Paths(paths) => paths.iter().any(|reported| {
             path == reported
                 || path.starts_with(&format!("{reported}/"))
                 || path.starts_with(&format!("{reported}\\"))
@@ -398,7 +398,7 @@ fn covers(change: &WatchChange, path: &str) -> bool {
 }
 
 struct WatchHelper {
-    changes: Arc<Mutex<Vec<WatchChange>>>,
+    changes: Arc<Mutex<Vec<FileChange>>>,
     cwd: String,
 }
 
@@ -441,7 +441,7 @@ impl WatchHelper {
     fn assert_no_excluded(&self, excluded: &[String]) {
         let changes = self.changes.lock().expect("changes");
         for change in changes.iter() {
-            if let WatchChange::Paths(paths) = change {
+            if let FileChange::Paths(paths) = change {
                 for path in paths {
                     for prefix in excluded {
                         assert!(
@@ -462,7 +462,7 @@ where
 {
     let changes = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&changes);
-    let callback = Arc::new(move |change: WatchChange| {
+    let callback = Arc::new(move |change: FileChange| {
         captured.lock().expect("changes").push(change);
     });
     let watcher = env
@@ -474,7 +474,7 @@ where
         cwd: env.cwd(),
     };
     run(Arc::clone(&env), helper).await;
-    watcher.close(&context()).await;
+    watcher.stop(&context()).await;
 }
 
 fn watch_target(path: &str) -> WatchTarget {
@@ -737,7 +737,7 @@ async fn watch_reports_an_error_and_stops_when_the_target_becomes_unreadable() {
                     let changes = watch.changes.lock().expect("changes");
                     changes
                         .iter()
-                        .any(|change| matches!(change, WatchChange::Error(_)))
+                        .any(|change| matches!(change, FileChange::Failed(_)))
                 };
                 if saw_error {
                     break;
@@ -767,7 +767,7 @@ async fn watch_stops_reporting_once_closed() {
     let env = create_env(&dir);
     let changes = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&changes);
-    let callback = Arc::new(move |change: WatchChange| {
+    let callback = Arc::new(move |change: FileChange| {
         captured.lock().expect("changes").push(change);
     });
     let watcher = env
@@ -778,8 +778,8 @@ async fn watch_stops_reporting_once_closed() {
         watcher.mode(),
         rpi_durable::env::types::WatchMode::Native | rpi_durable::env::types::WatchMode::Polling
     ));
-    watcher.close(&context()).await;
-    watcher.close(&context()).await;
+    watcher.stop(&context()).await;
+    watcher.stop(&context()).await;
     write(&env, "file.txt", "x");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(changes.lock().expect("changes").is_empty());

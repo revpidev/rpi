@@ -23,7 +23,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use sha2::{Digest, Sha256};
 
 use crate::chord::context::Context;
-use crate::env::types::{FileWatcher, WatchChange, WatchMode, WatchTarget};
+use crate::env::types::{FileChange, FileWatcher, WatchMode, WatchTarget};
 use crate::errors::{FileError, FileErrorCode};
 
 /// How [`NodeFileWatcher`] watches.
@@ -230,7 +230,7 @@ impl NodeFileWatcher {
     }
 
     /// Stop watching; idempotent.
-    pub async fn close(&self) {
+    pub async fn stop(&self) {
         let (reply, wait) = tokio::sync::oneshot::channel();
         if self.sender.send(Message::Close(reply)).await.is_err() {
             return;
@@ -248,8 +248,8 @@ impl FileWatcher for NodeFileWatcher {
         }
     }
 
-    async fn close(&self, _context: &Context) {
-        NodeFileWatcher::close(self).await;
+    async fn stop(&self, _context: &Context) {
+        NodeFileWatcher::stop(self).await;
     }
 }
 
@@ -261,7 +261,7 @@ impl Drop for NodeFileWatcher {
 }
 
 impl Worker {
-    fn deliver(&self, change: WatchChange) {
+    fn deliver(&self, change: FileChange) {
         let callback = Arc::clone(&self.on_change);
         // A throwing callback must not stop watching.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || callback(change)));
@@ -369,7 +369,7 @@ impl Worker {
             Ok((changed, added)) => {
                 reported.extend(changed);
                 if !reported.is_empty() {
-                    self.deliver(WatchChange::Paths(reported.into_iter().collect()));
+                    self.deliver(FileChange::Paths(reported.into_iter().collect()));
                 }
                 if added && cfg!(target_os = "macos") {
                     *settle_at = Some(
@@ -379,7 +379,7 @@ impl Worker {
                 Ok(())
             }
             Err(error) => {
-                self.deliver(WatchChange::Error(error));
+                self.deliver(FileChange::Failed(error));
                 self.close_watchers();
                 self.closed = true;
                 Err(())
@@ -839,7 +839,7 @@ impl Worker {
         }
         self.mode = NodeWatchMode::Polling;
         self.close_watchers();
-        self.deliver(WatchChange::Overflow);
+        self.deliver(FileChange::Overflow);
     }
 }
 

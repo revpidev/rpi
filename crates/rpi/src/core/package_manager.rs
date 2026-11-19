@@ -906,6 +906,8 @@ pub struct ResolvedPackageResource {
     pub source: String,
     pub scope: SourceScope,
     pub base_dir: Option<PathBuf>,
+    /// Resolved package changelog path (`PathMetadata.changelogPath`).
+    pub changelog_path: Option<PathBuf>,
 }
 
 /// The package slice of `ResolvedPaths` (package-manager.ts:69-74).
@@ -931,6 +933,7 @@ impl ResolvedPackagePaths {
                     enabled: entry.enabled,
                     scope: entry.scope,
                     base_dir: entry.base_dir.clone(),
+                    changelog_path: entry.changelog_path.clone(),
                 })
                 .collect()
         }
@@ -1061,6 +1064,7 @@ pub struct ResourcePathMetadata {
     pub scope: SourceScope,
     pub origin: SourceOrigin,
     pub base_dir: Option<PathBuf>,
+    pub changelog_path: Option<PathBuf>,
 }
 
 /// `ResolvedResource` (package-manager.ts:63-67).
@@ -1155,6 +1159,7 @@ impl FullResourceAccumulator {
                         scope: entry.scope,
                         origin: SourceOrigin::Package,
                         base_dir: entry.base_dir,
+                        changelog_path: entry.changelog_path,
                     },
                     entry.enabled,
                 );
@@ -1982,6 +1987,17 @@ impl DefaultPackageManager {
         })
     }
 
+    /// npm writes broken nested package-lock.json paths when `--prefix`
+    /// goes through a symlink (upstream #11358); pass the real path when the
+    /// root already exists.
+    fn real_npm_install_root(root: &Path) -> PathBuf {
+        if root.exists() {
+            std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+        } else {
+            root.to_path_buf()
+        }
+    }
+
     /// `getNpmInstallArgs` (package-manager.ts:1774-1795): peer dependency
     /// resolution is disabled for managed installs (`--legacy-peer-deps`
     /// and the bun/pnpm equivalents).
@@ -1991,7 +2007,9 @@ impl DefaultPackageManager {
         install_root: &Path,
     ) -> Result<Vec<String>, String> {
         let package_manager_name = self.get_package_manager_name()?;
-        let install_root = install_root.to_string_lossy().into_owned();
+        let install_root = Self::real_npm_install_root(install_root)
+            .to_string_lossy()
+            .into_owned();
         let mut args: Vec<String> = vec!["install".to_string()];
         args.extend(specs.iter().cloned());
         match package_manager_name.as_str() {
@@ -2011,6 +2029,10 @@ impl DefaultPackageManager {
                 args.push("--prefix".to_string());
                 args.push(install_root);
                 args.push("--legacy-peer-deps".to_string());
+                // Audit fix would run without --legacy-peer-deps and install
+                // host peers, so skip audit advice (package-manager.ts:2025).
+                args.push("--no-audit".to_string());
+                args.push("--no-fund".to_string());
             }
         }
         Ok(args)
@@ -2122,6 +2144,7 @@ impl DefaultPackageManager {
         if !install_root.exists() {
             return Ok(());
         }
+        let install_root = Self::real_npm_install_root(&install_root);
         let package_manager_name = self.get_package_manager_name()?;
         if package_manager_name == "bun" {
             return self.run_npm_command(
@@ -2142,6 +2165,8 @@ impl DefaultPackageManager {
         ];
         if package_manager_name != "pnpm" {
             args.push("--legacy-peer-deps".to_string());
+            args.push("--no-audit".to_string());
+            args.push("--no-fund".to_string());
         }
         self.run_npm_command(&args, None)
     }
@@ -4441,6 +4466,7 @@ impl DefaultPackageManager {
                     source: "builtin".to_string(),
                     scope,
                     base_dir: None,
+                    changelog_path: None,
                 },
             );
         }
@@ -4507,6 +4533,7 @@ impl DefaultPackageManager {
                     scope: SourceScope::Project,
                     origin: SourceOrigin::TopLevel,
                     base_dir: None,
+                    changelog_path: None,
                 },
                 &project_base_dir,
             );
@@ -4519,6 +4546,7 @@ impl DefaultPackageManager {
                     scope: SourceScope::User,
                     origin: SourceOrigin::TopLevel,
                     base_dir: None,
+                    changelog_path: None,
                 },
                 &global_base_dir,
             );
@@ -4550,6 +4578,7 @@ impl DefaultPackageManager {
                     scope,
                     origin: SourceOrigin::TopLevel,
                     base_dir: None,
+                    changelog_path: None,
                 },
                 enabled,
             );
@@ -4640,12 +4669,14 @@ impl DefaultPackageManager {
             scope: SourceScope::User,
             origin: SourceOrigin::TopLevel,
             base_dir: Some(global_base_dir.to_path_buf()),
+            changelog_path: None,
         };
         let project_metadata = ResourcePathMetadata {
             source: "auto".to_string(),
             scope: SourceScope::Project,
             origin: SourceOrigin::TopLevel,
             base_dir: Some(project_base_dir.to_path_buf()),
+            changelog_path: None,
         };
         let overrides = |settings: &Settings, resource_type: ResourceType| {
             settings_string_array(settings, resource_type.dir_name())
@@ -4817,6 +4848,7 @@ impl DefaultPackageManager {
                 source: source_str.clone(),
                 scope: *scope,
                 base_dir: None,
+                changelog_path: None,
             };
 
             if let ParsedSource::Local(local) = &parsed {
@@ -4985,6 +5017,13 @@ impl DefaultPackageManager {
         filter: Option<&PackageSourceFilter>,
         metadata: PackageMetadata,
     ) -> bool {
+        // Record the resolved changelog source with the package metadata
+        // (package-manager.ts:2418-2426).
+        let metadata = PackageMetadata {
+            changelog_path: crate::core::changelog::extension_package_metadata(package_root)
+                .map(|package| package.changelog_path),
+            ..metadata
+        };
         if let Some(filter) = filter {
             for resource_type in RESOURCE_TYPES {
                 let patterns = resource_type.filter_patterns(filter);
@@ -5249,6 +5288,7 @@ struct PackageMetadata {
     source: String,
     scope: SourceScope,
     base_dir: Option<PathBuf>,
+    changelog_path: Option<PathBuf>,
 }
 
 impl PackageMetadata {
@@ -5259,6 +5299,7 @@ impl PackageMetadata {
             source: self.source,
             scope: self.scope,
             base_dir: self.base_dir,
+            changelog_path: self.changelog_path,
         }
     }
 }
@@ -6233,6 +6274,8 @@ mod tests {
                 "--prefix",
                 dirs.agent_dir.join("npm").to_string_lossy().as_ref(),
                 "--legacy-peer-deps",
+                "--no-audit",
+                "--no-fund",
             ]
         );
         // `ensureNpmProject` side effects.
@@ -6248,6 +6291,41 @@ mod tests {
             std::fs::read_to_string(dirs.agent_dir.join("npm/.gitignore")).unwrap(),
             "*\n!.gitignore\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_npm_install_args_resolve_a_symlinked_install_root() {
+        let dirs = TestDirs::new();
+        let linked = dirs.root.join("linked-agent");
+        std::os::unix::fs::symlink(&dirs.agent_dir, &linked).unwrap();
+        std::fs::create_dir_all(linked.join("npm")).unwrap();
+        let settings_manager = SettingsManager::create(
+            &dirs.cwd,
+            Some(&linked),
+            crate::core::settings_manager::SettingsManagerCreateOptions {
+                project_trusted: true,
+            },
+        );
+        let manager = DefaultPackageManager::with_options(PackageManagerOptions {
+            cwd: dirs.cwd.clone(),
+            agent_dir: linked.clone(),
+            settings_manager,
+            runner: Some(FakeRunner::ok()),
+            offline: Some(false),
+            registry: None,
+            builtin_extensions: Vec::new(),
+        });
+        let args = manager
+            .get_npm_install_args(&["left-pad".to_owned()], &linked.join("npm"))
+            .unwrap();
+        let expected = std::fs::canonicalize(dirs.agent_dir.join("npm")).unwrap();
+        let prefix = args
+            .windows(2)
+            .find(|pair| pair[0] == "--prefix")
+            .map(|pair| pair[1].as_str())
+            .expect("--prefix");
+        assert_eq!(Path::new(prefix), expected);
     }
 
     #[test]
@@ -6338,6 +6416,8 @@ mod tests {
                 "--prefix",
                 dirs.agent_dir.join("npm").to_string_lossy().as_ref(),
                 "--legacy-peer-deps",
+                "--no-audit",
+                "--no-fund",
             ]
         );
     }
@@ -7046,6 +7126,14 @@ mod tests {
         let dirs = TestDirs::new();
         let package_dir = dirs.cwd.join("pkg");
         make_local_package(&package_dir);
+        write_file(
+            &package_dir.join("package.json"),
+            r#"{"name":"pkg","version":"1.2.3"}"#,
+        );
+        write_file(
+            &package_dir.join("CHANGELOG.md"),
+            "## [1.2.3]\n\n- Release\n",
+        );
         let runner = FakeRunner::ok();
         let manager = test_manager(&dirs, runner);
 
@@ -7074,6 +7162,24 @@ mod tests {
         );
         assert!(resolved.extensions[0].enabled);
         assert_eq!(resolved.extensions[0].base_dir, Some(package_dir.clone()));
+        let changelog = package_dir.join("CHANGELOG.md");
+        for resource in resolved
+            .extensions
+            .iter()
+            .chain(&resolved.skills)
+            .chain(&resolved.prompts)
+            .chain(&resolved.themes)
+        {
+            assert_eq!(
+                resource.changelog_path.as_deref(),
+                Some(changelog.as_path())
+            );
+        }
+        let loader_paths = resolved.to_package_resource_paths();
+        assert_eq!(
+            loader_paths.extension_paths[0].changelog_path.as_deref(),
+            Some(changelog.as_path())
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::chord::context::Context;
 use crate::chord::delta::Op;
 use crate::chord::json::{JsonObject, JsonValue};
 use crate::harness::{AGENT_DOC, INBOX_DOC, LIVE_DOC, PROVIDER_DOC, USAGE_DOC};
-use crate::ids::{ConversationId, EntryId, id_from_number};
+use crate::ids::{ConversationId, DocumentId, EntryId, id_from_number};
 use crate::session::{
     CommitPublication, CommittedWatch, Observation, Observer, SessionError, SessionFuture,
     SessionResult, Subscription, WatchCall, WatchEnd, WatchFuture,
@@ -183,8 +183,15 @@ impl Windowed {
 struct Mount {
     conversation: ConversationRecord,
     docs: BTreeMap<String, JsonObject>,
+    /// Current incarnation of each mounted document, by kind. A watch follows
+    /// the address, so retire/recreate must replace rather than remove the
+    /// entry (upstream `Mount.incarnations`, view.ts:256-262).
+    incarnations: BTreeMap<String, (DocumentId, u64)>,
     observers: HashMap<u64, Windowed>,
 }
+
+/// The built-in documents a conversation view mounts (upstream `MOUNTED`).
+const MOUNTED_KINDS: [&str; 5] = ["pi.agent", "pi.live", "pi.inbox", "pi.provider", "pi.usage"];
 
 impl Mount {
     fn advance(&mut self, publication: &CommitPublication, context: &Context) {
@@ -197,15 +204,25 @@ impl Mount {
                         != (DocumentScope::Conversation {
                             conversation_id: self.conversation.id,
                         })
+                        || !MOUNTED_KINDS.contains(&document.record.kind.as_str())
+                        || document.record.key.is_some()
                     {
                         continue;
                     }
-                    documents_changed = true;
+                    let kind = document.record.kind.clone();
+                    let version = document.version.unwrap_or(0);
+                    let current = self.incarnations.get(&kind).copied();
                     if document.is_retirement() {
-                        self.docs.remove(&document.record.kind);
+                        if current.map(|(id, _)| id) == Some(document.record.id) {
+                            self.incarnations.remove(&kind);
+                            self.docs.remove(&kind);
+                            documents_changed = true;
+                        }
                     } else if let Some(value) = &document.value {
-                        self.docs
-                            .insert(document.record.kind.clone(), value.clone());
+                        self.incarnations
+                            .insert(kind.clone(), (document.record.id, version));
+                        self.docs.insert(kind, value.clone());
+                        documents_changed = true;
                     }
                 }
                 crate::session::CommitChange::Table(StorageWrite::Entry { value })
@@ -361,8 +378,8 @@ impl ConversationViews {
         self.session
             .read_on_line(move || {
                 Box::pin(async move {
-                    let (conversation, docs, entries, before) =
-                        this.build(id, from, min, &context).await?;
+                    let (conversation, docs, incarnations, entries, before) =
+                        this.build(id, from, min, max, &context).await?;
                     let value = ConversationView {
                         conversation,
                         entries,
@@ -397,10 +414,12 @@ impl ConversationViews {
                         let mount = mounts.entry(id_for_detach).or_insert_with(|| Mount {
                             conversation: value.conversation.clone(),
                             docs: value.docs.clone(),
+                            incarnations: incarnations.clone(),
                             observers: HashMap::new(),
                         });
                         mount.conversation = value.conversation.clone();
                         mount.docs = value.docs.clone();
+                        mount.incarnations = incarnations;
                         mount.observers.insert(observer_id, windowed);
                     }
                     let mounts = Arc::clone(&this.mounts);
@@ -439,10 +458,12 @@ impl ConversationViews {
         id: ConversationId,
         from: Option<EntryId>,
         min: usize,
+        max: usize,
         context: &Context,
     ) -> SessionResult<(
         ConversationRecord,
         BTreeMap<String, JsonObject>,
+        BTreeMap<String, (DocumentId, u64)>,
         Vec<EntryRecord>,
         Option<EntryId>,
     )> {
@@ -453,6 +474,7 @@ impl ConversationViews {
             .await?
             .ok_or_else(|| SessionError::message(format!("Conversation {id} does not exist")))?;
         let mut docs = BTreeMap::new();
+        let mut incarnations = BTreeMap::new();
         for token in [
             &*AGENT_DOC,
             &*LIVE_DOC,
@@ -466,10 +488,15 @@ impl ConversationViews {
                 .await?
             {
                 docs.insert(token.definition.kind.clone(), document.value);
+                incarnations.insert(
+                    token.definition.kind.clone(),
+                    (document.record.id, document.version),
+                );
             }
         }
-        let (entries, before) = load_window(self.session.storage(), id, from, min, context).await?;
-        Ok(((*conversation).clone(), docs, entries, before))
+        let (entries, before) =
+            load_window(self.session.storage(), id, from, min, max, context).await?;
+        Ok(((*conversation).clone(), docs, incarnations, entries, before))
     }
 }
 
@@ -504,6 +531,7 @@ async fn load_window(
     id: ConversationId,
     from: Option<EntryId>,
     min: usize,
+    max: usize,
     context: &Context,
 ) -> SessionResult<(Vec<EntryRecord>, Option<EntryId>)> {
     if let Some(from) = from {
@@ -515,11 +543,11 @@ async fn load_window(
                 max_entry_id: None,
                 order: Some(ScanOrder::Ascending),
             },
-            min.saturating_mul(2) + 1,
+            max.saturating_add(1),
             context,
         )
         .await?;
-        if entries.len() <= min.saturating_mul(2) {
+        if entries.len() <= max {
             let previous = storage
                 .scan_entries(
                     EntryQuery {
