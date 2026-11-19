@@ -2151,17 +2151,23 @@ mod tests {
     }
 
     /// Sets Kitty image capabilities + cell dimensions, restores on drop
-    /// (tui-render.test.ts try/finally blocks).
-    struct CapsGuard;
+    /// (tui-render.test.ts try/finally blocks). Holds the shared caps lock so
+    /// concurrent markdown/image/alt-screen tests cannot overwrite them.
+    struct CapsGuard {
+        _caps: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl CapsGuard {
         fn kitty(cell_px: f64) -> CapsGuard {
+            let caps = crate::terminal_image::TEST_CAPS_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             set_capabilities(KITTY_CAPS);
             set_cell_dimensions(CellDimensions {
                 width_px: cell_px,
                 height_px: cell_px,
             });
-            CapsGuard
+            CapsGuard { _caps: caps }
         }
     }
 

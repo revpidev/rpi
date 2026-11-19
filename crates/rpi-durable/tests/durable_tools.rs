@@ -619,9 +619,10 @@ fn read_declares_its_description_and_text_or_image_structured_output() {
                     "properties": {
                         "type": { "const": "image" },
                         "data": { "type": "string" },
-                        "mimeType": { "type": "string" }
+                        "mimeType": { "type": "string" },
+                        "note": { "type": "string" }
                     },
-                    "required": ["type", "data", "mimeType"]
+                    "required": ["type", "data", "mimeType", "note"]
                 }
             ]
         }))
@@ -753,12 +754,20 @@ async fn read_returns_a_supported_image_within_the_limits() {
     };
     assert_eq!(image.mime_type, "image/png");
     assert!(!image.data.is_empty());
+    let note = result
+        .diagnostics
+        .iter()
+        .flatten()
+        .find(|diagnostic| diagnostic.code.as_deref() == Some("image"))
+        .map(|diagnostic| diagnostic.message.clone())
+        .expect("image note");
     assert_eq!(
         result.structured_output,
         Some(json!({
             "type": "image",
             "data": image.data,
-            "mimeType": image.mime_type
+            "mimeType": image.mime_type,
+            "note": note
         }))
     );
     assert!(result.diagnostics.iter().flatten().any(|diagnostic| {

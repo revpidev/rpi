@@ -1137,6 +1137,16 @@ async fn watch_delivers_unfolded_frames_in_order() {
 }
 
 /// Past 10,000 pending operations, only one root replacement remains.
+///
+/// This end-to-end case performs 10,001 session commits (about 7.9 GiB peak
+/// RSS and over two minutes in debug builds), so the default workspace gate
+/// skips it; `chord::delta::tests::folds_busy_leaf_operations_and_overflows_to_replacement`
+/// covers the same 10,001-op collapse directly. Run the explicit gate with:
+///
+/// ```sh
+/// cargo test -p rpi-durable --test session_kernel -- --ignored watch_overflow
+/// ```
+#[ignore = "10,001 commits; run with --ignored for the end-to-end overflow gate"]
 #[tokio::test]
 async fn watch_overflow_collapses_to_root_replacement() {
     let harness = open_test_session();

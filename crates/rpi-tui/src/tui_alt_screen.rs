@@ -6571,6 +6571,7 @@ mod tests {
     struct CapsGuard {
         _state: MutexGuard<'static, ()>,
         _image_state: MutexGuard<'static, ()>,
+        _caps: MutexGuard<'static, ()>,
     }
 
     impl CapsGuard {
@@ -6579,9 +6580,15 @@ mod tests {
             let image_state = crate::terminal_image::TEST_STATE_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The shared caps lock keeps markdown/image/main-screen tests from
+            // overwriting the capabilities this suite pinned.
+            let caps = crate::terminal_image::TEST_CAPS_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             CapsGuard {
                 _state: state,
                 _image_state: image_state,
+                _caps: caps,
             }
         }
 
@@ -7522,6 +7529,7 @@ mod tests {
     /// screen test).
     #[test]
     fn hardware_cursor_suppresses_the_focused_fake_cursor_in_fullscreen() {
+        let _caps = CapsGuard::lock_only();
         let terminal = RecordingTerminal::new(40, 10);
         let tui = TuiAltScreen::with_options(
             Box::new(terminal.clone()),

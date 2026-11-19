@@ -1311,6 +1311,13 @@ pub fn image_fallback(
 #[cfg(test)]
 pub(crate) static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Serializes every test that mutates the process-global terminal
+/// capabilities, across modules. Each suite used to keep a private lock, which
+/// let a concurrent markdown/image/main-screen test overwrite the capabilities
+/// an alt-screen test had just pinned (B07/Kitty review observation).
+#[cfg(test)]
+pub(crate) static TEST_CAPS_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1362,9 +1369,12 @@ mod tests {
     }
 
     /// Guards tests that read/write the capabilities cache and cell dimension
-    /// globals.
+    /// globals. Takes the shared caps lock after `TEST_STATE_LOCK` so a
+    /// concurrent markdown/image/alt-screen test cannot overwrite the
+    /// capabilities under test (same order as the other suites).
     fn with_globals(f: impl FnOnce()) {
         let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _caps = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         f();
     }
 

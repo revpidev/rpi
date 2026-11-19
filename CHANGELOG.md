@@ -4,7 +4,7 @@
 
 ### v0.1.9 draft — implementation in progress
 
-This section covers the V19-01 implementation work except its M06 handoff, plus the V19-02 B/C/D implementation. M06-OUT/CHECK and V19-02's final review are still pending, as is the V19-08 release gate.
+This section covers the V19-01 implementation work including its M06-OUT handoff, plus the V19-02 B/C/D implementation and the completed M06-CHECK. V19-02's final review and the V19-08 release gate are still pending.
 
 ### Main line
 
@@ -20,7 +20,7 @@ This section covers the V19-01 implementation work except its M06 handoff, plus 
 - **Sessions**: missing interactive cwds offer Continue/Fork/Cancel; Continue is non-persistent, startup Fork creates a new ID under the current cwd, and resume/import Fork uses the current session directory. Print/RPC retain `MissingSessionCwdError`. Disk failures roll back memory entries, branch metadata keeps live thinking, and summaries use current context edits/auth without hidden or failed originals.
 - **Tools and lifecycle**: `exec` adds `maxBuffer`/`truncated` with UTF-8-safe bounded output and process-tree termination; `read` adds optional chunk streams and bounded file windows; `edit` writes normalized source-span diffs before I/O while preserving mixed line endings; grep contexts consume only ripgrep output, leaving deprecated default `read_file` unused. Bash distinguishes shell exit from output timeout, prompt images share serial resizing, shutdown settles results before extension disposal, and exports include deep histories plus system prompt/tool updates.
 - **Interactive and terminal**: custom overlays aggregate blocked bitmaps and receive key text/hints; Markdown transformers cover `custom`/`summary`/`changelog` with optional `messageId`/`timestamp`, shared by assistant, summary and changelog surfaces. Mermaid supports pie, author styles and clickable labels without claiming every third-party boundary. Component frames add optional `capturesViewportInput`, renderer options add keybinding hints, and `Component::render`/`rpiAbi=1` are unchanged. Search covers NFC Unicode, name/full-name weighting and cycle-safe local `$ref`; UAX #29 tokenization is not presented as every `Intl.Segmenter` dictionary behavior.
-- **Experimental durable stack**: ordered multi-batch commit with `CommitResult`, shared `Arc` hot reads, SQLite statement/read caches and bounded outcome queues; tagged watch/observer calls, address-stable retire/recreate and 10,000-op collapse; deferred progress with bounded Append deltas and read/write/deadline/close flushes; live v3 migrations, bounded transcript windows, read-only Session/Harness/JSONL, incremental scheduler indexes, crash/retry recovery and terminal restart limits. `Continue`, `maxTurns`, raw entry ranges, `afterRun` draining and ordered provider-payload hooks are implemented, while default CLI isolation, Session JSONL outer framing and cumulative extension events are unchanged.
+- **Experimental durable stack**: ordered multi-batch commit with `CommitResult`, shared `Arc` hot reads, SQLite statement/read caches and bounded outcome queues; tagged watch/observer calls, address-stable retire/recreate and 10,000-op collapse; deferred progress with bounded Append deltas and read/write/deadline/close flushes; live v3 migrations, bounded transcript windows, read-only Session/Harness/JSONL, incremental scheduler indexes, crash/retry recovery and terminal restart limits. `read` declares text/image structured output for codemode (including an image note) with journaled replay. `Continue`, `maxTurns`, raw entry ranges, `afterRun` draining and ordered provider-payload hooks are implemented, while default CLI isolation, Session JSONL outer framing and cumulative extension events are unchanged.
 
 ### Breaking changes
 
@@ -42,7 +42,7 @@ This section covers the V19-01 implementation work except its M06 handoff, plus 
 
 ### Internal
 
-- The seven first-party extensions remain on `rpiAbi: 1`; Session JSONL outer framing and durable default isolation are unchanged. R2-A14 belongs to V19-05; V19-02 D16 wires the shared argument validator into durable `afterTool`, and R2-M06 proceeds only through the M06-IN/OUT handoff. No distribution or endpoint update is implied. Offline fixture/loopback evidence and the fresh-context review verdict are recorded in the task file.
+- The seven first-party extensions remain on `rpiAbi: 1`; Session JSONL outer framing and durable default isolation are unchanged. R2-A14 belongs to V19-05; V19-02 D16 wires the shared argument validator into durable `afterTool`, and R2-M06 is closed through the M06-IN/OUT/CHECK handoff. No distribution or endpoint update is implied. Offline fixture/loopback evidence and the fresh-context review verdict are recorded in the task file.
 
 ## [0.1.8] - 2026-11-12
 

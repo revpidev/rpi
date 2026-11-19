@@ -439,6 +439,7 @@ async fn read_image(
         "type": "image",
         "data": &image.data,
         "mimeType": &image.mime_type,
+        "note": &message,
     });
     Ok(ToolExecutionResult {
         output: Some(vec![ToolResultContent::Image(image)]),
@@ -757,9 +758,10 @@ pub fn create_read_tool_with_options(options: ReadToolOptions) -> ToolRegistrati
                     "properties": {
                         "type": { "const": "image" },
                         "data": { "type": "string" },
-                        "mimeType": { "type": "string" }
+                        "mimeType": { "type": "string" },
+                        "note": { "type": "string" }
                     },
-                    "required": ["type", "data", "mimeType"]
+                    "required": ["type", "data", "mimeType", "note"]
                 }
             ]
         })),

@@ -2973,6 +2973,9 @@ fn append_write_failure_in_readonly_directory_is_error_not_panic() {
 
     // The deferred create (#10000) happens with the first conversation
     // entry, so the read-only directory makes that append fail.
+    let before_entries = session.get_entries().len();
+    let before_leaf = session.get_leaf_id().map(str::to_owned);
+    let file = session.get_session_file().expect("file").to_path_buf();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
     let result = session.append_message(user_msg("hello"));
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
@@ -2981,6 +2984,27 @@ fn append_write_failure_in_readonly_directory_is_error_not_panic() {
         matches!(result, Err(RpiError::Io(_))),
         "io error, got: {result:?}"
     );
+    // `_appendEntry` rolls back the record, index and leaf so the next append
+    // cannot point at an entry that was never written.
+    assert_eq!(session.get_entries().len(), before_entries);
+    assert_eq!(session.get_leaf_id().map(str::to_owned), before_leaf);
+    assert!(!file.exists(), "a failed wx must not leave a partial file");
+
+    let id = session
+        .append_message(user_msg("after"))
+        .expect("append after restoring permissions");
+    let entry = session
+        .get_entries()
+        .into_iter()
+        .find(|entry| entry.id() == id)
+        .expect("appended entry");
+    assert_eq!(entry.parent_id().map(str::to_owned), before_leaf);
+    let written = std::fs::read_to_string(&file).expect("written file");
+    assert!(
+        !written.contains("hello"),
+        "failed entry must not be written"
+    );
+    assert!(written.contains("after"), "retry is written: {written}");
 }
 
 /// Unknown entry types: preserved on load → lossless write-back; unknown extension

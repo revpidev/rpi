@@ -807,6 +807,7 @@ impl CodemodeSandbox for ReadFileSandbox {
         assert!(declaration.description.contains("Promise<string | {"));
         assert!(declaration.description.contains("data: string"));
         assert!(declaration.description.contains("mimeType: string"));
+        assert!(declaration.description.contains("note: string"));
         let picture = host
             .call_tool(
                 "read",
@@ -822,6 +823,11 @@ impl CodemodeSandbox for ReadFileSandbox {
         assert_eq!(picture["type"], serde_json::json!("image"));
         assert_eq!(picture["data"], serde_json::json!(self.expected_data));
         assert_eq!(picture["mimeType"], serde_json::json!("image/png"));
+        let picture_note = picture["note"].as_str().expect("image note");
+        assert!(
+            picture_note.contains("Read image file [image/png]"),
+            "image note: {picture_note}"
+        );
         let image = CodemodeImage {
             data: picture["data"].as_str().expect("image data").to_string(),
             mime_type: picture["mimeType"]

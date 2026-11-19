@@ -298,8 +298,9 @@ mod tests {
         set_cell_dimensions,
     };
 
-    /// Serializes tests that mutate the global capabilities cache.
-    static TEST_CAPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes tests that mutate the global capabilities cache. Shared
+    /// with the markdown/alt-screen/main-screen suites.
+    use crate::terminal_image::TEST_CAPS_LOCK;
 
     fn kitty_caps() -> TerminalCapabilities {
         TerminalCapabilities {

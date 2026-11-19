@@ -3145,8 +3145,10 @@ mod tests {
     }
 
     /// Serializes tests that mutate the global capabilities cache (cargo
-    /// runs tests in one binary with parallel threads).
-    static TEST_CAPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// runs tests in one binary with parallel threads). Shared with the
+    /// image/alt-screen/main-screen suites so capabilities cannot change
+    /// mid-test.
+    use crate::terminal_image::TEST_CAPS_LOCK;
 
     // ── Lists ──────────────────────────────────────────────────────────────
 

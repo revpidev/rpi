@@ -145,3 +145,14 @@ bash scripts/v019-benchmark/test.sh
 ```
 
 The self-test runs input verification, `/proc` parser/budget unit tests, two deterministic smoke replays, incorrect-hash and missing-log negative tests, a debug-profile rejection, a real `/proc` capture and a zero-delta budget check. Logs default to `/tmp/rpi-v19-harness-self-test`.
+
+## Full-workspace gate environment
+
+Run the workspace gate from a clean shell. Inherited agent/subagent markers change resource-loader and extension behavior and make unrelated targets fail (for example `ask_user_question_e2e`, `parity_resources_test`, `resource_loader_test`, `context_with_system` and `l0_load`):
+
+```bash
+env -u RPI_SUBAGENT_CHILD -u RPI_NO_GLOBAL_CONTEXT -u AI_AGENT \
+  TMPDIR=/tmp cargo test --workspace --no-fail-fast
+```
+
+Use the standard `/tmp` filesystem (not a long ancestor path) so repo-ancestor discovery and fixed-width path assertions match the recorded gates. Do not set `MALLOC_ARENA_MAX` for the default gate: the production default is applied in-process, and forcing `MALLOC_ARENA_MAX=1` changes test-thread scheduling; the Kitty cache tests are serialized through the shared test caps lock, but the recorded default gate remains the no-override run.

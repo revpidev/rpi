@@ -255,19 +255,23 @@ mod tests {
     /// `start_common` → `query_cell_size`), which otherwise drifts with the
     /// test environment (TERM_PROGRAM/TMUX/...) and — for iTerm2 — mutates
     /// the global cache mid-test (the alt-screen iTerm2 demotion). Holds
-    /// both global-state locks in the same acquisition order as
+    /// the shared global-state locks in the same acquisition order as
     /// `tui_alt_screen.rs`'s guard so concurrent capability-mutating suites
     /// serialize against the pin; drop resets the cache so later tests
     /// re-detect from the environment.
     struct CapsGuard {
         _state: MutexGuard<'static, ()>,
         _image_state: MutexGuard<'static, ()>,
+        _caps: MutexGuard<'static, ()>,
     }
 
     impl CapsGuard {
         fn pin() -> CapsGuard {
             let state = crate::test_vt::state_lock();
             let image_state = crate::terminal_image::TEST_STATE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let caps = crate::terminal_image::TEST_CAPS_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             crate::terminal_image::set_capabilities(crate::terminal_image::TerminalCapabilities {
@@ -278,6 +282,7 @@ mod tests {
             CapsGuard {
                 _state: state,
                 _image_state: image_state,
+                _caps: caps,
             }
         }
     }

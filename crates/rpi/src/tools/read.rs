@@ -20,7 +20,7 @@ use crate::tools::image_process::{
 };
 use crate::tools::mime::{IMAGE_TYPE_SNIFF_BYTES, detect_supported_image_mime_type};
 use crate::tools::path_utils::resolve_read_path;
-use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size, truncate_head};
+use crate::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncate_head};
 
 // ---------------------------------------------------------------------------
 // ReadOperations (read.ts:43-50)
@@ -73,7 +73,7 @@ impl ReadOperations for LocalReadOperations {
     ) -> std::io::Result<Option<ReadByteStream>> {
         let file = tokio::fs::File::open(absolute_path).await?;
         let metadata = file.metadata().await?;
-        let initial_size = metadata.is_file().then_some(metadata.len());
+        let initial_size = (metadata.is_file() && metadata.len() > 0).then_some(metadata.len());
         Ok(Some(ReadByteStream {
             reader: Box::pin(file),
             initial_size,
@@ -252,6 +252,206 @@ struct StreamSelection {
     selected_total_lines: usize,
     selected_total_bytes: usize,
     first_selected_line_len: usize,
+    #[cfg(test)]
+    stored_lines: usize,
+    #[cfg(test)]
+    stored_bytes: usize,
+}
+
+/// Streaming UTF-8 decoder with the same lossy, BOM-preserving behavior as
+/// Node's `TextDecoder("utf-8", { ignoreBOM: true })` (read.ts:158): a BOM is
+/// kept, invalid sequences become U+FFFD, and a multi-byte character split
+/// across chunks is decoded once its remaining bytes arrive.
+struct Utf8StreamDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8StreamDecoder {
+    fn new() -> Self {
+        Self {
+            pending: Vec::with_capacity(4),
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8], selector: &mut LineSelector) {
+        if self.pending.is_empty() {
+            self.feed_slice(bytes, selector);
+        } else {
+            self.pending.extend_from_slice(bytes);
+            let data = std::mem::take(&mut self.pending);
+            self.feed_slice(&data, selector);
+        }
+    }
+
+    fn feed_slice(&mut self, buf: &[u8], selector: &mut LineSelector) {
+        let mut offset = 0;
+        loop {
+            match std::str::from_utf8(&buf[offset..]) {
+                Ok(valid) => {
+                    if !valid.is_empty() {
+                        selector.select(valid);
+                    }
+                    break;
+                }
+                Err(error) => {
+                    let valid_up_to = offset + error.valid_up_to();
+                    if valid_up_to > offset {
+                        let valid = std::str::from_utf8(&buf[offset..valid_up_to])
+                            .expect("valid_up_to marks a valid prefix");
+                        selector.select(valid);
+                    }
+                    match error.error_len() {
+                        Some(len) => {
+                            selector.select("\u{FFFD}");
+                            offset = valid_up_to + len;
+                            if offset >= buf.len() {
+                                break;
+                            }
+                        }
+                        None => {
+                            // An incomplete trailing sequence: keep it for the
+                            // next chunk (at most three bytes).
+                            self.pending.extend_from_slice(&buf[valid_up_to..]);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, selector: &mut LineSelector) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let buf = std::mem::take(&mut self.pending);
+        selector.select(&String::from_utf8_lossy(&buf));
+    }
+}
+
+/// Byte-bounded line selector (read.ts:150-235 `selectLinesFromStream`).
+///
+/// Only the lines `truncate_head` can show are stored: a line over the byte
+/// cap is measured but not retained, and once the stored line/byte caps are
+/// exceeded no further line is stored. Counters still advance over the whole
+/// stream, so `total_file_lines`/`selected_total_bytes` describe the file.
+struct LineSelector {
+    start_line: usize,
+    end_line: f64,
+    line: usize,
+    selected_lines: usize,
+    selected_bytes: usize,
+    first_line_bytes: usize,
+    last_line_empty: bool,
+    stored_lines: Vec<String>,
+    stored_bytes: usize,
+    stored_past_caps: bool,
+    pieces: Option<Vec<String>>,
+    line_bytes: usize,
+    line_has_text: bool,
+}
+
+impl LineSelector {
+    fn new(start_line: usize, limit: Option<f64>) -> Self {
+        let end_line = limit.map_or(f64::INFINITY, |limit| start_line as f64 + limit);
+        Self {
+            start_line,
+            end_line,
+            line: 0,
+            selected_lines: 0,
+            selected_bytes: 0,
+            first_line_bytes: 0,
+            last_line_empty: true,
+            stored_lines: Vec::new(),
+            stored_bytes: 0,
+            stored_past_caps: false,
+            pieces: Some(Vec::new()),
+            line_bytes: 0,
+            line_has_text: false,
+        }
+    }
+
+    fn append_to_line(&mut self, text: &str, start: usize, end: usize) {
+        self.line_has_text = true;
+        let Some(pieces) = self.pieces.as_mut() else {
+            return;
+        };
+        let piece = &text[start..end];
+        // A line over the byte cap is never shown, and a first line over it is
+        // only measured: never store all of a 1 GB line.
+        if self.line_bytes <= DEFAULT_MAX_BYTES {
+            pieces.push(piece.to_owned());
+        }
+        self.line_bytes += piece.len();
+    }
+
+    fn finish_line(&mut self) {
+        if let Some(pieces) = self.pieces.take() {
+            if self.selected_lines == 0 {
+                self.first_line_bytes = self.line_bytes;
+            }
+            // Storing continues one line past the caps: truncate_head ignores
+            // a trailing empty line, so the line after the cap must be there
+            // for it to decide truncation as for the full text.
+            if self.stored_lines.len() > DEFAULT_MAX_LINES || self.stored_bytes > DEFAULT_MAX_BYTES
+            {
+                self.stored_past_caps = true;
+            }
+            let text = pieces.join("");
+            self.stored_bytes += text.len() + usize::from(!self.stored_lines.is_empty());
+            self.stored_lines.push(text);
+        }
+        self.selected_lines += 1;
+        self.last_line_empty = !self.line_has_text;
+        self.pieces = if self.stored_past_caps {
+            None
+        } else {
+            Some(Vec::new())
+        };
+        self.line_bytes = 0;
+        self.line_has_text = false;
+    }
+
+    fn select(&mut self, text: &str) {
+        let mut position = 0usize;
+        // Start of the selected text in this chunk, measured as a whole: the
+        // joined lines' size.
+        let mut selection_start: Option<usize> = None;
+        loop {
+            let selected = self.line >= self.start_line && (self.line as f64) < self.end_line;
+            if selected && selection_start.is_none() {
+                selection_start = Some(position);
+            }
+            let newline = text[position..].find('\n').map(|index| position + index);
+            let end = newline.unwrap_or(text.len());
+            if selected && end > position {
+                self.append_to_line(text, position, end);
+            }
+            let Some(newline) = newline else {
+                break;
+            };
+            if selected {
+                self.finish_line();
+                if (self.line + 1) as f64 == self.end_line {
+                    if let Some(start) = selection_start {
+                        self.selected_bytes += text[start..newline].len();
+                    }
+                    selection_start = None;
+                }
+            }
+            self.line += 1;
+            position = newline + 1;
+        }
+        if let Some(start) = selection_start {
+            self.selected_bytes += text[start..].len();
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.line >= self.start_line && (self.line as f64) < self.end_line {
+            self.finish_line();
+        }
+    }
 }
 
 fn valid_stream_range(offset: Option<f64>, limit: Option<f64>) -> bool {
@@ -269,37 +469,9 @@ async fn read_selected_stream(
 ) -> Result<StreamSelection, AgentError> {
     use tokio::io::AsyncReadExt;
 
-    let start_line = start_line_raw as usize;
-    let end_line = limit.map(|limit| start_line_raw + limit);
-    let mut current_line = 0usize;
-    let mut selected_count = 0usize;
-    let mut selected_total_bytes = 0usize;
-    let mut selected_last_empty = false;
-    let mut first_selected_line_len = 0usize;
-    let mut retained = Vec::new();
+    let mut selector = LineSelector::new(start_line_raw as usize, limit);
+    let mut decoder = Utf8StreamDecoder::new();
     let mut buffer = [0u8; 64 * 1024];
-    let mut pending = Vec::new();
-
-    let mut process_line = |line: &[u8]| {
-        let in_window =
-            current_line >= start_line && end_line.is_none_or(|end| (current_line as f64) < end);
-        if in_window {
-            let text = String::from_utf8_lossy(line).into_owned();
-            if selected_count > 0 {
-                selected_total_bytes += 1;
-            }
-            selected_total_bytes += text.len();
-            if selected_count == 0 {
-                first_selected_line_len = text.len();
-            }
-            if retained.len() <= 2000 {
-                retained.push(text.clone());
-            }
-            selected_count += 1;
-            selected_last_empty = text.is_empty();
-        }
-        current_line += 1;
-    };
 
     loop {
         if signal.is_cancelled() {
@@ -318,30 +490,27 @@ async fn read_selected_stream(
         if let Some(remaining) = &mut stream.initial_size {
             *remaining = remaining.saturating_sub(read as u64);
         }
-        pending.extend_from_slice(&buffer[..read]);
-        let mut start = 0;
-        for (index, byte) in pending.iter().enumerate() {
-            if *byte == b'\n' {
-                process_line(&pending[start..index]);
-                start = index + 1;
-            }
-        }
-        pending = pending[start..].to_vec();
+        decoder.feed(&buffer[..read], &mut selector);
     }
-    process_line(&pending);
+    decoder.finish(&mut selector);
+    selector.finish();
 
-    let content = retained.join("\n");
-    let selected_total_lines = if content.is_empty() {
+    let content = selector.stored_lines.join("\n");
+    let selected_total_lines = if selector.selected_bytes == 0 {
         0
     } else {
-        selected_count - usize::from(selected_last_empty)
+        selector.selected_lines - usize::from(selector.last_line_empty)
     };
     Ok(StreamSelection {
         content,
-        total_file_lines: current_line,
+        total_file_lines: selector.line + 1,
         selected_total_lines,
-        selected_total_bytes,
-        first_selected_line_len,
+        selected_total_bytes: selector.selected_bytes,
+        first_selected_line_len: selector.first_line_bytes,
+        #[cfg(test)]
+        stored_lines: selector.stored_lines.len(),
+        #[cfg(test)]
+        stored_bytes: selector.stored_bytes,
     })
 }
 
@@ -677,6 +846,10 @@ mod tests {
     use crate::tools::ToolContext;
     use base64::Engine;
     use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context as TaskContext, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
 
     /// Minimal temp dir for test file creation.
     struct TestDir(PathBuf);
@@ -1122,6 +1295,374 @@ mod tests {
                 assert!(t.text.contains(NON_VISION_NOTE));
             }
             _ => panic!("expected text block"),
+        }
+    }
+
+    // ---- B07: streaming read is byte-bounded and keeps whole-file semantics ----
+
+    struct VirtualOps {
+        data: Vec<u8>,
+        initial_size: Option<u64>,
+        chunk: usize,
+        stream: bool,
+        cancel_after_first_read: Option<CancellationToken>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl VirtualOps {
+        fn streaming(data: Vec<u8>, chunk: usize) -> Self {
+            Self {
+                initial_size: None,
+                data,
+                chunk,
+                stream: true,
+                cancel_after_first_read: None,
+                reads: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn whole_file(data: Vec<u8>) -> Self {
+            Self {
+                initial_size: None,
+                data,
+                chunk: 0,
+                stream: false,
+                cancel_after_first_read: None,
+                reads: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    struct ChunkedReader {
+        data: Vec<u8>,
+        offset: usize,
+        chunk: usize,
+        cancel_after_first_read: Option<CancellationToken>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.as_mut().get_mut();
+            if let Some(token) = this.cancel_after_first_read.take() {
+                token.cancel();
+            }
+            let remaining = this.data.len().saturating_sub(this.offset);
+            let len = remaining.min(this.chunk).min(buf.remaining());
+            if len == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            buf.put_slice(&this.data[this.offset..this.offset + len]);
+            this.offset += len;
+            this.reads.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[async_trait]
+    impl ReadOperations for VirtualOps {
+        async fn create_read_stream(
+            &self,
+            _absolute_path: &Path,
+        ) -> std::io::Result<Option<ReadByteStream>> {
+            if !self.stream {
+                return Ok(None);
+            }
+            Ok(Some(ReadByteStream {
+                reader: Box::pin(ChunkedReader {
+                    data: self.data.clone(),
+                    offset: 0,
+                    chunk: self.chunk.max(1),
+                    cancel_after_first_read: self.cancel_after_first_read.clone(),
+                    reads: Arc::clone(&self.reads),
+                }),
+                initial_size: self.initial_size,
+            }))
+        }
+
+        async fn read_file(&self, _absolute_path: &Path) -> std::io::Result<Vec<u8>> {
+            Ok(self.data.clone())
+        }
+
+        async fn access(&self, _absolute_path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn detect_image_mime_type(
+            &self,
+            _absolute_path: &Path,
+        ) -> std::io::Result<Option<String>> {
+            Ok(None)
+        }
+    }
+
+    /// Older operations only implement the required methods; the default
+    /// `create_read_stream` returns `None` and the whole-file path must remain.
+    struct NoStreamOps {
+        data: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl ReadOperations for NoStreamOps {
+        async fn read_file(&self, _absolute_path: &Path) -> std::io::Result<Vec<u8>> {
+            Ok(self.data.clone())
+        }
+
+        async fn access(&self, _absolute_path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn detect_image_mime_type(
+            &self,
+            _absolute_path: &Path,
+        ) -> std::io::Result<Option<String>> {
+            Ok(None)
+        }
+    }
+
+    fn virtual_tool(ops: Arc<dyn ReadOperations>) -> Arc<dyn AgentTool> {
+        create_read_tool(
+            &ctx(Path::new("/virtual")),
+            ReadToolOptions {
+                operations: Some(ops),
+                ..Default::default()
+            },
+        )
+    }
+
+    async fn run_virtual(
+        ops: Arc<dyn ReadOperations>,
+        params: Value,
+    ) -> Result<AgentToolResult, String> {
+        let tool = virtual_tool(ops);
+        tool.execute("test", params, no_signal(), None)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn selection_for(
+        data: Vec<u8>,
+        chunk: usize,
+        start_line: f64,
+        limit: Option<f64>,
+    ) -> StreamSelection {
+        let ops = VirtualOps::streaming(data, chunk);
+        let stream = ops
+            .create_read_stream(Path::new("/virtual/file.txt"))
+            .await
+            .unwrap()
+            .expect("stream");
+        read_selected_stream(stream, start_line, limit, &no_signal())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_stream_storage_is_bounded_for_a_huge_single_line() {
+        let size = 8 * 1024 * 1024;
+        let selection = selection_for(vec![b'a'; size], 64 * 1024, 0.0, None).await;
+        assert_eq!(selection.first_selected_line_len, size);
+        assert_eq!(selection.total_file_lines, 1);
+        assert!(
+            selection.stored_bytes <= DEFAULT_MAX_BYTES + 64 * 1024,
+            "stored {} bytes for an {size}-byte line",
+            selection.stored_bytes
+        );
+        assert!(selection.stored_lines <= 2);
+        let mut truncation = truncate_head(&selection.content, None);
+        truncation.total_lines = selection.selected_total_lines;
+        truncation.total_bytes = selection.selected_total_bytes;
+        assert!(
+            truncation.first_line_exceeds_limit,
+            "the first line still exceeds the byte limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_storage_stops_after_the_line_cap() {
+        let data = (0..3000)
+            .map(|index| format!("line {index}\n"))
+            .collect::<String>();
+        let selection = selection_for(data.into_bytes(), 3, 0.0, None).await;
+        assert_eq!(selection.total_file_lines, 3001);
+        assert_eq!(selection.selected_total_lines, 3000);
+        assert!(
+            selection.stored_lines <= DEFAULT_MAX_LINES + 2,
+            "stored {} lines",
+            selection.stored_lines
+        );
+        assert!(selection.stored_bytes <= DEFAULT_MAX_BYTES + 64);
+    }
+
+    #[tokio::test]
+    async fn test_stream_storage_stops_after_the_byte_cap() {
+        let data = (0..500)
+            .map(|_| "x".repeat(200))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let selection = selection_for(data.into_bytes(), 7, 0.0, None).await;
+        assert_eq!(selection.total_file_lines, 500);
+        assert!(
+            selection.stored_lines <= 300,
+            "stored {} lines past the byte cap",
+            selection.stored_lines
+        );
+        assert!(
+            selection.stored_bytes <= DEFAULT_MAX_BYTES + 512,
+            "stored {} bytes past the byte cap",
+            selection.stored_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_stops_at_the_size_seen_at_open() {
+        let ops = Arc::new(VirtualOps {
+            initial_size: Some(11),
+            ..VirtualOps::streaming(b"line1\nline2\nline3".to_vec(), 4)
+        });
+        let result = run_virtual(ops, json!({ "path": "/virtual/file.txt" }))
+            .await
+            .unwrap();
+        // Bytes appended after the size was captured are not counted.
+        assert_eq!(text_of(&result), "line1\nline2");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_read_reads_a_zero_size_special_file_to_eof() {
+        if !Path::new("/proc/self/status").exists() {
+            eprintln!("skipping: /proc/self/status is unavailable");
+            return;
+        }
+        let stream = LocalReadOperations
+            .create_read_stream(Path::new("/proc/self/status"))
+            .await
+            .unwrap()
+            .expect("proc file stream");
+        assert!(
+            stream.initial_size.is_none(),
+            "a size-0 file must be read to EOF"
+        );
+        let tool = create_read_tool(&ctx(Path::new("/")), ReadToolOptions::default());
+        let result = read_file(&*tool, "/proc/self/status").await;
+        assert!(
+            text_of(&result).contains("Name:"),
+            "proc status was not read: {:?}",
+            text_of(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_abort_stops_before_the_next_chunk() {
+        let token = CancellationToken::new();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let ops = Arc::new(VirtualOps {
+            cancel_after_first_read: Some(token.clone()),
+            reads: Arc::clone(&reads),
+            ..VirtualOps::streaming(vec![b'a'; 4096], 64)
+        });
+        let tool = virtual_tool(ops);
+        let error = tool
+            .execute("test", json!({ "path": "/virtual/file.txt" }), token, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Operation aborted"));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_old_operations_without_a_stream_keep_the_whole_file_path() {
+        let tool = virtual_tool(Arc::new(NoStreamOps {
+            data: b"old\npath\n".to_vec(),
+        }));
+        let result = read_file(&*tool, "/virtual/file.txt").await;
+        assert_eq!(text_of(&result), "old\npath\n");
+    }
+
+    /// The streaming path must produce the same text, details and structured
+    /// output as the whole-file path for the same bytes and range.
+    #[tokio::test]
+    async fn test_stream_matches_the_whole_file_oracle() {
+        let mut cases: Vec<(&str, Vec<u8>, Value)> = vec![
+            ("plain", b"a\nb\nc".to_vec(), json!({})),
+            ("trailing-newline", b"a\nb\nc\n".to_vec(), json!({})),
+            ("empty", Vec::new(), json!({})),
+            ("blank-lines", b"\n\na\n\n".to_vec(), json!({})),
+            ("crlf", b"a\r\nb\r\n".to_vec(), json!({})),
+            ("bom", "\u{feff}a\nb".as_bytes().to_vec(), json!({})),
+            ("invalid-utf8", vec![0xff, 0x0a, b'a', 0x0a], json!({})),
+            (
+                "split-utf8",
+                "\u{e9}\u{65e5}\u{672c}\nok".as_bytes().to_vec(),
+                json!({}),
+            ),
+            ("offset", b"a\nb\nc\nd".to_vec(), json!({ "offset": 2 })),
+            (
+                "offset-limit",
+                b"a\nb\nc\nd".to_vec(),
+                json!({ "offset": 2, "limit": 2 }),
+            ),
+            ("limit-zero", b"a\nb".to_vec(), json!({ "limit": 0 })),
+            ("beyond", b"a\nb".to_vec(), json!({ "offset": 5 })),
+            (
+                "first-line-over",
+                format!("{}\nshort", "x".repeat(60_000)).into_bytes(),
+                json!({}),
+            ),
+            (
+                "byte-cap",
+                (0..500)
+                    .map(|_| "x".repeat(200))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .into_bytes(),
+                json!({}),
+            ),
+        ];
+        cases.push((
+            "line-cap",
+            (0..2500)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_bytes(),
+            json!({}),
+        ));
+
+        for (name, data, params) in cases {
+            for chunk in [1usize, 5, 4096] {
+                let mut stream_params = params.clone();
+                stream_params["path"] = json!("/virtual/file.txt");
+                let streamed = run_virtual(
+                    Arc::new(VirtualOps::streaming(data.clone(), chunk)),
+                    stream_params,
+                )
+                .await;
+                let mut whole_params = params.clone();
+                whole_params["path"] = json!("/virtual/file.txt");
+                let whole =
+                    run_virtual(Arc::new(VirtualOps::whole_file(data.clone())), whole_params).await;
+                match (streamed, whole) {
+                    (Ok(streamed), Ok(whole)) => {
+                        assert_eq!(text_of(&streamed), text_of(&whole), "{name} chunk={chunk}");
+                        assert_eq!(streamed.details, whole.details, "{name} chunk={chunk}");
+                        assert_eq!(
+                            streamed.structured_content, whole.structured_content,
+                            "{name} chunk={chunk}"
+                        );
+                    }
+                    (Err(streamed), Err(whole)) => {
+                        assert_eq!(streamed, whole, "{name} chunk={chunk}");
+                    }
+                    (streamed, whole) => {
+                        panic!("{name} chunk={chunk}: stream={streamed:?} whole={whole:?}")
+                    }
+                }
+            }
         }
     }
 
