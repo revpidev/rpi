@@ -1785,8 +1785,14 @@ impl SessionImpl {
 
     // ─── Listeners ──────────────────────────────────────────────────────────
 
-    /// Register a synchronous post-adoption commit listener (upstream `subscribeCommits`).
+    /// Register a synchronous post-adoption host commit listener. This is the
+    /// Rust lower-level counterpart of the `observeCommits()` dispatch; upstream
+    /// has no separate `subscribeCommits` method and schedules host observers as
+    /// a microtask (D-111 registers the synchronous Rust form).
     pub fn subscribe_commits(&self, listener: CommitListener) -> Subscription {
+        if self.assert_usable().is_err() {
+            return Subscription::new(|| {});
+        }
         let store = Arc::clone(&self.commit_listeners);
         let id = NEXT_LISTENER_ID.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut listeners) = store.lock() {
@@ -1804,6 +1810,23 @@ impl SessionImpl {
         self: &Arc<Self>,
         observer: Arc<dyn crate::session::CommitObserver>,
     ) -> crate::session::CommitObservation {
+        // Upstream `observeCommits()` calls `assertUsable()` and throws. The
+        // Rust API has no error return here, so an observation registered after
+        // close is ended immediately instead of being stored where it would
+        // never receive `end` (the close path already drained the observers).
+        if let Err(error) = self.assert_usable() {
+            let end = match error {
+                SessionError::Failed { cause } => crate::session::WatchEnd::Failed { error: cause },
+                _ => crate::session::WatchEnd::Ended,
+            };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.end(end))).is_err()
+            {
+                self.report_listener_error("commit observer end panicked".to_string(), None);
+            }
+            return crate::session::CommitObservation {
+                detach: Subscription::new(|| {}),
+            };
+        }
         let active = Arc::new(AtomicBool::new(true));
         let observer_id = NEXT_LISTENER_ID.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut observers) = self.commit_observers.lock() {
@@ -1889,6 +1912,9 @@ impl SessionImpl {
     /// Register the Session's own component commit listener: its throw fails
     /// the Session (upstream `subscribeInternalCommits`).
     pub fn subscribe_internal_commits(&self, listener: CommitListener) -> Subscription {
+        if self.assert_usable().is_err() {
+            return Subscription::new(|| {});
+        }
         let store = Arc::clone(&self.commit_listeners);
         let id = NEXT_LISTENER_ID.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut listeners) = store.lock() {
@@ -1903,6 +1929,9 @@ impl SessionImpl {
 
     /// Register a synchronous close listener (upstream `subscribeClose`).
     pub fn subscribe_close(&self, listener: CloseListener) -> Subscription {
+        if self.assert_usable().is_err() {
+            return Subscription::new(|| {});
+        }
         let store = Arc::clone(&self.close_listeners);
         let id = NEXT_LISTENER_ID.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut listeners) = store.lock() {

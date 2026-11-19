@@ -5690,6 +5690,30 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("original kept"), original);
     }
 
+    /// `ctx.switchSession()` uses the same missing-cwd prompt as `/resume`;
+    /// the extension command entry must offer Continue/Fork/Cancel too.
+    #[tokio::test]
+    async fn extension_switch_session_missing_cwd_continue_uses_fallback() {
+        let (mut mode, terminal, _session, tmp) = switchable_harness_with_session_dir().await;
+        mode.init().await;
+        let path = tmp.path().join("sessions").join("extension-resume.jsonl");
+        write_import_file(&path, &tmp.path().join("gone-cwd"));
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(&ui, &terminal, "Session cwd does not exist", &["\r"]).await;
+        };
+        let command = super::super::ExtensionSessionCommand::SwitchSession {
+            session_path: path.display().to_string(),
+            with_session: None,
+        };
+        let (_, ()) = tokio::join!(mode.handle_extension_session_command(command), feeder);
+
+        let manager = mode.ui_state.session().session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(manager.get_cwd(), tmp.path().join("cwd"));
+        assert_eq!(manager.get_session_file(), Some(path.as_path()));
+    }
+
     #[tokio::test]
     async fn import_command_missing_cwd_cancel_keeps_session() {
         let (mut mode, terminal, _session, tmp) = switchable_harness_with_session_dir().await;

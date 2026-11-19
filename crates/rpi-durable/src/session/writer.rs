@@ -383,6 +383,14 @@ impl Writer {
                     let error = take_storage_error(&mut storage_error, storage_cause);
                     self.complete(part, Err(error));
                 }
+                // A component listener throw is not the commit's failure: the
+                // commit stands, the Session fails after it, and the parts
+                // after it are not published (upstream writer.ts #publish).
+                Err(failure) if failure.kind == PublishFailureKind::Listener => {
+                    let cause = failure.error.to_string();
+                    self.complete(part, Ok(()));
+                    stop = Some((cause, false));
+                }
                 Err(failure) => {
                     let cause = failure.error.to_string();
                     self.complete(part, Err(failure.error));

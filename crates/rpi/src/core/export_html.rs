@@ -726,6 +726,19 @@ mod tests {
             "消息 19999"
         );
 
+        // The Node.js VM run is an optional integration check: keep the HTML
+        // generation assertions above, but do not fail a clean environment
+        // without Node (same convention as `tests/export_cli_test.rs`).
+        let node = std::process::Command::new("node").arg("--version").output();
+        let Ok(version) = node else {
+            eprintln!("skipping exported viewer run: node is not installed");
+            return;
+        };
+        if !version.status.success() {
+            eprintln!("skipping exported viewer run: node is not usable");
+            return;
+        }
+
         let tmp = TempDir::new();
         let html_path = tmp.path().join("deep.html");
         std::fs::write(&html_path, html).expect("write deep export");

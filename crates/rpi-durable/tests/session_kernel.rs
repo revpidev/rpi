@@ -1776,6 +1776,20 @@ async fn observe_commits_ends_when_the_session_closes() {
     observation.detach.unsubscribe();
 }
 
+#[tokio::test]
+async fn observe_commits_after_close_ends_immediately() {
+    let harness = open_test_session();
+    harness
+        .session
+        .close(&BACKGROUND_CONTEXT)
+        .await
+        .expect("close");
+    let (observer, _publications, ends) = commit_observer();
+    let observation = harness.session.observe_commits(observer);
+    assert_eq!(ends.lock().unwrap().as_slice(), [WatchEnd::Ended]);
+    observation.detach.unsubscribe();
+}
+
 /// A failed Session::close must leave the cleanup flag retryable.
 #[tokio::test]
 async fn close_retries_after_a_storage_failure() {
@@ -2644,15 +2658,16 @@ async fn host_close_listener_panic_is_contained() {
     );
 }
 
-/// R-D11: a component commit listener's panic fails the Session.
+/// R-D11: a component commit listener's panic fails the Session, but the
+/// commit it observed stands (upstream `session-adoption.test.ts:205-234`).
 #[tokio::test]
-async fn internal_commit_listener_panic_fails_the_session() {
+async fn internal_commit_listener_panic_fails_the_session_after_the_commit_stands() {
     let harness = open_test_session();
     let conversation = create_conversation(&harness.session).await;
     let _subscription = harness.session.subscribe_internal_commits(Arc::new(|_, _| {
         panic!("component exploded");
     }));
-    let _ = try_commit(&harness.session, move |tx| {
+    let committed = try_commit(&harness.session, move |tx| {
         Box::pin(async move {
             let draft = tx
                 .doc(live(), DocOwner::Conversation(conversation), None)
@@ -2666,6 +2681,20 @@ async fn internal_commit_listener_panic_fails_the_session() {
         })
     })
     .await;
+    assert!(
+        committed.is_ok(),
+        "a component listener throw must not reject the triggering commit: {committed:?}"
+    );
+    flush().await;
+    assert!(
+        harness
+            .session
+            .failure()
+            .as_deref()
+            .is_some_and(|cause| cause.contains("component exploded")),
+        "the Session must fail after the commit: {:?}",
+        harness.session.failure()
+    );
     assert!(matches!(
         try_commit(&harness.session, |_tx| Box::pin(async { Ok(()) })).await,
         Err(SessionError::Failed { .. })
@@ -3376,6 +3405,73 @@ async fn deferred_deadline_zero_and_retirement_flush_at_the_right_boundaries() {
     );
 }
 
+#[tokio::test]
+async fn deferred_mixed_within_ms_merges_append_ops_and_uses_the_earliest_deadline() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    // Materialize the document with an empty string first so both deferred
+    // writes below are holdable and diff to `Op::Append`.
+    commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            let draft = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            draft.write()?["message"] = serde_json::json!("");
+            Ok(())
+        })
+    })
+    .await;
+    let initial = harness.storage.commits.lock().unwrap().len();
+    write_live_deferred(&harness.session, conversation, "a", Some(1_000.0)).await;
+    write_live_deferred(&harness.session, conversation, "ab", Some(20.0)).await;
+    assert_eq!(
+        harness.storage.commits.lock().unwrap().len(),
+        initial,
+        "both commits stay held"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while harness.storage.commits.lock().unwrap().len() == initial {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the earlier within_ms deadline must flush");
+    assert_eq!(
+        harness.storage.commits.lock().unwrap().len(),
+        initial + 1,
+        "the merged document is stored once"
+    );
+    let stored_ops = {
+        let commits = harness.storage.commits.lock().unwrap();
+        let batch = commits.last().expect("stored batch");
+        batch
+            .iter()
+            .find_map(|write| match write {
+                rpi_durable::types::StorageWrite::DocumentChange {
+                    content: rpi_durable::types::DocumentContent::Delta { ops, .. },
+                    ..
+                } => Some(ops.clone()),
+                _ => None,
+            })
+            .expect("stored document delta")
+    };
+    assert!(
+        stored_ops.iter().any(|op| matches!(op, Op::Append { .. })),
+        "the merged deferred write must carry Append ops: {stored_ops:?}"
+    );
+    let value = harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("snapshot")
+        .expect("document");
+    assert_eq!(value["message"], serde_json::json!("ab"));
+}
+
 async fn write_deferred_message(
     session: &Arc<rpi_durable::session::SessionImpl>,
     token: &DocToken,
@@ -3619,6 +3715,9 @@ async fn flushing_merged_deferred_documents_releases_every_retention_pin() {
     .expect("all released documents must be evicted");
 }
 
+/// Rust host listeners run synchronously during publication (D-111): one
+/// that fails the Session makes the current commit reject. Upstream schedules
+/// host listeners as a microtask, so its commit would settle first.
 #[tokio::test]
 async fn publication_rejects_when_the_session_fails_during_a_host_listener() {
     let harness = open_test_session();

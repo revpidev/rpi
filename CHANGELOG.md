@@ -37,7 +37,7 @@ This section covers the V19-01 implementation work including its M06-OUT handoff
 
 ### Fixed
 
-- Deferred durable commits publish only current internal deltas, flush before unload/version reload and before close ends commit observers, release every retention pin, and reject on publication failure; Writer panics settle every outcome and gate.
+- Deferred durable commits publish only current internal deltas, flush before unload/version reload and before close ends commit observers, release every retention pin, and reject on storage/adoption publication failure (a component listener throw settles the commit and fails the Session); Writer panics settle every outcome and gate.
 - Nested host dialogs keep deferred inline components unmounted until the final close, and extension terminal titles use the same control-character replacement as direct terminal titles.
 - Catalog refresh no longer refreshes OAuth for configured-only sources; stale credential failures become warnings while other providers continue, and non-auth errors stay fatal. Bedrock strict fallback preserves required tools and isolates session state. Gemini preserves literal/default/example/`__proto__` subtrees, and faux cache writes no longer double-count input.
 - MCP OAuth refresh reuses stored client/state, separates lock busy from other errors and aborts idle callback connections. Relative root `$id`, bad percent escapes, missing and cyclic references are handled safely. OpenAI Responses uses `session-id`; Zhipu 1308/workspace limits are not retried, LiteLLM overflow is recognized, and dropped streams are retryable.
