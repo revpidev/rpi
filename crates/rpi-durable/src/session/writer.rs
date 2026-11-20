@@ -51,6 +51,7 @@ impl PublishFailure {
 type RunJob = Box<dyn FnOnce(JobOutcome) -> Result<(), PublishFailure> + Send>;
 
 pub(crate) struct CommitJob {
+    index: u64,
     writes: Option<Vec<StorageWrite>>,
     keys: Vec<String>,
     context: Context,
@@ -60,25 +61,28 @@ pub(crate) struct CommitJob {
 
 impl CommitJob {
     pub(crate) fn stored(
+        index: u64,
         writes: Vec<StorageWrite>,
         keys: Vec<String>,
         context: Context,
         run: RunJob,
     ) -> Self {
-        Self::new(Some(writes), keys, context, run)
+        Self::new(index, Some(writes), keys, context, run)
     }
 
-    pub(crate) fn held(keys: Vec<String>, context: Context, run: RunJob) -> Self {
-        Self::new(None, keys, context, run)
+    pub(crate) fn held(index: u64, keys: Vec<String>, context: Context, run: RunJob) -> Self {
+        Self::new(index, None, keys, context, run)
     }
 
     fn new(
+        index: u64,
         writes: Option<Vec<StorageWrite>>,
         keys: Vec<String>,
         context: Context,
         run: RunJob,
     ) -> Self {
         Self {
+            index,
             writes,
             keys,
             context,
@@ -103,6 +107,13 @@ impl Gate {
 struct Part {
     job: CommitJob,
     gate: Arc<Gate>,
+}
+
+struct FailedPart {
+    index: u64,
+    error: SessionError,
+    published: bool,
+    own: bool,
 }
 
 #[derive(Default)]
@@ -235,7 +246,8 @@ impl Writer {
             if let Err(payload) = outcome {
                 let cause = panic_message(payload);
                 if let Some(session) = self.session.upgrade() {
-                    session.fail(cause.clone());
+                    let at = parts.first().map(|part| part.job.index).unwrap_or(0);
+                    session.fail_at(cause.clone(), at, Vec::new());
                 }
                 self.abandon(&mut parts, cause);
             }
@@ -284,22 +296,25 @@ impl Writer {
             Err(error) => (Some(error), None),
         };
         let storage_cause = storage_error.as_ref().map(ToString::to_string);
-        let mut stop: Option<(String, bool)> = None;
+        let mut stop: Option<(u64, String, bool)> = None;
+        let mut failing = Vec::new();
         let mut stored_index = 0usize;
         let mut published = 0usize;
         for part in parts.iter_mut() {
+            let job_index = part.job.index;
             let stored = part.job.writes.is_some();
             let index = stored.then(|| {
                 let index = stored_index;
                 stored_index += 1;
                 index
             });
-            if let Some((cause, external)) = &stop {
-                let error = if !external
-                    && stored
-                    && let Some(storage_cause) = &storage_cause
-                {
-                    take_storage_error(&mut storage_error, storage_cause)
+            if let Some((_, cause, external)) = &stop {
+                let own = !external && stored && storage_cause.is_some();
+                let error = if own {
+                    take_storage_error(
+                        &mut storage_error,
+                        storage_cause.as_ref().expect("storage cause"),
+                    )
                 } else {
                     SessionError::Failed {
                         cause: self.failure().unwrap_or_else(|| {
@@ -307,7 +322,12 @@ impl Writer {
                         }),
                     }
                 };
-                self.discard(part, error);
+                failing.push(FailedPart {
+                    index: job_index,
+                    error,
+                    published: false,
+                    own,
+                });
                 continue;
             }
             let seq = index.and_then(|index| seqs.get(index).copied().flatten());
@@ -328,8 +348,13 @@ impl Writer {
                     }
                 };
                 let cause = error.to_string();
-                self.discard(part, error);
-                stop = Some((cause, false));
+                failing.push(FailedPart {
+                    index: job_index,
+                    error,
+                    published: false,
+                    own: true,
+                });
+                stop = Some((job_index, cause, false));
                 continue;
             }
 
@@ -337,13 +362,15 @@ impl Writer {
                 tokio::task::yield_now().await;
             }
             if let Some(cause) = self.failure() {
-                self.discard(
-                    part,
-                    SessionError::Failed {
+                failing.push(FailedPart {
+                    index: job_index,
+                    error: SessionError::Failed {
                         cause: cause.clone(),
                     },
-                );
-                stop = Some((cause, true));
+                    published: false,
+                    own: false,
+                });
+                stop = Some((job_index, cause, true));
                 continue;
             }
             let run = part.job.run.take().expect("commit job run");
@@ -356,16 +383,23 @@ impl Writer {
             match run_result {
                 Ok(()) => {
                     if let Some(cause) = self.failure() {
-                        self.complete(
-                            part,
-                            Err(SessionError::Failed {
+                        failing.push(FailedPart {
+                            index: job_index,
+                            error: SessionError::Failed {
                                 cause: cause.clone(),
-                            }),
-                        );
-                        stop = Some((cause, true));
+                            },
+                            published: true,
+                            own: false,
+                        });
+                        stop = Some((job_index, cause, true));
                     } else if let Some(storage_cause) = &storage_cause {
                         let error = take_storage_error(&mut storage_error, storage_cause);
-                        self.complete(part, Err(error));
+                        failing.push(FailedPart {
+                            index: job_index,
+                            error,
+                            published: true,
+                            own: true,
+                        });
                     } else {
                         self.complete(part, Ok(()));
                     }
@@ -381,7 +415,12 @@ impl Writer {
                         );
                     }
                     let error = take_storage_error(&mut storage_error, storage_cause);
-                    self.complete(part, Err(error));
+                    failing.push(FailedPart {
+                        index: job_index,
+                        error,
+                        published: true,
+                        own: true,
+                    });
                 }
                 // A component listener throw is not the commit's failure: the
                 // commit stands, the Session fails after it, and the parts
@@ -389,20 +428,61 @@ impl Writer {
                 Err(failure) if failure.kind == PublishFailureKind::Listener => {
                     let cause = failure.error.to_string();
                     self.complete(part, Ok(()));
-                    stop = Some((cause, false));
+                    stop = Some((job_index, cause, false));
                 }
                 Err(failure) => {
                     let cause = failure.error.to_string();
-                    self.complete(part, Err(failure.error));
-                    stop = Some((cause, false));
+                    failing.push(FailedPart {
+                        index: job_index,
+                        error: failure.error,
+                        published: true,
+                        own: true,
+                    });
+                    stop = Some((job_index, cause, false));
                 }
             }
         }
-        let cause = storage_cause.or_else(|| stop.map(|(cause, _)| cause));
-        if let Some(cause) = cause
-            && let Some(session) = self.session.upgrade()
-        {
-            session.fail(cause);
+        let stop_at = stop.as_ref().map(|(index, _, _)| *index);
+        let cause = storage_cause
+            .clone()
+            .or_else(|| stop.as_ref().map(|(_, cause, _)| cause.clone()));
+        if let Some(cause) = cause {
+            let at = if storage_cause.is_some() {
+                failing
+                    .iter()
+                    .find(|part| part.own)
+                    .map(|part| part.index)
+                    .or(stop_at)
+                    .unwrap_or(0)
+            } else {
+                stop_at.unwrap_or(0)
+            };
+            let own = failing
+                .iter()
+                .filter(|part| part.own)
+                .map(|part| part.index)
+                .collect::<Vec<_>>();
+            if let Some(session) = self.session.upgrade() {
+                session.fail_at(cause, at, own);
+            }
+        }
+        for mut failed in failing {
+            if !failed.own {
+                failed.error = SessionError::Failed {
+                    cause: self.failure().unwrap_or_else(|| failed.error.to_string()),
+                };
+            }
+            let index = failed.index;
+            let error = failed.error;
+            let part = parts
+                .iter_mut()
+                .find(|part| part.job.index == index)
+                .expect("failed part");
+            if failed.published {
+                self.complete(part, Err(error));
+            } else {
+                self.discard(part, error);
+            }
         }
     }
 
@@ -422,8 +502,15 @@ impl Writer {
     }
 
     fn discard(&self, part: &mut Part, error: SessionError) {
-        if let Some(run) = part.job.run.take() {
-            let _ = run(JobOutcome::Discard);
+        if let Some(run) = part.job.run.take()
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(JobOutcome::Discard)))
+                .is_err()
+            && let Some(session) = self.session.upgrade()
+        {
+            session.report_listener_error(
+                "A commit discard panicked".to_string(),
+                Some(part.job.context.clone()),
+            );
         }
         if let Some(completion) = part.job.completion.take() {
             let _ = completion.send(Err(error));

@@ -12,12 +12,13 @@
 //! [`StorageError::ReadAfterWrite`]. Document access and candidate-task reads
 //! remain legal after a table write.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
 use crate::chord::context::Context;
+use crate::chord::delta::{Op, PendingOps, PendingTake};
 use crate::chord::json::copy_json;
 use crate::chord::tracker::{Change, DocCell, Prepared, Tracker, track};
 use crate::documents::{
@@ -32,8 +33,8 @@ use crate::ids::{
 use crate::session::keys::{document_key, incarnation_key, scope_key, table_keys};
 use crate::session::session::SessionImpl;
 use crate::session::{
-    CommitChange, CommitPersistence, DocOwner, DocumentChange, DocumentCopyChange, SessionError,
-    SessionResult,
+    CommitChange, DeferredCommit, DocOwner, DocumentChange, DocumentCopyChange, SessionError,
+    SessionResult, earliest_deferred_deadline,
 };
 use crate::types::{
     ContextEdit, ConversationParent, ConversationQuery, ConversationRecord, Cursor,
@@ -366,6 +367,11 @@ struct PlanChange {
     definition: Option<Arc<crate::documents::DocDefinition>>,
 }
 
+struct HeldPublication {
+    ops: Vec<Op>,
+    observed: bool,
+}
+
 struct DocumentPlan {
     address_id: String,
     record: PlanRecord,
@@ -373,6 +379,7 @@ struct DocumentPlan {
     content: Option<StorageWrite>,
     change: Option<PlanChange>,
     conversation_id: Option<ConversationId>,
+    held: Option<HeldPublication>,
 }
 
 impl DocumentPlan {
@@ -414,7 +421,6 @@ pub struct Transaction {
     context: Context,
     scope: TransactionScope,
     sealed: bool,
-    persistence: CommitPersistence,
     has_table_write: bool,
     writes: Vec<StorageWrite>,
     created_conversation_ids: std::collections::BTreeSet<ConversationId>,
@@ -429,18 +435,12 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub(crate) fn new(
-        host: Arc<SessionImpl>,
-        context: Context,
-        scope: TransactionScope,
-        persistence: CommitPersistence,
-    ) -> Self {
+    pub(crate) fn new(host: Arc<SessionImpl>, context: Context, scope: TransactionScope) -> Self {
         Self {
             host,
             context,
             scope,
             sealed: false,
-            persistence,
             has_table_write: false,
             writes: Vec::new(),
             created_conversation_ids: Default::default(),
@@ -476,6 +476,189 @@ impl Transaction {
         keys
     }
 
+    pub(crate) fn take_held(
+        &mut self,
+        held: Option<DeferredCommit>,
+    ) -> (Vec<StorageWrite>, Option<DeferredCommit>, Vec<DocumentId>) {
+        let Some(mut held) = held else {
+            return (self.writes.clone(), None, Vec::new());
+        };
+        let held_writes = held
+            .writes
+            .iter()
+            .filter_map(|write| match write {
+                StorageWrite::DocumentChange { id, .. } => Some((*id, write.clone())),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let held_documents = held
+            .changes
+            .iter()
+            .filter_map(|change| match change {
+                CommitChange::Document(document) => Some((document.record.id, document.clone())),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let selected = self
+            .plans
+            .iter()
+            .filter_map(|plan| {
+                let id = plan.record_id();
+                held_writes.contains_key(&id).then_some(id)
+            })
+            .collect::<HashSet<_>>();
+        if selected.is_empty() {
+            return (self.writes.clone(), Some(held), Vec::new());
+        }
+
+        for plan in &mut self.plans {
+            let id = plan.record_id();
+            if !selected.contains(&id) {
+                continue;
+            }
+            let held_write = held_writes.get(&id).expect("selected held write");
+            let StorageWrite::DocumentChange {
+                content: held_content,
+                ..
+            } = held_write
+            else {
+                unreachable!()
+            };
+            let held_document = held_documents
+                .get(&id)
+                .expect("held publication for selected write");
+            let own = match &plan.content {
+                Some(StorageWrite::DocumentChange { .. }) => plan.content.clone(),
+                _ => None,
+            };
+            let current_ops = plan
+                .change
+                .as_ref()
+                .map(|change| change.prepared.ops().to_vec())
+                .unwrap_or_default();
+            let value = plan
+                .change
+                .as_ref()
+                .and_then(|change| change.prepared.value().as_object().cloned())
+                .or_else(|| held_document.value.clone())
+                .unwrap_or_default();
+            let version = held_document.version.unwrap_or(0);
+            let mut pending = PendingOps::new();
+            pending.push(&held_document.ops);
+            pending.push(&current_ops);
+            let (operations, overflow) = match pending.take() {
+                PendingTake::Ops(operations) => (operations, false),
+                PendingTake::Replace => (vec![Op::Replace(JsonValue::Object(value.clone()))], true),
+            };
+            let own_base = own.as_ref().is_some_and(|write| {
+                matches!(
+                    write,
+                    StorageWrite::DocumentChange {
+                        content: crate::types::DocumentContent::Base { .. },
+                        ..
+                    }
+                )
+            });
+            let content = if own_base {
+                match own.as_ref().expect("own base") {
+                    StorageWrite::DocumentChange { content, .. } => content.clone(),
+                    _ => unreachable!(),
+                }
+            } else if held_content.is_base() || overflow {
+                crate::types::DocumentContent::Base { version, value }
+            } else {
+                crate::types::DocumentContent::Delta {
+                    version,
+                    ops: operations.clone(),
+                }
+            };
+            let write = StorageWrite::DocumentChange { id, content };
+            if own.is_some() {
+                let position = self
+                    .writes
+                    .iter()
+                    .position(|candidate| {
+                        matches!(candidate, StorageWrite::DocumentChange { id: candidate_id, .. } if *candidate_id == id)
+                    })
+                    .expect("own document write");
+                self.writes[position] = write.clone();
+            } else {
+                let position = self.writes.iter().position(|candidate| {
+                    matches!(candidate, StorageWrite::DocumentRetire { id: candidate_id } if *candidate_id == id)
+                });
+                match position {
+                    Some(position) => self.writes.insert(position, write.clone()),
+                    None => self.writes.push(write.clone()),
+                }
+            }
+            plan.content = Some(write);
+            if !plan.retire {
+                plan.held = Some(HeldPublication {
+                    ops: operations,
+                    observed: own.is_some(),
+                });
+            }
+            if let DocumentScope::Conversation { conversation_id } = plan.scope() {
+                plan.conversation_id = Some(conversation_id);
+            }
+        }
+
+        let released = held
+            .pinned
+            .iter()
+            .copied()
+            .filter(|id| selected.contains(id))
+            .collect::<Vec<_>>();
+        held.writes.retain(|write| match write {
+            StorageWrite::DocumentChange { id, .. } => !selected.contains(id),
+            _ => true,
+        });
+        held.changes.retain(|change| match change {
+            CommitChange::Document(document) => !selected.contains(&document.record.id),
+            _ => true,
+        });
+        held.pinned.retain(|id| !selected.contains(id));
+        held.deadlines.retain(|id, _| !selected.contains(id));
+        held.deadline = earliest_deferred_deadline(&held.deadlines);
+        held.keys = deferred_keys(&held.changes);
+        let remaining = (!held.writes.is_empty()).then_some(held);
+        (self.writes.clone(), remaining, released)
+    }
+
+    pub(crate) fn split_publications(
+        &self,
+        documents: Vec<CommitChange>,
+    ) -> (Vec<CommitChange>, Vec<CommitChange>) {
+        let mut observed = Vec::new();
+        let mut stored = Vec::new();
+        for change in documents {
+            let held = match &change {
+                CommitChange::Document(document) => self
+                    .plans
+                    .iter()
+                    .find(|plan| plan.record_id() == document.record.id)
+                    .and_then(|plan| plan.held.as_ref()),
+                _ => None,
+            };
+            let Some(held) = held else {
+                observed.push(change.clone());
+                stored.push(change);
+                continue;
+            };
+            if held.observed {
+                observed.push(change.clone());
+            }
+            let mut stored_change = change;
+            if let CommitChange::Document(document) = &mut stored_change
+                && !document.is_retirement()
+            {
+                document.ops = held.ops.clone();
+            }
+            stored.push(stored_change);
+        }
+        (observed, stored)
+    }
+
     pub(crate) fn can_defer(&self) -> bool {
         !self.has_table_write
             && !self.plans.is_empty()
@@ -490,17 +673,13 @@ impl Transaction {
                 };
                 eligible_record
                     && !plan.retire
-                    && plan
-                        .change
-                        .as_ref()
-                        .is_some_and(|change| change.loaded.is_some())
-                    && matches!(
-                        plan.content,
-                        Some(StorageWrite::DocumentChange {
-                            content: crate::types::DocumentContent::Delta { .. },
-                            ..
-                        })
-                    )
+                    && plan.change.as_ref().is_some_and(|change| {
+                        change
+                            .loaded
+                            .as_ref()
+                            .is_some_and(|loaded| loaded.stored_version() == change.version)
+                    })
+                    && matches!(plan.content, Some(StorageWrite::DocumentChange { .. }))
             })
     }
 
@@ -1009,9 +1188,6 @@ impl Transaction {
         self.assert_open()?;
         let definition = Arc::clone(&token.definition);
         let resolved = resolve_address(&definition, doc_target(&definition, owner))?;
-        if self.persistence == CommitPersistence::Immediate {
-            self.host.flush_deferred_on_line().await?;
-        }
         self.assert_task_documents_open(&resolved.address)?;
         let skip_load = self
             .latest_index(&resolved.id)
@@ -1176,7 +1352,6 @@ impl Transaction {
         self.assert_open()?;
         let definition = Arc::clone(&token.definition);
         let resolved = resolve_address(&definition, doc_target(&definition, owner))?;
-        self.host.flush_deferred_on_line().await?;
         if let Some(index) = self.latest_index(&resolved.id) {
             if self.documents[index].retire_on_commit {
                 return Ok(());
@@ -1271,6 +1446,7 @@ impl Transaction {
 
     /// Adopt every prepared change by pointer swap and describe the publication.
     pub fn adopt(&self, seq: Seq) -> SessionResult<Vec<CommitChange>> {
+        let deferred = seq.0 == 0;
         let mut publications = Vec::new();
         for plan in &self.plans {
             let committed = matches!(plan.record, PlanRecord::Committed(_));
@@ -1307,14 +1483,16 @@ impl Transaction {
                     change.prepared.abort();
                 }
                 if let Some(loaded) = &change.loaded {
-                    if loaded.stored_version() < change.version {
-                        loaded.set_stored_version(change.version);
-                    }
-                    if let Some(StorageWrite::DocumentChange { content, .. }) = &plan.content {
-                        if content.is_base() {
-                            loaded.set_deltas_since_base(0);
-                        } else {
-                            loaded.set_deltas_since_base(loaded.deltas_since_base() + 1);
+                    if !deferred {
+                        if loaded.stored_version() < change.version {
+                            loaded.set_stored_version(change.version);
+                        }
+                        if let Some(StorageWrite::DocumentChange { content, .. }) = &plan.content {
+                            if content.is_base() {
+                                loaded.set_deltas_since_base(0);
+                            } else {
+                                loaded.set_deltas_since_base(loaded.deltas_since_base() + 1);
+                            }
                         }
                     }
                 } else if !plan.retire {
@@ -1587,6 +1765,7 @@ impl Transaction {
                         content: None,
                         change: None,
                         conversation_id: None,
+                        held: None,
                     });
                 }
                 cursor = page.next;
@@ -1848,6 +2027,23 @@ pub(crate) fn doc_target<'a>(
     }
 }
 
+pub(crate) fn deferred_keys(changes: &[CommitChange]) -> Vec<String> {
+    let mut keys = Vec::new();
+    for change in changes {
+        let CommitChange::Document(document) = change else {
+            continue;
+        };
+        let address = DocumentAddress {
+            kind: document.record.kind.clone(),
+            scope: document.record.scope.clone(),
+            key: document.record.key.clone(),
+        };
+        keys.push(document_key(&address_id(&address)));
+        keys.push(incarnation_key(document.record.id));
+    }
+    keys
+}
+
 fn plan_document(document: &DocumentEntry) -> SessionResult<Option<DocumentPlan>> {
     let Some(target) = &document.target else {
         return Ok(None);
@@ -1884,6 +2080,7 @@ fn plan_document(document: &DocumentEntry) -> SessionResult<Option<DocumentPlan>
                     definition: document.definition.clone(),
                 }),
                 conversation_id: None,
+                held: None,
             }))
         }
         DocumentTarget::ForkCopy { record, source } => Ok(Some(DocumentPlan {
@@ -1896,6 +2093,7 @@ fn plan_document(document: &DocumentEntry) -> SessionResult<Option<DocumentPlan>
             }),
             change: None,
             conversation_id: None,
+            held: None,
         })),
         DocumentTarget::RetireOnly { record } => Ok(Some(DocumentPlan {
             address_id,
@@ -1904,6 +2102,7 @@ fn plan_document(document: &DocumentEntry) -> SessionResult<Option<DocumentPlan>
             content: None,
             change: None,
             conversation_id: None,
+            held: None,
         })),
         DocumentTarget::Loaded(loaded) => {
             let definition = document
@@ -1948,6 +2147,7 @@ fn plan_document(document: &DocumentEntry) -> SessionResult<Option<DocumentPlan>
                     definition: Some(definition),
                 }),
                 conversation_id: None,
+                held: None,
             }))
         }
     }

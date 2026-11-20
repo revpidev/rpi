@@ -6,6 +6,7 @@ mod test_support;
 use std::sync::Arc;
 
 use rpi_durable::chord::context::BACKGROUND_CONTEXT;
+use rpi_durable::chord::delta::{Op, PathSegment};
 use rpi_durable::errors::StorageError;
 use rpi_durable::ids::{DocumentId, EntryId, ROOT_CONVERSATION_ID, id_from_number};
 use rpi_durable::storage::{
@@ -16,8 +17,8 @@ use rpi_durable::storage::{
 };
 use rpi_durable::testing::run_storage_conformance;
 use rpi_durable::types::{
-    ConversationRecord, DocumentContent, DocumentCreate, DocumentScope, EntryRecord, JoinPolicy,
-    Storage, StorageExt, StorageWrite, TaskRecord, TaskState,
+    ConversationRecord, DocumentContent, DocumentCreate, DocumentPoint, DocumentScope, EntryRecord,
+    JoinPolicy, Storage, StorageExt, StorageWrite, TaskRecord, TaskState,
 };
 use test_support::{ReopeningStorage, TempDir, cleanup_temp_dirs};
 
@@ -88,6 +89,130 @@ async fn batched_commit_128_conversations_and_run_counted() {
         "128-conversation batch: conversations=128, receipts=1, run_counted=1, elapsed={:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test]
+async fn batched_commit_128_single_conversation_batches_uses_constant_statements() {
+    let temp = TempDir::new("sqlite-group-benchmark");
+    let database = open_node_sqlite_database(
+        &temp.path().join("benchmark.sqlite").to_string_lossy(),
+        SqliteDatabaseOptions::default(),
+    )
+    .await
+    .expect("open database");
+    let storage = SqliteStorage::open(database.clone_handle())
+        .await
+        .expect("open storage");
+    let batches = (2..=129)
+        .map(|id| {
+            vec![StorageWrite::Conversation {
+                value: ConversationRecord {
+                    id: id_from_number(id),
+                    parent: None,
+                    owner: None,
+                },
+            }]
+        })
+        .collect::<Vec<_>>();
+    let queries_before = database.query_count();
+    let mut receipts = Vec::new();
+    let result = storage
+        .commit(
+            &batches,
+            &mut |index, seq| receipts.push((index, seq)),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("commit 128 batches");
+    assert_eq!(result.stored, 128);
+    assert!(result.refused.is_none());
+    assert_eq!(receipts.len(), 128);
+    let queries = database.query_count() - queries_before;
+    assert!(
+        queries <= 16,
+        "128 single-conversation batches used {queries} SQL operations (expected <= 16)"
+    );
+    let count = database
+        .get_i64("SELECT COUNT(*) FROM conversations", vec![])
+        .await
+        .expect("count conversations")
+        .expect("count row");
+    assert_eq!(count, 128);
+}
+
+#[tokio::test]
+async fn batched_commit_128_document_deltas_uses_constant_statements() {
+    let temp = TempDir::new("sqlite-document-group-benchmark");
+    let database = open_node_sqlite_database(
+        &temp.path().join("benchmark.sqlite").to_string_lossy(),
+        SqliteDatabaseOptions::default(),
+    )
+    .await
+    .expect("open database");
+    let storage = SqliteStorage::open(database.clone_handle())
+        .await
+        .expect("open storage");
+    let id: DocumentId = id_from_number(storage.mint_id().await.expect("mint document"));
+    storage
+        .commit_one(
+            &[StorageWrite::DocumentCreate {
+                record: DocumentCreate {
+                    id,
+                    kind: "benchmark.document".to_string(),
+                    key: None,
+                    scope: DocumentScope::Session,
+                    history: None,
+                    fork: None,
+                },
+                content: DocumentContent::Base {
+                    version: 1,
+                    value: serde_json::json!({"count": 0})
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                },
+            }],
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("create document");
+    let batches = (1..=128)
+        .map(|count| {
+            vec![StorageWrite::DocumentChange {
+                id,
+                content: DocumentContent::Delta {
+                    version: 1,
+                    ops: vec![Op::Set {
+                        path: vec![PathSegment::Key("count".to_string())],
+                        value: serde_json::json!(count),
+                    }],
+                },
+            }]
+        })
+        .collect::<Vec<_>>();
+    let queries_before = database.query_count();
+    let mut receipts = Vec::new();
+    let result = storage
+        .commit(
+            &batches,
+            &mut |index, seq| receipts.push((index, seq)),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("commit 128 document batches");
+    assert_eq!(result.stored, 128);
+    assert_eq!(receipts.len(), 128);
+    let queries = database.query_count() - queries_before;
+    assert!(
+        queries <= 16,
+        "128 document batches used {queries} SQL operations (expected <= 16)"
+    );
+    let document = storage
+        .document(id, DocumentPoint::CURRENT, &BACKGROUND_CONTEXT)
+        .await
+        .expect("read document")
+        .expect("document");
+    assert_eq!(document.value["count"], serde_json::json!(128));
 }
 
 #[tokio::test]

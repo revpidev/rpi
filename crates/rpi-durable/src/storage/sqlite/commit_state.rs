@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::chord::json::JsonValue;
-use crate::chord::sqlite::database::{SqliteTransaction, SqliteValue};
+use crate::chord::sqlite::database::SqliteTransaction;
 use crate::errors::{StorageError, StorageResult};
 use crate::ids::{DocumentId, Seq};
 use crate::types::{DocumentContent, DocumentRecord, DocumentScope, StorageWrite};
@@ -234,6 +234,10 @@ impl CommitState {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn document(&self, id: DocumentId) -> Option<&DocumentRecord> {
+        self.documents.get(&id.get())
     }
 
     pub(super) fn apply(
@@ -469,15 +473,10 @@ impl SqliteStorage {
                 version: stored.version,
                 value: stored.value,
             });
-            // The action is now a plain base content; `apply_document_actions`
-            // must not resolve the source again.
+            // The action is now plain base content for `PendingWrites`.
             action.copy = None;
             let _ = id;
         }
         Ok(())
     }
 }
-
-/// Reserved for future multi-row `PendingWrites`; the current commit applies
-/// accepted batches through the existing per-table multi-row helpers.
-pub(super) fn _unused(_: SqliteValue) {}

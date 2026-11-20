@@ -123,10 +123,48 @@ struct Windowed {
 }
 
 impl Windowed {
-    fn advance(&mut self, view: ConversationView, context: &Context) {
-        self.value = view.clone();
+    fn end(&mut self, end: WatchEnd) {
+        if !self.alive {
+            return;
+        }
+        self.alive = false;
         if let Some(watch) = &self.watch {
-            let value = serde_json::to_value(&view).unwrap_or(JsonValue::Null);
+            match end {
+                WatchEnd::Failed { error } => watch.close_session(Some(error)),
+                _ => watch.close_session(None),
+            }
+        } else if let Some(observer) = &self.observer {
+            observer.end(end);
+        }
+    }
+}
+
+struct Delivery {
+    conversation: ConversationId,
+    observer_id: u64,
+    value: ConversationView,
+    watch: Option<CommittedWatch>,
+    observer: Option<Arc<dyn Observer<ConversationView>>>,
+    reporter: Option<crate::session::session::FailureReporter>,
+}
+
+impl Delivery {
+    fn send(self, context: &Context, mounts: &Arc<Mutex<HashMap<ConversationId, Mount>>>) {
+        let mounted = mounts
+            .lock()
+            .ok()
+            .and_then(|mounts| {
+                mounts
+                    .get(&self.conversation)
+                    .and_then(|mount| mount.observers.get(&self.observer_id))
+                    .map(|windowed| windowed.alive)
+            })
+            .unwrap_or(false);
+        if !mounted {
+            return;
+        }
+        let value = serde_json::to_value(&self.value).unwrap_or(JsonValue::Null);
+        if let Some(watch) = &self.watch {
             watch.advance(
                 value.clone(),
                 vec![Op::Replace(value)],
@@ -141,41 +179,32 @@ impl Windowed {
         let succeeded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             observer.advance(
                 WatchCall::Value {
-                    value: view.clone(),
-                    ops: vec![Op::Replace(
-                        serde_json::to_value(&view).unwrap_or(JsonValue::Null),
-                    )],
+                    value: self.value,
+                    ops: vec![Op::Replace(value)],
                     retired: false,
                 },
                 context,
             );
         }))
         .is_ok();
-        if !succeeded {
-            if let Some(reporter) = &self.reporter {
-                reporter(
-                    "listener_error: conversation observer panicked".to_string(),
-                    Some(context.clone()),
-                );
-            }
-            self.end(WatchEnd::ListenerError {
-                error: "conversation observer panicked".to_string(),
-            });
-        }
-    }
-
-    fn end(&mut self, end: WatchEnd) {
-        if !self.alive {
+        if succeeded {
             return;
         }
-        self.alive = false;
-        if let Some(watch) = &self.watch {
-            match end {
-                WatchEnd::Failed { error } => watch.close_session(Some(error)),
-                _ => watch.close_session(None),
-            }
-        } else if let Some(observer) = &self.observer {
-            observer.end(end);
+        if let Some(reporter) = &self.reporter {
+            reporter(
+                "listener_error: conversation observer panicked".to_string(),
+                Some(context.clone()),
+            );
+        }
+        let removed = mounts.lock().ok().and_then(|mut mounts| {
+            mounts
+                .get_mut(&self.conversation)
+                .and_then(|mount| mount.observers.remove(&self.observer_id))
+        });
+        if let Some(mut windowed) = removed {
+            windowed.end(WatchEnd::ListenerError {
+                error: "conversation observer panicked".to_string(),
+            });
         }
     }
 }
@@ -194,7 +223,7 @@ struct Mount {
 const MOUNTED_KINDS: [&str; 5] = ["pi.agent", "pi.live", "pi.inbox", "pi.provider", "pi.usage"];
 
 impl Mount {
-    fn advance(&mut self, publication: &CommitPublication, context: &Context) {
+    fn advance(&mut self, publication: &CommitPublication) -> Vec<Delivery> {
         let mut appended = Vec::new();
         let mut documents_changed = false;
         for change in &publication.changes {
@@ -234,9 +263,10 @@ impl Mount {
             }
         }
         if appended.is_empty() && !documents_changed {
-            return;
+            return Vec::new();
         }
-        for windowed in self.observers.values_mut() {
+        let mut deliveries = Vec::new();
+        for (observer_id, windowed) in self.observers.iter_mut() {
             for entry in &appended {
                 if !windowed
                     .value
@@ -254,9 +284,16 @@ impl Mount {
                 windowed.value.entries.drain(..drop);
             }
             windowed.value.docs = self.docs.clone();
-            windowed.advance(windowed.value.clone(), context);
+            deliveries.push(Delivery {
+                conversation: self.conversation.id,
+                observer_id: *observer_id,
+                value: windowed.value.clone(),
+                watch: windowed.watch.clone(),
+                observer: windowed.observer.clone(),
+                reporter: windowed.reporter.clone(),
+            });
         }
-        self.observers.retain(|_, windowed| windowed.alive);
+        deliveries
     }
 }
 
@@ -280,31 +317,48 @@ impl ConversationViews {
         let mounts = Arc::new(Mutex::new(HashMap::<ConversationId, Mount>::new()));
         let commit_mounts = Arc::clone(&mounts);
         let commit = session.subscribe_internal_commits(Arc::new(move |publication, context| {
-            if let Ok(mut mounts) = commit_mounts.lock() {
-                for mount in mounts.values_mut() {
-                    mount.advance(publication, context);
-                }
+            let deliveries = match commit_mounts.lock() {
+                Ok(mut mounts) => mounts
+                    .values_mut()
+                    .flat_map(|mount| mount.advance(publication))
+                    .collect::<Vec<_>>(),
+                Err(_) => return,
+            };
+            for delivery in deliveries {
+                delivery.send(context, &commit_mounts);
             }
         }));
         let close_mounts = Arc::clone(&mounts);
         let weak = Arc::downgrade(&session);
         let close = session.subscribe_close(Arc::new(move || {
             let failure = weak.upgrade().and_then(|session| session.failure());
-            if let Ok(mut mounts) = close_mounts.lock() {
-                for mount in mounts.values_mut() {
-                    for windowed in mount.observers.values_mut() {
-                        windowed.end(match (&failure, windowed.observer.is_some()) {
-                            (Some(error), _) => WatchEnd::Failed {
-                                error: error.clone(),
-                            },
-                            (None, true) => WatchEnd::Failed {
-                                error: "Session is closed".to_string(),
-                            },
-                            (None, false) => WatchEnd::Ended,
-                        });
-                    }
+            let observers = match close_mounts.lock() {
+                Ok(mut mounts) => {
+                    let observers = mounts
+                        .values_mut()
+                        .flat_map(|mount| {
+                            mount
+                                .observers
+                                .drain()
+                                .map(|(_, windowed)| windowed)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    mounts.clear();
+                    observers
                 }
-                mounts.clear();
+                Err(_) => Vec::new(),
+            };
+            for mut windowed in observers {
+                windowed.end(match (&failure, windowed.observer.is_some()) {
+                    (Some(error), _) => WatchEnd::Failed {
+                        error: error.clone(),
+                    },
+                    (None, true) => WatchEnd::Failed {
+                        error: "Session is closed".to_string(),
+                    },
+                    (None, false) => WatchEnd::Ended,
+                });
             }
         }));
         Arc::new(Self {
@@ -430,21 +484,21 @@ impl ConversationViews {
                             if let Some(watch) = &watch {
                                 watch.close_session(None);
                             }
+                            let mut removed = None;
                             if let Ok(mut mounts) = mounts.lock() {
                                 let empty = mounts
                                     .get_mut(&id_for_detach)
                                     .map(|mount| {
-                                        if let Some(mut windowed) =
-                                            mount.observers.remove(&observer_id)
-                                        {
-                                            windowed.end(WatchEnd::Stopped);
-                                        }
+                                        removed = mount.observers.remove(&observer_id);
                                         mount.observers.is_empty()
                                     })
                                     .unwrap_or(false);
                                 if empty {
                                     mounts.remove(&id_for_detach);
                                 }
+                            }
+                            if let Some(mut windowed) = removed {
+                                windowed.end(WatchEnd::Stopped);
                             }
                         }),
                     })

@@ -5,6 +5,7 @@ mod commit_state;
 pub mod database;
 pub mod migrations;
 pub mod node;
+mod pending_writes;
 pub mod schema;
 pub mod storage;
 

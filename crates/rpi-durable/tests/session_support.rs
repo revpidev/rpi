@@ -87,6 +87,7 @@ pub struct ControlledStorage {
     mint_failure: Mutex<Option<StorageError>>,
     read_failure: Mutex<Option<StorageError>>,
     close_failure: Mutex<Option<StorageError>>,
+    pub close_count: AtomicU64,
     close_gate: Mutex<Option<Arc<Held>>>,
     close_backend: AtomicBool,
 }
@@ -118,6 +119,7 @@ impl ControlledStorage {
             mint_failure: Mutex::new(None),
             read_failure: Mutex::new(None),
             close_failure: Mutex::new(None),
+            close_count: AtomicU64::new(0),
             close_gate: Mutex::new(None),
             close_backend: AtomicBool::new(true),
         }
@@ -394,6 +396,7 @@ impl Storage for ControlledStorage {
     }
 
     async fn close(&self, context: &Context) -> StorageResult<()> {
+        self.close_count.fetch_add(1, Ordering::SeqCst);
         let held = self.close_gate.lock().expect("gate").take();
         if let Some(held) = held {
             held.wait().await;

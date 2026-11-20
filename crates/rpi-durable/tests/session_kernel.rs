@@ -20,7 +20,9 @@ use rpi_durable::session::{
     CommitObserver, CommitOptions, CommitPersistence, CommitPublication, DocOwner, EntryDraft,
     SessionEnd, SessionError, WatchCall, WatchEnd, commit_fn, watch_listener,
 };
-use rpi_durable::types::{DocumentFork, DocumentHistory};
+use rpi_durable::types::{
+    DocumentAddress, DocumentFork, DocumentHistory, DocumentPoint, DocumentScope,
+};
 use tokio_util::sync::CancellationToken;
 
 use session_support::{
@@ -1094,16 +1096,27 @@ async fn session_commits_group_admitted_batches_and_publish_in_line_order() {
     })
     .await
     .expect("all callbacks must start while storage is in flight");
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        settle_line(&harness.session),
-    )
-    .await
-    .expect("independent commits must admit while storage is in flight");
+    let admitted = Arc::new(tokio::sync::Notify::new());
+    let settling = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        let admitted = Arc::clone(&admitted);
+        async move {
+            session
+                .read_on_line(move || {
+                    admitted.notify_one();
+                    Box::pin(async { Ok(()) })
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), admitted.notified())
+        .await
+        .expect("independent commits must admit while storage is in flight");
     gate.release();
     for job in jobs {
         job.await.expect("join").expect("commit");
     }
+    settling.await.expect("join").expect("settle line");
     let calls = harness.storage.commit_calls.lock().expect("calls");
     assert_eq!(calls.iter().map(Vec::len).sum::<usize>(), 8);
     assert!(
@@ -1124,6 +1137,452 @@ async fn session_commits_group_admitted_batches_and_publish_in_line_order() {
         })
         .collect();
     assert_eq!(published, (0..8).collect::<Vec<_>>());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outcomes_are_fenced_in_line_order_without_losing_their_own_results() {
+    let harness = open_test_session();
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let gate = harness.storage.hold_commits();
+    let first = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        let delivered = Arc::clone(&delivered);
+        async move {
+            let result = session
+                .commit(
+                    commit_fn(|tx| {
+                        Box::pin(async move {
+                            tx.doc(counter(), DocOwner::Session, None).await.map(|_| ())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await;
+            delivered.lock().unwrap().push("first");
+            result
+        }
+    });
+    gate.entered().await;
+    let read_started = Arc::new(tokio::sync::Notify::new());
+    let read = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        let delivered = Arc::clone(&delivered);
+        let read_started = Arc::clone(&read_started);
+        async move {
+            let result = session
+                .read_on_line(move || {
+                    read_started.notify_one();
+                    Box::pin(async { Ok("read") })
+                })
+                .await;
+            delivered.lock().unwrap().push("read");
+            result
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), read_started.notified())
+        .await
+        .unwrap();
+    let none_started = Arc::new(tokio::sync::Notify::new());
+    let none = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        let delivered = Arc::clone(&delivered);
+        let none_started = Arc::clone(&none_started);
+        async move {
+            let result = session
+                .commit(
+                    commit_fn(move |_tx| {
+                        none_started.notify_one();
+                        Box::pin(async { Ok("none") })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await;
+            delivered.lock().unwrap().push("none");
+            result
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), none_started.notified())
+        .await
+        .unwrap();
+    let error_started = Arc::new(tokio::sync::Notify::new());
+    let error = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        let delivered = Arc::clone(&delivered);
+        let error_started = Arc::clone(&error_started);
+        async move {
+            let result = session
+                .commit(
+                    commit_fn(move |_tx| {
+                        error_started.notify_one();
+                        Box::pin(async { Err::<(), _>(SessionError::message("own")) })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await;
+            delivered.lock().unwrap().push("error");
+            result
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), error_started.notified())
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(delivered.lock().unwrap().is_empty());
+    gate.release();
+    first.await.unwrap().unwrap();
+    assert_eq!(read.await.unwrap().unwrap(), "read");
+    assert_eq!(none.await.unwrap().unwrap(), "none");
+    assert!(
+        matches!(error.await.unwrap(), Err(SessionError::Message(message)) if message == "own")
+    );
+    assert_eq!(delivered.lock().unwrap().len(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropping_a_line_job_does_not_stall_later_outcomes() {
+    let harness = open_test_session();
+    let gate = harness.storage.hold_commits();
+    let first = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .commit(
+                    commit_fn(|tx| {
+                        Box::pin(async move {
+                            tx.doc(counter(), DocOwner::Session, None).await.map(|_| ())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    gate.entered().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let second = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        let started = Arc::clone(&started);
+        async move {
+            session
+                .commit(
+                    commit_fn(move |_tx| {
+                        started.notify_one();
+                        Box::pin(async { Ok(()) })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    second.abort();
+    let _ = second.await;
+    let third = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move { session.read_on_line(|| Box::pin(async { Ok(()) })).await }
+    });
+    gate.release();
+    first.await.unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), third)
+        .await
+        .expect("the cancelled job must not strand the fence")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maintenance_storage_failure_does_not_poison_an_earlier_admitted_success() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    write_live_deferred(&harness.session, conversation, "a", Some(0.0)).await;
+    write_live_deferred(&harness.session, conversation, "held", Some(20.0)).await;
+    let gate = harness.storage.hold_commits();
+    let current = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .commit(
+                    commit_fn(move |tx| {
+                        Box::pin(async move {
+                            tx.append_entry(conversation, EntryDraft::new("successful"))
+                                .await?;
+                            Ok(())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    gate.entered().await;
+    let fired = Arc::new(AtomicBool::new(false));
+    let storage = Arc::clone(&harness.storage);
+    let _listener = harness.session.subscribe_commits(Arc::new(move |_, _| {
+        if !fired.swap(true, Ordering::SeqCst) {
+            storage
+                .fail_next_commit_after_receipt(StorageError::message("deadline storage failure"));
+        }
+    }));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    gate.release();
+    current
+        .await
+        .expect("the earlier successful commit must keep its own outcome")
+        .expect("successful commit");
+    let end = tokio::time::timeout(std::time::Duration::from_secs(2), harness.session.closed())
+        .await
+        .expect("maintenance failure must close the Session");
+    assert!(matches!(end, SessionEnd::Failed { error } if error == "deadline storage failure"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn successful_maintenance_does_not_wait_for_caller_delivery() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    write_live_deferred(&harness.session, conversation, "base", Some(0.0)).await;
+    write_live_deferred(&harness.session, conversation, "held", Some(60_000.0)).await;
+    let gate = harness.storage.hold_commits();
+    let session = Arc::clone(&harness.session);
+    let earlier = session.commit(
+        commit_fn(|tx| {
+            Box::pin(async move {
+                tx.doc(counter(), DocOwner::Session, None).await?;
+                Ok(())
+            })
+        }),
+        &BACKGROUND_CONTEXT,
+    );
+    tokio::pin!(earlier);
+    let entered = gate.entered();
+    tokio::pin!(entered);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if futures::poll!(entered.as_mut()).is_ready() {
+                break;
+            }
+            assert!(futures::poll!(earlier.as_mut()).is_pending());
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("earlier admission");
+    gate.release();
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        harness.session.unload_documents(),
+    )
+    .await
+    .expect("maintenance must not wait for an unrelated caller delivery")
+    .unwrap();
+    earlier.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_maintenance_flush_does_not_leave_a_fence_hole() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    write_live_deferred(&harness.session, conversation, "base", Some(0.0)).await;
+    write_live_deferred(&harness.session, conversation, "held", Some(60_000.0)).await;
+    let gate = harness.storage.hold_commits();
+    let unload = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move { session.unload_documents().await }
+    });
+    gate.entered().await;
+    unload.abort();
+    let _ = unload.await;
+    gate.release();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        harness.session.read_on_line(|| Box::pin(async { Ok(()) })),
+    )
+    .await
+    .expect("dropped maintenance must settle its line-index fence")
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outcomes_after_an_earlier_storage_failure_are_session_failed() {
+    let harness = open_test_session();
+    harness
+        .storage
+        .fail_next_commit(StorageError::message("first storage failure"));
+    let gate = harness.storage.hold_commits();
+    let first = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .commit(
+                    commit_fn(|tx| {
+                        Box::pin(async move {
+                            tx.doc(counter(), DocOwner::Session, None).await.map(|_| ())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    gate.entered().await;
+    let read = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move { session.read_on_line(|| Box::pin(async { Ok(()) })).await }
+    });
+    let none = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .commit(
+                    commit_fn(|_tx| Box::pin(async { Ok(()) })),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    let error = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .commit(
+                    commit_fn(|_tx| Box::pin(async { Err::<(), _>(SessionError::message("own")) })),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !first.is_finished() && !read.is_finished() && !none.is_finished() && !error.is_finished()
+    );
+    gate.release();
+    assert!(matches!(
+        first.await.unwrap(),
+        Err(SessionError::Storage(_))
+    ));
+    for result in [
+        read.await.unwrap(),
+        none.await.unwrap(),
+        error.await.unwrap(),
+    ] {
+        assert!(
+            matches!(result, Err(SessionError::Failed { cause }) if cause == "first storage failure")
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_part_gate_opens_only_after_the_session_has_failed() {
+    let harness = open_test_session();
+    let gate = harness.storage.hold_commits();
+    let blocker = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .commit(
+                    commit_fn(|tx| {
+                        Box::pin(async move {
+                            tx.doc(counter(), DocOwner::Session, None).await.map(|_| ())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    gate.entered().await;
+    let next_admission = Arc::new(AtomicU64::new(0));
+    let mut jobs = Vec::new();
+    for _ in 0..128 {
+        jobs.push(tokio::spawn({
+            let session = Arc::clone(&harness.session);
+            let next_admission = Arc::clone(&next_admission);
+            async move {
+                let admission = next_admission.fetch_add(1, Ordering::SeqCst);
+                let result = session
+                    .commit(
+                        commit_fn(move |tx| {
+                            let key = format!("gate-{admission}");
+                            Box::pin(async move {
+                                tx.doc(
+                                    session_family(),
+                                    DocOwner::Family(&key),
+                                    Some(serde_json::json!(admission)),
+                                )
+                                .await?;
+                                Ok(())
+                            })
+                        }),
+                        &BACKGROUND_CONTEXT,
+                    )
+                    .await;
+                (admission, result)
+            }
+        }));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while next_admission.load(Ordering::SeqCst) != 128 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let admitted = Arc::new(tokio::sync::Notify::new());
+    let settling = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        let admitted = Arc::clone(&admitted);
+        async move {
+            session
+                .read_on_line(move || {
+                    admitted.notify_one();
+                    Box::pin(async { Ok(()) })
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), admitted.notified())
+        .await
+        .unwrap();
+    let fired = Arc::new(AtomicBool::new(false));
+    let storage = Arc::clone(&harness.storage);
+    let _listener = harness.session.subscribe_commits(Arc::new(move |_, _| {
+        if !fired.swap(true, Ordering::SeqCst) {
+            storage.fail_next_commit_after_receipt(StorageError::message("io after receipt"));
+        }
+    }));
+    let reader = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .storage()
+                .find_document(
+                    DocumentAddress {
+                        kind: session_family().definition.kind.clone(),
+                        scope: DocumentScope::Session,
+                        key: Some("gate-0".to_string()),
+                    },
+                    DocumentPoint::CURRENT,
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    gate.release();
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+        .await
+        .expect("reader must not remain gated")
+        .unwrap();
+    assert!(matches!(read, Err(StorageError::SessionFailed(cause)) if cause == "io after receipt"));
+    blocker.await.unwrap().unwrap();
+    assert!(matches!(
+        settling.await.unwrap(),
+        Err(SessionError::Failed { .. })
+    ));
+    for job in jobs {
+        let (_, result) = job.await.unwrap();
+        assert!(result.is_err());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1396,11 +1855,18 @@ async fn watch_retirement_continues_through_recreation() {
             })
         }))
         .expect("start");
+    harness
+        .session
+        .set_document_retention(Arc::new(|| Some(0.0)));
     commit(&harness.session, |tx| {
         Box::pin(async move { tx.retire_doc(counter(), DocOwner::Session).await })
     })
     .await;
     flush().await;
+    settle_line(&harness.session).await;
+    let retired_sizes = harness.session.document_cache_sizes();
+    assert_eq!(retired_sizes.cached, 0);
+    assert_eq!(retired_sizes.attached, 0);
     assert_eq!(log.lock().unwrap().len(), 1);
     assert!(watch.value().is_some());
     assert!(!watch.is_closed());
@@ -1413,6 +1879,10 @@ async fn watch_retirement_continues_through_recreation() {
     })
     .await;
     flush().await;
+    settle_line(&harness.session).await;
+    let recreated_sizes = harness.session.document_cache_sizes();
+    assert_eq!(recreated_sizes.cached, 1);
+    assert_eq!(recreated_sizes.attached, 1);
     let delivered = log.lock().unwrap().clone();
     assert_eq!(delivered.len(), 2);
     assert_eq!(
@@ -1428,6 +1898,22 @@ async fn watch_retirement_continues_through_recreation() {
     );
     watch.close_session(None);
     assert_eq!(watch.closed().await, WatchEnd::Ended);
+    settle_line(&harness.session).await;
+    let stopped_sizes = harness.session.document_cache_sizes();
+    assert_eq!(stopped_sizes.cached, 0);
+    assert_eq!(stopped_sizes.attached, 0);
+}
+
+#[tokio::test]
+async fn failed_close_drops_deferred_writes() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    write_live_deferred(&harness.session, conversation, "a", Some(0.0)).await;
+    write_live_deferred(&harness.session, conversation, "held", None).await;
+    assert_eq!(harness.session.deferred_write_count(), 1);
+    harness.session.fail("forced failure");
+    harness.session.close(&BACKGROUND_CONTEXT).await.unwrap();
+    assert_eq!(harness.session.deferred_write_count(), 0);
 }
 
 /// session-watches.test.ts:315 Session close is terminal.
@@ -1722,14 +2208,18 @@ async fn observe_commits_publishes_only_stored_deferred_changes() {
     })
     .await;
     let published = publications.lock().unwrap().clone();
-    assert_eq!(published.len(), 2, "deferred flush + immediate commit");
+    assert_eq!(
+        published.len(),
+        1,
+        "the unrelated entry is the only stored publication"
+    );
     assert!(
-        published[0].changes.iter().any(|change| matches!(
+        published[0].changes.iter().all(|change| !matches!(
             change,
             rpi_durable::session::CommitChange::Document(document)
                 if document.record.kind == "test.live"
         )),
-        "the first publication must be the stored deferred change: {:?}",
+        "an unrelated write must leave the deferred change held: {:?}",
         published[0].changes
     );
     observation.detach.unsubscribe();
@@ -1790,24 +2280,58 @@ async fn observe_commits_after_close_ends_immediately() {
     observation.detach.unsubscribe();
 }
 
-/// A failed Session::close must leave the cleanup flag retryable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observe_commits_racing_close_ends_exactly_once() {
+    for _ in 0..64 {
+        let harness = open_test_session();
+        let (observer, _publications, ends) = commit_observer();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let registering = tokio::spawn({
+            let session = Arc::clone(&harness.session);
+            let barrier = Arc::clone(&barrier);
+            async move {
+                barrier.wait().await;
+                session.observe_commits(observer)
+            }
+        });
+        let closing = tokio::spawn({
+            let session = Arc::clone(&harness.session);
+            let barrier = Arc::clone(&barrier);
+            async move {
+                barrier.wait().await;
+                session.close(&BACKGROUND_CONTEXT).await
+            }
+        });
+        let observation = registering.await.unwrap();
+        closing.await.unwrap().unwrap();
+        flush().await;
+        assert_eq!(ends.lock().unwrap().len(), 1);
+        observation.detach.unsubscribe();
+    }
+}
+
+/// Repeated close returns the same storage failure without retrying the backend.
 #[tokio::test]
-async fn close_retries_after_a_storage_failure() {
+async fn close_repeats_the_same_storage_failure_without_retrying() {
     let harness = open_test_session();
     harness
         .storage
-        .fail_next_close(StorageError::message("close failed once"));
-    let error = harness
+        .fail_next_close(StorageError::message("close failed"));
+    let first = harness
         .session
         .close(&BACKGROUND_CONTEXT)
         .await
         .expect_err("first close must surface the storage error");
-    assert_eq!(error.to_string(), "close failed once");
-    harness
+    let second = harness
         .session
         .close(&BACKGROUND_CONTEXT)
         .await
-        .expect("second close must retry and succeed");
+        .expect_err("second close returns the same failure");
+    assert!(matches!(&first, SessionError::Storage(_)));
+    assert!(matches!(&second, SessionError::Storage(_)));
+    assert_eq!(first.to_string(), "close failed");
+    assert_eq!(second.to_string(), first.to_string());
+    assert_eq!(harness.storage.close_count.load(Ordering::SeqCst), 1);
 }
 
 /// session-watches.test.ts:353 cancellation is terminal.
@@ -3155,7 +3679,7 @@ async fn document_retention_coalesces_sweeps_while_a_commit_holds_the_line() {
 }
 
 #[tokio::test]
-async fn document_retention_does_not_pin_a_replacement_to_a_retired_observer() {
+async fn document_retention_pins_a_replacement_to_its_live_observer() {
     let (session, _storage, _clock) = controlled_retention_session(0.0);
     let conversation = create_conversation(&session).await;
     commit(&session, move |tx| {
@@ -3193,7 +3717,9 @@ async fn document_retention_does_not_pin_a_replacement_to_a_retired_observer() {
     })
     .await;
     settle_line(&session).await;
-    assert_eq!(session.document_cache_sizes().cached, 0);
+    let pinned = session.document_cache_sizes();
+    assert_eq!(pinned.cached, 1);
+    assert_eq!(pinned.attached, 1);
     let value = session
         .snapshot(
             live(),
@@ -3205,6 +3731,9 @@ async fn document_retention_does_not_pin_a_replacement_to_a_retired_observer() {
         .expect("replacement");
     assert_eq!(value["message"], "replacement");
     retired.stop().await;
+    settle_line(&session).await;
+    assert_eq!(session.document_cache_sizes().cached, 0);
+    assert_eq!(session.document_cache_sizes().attached, 0);
 }
 
 #[tokio::test]
@@ -3333,7 +3862,7 @@ async fn write_live_deferred(
 }
 
 #[tokio::test]
-async fn deferred_progress_merges_and_flushes_on_read_and_close() {
+async fn deferred_progress_stays_held_on_read_and_flushes_on_close() {
     let harness = open_test_session();
     let conversation = create_conversation(&harness.session).await;
     let initial = harness.storage.commits.lock().unwrap().len();
@@ -3360,16 +3889,212 @@ async fn deferred_progress_merges_and_flushes_on_read_and_close() {
     .await;
     assert_eq!(
         harness.storage.commits.lock().unwrap().len(),
-        initial + 2,
-        "read flushes the merged delta"
+        initial + 1,
+        "a read-only commit leaves the merged delta held"
     );
     write_live_deferred(&harness.session, conversation, "abcd", None).await;
     harness.session.close(&BACKGROUND_CONTEXT).await.unwrap();
     assert_eq!(
         harness.storage.commits.lock().unwrap().len(),
-        initial + 3,
+        initial + 2,
         "close flushes the last delta"
     );
+}
+
+#[tokio::test]
+async fn deferred_base_stays_held_and_covers_later_deltas_until_stored() {
+    static TOKEN: OnceLock<DocToken> = OnceLock::new();
+    let token = TOKEN.get_or_init(|| {
+        define_doc(DocDefinition {
+            kind: "test.deferred.base".to_string(),
+            version: 1,
+            scope: DocScope::Conversation,
+            history: Some(DocumentHistory::Latest),
+            fork: Some(DocumentFork::Initial),
+            family: false,
+            initial: Arc::new(|_| object(serde_json::json!({"message": "a"}))),
+            migrate: None,
+            checkpoint_when: Arc::new(|value, _ops, _revision| value["message"] == "base"),
+        })
+    });
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            tx.doc(token, DocOwner::Conversation(conversation), None)
+                .await
+                .map(|_| ())
+        })
+    })
+    .await;
+    write_deferred_message(&harness.session, token, conversation, "base", None).await;
+    assert_eq!(harness.storage.commits.lock().unwrap().len(), 2);
+    write_deferred_message(&harness.session, token, conversation, "base-plus", None).await;
+    assert_eq!(harness.storage.commits.lock().unwrap().len(), 2);
+    write_deferred_message(&harness.session, token, conversation, "final", Some(0.0)).await;
+    let calls = harness.storage.commit_calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.last().unwrap().len(), 1);
+    assert!(calls.last().unwrap()[0].iter().any(|write| matches!(
+        write,
+        rpi_durable::types::StorageWrite::DocumentChange {
+            content: rpi_durable::types::DocumentContent::Base { value, .. },
+            ..
+        } if value["message"] == "final"
+    )));
+}
+
+#[tokio::test]
+async fn deferred_adopt_preserves_stored_delta_metadata_for_checkpoint() {
+    static TOKEN: OnceLock<DocToken> = OnceLock::new();
+    let token = TOKEN.get_or_init(|| {
+        define_doc(DocDefinition {
+            kind: "test.deferred.revision".to_string(),
+            version: 1,
+            scope: DocScope::Conversation,
+            history: Some(DocumentHistory::Latest),
+            fork: Some(DocumentFork::Initial),
+            family: false,
+            initial: Arc::new(|_| object(serde_json::json!({"message": "a"}))),
+            migrate: None,
+            checkpoint_when: Arc::new(|_value, _ops, revision| revision == 1),
+        })
+    });
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    write_deferred_message(&harness.session, token, conversation, "a", Some(0.0)).await;
+    write_deferred_message(&harness.session, token, conversation, "b", Some(0.0)).await;
+    write_deferred_message(&harness.session, token, conversation, "held", None).await;
+    write_deferred_message(&harness.session, token, conversation, "final", Some(0.0)).await;
+    let calls = harness.storage.commit_calls.lock().unwrap();
+    assert!(calls.last().unwrap()[0].iter().any(|write| matches!(
+        write,
+        rpi_durable::types::StorageWrite::DocumentChange {
+            content: rpi_durable::types::DocumentContent::Base { value, .. },
+            ..
+        } if value["message"] == "final"
+    )));
+}
+
+#[tokio::test]
+async fn deferred_write_folds_held_and_current_operations_into_one_stored_commit() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    write_live_deferred(&harness.session, conversation, "a", Some(0.0)).await;
+    write_live_deferred(&harness.session, conversation, "ab", None).await;
+    let before = harness.storage.commit_calls.lock().unwrap().len();
+    write_live_deferred(&harness.session, conversation, "abc", Some(0.0)).await;
+    let calls = harness.storage.commit_calls.lock().unwrap();
+    assert_eq!(calls.len(), before + 1);
+    let call = calls.last().unwrap();
+    assert_eq!(call.len(), 1, "held and current writes share one batch");
+    let document_writes = call[0]
+        .iter()
+        .filter(|write| {
+            matches!(
+                write,
+                rpi_durable::types::StorageWrite::DocumentChange { .. }
+            )
+        })
+        .count();
+    assert_eq!(document_writes, 1);
+    let ops = call[0]
+        .iter()
+        .find_map(|write| match write {
+            rpi_durable::types::StorageWrite::DocumentChange {
+                content: rpi_durable::types::DocumentContent::Delta { ops, .. },
+                ..
+            } => Some(ops.clone()),
+            _ => None,
+        })
+        .expect("folded delta");
+    let mut value = serde_json::json!({"message": "a", "items": [], "nested": {"count": 0}});
+    rpi_durable::chord::delta::apply(&mut value, &ops).expect("replay folded operations");
+    assert_eq!(value["message"], serde_json::json!("abc"));
+}
+
+#[tokio::test]
+async fn deferred_read_with_other_writes_stores_one_batch_and_one_publication() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    write_live_deferred(&harness.session, conversation, "a", Some(0.0)).await;
+    write_live_deferred(&harness.session, conversation, "held", None).await;
+    let (observer, publications, _ends) = commit_observer();
+    let observation = harness.session.observe_commits(observer);
+    let before = harness.storage.commit_calls.lock().unwrap().len();
+    commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            let text = tx
+                .doc(live(), DocOwner::Conversation(conversation), None)
+                .await?
+                .read()?["message"]
+                .as_str()
+                .expect("message")
+                .to_string();
+            let mut entry = EntryDraft::new("test.derived");
+            entry.data = Some(serde_json::json!(text));
+            tx.append_entry(conversation, entry).await?;
+            Ok(())
+        })
+    })
+    .await;
+    let calls = harness.storage.commit_calls.lock().unwrap();
+    assert_eq!(calls.len(), before + 1);
+    let call = calls.last().unwrap();
+    assert_eq!(call.len(), 1);
+    assert_eq!(call[0].len(), 2, "document.change + entry");
+    assert!(call[0].iter().any(|write| matches!(
+        write,
+        rpi_durable::types::StorageWrite::DocumentChange { .. }
+    )));
+    assert!(
+        call[0]
+            .iter()
+            .any(|write| matches!(write, rpi_durable::types::StorageWrite::Entry { .. }))
+    );
+    let published = publications.lock().unwrap().clone();
+    assert_eq!(published.len(), 1);
+    assert!(
+        published[0].changes.iter().any(|change| matches!(
+            change,
+            rpi_durable::session::CommitChange::Document(document)
+                if document.record.kind == "test.live" && !document.ops.is_empty()
+        )),
+        "publication: {:?}",
+        published[0].changes
+    );
+    observation.detach.unsubscribe();
+}
+
+#[tokio::test]
+async fn deferred_rejects_negative_and_nan_within_ms() {
+    for within_ms in [-1.0, f64::NAN] {
+        let harness = open_test_session();
+        let conversation = create_conversation(&harness.session).await;
+        let result = harness
+            .session
+            .commit_with_options(
+                commit_fn(move |tx| {
+                    Box::pin(async move {
+                        tx.doc(live(), DocOwner::Conversation(conversation), None)
+                            .await?
+                            .write()?["message"] = serde_json::json!("invalid");
+                        Ok(())
+                    })
+                }),
+                &BACKGROUND_CONTEXT,
+                None,
+                CommitOptions {
+                    persistence: Some(CommitPersistence::Deferred {
+                        within_ms: Some(within_ms),
+                    }),
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(SessionError::Message(_))));
+        assert!(harness.session.failure().is_none());
+        assert_eq!(harness.storage.commit_calls.lock().unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]
@@ -3400,8 +4125,8 @@ async fn deferred_deadline_zero_and_retirement_flush_at_the_right_boundaries() {
     .await;
     assert_eq!(
         harness.storage.commits.lock().unwrap().len(),
-        5,
-        "held delta and retirement both persist"
+        4,
+        "held delta and retirement persist in one commit"
     );
 }
 
@@ -3665,6 +4390,98 @@ async fn version_reload_stores_held_changes_before_dropping_the_old_tracker() {
         .expect("snapshot")
         .expect("document");
     assert_eq!(value["message"], serde_json::json!("held"));
+    let before = harness.storage.commit_calls.lock().unwrap().len();
+    harness.session.unload_documents().await.unwrap();
+    assert_eq!(harness.storage.commit_calls.lock().unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn version_reload_preserves_unrelated_held_documents() {
+    static CURRENT: OnceLock<DocToken> = OnceLock::new();
+    let old = Arc::new(conversation_doc(
+        "test.deferred.selective",
+        1,
+        DocumentHistory::Latest,
+        DocumentFork::Initial,
+        |_| object(serde_json::json!({"message": null})),
+    ));
+    let current = CURRENT.get_or_init(|| {
+        let mut definition = DocDefinition {
+            kind: "test.deferred.selective".to_string(),
+            version: 2,
+            scope: DocScope::Conversation,
+            history: Some(DocumentHistory::Latest),
+            fork: Some(DocumentFork::Initial),
+            family: false,
+            initial: Arc::new(|_| object(serde_json::json!({"message": null}))),
+            migrate: None,
+            checkpoint_when: Arc::new(|_value, _ops, _revision| false),
+        };
+        definition.migrate = Some(Arc::new(|value, _from| value.clone()));
+        define_doc(definition)
+    });
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    let old_for_commit = Arc::clone(&old);
+    commit(&harness.session, move |tx| {
+        let old = Arc::clone(&old_for_commit);
+        Box::pin(async move {
+            tx.doc(&old, DocOwner::Conversation(conversation), None)
+                .await?;
+            tx.doc(live(), DocOwner::Conversation(conversation), None)
+                .await?;
+            Ok(())
+        })
+    })
+    .await;
+    write_deferred_message(
+        &harness.session,
+        &old,
+        conversation,
+        "held-old",
+        Some(60_000.0),
+    )
+    .await;
+    write_deferred_message(
+        &harness.session,
+        live(),
+        conversation,
+        "held-live",
+        Some(60_000.0),
+    )
+    .await;
+    assert_eq!(harness.session.deferred_write_count(), 2);
+    let before = harness.storage.commit_calls.lock().unwrap().len();
+    let value = harness
+        .session
+        .snapshot(
+            current,
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("snapshot")
+        .expect("document");
+    assert_eq!(value["message"], serde_json::json!("held-old"));
+    assert_eq!(
+        harness.storage.commit_calls.lock().unwrap().len(),
+        before + 1
+    );
+    assert_eq!(harness.session.deferred_write_count(), 1);
+    let unrelated = harness
+        .session
+        .snapshot(
+            live(),
+            DocOwner::Conversation(conversation),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("unrelated snapshot")
+        .expect("document");
+    assert_eq!(unrelated["message"], serde_json::json!("held-live"));
+    assert_eq!(harness.session.deferred_write_count(), 1);
+    harness.session.close(&BACKGROUND_CONTEXT).await.unwrap();
+    assert_eq!(harness.session.deferred_write_count(), 0);
 }
 
 #[tokio::test]

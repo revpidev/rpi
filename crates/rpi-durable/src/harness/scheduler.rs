@@ -492,6 +492,7 @@ struct SchedulerInner {
     full_idle_checks: AtomicU64,
     candidate_visits: AtomicU64,
     invocations: Mutex<BTreeMap<TaskId, Arc<Invocation>>>,
+    faulted: Mutex<Vec<(TaskRecord, String)>>,
     task_waiters: Waiters<TaskId, SettledTask<JsonValue>>,
     idle_waiters: Waiters<Option<ConversationId>, ()>,
     /// Definition whose migration failed per task; retried only for another definition.
@@ -559,6 +560,7 @@ impl SchedulerInner {
             full_idle_checks: AtomicU64::new(0),
             candidate_visits: AtomicU64::new(0),
             invocations: Mutex::new(BTreeMap::new()),
+            faulted: Mutex::new(Vec::new()),
             task_waiters: Waiters::new(),
             idle_waiters: Waiters::new(),
             failed_migrations: Mutex::new(BTreeMap::new()),
@@ -1353,7 +1355,11 @@ impl SchedulerInner {
                 })
             })
             .await;
-        found?.await.map_err(Into::into)
+        let found = found?;
+        self.report_faulted();
+        let settled = found.await.map_err(Into::into);
+        self.report_faulted();
+        settled
     }
 
     async fn wait_for_idle(
@@ -2705,20 +2711,40 @@ impl SchedulerInner {
         }
     }
 
+    fn report_faulted(&self) {
+        let faulted = self
+            .faulted
+            .lock()
+            .map(|mut values| std::mem::take(&mut *values))
+            .unwrap_or_default();
+        for (record, message) in faulted {
+            self.report_error(
+                message,
+                crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::TaskFaulted,
+                )
+                .with_task(crate::harness::types::ReportTask::new(
+                    record.id,
+                    record.kind,
+                    record.conversation_id,
+                ))
+                .with_reason("restart_limit"),
+                None,
+            );
+        }
+    }
+
     async fn reserve(self: &Arc<Self>) -> SessionResult<Vec<Reservation>> {
         let out: Arc<Mutex<Vec<Reservation>>> = Arc::new(Mutex::new(Vec::new()));
-        let faulted: Arc<Mutex<Vec<(TaskRecord, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let this = Arc::clone(self);
         let out_commit = Arc::clone(&out);
-        let faulted_commit = Arc::clone(&faulted);
         let result = self
             .session
             .commit_with(
                 commit_fn(move |tx| {
                     let this = Arc::clone(&this);
                     let out = Arc::clone(&out_commit);
-                    let faulted = Arc::clone(&faulted_commit);
-                    Box::pin(async move { this.reserve_in(tx, &out, &faulted).await })
+                    Box::pin(async move { this.reserve_in(tx, &out).await })
                 }),
                 &self.context,
                 None,
@@ -2730,29 +2756,13 @@ impl SchedulerInner {
             .unwrap_or_default();
         match result {
             Ok(()) => {
-                // Only after the fault is durable.
-                let faulted = faulted
-                    .lock()
-                    .map(|mut values| std::mem::take(&mut *values))
-                    .unwrap_or_default();
-                for (record, message) in faulted {
-                    self.report_error(
-                        message,
-                        crate::harness::types::ReportInfo::new(
-                            crate::harness::types::ReportKind::TaskFaulted,
-                        )
-                        .with_task(crate::harness::types::ReportTask::new(
-                            record.id,
-                            record.kind,
-                            record.conversation_id,
-                        ))
-                        .with_reason("restart_limit"),
-                        None,
-                    );
-                }
+                self.report_faulted();
                 Ok(reservations)
             }
             Err(error) => {
+                if let Ok(mut faulted) = self.faulted.lock() {
+                    faulted.clear();
+                }
                 for reservation in reservations {
                     if let Ok(mut map) = self.invocations.lock() {
                         map.remove(&reservation.invocation.task_id);
@@ -2768,7 +2778,6 @@ impl SchedulerInner {
         self: &Arc<Self>,
         tx: &mut Transaction,
         out: &Arc<Mutex<Vec<Reservation>>>,
-        faulted: &Arc<Mutex<Vec<(TaskRecord, String)>>>,
     ) -> SessionResult<()> {
         self.session.wait_for_all_writers().await?;
         if !self.enabled.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) {
@@ -2852,7 +2861,7 @@ impl SchedulerInner {
                     },
                 )
                 .await?;
-                if let Ok(mut values) = faulted.lock() {
+                if let Ok(mut values) = self.faulted.lock() {
                     values.push((record, message));
                 }
                 continue;

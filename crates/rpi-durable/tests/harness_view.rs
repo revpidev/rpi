@@ -10,7 +10,8 @@ use rpi_durable::harness::{
 };
 use rpi_durable::ids::{EntryId, id_from_number};
 use rpi_durable::session::{
-    ConversationOwnership, EntryDraft, Observer, WatchCall, WatchEnd, commit_fn, create_session,
+    ConversationOwnership, EntryDraft, Observer, Subscription, WatchCall, WatchEnd, commit_fn,
+    create_session,
 };
 use rpi_durable::storage::MemoryStorage;
 use rpi_durable::types::{Cursor, EntryQuery, EntryRecord, Page, ScanOrder};
@@ -106,6 +107,74 @@ async fn observers_have_independent_bounded_windows() {
     assert_eq!(watch.value().expect("view").entries.len(), 1);
     observation.detach.unsubscribe();
     watch.stop().await;
+}
+
+struct DetachingObserver {
+    detach: Mutex<Option<Subscription>>,
+}
+
+impl Observer<ConversationView> for DetachingObserver {
+    fn advance(
+        &self,
+        _call: WatchCall<ConversationView>,
+        _context: &rpi_durable::chord::context::Context,
+    ) {
+        if let Some(detach) = self.detach.lock().expect("detach").take() {
+            detach.unsubscribe();
+        }
+    }
+
+    fn end(&self, _end: WatchEnd) {}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observer_can_detach_inside_advance_without_deadlocking_the_writer() {
+    let session = create_session(Arc::new(MemoryStorage::new()), None);
+    let context = BACKGROUND_CONTEXT.clone();
+    let conversation = session
+        .commit(
+            commit_fn(|tx| {
+                Box::pin(async move {
+                    Ok(tx
+                        .create_conversation(ConversationOwnership::Ownerless)
+                        .await?
+                        .id)
+                })
+            }),
+            &context,
+        )
+        .await
+        .expect("conversation");
+    let views = ConversationViews::new(Arc::clone(&session));
+    let observer = Arc::new(DetachingObserver {
+        detach: Mutex::new(None),
+    });
+    let observation = views
+        .observe(
+            conversation,
+            Arc::clone(&observer) as Arc<dyn Observer<ConversationView>>,
+            ConversationWindow::default(),
+            &context,
+        )
+        .await
+        .expect("observe");
+    *observer.detach.lock().expect("detach") = Some(observation.detach);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        session.commit(
+            commit_fn(move |tx| {
+                Box::pin(async move {
+                    tx.append_entry(conversation, EntryDraft::new("detach"))
+                        .await?;
+                    Ok(())
+                })
+            }),
+            &context,
+        ),
+    )
+    .await
+    .expect("detach must not deadlock the writer")
+    .expect("commit");
 }
 
 #[tokio::test]

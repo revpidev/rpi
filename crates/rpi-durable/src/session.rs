@@ -274,12 +274,26 @@ pub struct CommitOptions {
 
 pub(crate) struct DeferredCommit {
     pub id: u64,
-    pub within_ms: Option<f64>,
+    pub deadline: Option<f64>,
+    pub deadlines: std::collections::HashMap<crate::ids::DocumentId, Option<f64>>,
     pub writes: Vec<StorageWrite>,
     pub changes: Vec<CommitChange>,
     pub keys: Vec<String>,
     /// Documents held by this deferred commit; never evicted until flushed.
     pub pinned: Vec<crate::ids::DocumentId>,
+}
+
+pub(crate) fn earliest_deferred_deadline(
+    deadlines: &std::collections::HashMap<crate::ids::DocumentId, Option<f64>>,
+) -> Option<f64> {
+    deadlines
+        .values()
+        .copied()
+        .fold(None, |earliest, deadline| match (earliest, deadline) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        })
 }
 
 /// Synchronous observer of value calls and one terminal end.
