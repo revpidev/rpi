@@ -1,7 +1,7 @@
 //! Conversation view mounts and per-observer bounded transcript windows.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -112,6 +112,15 @@ impl ConversationWatch {
     }
 }
 
+/// Serializes one windowed observer's `advance` and `end`: an `end` raised
+/// while its `advance` runs (a close, or a detach inside `advance`) is
+/// delivered once the callback returns, never concurrently with it.
+#[derive(Default)]
+struct CallbackState {
+    active: AtomicBool,
+    deferred: Mutex<Option<WatchEnd>>,
+}
+
 struct Windowed {
     min: usize,
     max: usize,
@@ -120,6 +129,33 @@ struct Windowed {
     observer: Option<Arc<dyn Observer<ConversationView>>>,
     reporter: Option<crate::session::session::FailureReporter>,
     alive: bool,
+    callback: Arc<CallbackState>,
+}
+
+fn finish_windowed(
+    watch: Option<&CommittedWatch>,
+    observer: Option<&Arc<dyn Observer<ConversationView>>>,
+    reporter: Option<&crate::session::session::FailureReporter>,
+    end: WatchEnd,
+) {
+    if let Some(watch) = watch {
+        match end {
+            WatchEnd::Failed { error } => watch.close_session(Some(error)),
+            _ => watch.close_session(None),
+        }
+        return;
+    }
+    let Some(observer) = observer else {
+        return;
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.end(end))).is_err()
+        && let Some(reporter) = reporter
+    {
+        reporter(
+            "listener_error: conversation observer end panicked".to_string(),
+            None,
+        );
+    }
 }
 
 impl Windowed {
@@ -128,14 +164,18 @@ impl Windowed {
             return;
         }
         self.alive = false;
-        if let Some(watch) = &self.watch {
-            match end {
-                WatchEnd::Failed { error } => watch.close_session(Some(error)),
-                _ => watch.close_session(None),
+        if self.callback.active.load(Ordering::SeqCst) {
+            if let Ok(mut deferred) = self.callback.deferred.lock() {
+                *deferred = Some(end);
             }
-        } else if let Some(observer) = &self.observer {
-            observer.end(end);
+            return;
         }
+        finish_windowed(
+            self.watch.as_ref(),
+            self.observer.as_ref(),
+            self.reporter.as_ref(),
+            end,
+        );
     }
 }
 
@@ -146,51 +186,70 @@ struct Delivery {
     watch: Option<CommittedWatch>,
     observer: Option<Arc<dyn Observer<ConversationView>>>,
     reporter: Option<crate::session::session::FailureReporter>,
+    callback: Arc<CallbackState>,
 }
 
 impl Delivery {
     fn send(self, context: &Context, mounts: &Arc<Mutex<HashMap<ConversationId, Mount>>>) {
+        let Delivery {
+            conversation,
+            observer_id,
+            value: view_value,
+            watch,
+            observer,
+            reporter,
+            callback,
+        } = self;
         let mounted = mounts
             .lock()
             .ok()
             .and_then(|mounts| {
                 mounts
-                    .get(&self.conversation)
-                    .and_then(|mount| mount.observers.get(&self.observer_id))
-                    .map(|windowed| windowed.alive)
+                    .get(&conversation)
+                    .and_then(|mount| mount.observers.get(&observer_id))
+                    .map(|windowed| windowed.alive && !callback.active.swap(true, Ordering::SeqCst))
             })
             .unwrap_or(false);
         if !mounted {
             return;
         }
-        let value = serde_json::to_value(&self.value).unwrap_or(JsonValue::Null);
-        if let Some(watch) = &self.watch {
+        let value = serde_json::to_value(&view_value).unwrap_or(JsonValue::Null);
+        let succeeded = if let Some(watch) = &watch {
             watch.advance(
                 value.clone(),
                 vec![Op::Replace(value)],
                 false,
                 context.clone(),
             );
-            return;
-        }
-        let Some(observer) = &self.observer else {
-            return;
+            true
+        } else if let Some(observer) = &observer {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer.advance(
+                    WatchCall::Value {
+                        value: view_value,
+                        ops: vec![Op::Replace(value)],
+                        retired: false,
+                    },
+                    context,
+                );
+            }))
+            .is_ok()
+        } else {
+            true
         };
-        let succeeded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            observer.advance(
-                WatchCall::Value {
-                    value: self.value,
-                    ops: vec![Op::Replace(value)],
-                    retired: false,
-                },
-                context,
-            );
-        }))
-        .is_ok();
+        callback.active.store(false, Ordering::SeqCst);
+        let deferred = callback
+            .deferred
+            .lock()
+            .ok()
+            .and_then(|mut deferred| deferred.take());
+        if let Some(end) = deferred {
+            finish_windowed(watch.as_ref(), observer.as_ref(), reporter.as_ref(), end);
+        }
         if succeeded {
             return;
         }
-        if let Some(reporter) = &self.reporter {
+        if let Some(reporter) = &reporter {
             reporter(
                 "listener_error: conversation observer panicked".to_string(),
                 Some(context.clone()),
@@ -198,8 +257,8 @@ impl Delivery {
         }
         let removed = mounts.lock().ok().and_then(|mut mounts| {
             mounts
-                .get_mut(&self.conversation)
-                .and_then(|mount| mount.observers.remove(&self.observer_id))
+                .get_mut(&conversation)
+                .and_then(|mount| mount.observers.remove(&observer_id))
         });
         if let Some(mut windowed) = removed {
             windowed.end(WatchEnd::ListenerError {
@@ -291,6 +350,7 @@ impl Mount {
                 watch: windowed.watch.clone(),
                 observer: windowed.observer.clone(),
                 reporter: windowed.reporter.clone(),
+                callback: Arc::clone(&windowed.callback),
             });
         }
         deliveries
@@ -302,6 +362,9 @@ pub struct ConversationViews {
     session: Arc<crate::session::SessionImpl>,
     mounts: Arc<Mutex<HashMap<ConversationId, Mount>>>,
     next_observer: AtomicU64,
+    /// Set by the close listener before it drains the mounts: an attachment
+    /// hydrating while close begins registers nothing (upstream `#closed`).
+    closed: Arc<AtomicBool>,
     _commit: Subscription,
     _close: Subscription,
 }
@@ -315,6 +378,8 @@ struct Attachment {
 impl ConversationViews {
     pub fn new(session: Arc<crate::session::SessionImpl>) -> Arc<Self> {
         let mounts = Arc::new(Mutex::new(HashMap::<ConversationId, Mount>::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        let close_closed = Arc::clone(&closed);
         let commit_mounts = Arc::clone(&mounts);
         let commit = session.subscribe_internal_commits(Arc::new(move |publication, context| {
             let deliveries = match commit_mounts.lock() {
@@ -331,6 +396,7 @@ impl ConversationViews {
         let close_mounts = Arc::clone(&mounts);
         let weak = Arc::downgrade(&session);
         let close = session.subscribe_close(Arc::new(move || {
+            close_closed.store(true, Ordering::SeqCst);
             let failure = weak.upgrade().and_then(|session| session.failure());
             let observers = match close_mounts.lock() {
                 Ok(mut mounts) => {
@@ -365,6 +431,7 @@ impl ConversationViews {
             session,
             mounts,
             next_observer: AtomicU64::new(1),
+            closed,
             _commit: commit,
             _close: close,
         })
@@ -463,8 +530,12 @@ impl ConversationViews {
                         observer,
                         reporter,
                         alive: true,
+                        callback: Arc::new(CallbackState::default()),
                     };
                     if let Ok(mut mounts) = this.mounts.lock() {
+                        if this.closed.load(Ordering::SeqCst) {
+                            return Err(SessionError::Closed);
+                        }
                         let mount = mounts.entry(id_for_detach).or_insert_with(|| Mount {
                             conversation: value.conversation.clone(),
                             docs: value.docs.clone(),

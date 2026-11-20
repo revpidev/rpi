@@ -543,12 +543,23 @@ impl Transaction {
                 .or_else(|| held_document.value.clone())
                 .unwrap_or_default();
             let version = held_document.version.unwrap_or(0);
-            let mut pending = PendingOps::new();
-            pending.push(&held_document.ops);
-            pending.push(&current_ops);
-            let (operations, overflow) = match pending.take() {
-                PendingTake::Ops(operations) => (operations, false),
-                PendingTake::Replace => (vec![Op::Replace(JsonValue::Object(value.clone()))], true),
+            // An overflowed held document is stored as a base of the current
+            // value (upstream `storeHeld` for a `replace` pending state); the
+            // current operations are already reflected in `value`, so they are
+            // not appended to the replacement.
+            let replaced = held.replaces.contains(&id);
+            let (operations, overflow) = if replaced {
+                (vec![Op::Replace(JsonValue::Object(value.clone()))], true)
+            } else {
+                let mut pending = PendingOps::new();
+                pending.push(&held_document.ops);
+                pending.push(&current_ops);
+                match pending.take() {
+                    PendingTake::Ops(operations) => (operations, false),
+                    PendingTake::Replace => {
+                        (vec![Op::Replace(JsonValue::Object(value.clone()))], true)
+                    }
+                }
             };
             let own_base = own.as_ref().is_some_and(|write| {
                 matches!(
@@ -618,6 +629,7 @@ impl Transaction {
             _ => true,
         });
         held.pinned.retain(|id| !selected.contains(id));
+        held.replaces.retain(|id| !selected.contains(id));
         held.deadlines.retain(|id, _| !selected.contains(id));
         held.deadline = earliest_deferred_deadline(&held.deadlines);
         held.keys = deferred_keys(&held.changes);

@@ -10,8 +10,8 @@ use rpi_durable::harness::{
 };
 use rpi_durable::ids::{EntryId, id_from_number};
 use rpi_durable::session::{
-    ConversationOwnership, EntryDraft, Observer, Subscription, WatchCall, WatchEnd, commit_fn,
-    create_session,
+    ConversationOwnership, EntryDraft, Observer, SessionError, Subscription, WatchCall, WatchEnd,
+    commit_fn, create_session,
 };
 use rpi_durable::storage::MemoryStorage;
 use rpi_durable::types::{Cursor, EntryQuery, EntryRecord, Page, ScanOrder};
@@ -111,6 +111,9 @@ async fn observers_have_independent_bounded_windows() {
 
 struct DetachingObserver {
     detach: Mutex<Option<Subscription>>,
+    in_advance: std::sync::atomic::AtomicBool,
+    ended: std::sync::atomic::AtomicBool,
+    ended_after_advance: std::sync::atomic::AtomicBool,
 }
 
 impl Observer<ConversationView> for DetachingObserver {
@@ -119,12 +122,22 @@ impl Observer<ConversationView> for DetachingObserver {
         _call: WatchCall<ConversationView>,
         _context: &rpi_durable::chord::context::Context,
     ) {
+        self.in_advance
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(detach) = self.detach.lock().expect("detach").take() {
             detach.unsubscribe();
         }
+        self.in_advance
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn end(&self, _end: WatchEnd) {}
+    fn end(&self, _end: WatchEnd) {
+        self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        if !self.in_advance.load(std::sync::atomic::Ordering::SeqCst) {
+            self.ended_after_advance
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -148,6 +161,9 @@ async fn observer_can_detach_inside_advance_without_deadlocking_the_writer() {
     let views = ConversationViews::new(Arc::clone(&session));
     let observer = Arc::new(DetachingObserver {
         detach: Mutex::new(None),
+        in_advance: std::sync::atomic::AtomicBool::new(false),
+        ended: std::sync::atomic::AtomicBool::new(false),
+        ended_after_advance: std::sync::atomic::AtomicBool::new(false),
     });
     let observation = views
         .observe(
@@ -175,6 +191,98 @@ async fn observer_can_detach_inside_advance_without_deadlocking_the_writer() {
     .await
     .expect("detach must not deadlock the writer")
     .expect("commit");
+    assert!(
+        observer.ended.load(std::sync::atomic::Ordering::SeqCst),
+        "the detached observer still ends"
+    );
+    assert!(
+        observer
+            .ended_after_advance
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "end must not run inside advance"
+    );
+}
+
+/// A mount that hydrates while close begins registers nothing (upstream
+/// `ConversationViews.attach` checks `#closed`), so the observer is not left
+/// attached to a closed session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attach_racing_close_registers_nothing_and_rejects() {
+    let session = create_session(Arc::new(MemoryStorage::new()), None);
+    let context = BACKGROUND_CONTEXT.clone();
+    let conversation = session
+        .commit(
+            commit_fn(|tx| {
+                Box::pin(async move {
+                    Ok(tx
+                        .create_conversation(ConversationOwnership::Ownerless)
+                        .await?
+                        .id)
+                })
+            }),
+            &context,
+        )
+        .await
+        .expect("conversation");
+    let views = ConversationViews::new(Arc::clone(&session));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let holding = tokio::spawn({
+        let session = Arc::clone(&session);
+        let context = context.clone();
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        async move {
+            session
+                .commit(
+                    commit_fn(move |_tx| {
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        Box::pin(async move {
+                            entered.notify_one();
+                            release.notified().await;
+                            Ok(())
+                        })
+                    }),
+                    &context,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the line is held");
+    let observing = tokio::spawn({
+        let views = Arc::clone(&views);
+        let context = context.clone();
+        async move {
+            views
+                .observe(
+                    conversation,
+                    Arc::new(RecordingObserver {
+                        values: Arc::new(Mutex::new(Vec::new())),
+                    }),
+                    ConversationWindow::default(),
+                    &context,
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let closing = tokio::spawn({
+        let session = Arc::clone(&session);
+        let context = context.clone();
+        async move { session.close(&context).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    release.notify_one();
+    holding.await.unwrap().unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), observing)
+        .await
+        .expect("the attach must not hang")
+        .unwrap();
+    assert!(matches!(result, Err(SessionError::Closed)));
+    closing.await.unwrap().unwrap();
 }
 
 #[tokio::test]

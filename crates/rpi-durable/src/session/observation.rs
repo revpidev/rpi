@@ -98,6 +98,10 @@ struct WatchState {
     observer: Option<Arc<dyn crate::session::Observer<ObservedDocumentValue>>>,
     observer_reporter: Option<crate::session::session::FailureReporter>,
     detach: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Set while a synchronous observer's `advance` runs: an `end` raised
+    /// meanwhile is delivered after it returns, never concurrently.
+    callback_active: bool,
+    deferred_end: Option<WatchEnd>,
 }
 
 /// Serialized exact-frame watch bound to one document incarnation (upstream
@@ -145,9 +149,37 @@ impl CommittedWatch {
         reporter: crate::session::session::FailureReporter,
     ) -> crate::session::Observation<ObservedDocumentValue> {
         let value = self.value();
+        let mut terminated = None;
+        let mut installed = false;
         if let Ok(mut state) = self.inner.lock() {
-            state.observer = Some(observer);
-            state.observer_reporter = Some(reporter);
+            if let Some(end) = state.end.clone() {
+                terminated = Some(end);
+            } else {
+                state.observer = Some(Arc::clone(&observer));
+                state.observer_reporter = Some(Arc::clone(&reporter));
+                installed = true;
+            }
+        }
+        if let Some(end) = terminated {
+            // A registration after the watch ended ends immediately, as the
+            // watch's own close/abort did; installing it would never deliver.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.end(end))).is_err()
+            {
+                reporter(
+                    "listener_error: document observer end panicked".to_string(),
+                    None,
+                );
+            }
+            return crate::session::Observation {
+                value,
+                detach: crate::session::Subscription::new(|| {}),
+            };
+        }
+        if !installed {
+            return crate::session::Observation {
+                value,
+                detach: crate::session::Subscription::new(|| {}),
+            };
         }
         let detach = crate::session::Subscription::new({
             let watch = self.clone();
@@ -258,6 +290,7 @@ impl CommittedWatch {
             let retired_ops = if retired { Vec::new() } else { ops };
             if let Some(observer) = state.observer.clone() {
                 let reporter = state.observer_reporter.clone();
+                state.callback_active = true;
                 drop(state);
                 let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     observer.advance(
@@ -269,6 +302,27 @@ impl CommittedWatch {
                         &context,
                     );
                 }));
+                let (deferred_end, deferred_observer) = {
+                    let Ok(mut state) = self.inner.lock() else {
+                        return;
+                    };
+                    state.callback_active = false;
+                    let end = state.deferred_end.take();
+                    let observer = end.as_ref().and_then(|_| state.observer.take());
+                    (end, observer)
+                };
+                if let Some(end) = deferred_end
+                    && let Some(observer) = deferred_observer
+                {
+                    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        observer.end(end);
+                    }));
+                    if failed.is_err()
+                        && let Some(reporter) = &reporter
+                    {
+                        reporter("listener_error: observer end panicked".to_string(), None);
+                    }
+                }
                 if failed.is_err() {
                     if let Some(reporter) = reporter {
                         reporter(
@@ -386,11 +440,16 @@ impl CommittedWatch {
             state.pending_context = None;
             state.pending_failure = None;
             state.replace_after_failure = false;
-            (
-                state.detach.take(),
-                state.observer.take(),
-                state.observer_reporter.clone(),
-            )
+            if state.callback_active {
+                state.deferred_end = Some(end.clone());
+                (state.detach.take(), None, state.observer_reporter.clone())
+            } else {
+                (
+                    state.detach.take(),
+                    state.observer.take(),
+                    state.observer_reporter.clone(),
+                )
+            }
         };
         if let Some(observer) = observer {
             let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -691,6 +750,89 @@ pub(crate) fn attach_state(source: &CommittedStateSource) -> AttachedReplicatedS
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    struct DeferredEndObserver {
+        closer: CommittedWatch,
+        in_advance: std::sync::atomic::AtomicBool,
+        ends: Arc<StdMutex<Vec<(WatchEnd, bool)>>>,
+    }
+
+    impl crate::session::Observer<ObservedDocumentValue> for DeferredEndObserver {
+        fn advance(
+            &self,
+            _call: WatchCall<ObservedDocumentValue>,
+            _context: &crate::chord::context::Context,
+        ) {
+            self.in_advance
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.closer.close_session(None);
+            self.in_advance
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn end(&self, end: WatchEnd) {
+            let in_advance = self.in_advance.load(std::sync::atomic::Ordering::SeqCst);
+            self.ends.lock().expect("ends").push((end, in_advance));
+        }
+    }
+
+    #[test]
+    fn advance_defers_end_until_the_observer_callback_returns() {
+        let watch = CommittedWatch::new(serde_json::json!({ "value": 0 }));
+        let advancing = watch.clone();
+        let closer = watch.clone();
+        let ends = Arc::new(StdMutex::new(Vec::new()));
+        let reporter: crate::session::session::FailureReporter = Arc::new(|_, _| {});
+        let _observation = watch.observe(
+            Arc::new(DeferredEndObserver {
+                closer,
+                in_advance: std::sync::atomic::AtomicBool::new(false),
+                ends: Arc::clone(&ends),
+            }),
+            reporter,
+        );
+        advancing.advance(
+            serde_json::json!({ "value": 1 }),
+            Vec::new(),
+            false,
+            crate::chord::context::BACKGROUND_CONTEXT.clone(),
+        );
+        let ends = ends.lock().expect("ends");
+        assert_eq!(ends.len(), 1);
+        assert!(!ends[0].1, "end must not run inside advance");
+    }
+
+    struct RecordingObserver {
+        ends: Arc<StdMutex<Vec<WatchEnd>>>,
+    }
+
+    impl crate::session::Observer<ObservedDocumentValue> for RecordingObserver {
+        fn advance(
+            &self,
+            _call: WatchCall<ObservedDocumentValue>,
+            _context: &crate::chord::context::Context,
+        ) {
+        }
+
+        fn end(&self, end: WatchEnd) {
+            self.ends.lock().expect("ends").push(end);
+        }
+    }
+
+    #[test]
+    fn observing_a_terminated_watch_ends_immediately() {
+        let watch = CommittedWatch::new(serde_json::json!({ "value": 0 }));
+        watch.close_session(None);
+        let ends = Arc::new(StdMutex::new(Vec::new()));
+        let reporter: crate::session::session::FailureReporter = Arc::new(|_, _| {});
+        let _observation = watch.observe(
+            Arc::new(RecordingObserver {
+                ends: Arc::clone(&ends),
+            }),
+            reporter,
+        );
+        assert_eq!(ends.lock().expect("ends").as_slice(), [WatchEnd::Ended]);
+    }
 
     fn listener(log: Arc<StdMutex<Vec<ObservedDocumentValue>>>) -> WatchListener {
         Arc::new(move |call, _context| {

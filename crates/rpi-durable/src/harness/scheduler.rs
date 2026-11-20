@@ -1356,7 +1356,9 @@ impl SchedulerInner {
             })
             .await;
         let found = found?;
-        self.report_faulted();
+        // A waiter settles on the task's terminal publication; a fault
+        // recorded by a later, still-unpublished reserve commit is not
+        // reported before it is durable.
         let settled = found.await.map_err(Into::into);
         self.report_faulted();
         settled

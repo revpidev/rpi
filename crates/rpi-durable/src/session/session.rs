@@ -1346,7 +1346,7 @@ impl SessionImpl {
             .as_ref()
             .map(|held| held.id)
             .unwrap_or_else(|| self.next_deferred_id.fetch_add(1, Ordering::SeqCst));
-        let (previous_writes, previous_changes, mut keys, mut pinned, mut deadlines) =
+        let (previous_writes, previous_changes, mut keys, mut pinned, mut deadlines, mut replaces) =
             match previous {
                 Some(held) => (
                     Some(held.writes),
@@ -1354,8 +1354,16 @@ impl SessionImpl {
                     held.keys,
                     held.pinned,
                     held.deadlines,
+                    held.replaces,
                 ),
-                None => (None, None, Vec::new(), Vec::new(), HashMap::new()),
+                None => (
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    HashMap::new(),
+                    std::collections::HashSet::new(),
+                ),
             };
         for id in tx.document_ids() {
             if !pinned.contains(&id) {
@@ -1379,8 +1387,9 @@ impl SessionImpl {
         let current_changes = tx
             .adopt(crate::ids::Seq(0))
             .map_err(PublishFailure::adoption)?;
-        let mut changes = merge_deferred_changes(previous_changes, current_changes.clone());
-        compact_deferred_operations(&mut writes, &mut changes);
+        let mut changes =
+            merge_deferred_changes(previous_changes, current_changes.clone(), &replaces);
+        compact_deferred_operations(&mut writes, &mut changes, &mut replaces);
         if let Ok(mut deferred) = self.deferred.lock() {
             *deferred = Some(DeferredCommit {
                 id,
@@ -1390,6 +1399,7 @@ impl SessionImpl {
                 changes,
                 keys,
                 pinned: pinned.clone(),
+                replaces,
             });
         }
         if let Ok(mut set) = self.pinned.lock() {
@@ -1467,10 +1477,14 @@ impl SessionImpl {
     }
 
     async fn flush_deferred_impl(self: &Arc<Self>, only: Option<DocumentId>) -> SessionResult<()> {
+        // A barrier even without holds, as upstream `#storeHolds` (and so
+        // `unloadDocuments`): a commit admitted before this job must publish
+        // before the cache is cleared, or its adoption would re-install a
+        // document after the unload.
+        self.writer().drained().await;
         if !self.deferred_pending.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.writer().drained().await;
         let previous = self
             .deferred
             .lock()
@@ -1510,6 +1524,7 @@ impl SessionImpl {
             crate::chord::context::BACKGROUND_CONTEXT.clone(),
             Box::new(move |outcome| match outcome {
                 JobOutcome::Stored(seq) => {
+                    this.advance_deferred_metadata(&held.writes, &held.changes);
                     let result = this.publish_stored(
                         seq,
                         &held.writes,
@@ -1544,6 +1559,51 @@ impl SessionImpl {
             outcome.await.map_err(|_| SessionError::Closed)??;
         }
         Ok(())
+    }
+
+    /// Advance the cached incarnations of a maintenance-stored deferred
+    /// commit: a stored base resets the delta count, a delta adds one
+    /// (upstream `#storeHolds`'s publish callback).
+    fn advance_deferred_metadata(
+        &self,
+        writes: &[crate::types::StorageWrite],
+        changes: &[CommitChange],
+    ) {
+        let Ok(documents) = self.documents.lock() else {
+            return;
+        };
+        for change in changes {
+            let CommitChange::Document(document) = change else {
+                continue;
+            };
+            let address = crate::documents::address_id(&crate::types::DocumentAddress {
+                kind: document.record.kind.clone(),
+                scope: document.record.scope.clone(),
+                key: document.record.key.clone(),
+            });
+            let Some(loaded) = documents.get(&address) else {
+                continue;
+            };
+            if loaded.record.id != document.record.id {
+                continue;
+            }
+            let Some(crate::types::StorageWrite::DocumentChange { content, .. }) =
+                writes.iter().find(|write| {
+                    matches!(
+                        write,
+                        crate::types::StorageWrite::DocumentChange { id, .. }
+                            if *id == document.record.id
+                    )
+                })
+            else {
+                continue;
+            };
+            if content.is_base() {
+                loaded.set_deltas_since_base(0);
+            } else {
+                loaded.set_deltas_since_base(loaded.deltas_since_base() + 1);
+            }
+        }
     }
 
     fn release_pins(&self, pinned: &[DocumentId]) {
@@ -1817,6 +1877,15 @@ impl SessionImpl {
             let failure = weak.upgrade().and_then(|session| session.failure());
             source_close.close_session(failure);
         }));
+        // Close/failure may have won while the document loaded. Upstream
+        // `subscribeClose` throws from `assertUsable`; the Rust registration is
+        // inert then, so reject the attachment instead of returning one that
+        // can never end.
+        if let Err(error) = self.assert_usable() {
+            subscription_commit.unsubscribe();
+            subscription_close.unsubscribe();
+            return Err(error);
+        }
         self.attach_document(&address_id, record_id);
         let weak = Arc::downgrade(self);
         let attached = address_id.clone();
@@ -2020,6 +2089,13 @@ impl SessionImpl {
             let failure = weak.upgrade().and_then(|session| session.failure());
             watch_close.close_session(failure);
         }));
+        // As `document_state_resolved`: a registration during close is inert,
+        // so a watch created here would never receive `end`.
+        if let Err(error) = self.assert_usable() {
+            subscription_commit.unsubscribe();
+            subscription_close.unsubscribe();
+            return Err(error);
+        }
         self.attach_document(&address_id, record_id);
         let weak = Arc::downgrade(self);
         let attached = address_id.clone();
@@ -2429,13 +2505,28 @@ impl SessionImpl {
         if let Ok(mut listeners) = store.lock() {
             listeners.push((id, listener));
         }
+        let subscription_store = Arc::clone(&store);
         let subscription = Subscription::new(move || {
-            if let Ok(mut listeners) = store.lock() {
+            if let Ok(mut listeners) = subscription_store.lock() {
                 listeners.retain(|(existing, _)| *existing != id);
             }
         });
         if self.assert_usable().is_err() {
+            // Close/failure won between the check and the push: a listener
+            // still in the set never saw `notify_close`, so call it now (once,
+            // as the registration is immediately closed).
+            let removed = store.lock().ok().and_then(|mut listeners| {
+                listeners
+                    .iter()
+                    .position(|(existing, _)| *existing == id)
+                    .map(|index| listeners.remove(index).1)
+            });
             subscription.unsubscribe();
+            if let Some(listener) = removed
+                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener())).is_err()
+            {
+                self.report_listener_error("A close listener panicked".to_string(), None);
+            }
             return Subscription::new(|| {});
         }
         subscription
@@ -2475,6 +2566,7 @@ fn split_deferred(
         changes,
         pinned,
         deadlines,
+        replaces,
         ..
     } = held;
     let mut selected_writes = Vec::new();
@@ -2513,6 +2605,15 @@ fn split_deferred(
         .into_iter()
         .filter(|(id, _)| *id != only)
         .collect::<HashMap<_, _>>();
+    let selected_replaces = replaces
+        .iter()
+        .copied()
+        .filter(|id| *id == only)
+        .collect::<std::collections::HashSet<_>>();
+    let remaining_replaces = replaces
+        .into_iter()
+        .filter(|id| *id != only)
+        .collect::<std::collections::HashSet<_>>();
     let selected = DeferredCommit {
         id,
         deadline: crate::session::earliest_deferred_deadline(&selected_deadlines),
@@ -2521,6 +2622,7 @@ fn split_deferred(
         keys: crate::session::transaction::deferred_keys(&selected_changes),
         changes: selected_changes,
         pinned: selected_pinned,
+        replaces: selected_replaces,
     };
     let has_remaining = !remaining_writes.is_empty();
     let remaining = DeferredCommit {
@@ -2531,6 +2633,7 @@ fn split_deferred(
         keys: crate::session::transaction::deferred_keys(&remaining_changes),
         changes: remaining_changes,
         pinned: remaining_pinned,
+        replaces: remaining_replaces,
     };
     (Some(selected), has_remaining.then_some(remaining))
 }
@@ -2579,6 +2682,7 @@ fn merge_deferred_writes(
 fn merge_deferred_changes(
     previous: Option<Vec<CommitChange>>,
     current: Vec<CommitChange>,
+    replaces: &std::collections::HashSet<crate::ids::DocumentId>,
 ) -> Vec<CommitChange> {
     let mut merged = previous.unwrap_or_default();
     for change in current {
@@ -2590,6 +2694,13 @@ fn merge_deferred_changes(
             matches!(existing, CommitChange::Document(existing_document) if existing_document.record.id == document.record.id)
         });
         if let Some(CommitChange::Document(existing_document)) = existing {
+            if replaces.contains(&document.record.id) {
+                // The held pending operations are a replacement: later
+                // operations are covered by the current value (upstream
+                // `PendingOps` ignores pushes in its `replace` state).
+                *existing_document = document.clone();
+                continue;
+            }
             let mut operations = std::mem::take(&mut existing_document.ops);
             operations.extend(document.ops.iter().cloned());
             *existing_document = document.clone();
@@ -2604,27 +2715,53 @@ fn merge_deferred_changes(
 fn compact_deferred_operations(
     writes: &mut [crate::types::StorageWrite],
     changes: &mut [CommitChange],
+    replaces: &mut std::collections::HashSet<crate::ids::DocumentId>,
 ) {
     let mut operations_by_document = std::collections::HashMap::new();
     for change in &mut *changes {
         let CommitChange::Document(document) = change else {
             continue;
         };
+        let id = document.record.id;
+        if replaces.contains(&id) {
+            // Upstream `Hold.pending` stays in its `replace` state: later
+            // operations are covered by the current value, and the stored
+            // change is the replacement.
+            let operations = vec![crate::chord::delta::Op::Replace(document.frame_value())];
+            operations_by_document.insert(id, operations.clone());
+            document.ops = operations;
+            continue;
+        }
         let mut pending = crate::chord::delta::PendingOps::new();
         pending.push(&document.ops);
         let operations = match pending.take() {
             crate::chord::delta::PendingTake::Ops(operations) => operations,
             crate::chord::delta::PendingTake::Replace => {
+                replaces.insert(id);
                 vec![crate::chord::delta::Op::Replace(document.frame_value())]
             }
         };
-        operations_by_document.insert(document.record.id, operations.clone());
+        operations_by_document.insert(id, operations.clone());
         document.ops = operations;
     }
     for write in writes {
         let crate::types::StorageWrite::DocumentChange { id, content } = write else {
             continue;
         };
+        if replaces.contains(id) {
+            if let Some(document) = changes.iter().find_map(|change| match change {
+                CommitChange::Document(document) if document.record.id == *id => Some(document),
+                _ => None,
+            }) {
+                // An overflowed held commit stores the whole value as a base,
+                // as upstream `storeHeld` does for `replace`.
+                *content = crate::types::DocumentContent::Base {
+                    version: document.version.unwrap_or(0),
+                    value: document.value.clone().unwrap_or_default(),
+                };
+            }
+            continue;
+        }
         match content {
             crate::types::DocumentContent::Delta { ops, .. } => {
                 if let Some(operations) = operations_by_document.get(id) {

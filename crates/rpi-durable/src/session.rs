@@ -281,6 +281,10 @@ pub(crate) struct DeferredCommit {
     pub keys: Vec<String>,
     /// Documents held by this deferred commit; never evicted until flushed.
     pub pinned: Vec<crate::ids::DocumentId>,
+    /// Documents whose held operations overflowed into a replacement: the
+    /// stored change is a base and later held operations are not folded into
+    /// it (upstream `Hold.pending`'s `replace` state).
+    pub replaces: std::collections::HashSet<crate::ids::DocumentId>,
 }
 
 pub(crate) fn earliest_deferred_deadline(

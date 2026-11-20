@@ -1934,6 +1934,69 @@ async fn watch_close_is_terminal() {
     assert_eq!(watch.closed().await, WatchEnd::Ended);
 }
 
+/// A watch that attaches while close already sealed admission must reject, as
+/// upstream `subscribeClose()`'s `assertUsable()` does, instead of returning a
+/// watch whose `closed()` never resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_doc_racing_close_rejects_instead_of_hanging() {
+    let harness = open_test_session();
+    commit(&harness.session, |tx| {
+        Box::pin(async move { tx.doc(counter(), DocOwner::Session, None).await.map(|_| ()) })
+    })
+    .await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let holding = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        async move {
+            session
+                .commit(
+                    commit_fn(move |_tx| {
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        Box::pin(async move {
+                            entered.notify_one();
+                            release.notified().await;
+                            Ok(())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the line is held");
+    let watch = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .watch_doc(counter(), DocOwner::Session, &BACKGROUND_CONTEXT)
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let closing = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move { session.close(&BACKGROUND_CONTEXT).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    release.notify_one();
+    holding.await.unwrap().unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), watch)
+        .await
+        .expect("the watch must not hang")
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(SessionError::Closed) | Err(SessionError::Failed { .. })
+    ));
+    closing.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn conversation_view_ignores_custom_conversation_documents() {
     let harness = open_test_session();
@@ -3977,6 +4040,145 @@ async fn deferred_adopt_preserves_stored_delta_metadata_for_checkpoint() {
 }
 
 #[tokio::test]
+async fn deferred_deadline_flush_advances_the_stored_delta_count() {
+    static TOKEN: OnceLock<DocToken> = OnceLock::new();
+    let token = TOKEN.get_or_init(|| {
+        define_doc(DocDefinition {
+            kind: "test.deferred.deadline-metadata".to_string(),
+            version: 1,
+            scope: DocScope::Conversation,
+            history: Some(DocumentHistory::Latest),
+            fork: Some(DocumentFork::Initial),
+            family: false,
+            initial: Arc::new(|_| object(serde_json::json!({"message": "a"}))),
+            migrate: None,
+            checkpoint_when: Arc::new(|_value, _ops, revision| revision >= 1),
+        })
+    });
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    // The create stores a base; the held delta is stored by the deadline
+    // timer, not by a commit that reads or writes the document.
+    write_deferred_message(&harness.session, token, conversation, "a", Some(0.0)).await;
+    write_deferred_message(&harness.session, token, conversation, "held", Some(10.0)).await;
+    let before = harness.storage.commit_calls.lock().unwrap().len();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if harness.storage.commit_calls.lock().unwrap().len() > before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the deadline flush stores the held delta");
+    // The maintenance flush must advance `deltasSinceBase`, so this commit's
+    // checkpoint predicate sees revision 1 and stores a base (upstream
+    // `#storeHolds`).
+    write_deferred_message(&harness.session, token, conversation, "after", Some(0.0)).await;
+    let calls = harness.storage.commit_calls.lock().unwrap();
+    assert!(calls.last().unwrap()[0].iter().any(|write| matches!(
+        write,
+        rpi_durable::types::StorageWrite::DocumentChange {
+            content: rpi_durable::types::DocumentContent::Base { value, .. },
+            ..
+        } if value["message"] == "after"
+    )));
+}
+
+#[tokio::test]
+async fn deferred_overflow_stores_a_base_and_does_not_accumulate_operations() {
+    static TOKEN: OnceLock<DocToken> = OnceLock::new();
+    let token = TOKEN.get_or_init(|| {
+        conversation_doc(
+            "test.deferred.overflow",
+            1,
+            DocumentHistory::Latest,
+            DocumentFork::Initial,
+            |_| object(serde_json::json!({"message": "a"})),
+        )
+    });
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    commit(&harness.session, move |tx| {
+        Box::pin(async move {
+            tx.doc(token, DocOwner::Conversation(conversation), None)
+                .await
+                .map(|_| ())
+        })
+    })
+    .await;
+    let held = token;
+    harness
+        .session
+        .commit_with_options(
+            commit_fn(move |tx| {
+                Box::pin(async move {
+                    let document = tx
+                        .doc(held, DocOwner::Conversation(conversation), None)
+                        .await?;
+                    let mut value = document.write()?;
+                    for index in 0..=rpi_durable::chord::delta::MAX_PENDING_OPS as u64 {
+                        value[format!("k{index}")] = serde_json::json!(index);
+                    }
+                    Ok(())
+                })
+            }),
+            &BACKGROUND_CONTEXT,
+            None,
+            deferred_options(Some(60_000.0)),
+        )
+        .await
+        .expect("overflowing held commit");
+    // A held commit after the overflow must be covered by the replacement, not
+    // appended to the held operations.
+    write_deferred_message(
+        &harness.session,
+        token,
+        conversation,
+        "final",
+        Some(60_000.0),
+    )
+    .await;
+    let (observer, publications, _ends) = commit_observer();
+    let observation = harness.session.observe_commits(observer);
+    harness.session.close(&BACKGROUND_CONTEXT).await.unwrap();
+    let published = publications.lock().unwrap().clone();
+    let change = published
+        .iter()
+        .flat_map(|publication| &publication.changes)
+        .find_map(|change| match change {
+            rpi_durable::session::CommitChange::Document(document)
+                if document.record.kind == "test.deferred.overflow" =>
+            {
+                Some(document)
+            }
+            _ => None,
+        })
+        .expect("the stored held change is published");
+    assert_eq!(change.ops.len(), 1, "overflow stores a replacement");
+    assert!(matches!(
+        change.ops[0],
+        rpi_durable::chord::delta::Op::Replace(_)
+    ));
+    observation.detach.unsubscribe();
+    let calls = harness.storage.commit_calls.lock().unwrap();
+    let last = calls.last().unwrap();
+    let base = last[0]
+        .iter()
+        .find_map(|write| match write {
+            rpi_durable::types::StorageWrite::DocumentChange {
+                content: rpi_durable::types::DocumentContent::Base { value, .. },
+                ..
+            } => Some(value),
+            _ => None,
+        })
+        .expect("the overflow is stored as a base");
+    assert_eq!(base["message"], serde_json::json!("final"));
+    assert_eq!(base["k10000"], serde_json::json!(10000));
+}
+
+#[tokio::test]
 async fn deferred_write_folds_held_and_current_operations_into_one_stored_commit() {
     let harness = open_test_session();
     let conversation = create_conversation(&harness.session).await;
@@ -4323,6 +4525,44 @@ async fn close_publishes_final_deferred_changes_before_ending_commit_observers()
         ["advance", "end"]
     );
     observation.detach.unsubscribe();
+}
+
+/// `unloadDocuments()` is a barrier even without held changes: a commit
+/// admitted before it must publish before the cache is cleared, or its
+/// adoption re-installs a document after the unload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unload_documents_waits_for_an_in_flight_publication() {
+    let harness = open_test_session();
+    let gate = harness.storage.hold_commits();
+    let committing = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .commit(
+                    commit_fn(|tx| {
+                        Box::pin(async move {
+                            tx.doc(counter(), DocOwner::Session, None).await.map(|_| ())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    gate.entered().await;
+    let unloading = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move { session.unload_documents().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !unloading.is_finished(),
+        "unload must wait for the admitted publication"
+    );
+    gate.release();
+    committing.await.unwrap().unwrap();
+    unloading.await.unwrap().unwrap();
+    assert_eq!(harness.session.document_cache_sizes().cached, 0);
 }
 
 #[tokio::test]
