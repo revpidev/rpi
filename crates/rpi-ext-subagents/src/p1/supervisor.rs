@@ -213,6 +213,37 @@ pub fn read_requests(dir: &Path) -> Vec<Value> {
     requests
 }
 
+/// Persist a terminal tombstone so a late reply can be classified.
+fn write_terminal_tombstone(channel_dir: &Path, request: &Value, kind: &str) {
+    let Some(id) = request["id"].as_str() else {
+        return;
+    };
+    if crate::paths::ensure_safe_component(id, "supervisor request id").is_err() {
+        return;
+    }
+    let _ = ensure_channel_dir(channel_dir);
+    let tombstone = json!({
+        "id": id,
+        "runId": request["runId"],
+        "orchestratorSessionId": request["orchestratorSessionId"],
+        "reason": request["reason"],
+        "childIndex": request["childIndex"],
+        "terminalKind": kind,
+        "closedAt": crate::artifacts::format_iso8601(now_millis()),
+    });
+    let _ = std::fs::write(
+        channel_dir.join("terminal").join(format!("{id}.json")),
+        tombstone.to_string(),
+    );
+}
+
+/// Child-side timeout: the child stops polling, so the request must not keep
+/// a later wait/drain yielding; a late parent reply sees `timeout`.
+fn expire_request(channel_dir: &Path, request: &Value, request_path: &Path) {
+    write_terminal_tombstone(channel_dir, request, "timeout");
+    let _ = std::fs::remove_file(request_path);
+}
+
 /// Drop every pending request owned by `run_id` when the run reaches a
 /// terminal state or the host shuts down. A dead child cannot consume a
 /// reply, and a stale blocking ask would otherwise keep `subagent_wait` and
@@ -248,30 +279,13 @@ pub fn close_requests_for_run_with_kind(run_id: &str, kind: &str) -> usize {
             if request["runId"].as_str() != Some(run_id) {
                 continue;
             }
-            let Some(id) = request["id"].as_str() else {
-                continue;
-            };
-            if let Err(error) = crate::paths::ensure_safe_component(id, "supervisor request id") {
-                tracing::warn!(%error, "skipping unsafe supervisor request id");
+            if request["id"].as_str().is_none() {
                 continue;
             }
             if std::fs::remove_file(&path).is_err() {
                 continue;
             }
-            let _ = ensure_channel_dir(&channel.path());
-            let tombstone = json!({
-                "id": id,
-                "runId": run_id,
-                "orchestratorSessionId": request["orchestratorSessionId"],
-                "reason": request["reason"],
-                "childIndex": request["childIndex"],
-                "terminalKind": kind,
-                "closedAt": crate::artifacts::format_iso8601(now_millis()),
-            });
-            let _ = std::fs::write(
-                channel.path().join("terminal").join(format!("{id}.json")),
-                tombstone.to_string(),
-            );
+            write_terminal_tombstone(&channel.path(), &request, kind);
             closed += 1;
         }
     }
@@ -449,6 +463,7 @@ impl ChildSupervisorContext {
                 return ok_result(&message);
             }
             if Instant::now() >= deadline {
+                expire_request(&self.channel_dir, &request, &request_path);
                 return error_result("Timed out waiting for the supervisor's reply.");
             }
             std::thread::sleep(Duration::from_millis(500));
@@ -733,6 +748,7 @@ pub fn parent_supervisor_action(
                     if let Err(error) = std::fs::write(&reply_path, reply.to_string()) {
                         return error_result(&format!("failed to write the reply: {error}"));
                     }
+                    write_terminal_tombstone(&channel.path(), &request, "answered");
                     let _ = std::fs::remove_file(&request_path);
                     return ok_result(&format!("Replied to supervisor request {reply_to}."));
                 }
@@ -1069,6 +1085,53 @@ mod tests {
         assert_eq!(reply["isError"], Value::Bool(false));
         assert!(channel.join("replies").join("req1.json").exists());
         assert!(!channel.join("requests").join("req1.json").exists());
+        // A second reply is classified as already answered.
+        let again =
+            parent_supervisor_action("reply", Some("req1"), Some("again"), "session-a", &root);
+        assert!(
+            again["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("already answered"),
+            "{again}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeout_writes_a_tombstone_and_closes_the_request() {
+        let root = channels_root().join(format!("timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let channel = root.join("runz-worker-0");
+        ensure_channel(&channel);
+        let request = json!({
+            "type": "subagent.supervisor.request",
+            "id": "req-timeout",
+            "createdAt": "2026-08-14T00:00:00.000Z",
+            "reason": "need_decision",
+            "message": "Ship?",
+            "orchestratorSessionId": "session-a",
+            "runId": "runz",
+        });
+        let request_path = channel.join("requests").join("req-timeout.json");
+        std::fs::write(&request_path, request.to_string()).unwrap();
+        expire_request(&channel, &request, &request_path);
+        assert!(!request_path.exists());
+        assert!(channel.join("terminal").join("req-timeout.json").exists());
+        let reply = parent_supervisor_action(
+            "reply",
+            Some("req-timeout"),
+            Some("late"),
+            "session-a",
+            &root,
+        );
+        assert!(
+            reply["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("already timeout"),
+            "{reply}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

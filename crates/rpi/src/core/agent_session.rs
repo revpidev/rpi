@@ -61,7 +61,9 @@ use tokio_util::sync::CancellationToken;
 use crate::core::auth_guidance::{
     format_no_api_key_found_message, format_no_model_selected_message,
 };
-use crate::core::compaction_runner::{CompactionEvent, CompactionRunner, PendingSessionCompact};
+use crate::core::compaction_runner::{
+    CompactionEvent, CompactionRunner, PendingSessionCompact, PendingSessionCompactFailed,
+};
 use crate::core::extensions::{
     BeforeAgentStartTrigger, ExtensionErrorInfo, ExtensionMode, ExtensionRunner,
     ExtensionRunnerRef, InputEventResult, InputSource, SessionStartEvent, SessionStartReason,
@@ -1259,8 +1261,10 @@ impl AgentSession {
                             .compact_before_next_assistant_response(&turn.context.messages)
                             .await;
                         let pending = runner.take_pending_session_compact();
+                        let failed = runner.take_pending_session_compact_failed();
                         drop(runner);
                         session.emit_pending_session_compact(pending).await;
+                        session.emit_pending_session_compact_failed(failed).await;
                         messages
                     };
                     let mut context = AgentContext {
@@ -5786,8 +5790,10 @@ impl AgentSession {
             // V19-03 S45: emit after the lock is released so `ctx.isIdle`
             // already reflects the completed compaction.
             let pending = runner.take_pending_session_compact();
+            let failed = runner.take_pending_session_compact_failed();
             drop(runner);
             self.emit_pending_session_compact(pending).await;
+            self.emit_pending_session_compact_failed(failed).await;
             result
         };
         // `_clearManualCompactionState` (agent-session.ts:1926-1929
@@ -5813,8 +5819,10 @@ impl AgentSession {
             .check_compaction(assistant_message, skip_aborted_check)
             .await;
         let pending = runner.take_pending_session_compact();
+        let failed = runner.take_pending_session_compact_failed();
         drop(runner);
         self.emit_pending_session_compact(pending).await;
+        self.emit_pending_session_compact_failed(failed).await;
         self.resolve_idle_wait_if_idle();
         outcome
     }
@@ -6943,6 +6951,26 @@ impl AgentSession {
                 pending.from_extension,
                 pending.reason.as_str(),
                 pending.will_retry,
+            )
+            .await;
+    }
+
+    /// Emit a deferred `session_compact_failed` after the compaction lock was
+    /// released (V19-03 S45 failure path).
+    async fn emit_pending_session_compact_failed(
+        &self,
+        pending: Option<PendingSessionCompactFailed>,
+    ) {
+        let Some(pending) = pending else {
+            return;
+        };
+        self.runner()
+            .emit_session_compact_failed(
+                pending.reason.as_str(),
+                pending.error_message.as_deref(),
+                pending.aborted,
+                pending.will_retry,
+                pending.from_extension,
             )
             .await;
     }

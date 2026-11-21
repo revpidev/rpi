@@ -132,15 +132,15 @@ fn recording_ext(records: Records, events: &[&'static str]) -> InlineExtension {
 /// Records `ctx.is_idle()` from inside a `session_compact` handler: the
 /// host must emit the event only after the compaction lock is released
 /// (V19-03 S45), otherwise the deferred wake can never observe idle.
-fn idle_recording_ext(records: Records) -> InlineExtension {
+fn idle_recording_ext(records: Records, event: &'static str) -> InlineExtension {
     let factory: ExtensionFactory = Arc::new(move |api| {
         let records = records.clone();
         api.on(
-            "session_compact",
+            event,
             Arc::new(move |payload, ctx| {
                 let idle = ctx.is_idle().unwrap_or(false);
                 records.lock().unwrap_or_else(|e| e.into_inner()).push((
-                    "session_compact".to_string(),
+                    event.to_string(),
                     json!({ "idle": idle, "payload": payload }),
                 ));
                 Box::pin(async { Ok(Value::Null) })
@@ -837,8 +837,12 @@ async fn fixture_with_settings(
 async fn session_compact_failed_payload_shape_on_threshold_failure() {
     let records: Records = Arc::new(Mutex::new(Vec::new()));
     let host = NativeExtensionHost::new("/compact-failed-cwd");
+    let idle_records: Records = Arc::new(Mutex::new(Vec::new()));
     let errors = host
-        .load_inline(&[recording_ext(records.clone(), &["session_compact_failed"])])
+        .load_inline(&[
+            recording_ext(records.clone(), &["session_compact_failed"]),
+            idle_recording_ext(idle_records.clone(), "session_compact_failed"),
+        ])
         .await;
     assert!(errors.is_empty(), "{errors:?}");
 
@@ -912,6 +916,14 @@ async fn session_compact_failed_payload_shape_on_threshold_failure() {
             && error_message.contains("summarizer exploded"),
         "errorMessage: {error_message}"
     );
+    // V19-03 S45 failure path: the handler also observes the post-lock idle
+    // state, so the deferred wake can flush at compaction end.
+    let idle_records = idle_records.lock().unwrap_or_else(|e| e.into_inner());
+    let failed_idle = idle_records
+        .iter()
+        .find(|(event, _)| event == "session_compact_failed")
+        .expect("idle recorder saw session_compact_failed");
+    assert_eq!(failed_idle.1["idle"], json!(true), "{:?}", failed_idle.1);
 }
 
 /// Without a registered handler the failure path is silent (upstream
@@ -1345,7 +1357,7 @@ async fn session_compact_handler_observes_idle_after_lock_release() {
     let records: Records = Arc::new(Mutex::new(Vec::new()));
     let host = NativeExtensionHost::new("/compact-idle");
     let errors = host
-        .load_inline(&[idle_recording_ext(records.clone())])
+        .load_inline(&[idle_recording_ext(records.clone(), "session_compact")])
         .await;
     assert!(errors.is_empty(), "{errors:?}");
 

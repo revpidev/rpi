@@ -122,6 +122,18 @@ pub struct PendingSessionCompact {
     pub will_retry: bool,
 }
 
+/// A `session_compact_failed` event deferred until the compaction lock is
+/// released (V19-03 S45): the failure path has the same idle-transition
+/// requirement as the success path.
+#[derive(Debug, Clone)]
+pub struct PendingSessionCompactFailed {
+    pub reason: CompactionReason,
+    pub error_message: Option<String>,
+    pub aborted: bool,
+    pub will_retry: bool,
+    pub from_extension: bool,
+}
+
 /// The bare error text upstream puts into `errorMessage` (`error.message`),
 /// without the `RpiError` Display prefix.
 fn raw_error_message(error: &RpiError) -> String {
@@ -214,6 +226,7 @@ pub struct CompactionRunner {
     /// timer seam, so deferring the emit makes the same transition observable
     /// without polling.
     pending_session_compact: Option<PendingSessionCompact>,
+    pending_session_compact_failed: Option<PendingSessionCompactFailed>,
     /// Manual compaction's token — upstream `_compactionAbortController`
     /// (agent-session.ts:327). The prompt rejection reads only this cell
     /// (agent-session.ts:1133).
@@ -268,6 +281,7 @@ impl CompactionRunner {
             emit,
             overflow_recovery_attempted: false,
             pending_session_compact: None,
+            pending_session_compact_failed: None,
             active_token: AbortTokenCell::default(),
             auto_active_token: AbortTokenCell::default(),
             extension_runner: None,
@@ -289,6 +303,12 @@ impl CompactionRunner {
     /// the post-compaction state.
     pub fn take_pending_session_compact(&mut self) -> Option<PendingSessionCompact> {
         self.pending_session_compact.take()
+    }
+
+    /// Take the deferred `session_compact_failed` payload (if any). The
+    /// caller must drop the compaction lock before emitting it.
+    pub fn take_pending_session_compact_failed(&mut self) -> Option<PendingSessionCompactFailed> {
+        self.pending_session_compact_failed.take()
     }
 
     /// T15 W2: install the extension runner slot (AgentSession passes its
@@ -420,8 +440,8 @@ impl CompactionRunner {
     /// when handlers are registered for `session_compact_failed` — zero
     /// overhead without extensions, like the upstream `hasHandlers` short
     /// circuit.
-    async fn emit_session_compact_failed(
-        &self,
+    fn emit_session_compact_failed(
+        &mut self,
         reason: CompactionReason,
         error_message: Option<String>,
         aborted: bool,
@@ -434,15 +454,13 @@ impl CompactionRunner {
         if !runner.has_handlers("session_compact_failed") {
             return;
         }
-        runner
-            .emit_session_compact_failed(
-                reason.as_str(),
-                error_message.as_deref(),
-                aborted,
-                will_retry,
-                from_extension,
-            )
-            .await;
+        self.pending_session_compact_failed = Some(PendingSessionCompactFailed {
+            reason,
+            error_message,
+            aborted,
+            will_retry,
+            from_extension,
+        });
     }
 
     fn emit(&self, event: CompactionEvent) {
@@ -551,8 +569,7 @@ impl CompactionRunner {
             aborted,
             false,
             from_extension,
-        )
-        .await;
+        );
         outcome
     }
 
@@ -873,8 +890,7 @@ impl CompactionRunner {
                     false,
                     false,
                     false,
-                )
-                .await;
+                );
                 return false;
             }
 
@@ -973,7 +989,7 @@ impl CompactionRunner {
     /// catch's `aborted = signal.aborted || cancelledByExtension`
     /// classification: clear the idle-blocking cell first (3852cb2b8), then
     /// emit the aborted `compaction_end` pair.
-    async fn abort_auto_outcome(&self, reason: CompactionReason, from_extension: bool) -> bool {
+    async fn abort_auto_outcome(&mut self, reason: CompactionReason, from_extension: bool) -> bool {
         *lock_abort(&self.auto_active_token) = None;
         self.emit(CompactionEvent::CompactionEnd {
             reason,
@@ -982,8 +998,7 @@ impl CompactionRunner {
             will_retry: false,
             error_message: None,
         });
-        self.emit_session_compact_failed(reason, None, true, false, from_extension)
-            .await;
+        self.emit_session_compact_failed(reason, None, true, false, from_extension);
         false
     }
 
@@ -1148,8 +1163,7 @@ impl CompactionRunner {
                         aborted,
                         false,
                         from_extension,
-                    )
-                    .await;
+                    );
                 }
                 false
             }

@@ -156,6 +156,7 @@ pub fn parse_tasks(tasks: &Value, max_tasks: u64) -> Result<Vec<TaskEntry>, Stri
                     .filter(|s| !s.is_empty())
                     .map(crate::paths::expand_tilde_and_resolve),
                 output,
+                inherited_output: None,
                 output_mode: match object.get("outputMode").and_then(Value::as_str) {
                     Some("inline") | Some("file-only") => object
                         .get("outputMode")

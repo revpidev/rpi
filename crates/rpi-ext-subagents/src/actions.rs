@@ -238,12 +238,13 @@ pub fn format_agent_capabilities_list(
 fn model_unavailable(
     model: &str,
     available_models: &[crate::launch::model::AvailableModel],
+    preferred_provider: Option<&str>,
 ) -> bool {
     !available_models.is_empty()
         && crate::launch::model::resolve_subagent_model_candidate(
             model,
             Some(available_models),
-            None,
+            preferred_provider,
         )
         .is_none()
 }
@@ -275,7 +276,13 @@ pub fn format_agent_capabilities_list_with_models(
                 tools = format!("{tools}; excludes: {}", agent.exclude_tools.join(", "));
             }
             let model = match &agent.model {
-                Some(model) if model_unavailable(model, available_models) => {
+                Some(model)
+                    if model_unavailable(
+                        model,
+                        available_models,
+                        agent.model_provider.as_deref(),
+                    ) =>
+                {
                     format!("{model} (unavailable in the active model registry)")
                 }
                 Some(model) => model.clone(),
@@ -400,11 +407,9 @@ pub fn agent_capabilities_snapshot_with_models(
         if let Some(aliases) = &agent.aliases {
             record["aliases"] = json!(aliases);
         }
-        if agent
-            .model
-            .as_deref()
-            .is_some_and(|model| model_unavailable(model, available_models))
-        {
+        if agent.model.as_deref().is_some_and(|model| {
+            model_unavailable(model, available_models, agent.model_provider.as_deref())
+        }) {
             record["model"]["unavailable"] = json!(true);
         }
         record
@@ -632,10 +637,11 @@ fn revived_run_params(
     if let Some(thinking) = thinking.filter(|value| !value.is_empty()) {
         params["thinking"] = json!(thinking);
     }
-    // S11/S42: the trusted record's output path is part of the revived
-    // launch contract; dropping it made a resumed child write elsewhere.
+    // S11/S42: the trusted record's output is an *inherited* path, not a
+    // call-level `params.output`: the resumed run must write a suffixed file
+    // next to the original report, never overwrite it (#2840).
     if let Some(output) = output.filter(|value| !value.is_empty()) {
-        params["output"] = json!(output);
+        params["inheritedOutput"] = json!(output);
     }
     params
 }
@@ -1076,7 +1082,7 @@ fn handle_management_action_inner(
                         let state = snapshot["state"].as_str().unwrap_or_default();
                         if matches!(
                             state,
-                            "complete" | "failed" | "stopped" | "paused" | "rejected"
+                            "complete" | "failed" | "stopped" | "paused" | "rejected" | "partial"
                         ) {
                             return ToolOutcome::error(format!(
                                 "invalid_state: Background run {} is {state}; stop only supports running async runs.",
@@ -3448,13 +3454,33 @@ mod tests {
         assert_eq!(params["cwd"], json!("/tmp/child-cwd"));
         assert_eq!(params["model"], json!("anthropic/model"));
         assert_eq!(params["thinking"], json!("high"));
-        assert_eq!(params["output"], json!("/tmp/report.md"));
+        assert_eq!(params["inheritedOutput"], json!("/tmp/report.md"));
+        assert!(params.get("output").is_none());
         assert_eq!(params["async"], json!(true));
         let bare = revived_run_params("scout", "x", "/tmp/s.jsonl", None, None, None, None);
         assert!(bare.get("cwd").is_none());
         assert!(bare.get("model").is_none());
         assert!(bare.get("thinking").is_none());
-        assert!(bare.get("output").is_none());
+        assert!(bare.get("inheritedOutput").is_none());
+
+        // Full resume param flow: the record output is inherited and gets
+        // the new run id suffix; it never becomes a call-level output.
+        let params = revived_run_params(
+            "worker",
+            "continue",
+            "/tmp/child.jsonl",
+            None,
+            None,
+            None,
+            Some("/x/report.md"),
+        );
+        assert!(params.get("output").is_none());
+        let spec =
+            crate::p1::launch_child::ChildSpec::from_params(params.as_object().expect("object"));
+        assert_eq!(
+            crate::p1::launch_child::resolved_output_path(&spec, None, "abcdef12"),
+            Some(std::path::PathBuf::from("/x/report.abcdef12.md"))
+        );
     }
 
     /// Integral JSON floats are accepted like `Number.isInteger(1.0)`;
@@ -4686,5 +4712,26 @@ mod tests {
         assert!(detail.contains("Thinking: high"));
         assert!(detail.contains("Default context: fork"));
         assert!(detail.contains("System Prompt:"));
+    }
+
+    #[test]
+    fn model_availability_uses_the_agent_provider_preference() {
+        let models = vec![
+            crate::launch::model::AvailableModel {
+                full_id: "alpha/shared".into(),
+                provider: "alpha".into(),
+                id: "shared".into(),
+            },
+            crate::launch::model::AvailableModel {
+                full_id: "beta/shared".into(),
+                provider: "beta".into(),
+                id: "shared".into(),
+            },
+        ];
+        assert!(!model_unavailable("shared", &models, Some("alpha")));
+        assert!(!model_unavailable("shared", &models, Some("beta")));
+        assert!(model_unavailable("missing", &models, Some("alpha")));
+        // An empty registry means "unknown", not "unavailable".
+        assert!(!model_unavailable("missing", &[], Some("alpha")));
     }
 }

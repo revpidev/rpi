@@ -523,11 +523,16 @@ pub fn validate_require_launcher_shape(
 /// `handoffs/<run>.json` is the durable cleanup report.
 fn worktree_resume_block(cwd: &str, run_id: &str) -> Option<String> {
     let path = Path::new(cwd);
-    let name = path.file_name()?.to_str()?;
-    if !name.starts_with(&format!("rpi-worktree-{run_id}-")) {
-        return None;
-    }
-    let manifest = path
+    let prefix = format!("rpi-worktree-{run_id}-");
+    // The recorded cwd may be a worktree subdirectory; walk up to the
+    // managed worktree root before looking for its handoff manifest.
+    let root = path.ancestors().find(|candidate| {
+        candidate
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&prefix))
+    })?;
+    let manifest = root
         .parent()?
         .join("handoffs")
         .join(format!("{run_id}.json"));
@@ -541,13 +546,14 @@ fn worktree_resume_block(cwd: &str, run_id: &str) -> Option<String> {
             "Background run {run_id} child working directory '{cwd}' has an unreadable worktree handoff manifest; resume is refused."
         ));
     };
+    let root_text = root.to_string_lossy();
     let task = value["groups"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|group| group["cleanup"]["tasks"].as_array())
         .flatten()
-        .find(|task| task["path"].as_str() == Some(cwd));
+        .find(|task| task["path"].as_str() == Some(root_text.as_ref()));
     match task {
         Some(task)
             if task["worktreeRemoved"].as_bool() == Some(true)
@@ -920,6 +926,10 @@ mod tests {
             "preserved": false,
         }));
         assert!(worktree_resume_block(&cwd_text, &run_id).is_none());
+        // A recorded cwd inside the worktree resolves to the same root.
+        let nested = cwd.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(worktree_resume_block(&nested.to_string_lossy(), &run_id).is_none());
         write(json!({
             "path": cwd_text,
             "worktreeRemoved": false,

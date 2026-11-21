@@ -1573,6 +1573,8 @@ fn dispatch_message(message: &Value) -> Value {
                     session_switch::session_start(&calls, start_reason);
                     tool_activation::restore_if_registered(&calls, start_reason);
                     compaction_wake::bind_session(session_id.as_deref());
+                    runner::background::bind_current_session(session_id.as_deref());
+                    crate::fleet::bind_session(session_id.clone());
                     runner::background::resend_pending_results(&calls, session_id.as_deref());
                     Value::Null
                 }

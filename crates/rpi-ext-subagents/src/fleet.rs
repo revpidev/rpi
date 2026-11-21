@@ -69,6 +69,23 @@ const MAX_TREE_ROWS: usize = 6;
 /// on exit so the next 0→1 boundary can respawn).
 static FLEET_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// S24: the session the singleton loop renders for. `session_start` rebinds
+/// it after take/leave so the strip follows the active session without
+/// waiting for a new run to respawn the loop.
+static CURRENT_SESSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn bind_session(session_id: Option<String>) {
+    *CURRENT_SESSION.lock().unwrap_or_else(|e| e.into_inner()) =
+        session_id.filter(|id| !id.is_empty());
+}
+
+fn current_session() -> Option<String> {
+    CURRENT_SESSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// One run's strip row.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct FleetRow {
@@ -479,15 +496,16 @@ pub fn ensure_refresh_loop(
     calls: AsyncHostCalls,
     session_id: Option<String>,
 ) {
+    bind_session(session_id.clone());
     if FLEET_LOOP_RUNNING.swap(true, Ordering::SeqCst) {
-        return; // already ticking
+        return; // already ticking; the bound session is updated above
     }
     runtime.spawn(async move {
         fleet_refresh_loop(calls, session_id).await;
     });
 }
 
-async fn fleet_refresh_loop(calls: AsyncHostCalls, session_id: Option<String>) {
+async fn fleet_refresh_loop(calls: AsyncHostCalls, _initial_session: Option<String>) {
     let mut linger: HashMap<String, (u64, u64)> = HashMap::new();
     let mut last_key = String::new();
     let mut mounted = false;
@@ -496,6 +514,7 @@ async fn fleet_refresh_loop(calls: AsyncHostCalls, session_id: Option<String>) {
     let fleet_expanded = config::load_config().fleet_expanded();
     loop {
         tokio::time::sleep(Duration::from_millis(REFRESH_MS)).await;
+        let session_id = current_session();
         let now = now_millis();
         // #55 supervisor-ask delivery (upstream `poll()` — the wake face the
         // port originally dropped): every tick, surface session-owned

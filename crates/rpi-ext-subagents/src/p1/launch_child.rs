@@ -24,7 +24,7 @@ use crate::{ParentSession, PluginRuntime, session_fork};
 
 /// Per-child output override (`normalizeOutputOverride` chain step
 /// semantics): a path, disabled, or inherit the agent default.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum OutputOverride {
     Path(PathBuf),
     Disabled,
@@ -47,6 +47,11 @@ pub struct ChildSpec {
     pub context_profile: bool,
     pub cwd: Option<PathBuf>,
     pub output: OutputOverride,
+    /// S11/S42: a resumed run's recorded output path. It is an *inherited*
+    /// output (upstream `inheritedOutputPath`), not a call-level
+    /// `params.output`: the new run writes a suffixed file and never
+    /// overwrites the original report.
+    pub inherited_output: Option<PathBuf>,
     /// #1305 call/step-level `outputMode`: inline | file-only (defaults
     /// through to the agent's own `outputMode`, then "inline").
     pub output_mode: Option<String>,
@@ -119,6 +124,11 @@ impl ChildSpec {
                 .filter(|s| !s.is_empty())
                 .map(crate::paths::expand_tilde_and_resolve),
             output,
+            inherited_output: object
+                .get("inheritedOutput")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .map(crate::paths::expand_tilde_and_resolve),
             output_mode: match object.get("outputMode").and_then(Value::as_str) {
                 Some("inline") | Some("file-only") => object
                     .get("outputMode")
@@ -552,20 +562,11 @@ pub fn approve_workflow_child(
     // The permission handler must see the path the child will actually
     // write: a call-level output wins, otherwise the agent's default output
     // (with the resume suffix applied) is the effective path (R19-S13).
-    let output_path = match &spec.output {
-        OutputOverride::Path(path) => Some(path.clone()),
-        OutputOverride::Disabled => None,
-        OutputOverride::Inherit => agent.and_then(|agent| {
-            agent.output.as_deref().map(|raw| {
-                let path = crate::paths::expand_tilde_and_resolve(raw);
-                if spec.session_file.is_some() {
-                    suffixed_output_path(&path, &ctx.run_id.chars().take(8).collect::<String>())
-                } else {
-                    path
-                }
-            })
-        }),
-    };
+    let output_path = resolved_output_path(
+        spec,
+        agent.and_then(|agent| agent.output.as_deref()),
+        &ctx.run_id,
+    );
     if let Some(path) = output_path {
         args["output"] = json!(path.to_string_lossy());
     }
@@ -663,6 +664,31 @@ pub fn preflight_self_extension(
 
 /// `<dir>/<name>.<suffix><ext>` next to `output_path`, with `.md` when it has
 /// no extension (`suffixedOutputPath`, subagent-executor.ts:3737-3740).
+/// Effective output path for a child: call-level `output` wins; a resumed
+/// run's recorded output is inherited and gets the new run id suffix so the
+/// original report is never overwritten; otherwise the agent default applies.
+pub(crate) fn resolved_output_path(
+    spec: &ChildSpec,
+    agent_output: Option<&str>,
+    run_id: &str,
+) -> Option<std::path::PathBuf> {
+    match &spec.output {
+        OutputOverride::Path(path) => Some(path.clone()),
+        OutputOverride::Disabled => None,
+        OutputOverride::Inherit => spec
+            .inherited_output
+            .clone()
+            .or_else(|| agent_output.map(crate::paths::expand_tilde_and_resolve))
+            .map(|path| {
+                if spec.session_file.is_some() {
+                    suffixed_output_path(&path, &run_id.chars().take(8).collect::<String>())
+                } else {
+                    path
+                }
+            }),
+    }
+}
+
 fn suffixed_output_path(output_path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let stem = output_path
         .file_stem()
@@ -975,21 +1001,7 @@ pub async fn run_child_async(
     // Output path: child override > agent frontmatter. A resumed run without
     // its own output must not overwrite the report the original run owns
     // (#2840): write `<name>.<new run id prefix><ext>` next to it instead.
-    let output_path = match &spec.output {
-        OutputOverride::Path(path) => Some(path.clone()),
-        OutputOverride::Disabled => None,
-        OutputOverride::Inherit => agent
-            .output
-            .as_deref()
-            .map(crate::paths::expand_tilde_and_resolve)
-            .map(|path| {
-                if spec.session_file.is_some() {
-                    suffixed_output_path(&path, &ctx.run_id.chars().take(8).collect::<String>())
-                } else {
-                    path
-                }
-            }),
-    };
+    let output_path = resolved_output_path(spec, agent.output.as_deref(), &ctx.run_id);
 
     // Effective output mode (#1305, subagent-executor.ts:3260 @ 0fc0eebb):
     // call/step param > agent frontmatter/builtin override > "inline".
@@ -1729,6 +1741,63 @@ mod te18_gate_budget_tests {
 
         // Path resolved: nothing is rejected either way.
         assert!(preflight_self_extension(&names_all, &agents, resolved).is_none());
+    }
+
+    #[test]
+    fn resumed_inherited_output_never_overwrites_the_original_report() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-resume-output-{}-{}",
+            std::process::id(),
+            crate::runner::budget::random_run_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("report.md");
+        std::fs::write(&original, "original report").unwrap();
+
+        let mut child = ChildSpec {
+            agent_name: "worker".into(),
+            task: "continue".into(),
+            ..Default::default()
+        };
+        child.output = OutputOverride::Inherit;
+        child.inherited_output = Some(original.clone());
+        child.session_file = Some(dir.join("child.jsonl"));
+        let resolved = resolved_output_path(&child, Some("/agent/default.md"), "abcdef12")
+            .expect("inherited output");
+        assert_eq!(resolved, dir.join("report.abcdef12.md"));
+        assert_ne!(resolved, original);
+        assert_eq!(
+            std::fs::read_to_string(&original).unwrap(),
+            "original report"
+        );
+
+        // A call-level output still wins over the inherited path.
+        child.output = OutputOverride::Path(dir.join("explicit.md"));
+        assert_eq!(
+            resolved_output_path(&child, None, "abcdef12").unwrap(),
+            dir.join("explicit.md")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_params_reads_the_internal_inherited_output_key() {
+        let parsed = ChildSpec::from_params(
+            json!({
+                "agent": "worker",
+                "task": "continue",
+                "sessionFile": "/tmp/child.jsonl",
+                "inheritedOutput": "/x/report.md",
+            })
+            .as_object()
+            .unwrap(),
+        );
+        assert_eq!(parsed.output, OutputOverride::Inherit);
+        assert_eq!(
+            parsed.inherited_output,
+            Some(std::path::PathBuf::from("/x/report.md"))
+        );
+        assert!(parsed.session_file.is_some());
     }
 
     #[test]

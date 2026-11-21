@@ -29,6 +29,23 @@ pub fn async_runs_dir() -> PathBuf {
 pub fn async_results_dir() -> PathBuf {
     crate::paths::temp_root_dir().join("async-subagent-results")
 }
+/// Current parent session id for completion delivery (S24 leave/take): the
+/// run's recorded owner must match this before `sendMessage` fires. `None`
+/// keeps the single-window fallback.
+static CURRENT_SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn bind_current_session(session_id: Option<&str>) {
+    *CURRENT_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) =
+        session_id.filter(|id| !id.is_empty()).map(str::to_string);
+}
+
+fn current_session_id() -> Option<String> {
+    CURRENT_SESSION_ID
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 pub fn spawn_budgets_dir() -> PathBuf {
     crate::paths::temp_root_dir().join("spawn-budgets")
 }
@@ -770,7 +787,9 @@ pub(crate) fn recorded_pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
 /// host died. The ledger is parent-owned (launch folder, beside
 /// `recovery.json`) so a child cannot seed arbitrary pids through its
 /// writable run folder. Append-only, so parallel children never clobber each
-/// other.
+/// other. A same-uid malicious child is outside this ledger's threat model;
+/// signal targets are still validated (self/init/ancestors/process-group
+/// leader) before any kill.
 pub fn record_child_pid(run_id: &str, pid: u32) {
     if pid == 0 {
         return;
@@ -1894,25 +1913,50 @@ impl AsyncNotify {
             handoff_path,
         });
         if let Some(calls) = &self.calls {
-            // sendMessage is synchronous through the ABI envelope; acceptance
-            // is any non-error response. A failed delivery keeps the result
-            // file for `resend_pending_results` on the next session start
-            // (#3032/#2968) and records one diagnostic event.
-            let trigger_turn = !crate::compaction_wake::defer_wake(self.session_id.as_deref());
-            match send_completion_message(calls, &details, trigger_turn) {
-                Ok(()) => {
-                    let _ = std::fs::remove_file(&result_path);
-                }
-                Err(error) => {
-                    append_event(
-                        handle.run_dir.as_path(),
-                        "run.result_delivery_failed",
-                        json!({
-                            "runId": run_id,
-                            "error": error,
-                            "resultPath": result_path.to_string_lossy(),
-                        }),
-                    );
+            // S24 leave/take: only deliver into the run's owner session. A
+            // mismatch keeps the result file for `resend_pending_results`
+            // when that owner becomes active again.
+            let owner = status["sessionId"].as_str();
+            let current = current_session_id();
+            let owned = match (owner, current.as_deref()) {
+                (Some(owner), Some(current)) => owner == current,
+                _ => true,
+            };
+            if !owned {
+                append_event(
+                    handle.run_dir.as_path(),
+                    "run.completion_deferred",
+                    json!({
+                        "runId": run_id,
+                        "reason": "owner-session-mismatch",
+                        "owner": owner,
+                        "current": current,
+                    }),
+                );
+            } else {
+                // sendMessage is synchronous through the ABI envelope; acceptance
+                // is any non-error response. A failed delivery keeps the result
+                // file for `resend_pending_results` on the next session start
+                // (#3032/#2968) and records one diagnostic event.
+                // The owner may have changed via take; defer against the
+                // current owner, not the launch-time binding.
+                let notice_session = status["sessionId"].as_str().or(self.session_id.as_deref());
+                let trigger_turn = !crate::compaction_wake::defer_wake(notice_session);
+                match send_completion_message(calls, &details, trigger_turn) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&result_path);
+                    }
+                    Err(error) => {
+                        append_event(
+                            handle.run_dir.as_path(),
+                            "run.result_delivery_failed",
+                            json!({
+                                "runId": run_id,
+                                "error": error,
+                                "resultPath": result_path.to_string_lossy(),
+                            }),
+                        );
+                    }
                 }
             }
             // Bus event (subagent:async-complete) is observation-only.
@@ -4461,6 +4505,68 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn completion_is_not_delivered_to_a_non_owner_session() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("notify-owner-{}", std::process::id());
+        let run_dir = async_runs_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let status = json!({
+            "runId": run_id,
+            "sessionId": "session-old",
+            "mode": "single",
+            "state": STATE_COMPLETE,
+            "steps": [{ "agent": "scout", "status": "complete" }],
+        });
+        crate::artifacts::write_metadata(&run_dir.join("status.json"), &status).unwrap();
+        let handle = Arc::new(AsyncRunHandle {
+            run_id: run_id.clone(),
+            status: Arc::new(RwLock::new(status)),
+            control: Arc::new(AsyncControl::default()),
+            run_dir: run_dir.clone(),
+            started_ms: 0,
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
+        });
+        let calls = crate::AsyncHostCalls {
+            call: fake_notify_host_call,
+            cookie: 0,
+        };
+        let notify = AsyncNotify {
+            calls: Some(calls),
+            session_id: Some("session-old".to_string()),
+        };
+        let result_path = async_results_dir().join(format!("{run_id}.json"));
+        let _ = std::fs::remove_file(&result_path);
+
+        FAKE_SEND_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        let before = FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        bind_current_session(Some("session-new"));
+        notify.send(&handle, STATE_COMPLETE, "done", None).await;
+        assert_eq!(
+            FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "non-owner session must not receive the completion"
+        );
+        assert!(result_path.exists(), "result stays pending for the owner");
+        let events = std::fs::read_to_string(run_dir.join("events.jsonl")).unwrap_or_default();
+        assert!(events.contains("run.completion_deferred"), "{events}");
+
+        bind_current_session(Some("session-old"));
+        notify.send(&handle, STATE_COMPLETE, "done", None).await;
+        assert!(
+            FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "owner session receives the completion"
+        );
+        assert!(!result_path.exists());
+        bind_current_session(None);
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[tokio::test]
     async fn notify_send_records_result_write_failure_event() {
         let (handle, dir) = te17_handle("send-fail");
         let run_id = handle.run_id.clone();
@@ -5230,6 +5336,7 @@ pub(crate) mod tests {
                     Value::Bool(false) => crate::p1::launch_child::OutputOverride::Disabled,
                     _ => crate::p1::launch_child::OutputOverride::Inherit,
                 },
+                inherited_output: None,
                 timeout_ms: None,
                 child_index: index,
                 skills: None,

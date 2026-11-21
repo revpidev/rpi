@@ -729,6 +729,7 @@ pub async fn run_chain_async_with_step_sink(
             context: step.context,
             context_profile: step.context_profile,
             cwd: step.cwd.clone(),
+            inherited_output: None,
             output: match output_override {
                 Some(path) => OutputOverride::Path(path),
                 None => OutputOverride::Disabled,
