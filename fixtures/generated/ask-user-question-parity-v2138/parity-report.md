@@ -18,8 +18,8 @@ typebox: 1.3.6
 - state/key-router.ts: 9f4ad8bf7ead9afb50fa09b1143c5864a2da7f4cacb9f2ceef733eaad3216782
 - view/components/preview/preview-layout-decider.ts: 7baf9ecd1db8af8383d2f792d69d4fd9b22623a7cbd29e1a95bc9fd480796a3b
 - view/components/preview/preview-box-renderer.ts: 20b900ead8a0e71f005aadb18c00103b2dff87391ec8c8011ebd3c47540a8c33
-- external/pi/packages/tui/src/keys.ts (pi-tui stub): 40cd0229bbc36cdcac24f3bdd2fce53f060ff4fe6f8522e239135212033d37f2
-- external/pi/packages/tui/src/utils.ts (pi-tui stub, TE31): 6e22ed5385c08965a46f01d6ec9686cb0eada95e34b9dc0f9a5e85d28f8f512a
+- external/pi/packages/tui/src/keys.ts (pi-tui stub): 8db2ec979e8aae55d21c8a3efba7334b1e5723ebc6f3fe552c5aa96da59f2298
+- external/pi/packages/tui/src/utils.ts (pi-tui stub, TE31): 767502b2baec02dfd33cdc35c5bfc0b7229ad033ffeaae8e707670b7b7ea8b19
 
 ## schema
 

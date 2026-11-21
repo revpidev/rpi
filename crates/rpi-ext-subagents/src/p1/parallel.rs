@@ -24,6 +24,26 @@ pub const KEY_PATTERN: &str = "[A-Za-z0-9][A-Za-z0-9._-]{0,127}";
 
 /// Fields a task entry may not carry (upstream `validateRunCall`
 /// scripted-workflow.ts:152-171 — one child per entry, no nested composition).
+/// Fields a task entry accepts (V19-03 S31, upstream #3207): anything else
+/// is rejected with a field-aware error instead of being silently ignored.
+const TASK_ENTRY_FIELDS: [&str; 15] = [
+    "key",
+    "agent",
+    "task",
+    "model",
+    "thinking",
+    "context",
+    "cwd",
+    "output",
+    "outputMode",
+    "timeoutMs",
+    "maxRuntimeMs",
+    "worktree",
+    "gate",
+    "skill",
+    "skills",
+];
+
 const FORBIDDEN_ENTRY_FIELDS: [&str; 7] = [
     "action",
     "workflowScript",
@@ -84,6 +104,23 @@ pub fn parse_tasks(tasks: &Value, max_tasks: u64) -> Result<Vec<TaskEntry>, Stri
                     "tasks[{index}].{field} is not allowed inside a task entry."
                 ));
             }
+        }
+        for field in object.keys() {
+            if TASK_ENTRY_FIELDS.contains(&field.as_str()) {
+                continue;
+            }
+            return Err(match field.as_str() {
+                "output" => format!(
+                    "tasks[{index}].output is not supported inside a task entry; set output on the outer call to write one file per child. No child was launched."
+                ),
+                "worktree" => format!(
+                    "tasks[{index}].worktree is not supported inside a task entry; set worktree on the outer call. No child was launched."
+                ),
+                other => format!(
+                    "tasks[{index}].{other} is not supported inside a task entry (supported: {}). No child was launched.",
+                    TASK_ENTRY_FIELDS.join(", ")
+                ),
+            });
         }
         let agent_name = object
             .get("agent")
@@ -689,6 +726,13 @@ async fn launch_one(
     // (upstream: "creation failure does not start the child") — with the
     // failure text kept so the aggregate can say why.
     let mut spec = entry.spec.clone();
+    // V19-03 S13: offer the child to the session's permission handlers
+    // before any process/file action (including worktree creation).
+    if let Err(reason) =
+        launch_child::approve_workflow_child(ctx, &mut spec, &entry.key, Some("parallel"))
+    {
+        return Some(Err(reason));
+    }
     let mut prepared = None;
     if let Some(plan) = worktree
         && plan
@@ -1021,6 +1065,18 @@ mod tests {
         assert!(!valid_key("a b"));
         assert!(!valid_key("a/b"));
         assert!(!valid_key(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn task_entry_rejects_unknown_fields_with_context() {
+        let error = parse_tasks(
+            &json!([{"agent": "scout", "task": "t", "mystery": true}]),
+            20,
+        )
+        .expect_err("unknown field");
+        assert!(error.contains("tasks[0].mystery"), "{error}");
+        assert!(error.contains("No child was launched"), "{error}");
+        assert!(error.contains("supported:"), "{error}");
     }
 
     #[test]
@@ -1381,6 +1437,10 @@ mod tests {
             control: crate::runner::control::ResolvedControlConfig::default(),
             control_sink: None,
             abort_probe: None,
+            approval: None,
+            required_launcher: None,
+            resume_launcher: None,
+            async_recovery: false,
             detach_ctx: None,
         };
         let probe: RunControlProbe = Arc::new(|| RunControlFlags {

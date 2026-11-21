@@ -116,6 +116,9 @@ extern "C" fn fake_host_call(host_ptr: PluginCookie, request: RVec<u8>) -> RVec<
                 .project_trusted
                 .load(std::sync::atomic::Ordering::SeqCst)
         }),
+        // V19-03 S13: the fake host has no permission handlers, so the
+        // logical workflow-child launch is allowed unchanged.
+        "approveToolCall" => json!({ "ok": { "block": false } }),
         "toolUpdate" => {
             TOOL_UPDATES
                 .lock()

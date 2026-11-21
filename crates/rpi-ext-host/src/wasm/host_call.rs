@@ -48,8 +48,8 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         // V16-14 additions: setToolExposures/clearToolExposures write the
         // session exposure override layer (the same surface setActiveTools
         // already exposes through the tools capability).
-        "registerTool" | "unregisterTool" | "toolUpdate" | "executeTool" | "setToolExposures"
-        | "clearToolExposures" => Requires(Capability::Tools),
+        "registerTool" | "unregisterTool" | "toolUpdate" | "executeTool" | "approveToolCall"
+        | "setToolExposures" | "clearToolExposures" => Requires(Capability::Tools),
         // V16-08 FR-E: MCP server registration is tools-capability surface.
         "registerMcpServer" | "unregisterMcpServer" | "getMcpServers" => {
             Requires(Capability::Tools)
@@ -635,6 +635,33 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             })?
             .map_err(|e| (error_kind(&e), e.to_string()))?;
             serde_json::to_value(&outcome).map_err(|e| ("internal", format!("executeTool: {e}")))
+        }
+
+        // V19-03 S13 (additive): run the session's `tool_call` handler chain
+        // for a synthetic call without executing a tool. Native plugins use it
+        // to offer workflow child launches (`subagent_launch`) to permission
+        // extensions. No current-tool binding is required.
+        "approveToolCall" => {
+            let name = str_arg(&args, "name")
+                .ok_or_else(|| ("invalidRequest", "approveToolCall: missing name".to_owned()))?
+                .to_owned();
+            let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
+            let actions = state
+                .api
+                .runtime()
+                .require_actions()
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            let handle = state.async_handle.clone();
+            // Reentrancy guard: this host call synchronously waits on the
+            // handler chain, so a dispatch back into this extension would
+            // deadlock (same rule as executeTool).
+            let _guard = state.api.extension().host_call_guard().clone().enter();
+            let approval = block_on(&handle, async move {
+                actions.approve_tool_call(&name, input).await
+            })?
+            .map_err(|e| (error_kind(&e), e.to_string()))?;
+            serde_json::to_value(approval)
+                .map_err(|e| ("internal", format!("approveToolCall: {e}")))
         }
 
         // ADR-0015: `toolUpdate(toolCallId, update)` — guest/plugin reports a

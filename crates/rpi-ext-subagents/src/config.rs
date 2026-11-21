@@ -96,6 +96,17 @@ pub struct ExtensionConfig {
     /// `RPI_SUBAGENT_WAIT_TOOL_DEFAULT_TIMEOUT_MS` overrides). None = the
     /// built-in 30-minute default.
     pub wait_tool_default_timeout_ms: Option<u64>,
+    /// `waitTool.name` (#3167): tool name override, validated at load. The
+    /// rpi default is `subagent_wait` (upstream's `bg_wait` counterpart);
+    /// `None` keeps the default.
+    pub wait_tool_name: Option<String>,
+    /// `defaultInheritGlobalContext` (#3206): inherit the global AGENTS.md
+    /// for every subagent unless the agent opts out. Default false.
+    pub default_inherit_global_context: Option<bool>,
+    /// `runnerLaunchers` (#3163): user-configured launcher argv map. A
+    /// launcher wraps the local child process; names match
+    /// `^[A-Za-z][A-Za-z0-9_-]*$` and argv entries are non-empty strings.
+    pub runner_launchers: Option<std::collections::BTreeMap<String, Vec<String>>>,
     /// `control` (subagent-control.ts): global attention/active-long-running
     /// thresholds. Raw JSON because `resolveControlConfig` is lenient and
     /// ignores invalid positive integers/lists.
@@ -137,6 +148,9 @@ impl ExtensionConfig {
             worktree_setup_hook: None,
             intercom_bridge: None,
             wait_tool_default_timeout_ms: None,
+            wait_tool_name: None,
+            default_inherit_global_context: None,
+            runner_launchers: None,
             control: None,
             enable_slash_commands: None,
         }
@@ -258,6 +272,28 @@ impl ExtensionConfig {
         self.wait_tool_default_timeout_ms
     }
 
+    /// `waitTool.name` (#3167): configured override or the rpi default
+    /// `subagent_wait` (upstream `bg_wait` counterpart, TE-D46 naming).
+    pub fn wait_tool_name(&self) -> String {
+        self.wait_tool_name
+            .clone()
+            .unwrap_or_else(|| "subagent_wait".to_string())
+    }
+
+    /// `defaultInheritGlobalContext` (#3206): default false.
+    pub fn default_inherit_global_context(&self) -> bool {
+        self.default_inherit_global_context.unwrap_or(false)
+    }
+
+    /// `runnerLaunchers` lookup (own-property semantics: no inheritance in a
+    /// JSON map; missing names return `None`).
+    pub fn runner_launcher(&self, name: &str) -> Option<Vec<String>> {
+        self.runner_launchers
+            .as_ref()
+            .and_then(|map| map.get(name))
+            .cloned()
+    }
+
     /// `fleet.enabled` (TE11 FR-C): env
     /// `RPI_SUBAGENT_FLEET_ENABLED` > config > true.
     pub fn fleet_enabled(&self) -> bool {
@@ -300,12 +336,6 @@ impl ExtensionConfig {
     pub fn global_concurrency_limit(&self) -> u64 {
         match &self.global_concurrency_limit {
             Some(Value::Number(n)) => n.as_u64().filter(|v| *v >= 1).unwrap_or(20),
-            Some(Value::String(s)) => s
-                .trim()
-                .parse::<u64>()
-                .ok()
-                .filter(|v| *v >= 1)
-                .unwrap_or(20),
             _ => 20,
         }
     }
@@ -368,6 +398,46 @@ pub fn get_config_path() -> PathBuf {
 }
 
 /// `validateConfig` + `readConfigForUpdate` (config.ts:49-82), P0 key subset.
+/// `waitTool.name` validation (wait-config.ts:22-29 @ feb6da00, #3167):
+/// starts with a letter, then letters/digits/underscores, at most 64 chars;
+/// names of tools this extension registers are reserved.
+fn valid_wait_tool_name(name: &str) -> bool {
+    const RESERVED: [&str; 12] = [
+        "subagent",
+        "subagents_enable",
+        "subagent_supervisor",
+        "contact_supervisor",
+        "intercom",
+        "structured_output",
+        "subagent_launch",
+        "subagent_command",
+        "watchdog_diff",
+        "watchdog_ask",
+        "watchdog_warn",
+        "watchdog_permission_decision",
+    ];
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() || name.len() > 64 {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    !RESERVED.contains(&name)
+}
+
+/// `runnerLaunchers` name pattern (shared/types.ts @ feb6da00).
+fn valid_launcher_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic() && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
     let Some(object) = raw.as_object() else {
         return Err(format!("Subagent config at '{path}' must be a JSON object"));
@@ -440,8 +510,13 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
         }
     }
     if let Some(value) = object.get("globalConcurrencyLimit") {
-        if !value.is_number() && !value.is_string() {
-            return Err("config.globalConcurrencyLimit must be a number".into());
+        // config.ts:184-188 @ feb6da00 (#3165): strict positive integer;
+        // 0, fractions and strings fail config load instead of silently
+        // degrading to a serial run.
+        let valid = value.as_u64().is_some_and(|value| value >= 1)
+            && value.as_f64().is_some_and(|value| value.fract() == 0.0);
+        if !valid {
+            return Err("config.globalConcurrencyLimit must be a positive integer".into());
         }
         config.global_concurrency_limit = Some(value.clone());
     }
@@ -487,13 +562,24 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
                     None => true,
                     Some(timeout) => timeout.as_u64().is_some_and(|v| v >= 1),
                 };
-                enabled_ok && timeout_ok
+                let name_ok = match o.get("name") {
+                    None => true,
+                    Some(name) => name.as_str().is_some_and(valid_wait_tool_name),
+                };
+                enabled_ok && timeout_ok && name_ok
             });
         if !valid {
             return Err(
-                "config.waitTool must be a boolean or an object with optional enabled boolean and defaultTimeoutMs positive integer"
+                "config.waitTool must be a boolean or an object with optional enabled boolean, defaultTimeoutMs positive integer and a valid name"
                     .into(),
             );
+        }
+        if let Some(name) = wait_tool
+            .as_object()
+            .and_then(|o| o.get("name"))
+            .and_then(Value::as_str)
+        {
+            config.wait_tool_name = Some(name.to_string());
         }
         if let Some(timeout) = wait_tool
             .as_object()
@@ -504,6 +590,46 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
             config.wait_tool_default_timeout_ms = Some(timeout);
         }
         config.wait_tool = Some(wait_tool.clone());
+    }
+    if let Some(value) = object.get("defaultInheritGlobalContext") {
+        match value.as_bool() {
+            Some(value) => config.default_inherit_global_context = Some(value),
+            None => {
+                return Err("config.defaultInheritGlobalContext must be a boolean".into());
+            }
+        }
+    }
+    if let Some(launchers) = object.get("runnerLaunchers") {
+        // config.ts `validateRunnerLaunchersConfig`: object of name → argv
+        // array of non-empty strings.
+        let Some(launchers) = launchers.as_object() else {
+            return Err("config.runnerLaunchers must be an object".into());
+        };
+        let mut parsed = std::collections::BTreeMap::new();
+        for (name, argv) in launchers {
+            if !valid_launcher_name(name) {
+                return Err(format!(
+                    "config.runnerLaunchers.{name} is not a valid launcher name"
+                ));
+            }
+            let Some(argv) = argv.as_array() else {
+                return Err(format!("config.runnerLaunchers.{name} must be an array"));
+            };
+            let mut args = Vec::new();
+            for arg in argv {
+                let Some(arg) = arg.as_str().filter(|arg| !arg.trim().is_empty()) else {
+                    return Err(format!(
+                        "config.runnerLaunchers.{name} must contain non-empty strings"
+                    ));
+                };
+                args.push(arg.to_string());
+            }
+            if args.is_empty() {
+                return Err(format!("config.runnerLaunchers.{name} must not be empty"));
+            }
+            parsed.insert(name.clone(), args);
+        }
+        config.runner_launchers = Some(parsed);
     }
     if let Some(fleet) = object.get("fleet") {
         // TE11 FR-C: boolean, or `{enabled?, expanded?}` with boolean values.
@@ -798,6 +924,9 @@ pub struct SubagentSettings {
     /// `agentExcludeDirs` (#2146): directory trees excluded from agent
     /// discovery (resolved against this settings file's directory).
     pub agent_exclude_dirs: Option<Vec<String>>,
+    /// `defaultInheritGlobalContext` (#3206): project wins over user when
+    /// present; absent keeps the current default (false).
+    pub default_inherit_global_context: Option<bool>,
 }
 
 /// `readSubagentSettings` (agents.ts:860-928) — fail-fast on invalid values.
@@ -1020,6 +1149,17 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
         }
     }
 
+    if let Some(value) = subagents.get("defaultInheritGlobalContext") {
+        match value.as_bool() {
+            Some(value) => parsed.default_inherit_global_context = Some(value),
+            None => {
+                return Err(format!(
+                    "Subagent settings in '{}' have invalid 'defaultInheritGlobalContext'; expected a boolean.",
+                    path.to_string_lossy()
+                ));
+            }
+        }
+    }
     if let Some(value) = subagents.get("agentExcludeDirs") {
         match value.as_array() {
             Some(items) => {
@@ -1497,6 +1637,9 @@ pub struct SettingsPair {
     pub max_thinking: Option<String>,
     /// `resolveSubagentDefaultProvider` (agents.ts:1242-1250): project wins.
     pub default_provider: Option<String>,
+    /// `resolveSubagentDefaultInheritGlobalContext` (agents.ts:1494-1500):
+    /// project wins when its settings file sets the key.
+    pub default_inherit_global_context: Option<bool>,
 }
 
 impl SettingsPair {
@@ -1589,6 +1732,12 @@ pub fn read_settings_pair_trusted(
     } else {
         user.default_provider.clone()
     };
+    let default_inherit_global_context =
+        if project_settings_present && project.default_inherit_global_context.is_some() {
+            project.default_inherit_global_context
+        } else {
+            user.default_inherit_global_context
+        };
     // #2146: exclusion roots — user entries resolve against the user agent
     // dir, project entries against the project settings dir; `~` expands and
     // absolute entries pass through.
@@ -1630,6 +1779,7 @@ pub fn read_settings_pair_trusted(
         model_scope,
         max_thinking,
         default_provider,
+        default_inherit_global_context,
         user,
         project,
     })
@@ -1677,20 +1827,12 @@ mod tests {
                 .global_concurrency_limit(),
             3
         );
-        // Invalid numbers fall back to the default (the semaphore site
-        // clamps ≥ 1).
-        assert_eq!(
-            parse(r#"{"globalConcurrencyLimit": 0}"#)
-                .unwrap()
-                .global_concurrency_limit(),
-            20
-        );
-        assert_eq!(
-            parse(r#"{"globalConcurrencyLimit": "not-a-number"}"#)
-                .unwrap()
-                .global_concurrency_limit(),
-            20
-        );
+        // #3165: 0, fractions and strings fail config load instead of
+        // silently degrading to a serial run.
+        assert!(parse(r#"{"globalConcurrencyLimit": 0}"#).is_err());
+        assert!(parse(r#"{"globalConcurrencyLimit": 2.5}"#).is_err());
+        assert!(parse(r#"{"globalConcurrencyLimit": "3"}"#).is_err());
+        assert!(parse(r#"{"globalConcurrencyLimit": -1}"#).is_err());
     }
 
     #[test]
@@ -2105,7 +2247,7 @@ mod tests {
     fn p1_config_keys_parse_and_resolve() {
         let config = parse(
             r#"{"parallel":{"maxTasks":"6","concurrency":2},"waitTool":{"enabled":false},
-                "forceTopLevelAsync":true,"globalConcurrencyLimit":"12",
+                "forceTopLevelAsync":true,"globalConcurrencyLimit":12,
                 "maxSubagentSpawnsPerSession":100,"maxActiveAsyncRunsPerSession":3,
                 "singleRunOutputBaseDir":"out","worktreeBaseDir":"/tmp/wt",
                 "worktreeSetupHook":"./setup.sh",
@@ -2357,5 +2499,61 @@ mod te18_override_parse_tests {
         let error = read_subagent_settings(&bad).unwrap_err();
         assert!(error.contains("agentExcludeDirs"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod wait_tool_name_tests {
+    use super::*;
+
+    fn parse(raw: &str) -> Result<ExtensionConfig, String> {
+        let value: Value = serde_json::from_str(raw).unwrap();
+        parse_config(&value, "/cfg/config.json")
+    }
+
+    #[test]
+    fn wait_tool_name_defaults_and_validates() {
+        assert_eq!(parse("{}").unwrap().wait_tool_name(), "subagent_wait");
+        assert_eq!(
+            parse(r#"{"waitTool":{"name":"my_wait"}}"#)
+                .unwrap()
+                .wait_tool_name(),
+            "my_wait"
+        );
+        // Pattern: leading letter, letters/digits/underscores, ≤64 chars.
+        assert!(parse(r#"{"waitTool":{"name":"1bad"}}"#).is_err());
+        assert!(parse(r#"{"waitTool":{"name":"bad-name"}}"#).is_err());
+        assert!(
+            parse(&format!(
+                r#"{{"waitTool":{{"name":"{}"}}}}"#,
+                "a".repeat(65)
+            ))
+            .is_err()
+        );
+        // Reserved tool names cannot be reused.
+        assert!(parse(r#"{"waitTool":{"name":"subagent"}}"#).is_err());
+        assert!(parse(r#"{"waitTool":{"name":"subagent_launch"}}"#).is_err());
+    }
+
+    #[test]
+    fn default_inherit_global_context_and_launchers_parse() {
+        assert!(!parse("{}").unwrap().default_inherit_global_context());
+        assert!(
+            parse(r#"{"defaultInheritGlobalContext":true}"#)
+                .unwrap()
+                .default_inherit_global_context()
+        );
+        assert!(parse(r#"{"defaultInheritGlobalContext":"yes"}"#).is_err());
+
+        let config =
+            parse(r#"{"runnerLaunchers":{"sandbox":["/usr/bin/sandbox","--flag"]}}"#).unwrap();
+        assert_eq!(
+            config.runner_launcher("sandbox"),
+            Some(vec!["/usr/bin/sandbox".into(), "--flag".into()])
+        );
+        assert_eq!(config.runner_launcher("missing"), None);
+        assert!(parse(r#"{"runnerLaunchers":{"sandbox":[]}}"#).is_err());
+        assert!(parse(r#"{"runnerLaunchers":{"sandbox":[""]}}"#).is_err());
+        assert!(parse(r#"{"runnerLaunchers":{"bad name":["x"]}}"#).is_err());
     }
 }

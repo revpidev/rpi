@@ -35,6 +35,8 @@ mod notice_marker;
 mod p1;
 mod paths;
 mod prompts;
+/// V19-03 S11: trusted recovery records + runner launchers.
+pub mod recovery;
 mod render;
 mod runner;
 mod runtime;
@@ -165,6 +167,11 @@ fn process_start_wall_clock() -> std::time::SystemTime {
     *START.get_or_init(std::time::SystemTime::now)
 }
 
+/// V19-03 S13: synchronous seam that offers a synthetic tool call to the
+/// session's `tool_call` handler chain (host call `approveToolCall`). The
+/// returned JSON is `{block, reason?, input?}`.
+pub type ApprovalSeam = std::sync::Arc<dyn Fn(&str, Value) -> Result<Value, String> + Send + Sync>;
+
 /// Host bridge the tool layer uses (cwd, parent model, parent session,
 /// and — from TE05 — the scoped model registry for fuzzy resolution).
 pub trait HostContext {
@@ -192,6 +199,13 @@ pub trait HostContext {
     /// when the host reports none — resolution then falls back to verbatim.
     fn scoped_models(&self) -> Vec<launch::model::AvailableModel> {
         Vec::new()
+    }
+
+    /// V19-03 S13: approval seam for workflow child launches; `None` in
+    /// contexts without a live host session (test fakes) skips the logical
+    /// `subagent_launch` call.
+    fn approval_seam(&self) -> Option<ApprovalSeam> {
+        None
     }
 
     /// Host tool names from `getAllTools` (R7.1.4.3 / #2034, TE18 FR-C):
@@ -284,6 +298,30 @@ impl HostCallsContext<'_> {
 }
 
 impl HostContext for HostCallsContext<'_> {
+    fn approval_seam(&self) -> Option<ApprovalSeam> {
+        let calls = RpiHostCalls {
+            call: self.calls.call,
+        };
+        let cookie = self.cookie;
+        Some(std::sync::Arc::new(move |name: &str, input: Value| {
+            let response = host_call(
+                &calls,
+                cookie,
+                "approveToolCall",
+                json!({ "name": name, "input": input }),
+            );
+            if let Some(error) = response.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| error.to_string());
+                return Err(message);
+            }
+            Ok(response.get("ok").cloned().unwrap_or(Value::Null))
+        }))
+    }
+
     fn cwd(&self) -> PathBuf {
         if let Some(cwd) = host_call_ok(self.calls, self.cookie, "ctx.cwd", json!({}))
             && let Some(cwd) = cwd.as_str()
@@ -725,11 +763,12 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                         "subagent_supervisor registration denied for nested coordinator"
                     );
                 }
-                if config::load_config().wait_tool_enabled()
+                let child_wait_config = config::load_config();
+                if child_wait_config.wait_tool_enabled()
                     && let Err(error) = register(
                         "registerTool",
                         json!({
-                            "name": "subagent_wait",
+                            "name": child_wait_config.wait_tool_name(),
                             "label": "Subagent wait",
                             "description": "Wait for background subagent runs to reach a terminal state (first-terminal by default, all with { all: true }); non-blocking with { nonBlocking: true }. Disabled by config.waitTool.",
                             "parameters": {
@@ -909,7 +948,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                 && let Err(error) = register(
                     "registerTool",
                     json!({
-                        "name": "subagent_wait",
+                        "name": config.wait_tool_name(),
                         "label": "Subagent wait",
                         "description": "Wait for background subagent runs to reach a terminal state (first-terminal by default, all with { all: true }); non-blocking with { nonBlocking: true }. Disabled by config.waitTool.",
                         "parameters": {
@@ -933,6 +972,10 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             // parent sessions only — children never resolve it).
             prompts::install_orchestration_skill();
             runner::background::reconcile_stale_runs();
+            // V19-03 S09/S33/S42: expired run folders (30/90 days), nested
+            // artifact cleanup, and unused fork session copies.
+            runner::background::cleanup_expired_runs();
+            artifacts::cleanup_fork_copies(config.cleanup_days_or_default());
             artifacts::cleanup_all_artifact_dirs(config.cleanup_days_or_default());
         }
     }
@@ -1066,7 +1109,7 @@ fn dispatch_message(message: &Value) -> Value {
                     "details": { "mode": "single", "results": [] },
                 });
             }
-            if tool_name == "subagent_wait" {
+            if tool_name == crate::config::load_config().wait_tool_name() {
                 let tool_call_id = message
                     .get("toolCallId")
                     .and_then(Value::as_str)
@@ -1792,6 +1835,8 @@ pub mod parity {
         pub system_prompt: Option<String>,
         pub system_prompt_mode: &'static str,
         pub inherit_project_context: bool,
+        /// #3206: global AGENTS.md inheritance (false sets the skip env).
+        pub inherit_global_context: bool,
         pub inherit_skills: bool,
         pub require_read_tool: bool,
         pub tools: Option<Vec<String>>,
@@ -1835,6 +1880,7 @@ pub mod parity {
             system_prompt: input.system_prompt.clone(),
             system_prompt_mode: input.system_prompt_mode,
             inherit_project_context: input.inherit_project_context,
+            inherit_global_context: input.inherit_global_context,
             inherit_skills: input.inherit_skills,
             require_read_tool: input.require_read_tool,
             tools: input.tools.clone(),

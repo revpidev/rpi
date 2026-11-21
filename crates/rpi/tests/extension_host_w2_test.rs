@@ -1597,3 +1597,59 @@ async fn w2_before_agent_start_starting_state_queues_and_aborts() {
     );
     assert!(fixture.session.is_abort_requested());
 }
+
+/// V19-03 S13/S46: the additive `approveToolCall` surface aggregates the
+/// `tool_call` handler chain for a synthetic call without dispatching a tool
+/// (the native host-call envelope is exercised by the subagents crate; this
+/// pins the runner semantics: block/reason + handler input rewrite).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w2_approve_tool_call_aggregates_block_and_rewrite() {
+    let host = host_with(vec![inline_ext(|api| {
+        on_json(api, ext::EVENT_TOOL_CALL, |event| {
+            assert_eq!(event["toolName"], "subagent_launch");
+            Ok(json!({
+                "input": {
+                    "key": event["input"]["key"],
+                    "task": "rewritten by handler"
+                }
+            }))
+        });
+    })])
+    .await;
+    let fixture = session_fixture(vec![text_step("done")], Arc::new(host), vec![]).await;
+    let outcome = fixture
+        .session
+        .extension_runner()
+        .emit_tool_call(
+            "synthetic-1",
+            "subagent_launch",
+            json!({"key": "task-1", "task": "original"}),
+            None,
+        )
+        .await
+        .expect("handlers ran");
+    assert_eq!(outcome.block, None);
+    assert_eq!(
+        outcome
+            .input
+            .as_ref()
+            .and_then(|input| input["task"].as_str()),
+        Some("rewritten by handler")
+    );
+
+    let deny_host = host_with(vec![inline_ext(|api| {
+        on_json(api, ext::EVENT_TOOL_CALL, |_| {
+            Ok(json!({"block": true, "reason": "not allowed"}))
+        });
+    })])
+    .await;
+    let deny_fixture = session_fixture(vec![text_step("done")], Arc::new(deny_host), vec![]).await;
+    let outcome = deny_fixture
+        .session
+        .extension_runner()
+        .emit_tool_call("synthetic-2", "subagent_launch", json!({}), None)
+        .await
+        .expect("handlers ran");
+    assert_eq!(outcome.block, Some(true));
+    assert_eq!(outcome.reason.as_deref(), Some("not allowed"));
+}

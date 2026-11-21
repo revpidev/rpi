@@ -866,6 +866,18 @@ pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Ar
     update_status(&handle, |_| {});
     append_event(&run_dir, "run.started", json!({ "runId": run_id }));
     register_run(handle.clone());
+    // V19-03 S11: the parent-owned trusted record exists before any child.
+    if let Err(error) = crate::recovery::start_record(
+        run_id,
+        match body {
+            AsyncBody::Single { .. } => "single",
+            AsyncBody::Tasks { .. } => "parallel",
+            AsyncBody::Steps { .. } => "chain",
+        },
+        session_id,
+    ) {
+        tracing::warn!(run_id, error = %error, "failed to persist trusted recovery record");
+    }
     handle
 }
 
@@ -1615,6 +1627,12 @@ fn record_step_result(
         // currentTool only for pending/running steps).
         clear_step_live_fields(step);
     });
+    crate::recovery::update_child_session(
+        &handle.run_id,
+        index as u32,
+        result.session_file.as_deref(),
+        terminal.as_status(),
+    );
 }
 
 /// Persist one settled chain step: terminal classification plus the
@@ -2060,6 +2078,7 @@ async fn finish_with_handoff(
         settle_unfinished_steps(status, unfinished_state, unfinished_error);
         clear_steps_terminal(status);
     });
+    crate::recovery::finish_record(&handle.run_id, state);
     append_event(
         handle.run_dir.as_path(),
         "run.finished",
@@ -2128,6 +2147,7 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
         );
     }
     flush_pending_status_write_failure(handle);
+    crate::recovery::finish_record(&handle.run_id, state);
     crate::p1::supervisor::close_requests_for_run(&handle.run_id);
     notify.send(handle, state, output, None).await;
     prune_terminal_runs();
@@ -2301,20 +2321,49 @@ pub fn read_run_status(run_id: &str) -> Result<Option<Value>, String> {
             ));
         }
     };
-    serde_json::from_str(&raw).map(Some).map_err(|error| {
+    let status: Value = serde_json::from_str(&raw).map_err(|error| {
         format!(
             "Corrupt status for run '{run_id}' at {}: {error}",
             path.display()
         )
-    })
+    })?;
+    // V19-03 S11 (#3116): the status file must name the run whose folder it
+    // sits in; a mismatch is refused with both names instead of resuming the
+    // id the child-controlled file claims.
+    if let Some(named) = status["runId"].as_str()
+        && named != run_id
+    {
+        return Err(format!(
+            "Status file '{}' names run '{}', but the run directory is '{}'; resume is refused.",
+            path.display(),
+            named,
+            run_id
+        ));
+    }
+    Ok(Some(status))
 }
 
 /// `requestAsyncInterrupt`: pause marker; the run becomes `paused` between
 /// children and can be `resume`d.
+#[allow(dead_code)]
 pub fn interrupt_run(query: &str) -> Result<Value, String> {
+    interrupt_run_for_session(query, None)
+}
+
+/// V19-03 S24: owner-scoped interrupt — a run owned by another session is
+/// invisible to this one (local ownership; no cross-window routing).
+pub fn interrupt_run_for_session(
+    query: &str,
+    current_session: Option<&str>,
+) -> Result<Value, String> {
     let handle =
         find_active_run(query).ok_or_else(|| format!("No active async run matches '{query}'."))?;
+    if !run_owned_by(&handle, current_session) {
+        return Err(format!("No active async run matches '{query}'."));
+    }
     handle.control.request_interrupt();
+    // V19-03 S11: a paused run is resumable; the trusted record must say so.
+    crate::recovery::set_record_state(&handle.run_id, STATE_PAUSED);
     let control_dir = handle.run_dir.join("control");
     let _ = std::fs::create_dir_all(&control_dir);
     let _ = std::fs::write(
@@ -2328,6 +2377,23 @@ pub fn interrupt_run(query: &str) -> Result<Value, String> {
         json!({ "runId": handle.run_id }),
     );
     Ok(status_snapshot(&handle))
+}
+
+/// V19-03 S24: run ownership is the parent session id recorded at launch
+/// (a fork gets a new id). `None` on either side keeps the local default
+/// (single-window hosts).
+pub fn run_owned_by(handle: &AsyncRunHandle, current_session: Option<&str>) -> bool {
+    let Some(current) = current_session else {
+        return true;
+    };
+    let status = handle
+        .status
+        .read()
+        .unwrap_or_else(|error| error.into_inner());
+    match status["sessionId"].as_str() {
+        Some(owner) => owner == current,
+        None => true,
+    }
 }
 
 /// All live runs for the status listing.
@@ -2416,6 +2482,7 @@ pub async fn harvest_for_shutdown() {
         // status-write failure after the terminal event (TE17 R7.1.7.1).
         flush_pending_status_write_failure(handle);
         crate::p1::supervisor::close_requests_for_run(&handle.run_id);
+        crate::recovery::finish_record(&handle.run_id, STATE_STOPPED);
         unregister_run(&handle.run_id);
     }
 }
@@ -2501,6 +2568,95 @@ pub fn reconcile_stale_runs() {
                 "run.status_write_failed",
                 write_failure_payload(run_id, &status_path, &error),
             );
+        }
+    }
+}
+
+/// V19-03 S09 (#3098): remove finished run folders on disk. A run whose
+/// child session file still exists is kept for 90 days (resumable), any
+/// other finished run for 30; active runs are never touched. The trusted
+/// launch folder is removed with its run. Best-effort: a failed removal is a
+/// warning, not a host exit.
+pub fn cleanup_expired_runs() {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(async_runs_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let run_dir = entry.path();
+        if !run_dir.is_dir() {
+            continue;
+        }
+        let status_path = run_dir.join("status.json");
+        let Ok(raw) = std::fs::read_to_string(&status_path) else {
+            // A run folder without status is not a finished run this sweep
+            // owns; stale reconciliation handles the crash branch.
+            continue;
+        };
+        let Ok(status) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if matches!(
+            status["state"].as_str().unwrap_or(""),
+            STATE_QUEUED | STATE_RUNNING | STATE_PAUSED
+        ) {
+            continue;
+        }
+        let run_id = status["runId"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| entry.file_name().to_str().map(str::to_string));
+        let Some(run_id) = run_id else {
+            continue;
+        };
+        let age = status_path
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let session_exists = status["sessionFile"]
+            .as_str()
+            .map(|file| Path::new(file).is_file())
+            .unwrap_or(false)
+            || status["steps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|step| step["sessionFile"].as_str())
+                .any(|file| Path::new(file).is_file());
+        let max_age = if session_exists {
+            90 * DAY_MS
+        } else {
+            30 * DAY_MS
+        };
+        if age <= max_age {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&run_dir) {
+            tracing::warn!(run_id = %run_id, error = %error, "failed to remove expired async run");
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+        crate::p1::supervisor::close_requests_for_run(&run_id);
+    }
+    // Orphaned launch folders (run folder already gone): 30 days.
+    let launches = crate::paths::temp_root_dir().join("async-subagent-launches");
+    if let Ok(entries) = std::fs::read_dir(&launches) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let age = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            if age > 30 * DAY_MS {
+                let _ = std::fs::remove_dir_all(&path);
+            }
         }
     }
 }
@@ -4988,5 +5144,136 @@ pub(crate) mod tests {
             error.contains("No active background run matches"),
             "{error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_integration_tests {
+    use super::*;
+
+    #[test]
+    fn status_file_naming_another_run_is_refused() {
+        let run_id = format!("recovery-mismatch-{}", std::process::id());
+        let run_dir = async_runs_dir().join(&run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("status.json"),
+            serde_json::to_string(&json!({
+                "runId": "some-other-run",
+                "state": "complete",
+                "steps": [],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = read_run_status(&run_id).expect_err("mismatch refused");
+        assert!(error.contains("some-other-run"), "{error}");
+        assert!(error.contains(&run_id), "{error}");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+    }
+
+    #[tokio::test]
+    async fn start_run_writes_the_trusted_record() {
+        let run_id = format!("recovery-start-{}", std::process::id());
+        let body = AsyncBody::Single {
+            spec: Box::new(crate::p1::launch_child::ChildSpec {
+                agent_name: "scout".into(),
+                task: "t".into(),
+                ..Default::default()
+            }),
+        };
+        let handle = start_run(&run_id, Some("session-a"), &body);
+        let record = crate::recovery::read_record(&run_id)
+            .expect("read")
+            .expect("record exists before children");
+        assert_eq!(record.mode, "single");
+        assert_eq!(record.parent_session_id.as_deref(), Some("session-a"));
+        assert_eq!(record.state, "running");
+        finish_failed(&handle, "test failure", &AsyncNotify { calls: None }).await;
+        assert_eq!(
+            crate::recovery::read_record(&run_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "failed"
+        );
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+        unregister_run(&run_id);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    fn backdate(path: &Path, days: u64) {
+        let when =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open");
+        file.set_modified(when).expect("set mtime");
+    }
+
+    fn fake_run(run_id: &str, session_file: Option<&Path>, age_days: u64) {
+        let run_dir = async_runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let status = json!({
+            "runId": run_id,
+            "state": "complete",
+            "steps": [{
+                "agent": "worker",
+                "status": "complete",
+                "sessionFile": session_file.map(|file| file.to_string_lossy().to_string()),
+            }],
+        });
+        let path = run_dir.join("status.json");
+        std::fs::write(&path, serde_json::to_string(&status).unwrap()).unwrap();
+        backdate(&path, age_days);
+    }
+
+    #[test]
+    fn retention_uses_30_days_or_90_when_the_session_survives() {
+        let base = std::env::temp_dir().join(format!("rpi-retention-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let session = base.join("child.jsonl");
+        std::fs::write(&session, "{}").unwrap();
+
+        let kept_run = format!("retention-keep-{}", std::process::id());
+        fake_run(&kept_run, Some(&session), 40);
+        let old_run = format!("retention-old-{}", std::process::id());
+        fake_run(&old_run, Some(&session), 91);
+        let no_session_run = format!("retention-nosession-{}", std::process::id());
+        fake_run(&no_session_run, None, 31);
+        let fresh_run = format!("retention-fresh-{}", std::process::id());
+        fake_run(&fresh_run, None, 29);
+
+        cleanup_expired_runs();
+
+        assert!(
+            async_runs_dir().join(&kept_run).is_dir(),
+            "40-day run with a live session is kept"
+        );
+        assert!(
+            !async_runs_dir().join(&old_run).is_dir(),
+            "91-day run is removed"
+        );
+        assert!(
+            !async_runs_dir().join(&no_session_run).is_dir(),
+            "31-day run without a session is removed"
+        );
+        assert!(
+            async_runs_dir().join(&fresh_run).is_dir(),
+            "29-day run is kept"
+        );
+
+        for run in [&kept_run, &fresh_run] {
+            let _ = std::fs::remove_dir_all(async_runs_dir().join(run));
+            let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(run));
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

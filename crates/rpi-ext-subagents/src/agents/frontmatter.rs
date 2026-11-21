@@ -250,6 +250,28 @@ pub fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
                  lines: &mut Option<Vec<String>>,
                  folded: bool| {
         if let (Some(k), Some(block)) = (key.take(), lines.take()) {
+            // `flushBlockLines` (frontmatter.ts:157-174 @ feb6da00, #3089):
+            // for non-scalar blocks drop exactly-empty edge lines and every
+            // line from the first exactly-empty one after the last content
+            // line, so nested values without inner blank lines parse as
+            // before while an inner blank line no longer truncates the block.
+            let block = if folded {
+                block
+            } else {
+                let last_content = block.iter().rposition(|line| !line.trim().is_empty());
+                let start = block.iter().position(|line| !line.is_empty()).unwrap_or(0);
+                let end = match last_content {
+                    Some(last) => block
+                        .iter()
+                        .enumerate()
+                        .skip(last + 1)
+                        .find(|(_, line)| line.is_empty())
+                        .map(|(index, _)| index)
+                        .unwrap_or(block.len()),
+                    None => 0,
+                };
+                block[start.min(end)..end].to_vec()
+            };
             let raw_block = block.join("\n");
             let stripped = strip_block_prefix(&raw_block);
             frontmatter.insert(
@@ -274,10 +296,11 @@ pub fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
             continue;
         }
 
+        // Exactly-empty lines belong to any pending block, not only to |
+        // and > scalars (frontmatter.ts:107-112 @ feb6da00, #3089).
         let in_block = current_key.is_some()
             && current_block_lines.is_some()
-            && (indent > current_indent
-                || ((current_folded || current_literal) && trimmed.is_empty()));
+            && (indent > current_indent || trimmed.is_empty());
         if in_block {
             if let Some(lines) = current_block_lines.as_mut() {
                 lines.push(line.to_string());
@@ -439,6 +462,31 @@ mod tests {
                 "edit".to_string()
             ])
         );
+    }
+
+    #[test]
+    fn blank_line_inside_indented_block_keeps_later_fields() {
+        // v0.83.1 (#3089): a completely empty line inside an indented block
+        // no longer truncates the value or drops every setting below it.
+        let parsed =
+            parse_frontmatter("---\ntools:\n  - read\n\n  - bash\ndescription: after\n---\nbody");
+        assert_eq!(
+            parse_frontmatter_list(parsed.frontmatter.get("tools").map(String::as_str)),
+            Some(vec!["read".into(), "bash".into()])
+        );
+        assert_eq!(parsed.frontmatter["description"], "after");
+
+        // A blank line before the next top-level key does not leak into the
+        // block value, and an indented scalar keeps its inner blank line.
+        let scalar = parse_frontmatter("---\nnotes:\n  first\n\n  second\nname: x\n---\nbody");
+        assert_eq!(scalar.frontmatter["notes"], "first\n\nsecond");
+        assert_eq!(scalar.frontmatter["name"], "x");
+
+        // | and > block scalars are unchanged.
+        let literal = parse_frontmatter("---\ndescription: |\n  first\n\n  second\n---\n");
+        assert_eq!(literal.frontmatter["description"], "first\n\nsecond");
+        let folded = parse_frontmatter("---\ndescription: >\n  one\n\n  two\n---\n");
+        assert_eq!(folded.frontmatter["description"], "one\ntwo");
     }
 
     #[test]

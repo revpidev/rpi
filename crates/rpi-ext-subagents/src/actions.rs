@@ -893,7 +893,13 @@ fn handle_management_action_inner(
         }
         // Async control actions (async-stop-action.ts / control-channel.ts).
         "interrupt" => match id_param(&raw_params) {
-            Some(id) => match crate::runner::background::interrupt_run(&id) {
+            Some(id) => match crate::runner::background::interrupt_run_for_session(
+                &id,
+                deps.host
+                    .and_then(|host| host.parent_session(settings))
+                    .map(|session| session.id)
+                    .as_deref(),
+            ) {
                 Ok(status) => ToolOutcome::text(format_async_status("interrupted", &status)),
                 Err(message) => ToolOutcome::error(message),
             },
@@ -914,6 +920,17 @@ fn handle_management_action_inner(
                     .map(str::to_string);
                 match crate::runner::background::find_run(&id) {
                     Some(handle) => {
+                        if !crate::runner::background::run_owned_by(
+                            &handle,
+                            deps.host
+                                .and_then(|host| host.parent_session(settings))
+                                .map(|session| session.id)
+                                .as_deref(),
+                        ) {
+                            return ToolOutcome::error(format!(
+                                "No active background run matches '{id}'."
+                            ));
+                        }
                         // Terminal runs stay registered (wait/status read
                         // them); stopping one is invalid_state (#1965) —
                         // report instead of queueing or silently succeeding.
@@ -1154,60 +1171,23 @@ fn handle_management_action_inner(
                 Ok(index) => index,
                 Err(message) => return ToolOutcome::error(message),
             };
-            let Some(selected) = steps.get(step_index) else {
-                return ToolOutcome::error(format!(
-                    "Background run {id} has no persisted child session to resume from."
-                ));
-            };
             // TE38 W5 (#2242 @ b72714de): a stopped child has no continuation
             // to revive — resume must not resurrect it (`resolveAsyncResumeTarget`
             // rejects `status == "stopped" || stopped == true` for the selected
             // step).
-            if selected["status"].as_str() == Some("stopped")
-                || selected["stopped"].as_bool() == Some(true)
+            if let Some(selected) = steps.get(step_index)
+                && (selected["status"].as_str() == Some("stopped")
+                    || selected["stopped"].as_bool() == Some(true))
             {
                 return ToolOutcome::error(format!(
                     "Async run '{id}' child {step_index} was stopped and cannot be resumed. Start a new run instead."
                 ));
             }
-            let session_file = selected["sessionFile"].as_str().map(str::to_string);
-            let Some(session_file) = session_file else {
-                return ToolOutcome::error(format!(
-                    "Background run {id} has no persisted child session to resume from."
-                ));
-            };
-            if !session_file.ends_with(".jsonl") {
-                return ToolOutcome::error(format!(
-                    "Async run '{id}' session file must be a .jsonl file: {session_file}"
-                ));
-            }
-            if !Path::new(&session_file).is_file() {
-                return ToolOutcome::error(format!(
-                    "Async run '{id}' session file does not exist: {session_file}"
-                ));
-            }
-            let agent_name = selected["agent"].as_str().unwrap_or("worker").to_string();
-            let task = task
-                .unwrap_or_else(|| "Continue the interrupted task from this session.".to_string());
-            // New async run reviving the old session file in the selected
-            // child's cwd/model/thinking (upstream `resolveAsyncResumeTarget`);
-            // the run-level cwd covers single-agent records written before
-            // the per-step field existed.
-            let params = revived_run_params(
-                &agent_name,
-                &task,
-                &session_file,
-                selected["cwd"]
-                    .as_str()
-                    .filter(|cwd| !cwd.is_empty())
-                    .or_else(|| status["cwd"].as_str().filter(|cwd| !cwd.is_empty())),
-                selected["model"].as_str().filter(|model| !model.is_empty()),
-                selected["thinking"]
-                    .as_str()
-                    .filter(|thinking| !thinking.is_empty()),
-            );
+            // V19-03 S11: resume reads only the parent-owned trusted record.
+            // The run-dir status above is diagnostics; a legacy run without a
+            // record is refused with a relaunch/reuseFrom hint.
             let host_cwd = host.cwd();
-            let settings = match crate::config::read_settings_pair_trusted(
+            let resume_settings = match crate::config::read_settings_pair_trusted(
                 &host_cwd,
                 host.project_trusted() != Some(false),
             ) {
@@ -1220,10 +1200,81 @@ fn handle_management_action_inner(
                     return ToolOutcome::error(format!("Subagent settings error: {error}"));
                 }
             };
-            let config = crate::config::load_config();
-            let result = crate::tool::execute_subagent_tool(
-                &params, host, &settings, &config, runtime, None,
+            let resume_config = crate::config::load_config();
+            let agents = match crate::agents::discover::discover_agents_trusted(
+                &host_cwd,
+                "both",
+                &resume_settings,
+                None,
+                host.project_trusted() != Some(false),
+            ) {
+                Ok(agents) => agents,
+                Err(error) => {
+                    return ToolOutcome::error(format!("Agent discovery error: {error}"));
+                }
+            };
+            let (record, child) = match crate::recovery::trusted_resume_child(
+                &id,
+                current_session.as_deref(),
+                &agents,
+                step_index,
+            ) {
+                Ok(found) => found,
+                Err(message) => return ToolOutcome::error(message),
+            };
+            if matches!(record.state.as_str(), "running" | "queued") {
+                return ToolOutcome::error(format!(
+                    "Background run {id} is still {}; resume applies to interrupted or stopped runs.",
+                    record.state
+                ));
+            }
+            let Some(session_file) = child.session_file.clone() else {
+                return ToolOutcome::error(format!(
+                    "Background run {id} has no trusted persisted child session to resume from."
+                ));
+            };
+            if !session_file.ends_with(".jsonl") {
+                return ToolOutcome::error(format!(
+                    "Async run '{id}' session file must be a .jsonl file: {session_file}"
+                ));
+            }
+            if !Path::new(&session_file).is_file() {
+                return ToolOutcome::error(format!(
+                    "Async run '{id}' session file does not exist: {session_file}"
+                ));
+            }
+            let task = task
+                .unwrap_or_else(|| "Continue the interrupted task from this session.".to_string());
+            // New async run reviving the recorded session file in the trusted
+            // child's cwd/model/thinking; the launcher (or its explicit
+            // absence) also comes from the record.
+            let params = revived_run_params(
+                &child.agent,
+                &task,
+                &session_file,
+                Some(&child.cwd),
+                child.model.as_deref(),
+                child.thinking.as_deref(),
             );
+            let resume_context = crate::recovery::ResumeContext {
+                launcher: if child.launcher_recorded {
+                    Some(child.launcher.clone())
+                } else {
+                    None
+                },
+                required_launcher: child.required_launcher.clone(),
+            };
+            let _ = resume_settings;
+            let result = crate::recovery::with_resume_context(Some(resume_context), || {
+                crate::tool::execute_subagent_tool(
+                    &params,
+                    host,
+                    settings,
+                    &resume_config,
+                    runtime,
+                    None,
+                )
+            });
             ToolOutcome {
                 text: result["content"][0]["text"]
                     .as_str()
@@ -3243,16 +3294,15 @@ mod tests {
             out_of_range.text,
             format!("Async run '{run_id}' has 2 children. Index 5 is out of range.")
         );
+        // V19-03 S11: without a trusted recovery record the run is refused
+        // (BREAKING) instead of trusting the child-writable status file.
         let selected = invoke(json!({
             "action": "resume", "id": run_id, "index": 1, "task": "continue"
         }));
         assert!(selected.is_error, "{}", selected.text);
         assert!(
-            selected.text.contains(&format!(
-                "session file does not exist: {}",
-                missing.display()
-            )),
-            "selected child 1, not the last/first step: {}",
+            selected.text.contains("no trusted recovery record"),
+            "legacy run refused: {}",
             selected.text
         );
         cleanup_run(&run_id);

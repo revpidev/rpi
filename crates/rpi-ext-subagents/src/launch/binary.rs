@@ -24,6 +24,25 @@ pub struct SpawnCommand {
     pub args: Vec<String>,
 }
 
+/// V19-03 S11: a runner launcher wraps the local runner command
+/// (`[...launcher argv, program, ...args]`, async-execution.ts:822 @
+/// feb6da00). The launcher is the direct child, so startup-failure cleanup
+/// only ever signals this process group — never a pid the runner reports.
+pub fn apply_launcher(mut command: SpawnCommand, launcher_argv: Option<&[String]>) -> SpawnCommand {
+    let Some(argv) = launcher_argv else {
+        return command;
+    };
+    let Some((program, rest)) = argv.split_first() else {
+        return command;
+    };
+    let mut args = rest.to_vec();
+    args.push(command.program);
+    args.extend(command.args);
+    command.program = program.clone();
+    command.args = args;
+    command
+}
+
 /// `getPiSpawnCommand` order: env override → `process.execPath` when its file
 /// name is `rpi` → bare `rpi` (PATH lookup at spawn time).
 pub fn resolve_spawn_command(args: &[String]) -> SpawnCommand {
@@ -108,5 +127,26 @@ mod tests {
         // PATH branches without depending on the test runner's binary name.
         let resolved = resolve_spawn_command(&["--mode".into(), "json".into()]);
         assert_eq!(resolved.args, vec!["--mode", "json"]);
+    }
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    use super::*;
+
+    #[test]
+    fn launcher_wraps_the_runner_command() {
+        let base = SpawnCommand {
+            program: "rpi".into(),
+            args: vec!["--mode".into(), "json".into()],
+        };
+        let wrapped = apply_launcher(
+            base.clone(),
+            Some(&["/usr/bin/sandbox".into(), "--flag".into()]),
+        );
+        assert_eq!(wrapped.program, "/usr/bin/sandbox");
+        assert_eq!(wrapped.args, vec!["--flag", "rpi", "--mode", "json"]);
+        assert_eq!(apply_launcher(base.clone(), None), base);
+        assert_eq!(apply_launcher(base.clone(), Some(&[])), base);
     }
 }

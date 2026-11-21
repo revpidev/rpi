@@ -83,6 +83,43 @@ pub fn parse_steps(steps: &Value) -> Result<Vec<StepSpec>, String> {
                 "Duplicate output binding '{binding}' in steps; each `as` name must be unique."
             ));
         }
+        // V19-03 S31 (upstream #3207): reject unknown step fields instead of
+        // silently dropping them, with the outer-call pointer for call-level
+        // options.
+        const STEP_FIELDS: [&str; 15] = [
+            "agent",
+            "task",
+            "model",
+            "thinking",
+            "context",
+            "output",
+            "outputMode",
+            "reads",
+            "skill",
+            "skills",
+            "progress",
+            "as",
+            "timeoutMs",
+            "cwd",
+            "gate",
+        ];
+        for field in object.keys() {
+            if STEP_FIELDS.contains(&field.as_str()) {
+                continue;
+            }
+            return Err(match field.as_str() {
+                "worktree" => format!(
+                    "steps[{index}].worktree is not supported inside a chain step; set worktree on the outer call. No child was launched."
+                ),
+                "output" => format!(
+                    "steps[{index}].output is not supported inside a chain step; set output on the outer call to write one file per child. No child was launched."
+                ),
+                other => format!(
+                    "steps[{index}].{other} is not supported inside a chain step (supported: {}). No child was launched.",
+                    STEP_FIELDS.join(", ")
+                ),
+            });
+        }
         let output = match object.get("output") {
             Some(Value::Bool(false)) => OutputOverride::Disabled,
             Some(Value::String(path)) if !path.trim().is_empty() => {
@@ -664,7 +701,7 @@ pub async fn run_chain_async_with_step_sink(
             &chain_dir,
         );
         let full_task = format!("{prefix}{task}{suffix}");
-        let spec = ChildSpec {
+        let mut spec = ChildSpec {
             agent_name: agent.name.clone(),
             task: full_task,
             model: step.model.clone(),
@@ -713,6 +750,24 @@ pub async fn run_chain_async_with_step_sink(
             return Ok((
                 completed,
                 Some(budget_exhausted_outcome(index, &step.agent_name, &message)),
+            ));
+        }
+        // V19-03 S13/S46: approval after interpolation (the handler sees the
+        // final `{previous}` text) and before the child starts.
+        if let Err(reason) = crate::p1::launch_child::approve_workflow_child(
+            ctx,
+            &mut spec,
+            &format!("step-{index}"),
+            Some("chain"),
+        ) {
+            if let Some(on_step) = &on_step {
+                on_step(ChainStepEvent::Finished {
+                    outcome: Box::new(budget_exhausted_outcome(index, &step.agent_name, &reason)),
+                });
+            }
+            return Ok((
+                completed,
+                Some(budget_exhausted_outcome(index, &step.agent_name, &reason)),
             ));
         }
         if let Some(on_step) = &on_step {
@@ -881,6 +936,18 @@ fn test_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_rejects_unknown_fields_with_context() {
+        let error = parse_steps(&serde_json::json!([{
+            "agent": "scout",
+            "task": "t",
+            "mystery": true
+        }]))
+        .expect_err("unknown field");
+        assert!(error.contains("steps[0].mystery"), "{error}");
+        assert!(error.contains("No child was launched"), "{error}");
+    }
 
     #[test]
     fn steps_accept_per_child_cwd_and_model() {
@@ -1073,6 +1140,10 @@ mod tests {
             control: crate::runner::control::ResolvedControlConfig::default(),
             control_sink: None,
             abort_probe: None,
+            approval: None,
+            required_launcher: None,
+            resume_launcher: None,
+            async_recovery: false,
             detach_ctx: None,
         };
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -1134,6 +1205,10 @@ mod tests {
             control: crate::runner::control::ResolvedControlConfig::default(),
             control_sink: None,
             abort_probe: None,
+            approval: None,
+            required_launcher: None,
+            resume_launcher: None,
+            async_recovery: false,
             detach_ctx: None,
         };
         let probe: crate::p1::parallel::RunControlProbe =
@@ -1201,6 +1276,10 @@ mod tests {
             control: crate::runner::control::ResolvedControlConfig::default(),
             control_sink: None,
             abort_probe: None,
+            approval: None,
+            required_launcher: None,
+            resume_launcher: None,
+            async_recovery: false,
             detach_ctx: None,
         };
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");

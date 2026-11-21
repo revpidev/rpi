@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use rpi_ai::types::{ImageContent, UserContent};
 use rpi_ext_host::api::{
     DeliverAs, ExecOptions, ExecResult, ExecuteToolOptions, ExecuteToolOutcome, HostActions,
-    SendMessageOptions, SendUserMessageOptions,
+    SendMessageOptions, SendUserMessageOptions, ToolCallApproval,
 };
 use rpi_ext_host::error::ExtError;
 use serde_json::Value;
@@ -800,6 +800,39 @@ impl HostActions for SessionHostActions {
             .remove_runtime_api_key(provider_id)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// V19-03 S13 additive (`approveToolCall` host call): run the session's
+    /// `tool_call` handler chain for a synthetic call without dispatching a
+    /// tool. Used by workflow child launches (`subagent_launch`).
+    async fn approve_tool_call(
+        &self,
+        tool_name: &str,
+        input: Value,
+    ) -> Result<ToolCallApproval, ExtError> {
+        let Some(session) = self.session() else {
+            return Err(ExtError::Unbound("session is gone".to_owned()));
+        };
+        let synthetic_id = format!(
+            "subagent-launch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        );
+        let outcome = session
+            .extension_runner()
+            .emit_tool_call(&synthetic_id, tool_name, input, None)
+            .await;
+        Ok(match outcome {
+            Some(outcome) => ToolCallApproval {
+                block: outcome.block.unwrap_or(false),
+                reason: outcome.reason,
+                input: outcome.input,
+            },
+            None => ToolCallApproval::default(),
+        })
     }
 
     /// Backs `ExtensionToolContext.executeTool()` (types.ts:390-394 @

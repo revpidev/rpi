@@ -375,7 +375,15 @@ pub struct ForegroundRunInput {
     /// `--no-approve` to the child argv.
     pub project_trusted: Option<bool>,
     pub agent_inherit_project_context: bool,
+    /// `inheritGlobalContext` (#3206) — see `BuildArgsInput`.
+    pub agent_inherit_global_context: bool,
     pub agent_inherit_skills: bool,
+    /// V19-03 S11: the resolved runner launcher (recorded in the trusted
+    /// recovery record; the argv below wraps the spawn).
+    #[allow(dead_code)]
+    pub launcher: Option<crate::recovery::LauncherRecord>,
+    /// The launcher argv (`[...launcher argv, program, ...args]`).
+    pub launcher_argv: Option<Vec<String>>,
     pub task: String,
     pub task_delivery: Option<TaskDelivery>,
     pub cwd: PathBuf,
@@ -841,6 +849,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         system_prompt: Some(input.agent_system_prompt.clone()),
         system_prompt_mode: input.agent_system_prompt_mode,
         inherit_project_context: input.agent_inherit_project_context,
+        inherit_global_context: input.agent_inherit_global_context,
         inherit_skills: input.agent_inherit_skills,
         require_read_tool: false,
         tools: input.agent_tools.clone(),
@@ -893,7 +902,10 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         env.insert(key, value);
     }
 
-    let spawn_command = binary::resolve_spawn_command(&launch.args);
+    let spawn_command = binary::apply_launcher(
+        binary::resolve_spawn_command(&launch.args),
+        input.launcher_argv.as_deref(),
+    );
     let mut command = Command::new(&spawn_command.program);
     command
         .args(&spawn_command.args)
@@ -2628,7 +2640,10 @@ mod terminal_classification_tests {
             tool_budget_env: None,
             project_trusted: None,
             agent_inherit_project_context: true,
+            agent_inherit_global_context: true,
             agent_inherit_skills: false,
+            launcher: None,
+            launcher_argv: None,
             task: "replay".to_string(),
             task_delivery: None,
             cwd: std::env::temp_dir(),

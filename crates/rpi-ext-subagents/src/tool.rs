@@ -1684,6 +1684,8 @@ fn clone_ctx_for_async(ctx: &crate::p1::launch_child::RunCtx) -> crate::p1::laun
     // #55: async children never detach on asks — their parent is idle
     // between turns and wakes through the fleet-loop ask delivery.
     clone.detach_ctx = None;
+    // V19-03 S11: background child launches persist the trusted record.
+    clone.async_recovery = true;
     clone
 }
 
@@ -1875,6 +1877,10 @@ mod tests {
             .output()
             .expect("git");
         let ctx = crate::p1::launch_child::RunCtx {
+            approval: None,
+            required_launcher: None,
+            resume_launcher: None,
+            async_recovery: false,
             detach_ctx: None,
             settings: Default::default(),
             config: Default::default(),

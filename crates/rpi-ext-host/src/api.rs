@@ -566,6 +566,22 @@ pub struct ExecuteToolOptions {
     pub signal: Option<CancellationToken>,
 }
 
+/// V19-03 S13/S46 additive host surface: the aggregated outcome of the
+/// `tool_call` handler chain for a synthetic call that is never executed.
+/// Extensions use it to offer workflow child launches to permission
+/// handlers (`subagent_launch`) without re-entering their own tool dispatch.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallApproval {
+    #[serde(default)]
+    pub block: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The input after every handler ran (`None` when no handler changed it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Value>,
+}
+
 /// `AgentToolCallOutcome` (packages/agent/src/types.ts:449-453 @ b4afdddf)
 /// carried over the
 /// host boundary: the tool call JSON, its result, and the error flag.
@@ -838,6 +854,21 @@ pub trait HostActions: Send + Sync {
 
     /// `ctx.removeRuntimeApiKey(providerId)` (model-runtime.ts:549-560).
     async fn remove_runtime_api_key(&self, provider_id: &str) -> Result<(), String>;
+
+    /// V19-03 S13 additive: run the session's `tool_call` handler chain for a
+    /// synthetic tool call and return the aggregated block/rewrite decision.
+    /// Unlike `execute_tool` this never dispatches a tool, so a native plugin
+    /// can offer a workflow child launch to permission handlers without
+    /// re-entering its own tool dispatch. Default: unbound.
+    async fn approve_tool_call(
+        &self,
+        _tool_name: &str,
+        _input: Value,
+    ) -> Result<ToolCallApproval, ExtError> {
+        Err(ExtError::Unbound(
+            "approveToolCall is not bound to a session".to_owned(),
+        ))
+    }
 
     /// Backs `ExtensionToolContext.executeTool()` (types.ts:390-394 @
     /// b4afdddf; `_executeNestedToolCall`, agent-session.ts:702-735): run

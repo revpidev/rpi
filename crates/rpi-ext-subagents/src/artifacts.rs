@@ -393,26 +393,174 @@ pub fn cleanup_old_artifacts(dir: &Path, max_age_days: u64) {
         }
     }
     let cutoff = now.saturating_sub(max_age_days * DAY_MS);
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy() == CLEANUP_MARKER_FILE {
+    // V19-03 S33 (#3217): recurse into nested artifact folders (workflow
+    // child outputs under `outputs/`) with a safe-root walker; worktree
+    // handoff records/patches are preserved, symlinks are never followed,
+    // and a path that resolves outside the root is skipped.
+    let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    cleanup_dir_recursive(dir, &root, cutoff);
+    let _ = std::fs::write(&marker_path, now.to_string());
+}
+
+/// `cleanupOldArtifacts` recursion (V19-03 S33): one safe-root walk. Keeps
+/// `handoffs/` and `*.patch` files (worktree recovery evidence), never
+/// follows symlinks, and only removes entries whose real path stays under
+/// the root.
+fn cleanup_dir_recursive(dir: &Path, root: &Path, cutoff: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == CLEANUP_MARKER_FILE {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        if !canonical.starts_with(root) {
+            continue;
+        }
+        if file_type.is_dir() {
+            if name == "handoffs" {
                 continue;
             }
+            cleanup_dir_recursive(&path, root, cutoff);
+            let empty = std::fs::read_dir(&path)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false);
+            if empty {
+                let _ = std::fs::remove_dir(&path);
+            }
+            continue;
+        }
+        if name.ends_with(".patch") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let mtime = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if mtime < cutoff {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Fork session copies under `<agent sessions>/*/forks/` (V19-03 S42,
+/// #3232): delete a copy only when no active background run references it
+/// and nothing wrote to it for `cleanup_days`. The walker never leaves the
+/// sessions root and never follows symlinks.
+pub fn cleanup_fork_copies(cleanup_days: u64) {
+    if cleanup_days == 0 {
+        return;
+    }
+    let sessions_base = paths::get_agent_dir().join("sessions");
+    let Ok(session_dirs) = std::fs::read_dir(&sessions_base) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(cleanup_days * 24 * 60 * 60))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let active = active_run_session_files();
+    for session_dir in session_dirs.flatten() {
+        let forks = session_dir.path().join("forks");
+        let Ok(entries) = std::fs::read_dir(&forks) else {
+            continue;
+        };
+        let root = forks.canonicalize().unwrap_or_else(|_| forks.clone());
+        for entry in entries.flatten() {
             let path = entry.path();
-            let Ok(meta) = entry.metadata() else { continue };
-            let Ok(modified) = meta.modified() else {
+            let Ok(canonical) = path.canonicalize() else {
                 continue;
             };
-            let mtime = modified
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            if mtime < cutoff {
-                let _ = std::fs::remove_file(&path);
+            if !canonical.starts_with(&root) {
+                continue;
+            }
+            if active
+                .iter()
+                .any(|active| canonical.starts_with(active) || active.starts_with(&canonical))
+            {
+                continue;
+            }
+            let newest = newest_write(&path);
+            if newest.is_some_and(|newest| newest < cutoff) {
+                let _ = std::fs::remove_dir_all(&path);
             }
         }
     }
-    let _ = std::fs::write(&marker_path, now.to_string());
+}
+
+/// Newest mtime anywhere below `path` (the copy itself when it is a file).
+fn newest_write(path: &Path) -> Option<std::time::SystemTime> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_dir() {
+        return meta.modified().ok();
+    }
+    let mut newest = meta.modified().ok();
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return newest;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_type()
+            .map(|kind| kind.is_symlink())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        if let Some(candidate) = newest_write(&entry.path())
+            && newest.is_none_or(|current| candidate > current)
+        {
+            newest = Some(candidate);
+        }
+    }
+    newest
+}
+
+/// Session files of non-terminal async runs (fork-copy protection).
+fn active_run_session_files() -> Vec<PathBuf> {
+    let runs = crate::runner::background::async_runs_dir();
+    let Ok(entries) = std::fs::read_dir(runs) else {
+        return Vec::new();
+    };
+    let mut active = Vec::new();
+    for entry in entries.flatten() {
+        let status_path = entry.path().join("status.json");
+        let Ok(raw) = std::fs::read_to_string(&status_path) else {
+            continue;
+        };
+        let Ok(status) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if !matches!(
+            status["state"].as_str().unwrap_or(""),
+            "queued" | "running" | "paused"
+        ) {
+            continue;
+        }
+        for step in status["steps"].as_array().into_iter().flatten() {
+            if let Some(file) = step["sessionFile"].as_str()
+                && let Ok(path) = PathBuf::from(file).canonicalize()
+            {
+                active.push(path);
+            }
+        }
+    }
+    active
 }
 
 /// `cleanupAllArtifactDirs` (artifacts.ts:261-285): temp artifacts + every
@@ -775,5 +923,73 @@ mod tests {
         let error = result.expect_err("EACCES propagates");
         assert_eq!(error.raw_os_error(), Some(libc::EACCES));
         assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod recursive_cleanup_tests {
+    use super::*;
+
+    fn set_age(path: &Path, days: u64) {
+        let when =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for mtime");
+        file.set_modified(when).expect("set mtime");
+    }
+
+    #[test]
+    fn nested_outputs_are_cleaned_and_handoffs_patches_kept() {
+        let root = std::env::temp_dir().join(format!(
+            "rpi-artifacts-rec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let outputs = root.join("outputs");
+        let handoffs = root.join("handoffs");
+        std::fs::create_dir_all(&outputs).unwrap();
+        std::fs::create_dir_all(&handoffs).unwrap();
+        let old_output = outputs.join("old.md");
+        let keep_patch = root.join("recovery.patch");
+        let keep_handoff = handoffs.join("run.json");
+        for path in [&old_output, &keep_patch, &keep_handoff] {
+            std::fs::write(path, "x").unwrap();
+            set_age(path, 40);
+        }
+        // No throttle marker: the first sweep runs.
+        cleanup_old_artifacts(&root, 7);
+        assert!(!old_output.exists(), "nested output removed");
+        assert!(keep_patch.exists(), "worktree patch preserved");
+        assert!(keep_handoff.exists(), "handoff record preserved");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_not_followed() {
+        let root = std::env::temp_dir().join(format!(
+            "rpi-artifacts-sym-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let outside =
+            std::env::temp_dir().join(format!("rpi-artifacts-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("keep.txt");
+        std::fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link.txt")).unwrap();
+        cleanup_old_artifacts(&root, 7);
+        assert!(target.exists(), "symlink target untouched");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

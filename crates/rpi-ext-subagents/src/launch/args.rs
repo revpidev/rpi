@@ -335,6 +335,9 @@ pub struct BuildArgsInput {
     pub system_prompt: Option<String>,
     pub system_prompt_mode: &'static str,
     pub inherit_project_context: bool,
+    /// `inheritGlobalContext` (#3206): when false the child gets
+    /// `RPI_NO_GLOBAL_CONTEXT=1` and skips the global AGENTS.md.
+    pub inherit_global_context: bool,
     pub inherit_skills: bool,
     pub require_read_tool: bool,
     pub tools: Option<Vec<String>>,
@@ -753,7 +756,9 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
     // (`resource_loader::no_global_context`); a host that does not know the
     // switch keeps loading it (old-host fallback — no refusal, no crash).
     // No user-visible config key in v0.1.4 (ADR-0026 decision 4).
-    env.insert(NO_GLOBAL_CONTEXT_ENV.into(), Some("1".into()));
+    if !input.inherit_global_context {
+        env.insert(NO_GLOBAL_CONTEXT_ENV.into(), Some("1".into()));
+    }
     env.insert(
         SUBAGENT_FANOUT_CHILD_ENV.into(),
         Some(
@@ -1647,5 +1652,65 @@ mod te18_args_tests {
         assert!(!build(Some(true)).contains(&"--no-approve".to_string()));
         assert!(!build(None).contains(&"--no-approve".to_string()));
         assert!(build(Some(false)).contains(&"--no-approve".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod inherit_global_context_env_tests {
+    use super::*;
+
+    fn input(inherit_global_context: bool) -> BuildArgsInput {
+        BuildArgsInput {
+            base_args: vec!["--mode".into(), "json".into()],
+            task: "do it".into(),
+            task_delivery: None,
+            session_enabled: false,
+            session_dir: None,
+            session_file: None,
+            model: None,
+            thinking: None,
+            system_prompt: None,
+            system_prompt_mode: "replace",
+            inherit_project_context: false,
+            inherit_global_context,
+            inherit_skills: false,
+            require_read_tool: false,
+            tools: None,
+            exclude_tools: Vec::new(),
+            extensions: None,
+            subagent_only_extensions: None,
+            mcp_direct_tools: Vec::new(),
+            prompt_file_stem: None,
+            run_id: None,
+            child_agent_name: None,
+            child_index: None,
+            parent_session_id: None,
+            fanout_authorized: false,
+            self_extension: None,
+            steer_inbox: None,
+            thinking_ceiling: None,
+            session_name: None,
+            supervisor_channel: None,
+            descendant_allowed_agents: None,
+            diff_baseline: None,
+            tool_budget_env: None,
+            project_trusted: None,
+        }
+    }
+
+    #[test]
+    fn global_context_switch_follows_the_agent_flag() {
+        let skipped = build_rpi_args(&input(false)).expect("args");
+        assert_eq!(
+            skipped.env.get(NO_GLOBAL_CONTEXT_ENV),
+            Some(&Some("1".into())),
+            "opt-out sets the skip env"
+        );
+        let inherited = build_rpi_args(&input(true)).expect("args");
+        assert_ne!(
+            inherited.env.get(NO_GLOBAL_CONTEXT_ENV),
+            Some(&Some("1".into())),
+            "inheriting never sets the skip env"
+        );
     }
 }
