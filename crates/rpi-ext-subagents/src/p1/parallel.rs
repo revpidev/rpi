@@ -175,6 +175,9 @@ pub fn parse_tasks(tasks: &Value, max_tasks: u64) -> Result<Vec<TaskEntry>, Stri
                     .map(str::to_string),
                 turn_budget: None,
                 tool_budget: None,
+                output_schema: crate::structured_output::parse_call_schema(
+                    object.get("outputSchema"),
+                ),
                 session_file: None,
                 steer_inbox: None,
                 skill_fallback_cwd: None,
@@ -345,6 +348,8 @@ impl StepTerminal {
 pub struct RunControlFlags {
     pub stop_requested: bool,
     pub interrupt_requested: bool,
+    /// S29: stop admitting new children; started children finish.
+    pub drain_requested: bool,
 }
 
 /// Live control probe, read when a child settles (a stop can arrive
@@ -519,6 +524,7 @@ pub fn run_parallel(
         Arc::new(move || RunControlFlags {
             stop_requested: probe(),
             interrupt_requested: false,
+            drain_requested: false,
         }) as RunControlProbe
     });
     runtime.block_on(run_parallel_async(
@@ -587,6 +593,24 @@ pub async fn run_parallel_async(
                     // running children have been signalled. Upstream returns
                     // a stopped step for every queued task instead of
                     // launching it.
+                    let drain = control_probe
+                        .as_ref()
+                        .is_some_and(|probe| probe().drain_requested);
+                    if drain {
+                        let reason = "Workflow draining; child not started.".to_string();
+                        if let Some(sink) = &on_step {
+                            sink(
+                                index,
+                                ParallelStepEvent::Finished {
+                                    exit_code: -1,
+                                    error: Some(reason.clone()),
+                                    terminal: StepTerminal::Stopped,
+                                    details: None,
+                                },
+                            );
+                        }
+                        return (index, Some(Err(reason)));
+                    }
                     if control_probe
                         .as_ref()
                         .is_some_and(|probe| probe().stop_requested)
@@ -1165,6 +1189,7 @@ mod tests {
             let control = RunControlFlags {
                 stop_requested: input["stopRequested"].as_bool().unwrap_or(false),
                 interrupt_requested: input["interruptRequested"].as_bool().unwrap_or(false),
+                drain_requested: input["drainRequested"].as_bool().unwrap_or(false),
             };
             let terminal = classify_terminal(
                 input["exitCode"].as_i64().unwrap_or(0) as i32,
@@ -1446,6 +1471,7 @@ mod tests {
         let probe: RunControlProbe = Arc::new(|| RunControlFlags {
             stop_requested: true,
             interrupt_requested: false,
+            drain_requested: false,
         });
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let outcomes = runtime
@@ -1463,6 +1489,87 @@ mod tests {
         for outcome in &outcomes {
             assert_eq!(outcome.exit_code, -1);
             assert_eq!(outcome.error.as_deref(), Some("Stopped before completion."));
+        }
+        // No child session/artifact was created for either skipped task.
+        assert!(!base.join("sessions").exists(), "no child should spawn");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn drain_probe_skips_queued_tasks_without_spawning() {
+        let agents = crate::agents::builtin::load_builtin_agents(None);
+        let entries = parse_tasks(
+            &json!([
+                {"key": "a", "agent": "scout", "task": "a"},
+                {"key": "b", "agent": "worker", "task": "b"}
+            ]),
+            8,
+        )
+        .unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos())
+            .unwrap_or(0);
+        let base =
+            std::env::temp_dir().join(format!("rpi-parallel-drain-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = RunCtx {
+            settings: Default::default(),
+            config: Default::default(),
+            base_cwd: base.clone(),
+            parent_session: None,
+            parent_session_file: None,
+            parent_session_id: None,
+            parent_model: None,
+            project_trusted: None,
+            registry: Vec::new(),
+            host_builtin_tool_names: Ok(Vec::new()),
+            run_id: "stop-parallel".to_string(),
+            top_model: None,
+            top_thinking: None,
+            top_context: None,
+            top_timeout_ms: None,
+            top_turn_budget: None,
+            top_tool_budget: None,
+            usage_budget: None,
+            artifacts_dir: None,
+            session_root: base.join("sessions"),
+            session_root_is_derived: true,
+            frame_sink: None,
+            step_status: None,
+            control: crate::runner::control::ResolvedControlConfig::default(),
+            control_sink: None,
+            abort_probe: None,
+            approval: None,
+            required_launcher: None,
+            resume_launcher: None,
+            async_recovery: false,
+            detach_ctx: None,
+        };
+        let probe: RunControlProbe = Arc::new(|| RunControlFlags {
+            stop_requested: false,
+            interrupt_requested: false,
+            drain_requested: true,
+        });
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let outcomes = runtime
+            .block_on(run_parallel_async(
+                &entries,
+                &agents,
+                &ctx,
+                2,
+                None,
+                None,
+                Some(probe),
+            ))
+            .expect("drain is a normal batch outcome");
+        assert_eq!(outcomes.len(), 2);
+        for outcome in &outcomes {
+            assert_eq!(outcome.exit_code, -1);
+            assert_eq!(
+                outcome.error.as_deref(),
+                Some("Workflow draining; child not started.")
+            );
         }
         // No child session/artifact was created for either skipped task.
         assert!(!base.join("sessions").exists(), "no child should spawn");

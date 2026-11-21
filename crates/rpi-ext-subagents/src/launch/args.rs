@@ -413,6 +413,7 @@ pub struct LaunchToolPlan {
 pub fn resolve_launch_tool_plan(
     tools: Option<&Vec<String>>,
     exclude_tools: &[String],
+    mcp_direct_tools: &[String],
     extensions: Option<&Vec<String>>,
     subagent_only_extensions: Option<&Vec<String>>,
     require_read_tool: bool,
@@ -430,7 +431,7 @@ pub fn resolve_launch_tool_plan(
     // extension paths, not builtin tool names (pi-args.ts:385-389, 408-414).
     let is_path_shaped =
         |tool: &str| tool.contains('/') || tool.ends_with(".ts") || tool.ends_with(".js");
-    let requested_builtin: Vec<String> = tools
+    let mut requested_builtin: Vec<String> = tools
         .map(|list| {
             list.iter()
                 .filter(|t| !is_path_shaped(t))
@@ -438,6 +439,27 @@ pub fn resolve_launch_tool_plan(
                 .collect()
         })
         .unwrap_or_default();
+    // S32/S47: `mcp:server.tool` selectors map to the host's built-in MCP
+    // tool name (`mcp__server__tool`, `-` → `_`). `server.*` keeps the
+    // namespace wildcard. Explicit builtin allowlists carry them; with no
+    // allowlist the child's ambient MCP tools stay intact.
+    for selector in mcp_direct_tools {
+        let selector = selector.trim();
+        if selector.is_empty() || selector == "search" {
+            continue;
+        }
+        let normalized = selector.replace('-', "_");
+        let name = if let Some((server, tool)) = normalized.split_once('.') {
+            if tool == "*" {
+                format!("mcp__{server}__*")
+            } else {
+                format!("mcp__{server}__{tool}")
+            }
+        } else {
+            format!("mcp__{normalized}")
+        };
+        requested_builtin.push(name);
+    }
     let tool_extension_paths: Vec<String> = tools
         .map(|list| list.iter().filter(|t| is_path_shaped(t)).cloned().collect())
         .unwrap_or_default();
@@ -614,6 +636,7 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
     let tool_plan = resolve_launch_tool_plan(
         input.tools.as_ref(),
         &input.exclude_tools,
+        &input.mcp_direct_tools,
         input.extensions.as_ref(),
         input.subagent_only_extensions.as_ref(),
         input.require_read_tool,
@@ -1214,21 +1237,21 @@ mod tests {
     #[test]
     fn tools_three_branches() {
         // omitted: no --tools flag
-        let plan = resolve_launch_tool_plan(None, &[], None, None, false, None);
+        let plan = resolve_launch_tool_plan(None, &[], &[], None, None, false, None);
         assert!(!plan.explicit_tool_allowlist);
         // empty list: --no-tools
-        let plan = resolve_launch_tool_plan(Some(&Vec::new()), &[], None, None, false, None);
+        let plan = resolve_launch_tool_plan(Some(&Vec::new()), &[], &[], None, None, false, None);
         assert!(plan.explicit_tool_allowlist);
         assert!(plan.effective_tool_allowlist.is_empty());
         // values: --tools with read auto-added when skills require it
         let tools = vec!["bash".to_string(), "write".to_string()];
-        let plan = resolve_launch_tool_plan(Some(&tools), &[], None, None, true, None);
+        let plan = resolve_launch_tool_plan(Some(&tools), &[], &[], None, None, true, None);
         assert_eq!(plan.effective_tool_allowlist, vec!["read", "bash", "write"]);
         assert_eq!(plan.required_child_tools, vec!["read", "bash", "write"]);
         assert!(!plan.fanout_authorized);
         // subagent in tools authorizes fanout
         let tools = vec!["read".to_string(), "subagent".to_string()];
-        let plan = resolve_launch_tool_plan(Some(&tools), &[], None, None, false, None);
+        let plan = resolve_launch_tool_plan(Some(&tools), &[], &[], None, None, false, None);
         assert!(plan.fanout_authorized);
     }
 
@@ -1238,6 +1261,7 @@ mod tests {
         // present (even empty) disables ambient + lists runtime first
         let plan = resolve_launch_tool_plan(
             Some(&vec!["read".into()]),
+            &[],
             &[],
             Some(&vec![]),
             None,
@@ -1250,6 +1274,7 @@ mod tests {
         let plan = resolve_launch_tool_plan(
             None,
             &[],
+            &[],
             Some(&vec!["/ext/other.so".into()]),
             None,
             false,
@@ -1261,6 +1286,7 @@ mod tests {
         let plan = resolve_launch_tool_plan(
             None,
             &[],
+            &[],
             None,
             Some(&vec!["/path/to/ext.so".to_string()]),
             false,
@@ -1270,7 +1296,7 @@ mod tests {
         assert_eq!(plan.extension_args, vec![SELF, "/path/to/ext.so"]);
         // tool entries with path shapes route to extensions, not --tools
         let tools = vec!["read".to_string(), "/abs/tool.so".to_string()];
-        let plan = resolve_launch_tool_plan(Some(&tools), &[], None, None, false, Some(SELF));
+        let plan = resolve_launch_tool_plan(Some(&tools), &[], &[], None, None, false, Some(SELF));
         assert_eq!(plan.effective_tool_allowlist, vec!["read"]);
         assert_eq!(plan.extension_args, vec![SELF, "/abs/tool.so"]);
     }
@@ -1565,6 +1591,7 @@ mod te18_args_tests {
         let plan = resolve_launch_tool_plan(
             Some(&vec!["subagent".to_string(), "read".to_string()]),
             &["subagent".to_string()],
+            &[],
             None,
             None,
             false,

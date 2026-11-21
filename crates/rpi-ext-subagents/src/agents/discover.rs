@@ -19,6 +19,19 @@ use std::path::{Path, PathBuf};
 
 use crate::paths;
 
+/// S20 (#3117): agent discovery is bound to a session generation. A reload
+/// or session switch bumps it; a scan that observes a change before it
+/// returns is stale and must not rebuild the old session's agents.
+static DISCOVERY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn discovery_generation() -> u64 {
+    DISCOVERY_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub fn bump_discovery_generation() -> u64 {
+    DISCOVERY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
 /// Frontmatter `thinking`: unset | explicitly disabled (`false`) | a level.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThinkingSpec {
@@ -1339,6 +1352,7 @@ pub fn discover_agents_with_user_dirs_with_diagnostics_trusted(
     mut user_dirs: Vec<PathBuf>,
     project_trusted: bool,
 ) -> (Vec<AgentConfig>, Vec<DiscoverDiagnostic>) {
+    let generation = discovery_generation();
     // #1801: user-scope `agentScanDirs` append after the (explicit or
     // default) fixed user dirs — fixed definitions win on same-name because
     // scan dirs load last (agents.ts discovery order + the upstream test
@@ -1450,6 +1464,17 @@ pub fn discover_agents_with_user_dirs_with_diagnostics_trusted(
         for agent in project {
             merged.insert(agent.name.clone(), agent);
         }
+    }
+    // S20: a reload/session switch during the scan invalidates its result.
+    if generation != discovery_generation() {
+        return (
+            Vec::new(),
+            vec![DiscoverDiagnostic {
+                path: cwd.to_path_buf(),
+                scope: AgentSource::Project,
+                error: "agent discovery was cancelled by a session generation change".to_string(),
+            }],
+        );
     }
     (
         merged
@@ -2274,6 +2299,39 @@ mod tests {
                 .all(|agent| agent.source == AgentSource::Builtin),
             "{project_scope:?}"
         );
+    }
+
+    #[test]
+    fn untrusted_discovery_does_not_probe_ancestor_agent_dirs() {
+        let root = temp_root("untrusted-ancestor");
+        let cwd = root.join("nested").join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let ancestor_agents = root.join(".rpi").join("agents");
+        std::fs::create_dir_all(&ancestor_agents).unwrap();
+        // A corrupt definition would produce a diagnostic if scanned.
+        std::fs::write(ancestor_agents.join("bad.md"), "not frontmatter").unwrap();
+        let settings = crate::config::SettingsPair::default();
+        let (agents, diagnostics) = discover_agents_with_user_dirs_with_diagnostics_trusted(
+            &cwd,
+            "both",
+            &settings,
+            None,
+            vec![],
+            false,
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.path.ends_with("bad.md")),
+            "untrusted discovery must not probe ancestor .rpi: {diagnostics:?}"
+        );
+        assert!(
+            agents
+                .iter()
+                .all(|agent| agent.source == AgentSource::Builtin),
+            "untrusted discovery must not load project agents"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

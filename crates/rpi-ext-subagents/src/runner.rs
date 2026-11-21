@@ -8,4 +8,5 @@ pub mod events;
 pub mod foreground;
 pub mod foreground_history;
 pub mod guard;
+pub mod pausable;
 pub mod streaming;

@@ -473,6 +473,17 @@ pub fn resolve_required_subagent_model_candidate(
         error.push_str(
             " If the model is an extension-registered virtual model, the extension that registers it must load in this child: list it in `subagentOnlyExtensions` or `extensions`, or register it from the host so it loads for every launch.",
         );
+    } else if let Some((provider, _)) = model.split_once('/')
+        && !models
+            .iter()
+            .any(|entry| entry.provider.eq_ignore_ascii_case(provider))
+    {
+        // S10 (#3100): a child whose `extensions: []` drops the provider's
+        // registering extension must be told which provider is missing and
+        // how to load it.
+        error.push_str(&format!(
+            " Provider '{provider}' is not in the child's registry. If it comes from an extension, load that extension in this child via `extensions`/`subagentOnlyExtensions`, or keep the host's ambient extension load."
+        ));
     }
     Err(error)
 }
@@ -1592,9 +1603,15 @@ mod te18_model_tests {
         let error =
             resolve_required_subagent_model_candidate("faux/primary", Some(&registry), None)
                 .unwrap_err();
-        assert_eq!(
-            error,
-            "Unknown subagent model 'faux/primary' in the active rpi model registry."
+        assert!(
+            error.starts_with(
+                "Unknown subagent model 'faux/primary' in the active rpi model registry."
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("Provider 'faux' is not in the child's registry"),
+            "{error}"
         );
         // Empty registry never fails (passthrough is correct there).
         assert_eq!(

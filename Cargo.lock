@@ -3591,6 +3591,7 @@ dependencies = [
  "abi_stable",
  "fs2",
  "futures",
+ "jsonschema",
  "libc",
  "regex",
  "rpi-agent",

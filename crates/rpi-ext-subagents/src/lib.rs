@@ -23,6 +23,7 @@ mod actions;
 mod agents;
 mod artifacts;
 mod commands;
+mod compaction_wake;
 mod config;
 mod description;
 mod diagnostic;
@@ -31,6 +32,7 @@ mod error;
 pub mod fleet;
 mod launch;
 mod messages;
+mod missions;
 mod notice_marker;
 mod p1;
 mod paths;
@@ -41,9 +43,13 @@ mod render;
 mod runner;
 mod runtime;
 mod scalars;
+mod schedules;
 mod session_fork;
+mod session_switch;
 mod settings_lease;
+mod structured_output;
 mod tool;
+mod tool_activation;
 
 use std::path::PathBuf;
 
@@ -658,6 +664,34 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             {
                 return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
+            // S17: the parent set an outputSchema — register the child tool
+            // whose permissive parameters preserve the raw JSON value.
+            if let Ok(raw) = std::env::var("RPI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA") {
+                match serde_json::from_str::<Value>(&raw) {
+                    Ok(schema) => {
+                        if let Err(error) = crate::structured_output::validate_schema_shape(&schema)
+                        {
+                            tracing::warn!(error = %error, "invalid structured output schema");
+                        } else if let Err(error) = register(
+                            "registerTool",
+                            json!({
+                                "name": "structured_output",
+                                "label": "Structured output",
+                                "description": "Submit the final result as raw JSON; it is validated against the requested schema before any coercion.",
+                                "parameters": crate::structured_output::tool_parameters(&schema),
+                            }),
+                        ) {
+                            tracing::warn!(
+                                error = %error.to_string(),
+                                "structured_output registration denied; child continues without it"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "invalid RPI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA");
+                    }
+                }
+            }
             // #2333/#2426 reviewer diff tool: register whenever the parent
             // requested it (gated by the agent's tools naming it) — a child
             // without a Git baseline registers in unavailable mode instead of
@@ -893,6 +927,11 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             for event in [
                 "session_start",
                 "session_shutdown",
+                "session_before_switch",
+                "session_before_fork",
+                "session_compact",
+                "session_compact_failed",
+                "agent_start",
                 "agent_end",
                 // FR-J R1 (#3061): the notice-marker transform runs after the
                 // host restored prompt/tool state so mid-conversation system
@@ -1116,6 +1155,40 @@ fn dispatch_message(message: &Value) -> Value {
                     .filter(|id| !id.is_empty());
                 return execute_subagent_wait(&params, &state, tool_call_id);
             }
+            if tool_name == "structured_output" {
+                let schema = std::env::var("RPI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA")
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+                let Some(schema) = schema else {
+                    return json!({
+                        "content": [{ "type": "text", "text":
+                            "structured_output is unavailable: this child was launched without an outputSchema."
+                        }],
+                        "details": { "mode": "single", "results": [] },
+                        "isError": true,
+                    });
+                };
+                return match crate::structured_output::capture(&schema, &params) {
+                    Ok(value) => {
+                        if let Ok(path) = std::env::var("RPI_SUBAGENT_STRUCTURED_OUTPUT_PATH") {
+                            let _ = crate::artifacts::write_metadata(
+                                std::path::Path::new(&path),
+                                &value,
+                            );
+                        }
+                        json!({
+                            "content": [{ "type": "text", "text": "Structured output captured." }],
+                            "details": { "mode": "single", "results": [], "structuredOutput": value },
+                            "isError": false,
+                        })
+                    }
+                    Err(error) => json!({
+                        "content": [{ "type": "text", "text": error }],
+                        "details": { "mode": "single", "results": [] },
+                        "isError": true,
+                    }),
+                };
+            }
             if tool_name == "contact_supervisor" {
                 if let Some(context) = crate::p1::supervisor::ChildSupervisorContext::from_env() {
                     return context.execute(&params);
@@ -1329,7 +1402,67 @@ fn dispatch_message(message: &Value) -> Value {
                 (_, notice_marker::CONTEXT_WITH_SYSTEM_EVENT) => {
                     notice_marker::handle_context_with_system(message)
                 }
+                (PluginMode::Parent, "session_before_switch") => {
+                    let calls = AsyncHostCalls {
+                        call: state.calls.call,
+                        cookie: state.cookie,
+                    };
+                    let reason = message
+                        .get("payload")
+                        .and_then(|payload| payload.get("reason"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("new");
+                    session_switch::before_switch(&calls, reason)
+                }
+                (PluginMode::Parent, "session_before_fork") => {
+                    let calls = AsyncHostCalls {
+                        call: state.calls.call,
+                        cookie: state.cookie,
+                    };
+                    session_switch::before_switch(&calls, "fork")
+                }
+                (PluginMode::Parent, "agent_start") => {
+                    compaction_wake::on_agent_start();
+                    Value::Null
+                }
+                (PluginMode::Parent, "session_before_compact") => {
+                    let reason = message
+                        .get("payload")
+                        .and_then(|payload| payload.get("reason"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    compaction_wake::on_before_compact(reason);
+                    Value::Null
+                }
+                (PluginMode::Parent, "session_compact") => {
+                    let reason = message
+                        .get("payload")
+                        .and_then(|payload| payload.get("reason"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let calls = AsyncHostCalls {
+                        call: state.calls.call,
+                        cookie: state.cookie,
+                    };
+                    compaction_wake::on_compact_end(&calls, reason, true);
+                    tool_activation::restore_if_registered(&calls, "compact");
+                    Value::Null
+                }
+                (PluginMode::Parent, "session_compact_failed") => {
+                    let reason = message
+                        .get("payload")
+                        .and_then(|payload| payload.get("reason"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let calls = AsyncHostCalls {
+                        call: state.calls.call,
+                        cookie: state.cookie,
+                    };
+                    compaction_wake::on_compact_end(&calls, reason, false);
+                    Value::Null
+                }
                 (PluginMode::Parent, "session_start") => {
+                    agents::discover::bump_discovery_generation();
                     let config = config::load_config();
                     artifacts::cleanup_all_artifact_dirs(config.cleanup_days_or_default());
                     // Session start is the first point where the host's
@@ -1365,6 +1498,14 @@ fn dispatch_message(message: &Value) -> Value {
                                     .map(str::to_string)
                             })
                             .filter(|id| !id.is_empty());
+                    let start_reason = message
+                        .get("payload")
+                        .and_then(|payload| payload.get("reason"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("startup");
+                    session_switch::session_start(&calls, start_reason);
+                    tool_activation::restore_if_registered(&calls, start_reason);
+                    compaction_wake::bind_session(session_id.as_deref());
                     runner::background::resend_pending_results(&calls, session_id.as_deref());
                     Value::Null
                 }
@@ -1378,10 +1519,23 @@ fn dispatch_message(message: &Value) -> Value {
                     // immediately when nothing is live; finished runs retained
                     // in the registry (status/wait) carry no children and no
                     // longer stall every interactive exit.
+                    let shutdown_reason = message
+                        .get("payload")
+                        .and_then(|payload| payload.get("reason"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    agents::discover::bump_discovery_generation();
+                    session_switch::session_shutdown(shutdown_reason);
+                    compaction_wake::session_shutdown(shutdown_reason);
                     state.runtime.block_on(async_runner_shutdown());
                     Value::Null
                 }
                 (PluginMode::Parent, "agent_end") => {
+                    let calls = AsyncHostCalls {
+                        call: state.calls.call,
+                        cookie: state.cookie,
+                    };
+                    compaction_wake::on_agent_end(&calls);
                     // Headless auto-drain (ADR-0019 print branch,
                     // auto-drain.ts): wait for outstanding runs before exit.
                     // Dispatch is synchronous, so blocking here blocks the
@@ -1420,10 +1574,12 @@ async fn async_runner_shutdown() {
 }
 
 async fn async_move_drain(session_id: Option<&str>) {
-    // DEFAULT_AUTO_DRAIN_TIMEOUT_MS (auto-drain.ts:9): 30 minutes.
-    if let Err(message) =
-        runner::background::drain_outstanding_work(30 * 60 * 1000, session_id).await
-    {
+    // S38 (#3234): a headless parent waits as long as config.timeoutMs allows
+    // a run; unset/invalid keeps the 30-minute default (auto-drain.ts:9).
+    let timeout_ms = config::load_config()
+        .resolve_default_timeout_ms()
+        .unwrap_or(30 * 60 * 1000);
+    if let Err(message) = runner::background::drain_outstanding_work(timeout_ms, session_id).await {
         tracing::error!(%message, "auto-drain failed");
     }
 }
@@ -1500,6 +1656,7 @@ fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Opti
         // (`waitTool.defaultTimeoutMs`, env override) — None falls back to
         // the built-in 30 minutes.
         .or_else(|| config.wait_tool_default_timeout_ms())
+        .or_else(|| config.resolve_default_timeout_ms())
         .unwrap_or(30 * 60 * 1000);
     // Supervisor asks always stop the wait (#1315). Since TE51,
     // `stopOnAttention` also gates the long-running guard's

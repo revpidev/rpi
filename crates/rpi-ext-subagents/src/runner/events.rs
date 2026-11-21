@@ -1000,6 +1000,15 @@ pub struct ChildRunState {
     /// A toolResult carrying this budget's blocked message was observed
     /// (`result.toolBudgetBlocked`).
     pub tool_budget_blocked: bool,
+    /// S40 (#3227): a terminal acceptance report was seen; later steer or
+    /// follow-up guidance must not open a new turn.
+    pub acceptance_final: bool,
+    /// S17/S39: a validated structured_output value was captured from the
+    /// child's raw tool arguments.
+    pub structured_output: Option<Value>,
+    pub structured_output_valid: bool,
+    /// S17: the outputSchema this child must satisfy (parent-side copy).
+    pub structured_output_schema: Option<Value>,
 }
 
 /// One in-flight tool call (`pendingToolResultsByCallId`).
@@ -1035,6 +1044,14 @@ pub struct ToolEndSignal {
     pub duration_ms: Option<u64>,
 }
 
+/// Tool-start facts the runner needs for pausable budgets (S38).
+#[derive(Debug, Clone, Default)]
+pub struct ToolStartSignal {
+    pub tool_call_id: String,
+    pub tool: String,
+    pub args: Value,
+}
+
 /// One `recentTools` entry (`tool_execution_end` push, execution.ts:916-922).
 #[derive(Debug, Default, Clone)]
 pub struct RecentToolEntry {
@@ -1049,6 +1066,8 @@ pub struct LineOutcome {
     pub lifecycle: ChildLifecycleAction,
     /// Mutating-tool end facts for the guard (tool_execution_end only).
     pub tool_end: Option<ToolEndSignal>,
+    /// Tool-start facts for pausable run budgets (S38; tool_execution_start only).
+    pub tool_start: Option<ToolStartSignal>,
     /// Whether the line was a progress-bearing event (drives the streaming
     /// frame push — upstream fires the update per event, execution.ts:914/
     /// 929/972/1005).
@@ -1100,6 +1119,10 @@ impl Default for ChildRunState {
             tool_budget_config: None,
             tool_budget: None,
             tool_budget_blocked: false,
+            acceptance_final: false,
+            structured_output: None,
+            structured_output_valid: false,
+            structured_output_schema: None,
         }
     }
 }
@@ -1253,6 +1276,26 @@ impl ChildRunState {
                             self.tool_count
                         )
                     });
+                if tool_name.as_deref() == Some("structured_output")
+                    && let Some(schema) = &self.structured_output_schema
+                {
+                    match crate::structured_output::capture(schema, &tool_args) {
+                        Ok(value) => {
+                            self.structured_output = Some(value);
+                            self.structured_output_valid = true;
+                        }
+                        Err(error) => {
+                            self.structured_output = None;
+                            self.structured_output_valid = false;
+                            self.assistant_error = Some(error);
+                        }
+                    }
+                }
+                outcome.tool_start = Some(ToolStartSignal {
+                    tool_call_id: tool_call_id.clone(),
+                    tool: tool_name.clone().unwrap_or_else(|| "tool".to_string()),
+                    args: tool_args.clone(),
+                });
                 self.pending_tool_calls.insert(
                     tool_call_id.clone(),
                     PendingToolCall {
@@ -1516,6 +1559,18 @@ impl ChildRunState {
                 {
                     self.assistant_error = None;
                 }
+                // S40 (#3227): a terminal acceptance report closes guidance.
+                if error_message.is_none()
+                    && message
+                        .get("content")
+                        .map(|content| {
+                            let text = super::display::extract_text_from_content(content);
+                            is_acceptance_report(&text)
+                        })
+                        .unwrap_or(false)
+                {
+                    self.acceptance_final = true;
+                }
             }
             // #2653 (9bc8f2d1): a completed assistant message clears the
             // streamed partial text; an errored one becomes the latest
@@ -1638,6 +1693,16 @@ pub fn get_final_output(messages: &[Value]) -> String {
         }
     }
     valid_text_parts.first().cloned().unwrap_or_default()
+}
+
+/// S39 (#3245): the last assistant message's stop reason.
+pub fn get_terminal_assistant_stop_reason(messages: &[Value]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .and_then(|message| message.get("stopReason"))
+        .and_then(Value::as_str)
 }
 
 /// `hasEmptyTerminalAssistantResponse` (utils.ts:456-467 @ v0.66.0, #1921

@@ -368,7 +368,7 @@ fn child_view(entry: &Value, progress: Option<&Value>, is_partial: bool) -> Chil
         return ChildView {
             glyph: "✗".to_string(),
             agent,
-            status_text: format!("Error: {}", first_line(error)),
+            status_text: format!("Error: {}", truncate_utf8_bytes(first_line(error), 256)),
             tone: "error",
             stats,
             activity: None,
@@ -548,7 +548,7 @@ fn artifact_output_path(entry: &Value) -> Option<String> {
 /// [`EXPANDED_TAIL_LINES`] lines (matching the terminal bound) — a single
 /// bounded window instead of the whole in-memory 50-line recentOutput.
 fn expanded_tail(result: &Value, results: &[Value], is_partial: bool) -> String {
-    const EXPANDED_TAIL_LINES: usize = 10;
+    const EXPANDED_TAIL_LINES: usize = 8;
     fn tail_lines(text: &str) -> Vec<&str> {
         let lines: Vec<&str> = text.lines().collect();
         let start = lines.len().saturating_sub(EXPANDED_TAIL_LINES);
@@ -562,14 +562,26 @@ fn expanded_tail(result: &Value, results: &[Value], is_partial: bool) -> String 
             .or_else(|| results.first().and_then(|_| result.get("recentOutput")))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        return tail_lines(tail.trim_end()).join("\n");
+        // S26: one running child keeps its newlines (up to 8 lines); a
+        // multi-child card stays single-line.
+        let lines = tail_lines(tail.trim_end());
+        return if results.len() > 1 {
+            lines.join(" · ")
+        } else {
+            lines.join("\n")
+        };
     }
     let output = results
         .first()
         .and_then(|entry| entry.get("finalOutput"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    tail_lines(output).join("\n")
+    let lines = tail_lines(output);
+    if results.len() > 1 {
+        lines.join(" · ")
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn usage_totals(results: &[Value], progress: &[Value]) -> (u64, u64) {
@@ -592,6 +604,24 @@ fn usage_totals(results: &[Value], progress: &[Value]) -> (u64, u64) {
             .unwrap_or(0);
     }
     (input, output)
+}
+
+/// S06 (#3097): truncate at a UTF-8 character boundary, never above
+/// `max_bytes`; an ellipsis is included in the budget.
+pub fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let ellipsis = "…";
+    let budget = max_bytes.saturating_sub(ellipsis.len());
+    let mut end = 0;
+    for (index, ch) in text.char_indices() {
+        if index + ch.len_utf8() > budget {
+            break;
+        }
+        end = index + ch.len_utf8();
+    }
+    format!("{}{ellipsis}", &text[..end])
 }
 
 fn first_line(text: &str) -> &str {
@@ -624,6 +654,16 @@ mod tests {
     use super::*;
 
     // ===== FR-A =====
+
+    #[test]
+    fn utf8_byte_truncation_keeps_character_boundaries() {
+        let text = "aé中🙂b";
+        let cut = truncate_utf8_bytes(text, 6);
+        assert!(cut.len() <= 6, "{cut:?} has {} bytes", cut.len());
+        assert!(text.starts_with(cut.trim_end_matches('…')));
+        assert_eq!(truncate_utf8_bytes("short", 256), "short");
+        assert!(truncate_utf8_bytes(&"x".repeat(300), 256).len() <= 256);
+    }
 
     #[test]
     fn call_title_four_shapes() {

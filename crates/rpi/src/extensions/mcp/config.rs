@@ -323,7 +323,83 @@ fn resolve_exposure_alias(value: &Value) -> Value {
 }
 
 /// `resolveExposureAliases` (mcp-servers.ts).
+/// S32 (#3201/#3238): `directTools` is the upstream selector alias:
+/// `true` = direct, `"search"` = reachable through tool_search/deferred,
+/// an array = those tools direct and the rest codemode. `false` leaves the
+/// server's normal exposure. Unknown values are rejected by validation.
+fn apply_direct_tools_alias(value: &mut Map<String, Value>) {
+    let Some(direct) = value.get("directTools").cloned() else {
+        return;
+    };
+    if value.contains_key("exposure") {
+        return;
+    }
+    match direct {
+        Value::Bool(true) => {
+            value.insert("exposure".to_owned(), Value::String("direct".to_owned()));
+        }
+        Value::String(search) if search == "search" => {
+            value.insert("exposure".to_owned(), Value::String("deferred".to_owned()));
+        }
+        Value::Array(tools) => {
+            let mut overrides = value
+                .get("toolExposure")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            for tool in tools {
+                if let Some(tool) = tool.as_str() {
+                    overrides.insert(tool.to_owned(), Value::String("direct".to_owned()));
+                }
+            }
+            value.insert("toolExposure".to_owned(), Value::Object(overrides));
+        }
+        _ => {}
+    }
+}
+
+/// Expand `${NAME:-default}` in string values (S32). Unset/empty variables
+/// use the default; an unterminated expression is left verbatim.
+fn expand_env_defaults(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let expression = &after[..end];
+        if let Some((name, default)) = expression.split_once(":-") {
+            let value = std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| default.to_string());
+            out.push_str(&value);
+        } else {
+            out.push_str(&rest[start..start + 2 + end + 1]);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn expand_env_defaults_value(value: &mut Value) {
+    match value {
+        Value::String(text) => *text = expand_env_defaults(text),
+        Value::Array(items) => items.iter_mut().for_each(expand_env_defaults_value),
+        Value::Object(map) => map.values_mut().for_each(expand_env_defaults_value),
+        _ => {}
+    }
+}
+
 fn resolve_exposure_aliases(mut value: Map<String, Value>) -> Map<String, Value> {
+    apply_direct_tools_alias(&mut value);
+    for value in value.values_mut() {
+        expand_env_defaults_value(value);
+    }
     if let Some(exposure) = value.get("exposure").cloned() {
         value.insert("exposure".to_owned(), resolve_exposure_alias(&exposure));
     }
@@ -390,6 +466,18 @@ pub fn validate_mcp_server_config(name: &str, raw: &Value) -> Result<McpServerCo
         return Err(format!(
             "server \"{name}\": exposure must be one of {exposures}"
         ));
+    }
+    if let Some(direct_tools) = value.get("directTools") {
+        let valid = direct_tools.is_boolean()
+            || direct_tools.as_str() == Some("search")
+            || direct_tools
+                .as_array()
+                .is_some_and(|tools| tools.iter().all(Value::is_string));
+        if !valid {
+            return Err(format!(
+                "server \"{name}\": directTools must be a boolean, \"search\", or an array of tool names"
+            ));
+        }
     }
     if let Some(tool_exposure) = value.get("toolExposure") {
         let Some(map) = tool_exposure.as_object() else {
@@ -842,6 +930,34 @@ mod tests {
         assert_eq!(
             get_mcp_tool_exposure(&config, "write_x"),
             McpExposure::Hidden
+        );
+    }
+
+    #[test]
+    fn direct_tools_alias_and_env_defaults() {
+        let config = validate_mcp_server_config(
+            "s",
+            &json!({
+                "url": "https://x",
+                "directTools": "search",
+                "headers": {"Authorization": "Bearer ${RPI_TEST_MCP_TOKEN:-fallback}"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(config.exposure(), McpExposure::Deferred);
+        let config = validate_mcp_server_config(
+            "s",
+            &json!({"url": "https://x", "directTools": ["read", "write"]}),
+        )
+        .unwrap();
+        assert_eq!(get_mcp_tool_exposure(&config, "read"), McpExposure::Direct);
+        assert_eq!(
+            get_mcp_tool_exposure(&config, "other"),
+            McpExposure::Codemode
+        );
+        assert!(
+            validate_mcp_server_config("s", &json!({"url": "https://x", "directTools": "nope"}))
+                .is_err()
         );
     }
 

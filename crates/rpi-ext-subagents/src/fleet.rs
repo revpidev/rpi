@@ -61,7 +61,7 @@ pub fn set_linger_for_test(ms: u64) {
     LINGER_MS_TEST.store(ms, Ordering::SeqCst);
 }
 
-const MAX_TERMINAL_ROWS: usize = 3;
+const MAX_TERMINAL_ROWS: usize = 4;
 /// Expanded tree row cap (upstream `MAX_AGENT_ROWS`).
 const MAX_TREE_ROWS: usize = 6;
 
@@ -87,6 +87,9 @@ pub struct FleetRow {
     pub current_tool: Option<String>,
     /// Long-running guard activity (`needs_attention`/`active_long_running`).
     pub activity_state: Option<String>,
+    /// S36: latest `contact_supervisor(progress_update)` text and age.
+    pub progress: Option<String>,
+    pub progress_age_ms: Option<u64>,
 }
 
 /// Everything one push renders from.
@@ -97,6 +100,9 @@ pub struct FleetSnapshot {
     pub lingering: Vec<FleetRow>,
     /// Configured `maxActiveAsyncRunsPerSession` (`None` = unlimited).
     pub limit: Option<u64>,
+    /// S16: terminal rows observed inside the linger window (including the
+    /// newest rows kept in `lingering`).
+    pub earlier_done: usize,
 }
 
 impl FleetSnapshot {
@@ -175,6 +181,7 @@ pub fn capture_fleet(now_ms: u64, linger: &mut HashMap<String, (u64, u64)>) -> F
     linger.retain(|run_id, _| seen_ids.contains(run_id));
     // Newest terminal runs first, capped.
     terminal.sort_by_key(|&(seen, _)| std::cmp::Reverse(seen));
+    let earlier_done = terminal.len();
     let lingering: Vec<FleetRow> = terminal
         .into_iter()
         .take(MAX_TERMINAL_ROWS)
@@ -189,6 +196,7 @@ pub fn capture_fleet(now_ms: u64, linger: &mut HashMap<String, (u64, u64)>) -> F
         active: active.into_iter().map(|(_, _, row)| row).collect(),
         lingering,
         limit: config::load_config().max_active_async_runs_per_session(),
+        earlier_done,
     }
 }
 
@@ -241,6 +249,19 @@ fn fleet_row(run_id: &str, status: &Value, started_ms: u64, now_ms: u64) -> Flee
                     .map(str::to_owned)
             })
         });
+    let progress = steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| {
+            let agent = step.get("agent").and_then(Value::as_str)?;
+            let channel = crate::p1::supervisor::channel_dir(run_id, agent, index);
+            crate::p1::supervisor::latest_progress(&channel)
+        })
+        .max_by_key(|(_, received_at)| *received_at);
+    let (progress, progress_age_ms) = match progress {
+        Some((text, received_at)) => (Some(text), Some(now_ms.saturating_sub(received_at))),
+        None => (None, None),
+    };
     FleetRow {
         run_id: run_id.to_string(),
         mode,
@@ -250,6 +271,8 @@ fn fleet_row(run_id: &str, status: &Value, started_ms: u64, now_ms: u64) -> Flee
         duration_ms: now_ms.saturating_sub(started_ms),
         current_tool,
         activity_state,
+        progress,
+        progress_age_ms,
     }
 }
 
@@ -257,8 +280,13 @@ fn fleet_row(run_id: &str, status: &Value, started_ms: u64, now_ms: u64) -> Flee
 /// during activity the key never matches, by design; the quiet period is
 /// where it saves the re-push).
 pub fn dirty_key(snapshot: &FleetSnapshot) -> String {
-    serde_json::to_string(&(&snapshot.active, &snapshot.lingering, snapshot.limit))
-        .unwrap_or_default()
+    serde_json::to_string(&(
+        &snapshot.active,
+        &snapshot.lingering,
+        snapshot.limit,
+        snapshot.earlier_done,
+    ))
+    .unwrap_or_default()
 }
 
 /// `Async runs {used}/{limit}` (unlimited renders as `∞`).
@@ -332,6 +360,11 @@ pub fn fleet_tree(snapshot: &FleetSnapshot, expanded: bool) -> Value {
                 capacity_text(snapshot)
             )
         };
+        let line = if snapshot.earlier_done > 0 {
+            format!("{line} · … {} earlier done", snapshot.earlier_done)
+        } else {
+            line
+        };
         return json!({
             "type": "column",
             "props": {},
@@ -341,7 +374,26 @@ pub fn fleet_tree(snapshot: &FleetSnapshot, expanded: bool) -> Value {
             })],
         });
     }
-    let mut children: Vec<Value> = Vec::new();
+    let mut children: Vec<Value> = vec![json!({
+        "type": "text",
+        "props": {
+            "text": format!(
+                "{} agents · {} active · {} done · {}",
+                snapshot
+                    .active
+                    .iter()
+                    .chain(snapshot.lingering.iter())
+                    .map(|row| row.agents)
+                    .sum::<usize>()
+                    .max(snapshot.run_count()),
+                snapshot.active.len(),
+                snapshot.earlier_done,
+                capacity_text(snapshot),
+            ),
+            "fg": "muted",
+            "truncate": true,
+        },
+    })];
     let rows: Vec<&FleetRow> = snapshot
         .active
         .iter()
@@ -371,6 +423,13 @@ pub fn fleet_tree(snapshot: &FleetSnapshot, expanded: bool) -> Value {
         }
         if let Some(tool) = &row.current_tool {
             text.push_str(&format!(" · ⎿ {tool}"));
+        }
+        if let Some(progress) = &row.progress {
+            let age = row
+                .progress_age_ms
+                .map(crate::render::format_duration)
+                .unwrap_or_default();
+            text.push_str(&format!(" · {progress} ({age})"));
         }
         children.push(json!({
             "type": "text",
@@ -560,6 +619,8 @@ mod tests {
             duration_ms,
             current_tool: None,
             activity_state: None,
+            progress: None,
+            progress_age_ms: None,
         }
     }
 
@@ -569,6 +630,7 @@ mod tests {
             active: vec![row("a", "researcher", STATE_RUNNING, 5_000)],
             lingering: vec![row("b", "scout", "complete", 90_000)],
             limit: Some(4),
+            earlier_done: 1,
         };
         let tree = fleet_tree(&snapshot, false);
         let text = tree["children"][0]["props"]["text"].as_str().unwrap();
@@ -585,6 +647,7 @@ mod tests {
             ],
             lingering: vec![row("c", "scout", "complete", 40_000)],
             limit: None,
+            earlier_done: 1,
         };
         let tree = fleet_tree(&snapshot, true);
         let texts: Vec<&str> = tree["children"]
@@ -593,9 +656,9 @@ mod tests {
             .iter()
             .map(|n| n["props"]["text"].as_str().unwrap())
             .collect();
-        assert_eq!(texts.len(), 4, "{texts:?}"); // 3 rows + footer
+        assert_eq!(texts.len(), 5, "{texts:?}"); // summary + 3 rows + footer
         assert!(
-            texts[0].contains("researcher · running · 12.5s"),
+            texts[1].contains("researcher · running · 12.5s"),
             "{texts:?}"
         );
         assert!(
@@ -617,12 +680,13 @@ mod tests {
             active,
             lingering: vec![],
             limit: None,
+            earlier_done: 0,
         };
         let tree = fleet_tree(&snapshot, true);
         let children = tree["children"].as_array().unwrap();
-        assert_eq!(children.len(), 6 + 1 + 1); // cap + "+N more" + footer
+        assert_eq!(children.len(), 1 + 6 + 1 + 1); // summary + cap + "+N more" + footer
         assert!(
-            children[6]["props"]["text"]
+            children[7]["props"]["text"]
                 .as_str()
                 .unwrap()
                 .contains("+2 more")
@@ -635,6 +699,7 @@ mod tests {
             active: vec![row("a", "researcher", STATE_RUNNING, 5_000)],
             lingering: vec![],
             limit: None,
+            earlier_done: 0,
         };
         let mut advanced = base.clone();
         advanced.active[0].duration_ms = 5_500;

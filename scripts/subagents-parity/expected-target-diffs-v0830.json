@@ -1,4 +1,26 @@
 {
-  "//": "Target-track attribution manifest for the v0.1.8 rebase window (TE51, ADR-0038): expected-source pin = pi-subagents v0.83.0 @ 3a63e0ad. Seeded EMPTY; TE51 attributes every remaining difference here (upstream-semantics vs rpi-deviation, each with R + owner task) and closes the track with zero unattributed diffs. The args leg is the frozen v0.48 golden on both tracks ([RPI-OWN], ADR-0025 §4).",
-  "cases": []
+  "//": "Target-track attribution manifest for the v0.1.8 rebase window (TE51, ADR-0038): expected-source pin = pi-subagents v0.83.0 @ 3a63e0ad. Seeded EMPTY; TE51 attributes every remaining difference here (upstream-semantics vs rpi-deviation, each with R + owner task) and closes the track with zero unattributed diffs. The args leg is the frozen v0.48 golden on both tracks ([RPI-OWN], ADR-0025 \u00a74).",
+  "cases": [
+    {
+      "mode": "model",
+      "case": "explicit-miss-fails-closed",
+      "section": "upstream-semantics",
+      "r": "R19-S10",
+      "owner": "V19-03"
+    },
+    {
+      "mode": "model",
+      "case": "candidates-explicit-miss-throws",
+      "section": "upstream-semantics",
+      "r": "R19-S10",
+      "owner": "V19-03"
+    },
+    {
+      "mode": "model",
+      "case": "candidates-configured-miss-deferred-throw",
+      "section": "upstream-semantics",
+      "r": "R19-S10",
+      "owner": "V19-03"
+    }
+  ]
 }

@@ -80,6 +80,8 @@ pub struct AsyncRunHandle {
 pub struct AsyncControl {
     pub stop_requested: Mutex<bool>,
     pub interrupt_requested: Mutex<bool>,
+    /// S29 (#3202): stop admitting new children; started children finish.
+    pub drain_requested: Mutex<bool>,
 }
 
 impl AsyncControl {
@@ -104,6 +106,18 @@ impl AsyncControl {
     pub fn interrupt_requested(&self) -> bool {
         *self
             .interrupt_requested
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+    pub fn request_drain(&self) {
+        *self
+            .drain_requested
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
+    }
+    pub fn drain_requested(&self) -> bool {
+        *self
+            .drain_requested
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
@@ -1264,6 +1278,7 @@ pub async fn drive_run(
                 std::sync::Arc::new(move || crate::p1::parallel::RunControlFlags {
                     stop_requested: control_handle.control.stop_requested(),
                     interrupt_requested: control_handle.control.interrupt_requested(),
+                    drain_requested: control_handle.control.drain_requested(),
                 });
             let outcome = crate::p1::parallel::run_parallel_async(
                 &entries,
@@ -1290,7 +1305,9 @@ pub async fn drive_run(
                     let any_failed = outcomes.iter().any(|o| o.exit_code != 0);
                     finish_with_handoff(
                         &handle,
-                        if any_failed {
+                        if handle.control.drain_requested() {
+                            STATE_STOPPED
+                        } else if any_failed {
                             STATE_FAILED
                         } else {
                             STATE_COMPLETE
@@ -1335,6 +1352,7 @@ pub async fn drive_run(
                 std::sync::Arc::new(move || crate::p1::parallel::RunControlFlags {
                     stop_requested: control_handle.control.stop_requested(),
                     interrupt_requested: control_handle.control.interrupt_requested(),
+                    drain_requested: control_handle.control.drain_requested(),
                 });
             match crate::p1::chain::run_chain_async_with_step_sink(
                 &steps,
@@ -1364,6 +1382,9 @@ pub async fn drive_run(
                             } else {
                                 finish_failed(&handle, error, &notify).await
                             }
+                        }
+                        None if handle.control.drain_requested() => {
+                            finish(&handle, STATE_STOPPED, &last_output, &notify).await
                         }
                         None => finish(&handle, STATE_COMPLETE, &last_output, &notify).await,
                     }
@@ -1623,6 +1644,11 @@ fn record_step_result(
         if result.output_partial {
             step["outputPartial"] = json!(true);
         }
+        // S40 (#3227): a terminal acceptance report closes guidance until an
+        // explicit resume; steer/follow-up must not open a new turn.
+        if result.acceptance_final {
+            step["acceptanceFinal"] = json!(true);
+        }
         // Terminal steps drop the live-activity fields (upstream shows
         // currentTool only for pending/running steps).
         clear_step_live_fields(step);
@@ -1671,6 +1697,7 @@ fn run_control_flags(handle: &Arc<AsyncRunHandle>) -> crate::p1::parallel::RunCo
     crate::p1::parallel::RunControlFlags {
         stop_requested: handle.control.stop_requested(),
         interrupt_requested: handle.control.interrupt_requested(),
+        drain_requested: handle.control.drain_requested(),
     }
 }
 
@@ -1737,6 +1764,8 @@ pub async fn drive_run_and_release(
 #[derive(Clone)]
 pub struct AsyncNotify {
     pub calls: Option<crate::AsyncHostCalls>,
+    /// S45: the owning session, used to defer a wake during manual compaction.
+    pub session_id: Option<String>,
 }
 
 impl AsyncNotify {
@@ -1799,7 +1828,8 @@ impl AsyncNotify {
             // is any non-error response. A failed delivery keeps the result
             // file for `resend_pending_results` on the next session start
             // (#3032/#2968) and records one diagnostic event.
-            match send_completion_message(calls, &details) {
+            let trigger_turn = !crate::compaction_wake::defer_wake(self.session_id.as_deref());
+            match send_completion_message(calls, &details, trigger_turn) {
                 Ok(()) => {
                     let _ = std::fs::remove_file(&result_path);
                 }
@@ -1887,6 +1917,7 @@ fn completion_details(notice: &CompletionNotice<'_>) -> crate::messages::Subagen
 fn send_completion_message(
     calls: &crate::AsyncHostCalls,
     details: &crate::messages::SubagentNotifyDetails,
+    trigger_turn: bool,
 ) -> Result<(), String> {
     let content = crate::messages::format_single_completion(details);
     let display = details.status != "completed";
@@ -1900,7 +1931,7 @@ fn send_completion_message(
     let response = crate::host_call_static(
         calls,
         "sendMessage",
-        json!({ "message": message, "options": { "triggerTurn": true } }),
+        json!({ "message": message, "options": { "triggerTurn": trigger_turn } }),
     );
     match response.get("error") {
         None => Ok(()),
@@ -1975,7 +2006,7 @@ pub fn resend_pending_results(calls: &crate::AsyncHostCalls, session_id: Option<
             duration_ms,
             handoff_path: handoff.as_deref(),
         });
-        if send_completion_message(calls, &details).is_ok() {
+        if send_completion_message(calls, &details, true).is_ok() {
             let _ = std::fs::remove_file(&path);
             let _ = crate::host_call_static(
                 calls,
@@ -2079,6 +2110,7 @@ async fn finish_with_handoff(
         clear_steps_terminal(status);
     });
     crate::recovery::finish_record(&handle.run_id, state);
+    crate::p1::supervisor::clear_progress_for_run(&handle.run_id);
     append_event(
         handle.run_dir.as_path(),
         "run.finished",
@@ -2206,6 +2238,14 @@ pub fn deliver_steer(
         ));
     }
     let steps: Vec<Value> = status["steps"].as_array().cloned().unwrap_or_default();
+    if steps
+        .iter()
+        .any(|step| step["acceptanceFinal"].as_bool() == Some(true))
+    {
+        return Err(
+            "Child completed its acceptance report; resume it for further guidance.".to_string(),
+        );
+    }
     let step_live = |step: &Value| {
         matches!(
             step["status"].as_str(),
@@ -2400,6 +2440,87 @@ pub fn run_owned_by(handle: &AsyncRunHandle, current_session: Option<&str>) -> b
 pub fn list_runs() -> Vec<Value> {
     let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
     runs.values().map(|h| status_snapshot(h)).collect()
+}
+
+/// S12: result files whose completion notice has not reached this session
+/// yet. A result file is removed after a successful `sendMessage`.
+pub fn pending_result_count(session_id: Option<&str>) -> usize {
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(async_results_dir()) else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(result) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(run_id) = result["runId"].as_str() else {
+            continue;
+        };
+        let status = async_runs_dir().join(run_id).join("status.json");
+        let Ok(raw) = std::fs::read_to_string(status) else {
+            continue;
+        };
+        let Ok(status) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if status["sessionId"].as_str() == Some(session_id) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// S12: move this process's live run ownership to the successor session.
+pub fn reassign_owner(old_session: &str, new_session: &str) {
+    if old_session.is_empty() || new_session.is_empty() || old_session == new_session {
+        return;
+    }
+    let handles: Vec<Arc<AsyncRunHandle>> = ASYNC_RUNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    for handle in handles {
+        let owned = {
+            let status = handle.status.read().unwrap_or_else(|e| e.into_inner());
+            status["sessionId"].as_str() == Some(old_session)
+        };
+        if owned {
+            update_status(&handle, |status| {
+                status["sessionId"] = json!(new_session);
+            });
+        }
+    }
+    // Runs retained on disk but not in this process's registry.
+    let Ok(entries) = std::fs::read_dir(async_runs_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("status.json");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut status) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if status["sessionId"].as_str() != Some(old_session) {
+            continue;
+        }
+        status["sessionId"] = json!(new_session);
+        status["updatedAt"] = json!(iso8601(now_millis()));
+        let _ = crate::artifacts::write_metadata(&path, &status);
+    }
 }
 
 /// Has any run in the non-terminal states? (auto-drain probe)
@@ -3330,7 +3451,15 @@ pub(crate) mod tests {
             status["activityState"] = json!("needs_attention");
             status["lastActivityAt"] = json!(2);
         });
-        finish_failed(&handle, "chain step failed", &AsyncNotify { calls: None }).await;
+        finish_failed(
+            &handle,
+            "chain step failed",
+            &AsyncNotify {
+                calls: None,
+                session_id: None,
+            },
+        )
+        .await;
         let status = status_snapshot(&handle);
         assert_eq!(status["state"], json!(STATE_FAILED));
         assert!(status.get("activityState").is_none(), "{status}");
@@ -3377,7 +3506,15 @@ pub(crate) mod tests {
             status["steps"][0]["currentTool"] = json!("bash");
         });
         handle.control.request_stop();
-        finish_failed(&handle, "spawn failed", &AsyncNotify { calls: None }).await;
+        finish_failed(
+            &handle,
+            "spawn failed",
+            &AsyncNotify {
+                calls: None,
+                session_id: None,
+            },
+        )
+        .await;
         let status = status_snapshot(&handle);
         assert_eq!(status["state"], json!(STATE_STOPPED));
         assert_eq!(status["stopped"], json!(true));
@@ -4034,7 +4171,10 @@ pub(crate) mod tests {
             cookie: 0,
         };
         FAKE_SEND_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
-        let notify = AsyncNotify { calls: Some(calls) };
+        let notify = AsyncNotify {
+            calls: Some(calls),
+            session_id: None,
+        };
         notify
             .send(&handle, STATE_COMPLETE, "report body", None)
             .await;
@@ -4076,7 +4216,10 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&result_dir);
         let _ = std::fs::remove_file(&result_dir);
         block_target(&result_dir);
-        let notify = AsyncNotify { calls: None };
+        let notify = AsyncNotify {
+            calls: None,
+            session_id: None,
+        };
         notify.send(&handle, STATE_COMPLETE, "done", None).await;
         let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
         let failure_line = events
@@ -4166,6 +4309,43 @@ pub(crate) mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&channel);
+    }
+
+    #[test]
+    fn live_runner_between_result_and_final_status_is_not_repaired() {
+        // S49 (#3261): a result file written just before the final status
+        // must not make reconciliation replace a live runner's status with a
+        // placeholder terminal state.
+        let run_id = format!("result-window-{}", std::process::id());
+        let dir = async_runs_dir().join(&run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::artifacts::write_metadata(
+            &dir.join("status.json"),
+            &json!({
+                "runId": run_id,
+                "state": STATE_RUNNING,
+                "sessionId": "s",
+                "ownerPid": std::process::id(),
+                "ownerBootId": process_boot_id(std::process::id() as u64),
+                "mode": "single",
+            }),
+        )
+        .unwrap();
+        let result_path = async_results_dir().join(format!("{run_id}.json"));
+        std::fs::create_dir_all(async_results_dir()).unwrap();
+        crate::artifacts::write_metadata(
+            &result_path,
+            &json!({ "runId": run_id, "state": "complete", "output": "done" }),
+        )
+        .unwrap();
+        reconcile_stale_runs();
+        let status: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["state"], json!(STATE_RUNNING));
+        assert_ne!(status["state"], json!("unknown(observer-unavailable)"));
+        let _ = std::fs::remove_file(result_path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -4388,6 +4568,7 @@ pub(crate) mod tests {
             timed_out: false,
             process_signal: None,
             output_partial: false,
+            acceptance_final: false,
             tool_count: 0,
             turns: 1,
             activity_state: None,
@@ -4528,7 +4709,10 @@ pub(crate) mod tests {
             &handle,
             STATE_COMPLETE,
             "stopped after step 1",
-            &AsyncNotify { calls: None },
+            &AsyncNotify {
+                calls: None,
+                session_id: None,
+            },
         )
         .await;
         let status = status_snapshot(&handle);
@@ -4554,7 +4738,10 @@ pub(crate) mod tests {
         finish_detached_with_result(
             &handle,
             &result,
-            &AsyncNotify { calls: None },
+            &AsyncNotify {
+                calls: None,
+                session_id: None,
+            },
             Path::new("/tmp/detached-cwd"),
         )
         .await;
@@ -4636,6 +4823,7 @@ pub(crate) mod tests {
                 gate: None,
                 turn_budget: None,
                 tool_budget: None,
+                output_schema: None,
                 session_file: None,
                 steer_inbox: None,
                 context_profile: false,
@@ -5190,7 +5378,15 @@ mod recovery_integration_tests {
         assert_eq!(record.mode, "single");
         assert_eq!(record.parent_session_id.as_deref(), Some("session-a"));
         assert_eq!(record.state, "running");
-        finish_failed(&handle, "test failure", &AsyncNotify { calls: None }).await;
+        finish_failed(
+            &handle,
+            "test failure",
+            &AsyncNotify {
+                calls: None,
+                session_id: None,
+            },
+        )
+        .await;
         assert_eq!(
             crate::recovery::read_record(&run_id)
                 .unwrap()

@@ -314,6 +314,32 @@ pub fn update_child_session(run_id: &str, index: u32, session_file: Option<&Path
     });
 }
 
+/// S12: move the trusted owner generation after a take-over switch.
+pub fn reassign_owner(old_session: &str, new_session: &str) {
+    if old_session.is_empty() || new_session.is_empty() || old_session == new_session {
+        return;
+    }
+    let root = crate::paths::temp_root_dir().join("async-subagent-launches");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("recovery.json");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut record) = serde_json::from_str::<TrustedRecoveryRecord>(&raw) else {
+            continue;
+        };
+        if record.parent_session_id.as_deref() != Some(old_session) {
+            continue;
+        }
+        record.parent_session_id = Some(new_session.to_string());
+        record.owner_generation = Some(new_session.to_string());
+        let _ = write_record(&record);
+    }
+}
+
 /// Update the run-level state (interrupt → paused, resume → running).
 pub fn set_record_state(run_id: &str, state: &str) {
     let _ = update_record(run_id, |record| {

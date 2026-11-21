@@ -74,6 +74,64 @@ pub fn ensure_channel(dir: &Path) {
     }
 }
 
+/// S36: persist the latest `contact_supervisor(progress_update)` text.
+pub fn write_progress(channel_dir: &Path, run_id: &str, message: &str) {
+    let _ = ensure_channel_dir(channel_dir);
+    let payload = json!({
+        "runId": run_id,
+        "text": message.trim(),
+        "receivedAt": now_millis(),
+    });
+    let path = channel_dir.join("progress.json");
+    let _ = std::fs::write(path, payload.to_string());
+}
+
+/// S36: the latest progress text and its wall-clock receive time.
+pub fn latest_progress(channel_dir: &Path) -> Option<(String, u64)> {
+    let raw = std::fs::read_to_string(channel_dir.join("progress.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let text = value
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())?
+        .to_string();
+    let received_at = value
+        .get("receivedAt")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(now_millis);
+    Some((text, received_at))
+}
+
+/// S36: drop progress files for a finished run.
+pub fn clear_progress_for_run(run_id: &str) {
+    let Ok(entries) = std::fs::read_dir(channels_root()) else {
+        return;
+    };
+    for channel in entries.flatten() {
+        let path = channel.path().join("progress.json");
+        let owned = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| {
+                value
+                    .get("runId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some(run_id);
+        if owned {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn ensure_channel_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir.join("requests"))?;
+    std::fs::create_dir_all(dir.join("replies"))
+}
+
 /// `formatChildMessage` header (L151): reason title + run context lines.
 pub fn format_child_message(
     reason: &str,
@@ -231,12 +289,17 @@ impl ChildSupervisorContext {
             "childIndex": self.child_index,
             "interview": params.get("interview").cloned().unwrap_or(Value::Null),
         });
-        // progress_update (L265-270 + 3d78e6ec at v0.70): non-blocking note —
-        // upstream writes then deletes it on the watcher read so it never
-        // reaches the parent; rpi's parent-side ask delivery (fleet loop +
-        // foreground detach) only surfaces reply-expecting requests, so the
-        // write is skipped outright (identical net semantics for progress
-        // notes: no parent turn, no pending entry, no channel litter).
+        // progress_update (L265-270 + 3d78e6ec at v0.70): a non-blocking
+        // note. S36 (#3230): persist the latest text so the widget/status can
+        // show it with an age; it never becomes a parent turn.
+        if reason == "progress_update" {
+            write_progress(&self.channel_dir, &self.run_id, message);
+            return json!({
+                "content": [{ "type": "text", "text": "Progress update recorded." }],
+                "details": { "mode": "single", "results": [] },
+                "isError": false,
+            });
+        }
         // need_decision / interview_request DO reach the parent — see
         // `blocking_requests_for_session` (async wake) and the foreground
         // detach path in `runner/foreground.rs` (issue #55).
@@ -389,6 +452,39 @@ pub fn has_pending_blocking_requests(orchestrator_session_id: &str) -> bool {
         }
     }
     false
+}
+
+/// S12: move pending asks to the successor session after a take-over switch.
+pub fn reassign_owner(old_session: &str, new_session: &str) {
+    if old_session.is_empty() || new_session.is_empty() || old_session == new_session {
+        return;
+    }
+    let Ok(channels) = std::fs::read_dir(channels_root()) else {
+        return;
+    };
+    for channel in channels.flatten() {
+        let requests = channel.path().join("requests");
+        let Ok(files) = std::fs::read_dir(&requests) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(mut request) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            if request["orchestratorSessionId"].as_str() != Some(old_session) {
+                continue;
+            }
+            request["orchestratorSessionId"] = json!(new_session);
+            let _ = std::fs::write(&path, request.to_string());
+        }
+    }
 }
 
 /// Blocking asks owned by this orchestrator session across every channel

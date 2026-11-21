@@ -669,12 +669,48 @@ fn handle_management_action_inner(
             // records (agent-management.ts:972-995 + agentCapabilityRow @
             // 0fc0eebb); the default listing shape is unchanged.
             let capability_mode = raw_params.get("capabilities") == Some(&Value::Bool(true));
+            // S37 (#3225): `options.search` matches name/description/alias,
+            // stable-sorted, at most 30 rows with a continuation hint.
+            let search = raw_params
+                .get("options")
+                .and_then(|options| options.get("search"))
+                .or_else(|| raw_params.get("search"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|search| !search.is_empty())
+                .map(str::to_lowercase);
+            let (agents, search_truncated) = match &search {
+                Some(query) => {
+                    let mut matches: Vec<discover::AgentConfig> = agents
+                        .into_iter()
+                        .filter(|agent| {
+                            agent.name.to_lowercase().contains(query)
+                                || agent.description.to_lowercase().contains(query)
+                                || agent.aliases.as_ref().is_some_and(|aliases| {
+                                    aliases
+                                        .iter()
+                                        .any(|alias| alias.to_lowercase().contains(query))
+                                })
+                        })
+                        .collect();
+                    matches.sort_by(|a, b| a.name.cmp(&b.name));
+                    let truncated = matches.len() > 30;
+                    matches.truncate(30);
+                    (matches, truncated)
+                }
+                None => (agents, false),
+            };
             let session_ceiling = crate::launch::args::DescendantAllowlist::from_env();
             let mut text = if capability_mode {
                 format_agent_capabilities_list(&agents, session_ceiling.as_ref())
             } else {
                 format_agent_list_with_ceiling(&agents, session_ceiling.as_ref())
             };
+            if search_truncated {
+                text.push_str(
+                    "\n\nShowing the first 30 matches; refine options.search to narrow the list.",
+                );
+            }
             let diagnostic_lines = format_discovery_diagnostics(&diagnostics);
             if !diagnostic_lines.is_empty() {
                 text.push('\n');
@@ -686,6 +722,8 @@ fn handle_management_action_inner(
                     "mode": "management",
                     "results": [],
                     "agentCapabilities": agent_capabilities_snapshot(&agents, session_ceiling.as_ref()),
+                    "search": search,
+                    "searchTruncated": search_truncated,
                 });
             }
             ToolOutcome {
@@ -999,6 +1037,38 @@ fn handle_management_action_inner(
                             return ToolOutcome::text(format!(
                                 "Stop requested for child {child_id} in background run {}.",
                                 handle.run_id
+                            ));
+                        }
+                        // S29 (#3202): drain is a workflow-only stop that
+                        // admits no new child and lets started children finish.
+                        let drain = raw_params
+                            .get("drain")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if drain {
+                            let mode = snapshot["mode"].as_str().unwrap_or("single");
+                            if mode == "single" {
+                                return ToolOutcome::error(format!(
+                                    "drain applies only to live multi-child runs in this session; '{}' is a single run.",
+                                    handle.run_id
+                                ));
+                            }
+                            let started = steps
+                                .iter()
+                                .filter(|step| step["status"].as_str() == Some("running"))
+                                .count();
+                            handle.control.request_drain();
+                            crate::artifacts::append_jsonl(
+                                &handle.run_dir.join("events.jsonl"),
+                                &serde_json::json!({
+                                    "type": "control.drain",
+                                    "runId": handle.run_id,
+                                })
+                                .to_string(),
+                            );
+                            return ToolOutcome::text(format!(
+                                "Drain requested for background run {}: no new children will start; {} started child(ren) will finish.",
+                                handle.run_id, started
                             ));
                         }
                         // Cooperative stop + direct child signalling; the
@@ -1370,9 +1440,82 @@ fn handle_management_action_inner(
             };
             manage_refine(action, name, &raw_params, cwd, settings, trusted)
         }
+        "mission.show" => {
+            let Some(id) = raw_params.get("missionId").and_then(Value::as_str) else {
+                return ToolOutcome::error(
+                    "action \"mission.show\" requires missionId.".to_string(),
+                );
+            };
+            match crate::missions::show(cwd, id) {
+                Ok((record, warnings)) => {
+                    let mut text = crate::missions::format_mission(&record);
+                    for warning in &warnings {
+                        text.push_str(&format!("\nWarning: {warning}"));
+                    }
+                    ToolOutcome {
+                        text,
+                        details: json!({
+                            "mode": "management",
+                            "results": [],
+                            "missionId": record.id,
+                            "mission": record,
+                            "missions": { "warnings": warnings },
+                        }),
+                        is_error: false,
+                    }
+                }
+                Err(message) => ToolOutcome::error(message),
+            }
+        }
+        "mission.close" => {
+            let Some(id) = raw_params.get("missionId").and_then(Value::as_str) else {
+                return ToolOutcome::error(
+                    "action \"mission.close\" requires missionId.".to_string(),
+                );
+            };
+            let status = raw_params
+                .get("missionStatus")
+                .and_then(Value::as_str)
+                .unwrap_or("completed");
+            let summary = raw_params.get("summary").and_then(Value::as_str);
+            match crate::missions::close(cwd, id, status, summary) {
+                Ok(record) => ToolOutcome {
+                    text: format!("Closed mission {} as {}.", record.id, record.status),
+                    details: json!({
+                        "mode": "management",
+                        "results": [],
+                        "missionId": record.id,
+                        "mission": record,
+                    }),
+                    is_error: false,
+                },
+                Err(message) => ToolOutcome::error(message),
+            }
+        }
+        "mission.list" => {
+            let (records, warnings) = crate::missions::list(cwd);
+            let text = if records.is_empty() {
+                "No missions.".to_string()
+            } else {
+                records
+                    .iter()
+                    .map(|record| format!("- {} ({}): {}", record.id, record.status, record.title))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            ToolOutcome {
+                text,
+                details: json!({
+                    "mode": "management",
+                    "results": [],
+                    "missions": { "records": records, "warnings": warnings },
+                }),
+                is_error: false,
+            }
+        }
         "doctor" => ToolOutcome::text(doctor_report(cwd, settings, config, trusted)),
         other => ToolOutcome::error(format!(
-            "Unknown subagent action \"{other}\". Supported actions: list, get, status, interrupt, stop, steer, resume, refine, refine.show, refine.rollback, grant-spawn-budget, debug.run, doctor."
+            "Unknown subagent action \"{other}\". Supported actions: list, get, status, interrupt, stop, steer, resume, refine, refine.show, refine.rollback, grant-spawn-budget, mission.list, mission.show, mission.close, debug.run, doctor."
         )),
     }
 }

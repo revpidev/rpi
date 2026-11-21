@@ -66,6 +66,8 @@ pub struct ChildSpec {
     /// Budget payloads inherited from the top-level call (FR-P1-09).
     pub turn_budget: Option<Value>,
     pub tool_budget: Option<Value>,
+    /// S17: outputSchema for this child (validated raw structured_output).
+    pub output_schema: Option<Value>,
     /// Skill resolution fallback cwd (chain scratch dir); defaults to base.
     pub skill_fallback_cwd: Option<PathBuf>,
     /// Extra cwd for skill resolution when the chain dir differs.
@@ -134,6 +136,7 @@ impl ChildSpec {
                 .map(str::to_string),
             turn_budget: object.get("turnBudget").cloned(),
             tool_budget: object.get("toolBudget").cloned(),
+            output_schema: crate::structured_output::parse_call_schema(object.get("outputSchema")),
             session_file: object
                 .get("sessionFile")
                 .and_then(Value::as_str)
@@ -1129,11 +1132,13 @@ pub async fn run_child_async(
         agent_system_prompt_mode: agent.system_prompt_mode,
         agent_tools: agent_tools.clone(),
         agent_exclude_tools: agent.exclude_tools.clone(),
+        mcp_direct_tools: agent.mcp_direct_tools.clone(),
         agent_extensions: agent.extensions.clone(),
         agent_subagent_only_extensions: agent.subagent_only_extensions.clone(),
         agent_allowed_agents: agent.allowed_agents.clone(),
         diff_baseline,
         tool_budget_env,
+        output_schema: spec.output_schema.clone(),
         // #2570: children follow the parent session's project trust.
         project_trusted: ctx.project_trusted,
         agent_inherit_project_context: agent.inherit_project_context,

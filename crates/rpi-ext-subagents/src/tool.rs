@@ -143,6 +143,18 @@ pub fn tool_parameters_schema() -> Value {
                 "type": "string",
                 "description": "Per-run model override (provider/id); children without their own model inherit it."
             },
+            "outputSchema": {
+                "type": ["object", "boolean", "string"],
+                "description": "S17: JSON Schema for the child's structured_output. The raw JSON value is validated before coercion; false disables."
+            },
+            "mission": {
+                "type": ["object", "boolean"],
+                "description": "S02: create an explicit durable mission for this run ({title|summary, objective?, labels?}); false disables. An explicit mission stays waiting until its runs have accepted evidence."
+            },
+            "missionId": {
+                "type": "string",
+                "description": "S02: attach this run to an existing mission; cannot be combined with mission."
+            },
             "thinking": {
                 "type": "string",
                 "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
@@ -219,6 +231,10 @@ pub fn tool_parameters_schema() -> Value {
                 "minLength": 1,
                 "description": "With action stop (#1603): stop one child of a multi-child run (`step:<index>` or the child's run id) instead of the whole run."
             },
+            "drain": {
+                "type": "boolean",
+                "description": "With action stop (#3202): stop admitting new workflow children and let already-started children finish; the run ends stopped."
+            },
             "workflowScript": {
                 "type": "string",
                 "minLength": 1,
@@ -239,6 +255,14 @@ pub fn tool_parameters_schema() -> Value {
         }
     });
     schema["properties"]["control"] = control_schema();
+    schema["properties"]["search"] = json!({
+        "type": "string",
+        "description": "With action list (#3225): case-insensitive filter over name, description and aliases; at most 30 rows."
+    });
+    schema["properties"]["options"] = json!({
+        "type": "object",
+        "description": "Action options; `search` filters action list."
+    });
     schema
 }
 
@@ -569,6 +593,12 @@ fn execute_subagent_tool_inner(
         Ok(ctx) => ctx,
         Err(error) => return ToolOutcome::mode_error(requested_mode, error),
     };
+    // S28: reject a cyclic/too-deep outputSchema before any process action.
+    if let Some(schema) = crate::structured_output::parse_call_schema(object.get("outputSchema"))
+        && let Err(error) = crate::structured_output::validate_schema_shape(&schema)
+    {
+        return ToolOutcome::mode_error(requested_mode, error);
+    }
     // #2805 / R18.4: an untrusted project must not silently fall back to a
     // same-named builtin when the caller explicitly asked for project scope.
     if scope == "project" && ctx.project_trusted == Some(false) {
@@ -602,6 +632,15 @@ fn execute_subagent_tool_inner(
         Ok(agents) => agents,
         Err(error) => return ToolOutcome::mode_error(requested_mode, error),
     };
+
+    // S02: validate the explicit mission request before any process/file
+    // side effect, then remember it for the dispatch receipt/result.
+    match crate::missions::prepare_launch(&object, &ctx.base_cwd, ctx.parent_session_id.as_deref())
+    {
+        Ok(Some(launch)) => crate::missions::remember(&ctx.run_id, launch),
+        Ok(None) => {}
+        Err(error) => return ToolOutcome::mode_error(requested_mode, error),
+    }
 
     if wants_async {
         return dispatch_async(&object, &agents, &ctx, host, runtime, has_tasks, has_steps);
@@ -673,6 +712,7 @@ fn execute_subagent_tool_inner(
         // resolve the same run twice.
         crate::runner::foreground_history::discard_running(&ctx.run_id);
         let details = assemble_single_details(&ctx, &spec, &agent, &outcome);
+        crate::missions::attach_outcome(&ctx.run_id, &details);
         let reason = result.detach_reason.as_deref().unwrap_or("user request");
         let text = format!(
             "Detached for {reason} (run {}): the subagent asked for a supervisor decision and the run continues in the background. Answer the supervisor request (it arrived as a session message; `subagent_supervisor({{action:\"pending\"}})` re-lists it) — the completion arrives as a session message.",
@@ -686,6 +726,7 @@ fn execute_subagent_tool_inner(
     }
 
     let details = assemble_single_details(&ctx, &spec, &agent, &outcome);
+    crate::missions::attach_outcome(&ctx.run_id, &details);
     crate::runner::foreground_history::persist_final(&history_meta, result);
 
     {
@@ -1290,6 +1331,7 @@ fn dispatch_tasks(
     if !control_events.is_empty() {
         details["controlEvents"] = json!(control_events);
     }
+    crate::missions::attach_outcome(&ctx.run_id, &details);
     ToolOutcome {
         text,
         details,
@@ -1495,6 +1537,7 @@ fn dispatch_steps(
     if !control_events.is_empty() {
         details["controlEvents"] = json!(control_events);
     }
+    crate::missions::attach_outcome(&ctx.run_id, &details);
     ToolOutcome {
         text,
         details,
@@ -1650,6 +1693,7 @@ fn dispatch_async(
     }
     let notify = crate::runner::background::AsyncNotify {
         calls: host.async_calls(),
+        session_id: session_id.clone(),
     };
     let drive_ctx = clone_ctx_for_async(ctx);
     let drive_handle = handle.clone();
@@ -1663,6 +1707,7 @@ fn dispatch_async(
     ));
 
     let receipt = crate::runner::background::receipt(&ctx.run_id, &handle.run_dir);
+    crate::missions::attach_outcome(&ctx.run_id, &receipt);
     ToolOutcome {
         text: format!(
             "Background run {} started ({}); completion will arrive as a session message. Use subagent({{action:\"status\"}}) to inspect.",

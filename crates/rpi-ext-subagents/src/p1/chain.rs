@@ -591,6 +591,7 @@ pub async fn run_chain_async(
             std::sync::Arc::new(move || crate::p1::parallel::RunControlFlags {
                 stop_requested: probe(),
                 interrupt_requested: false,
+                drain_requested: false,
             }) as crate::p1::parallel::RunControlProbe
         });
     run_chain_async_with_step_sink(
@@ -636,6 +637,25 @@ pub async fn run_chain_async_with_step_sink(
     let mut previous_output: Option<String> = None;
     let mut first_progress_seen = false;
     for (index, step) in steps.iter().enumerate() {
+        // S29 (#3202): a drain settles every remaining step as stopped and
+        // lets the already-started chain finish its current child.
+        if control_probe.is_some_and(|probe| probe().drain_requested) {
+            let message = "Workflow draining; child not started.";
+            if let Some(on_step) = &on_step {
+                for (remaining, _) in steps.iter().enumerate().skip(index) {
+                    on_step(ChainStepEvent::Stopped { index: remaining });
+                }
+            }
+            return Ok((
+                completed,
+                Some(terminal_without_launch(
+                    index,
+                    &steps[index].agent_name,
+                    -1,
+                    message,
+                )),
+            ));
+        }
         // A stop request settles the current and every remaining step as
         // stopped without launching another child (upstream checks
         // `stopped` before each sequential step, subagent-runner.ts:4451).
@@ -720,6 +740,7 @@ pub async fn run_chain_async_with_step_sink(
             gate: step.gate.clone(),
             turn_budget: None,
             tool_budget: None,
+            output_schema: None,
             session_file: None,
             steer_inbox: None,
             skill_fallback_cwd: Some(ctx.base_cwd.clone()),
@@ -1215,6 +1236,7 @@ mod tests {
             std::sync::Arc::new(|| crate::p1::parallel::RunControlFlags {
                 stop_requested: true,
                 interrupt_requested: false,
+                drain_requested: false,
             });
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let (completed, failed) = runtime

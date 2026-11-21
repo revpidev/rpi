@@ -61,12 +61,12 @@
 - no-registry-passthrough: MATCH
 - explicit-hit-canonicalized: MATCH
 - explicit-thinking-suffix-retry: MATCH
-- explicit-miss-fails-closed: MATCH
+- explicit-miss-fails-closed: ATTRIBUTED [rpi-deviation] R19-S10 → V19-03 fields: error
 - inherited-miss-passes-through: MATCH
 - inherit-sentinel-resolves-parent: MATCH
 - empty-model-inherits-parent: MATCH
-- candidates-explicit-miss-throws: MATCH
-- candidates-configured-miss-deferred-throw: MATCH
+- candidates-explicit-miss-throws: ATTRIBUTED [rpi-deviation] R19-S10 → V19-03 fields: error
+- candidates-configured-miss-deferred-throw: ATTRIBUTED [rpi-deviation] R19-S10 → V19-03 fields: error
 - candidates-inherited-passthrough: MATCH
 - candidates-empty-chain-no-throw: MATCH
 - scoped-token-expands-snapshot: MATCH
@@ -100,11 +100,13 @@
 
 ### rpi-deviation
 
-- (none)
+- model/explicit-miss-fails-closed (R19-S10 → V19-03)
+- model/candidates-explicit-miss-throws (R19-S10 → V19-03)
+- model/candidates-configured-miss-deferred-throw (R19-S10 → V19-03)
 
 ### unattributed
 
 - (none)
 
 
-## RESULT: MATCH
+## RESULT: ATTRIBUTED-OK
