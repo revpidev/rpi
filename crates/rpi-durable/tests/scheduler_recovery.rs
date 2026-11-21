@@ -649,7 +649,26 @@ async fn restart_limit_reports_task_faulted() {
         .wait_for_task(id, &context())
         .await
         .expect("limited task settles");
-    let captured: Vec<ReportInfo> = reports.lock().expect("reports").clone();
+    // The report is emitted after the terminal publication becomes durable.
+    // On a multi-thread runtime the waiter may resume before `reserve` gets
+    // its post-commit turn, so wait for the durable report instead of
+    // assuming it is already in the sink.
+    let captured = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let captured: Vec<ReportInfo> = reports.lock().expect("reports").clone();
+            if captured.iter().any(|info| {
+                info.kind == ReportKind::TaskFaulted
+                    && info.task.as_ref().map(|task| task.id) == Some(id)
+                    && info.task.as_ref().map(|task| task.kind.as_str()) == Some("test.count")
+                    && info.reason.as_deref() == Some("restart_limit")
+            }) {
+                break captured;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("task_faulted report");
     assert!(captured.iter().any(|info| {
         info.kind == ReportKind::TaskFaulted
             && info.task.as_ref().map(|task| task.id) == Some(id)

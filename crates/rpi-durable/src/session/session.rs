@@ -1216,12 +1216,9 @@ impl SessionImpl {
                             .map(|_| ()),
                         JobOutcome::Discard => {
                             tx.discard();
-                            let has_deferred = this
-                                .deferred
-                                .lock()
-                                .ok()
-                                .is_some_and(|deferred| deferred.is_some());
-                            if !has_deferred {
+                            if let Ok(deferred) = this.deferred.lock()
+                                && deferred.is_none()
+                            {
                                 this.deferred_pending.store(false, Ordering::SeqCst);
                             }
                             Ok(())
@@ -1442,17 +1439,18 @@ impl SessionImpl {
             return;
         }
         let mut timer = None;
-        if let Some(mut held) = remaining {
-            if held.deadline != previous_deadline {
-                held.id = self.next_deferred_id.fetch_add(1, Ordering::SeqCst);
-                timer = held.deadline.map(|deadline| (held.id, deadline));
-            }
-            self.deferred_pending.store(true, Ordering::SeqCst);
-            if let Ok(mut deferred) = self.deferred.lock() {
+        if let Ok(mut deferred) = self.deferred.lock() {
+            if let Some(mut held) = remaining {
+                if held.deadline != previous_deadline {
+                    held.id = self.next_deferred_id.fetch_add(1, Ordering::SeqCst);
+                    timer = held.deadline.map(|deadline| (held.id, deadline));
+                }
                 *deferred = Some(held);
+                self.deferred_pending.store(true, Ordering::SeqCst);
+            } else {
+                *deferred = None;
+                self.deferred_pending.store(false, Ordering::SeqCst);
             }
-        } else {
-            self.deferred_pending.store(false, Ordering::SeqCst);
         }
         if let Some((id, deadline)) = timer {
             self.arm_deferred_timer(id, deadline);
@@ -2408,8 +2406,8 @@ impl SessionImpl {
             };
             if let Ok(mut deferred) = this.deferred.lock() {
                 deferred.take();
+                this.deferred_pending.store(false, Ordering::SeqCst);
             }
-            this.deferred_pending.store(false, Ordering::SeqCst);
             this.end_commit_observers();
             if let Ok(mut documents) = this.documents.lock() {
                 documents.clear();

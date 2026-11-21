@@ -465,6 +465,27 @@ struct FaultedTask {
     durable: bool,
 }
 
+/// Unsubscribes a temporary commit listener even if `reserve` is dropped.
+struct ListenerGuard(Option<Subscription>);
+
+impl ListenerGuard {
+    fn new(subscription: Subscription) -> Self {
+        Self(Some(subscription))
+    }
+
+    fn unsubscribe(&mut self) {
+        if let Some(subscription) = self.0.take() {
+            subscription.unsubscribe();
+        }
+    }
+}
+
+impl Drop for ListenerGuard {
+    fn drop(&mut self) {
+        self.unsubscribe();
+    }
+}
+
 struct SchedulerInner {
     session: Arc<SessionImpl>,
     storage: Arc<dyn Storage>,
@@ -2761,9 +2782,8 @@ impl SchedulerInner {
         // the actual report stays after the commit (reserve) or after the
         // waiter's terminal publication, as upstream `#reserve` does.
         let listener = Arc::clone(self);
-        let subscription = self
-            .session
-            .subscribe_commits(Arc::new(move |publication, _| {
+        let mut subscription = ListenerGuard::new(self.session.subscribe_commits(Arc::new(
+            move |publication, _| {
                 if let Ok(mut values) = listener.faulted.lock() {
                     for fault in values.iter_mut() {
                         if !fault.durable
@@ -2787,7 +2807,8 @@ impl SchedulerInner {
                         }
                     }
                 }
-            }));
+            },
+        )));
         let result = self
             .session
             .commit_with(
@@ -5302,6 +5323,17 @@ fn json_equal(left: &JsonValue, right: &JsonValue) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_guard_unsubscribes_on_drop() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&called);
+        let guard = ListenerGuard::new(Subscription::new(move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        drop(guard);
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn owned_tasks_rechecks_the_invocation_on_the_mutation_line() {
