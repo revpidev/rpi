@@ -1539,7 +1539,11 @@ mod tests {
             &exec_args(&["-c", "trap '' TERM; while :; do sleep 1; done"]),
             "/",
             Some(ExecOptions {
-                timeout: Some(10),
+                // Leave enough time for the shell to install the TERM trap;
+                // 10 ms is shorter than shell startup under a loaded test
+                // runner, which made the child exit on the first SIGTERM
+                // before the force-kill escalation could run.
+                timeout: Some(1_500),
                 ..Default::default()
             }),
         )
