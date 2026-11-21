@@ -130,7 +130,11 @@ fn now_millis() -> u64 {
 /// from observation, not from ISO timestamp parsing. Freezing the terminal
 /// duration keeps the quiet period quiet: the row text — and with it the
 /// dirty-key — stops changing once every run has settled.
-pub fn capture_fleet(now_ms: u64, linger: &mut HashMap<String, (u64, u64)>) -> FleetSnapshot {
+pub fn capture_fleet(
+    now_ms: u64,
+    linger: &mut HashMap<String, (u64, u64)>,
+    current_session: Option<&str>,
+) -> FleetSnapshot {
     let linger_ms = terminal_linger_ms();
     let runs: Vec<Arc<AsyncRunHandle>> = {
         let registry = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
@@ -145,6 +149,11 @@ pub fn capture_fleet(now_ms: u64, linger: &mut HashMap<String, (u64, u64)>) -> F
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        // V19-03 S24: the fleet strip is session-scoped; a forked/reopened
+        // session must not see another session's runs.
+        if !crate::runner::background::status_owned_by(&status, current_session) {
+            continue;
+        }
         let state = status
             .get("state")
             .and_then(Value::as_str)
@@ -257,9 +266,15 @@ fn fleet_row(run_id: &str, status: &Value, started_ms: u64, now_ms: u64) -> Flee
             let channel = crate::p1::supervisor::channel_dir(run_id, agent, index);
             crate::p1::supervisor::latest_progress(&channel)
         })
-        .max_by_key(|(_, received_at)| *received_at);
+        .max_by_key(|progress| progress.received_at_monotonic);
     let (progress, progress_age_ms) = match progress {
-        Some((text, received_at)) => (Some(text), Some(now_ms.saturating_sub(received_at))),
+        Some(progress) => (
+            Some(progress.text),
+            Some(
+                crate::p1::supervisor::monotonic_millis()
+                    .saturating_sub(progress.received_at_monotonic),
+            ),
+        ),
         None => (None, None),
     };
     FleetRow {
@@ -493,7 +508,7 @@ async fn fleet_refresh_loop(calls: AsyncHostCalls, session_id: Option<String>) {
             session_id.as_deref().unwrap_or(""),
             &mut delivered_asks,
         );
-        let snapshot = capture_fleet(now, &mut linger);
+        let snapshot = capture_fleet(now, &mut linger, session_id.as_deref());
         if snapshot.is_empty() {
             if mounted {
                 let _ = set_widget(&calls, Value::Null);
@@ -734,7 +749,7 @@ mod tests {
         });
         let handle_done = spawn_test_handle("fleet-t2", status_done, 200_000);
         let mut linger = HashMap::new();
-        let snapshot = capture_fleet(300_000, &mut linger);
+        let snapshot = capture_fleet(300_000, &mut linger, None);
         assert_eq!(snapshot.active.len(), 1);
         assert_eq!(snapshot.active[0].agent_label, "researcher");
         assert_eq!(snapshot.active[0].current_tool.as_deref(), Some("grep"));
@@ -744,14 +759,14 @@ mod tests {
         // Terminal durations freeze at first sight: the row text (and the
         // dirty-key) stays constant across ticks.
         assert_eq!(snapshot.lingering[0].duration_ms, 100_000); // 300k - 200k
-        let snapshot = capture_fleet(300_500, &mut linger);
+        let snapshot = capture_fleet(300_500, &mut linger, None);
         assert_eq!(snapshot.lingering[0].duration_ms, 100_000);
         // Linger window: past first sight + the window the terminal row
         // drops (forced window via the test seam for determinism).
         set_linger_for_test(1_000);
         let mut linger = HashMap::new();
-        let _ = capture_fleet(300_000, &mut linger); // first sight at t=300s
-        let snapshot = capture_fleet(300_000 + 1_000 + 1, &mut linger);
+        let _ = capture_fleet(300_000, &mut linger, None); // first sight at t=300s
+        let snapshot = capture_fleet(300_000 + 1_000 + 1, &mut linger, None);
         set_linger_for_test(u64::MAX);
         assert!(
             snapshot.lingering.is_empty(),
@@ -817,7 +832,7 @@ mod tests {
             1_000,
         );
         let mut linger = HashMap::new();
-        let snapshot = capture_fleet(40_000, &mut linger);
+        let snapshot = capture_fleet(40_000, &mut linger, None);
         let ids: Vec<&str> = snapshot
             .active
             .iter()
@@ -836,7 +851,7 @@ mod tests {
         assert_eq!(snapshot.lingering.len(), 1);
         assert_eq!(snapshot.lingering[0].run_id, "fleet-sort-terminal");
         // Repeat calls are stable (no registry-iteration reshuffle).
-        let again = capture_fleet(40_500, &mut linger);
+        let again = capture_fleet(40_500, &mut linger, None);
         let ids_again: Vec<&str> = again.active.iter().map(|row| row.run_id.as_str()).collect();
         assert_eq!(ids, ids_again);
         drop(late);

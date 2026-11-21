@@ -43,7 +43,6 @@ mod render;
 mod runner;
 mod runtime;
 mod scalars;
-mod schedules;
 mod session_fork;
 mod session_switch;
 mod settings_lease;
@@ -317,6 +316,16 @@ impl HostContext for HostCallsContext<'_> {
                 json!({ "name": name, "input": input }),
             );
             if let Some(error) = response.get("error") {
+                // An older host that does not know the additive
+                // `approveToolCall` method degrades to "no approval seam"
+                // (same policy as `ctx.isProjectTrusted`) instead of
+                // refusing every tasks/steps launch with "unknown method".
+                if error.get("kind").and_then(Value::as_str) == Some("unknownMethod") {
+                    tracing::warn!(
+                        "approveToolCall is unavailable on this host; workflow child approval is skipped"
+                    );
+                    return Ok(Value::Null);
+                }
                 let message = error
                     .get("message")
                     .and_then(Value::as_str)

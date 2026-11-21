@@ -780,6 +780,7 @@ pub async fn run_chain_async_with_step_sink(
             &mut spec,
             &format!("step-{index}"),
             Some("chain"),
+            Some(agent),
         ) {
             if let Some(on_step) = &on_step {
                 on_step(ChainStepEvent::Finished {

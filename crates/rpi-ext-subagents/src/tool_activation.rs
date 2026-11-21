@@ -68,7 +68,10 @@ pub fn restore_if_registered(calls: &AsyncHostCalls, reason: &str) -> bool {
     }
     let mut next = active;
     next.push("subagent".to_string());
-    let _ = host_call(calls, "setActiveTools", json!({ "tools": next }));
+    // The host reads `toolNames` (host_call.rs `setActiveTools`); sending any
+    // other key makes the host fall back to an empty list and clear every
+    // active tool.
+    let _ = host_call(calls, "setActiveTools", json!({ "toolNames": next }));
     true
 }
 
@@ -93,7 +96,7 @@ mod tests {
                 "getActiveTools" => json!({ "ok": state.0.clone() }),
                 "getAllTools" => json!({ "ok": state.1.clone() }),
                 "setActiveTools" => {
-                    state.0 = request["args"]["tools"]
+                    state.0 = request["args"]["toolNames"]
                         .as_array()
                         .map(|items| {
                             items
@@ -123,6 +126,44 @@ mod tests {
         STATE.with(|state| *state.borrow_mut() = (vec![], vec!["subagent".into()]));
         assert!(restore_if_registered(&calls(), "reload"));
         STATE.with(|state| assert_eq!(state.borrow().0, vec!["subagent".to_string()]));
+    }
+
+    #[test]
+    fn restore_preserves_the_existing_active_set() {
+        STATE.with(|state| {
+            *state.borrow_mut() = (
+                vec!["read".into(), "bash".into()],
+                vec!["read".into(), "bash".into(), "subagent".into()],
+            );
+        });
+        assert!(restore_if_registered(&calls(), "compact"));
+        STATE.with(|state| {
+            assert_eq!(
+                state.borrow().0,
+                vec![
+                    "read".to_string(),
+                    "bash".to_string(),
+                    "subagent".to_string()
+                ]
+            )
+        });
+    }
+
+    #[test]
+    fn restore_is_a_no_op_when_the_tool_is_already_active() {
+        STATE.with(|state| {
+            *state.borrow_mut() = (
+                vec!["read".into(), "subagent".into()],
+                vec!["subagent".into()],
+            );
+        });
+        assert!(!restore_if_registered(&calls(), "reload"));
+        STATE.with(|state| {
+            assert_eq!(
+                state.borrow().0,
+                vec!["read".to_string(), "subagent".to_string()]
+            )
+        });
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use rpi::core::extension_host_adapter::ExtensionHostAdapter;
 use rpi::core::extensions::{
     ExtensionRunner, UserBashDecision, extension_on_response_callback, new_extension_runner_ref,
+    read_runner,
 };
 use rpi_agent::messages::AgentMessage;
 use rpi_agent::types::{AgentTool, AgentToolResult, AgentToolUpdateCallback};
@@ -601,7 +602,7 @@ async fn w2_session_before_compact_cancel_aborts_manual_compaction() {
         Arc::new(ExtensionHostAdapter::new(Arc::new(host))) as Arc<dyn ExtensionRunner>
     );
 
-    let mut fixture = compaction_fixture(Vec::new(), Some(runner_ref));
+    let mut fixture = compaction_fixture(Vec::new(), Some(runner_ref.clone()));
     fixture.seed_three_turns();
 
     let error = fixture.runner.compact(None).await.expect_err("cancelled");
@@ -654,13 +655,28 @@ async fn w2_session_before_compact_replacement_sets_from_extension_and_emits_ses
         Arc::new(ExtensionHostAdapter::new(Arc::new(host))) as Arc<dyn ExtensionRunner>
     );
 
-    let mut fixture = compaction_fixture(Vec::new(), Some(runner_ref));
+    let mut fixture = compaction_fixture(Vec::new(), Some(runner_ref.clone()));
     fixture.seed_three_turns();
 
     let result = fixture.runner.compact(None).await.expect("compact");
     assert_eq!(result.summary, "ext-summary");
     assert_eq!(result.tokens_before, 42);
     assert!(result.estimated_tokens_after.is_some());
+
+    // V19-03 S45: the runner defers the event until its caller drops the
+    // compaction lock; this runner-level test emits it explicitly.
+    let pending = fixture
+        .runner
+        .take_pending_session_compact()
+        .expect("deferred session_compact");
+    read_runner(&runner_ref)
+        .emit_session_compact(
+            pending.compaction_entry,
+            pending.from_extension,
+            pending.reason.as_str(),
+            pending.will_retry,
+        )
+        .await;
 
     let event = captured.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(event["type"], "session_compact");

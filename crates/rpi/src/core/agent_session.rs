@@ -61,7 +61,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::auth_guidance::{
     format_no_api_key_found_message, format_no_model_selected_message,
 };
-use crate::core::compaction_runner::{CompactionEvent, CompactionRunner};
+use crate::core::compaction_runner::{CompactionEvent, CompactionRunner, PendingSessionCompact};
 use crate::core::extensions::{
     BeforeAgentStartTrigger, ExtensionErrorInfo, ExtensionMode, ExtensionRunner,
     ExtensionRunnerRef, InputEventResult, InputSource, SessionStartEvent, SessionStartReason,
@@ -1254,13 +1254,14 @@ impl AgentSession {
                         // `_compactBeforeNextAssistantResponse`,
                         // agent-session.ts:563).
                         session.sync_compaction_model().await;
-                        session
-                            .inner
-                            .compaction
-                            .lock()
-                            .await
+                        let mut runner = session.inner.compaction.lock().await;
+                        let messages = runner
                             .compact_before_next_assistant_response(&turn.context.messages)
-                            .await
+                            .await;
+                        let pending = runner.take_pending_session_compact();
+                        drop(runner);
+                        session.emit_pending_session_compact(pending).await;
+                        messages
                     };
                     let mut context = AgentContext {
                         messages,
@@ -5781,7 +5782,13 @@ impl AgentSession {
         let result = {
             let mut runner = self.inner.compaction.lock().await;
             runner.set_manual_interrupted(interrupted);
-            runner.compact(custom_instructions).await
+            let result = runner.compact(custom_instructions).await;
+            // V19-03 S45: emit after the lock is released so `ctx.isIdle`
+            // already reflects the completed compaction.
+            let pending = runner.take_pending_session_compact();
+            drop(runner);
+            self.emit_pending_session_compact(pending).await;
+            result
         };
         // `_clearManualCompactionState` (agent-session.ts:1926-1929
         // @ 9841914): resolve a pending `waitForIdle` when the manual
@@ -5805,7 +5812,9 @@ impl AgentSession {
         let outcome = runner
             .check_compaction(assistant_message, skip_aborted_check)
             .await;
+        let pending = runner.take_pending_session_compact();
         drop(runner);
+        self.emit_pending_session_compact(pending).await;
         self.resolve_idle_wait_if_idle();
         outcome
     }
@@ -6920,6 +6929,22 @@ impl AgentSession {
 
     pub fn extension_runner(&self) -> Arc<dyn ExtensionRunner> {
         self.runner()
+    }
+
+    /// Emit a `session_compact` deferred by the compaction runner until the
+    /// compaction lock was released (V19-03 S45).
+    async fn emit_pending_session_compact(&self, pending: Option<PendingSessionCompact>) {
+        let Some(pending) = pending else {
+            return;
+        };
+        self.runner()
+            .emit_session_compact(
+                pending.compaction_entry,
+                pending.from_extension,
+                pending.reason.as_str(),
+                pending.will_retry,
+            )
+            .await;
     }
 
     pub fn extension_mode(&self) -> ExtensionMode {

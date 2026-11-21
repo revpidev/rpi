@@ -41,6 +41,7 @@ pub const STATE_FAILED: &str = "failed";
 pub const STATE_PAUSED: &str = "paused";
 pub const STATE_STOPPED: &str = "stopped";
 pub const STATE_REJECTED: &str = "rejected";
+pub const STATE_PARTIAL: &str = "partial";
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -199,7 +200,12 @@ fn remove_status_gate(run_id: &str) {
 fn is_terminal_state(state: &str) -> bool {
     matches!(
         state,
-        STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
+        STATE_COMPLETE
+            | STATE_FAILED
+            | STATE_STOPPED
+            | STATE_PAUSED
+            | STATE_REJECTED
+            | STATE_PARTIAL
     )
 }
 
@@ -221,6 +227,7 @@ fn prune_terminal_runs() {
         STATE_STOPPED,
         STATE_PAUSED,
         STATE_REJECTED,
+        STATE_PARTIAL,
     ];
     let is_terminal = |handle: &Arc<AsyncRunHandle>| {
         let status = handle.status.read().unwrap_or_else(|e| e.into_inner());
@@ -268,7 +275,12 @@ pub fn find_active_run(query: &str) -> Option<Arc<AsyncRunHandle>> {
         let status = handle.status.read().unwrap_or_else(|e| e.into_inner());
         matches!(
             status["state"].as_str().unwrap_or(""),
-            STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
+            STATE_COMPLETE
+                | STATE_FAILED
+                | STATE_STOPPED
+                | STATE_PAUSED
+                | STATE_REJECTED
+                | STATE_PARTIAL
         )
     };
     if terminal { None } else { Some(handle) }
@@ -683,6 +695,57 @@ pub fn process_boot_id(pid: u64) -> Option<u64> {
     }
 }
 
+/// Parent pid of `pid` (`/proc/<pid>/stat` field 4).
+fn process_parent_pid(pid: u64) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = raw.rsplit_once(')')?.1;
+        after_comm
+            .split_whitespace()
+            .nth(1)
+            .and_then(|token| token.parse().ok())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Refuse to signal the host itself, init, one of the host's ancestors, or a
+/// pid that is not a subagent process-group leader. The ledger lives in the
+/// parent-owned launch folder, but the reconciler still validates every
+/// target before sending a signal (R19-S11: never trust a reported pid).
+fn is_safe_reap_target(pid: u64) -> bool {
+    if pid == 0 || pid == 1 || pid == u64::from(std::process::id()) {
+        return false;
+    }
+    let mut current = u64::from(std::process::id());
+    for _ in 0..64 {
+        let Some(parent) = process_parent_pid(current) else {
+            break;
+        };
+        if parent == 0 {
+            break;
+        }
+        if parent == pid {
+            return false;
+        }
+        current = parent;
+    }
+    #[cfg(unix)]
+    {
+        // Subagent children are spawned with `process_group(0)`, so a real
+        // recorded child is its own group leader. A forged unrelated pid
+        // almost never satisfies this.
+        if unsafe { libc::getpgid(pid as i32) } != pid as i32 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether `pid` is alive AND started at `boot_id` (pid-reuse guard). A
 /// recorded `boot_id` of `None` (non-unix) degrades to a liveness check.
 pub(crate) fn pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
@@ -704,19 +767,26 @@ pub(crate) fn recorded_pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
 
 /// Persist a spawned child pid for `run_id` (ADR-0019 crash branch): the
 /// stale-run reconciler reads these to signal orphaned children whose owner
-/// host died. Append-only, so parallel children never clobber each other.
+/// host died. The ledger is parent-owned (launch folder, beside
+/// `recovery.json`) so a child cannot seed arbitrary pids through its
+/// writable run folder. Append-only, so parallel children never clobber each
+/// other.
 pub fn record_child_pid(run_id: &str, pid: u32) {
     if pid == 0 {
         return;
     }
     let run_dir = async_runs_dir().join(run_id);
-    // Only async runs keep a run directory; foreground runs have no
+    // Only async/detached runs keep a run directory; foreground runs have no
     // reconciler surface (their dispatch dies with the host).
     if !run_dir.is_dir() {
         return;
     }
+    let launch_dir = crate::recovery::launch_dir(run_id);
+    if crate::paths::create_private_dir_all(&launch_dir).is_err() {
+        return;
+    }
     crate::artifacts::append_jsonl(
-        &run_dir.join("children.jsonl"),
+        &crate::recovery::child_pid_ledger_path(run_id),
         &json!({
             "pid": pid,
             "bootId": process_boot_id(pid as u64),
@@ -726,9 +796,9 @@ pub fn record_child_pid(run_id: &str, pid: u32) {
     );
 }
 
-/// Read the recorded child pids for a run directory (empty when absent).
-fn recorded_child_pids(run_dir: &Path) -> Vec<(u64, Option<u64>)> {
-    std::fs::read_to_string(run_dir.join("children.jsonl"))
+/// Read the recorded child pids for a run id (empty when absent).
+fn recorded_child_pids(run_id: &str) -> Vec<(u64, Option<u64>)> {
+    std::fs::read_to_string(crate::recovery::child_pid_ledger_path(run_id))
         .ok()
         .map(|raw| {
             raw.lines()
@@ -1987,7 +2057,12 @@ pub fn resend_pending_results(calls: &crate::AsyncHostCalls, session_id: Option<
         }
         if !matches!(
             status["state"].as_str().unwrap_or(""),
-            STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
+            STATE_COMPLETE
+                | STATE_FAILED
+                | STATE_STOPPED
+                | STATE_PAUSED
+                | STATE_REJECTED
+                | STATE_PARTIAL
         ) {
             continue;
         }
@@ -2126,7 +2201,14 @@ async fn finish_with_handoff(
     flush_pending_status_write_failure(handle);
     // A terminal child cannot consume a supervisor reply; close its asks so
     // they do not keep a later wait/drain yielding on a dead run.
-    crate::p1::supervisor::close_requests_for_run(&handle.run_id);
+    crate::p1::supervisor::close_requests_for_run_with_kind(
+        &handle.run_id,
+        if state == STATE_STOPPED {
+            "stopped"
+        } else {
+            "closed"
+        },
+    );
     notify.send(handle, state, output, handoff_path).await;
     // Terminal handle stays registered (see prune_terminal_runs): wait/stop
     // poll this table for the terminal transition.
@@ -2165,7 +2247,7 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
     );
     flush_pending_status_write_failure(handle);
     crate::recovery::finish_record(&handle.run_id, state);
-    crate::p1::supervisor::close_requests_for_run(&handle.run_id);
+    crate::p1::supervisor::close_requests_for_run_with_kind(&handle.run_id, "closed");
     notify.send(handle, state, error, None).await;
     prune_terminal_runs();
 }
@@ -2208,9 +2290,13 @@ pub fn deliver_steer(
     message: &str,
     mode: &str,
     target_index: Option<usize>,
+    current_session: Option<&str>,
 ) -> Result<Value, String> {
     let handle =
         find_run(run_id).ok_or_else(|| format!("No active background run matches '{run_id}'."))?;
+    if !run_owned_by(&handle, current_session) {
+        return Err(format!("No active background run matches '{run_id}'."));
+    }
     let status = status_snapshot(&handle);
     let state = status["state"].as_str().unwrap_or("").to_string();
     if is_terminal_state(&state) {
@@ -2226,6 +2312,17 @@ pub fn deliver_steer(
     if steps
         .iter()
         .any(|step| step["acceptanceFinal"].as_bool() == Some(true))
+    {
+        return Err(
+            "Child completed its acceptance report; resume it for further guidance.".to_string(),
+        );
+    }
+    // S40: the child writes this marker as soon as its final assistant
+    // message is an acceptance report, before the run records the terminal
+    // step. Steer must be rejected during that finishing window too.
+    if steer_inbox_dir(&handle.run_dir, target_index.unwrap_or(0))
+        .join("steer-inbox-closed.json")
+        .exists()
     {
         return Err(
             "Child completed its acceptance report; resume it for further guidance.".to_string(),
@@ -2408,13 +2505,18 @@ pub fn interrupt_run_for_session(
 /// (a fork gets a new id). `None` on either side keeps the local default
 /// (single-window hosts).
 pub fn run_owned_by(handle: &AsyncRunHandle, current_session: Option<&str>) -> bool {
-    let Some(current) = current_session else {
-        return true;
-    };
     let status = handle
         .status
         .read()
         .unwrap_or_else(|error| error.into_inner());
+    status_owned_by(&status, current_session)
+}
+
+/// Ownership check for a status snapshot (list/fleet/wait surfaces).
+pub fn status_owned_by(status: &Value, current_session: Option<&str>) -> bool {
+    let Some(current) = current_session else {
+        return true;
+    };
     match status["sessionId"].as_str() {
         Some(owner) => owner == current,
         None => true,
@@ -2425,6 +2527,16 @@ pub fn run_owned_by(handle: &AsyncRunHandle, current_session: Option<&str>) -> b
 pub fn list_runs() -> Vec<Value> {
     let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
     runs.values().map(|h| status_snapshot(h)).collect()
+}
+
+/// Live runs owned by `current_session` (S24: list/status must not expose
+/// another session's runs). `None` keeps the single-window default.
+pub fn list_runs_for_session(current_session: Option<&str>) -> Vec<Value> {
+    let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    runs.values()
+        .filter(|handle| run_owned_by(handle, current_session))
+        .map(|h| status_snapshot(h))
+        .collect()
 }
 
 /// S12: result files whose completion notice has not reached this session
@@ -2587,7 +2699,7 @@ pub async fn harvest_for_shutdown() {
         // The host-shutdown stop is terminal too: surface a deferred
         // status-write failure after the terminal event (TE17 R7.1.7.1).
         flush_pending_status_write_failure(handle);
-        crate::p1::supervisor::close_requests_for_run(&handle.run_id);
+        crate::p1::supervisor::close_requests_for_run_with_kind(&handle.run_id, "stopped");
         crate::recovery::finish_record(&handle.run_id, STATE_STOPPED);
         unregister_run(&handle.run_id);
     }
@@ -2597,6 +2709,126 @@ pub async fn harvest_for_shutdown() {
 /// stuck in queued/running whose owner host pid is dead get their recorded
 /// children signalled (SIGTERM → bounded poll → SIGKILL, bootId-guarded
 /// against pid reuse) and are then marked failed(stale).
+/// S49 (#3261): result files are written before the final status; when the
+/// owner died in that window the result is better evidence than a generic
+/// "stale" failure. Mirrors upstream `readResultRepairData` /
+/// `terminalStatusFromResult` (stale-run-reconciler.ts:120-208).
+struct ResultRepairData {
+    state: &'static str,
+    error: Option<String>,
+    results: Vec<Value>,
+}
+
+fn read_result_repair_data(run_id: &str) -> Option<ResultRepairData> {
+    let path = async_results_dir().join(format!("{run_id}.json"));
+    let raw = std::fs::read_to_string(path).ok()?;
+    let data: Value = serde_json::from_str(&raw).ok()?;
+    let state = if data["success"].as_bool() == Some(true) {
+        STATE_COMPLETE
+    } else {
+        match data["state"].as_str() {
+            Some("stopped") => STATE_STOPPED,
+            Some("rejected") => STATE_REJECTED,
+            Some("partial") => STATE_PARTIAL,
+            Some("paused") => STATE_PAUSED,
+            _ if data["exitCode"].as_i64() == Some(0) => STATE_PAUSED,
+            _ => STATE_FAILED,
+        }
+    };
+    let error = data["error"]
+        .as_str()
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            data["results"].as_array().and_then(|results| {
+                results.iter().find_map(|child| {
+                    (child["success"].as_bool() == Some(false))
+                        .then(|| child["error"].as_str().map(str::trim))
+                        .flatten()
+                        .filter(|error| !error.is_empty())
+                        .map(str::to_string)
+                })
+            })
+        });
+    Some(ResultRepairData {
+        state,
+        error,
+        results: data["results"].as_array().cloned().unwrap_or_default(),
+    })
+}
+
+fn apply_result_repair(status: &mut Value, repair: &ResultRepairData, now: u64) {
+    let now_iso = iso8601(now);
+    status["state"] = json!(repair.state);
+    if let Some(error) = &repair.error
+        && matches!(repair.state, STATE_FAILED | STATE_PARTIAL)
+    {
+        status["error"] = json!(error);
+    }
+    status["updatedAt"] = json!(now_iso);
+    status["endedAt"] = status
+        .get("endedAt")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| json!(now_iso));
+    if repair.state == STATE_STOPPED {
+        status["stopped"] = json!(true);
+    }
+    if let Some(object) = status.as_object_mut() {
+        object.remove("activityState");
+        object.remove("lastActivityAt");
+    }
+    if let Some(steps) = status["steps"].as_array_mut() {
+        for (index, step) in steps.iter_mut().enumerate() {
+            let live = matches!(
+                step["status"].as_str(),
+                Some("running") | Some("pending") | Some("queued")
+            );
+            if !live {
+                continue;
+            }
+            let child = repair.results.get(index);
+            let child_state = match child.and_then(|child| child["success"].as_bool()) {
+                Some(true) => STATE_COMPLETE,
+                Some(false) => STATE_FAILED,
+                None => repair.state,
+            };
+            step["status"] = json!(child_state);
+            step["endedAt"] = json!(now_iso);
+            if let Some(started) = step["startedAt"].as_u64()
+                && step["durationMs"].is_null()
+            {
+                step["durationMs"] = json!(now.saturating_sub(started));
+            }
+            step["exitCode"] = json!(if matches!(child_state, STATE_COMPLETE | STATE_PAUSED) {
+                0
+            } else {
+                1
+            });
+            if let Some(error) = child
+                .and_then(|child| child["error"].as_str())
+                .filter(|error| !error.trim().is_empty())
+                && matches!(child_state, STATE_FAILED | STATE_PARTIAL | STATE_STOPPED)
+            {
+                step["error"] = json!(error);
+            }
+            if child_state == STATE_STOPPED {
+                step["stopped"] = json!(true);
+            }
+            if let Some(child) = child {
+                for key in ["sessionFile", "sessionName", "model", "thinking"] {
+                    if step.get(key).is_none_or(Value::is_null)
+                        && let Some(value) = child.get(key).cloned()
+                    {
+                        step[key] = value;
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn reconcile_stale_runs() {
     let Ok(entries) = std::fs::read_dir(async_runs_dir()) else {
         return;
@@ -2633,36 +2865,56 @@ pub fn reconcile_stale_runs() {
         // recorded pids survive the host crash in an independent process
         // group and would otherwise hang forever on the full stdout pipe.
         let mut reaped = Vec::new();
-        for (pid, boot_id) in recorded_child_pids(&run_dir) {
+        let run_id = status["runId"].as_str().unwrap_or_default();
+        for (pid, boot_id) in recorded_child_pids(run_id) {
             if !pid_matches(pid, boot_id) {
+                continue;
+            }
+            if !is_safe_reap_target(pid) {
+                append_event(
+                    &run_dir,
+                    "run.reconcile_skipped_pid",
+                    json!({ "reason": "unsafe-target", "pid": pid }),
+                );
                 continue;
             }
             reap_orphan_pid(pid);
             reaped.push(pid);
         }
-        status["state"] = json!(STATE_FAILED);
-        status["error"] = json!("stale: owning host process exited before the run finished");
-        status["updatedAt"] = json!(iso8601(now_millis()));
-        if let Some(object) = status.as_object_mut() {
-            object.remove("activityState");
-            object.remove("lastActivityAt");
+        // S49: a result file written before the owner died carries the real
+        // outcome; only runs without one get the generic stale failure.
+        let repaired = read_result_repair_data(run_id);
+        if let Some(repair) = &repaired {
+            apply_result_repair(&mut status, repair, now_millis());
+        } else {
+            status["state"] = json!(STATE_FAILED);
+            status["error"] = json!("stale: owning host process exited before the run finished");
+            status["updatedAt"] = json!(iso8601(now_millis()));
+            if let Some(object) = status.as_object_mut() {
+                object.remove("activityState");
+                object.remove("lastActivityAt");
+            }
+            settle_unfinished_steps(
+                &mut status,
+                "failed",
+                "stale: owning host process exited before the run finished",
+            );
+            clear_steps_terminal(&mut status);
         }
-        settle_unfinished_steps(
-            &mut status,
-            "failed",
-            "stale: owning host process exited before the run finished",
-        );
-        clear_steps_terminal(&mut status);
         let write_result = crate::artifacts::write_metadata(&status_path, &status);
         append_event(
             &run_dir,
             "run.reconciled",
-            json!({ "reason": "owner-dead", "reapedChildPids": reaped }),
+            json!({
+                "reason": "owner-dead",
+                "repairedState": status["state"],
+                "reapedChildPids": reaped,
+            }),
         );
         // The run is terminal now; close its pending supervisor asks so a
         // later wait/drain does not keep yielding on a dead owner.
         if let Some(run_id) = status["runId"].as_str() {
-            crate::p1::supervisor::close_requests_for_run(run_id);
+            crate::p1::supervisor::close_requests_for_run_with_kind(run_id, "interrupted");
         }
         // The reconciled write is terminal: a failure surfaces after
         // run.reconciled (TE17 R7.1.7.1 — no run handle exists here, so the
@@ -2746,7 +2998,7 @@ pub fn cleanup_expired_runs() {
             continue;
         }
         let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
-        crate::p1::supervisor::close_requests_for_run(&run_id);
+        crate::p1::supervisor::close_requests_for_run_with_kind(&run_id, "expired");
     }
     // Orphaned launch folders (run folder already gone): 30 days.
     let launches = crate::paths::temp_root_dir().join("async-subagent-launches");
@@ -2761,6 +3013,14 @@ pub fn cleanup_expired_runs() {
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(0);
             if age > 30 * DAY_MS {
+                // A launch folder belongs to a run folder; the run sweep owns
+                // its retention (30/90 days, paused kept). Only remove truly
+                // orphaned folders, otherwise a 31-day-old launch folder
+                // would delete the trusted record of a 90-day resumable run.
+                let run_id = entry.file_name().to_string_lossy().to_string();
+                if async_runs_dir().join(&run_id).exists() {
+                    continue;
+                }
                 let _ = std::fs::remove_dir_all(&path);
             }
         }
@@ -2822,7 +3082,12 @@ pub async fn wait_for_runs_with_session_asks(
     let is_terminal = |state: &str| {
         matches!(
             state,
-            STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
+            STATE_COMPLETE
+                | STATE_FAILED
+                | STATE_STOPPED
+                | STATE_PAUSED
+                | STATE_REJECTED
+                | STATE_PARTIAL
         )
     };
     // subagent-wait.ts:552-566: the wait tracks the runs ACTIVE WHEN IT
@@ -2850,6 +3115,7 @@ pub async fn wait_for_runs_with_session_asks(
                         .filter(|h| {
                             let status = h.status.read().unwrap_or_else(|e| e.into_inner());
                             !is_terminal(status["state"].as_str().unwrap_or(""))
+                                && status_owned_by(&status, orchestrator_session_id)
                         })
                         .map(|h| h.run_id.clone())
                 };
@@ -2868,6 +3134,7 @@ pub async fn wait_for_runs_with_session_asks(
                 .filter(|h| {
                     let status = h.status.read().unwrap_or_else(|e| e.into_inner());
                     !is_terminal(status["state"].as_str().unwrap_or(""))
+                        && status_owned_by(&status, orchestrator_session_id)
                 })
                 .map(|h| h.run_id.clone())
                 .collect(),
@@ -4296,6 +4563,68 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&channel);
     }
 
+    #[test]
+    fn stale_reconciler_repairs_from_a_result_file() {
+        let cases = [
+            (
+                "complete",
+                json!({ "success": true, "results": [{ "success": true }] }),
+                STATE_COMPLETE,
+                "complete",
+            ),
+            (
+                "partial",
+                json!({ "state": "partial", "results": [{ "success": true }, { "success": false, "error": "boom" }] }),
+                STATE_PARTIAL,
+                "complete",
+            ),
+            (
+                "stopped",
+                json!({ "state": "stopped" }),
+                STATE_STOPPED,
+                "stopped",
+            ),
+        ];
+        for (tag, result, expected_state, expected_step) in cases {
+            let run_id = format!("recon-result-{tag}-{}", std::process::id());
+            let dir = async_runs_dir().join(&run_id);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            crate::artifacts::write_metadata(
+                &dir.join("status.json"),
+                &json!({
+                    "runId": run_id,
+                    "state": STATE_RUNNING,
+                    "ownerPid": 4000000,
+                    "steps": [
+                        { "agent": "a", "status": "running" },
+                        { "agent": "b", "status": "running" },
+                    ],
+                }),
+            )
+            .unwrap();
+            std::fs::create_dir_all(async_results_dir()).unwrap();
+            let result_path = async_results_dir().join(format!("{run_id}.json"));
+            crate::artifacts::write_metadata(&result_path, &result).unwrap();
+            reconcile_stale_runs();
+            let status: Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("status.json")).unwrap())
+                    .unwrap();
+            assert_eq!(status["state"], json!(expected_state), "{tag}: {status}");
+            assert_eq!(
+                status["steps"][0]["status"],
+                json!(expected_step),
+                "{tag}: {status}"
+            );
+            if tag == "partial" {
+                assert_eq!(status["steps"][1]["status"], json!("failed"));
+                assert_eq!(status["steps"][1]["error"], json!("boom"));
+            }
+            let _ = std::fs::remove_file(result_path);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     #[tokio::test]
     async fn drained_failure_routes_to_stopped() {
         let run_id = format!("drain-failed-{}", std::process::id());
@@ -4385,6 +4714,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn stale_reconciler_reaps_orphaned_child_processes() {
+        use std::os::unix::process::CommandExt;
         use std::process::Command;
         // A stand-in for a subagent child that outlived its crashed host:
         // independent process group, still running.
@@ -4392,22 +4722,23 @@ pub(crate) mod tests {
             .arg("30")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()
             .expect("spawn sleep");
         let pid = orphan.id() as u64;
-        let dir = async_runs_dir().join(format!("recon-orphan-{}", std::process::id()));
+        let run_id = format!("recon-orphan-{}", std::process::id());
+        let dir = async_runs_dir().join(&run_id);
         std::fs::create_dir_all(&dir).unwrap();
-        // children.jsonl first: status.json is the reconciler's entry
-        // condition, and a concurrent test's reconcile sweep must not mark
-        // the run terminal before the pid record exists.
+        // The ledger is parent-owned (launch folder); status.json is the
+        // reconciler's entry condition, so write the pid first.
         crate::artifacts::append_jsonl(
-            &dir.join("children.jsonl"),
+            &crate::recovery::child_pid_ledger_path(&run_id),
             &json!({ "pid": pid, "bootId": process_boot_id(pid) }).to_string(),
         );
         crate::artifacts::write_metadata(
             &dir.join("status.json"),
             &json!({
-                "runId": "orphans",
+                "runId": run_id,
                 "state": STATE_RUNNING,
                 "ownerPid": 4000000, // not a live pid on this system
             }),
@@ -4431,31 +4762,35 @@ pub(crate) mod tests {
         assert!(events.contains("run.reconciled"));
         assert!(events.contains(&format!("{pid}")));
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
     }
 
     #[cfg(unix)]
     #[test]
     fn stale_reconciler_skips_reused_pids() {
+        use std::os::unix::process::CommandExt;
         use std::process::Command;
         let mut child = Command::new("sleep")
             .arg("30")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()
             .expect("spawn sleep");
         let pid = child.id() as u64;
-        let dir = async_runs_dir().join(format!("recon-reuse-{}", std::process::id()));
+        let run_id = format!("recon-reuse-{}", std::process::id());
+        let dir = async_runs_dir().join(&run_id);
         std::fs::create_dir_all(&dir).unwrap();
         // bootId deliberately wrong → the live pid must not be signalled.
         // Written before status.json for the same race reason as above.
         crate::artifacts::append_jsonl(
-            &dir.join("children.jsonl"),
+            &crate::recovery::child_pid_ledger_path(&run_id),
             &json!({ "pid": pid, "bootId": 1 }).to_string(),
         );
         crate::artifacts::write_metadata(
             &dir.join("status.json"),
             &json!({
-                "runId": "reuse",
+                "runId": run_id,
                 "state": STATE_RUNNING,
                 "ownerPid": 4000000,
             }),
@@ -4466,6 +4801,55 @@ pub(crate) mod tests {
         assert!(pid_alive(pid), "mismatched bootId must be left alone");
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciler_never_targets_self_init_or_ancestors() {
+        assert!(!is_safe_reap_target(0));
+        assert!(!is_safe_reap_target(1));
+        assert!(!is_safe_reap_target(u64::from(std::process::id())));
+        let parent = process_parent_pid(u64::from(std::process::id())).unwrap_or(0);
+        if parent > 1 {
+            assert!(
+                !is_safe_reap_target(parent),
+                "parent must never be signalled"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciler_ignores_a_forged_run_dir_ledger() {
+        // The child-writable run folder must not be able to seed pids; only
+        // the parent-owned launch ledger is read.
+        let run_id = format!("recon-forged-{}", std::process::id());
+        let dir = async_runs_dir().join(&run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid = u64::from(std::process::id());
+        crate::artifacts::append_jsonl(
+            &dir.join("children.jsonl"),
+            &json!({ "pid": pid, "bootId": process_boot_id(pid) }).to_string(),
+        );
+        crate::artifacts::write_metadata(
+            &dir.join("status.json"),
+            &json!({
+                "runId": run_id,
+                "state": STATE_RUNNING,
+                "ownerPid": 4000000,
+            }),
+        )
+        .unwrap();
+        reconcile_stale_runs();
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+        let reconciled: Value = events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["type"] == json!("run.reconciled"))
+            .expect("run.reconciled event");
+        assert_eq!(reconciled["reapedChildPids"], json!([]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4548,12 +4932,7 @@ pub(crate) mod tests {
     fn record_child_pid_writes_only_for_async_runs() {
         // The async-runs root holds no directory for this id → no file.
         record_child_pid("no-such-run-id-xyz", 4242);
-        assert!(
-            !async_runs_dir()
-                .join("no-such-run-id-xyz")
-                .join("children.jsonl")
-                .exists()
-        );
+        assert!(!crate::recovery::child_pid_ledger_path("no-such-run-id-xyz").exists());
     }
 
     // ---- V13-01 FR-C: status write coalescing + terminal flush ---------
@@ -5146,7 +5525,7 @@ pub(crate) mod tests {
         let _handle = steer_test_run(&run_id, &run_dir);
         write_pending_ask(&run_id, "req-1");
 
-        let error = deliver_steer(&run_id, "change of plans", "steer", None)
+        let error = deliver_steer(&run_id, "change of plans", "steer", None, None)
             .expect_err("pending ask must block the steer");
         // The rejection carries the guidance + the request id (FR-A).
         assert!(error.contains("need_decision"), "{error}");
@@ -5163,7 +5542,7 @@ pub(crate) mod tests {
 
         // Answering (consuming the ask) unblocks the normal path.
         remove_ask(&run_id, "req-1");
-        let request = deliver_steer(&run_id, "change of plans", "steer", None)
+        let request = deliver_steer(&run_id, "change of plans", "steer", None, None)
             .expect("steer delivers once the ask is answered");
         assert_eq!(request["targetIndex"], json!(0));
         assert!(steer_inbox_dir(&run_dir, 0).is_dir());
@@ -5213,7 +5592,7 @@ pub(crate) mod tests {
             status["state"] = json!(STATE_COMPLETE);
             status["steps"][0]["status"] = json!("complete");
         }
-        let error = deliver_steer(&run_id, "hello?", "steer", None)
+        let error = deliver_steer(&run_id, "hello?", "steer", None, None)
             .expect_err("terminal runs cannot be steered");
         assert!(
             error.contains("is complete and cannot be steered"),
@@ -5243,18 +5622,18 @@ pub(crate) mod tests {
         }
         // Out of range: names the available range.
         let error =
-            deliver_steer(&run_id, "m", "steer", Some(5)).expect_err("index 5 out of range");
+            deliver_steer(&run_id, "m", "steer", Some(5), None).expect_err("index 5 out of range");
         assert!(error.contains("has 2 children"), "{error}");
         assert!(error.contains("Index 5 is out of range"), "{error}");
         // Terminal child: refuses to steer it.
-        let error = deliver_steer(&run_id, "m", "steer", Some(1))
+        let error = deliver_steer(&run_id, "m", "steer", Some(1), None)
             .expect_err("terminal child cannot be steered");
         assert!(
             error.contains("child 1 is complete and cannot be steered"),
             "{error}"
         );
         // Live child at an explicit index delivers to THAT inbox.
-        let request = deliver_steer(&run_id, "m", "steer", Some(0)).expect("index 0 steers");
+        let request = deliver_steer(&run_id, "m", "steer", Some(0), None).expect("index 0 steers");
         assert_eq!(request["targetIndex"], json!(0));
         assert!(steer_inbox_dir(&run_dir, 0).is_dir());
         unregister_run(&run_id);
@@ -5357,15 +5736,86 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn steer_is_rejected_during_the_acceptance_finishing_window() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("steer-finishing-{}", std::process::id());
+        let run_dir = std::env::temp_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let _handle = steer_test_run(&run_id, &run_dir);
+        let inbox = steer_inbox_dir(&run_dir, 0);
+        std::fs::create_dir_all(&inbox).unwrap();
+        // The child writes this as soon as its terminal acceptance report is
+        // seen; the run's step is still `running` at this point.
+        std::fs::write(inbox.join("steer-inbox-closed.json"), "{}").unwrap();
+        let error = deliver_steer(&run_id, "one more thing", "steer", None, None)
+            .expect_err("acceptance finishing window must reject steer");
+        assert!(error.contains("completed its acceptance report"), "{error}");
+        unregister_run(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
     fn steer_unknown_run_is_not_found() {
         let _guard = REGISTRY_TEST_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let error = deliver_steer("no-such-run-xyz", "m", "steer", None).unwrap_err();
+        let error = deliver_steer("no-such-run-xyz", "m", "steer", None, None).unwrap_err();
         assert!(
             error.contains("No active background run matches"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn owner_scope_covers_list_steer_and_wait() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("owner-scope-{}", std::process::id());
+        let run_dir = std::env::temp_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let _handle = steer_test_run(&run_id, &run_dir);
+        {
+            let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            let handle = runs.get(run_id.as_str()).expect("registered run");
+            let mut status = handle.status.write().unwrap_or_else(|e| e.into_inner());
+            status["sessionId"] = json!("session-a");
+        }
+        assert!(
+            list_runs_for_session(Some("session-a"))
+                .iter()
+                .any(|run| run["runId"] == json!(run_id))
+        );
+        assert!(
+            !list_runs_for_session(Some("session-b"))
+                .iter()
+                .any(|run| run["runId"] == json!(run_id))
+        );
+        assert!(
+            deliver_steer(&run_id, "m", "steer", None, Some("session-b")).is_err(),
+            "another session must not steer"
+        );
+        assert!(
+            deliver_steer(&run_id, "m", "steer", None, Some("session-a")).is_ok(),
+            "the owner may steer"
+        );
+        let error = wait_for_runs_with_session_asks(
+            Some(&run_id),
+            false,
+            10,
+            None,
+            None,
+            Some("session-b"),
+            true,
+        )
+        .await
+        .expect_err("another session must not wait on the run");
+        assert!(error.contains("No active run matched"), "{error}");
+        unregister_run(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 }
 
@@ -5441,10 +5891,9 @@ mod retention_tests {
     fn backdate(path: &Path, days: u64) {
         let when =
             std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .expect("open");
+        // A read-only handle can still set times as the owner and also works
+        // for directories (a write handle on a directory is EISDIR).
+        let file = std::fs::File::open(path).expect("open");
         file.set_modified(when).expect("set mtime");
     }
 
@@ -5500,7 +5949,54 @@ mod retention_tests {
             "29-day run is kept"
         );
 
-        for run in [&kept_run, &fresh_run] {
+        // The orphaned-launch-folder sweep must not delete the trusted record
+        // of a run whose run folder is still retained (V19-03 S09/S42).
+        let kept_launch = crate::recovery::launch_dir(&kept_run);
+        std::fs::create_dir_all(&kept_launch).unwrap();
+        let kept_record = kept_launch.join("recovery.json");
+        std::fs::write(&kept_record, "{}").unwrap();
+        backdate(&kept_record, 40);
+        backdate(&kept_launch, 40);
+
+        let paused_run = format!("retention-paused-{}", std::process::id());
+        fake_run(&paused_run, None, 40);
+        let paused_status = async_runs_dir().join(&paused_run).join("status.json");
+        let mut paused: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paused_status).unwrap()).unwrap();
+        paused["state"] = json!("paused");
+        std::fs::write(&paused_status, serde_json::to_string(&paused).unwrap()).unwrap();
+        backdate(&paused_status, 40);
+        let paused_launch = crate::recovery::launch_dir(&paused_run);
+        std::fs::create_dir_all(&paused_launch).unwrap();
+        let paused_record = paused_launch.join("recovery.json");
+        std::fs::write(&paused_record, "{}").unwrap();
+        backdate(&paused_record, 40);
+        backdate(&paused_launch, 40);
+
+        let orphan_launch =
+            crate::recovery::launch_dir(&format!("retention-orphan-{}", std::process::id()));
+        std::fs::create_dir_all(&orphan_launch).unwrap();
+        let orphan_record = orphan_launch.join("recovery.json");
+        std::fs::write(&orphan_record, "{}").unwrap();
+        backdate(&orphan_record, 31);
+        backdate(&orphan_launch, 31);
+
+        cleanup_expired_runs();
+
+        assert!(
+            kept_record.is_file(),
+            "a 40-day launch folder whose 90-day run still exists is kept"
+        );
+        assert!(
+            paused_record.is_file(),
+            "a paused run's trusted record survives the orphan sweep"
+        );
+        assert!(
+            !orphan_launch.exists(),
+            "a 31-day launch folder without a run folder is removed"
+        );
+
+        for run in [&kept_run, &fresh_run, &paused_run] {
             let _ = std::fs::remove_dir_all(async_runs_dir().join(run));
             let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(run));
         }

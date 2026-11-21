@@ -752,9 +752,13 @@ async fn launch_one(
     let mut spec = entry.spec.clone();
     // V19-03 S13: offer the child to the session's permission handlers
     // before any process/file action (including worktree creation).
-    if let Err(reason) =
-        launch_child::approve_workflow_child(ctx, &mut spec, &entry.key, Some("parallel"))
-    {
+    if let Err(reason) = launch_child::approve_workflow_child(
+        ctx,
+        &mut spec,
+        &entry.key,
+        Some("parallel"),
+        Some(&agent),
+    ) {
         return Some(Err(reason));
     }
     let mut prepared = None;

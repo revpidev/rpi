@@ -663,6 +663,35 @@ mod tests {
         assert!(text.starts_with(cut.trim_end_matches('…')));
         assert_eq!(truncate_utf8_bytes("short", 256), "short");
         assert!(truncate_utf8_bytes(&"x".repeat(300), 256).len() <= 256);
+        // Exactly at the limit is untouched.
+        let exactly = "x".repeat(256);
+        assert_eq!(truncate_utf8_bytes(&exactly, 256), exactly);
+        // A multibyte character straddling the byte budget is dropped whole.
+        let boundary = format!("{}é", "x".repeat(255));
+        let cut = truncate_utf8_bytes(&boundary, 256);
+        assert!(cut.len() <= 256, "{cut:?} has {} bytes", cut.len());
+        assert!(cut.ends_with('…'));
+        assert!(cut.is_char_boundary(cut.len() - '…'.len_utf8()));
+    }
+
+    #[test]
+    fn error_status_text_uses_the_same_256_byte_bound() {
+        let exactly = "e".repeat(256);
+        let view = child_view(
+            &json!({"agent": "a", "status": "failed", "error": exactly}),
+            None,
+            false,
+        );
+        assert_eq!(view.status_text, format!("Error: {exactly}"));
+        let over = format!("{}é", "e".repeat(255));
+        let view = child_view(
+            &json!({"agent": "a", "status": "failed", "error": over}),
+            None,
+            false,
+        );
+        let bounded = view.status_text.trim_start_matches("Error: ");
+        assert!(bounded.len() <= 256, "{} bytes", bounded.len());
+        assert!(bounded.ends_with('…'));
     }
 
     #[test]

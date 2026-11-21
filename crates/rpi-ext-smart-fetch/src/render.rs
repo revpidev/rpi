@@ -1,7 +1,7 @@
 //! renderCall/renderResult component trees (FR-P2-E) — port of the
-//! renderer half of upstream `pi-smart-fetch/src/index.ts` @ b0111612
-//! (:77-468 helpers, :628-664 web_fetch renderers, :773-789 batch
-//! renderers), mapped onto ComponentTree v1
+//! renderer half of upstream `pi-smart-fetch/src/index.ts` @ feb6da00
+//! (smart-fetch-core v0.3.23; :77-468 helpers, :628-664 web_fetch renderers,
+//! :773-789 batch renderers), mapped onto ComponentTree v1
 //! (`rpi.component-tree.v1`).
 //!
 //! Protocol-driven degradations (v1 has no `row`, one `fg` per text node —
@@ -9,7 +9,8 @@
 //! pixel-level parity are non-goals):
 //! - every horizontal multi-color composition collapses to a single text
 //!   node (the glyph/URL/`█░` bar line carries one foreground color);
-//! - the Markdown preview renders as plain text;
+//! - the Markdown preview renders as plain text (F07 removed the Markdown
+//!   renderer dependency);
 //! - `getOptimisticProgress` time extrapolation is dropped (Out: depends on
 //!   `Date.now`) — bar fill uses the event's static progress value.
 //!

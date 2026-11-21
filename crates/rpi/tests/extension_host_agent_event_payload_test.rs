@@ -129,6 +129,29 @@ fn recording_ext(records: Records, events: &[&'static str]) -> InlineExtension {
     InlineExtension::Anonymous(factory)
 }
 
+/// Records `ctx.is_idle()` from inside a `session_compact` handler: the
+/// host must emit the event only after the compaction lock is released
+/// (V19-03 S45), otherwise the deferred wake can never observe idle.
+fn idle_recording_ext(records: Records) -> InlineExtension {
+    let factory: ExtensionFactory = Arc::new(move |api| {
+        let records = records.clone();
+        api.on(
+            "session_compact",
+            Arc::new(move |payload, ctx| {
+                let idle = ctx.is_idle().unwrap_or(false);
+                records.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    "session_compact".to_string(),
+                    json!({ "idle": idle, "payload": payload }),
+                ));
+                Box::pin(async { Ok(Value::Null) })
+            }),
+        )
+        .expect("register handler");
+        Box::pin(async { Ok(()) })
+    });
+    InlineExtension::Anonymous(factory)
+}
+
 const AGENT_EVENTS: [&str; 8] = [
     "agent_end",
     "turn_start",
@@ -1312,4 +1335,56 @@ async fn message_update_delta_forwards_a_delta_only_payload() {
     // `message_end` still carries the authoritative final message.
     let ends = records_of(&records, "message_end");
     assert!(!ends.is_empty(), "expected message_end");
+}
+
+/// V19-03 S45 regression: `AgentSession::compact` emits `session_compact`
+/// after dropping the compaction lock, so the handler observes idle and the
+/// plugin's deferred wake can flush without polling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compact_handler_observes_idle_after_lock_release() {
+    let records: Records = Arc::new(Mutex::new(Vec::new()));
+    let host = NativeExtensionHost::new("/compact-idle");
+    let errors = host
+        .load_inline(&[idle_recording_ext(records.clone())])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let fixture = fixture_with_settings(
+        vec![faux_assistant_message("SUMMARY", FauxAssistantOptions::default()).into()],
+        host,
+        8192,
+        r#"{"compaction":{"reserveTokens":1,"keepRecentTokens":1}}"#,
+    )
+    .await;
+    {
+        let manager = fixture.session.session_manager();
+        let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        for (text, role) in [
+            (format!("q1 {}", "x".repeat(2000)), "user"),
+            (format!("a1 {}", "y".repeat(2000)), "assistant"),
+            (format!("q2 {}", "x".repeat(2000)), "user"),
+        ] {
+            let message = if role == "user" {
+                serde_json::from_value(json!({
+                    "role": "user",
+                    "content": text,
+                    "timestamp": 1,
+                }))
+                .expect("user message")
+            } else {
+                rpi_agent::messages::AgentMessage::Assistant(faux_assistant_message(
+                    text,
+                    FauxAssistantOptions::default(),
+                ))
+            };
+            manager.append_message(message).expect("append message");
+        }
+    }
+    fixture.session.compact(None).await.expect("compact");
+    let records = records.lock().unwrap_or_else(|e| e.into_inner());
+    let compact = records
+        .iter()
+        .find(|(event, _)| event == "session_compact")
+        .expect("session_compact recorded");
+    assert_eq!(compact.1["idle"], json!(true), "{:?}", compact.1);
 }

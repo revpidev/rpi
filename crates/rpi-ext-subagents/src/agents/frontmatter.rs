@@ -248,14 +248,15 @@ pub fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
     let flush = |frontmatter: &mut std::collections::BTreeMap<String, String>,
                  key: &mut Option<String>,
                  lines: &mut Option<Vec<String>>,
-                 folded: bool| {
+                 folded: bool,
+                 literal: bool| {
         if let (Some(k), Some(block)) = (key.take(), lines.take()) {
             // `flushBlockLines` (frontmatter.ts:157-174 @ feb6da00, #3089):
             // for non-scalar blocks drop exactly-empty edge lines and every
             // line from the first exactly-empty one after the last content
             // line, so nested values without inner blank lines parse as
             // before while an inner blank line no longer truncates the block.
-            let block = if folded {
+            let block = if folded || literal {
                 block
             } else {
                 let last_content = block.iter().rposition(|line| !line.trim().is_empty());
@@ -313,6 +314,7 @@ pub fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
             &mut current_key,
             &mut current_block_lines,
             current_folded,
+            current_literal,
         );
         current_folded = false;
         current_literal = false;
@@ -368,6 +370,7 @@ pub fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
         &mut current_key,
         &mut current_block_lines,
         current_folded,
+        current_literal,
     );
 
     ParsedFrontmatter { frontmatter, body }
@@ -487,6 +490,11 @@ mod tests {
         assert_eq!(literal.frontmatter["description"], "first\n\nsecond");
         let folded = parse_frontmatter("---\ndescription: >\n  one\n\n  two\n---\n");
         assert_eq!(folded.frontmatter["description"], "one\ntwo");
+        // A literal block keeps its trailing blank line (upstream trims edge
+        // lines only for non-literal, non-folded blocks).
+        let literal_tail = parse_frontmatter("---\ndescription: |\n  first\n\nname: x\n---\n");
+        assert_eq!(literal_tail.frontmatter["description"], "first\n");
+        assert_eq!(literal_tail.frontmatter["name"], "x");
     }
 
     #[test]

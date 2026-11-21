@@ -176,10 +176,18 @@ fn flush_if_ready(calls: &AsyncHostCalls) -> bool {
 }
 
 pub fn session_shutdown(reason: &str) {
+    let mut state = lock();
     if reason == "reload" {
+        // Reload replaces the runtime: drop any pending wake/timer state and
+        // keep only the session binding (the new runtime re-binds anyway).
+        state.parent_active = false;
+        state.manual_compaction = false;
+        state.interrupted_parent = false;
+        state.deferred = false;
+        state.wake_owed = false;
         return;
     }
-    *lock() = WakeState::default();
+    *state = WakeState::default();
 }
 
 /// Test seam: reset the process-global wake state.

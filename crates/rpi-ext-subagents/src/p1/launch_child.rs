@@ -523,6 +523,7 @@ pub fn approve_workflow_child(
     spec: &mut ChildSpec,
     key: &str,
     workflow_identity: Option<&str>,
+    agent: Option<&AgentConfig>,
 ) -> Result<(), String> {
     let Some(seam) = &ctx.approval else {
         return Ok(());
@@ -548,7 +549,24 @@ pub fn approve_workflow_child(
             "cwd": cwd.to_string_lossy(),
         }]);
     }
-    if let OutputOverride::Path(path) = &spec.output {
+    // The permission handler must see the path the child will actually
+    // write: a call-level output wins, otherwise the agent's default output
+    // (with the resume suffix applied) is the effective path (R19-S13).
+    let output_path = match &spec.output {
+        OutputOverride::Path(path) => Some(path.clone()),
+        OutputOverride::Disabled => None,
+        OutputOverride::Inherit => agent.and_then(|agent| {
+            agent.output.as_deref().map(|raw| {
+                let path = crate::paths::expand_tilde_and_resolve(raw);
+                if spec.session_file.is_some() {
+                    suffixed_output_path(&path, &ctx.run_id.chars().take(8).collect::<String>())
+                } else {
+                    path
+                }
+            })
+        }),
+    };
+    if let Some(path) = output_path {
         args["output"] = json!(path.to_string_lossy());
     }
     let approval = {
@@ -2003,8 +2021,14 @@ mod workflow_approval_tests {
         let mut child = spec("original");
         child.gate = Some("cargo test".into());
         child.output = OutputOverride::Path(PathBuf::from("/tmp/out.md"));
-        approve_workflow_child(&ctx(Some(seam)), &mut child, "task-1", Some("parallel"))
-            .expect("allowed");
+        approve_workflow_child(
+            &ctx(Some(seam)),
+            &mut child,
+            "task-1",
+            Some("parallel"),
+            None,
+        )
+        .expect("allowed");
         assert_eq!(child.task, "original");
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0].0, "subagent_launch");
@@ -2019,7 +2043,7 @@ mod workflow_approval_tests {
     fn deny_refuses_with_the_reason() {
         let (seam, _) = seam(json!({ "block": true, "reason": "not allowed" }));
         let mut child = spec("original");
-        let error = approve_workflow_child(&ctx(Some(seam)), &mut child, "task-1", None)
+        let error = approve_workflow_child(&ctx(Some(seam)), &mut child, "task-1", None, None)
             .expect_err("denied");
         assert!(error.contains("not allowed"), "{error}");
         assert_eq!(child.task, "original");
@@ -2032,13 +2056,14 @@ mod workflow_approval_tests {
             "input": { "task": "rewritten" }
         }));
         let mut child = spec("original");
-        approve_workflow_child(&ctx(Some(seam.clone())), &mut child, "task-1", None)
+        approve_workflow_child(&ctx(Some(seam.clone())), &mut child, "task-1", None, None)
             .expect("allowed");
         assert_eq!(child.task, "rewritten");
 
         let mut resumed = spec("original");
         resumed.session_file = Some(PathBuf::from("/tmp/session.jsonl"));
-        approve_workflow_child(&ctx(Some(seam)), &mut resumed, "task-1", None).expect("allowed");
+        approve_workflow_child(&ctx(Some(seam)), &mut resumed, "task-1", None, None)
+            .expect("allowed");
         assert_eq!(resumed.task, "original", "resume message is immutable");
     }
 
@@ -2049,7 +2074,7 @@ mod workflow_approval_tests {
             "input": { "task": "   " }
         }));
         let mut child = spec("original");
-        let error = approve_workflow_child(&ctx(Some(seam)), &mut child, "task-1", None)
+        let error = approve_workflow_child(&ctx(Some(seam)), &mut child, "task-1", None, None)
             .expect_err("empty rewrite");
         assert!(error.contains("empty value"), "{error}");
     }
@@ -2057,7 +2082,7 @@ mod workflow_approval_tests {
     #[test]
     fn no_seam_keeps_the_existing_behavior() {
         let mut child = spec("original");
-        approve_workflow_child(&ctx(None), &mut child, "task-1", None).expect("no host");
+        approve_workflow_child(&ctx(None), &mut child, "task-1", None, None).expect("no host");
         assert_eq!(child.task, "original");
     }
 }

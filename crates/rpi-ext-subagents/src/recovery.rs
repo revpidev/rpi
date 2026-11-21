@@ -167,6 +167,13 @@ pub fn recovery_path(run_id: &str) -> PathBuf {
     launch_dir(run_id).join("recovery.json")
 }
 
+/// Parent-owned child-pid ledger for the stale-run reconciler. It lives
+/// beside `recovery.json` (never in the child-writable run folder), so a
+/// child cannot seed the reconciler with arbitrary pids (V19-03 S11).
+pub fn child_pid_ledger_path(run_id: &str) -> PathBuf {
+    launch_dir(run_id).join("children.jsonl")
+}
+
 fn now_iso() -> String {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -364,9 +371,21 @@ pub fn agent_definition_digest(agent: &AgentConfig) -> String {
         crate::agents::discover::ThinkingSpec::Disabled => json!({ "disabled": true }),
         crate::agents::discover::ThinkingSpec::Unset => Value::Null,
     };
+    // The file content digest makes an edit that the parser ignores (e.g. a
+    // comment) irrelevant, while any behavior-defining byte change is
+    // visible even if it does not map to a modeled field (upstream
+    // `fileContentDigest`, launch-contract.ts:39-72).
+    let file_content_digest = std::fs::read(&agent.file_path).ok().map(|bytes| {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    });
     let canonical = json!({
         "name": agent.name,
         "description": agent.description,
+        "aliases": agent.aliases,
+        "advertise": agent.advertise,
+        "disabled": agent.disabled,
         "tools": agent.tools,
         "excludeTools": agent.exclude_tools,
         "mcpDirectTools": agent.mcp_direct_tools,
@@ -384,6 +403,8 @@ pub fn agent_definition_digest(agent: &AgentConfig) -> String {
         }),
         "defaultAsync": agent.default_async,
         "defaultTimeoutMs": agent.default_timeout_ms,
+        "defaultReads": agent.default_reads,
+        "defaultProgress": agent.default_progress,
         "systemPrompt": agent.system_prompt,
         "skills": agent.skills,
         "extensions": agent.extensions,
@@ -399,6 +420,8 @@ pub fn agent_definition_digest(agent: &AgentConfig) -> String {
             "scope": memory.scope,
             "path": memory.path,
         })),
+        "filePath": agent.file_path.to_string_lossy(),
+        "fileContentDigest": file_content_digest,
     });
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
     let mut hasher = Sha256::new();
@@ -494,6 +517,53 @@ pub fn validate_require_launcher_shape(
     Ok(())
 }
 
+/// S01: a managed worktree whose cleanup has not finalized cannot be a
+/// resume target (upstream `parallel-handoff.ts:200`). The recorded cwd names
+/// the worktree (`<base>/rpi-worktree-<run>-<index>`); its sibling
+/// `handoffs/<run>.json` is the durable cleanup report.
+fn worktree_resume_block(cwd: &str, run_id: &str) -> Option<String> {
+    let path = Path::new(cwd);
+    let name = path.file_name()?.to_str()?;
+    if !name.starts_with(&format!("rpi-worktree-{run_id}-")) {
+        return None;
+    }
+    let manifest = path
+        .parent()?
+        .join("handoffs")
+        .join(format!("{run_id}.json"));
+    let Ok(raw) = std::fs::read_to_string(&manifest) else {
+        return Some(format!(
+            "Background run {run_id} child working directory '{cwd}' is a managed worktree whose cleanup has not finalized (no handoff manifest); resume is refused."
+        ));
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Some(format!(
+            "Background run {run_id} child working directory '{cwd}' has an unreadable worktree handoff manifest; resume is refused."
+        ));
+    };
+    let task = value["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group["cleanup"]["tasks"].as_array())
+        .flatten()
+        .find(|task| task["path"].as_str() == Some(cwd));
+    match task {
+        Some(task)
+            if task["worktreeRemoved"].as_bool() == Some(true)
+                && task["preserved"].as_bool() != Some(true) =>
+        {
+            None
+        }
+        Some(_) => Some(format!(
+            "Background run {run_id} child working directory '{cwd}' is a managed worktree whose cleanup is preserved or pending; resume is refused."
+        )),
+        None => Some(format!(
+            "Background run {run_id} child working directory '{cwd}' is not recorded as a finalized worktree cleanup; resume is refused."
+        )),
+    }
+}
+
 /// Resume-side validation: load and verify the trusted record for `run_id`.
 /// Returns the selected child's trusted facts or the refusal message.
 pub fn trusted_resume_child(
@@ -551,6 +621,9 @@ pub fn trusted_resume_child(
             "Background run {run_id} child {index} working directory '{}' no longer exists; resume is refused.",
             child.cwd
         ));
+    }
+    if let Some(error) = worktree_resume_block(&child.cwd, run_id) {
+        return Err(error);
     }
     if let Some(launcher) = &child.launcher
         && !valid_launcher_name(&launcher.name)
@@ -660,11 +733,25 @@ mod tests {
 
         let mut same = base.clone();
         same.file_path = dir.join("other-path.md");
-        assert_eq!(
+        assert_ne!(
             agent_definition_digest(&same),
             digest,
-            "source path is not part of the definition"
+            "the definition file path is part of the launch contract"
         );
+
+        let mut content_changed = base.clone();
+        std::fs::write(&path, "---\nname: worker\n---\nother body\n").unwrap();
+        assert_ne!(
+            agent_definition_digest(&content_changed),
+            digest,
+            "file content is part of the digest"
+        );
+        std::fs::write(&path, "---\nname: worker\n---\nbody\n").unwrap();
+        let _ = &mut content_changed;
+
+        let mut changed = base.clone();
+        changed.default_reads = vec!["README.md".into()];
+        assert_ne!(agent_definition_digest(&changed), digest);
 
         let mut changed = base.clone();
         changed.model = Some("provider/other".into());
@@ -800,5 +887,46 @@ mod tests {
         assert_eq!(resolved.0.name, "sandbox");
         assert_eq!(resolved.1, vec!["/usr/bin/sandbox", "--flag"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worktree_cleanup_state_blocks_resume_until_finalized() {
+        let base = std::env::temp_dir().join(unique("rpi-worktree-finalizing"));
+        let run_id = unique("run");
+        let cwd = base.join(format!("rpi-worktree-{run_id}-0"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_text = cwd.to_string_lossy().to_string();
+        // No handoff manifest yet: cleanup is still finalizing.
+        assert!(worktree_resume_block(&cwd_text, &run_id).is_some());
+        let manifest = base.join("handoffs").join(format!("{run_id}.json"));
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        let write = |task: serde_json::Value| {
+            std::fs::write(
+                &manifest,
+                json!({ "groups": [{ "cleanup": { "tasks": [task] } }] }).to_string(),
+            )
+            .unwrap();
+        };
+        write(json!({
+            "path": cwd_text,
+            "worktreeRemoved": false,
+            "preserved": true,
+            "reason": "cleanup pending durable handoff capture",
+        }));
+        assert!(worktree_resume_block(&cwd_text, &run_id).is_some());
+        write(json!({
+            "path": cwd_text,
+            "worktreeRemoved": true,
+            "preserved": false,
+        }));
+        assert!(worktree_resume_block(&cwd_text, &run_id).is_none());
+        write(json!({
+            "path": cwd_text,
+            "worktreeRemoved": false,
+            "preserved": true,
+            "reason": "capture failed",
+        }));
+        assert!(worktree_resume_block(&cwd_text, &run_id).is_some());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

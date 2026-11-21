@@ -67,10 +67,34 @@ pub fn channel_dir(run_id: &str, agent: &str, child_index: usize) -> PathBuf {
 pub fn ensure_channel(dir: &Path) {
     let _ = std::fs::create_dir_all(dir.join("requests"));
     let _ = std::fs::create_dir_all(dir.join("replies"));
+    let _ = std::fs::create_dir_all(dir.join("terminal"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// System-wide monotonic milliseconds (CLOCK_MONOTONIC): comparable across
+/// the child/parent processes on one boot and immune to wall-clock jumps.
+pub fn monotonic_millis() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // Safety: clock_gettime writes the provided timespec.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+            return (ts.tv_sec as u64)
+                .saturating_mul(1000)
+                .saturating_add(ts.tv_nsec as u64 / 1_000_000);
+        }
+        now_millis()
+    }
+    #[cfg(not(unix))]
+    {
+        now_millis()
     }
 }
 
@@ -81,13 +105,22 @@ pub fn write_progress(channel_dir: &Path, run_id: &str, message: &str) {
         "runId": run_id,
         "text": message.trim(),
         "receivedAt": now_millis(),
+        "receivedAtMonotonic": monotonic_millis(),
     });
     let path = channel_dir.join("progress.json");
     let _ = std::fs::write(path, payload.to_string());
 }
 
-/// S36: the latest progress text and its wall-clock receive time.
-pub fn latest_progress(channel_dir: &Path) -> Option<(String, u64)> {
+/// S36: the latest progress text with wall-clock (display) and monotonic
+/// (age) receive times.
+pub struct ProgressSnapshot {
+    pub text: String,
+    #[allow(dead_code)] // wall clock is display-only; age uses monotonic
+    pub received_at: u64,
+    pub received_at_monotonic: u64,
+}
+
+pub fn latest_progress(channel_dir: &Path) -> Option<ProgressSnapshot> {
     let raw = std::fs::read_to_string(channel_dir.join("progress.json")).ok()?;
     let value: Value = serde_json::from_str(&raw).ok()?;
     let text = value
@@ -100,7 +133,17 @@ pub fn latest_progress(channel_dir: &Path) -> Option<(String, u64)> {
         .get("receivedAt")
         .and_then(Value::as_u64)
         .unwrap_or_else(now_millis);
-    Some((text, received_at))
+    // Records written before the monotonic field fall back to the wall
+    // value (best effort; new records always carry the monotonic one).
+    let received_at_monotonic = value
+        .get("receivedAtMonotonic")
+        .and_then(Value::as_u64)
+        .unwrap_or(received_at);
+    Some(ProgressSnapshot {
+        text,
+        received_at,
+        received_at_monotonic,
+    })
 }
 
 /// S36: drop progress files for a finished run.
@@ -129,7 +172,8 @@ pub fn clear_progress_for_run(run_id: &str) {
 
 fn ensure_channel_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir.join("requests"))?;
-    std::fs::create_dir_all(dir.join("replies"))
+    std::fs::create_dir_all(dir.join("replies"))?;
+    std::fs::create_dir_all(dir.join("terminal"))
 }
 
 /// `formatChildMessage` header (L151): reason title + run context lines.
@@ -173,7 +217,14 @@ pub fn read_requests(dir: &Path) -> Vec<Value> {
 /// terminal state or the host shuts down. A dead child cannot consume a
 /// reply, and a stale blocking ask would otherwise keep `subagent_wait` and
 /// headless auto-drain yielding forever (the `eb91202f` shutdown half).
+///
+/// A tombstone is kept in `terminal/<id>.json` so a late reply can be told
+/// why the request is no longer answerable (S18).
 pub fn close_requests_for_run(run_id: &str) -> usize {
+    close_requests_for_run_with_kind(run_id, "closed")
+}
+
+pub fn close_requests_for_run_with_kind(run_id: &str, kind: &str) -> usize {
     let Ok(entries) = std::fs::read_dir(channels_root()) else {
         return 0;
     };
@@ -188,18 +239,62 @@ pub fn close_requests_for_run(run_id: &str) -> usize {
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            let owned = std::fs::read_to_string(&path)
+            let request = std::fs::read_to_string(&path)
                 .ok()
-                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                .and_then(|request| request["runId"].as_str().map(str::to_string))
-                .as_deref()
-                == Some(run_id);
-            if owned && std::fs::remove_file(&path).is_ok() {
-                closed += 1;
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            let Some(request) = request else {
+                continue;
+            };
+            if request["runId"].as_str() != Some(run_id) {
+                continue;
             }
+            let Some(id) = request["id"].as_str() else {
+                continue;
+            };
+            if let Err(error) = crate::paths::ensure_safe_component(id, "supervisor request id") {
+                tracing::warn!(%error, "skipping unsafe supervisor request id");
+                continue;
+            }
+            if std::fs::remove_file(&path).is_err() {
+                continue;
+            }
+            let _ = ensure_channel_dir(&channel.path());
+            let tombstone = json!({
+                "id": id,
+                "runId": run_id,
+                "orchestratorSessionId": request["orchestratorSessionId"],
+                "reason": request["reason"],
+                "childIndex": request["childIndex"],
+                "terminalKind": kind,
+                "closedAt": crate::artifacts::format_iso8601(now_millis()),
+            });
+            let _ = std::fs::write(
+                channel.path().join("terminal").join(format!("{id}.json")),
+                tombstone.to_string(),
+            );
+            closed += 1;
         }
     }
     closed
+}
+
+/// Find the terminal tombstone for `request_id` under `root`.
+fn terminal_request(root: &Path, request_id: &str) -> Option<Value> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return None;
+    };
+    for channel in entries.flatten() {
+        let path = channel
+            .path()
+            .join("terminal")
+            .join(format!("{request_id}.json"));
+        if let Ok(raw) = std::fs::read_to_string(&path)
+            && let Ok(value) = serde_json::from_str::<Value>(&raw)
+        {
+            return Some(value);
+        }
+    }
+    None
 }
 
 /// `requestMatchesContext` (L453): only the orchestrator session sees the
@@ -606,6 +701,7 @@ pub fn parent_supervisor_action(
             // session-filtered pending map, native-supervisor-channel.ts
             // 571-576 + 674).
             if let Ok(channel_entries) = std::fs::read_dir(channels_root) {
+                let mut wrong_session = false;
                 for channel in channel_entries.flatten() {
                     let request_path = channel
                         .path()
@@ -621,6 +717,7 @@ pub fn parent_supervisor_action(
                         continue;
                     };
                     if !request_matches_session(&request, orchestrator_session_id) {
+                        wrong_session = true;
                         continue;
                     }
                     let reply = json!({
@@ -638,6 +735,24 @@ pub fn parent_supervisor_action(
                     }
                     let _ = std::fs::remove_file(&request_path);
                     return ok_result(&format!("Replied to supervisor request {reply_to}."));
+                }
+                // S18: a late reply to a request the run already closed gets
+                // the terminal reason instead of the generic "no match".
+                if let Some(tombstone) = terminal_request(channels_root, reply_to) {
+                    if request_matches_session(&tombstone, orchestrator_session_id) {
+                        let kind = tombstone["terminalKind"].as_str().unwrap_or("closed");
+                        return error_result(&format!(
+                            "Supervisor request '{reply_to}' is already {kind}; it cannot be answered."
+                        ));
+                    }
+                    return error_result(&format!(
+                        "Supervisor request '{reply_to}' belongs to another session."
+                    ));
+                }
+                if wrong_session {
+                    return error_result(&format!(
+                        "Supervisor request '{reply_to}' belongs to another session."
+                    ));
                 }
             }
             error_result(&format!(
@@ -954,6 +1069,45 @@ mod tests {
         assert_eq!(reply["isError"], Value::Bool(false));
         assert!(channel.join("replies").join("req1.json").exists());
         assert!(!channel.join("requests").join("req1.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn late_reply_reports_the_terminal_kind() {
+        let root = channels_root().join(format!("late-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let channel = root.join("runy-worker-0");
+        ensure_channel(&channel);
+        std::fs::write(
+            channel.join("terminal").join("req9.json"),
+            json!({
+                "id": "req9",
+                "runId": "runy",
+                "orchestratorSessionId": "session-a",
+                "terminalKind": "stopped",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let reply =
+            parent_supervisor_action("reply", Some("req9"), Some("too late"), "session-a", &root);
+        assert_eq!(reply["isError"], Value::Bool(true));
+        assert!(
+            reply["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("already stopped"),
+            "{reply}"
+        );
+        let foreign =
+            parent_supervisor_action("reply", Some("req9"), Some("too late"), "session-b", &root);
+        assert!(
+            foreign["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("belongs to another session"),
+            "{foreign}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

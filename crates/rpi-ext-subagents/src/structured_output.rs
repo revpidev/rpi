@@ -161,11 +161,24 @@ pub fn env_secret_values() -> Vec<String> {
 /// Extract and validate the raw `value` from a `structured_output` call.
 /// The validated value is redacted before it is persisted or returned.
 pub fn capture(schema: &Value, args: &Value) -> Result<Value, String> {
+    capture_with_secrets(schema, args, &env_secret_values())
+}
+
+fn capture_with_secrets(schema: &Value, args: &Value, secrets: &[String]) -> Result<Value, String> {
     let Some(value) = args.get("value") else {
         return Err("structured_output requires a `value` field.".to_string());
     };
     validate_value(schema, value)?;
-    Ok(redact_secrets(value, &env_secret_values()))
+    let redacted = redact_secrets(value, secrets);
+    // S27: redaction must not silently produce a value that no longer
+    // satisfies the schema (a numeric secret becomes a string, a key rename
+    // can break required/additionalProperties). Fail safe instead.
+    validate_value(schema, &redacted).map_err(|error| {
+        format!(
+            "structured_output redaction made the value invalid against outputSchema; refusing to persist it. {error}"
+        )
+    })?;
+    Ok(redacted)
 }
 
 /// S27: recursive string/key/number redaction for validated structured
@@ -279,6 +292,49 @@ mod tests {
         let captured = capture(&schema, &json!({"value": {"token": "s3cr3t-value"}})).unwrap();
         unsafe { std::env::remove_var(key) };
         assert_eq!(captured["token"], json!("[redacted]"));
+    }
+
+    #[test]
+    fn redaction_that_breaks_the_schema_fails_safe() {
+        // A numeric secret is replaced by a string; the re-validation must
+        // reject it instead of persisting a value outside outputSchema.
+        let schema = json!({
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"],
+            "additionalProperties": false
+        });
+        let error = capture_with_secrets(
+            &schema,
+            &json!({ "value": { "count": 1234 } }),
+            &["1234".to_string()],
+        )
+        .expect_err("redacted numeric secret must fail re-validation");
+        assert!(
+            error.contains("redaction made the value invalid"),
+            "{error}"
+        );
+
+        // A redacted key that violates additionalProperties fails too.
+        let key_schema = json!({
+            "type": "object",
+            "properties": {
+                "ok": {"type": "boolean"},
+                "tok-abc": {"type": "integer"}
+            },
+            "required": ["ok"],
+            "additionalProperties": false
+        });
+        let error = capture_with_secrets(
+            &key_schema,
+            &json!({ "value": { "ok": true, "tok-abc": 1 } }),
+            &["abc".to_string()],
+        )
+        .expect_err("redacted key must fail re-validation");
+        assert!(
+            error.contains("redaction made the value invalid"),
+            "{error}"
+        );
     }
 
     #[test]

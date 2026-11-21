@@ -1095,6 +1095,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     // this ladder on a clean terminal, so no error is recorded here.
     let drain_run_id = input.run_id.clone();
     let drain_inbox = input.steer_inbox.clone();
+    let acceptance_inbox = input.steer_inbox.clone();
     let drain_task = tokio::spawn(async move {
         let mut steer_hold_since: Option<u64> = None;
         loop {
@@ -1290,6 +1291,16 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                 let (outcome, status_fields, frame, control_events, drained_control) = {
                     let mut state = stdout_state.lock().unwrap_or_else(|e| e.into_inner());
                     let outcome = state.process_line(trimmed, now_ms);
+                    // S40: the acceptance report closes guidance immediately,
+                    // not only when the child finally exits. The marker is
+                    // the parent-visible signal `deliver_steer` checks during
+                    // the finishing window.
+                    if state.acceptance_final
+                        && let Some(inbox) = &acceptance_inbox
+                        && !inbox.join("steer-inbox-closed.json").exists()
+                    {
+                        let _ = std::fs::write(inbox.join("steer-inbox-closed.json"), "{}");
+                    }
                     let control_events = outcome
                         .tool_end
                         .as_ref()

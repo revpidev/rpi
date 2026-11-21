@@ -112,6 +112,16 @@ pub enum CompactionEvent {
 /// stream; tests capture them verbatim for parity comparison.
 pub type CompactionEventSink = Arc<dyn Fn(CompactionEvent) + Send + Sync>;
 
+/// A `session_compact` event whose emit was deferred until the compaction
+/// lock is released (V19-03 S45).
+#[derive(Debug, Clone)]
+pub struct PendingSessionCompact {
+    pub compaction_entry: serde_json::Value,
+    pub from_extension: bool,
+    pub reason: CompactionReason,
+    pub will_retry: bool,
+}
+
 /// The bare error text upstream puts into `errorMessage` (`error.message`),
 /// without the `RpiError` Display prefix.
 fn raw_error_message(error: &RpiError) -> String {
@@ -198,6 +208,12 @@ pub struct CompactionRunner {
     thinking_level: ThinkingLevel,
     emit: CompactionEventSink,
     overflow_recovery_attempted: bool,
+    /// V19-03 S45: `session_compact` is emitted by the session layer after
+    /// the compaction lock is released. Pi emits it while compaction state
+    /// is still set, so extensions must poll `isIdle`; the plugin host has no
+    /// timer seam, so deferring the emit makes the same transition observable
+    /// without polling.
+    pending_session_compact: Option<PendingSessionCompact>,
     /// Manual compaction's token — upstream `_compactionAbortController`
     /// (agent-session.ts:327). The prompt rejection reads only this cell
     /// (agent-session.ts:1133).
@@ -251,6 +267,7 @@ impl CompactionRunner {
             thinking_level,
             emit,
             overflow_recovery_attempted: false,
+            pending_session_compact: None,
             active_token: AbortTokenCell::default(),
             auto_active_token: AbortTokenCell::default(),
             extension_runner: None,
@@ -265,6 +282,13 @@ impl CompactionRunner {
     /// streaming parent run (captured before `abort()`).
     pub fn set_manual_interrupted(&mut self, interrupted: bool) {
         self.manual_interrupted = interrupted;
+    }
+
+    /// Take the deferred `session_compact` payload (if any). The caller must
+    /// drop the compaction lock before emitting it so `ctx.isIdle` observes
+    /// the post-compaction state.
+    pub fn take_pending_session_compact(&mut self) -> Option<PendingSessionCompact> {
+        self.pending_session_compact.take()
     }
 
     /// T15 W2: install the extension runner slot (AgentSession passes its
@@ -660,7 +684,8 @@ impl CompactionRunner {
         let estimated_tokens_after = estimate_messages_tokens(&session_context.messages);
 
         // `session_compact` with the saved entry (found by summary,
-        // agent-session.ts:1876-1891 / :2156-2172).
+        // agent-session.ts:1876-1891 / :2156-2172). The emit itself is
+        // deferred to the session layer (see `pending_session_compact`).
         if let Some(runner) = self.extension_runner()
             && runner.has_handlers("session_compact")
         {
@@ -675,14 +700,12 @@ impl CompactionRunner {
             if let Some(entry) = saved_entry {
                 match serde_json::to_value(&entry) {
                     Ok(value) => {
-                        runner
-                            .emit_session_compact(
-                                value,
-                                from_extension,
-                                reason.as_str(),
-                                will_retry,
-                            )
-                            .await;
+                        self.pending_session_compact = Some(PendingSessionCompact {
+                            compaction_entry: value,
+                            from_extension,
+                            reason,
+                            will_retry,
+                        });
                     }
                     Err(error) => {
                         tracing::warn!("session_compact payload serialize failed: {error}")

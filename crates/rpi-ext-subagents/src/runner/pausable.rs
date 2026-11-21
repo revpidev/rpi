@@ -120,7 +120,7 @@ impl PausableTimeout {
                 state.remaining = state.remaining.saturating_sub(elapsed);
             }
         }
-        self.inner.notify.notify_waiters();
+        self.inner.notify.notify_one();
     }
 
     /// Resume the countdown for `key`; the timer restarts only when no other
@@ -133,7 +133,7 @@ impl PausableTimeout {
             }
             state.running_since = Some(Instant::now());
         }
-        self.inner.notify.notify_waiters();
+        self.inner.notify.notify_one();
     }
 
     /// Active time left (paused time excluded).
@@ -153,7 +153,7 @@ impl PausableTimeout {
             state.running_since = None;
             state.remaining = Duration::ZERO;
         }
-        self.inner.notify.notify_waiters();
+        self.inner.notify.notify_one();
         if let Some(task) = self
             .inner
             .task
@@ -173,7 +173,7 @@ impl Drop for PausableInner {
             state.done = true;
             state.running_since = None;
         }
-        self.notify.notify_waiters();
+        self.notify.notify_one();
         if let Some(task) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
             task.abort();
         }
