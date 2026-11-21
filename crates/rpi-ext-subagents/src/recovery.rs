@@ -540,6 +540,34 @@ fn looks_like_managed_worktree_root(candidate: &Path) -> bool {
         })
 }
 
+/// The sibling handoff manifest for a managed worktree root.
+fn worktree_handoff_manifest(root: &Path, run_id: &str) -> Option<PathBuf> {
+    Some(
+        root.parent()?
+            .join("handoffs")
+            .join(format!("{run_id}.json")),
+    )
+}
+
+/// Whether the handoff manifest records this exact worktree path (the
+/// cleanup task list is the durable evidence that the directory is ours).
+fn manifest_records_root(manifest: &Path, root: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(manifest) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let root_text = root.to_string_lossy();
+    value["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group["cleanup"]["tasks"].as_array())
+        .flatten()
+        .any(|task| task["path"].as_str() == Some(root_text.as_ref()))
+}
+
 /// S01: a managed worktree whose cleanup has not finalized cannot be a
 /// resume target (upstream `parallel-handoff.ts:200`). The recorded cwd names
 /// the worktree (`<base>/rpi-worktree-<run>-<index>`); its sibling
@@ -548,20 +576,24 @@ fn worktree_resume_block(cwd: &str, run_id: &str) -> Option<String> {
     let path = Path::new(cwd);
     let prefix = format!("rpi-worktree-{run_id}-");
     // The recorded cwd may be a worktree subdirectory; walk up to the
-    // managed worktree root before looking for its handoff manifest. The
-    // `.git` marker is a second confirmation: a same-named ancestor that is
-    // not a linked worktree is not ours.
+    // managed worktree root before looking for its handoff manifest. A
+    // same-named ancestor is only ours when it carries the `git worktree
+    // add` marker or the run's handoff manifest names it.
     let root = path.ancestors().find(|candidate| {
-        candidate
+        let name_matches = candidate
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(&prefix))
-            && looks_like_managed_worktree_root(candidate)
+            .is_some_and(|name| name.starts_with(&prefix));
+        if !name_matches {
+            return false;
+        }
+        if looks_like_managed_worktree_root(candidate) {
+            return true;
+        }
+        worktree_handoff_manifest(candidate, run_id)
+            .is_some_and(|manifest| manifest_records_root(&manifest, candidate))
     })?;
-    let manifest = root
-        .parent()?
-        .join("handoffs")
-        .join(format!("{run_id}.json"));
+    let manifest = worktree_handoff_manifest(root, run_id)?;
     let Ok(raw) = std::fs::read_to_string(&manifest) else {
         return Some(format!(
             "Background run {run_id} child working directory '{cwd}' is a managed worktree whose cleanup has not finalized (no handoff manifest); resume is refused."
@@ -986,6 +1018,46 @@ mod tests {
         assert!(
             worktree_resume_block(&nested.to_string_lossy(), &run_id).is_none(),
             "a same-named ancestor without the worktree marker is not ours"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The run's handoff manifest is the alternative confirmation when the
+    /// `.git` marker is already gone: a recorded task path still blocks
+    /// resume, while an unrecorded sibling does not.
+    #[test]
+    fn manifest_alone_confirms_a_managed_worktree() {
+        let base = std::env::temp_dir().join(unique("rpi-worktree-manifest-only"));
+        let run_id = unique("run");
+        let cwd = base.join(format!("rpi-worktree-{run_id}-0"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let manifest = base.join("handoffs").join(format!("{run_id}.json"));
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest,
+            json!({
+                "groups": [{
+                    "cleanup": {
+                        "tasks": [{
+                            "path": cwd.to_string_lossy(),
+                            "worktreeRemoved": false,
+                            "preserved": true,
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            worktree_resume_block(&cwd.to_string_lossy(), &run_id).is_some(),
+            "the manifest records this worktree, so resume is refused"
+        );
+        let sibling = base.join(format!("rpi-worktree-{run_id}-1"));
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(
+            worktree_resume_block(&sibling.to_string_lossy(), &run_id).is_none(),
+            "a sibling not named by the manifest is not ours"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
