@@ -1428,6 +1428,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// S18: if the child claimed `timeout` after the parent read the request
+    /// (the request file is still present for this narrow window), the
+    /// parent's reply must be discarded and the timeout kind preserved.
+    #[test]
+    fn a_reply_that_loses_the_timeout_race_is_discarded() {
+        let root = channels_root().join(format!("reply-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let channel = root.join("runv-worker-0");
+        ensure_channel(&channel);
+        let request = json!({
+            "type": "subagent.supervisor.request",
+            "id": "req-reply-race",
+            "createdAt": "2026-08-14T00:00:00.000Z",
+            "reason": "need_decision",
+            "message": "Ship?",
+            "orchestratorSessionId": "session-a",
+            "runId": "runv",
+        });
+        let request_path = channel.join("requests").join("req-reply-race.json");
+        std::fs::write(&request_path, request.to_string()).unwrap();
+        // The child claimed timeout, but has not removed the request yet.
+        assert!(matches!(
+            claim_terminal(&channel, &request, "timeout"),
+            TerminalClaim::Claimed
+        ));
+        let reply = parent_supervisor_action(
+            "reply",
+            Some("req-reply-race"),
+            Some("too late"),
+            "session-a",
+            &root,
+        );
+        assert!(
+            reply["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("already timeout"),
+            "{reply}"
+        );
+        assert!(
+            !channel.join("replies").join("req-reply-race.json").exists(),
+            "the losing reply must be removed"
+        );
+        let tombstone: Value = serde_json::from_str(
+            &std::fs::read_to_string(channel.join("terminal").join("req-reply-race.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tombstone["terminalKind"], json!("timeout"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// S18: closing a run cleans up a request but never rewrites an existing
     /// `answered` tombstone.
     #[test]
