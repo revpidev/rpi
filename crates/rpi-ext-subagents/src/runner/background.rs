@@ -1913,13 +1913,19 @@ impl AsyncNotify {
             handoff_path,
         });
         if let Some(calls) = &self.calls {
-            // S24 leave/take: only deliver into the run's owner session. A
-            // mismatch keeps the result file for `resend_pending_results`
-            // when that owner becomes active again.
+            // S24 leave/take: only deliver into the run's owner session. The
+            // host-call channel belongs to the session that launched the run;
+            // after a take the status owner changes but the channel does not,
+            // so the owner must match BOTH the channel and the active session.
+            // A mismatch keeps the result file for `resend_pending_results`
+            // when the owner becomes active again.
             let owner = status["sessionId"].as_str();
+            let channel_session = self.session_id.as_deref();
             let current = current_session_id();
-            let owned = match (owner, current.as_deref()) {
-                (Some(owner), Some(current)) => owner == current,
+            let owned = match (owner, channel_session, current.as_deref()) {
+                (Some(owner), Some(channel), Some(current)) => owner == channel && owner == current,
+                (Some(owner), Some(channel), None) => owner == channel,
+                (Some(owner), None, Some(current)) => owner == current,
                 _ => true,
             };
             if !owned {
@@ -1930,6 +1936,7 @@ impl AsyncNotify {
                         "runId": run_id,
                         "reason": "owner-session-mismatch",
                         "owner": owner,
+                        "channel": channel_session,
                         "current": current,
                     }),
                 );
@@ -4560,6 +4567,80 @@ pub(crate) mod tests {
         assert!(
             FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst) > before,
             "owner session receives the completion"
+        );
+        assert!(!result_path.exists());
+        bind_current_session(None);
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    /// S24 take: the run's status owner is the new session, but the host-call
+    /// channel still belongs to the launch session. The completion must be
+    /// deferred (result kept) so the new owner's `resend_pending_results`
+    /// delivers it, not sent through the old channel.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn completion_take_is_deferred_to_the_new_owner() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("notify-take-{}", std::process::id());
+        let run_dir = async_runs_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let status = json!({
+            "runId": run_id,
+            "sessionId": "session-new",
+            "mode": "single",
+            "state": STATE_COMPLETE,
+            "steps": [{ "agent": "scout", "status": "complete" }],
+        });
+        crate::artifacts::write_metadata(&run_dir.join("status.json"), &status).unwrap();
+        let handle = Arc::new(AsyncRunHandle {
+            run_id: run_id.clone(),
+            status: Arc::new(RwLock::new(status)),
+            control: Arc::new(AsyncControl::default()),
+            run_dir: run_dir.clone(),
+            started_ms: 0,
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
+        });
+        let calls = crate::AsyncHostCalls {
+            call: fake_notify_host_call,
+            cookie: 0,
+        };
+        // Launched by session-old, then taken over by session-new.
+        let notify = AsyncNotify {
+            calls: Some(calls),
+            session_id: Some("session-old".to_string()),
+        };
+        let result_path = async_results_dir().join(format!("{run_id}.json"));
+        let _ = std::fs::remove_file(&result_path);
+
+        FAKE_SEND_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        let before = FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        bind_current_session(Some("session-new"));
+        notify.send(&handle, STATE_COMPLETE, "done", None).await;
+        assert_eq!(
+            FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "a taken run must not send through the launch session's host channel"
+        );
+        assert!(
+            result_path.exists(),
+            "result stays pending for the new owner"
+        );
+        let events = std::fs::read_to_string(run_dir.join("events.jsonl")).unwrap_or_default();
+        assert!(events.contains("run.completion_deferred"), "{events}");
+
+        // The new owner's session_start resends the pending result.
+        let calls = crate::AsyncHostCalls {
+            call: fake_notify_host_call,
+            cookie: 0,
+        };
+        resend_pending_results(&calls, Some("session-new"));
+        assert!(
+            FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "new owner receives the pending completion"
         );
         assert!(!result_path.exists());
         bind_current_session(None);
