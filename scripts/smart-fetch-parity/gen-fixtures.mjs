@@ -1,5 +1,5 @@
-// TE06 parity fixture generator: drives the PINNED upstream
-// (agent-smart-fetch v0.3.17 / b0111612) through golden inputs and records
+// TE06 parity fixture generator: drives the selected upstream track
+// (agent-smart-fetch v0.3.23 / feb6da00 target, v0.3.17 / b0111612 regression) through golden inputs and records
 // input/output pairs for byte-level comparison against the Rust port
 // (rpi-ext-smart-fetch).
 //

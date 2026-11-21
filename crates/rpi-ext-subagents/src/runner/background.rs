@@ -4297,6 +4297,30 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn drained_failure_routes_to_stopped() {
+        let run_id = format!("drain-failed-{}", std::process::id());
+        let body = AsyncBody::Single {
+            spec: Box::new(crate::p1::launch_child::ChildSpec::default()),
+        };
+        let handle = start_run(&run_id, Some("s"), &body);
+        handle.control.request_drain();
+        let notify = AsyncNotify {
+            calls: None,
+            session_id: Some("s".to_string()),
+        };
+        finish_failed(&handle, "launch failed", &notify).await;
+        let status = status_snapshot(&handle);
+        assert_eq!(status["state"], json!(STATE_STOPPED));
+        assert_eq!(status["stoppedReason"], json!("drain-request"));
+        ASYNC_RUNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id);
+        let _ = std::fs::remove_dir_all(async_runs_dir().join(&run_id));
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+    }
+
+    #[tokio::test]
     async fn drained_finish_marks_queued_steps_stopped() {
         let run_id = format!("drain-finish-{}", std::process::id());
         let body = AsyncBody::Single {
