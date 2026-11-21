@@ -4,7 +4,7 @@
 
 ### v0.1.9 draft — implementation in progress
 
-This section covers the V19-01 implementation work including its M06-OUT handoff, the V19-02 B/C/D implementation and completed M06-CHECK, and the V19-03 extension rebase remediation. V19-01's final review passed on 2026-11-19; V19-02's D-111 follow-up remediation passed a fresh-context review on 2026-11-21; V19-03's comprehensive review returned BLOCK and the remediation is awaiting a fresh-context re-review; the V19-08 release gate is still pending.
+This section covers the V19-01 implementation work including its M06-OUT handoff, the V19-02 B/C/D implementation and completed M06-CHECK, and the V19-03 extension rebase remediation. V19-01's final review passed on 2026-11-19; V19-02's D-111 follow-up remediation passed a fresh-context review on 2026-11-21; V19-03's comprehensive review returned BLOCK and the remediation, including the P3 closeout, is awaiting a fresh-context re-review; the V19-08 release gate is still pending.
 
 ### Main line
 
