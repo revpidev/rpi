@@ -410,6 +410,10 @@ pub struct SessionBeforeCompactEvent {
     pub custom_instructions: Option<String>,
     pub reason: CompactionReason,
     pub will_retry: bool,
+    /// Additive (V19-03 S45): the manual compaction interrupted a streaming
+    /// parent run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
 }
 
 /// `SessionBeforeCompactResult` (types.ts:1106-1109). `compaction` is the

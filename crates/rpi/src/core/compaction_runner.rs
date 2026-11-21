@@ -224,6 +224,9 @@ pub struct CompactionRunner {
     /// agent-session.ts:549-568): resolves the model + thinking level of a
     /// summary request; a virtual selection routes with reason `direct`.
     summarization_model_resolver: Option<SummarizationModelResolver>,
+    /// Additive (V19-03 S45): `AgentSession::compact` captured whether a
+    /// parent run was streaming before it aborted it.
+    manual_interrupted: bool,
 }
 
 impl CompactionRunner {
@@ -254,7 +257,14 @@ impl CompactionRunner {
             omit_recovery: None,
             mark_failed_response: None,
             summarization_model_resolver: None,
+            manual_interrupted: false,
         }
+    }
+
+    /// V19-03 S45: record whether the manual compaction interrupted a
+    /// streaming parent run (captured before `abort()`).
+    pub fn set_manual_interrupted(&mut self, interrupted: bool) {
+        self.manual_interrupted = interrupted;
     }
 
     /// T15 W2: install the extension runner slot (AgentSession passes its
@@ -490,6 +500,7 @@ impl CompactionRunner {
             }
             Ok(_) => false,
         };
+        self.manual_interrupted = false;
         let (result, error_message) = match &outcome {
             Ok(result) => (Some(Box::new(result.clone())), None),
             Err(error) if aborted => (None, None),
@@ -532,6 +543,7 @@ impl CompactionRunner {
         custom_instructions: Option<&str>,
         reason: CompactionReason,
         will_retry: bool,
+        interrupted: bool,
     ) -> Result<Option<CompactionResult>, RpiError> {
         let Some(runner) = self.extension_runner() else {
             return Ok(None);
@@ -547,6 +559,7 @@ impl CompactionRunner {
             custom_instructions: custom_instructions.map(str::to_owned),
             reason: reason.as_str().to_owned(),
             will_retry,
+            interrupted,
         };
         let Some(result) = runner.emit_session_before_compact(&event).await else {
             return Ok(None);
@@ -585,6 +598,7 @@ impl CompactionRunner {
                 custom_instructions,
                 CompactionReason::Manual,
                 false,
+                self.manual_interrupted,
             )
             .await?;
         *from_extension = extension_compaction.is_some();
@@ -988,6 +1002,7 @@ impl CompactionRunner {
                     None,
                     reason,
                     will_retry,
+                    false,
                 )
                 .await
             {

@@ -1377,7 +1377,7 @@ pub async fn drive_run(
                     match failed {
                         Some(failure) => {
                             let error = failure.error.as_deref().unwrap_or("chain step failed");
-                            if handle.control.stop_requested() {
+                            if handle.control.stop_requested() || handle.control.drain_requested() {
                                 finish(&handle, STATE_STOPPED, error, &notify).await
                             } else {
                                 finish_failed(&handle, error, &notify).await

@@ -137,9 +137,22 @@ pub fn env_secret_values() -> Vec<String> {
     std::env::vars()
         .filter(|(key, value)| {
             value.len() >= 4
-                && ["TOKEN", "SECRET", "PASSWORD", "API_KEY", "APIKEY"]
-                    .iter()
-                    .any(|marker| key.to_ascii_uppercase().contains(marker))
+                && [
+                    "TOKEN",
+                    "SECRET",
+                    "PASSWORD",
+                    "PASS",
+                    "AUTH",
+                    "CREDENTIAL",
+                    "COOKIE",
+                    "SESSION",
+                    "PRIVATE",
+                    "ACCESS_KEY",
+                    "API_KEY",
+                    "APIKEY",
+                ]
+                .iter()
+                .any(|marker| key.to_ascii_uppercase().contains(marker))
         })
         .map(|(_, value)| value)
         .collect()
@@ -155,14 +168,17 @@ pub fn capture(schema: &Value, args: &Value) -> Result<Value, String> {
     Ok(redact_secrets(value, &env_secret_values()))
 }
 
-/// Whether a captured value is a validated structured output (used by S39's
-/// length rule: a validated answer still succeeds).
+/// S27: recursive string/key/number redaction for validated structured
+/// output. Ordinary values (for example `KDE_FULL_SESSION=true`) survive.
 pub fn redact_secrets(value: &Value, secrets: &[String]) -> Value {
-    let filtered: Vec<&str> = secrets
+    let mut filtered: Vec<&str> = secrets
         .iter()
         .map(String::as_str)
         .filter(|secret| !secret.is_empty())
         .collect();
+    // Longest first: replacing a short overlapping secret first would leak
+    // the suffix of a longer one.
+    filtered.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     let redact_text = |text: &str| -> String {
         let mut out = text.to_string();
         for secret in &filtered {
@@ -231,6 +247,16 @@ mod tests {
             validate_schema_shape(&schema).expect_err("depth"),
             INVALID_SCHEMA_ERROR
         );
+    }
+
+    #[test]
+    fn overlapping_secrets_are_replaced_longest_first() {
+        let redacted = redact_secrets(
+            &json!({"token": "abcdef", "authorization": "Bearer abc"}),
+            &["abc".to_string(), "abcdef".to_string()],
+        );
+        assert_eq!(redacted["token"], json!("[redacted]"));
+        assert_eq!(redacted["authorization"], json!("Bearer [redacted]"));
     }
 
     #[test]

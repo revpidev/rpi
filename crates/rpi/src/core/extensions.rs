@@ -220,6 +220,10 @@ pub struct SessionBeforeCompactEvent {
     /// `"manual" | "threshold" | "overflow"`.
     pub reason: String,
     pub will_retry: bool,
+    /// Additive (V19-03 S45): the manual compaction aborted a streaming
+    /// parent run. `agent_end` may already have cleared the extension's own
+    /// active flag, so the host records this at `compact()` entry.
+    pub interrupted: bool,
 }
 
 /// `ToolCallEventResult` (extensions/types.ts:1065-1069) plus the threaded

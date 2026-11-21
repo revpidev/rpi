@@ -69,8 +69,8 @@ them consistently; see `fixtures/subagents-v066/discovery/materialize.json`).
 ## Target-track upstream source (out-of-repo; zero writes to external/)
 
 `setup-target-source.sh` uses `git -C external/pi-subagents archive <pin>` to extract BOTH snapshots —
-the v0.83.0 target into `/tmp/rpi-subagents-parity-target-v0830` and the v0.76.1
-regression source into `/tmp/rpi-subagents-parity-regression-v0761` (each overridable via
+the v0.88.1 target into `/tmp/rpi-subagents-parity-target-v0881` and the v0.83.0
+regression source into `/tmp/rpi-subagents-parity-regression-v0830` (each overridable via
 `RPI_SUBAGENTS_TARGET_SRC` / `RPI_SUBAGENTS_REGRESSION_SRC`; `--skip-regression` skips the latter) —
 no checkout,
 no `git worktree add`, no submodule HEAD changes — so
@@ -108,8 +108,8 @@ thinking-suffix retry / miss fail-closed (#1093) and the origin-aware candidate 
 
 ## Attribution rules (target track)
 
-Every target-track difference must hit `expected-target-diffs-v0830.json` (the v0.1.8 target manifest; the regression
-track uses the v0.1.7 `expected-target-diffs-v0761.json`), or the report lands in `### unattributed` with a non-zero exit code:
+Every target-track difference must hit `expected-target-diffs-v0881.json` (the v0.1.9 target manifest; the regression
+track uses `expected-target-diffs-v0830.json`), or the report lands in `### unattributed` with a non-zero exit code:
 
 - `upstream-semantics`: new-tag behavior rpi hasn't adopted yet (attached R entry + owning task);
 - `rpi-deviation`: deviations where rpi's existing implementation disagrees with both pins;
@@ -138,8 +138,8 @@ track uses the v0.1.7 `expected-target-diffs-v0761.json`), or the report lands i
 | `expected-target-diffs-v0761.json` | The v0.1.7 target-track manifest, reused as TE51's regression-track manifest: it carries the two `upstream-semantics` frontmatter cases (#2995/#3017) the v0.83.0 implementation intentionally changes |
 | `expected-target-diffs-v074.json` | The v0.1.6 target-track attribution manifest (TE45 seed; closed empty; historical) |
 | `expected-target-diffs-v070.json` | The v0.1.5 target-track attribution manifest (TE37 seed; closed empty by TE38/TE39; historical) |
-| `upstream-runner.mjs` | Runs upstream modules directly via tsx from the track root (v0.83.0 snapshot = target; v0.76.1 snapshot = regression); args via the golden file on both tracks; fallback/model anchored at the target's `model-resolution.ts` (TE39 followed the #2270 removal; TE45 re-anchored the `scoped` token + provider-prefixed id work; TE48 recorded the v0.76.1 virtual-model verification branch; TE51 drives the #2913 reply-text split and records the closest-registry-model candidates as an undriven face) |
-| `setup-target-source.sh` | Extracts the v0.83.0 target and v0.76.1 regression snapshots out-of-repo + installs their prod dependencies (zero writes to external/) |
+| `upstream-runner.mjs` | Runs upstream modules directly via tsx from the track root (v0.88.1 snapshot = target; v0.83.0 snapshot = regression); args via the golden file on both tracks; fallback/model anchored at the target's `model-resolution.ts` (TE39 followed the #2270 removal; TE45 re-anchored the `scoped` token + provider-prefixed id work; TE48 recorded the v0.76.1 virtual-model verification branch; TE51 drives the #2913 reply-text split and records the closest-registry-model candidates as an undriven face) |
+| `setup-target-source.sh` | Extracts the v0.88.1 target and v0.83.0 regression snapshots out-of-repo + installs their prod dependencies (zero writes to external/) |
 | `examples/subagents_parity_runner.rs` | Drives this crate with the same fixtures (parity facade, `lib.rs::parity`); built by the orchestrator and executed from a private copy |
 | `run-parity.mjs` | Orchestration + normalized diff + attribution + report writing; fixture materialization and the Rust binary copy land in out-of-repo temp directories |
 

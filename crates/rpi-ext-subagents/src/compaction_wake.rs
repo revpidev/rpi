@@ -89,15 +89,15 @@ pub fn on_agent_end(calls: &AsyncHostCalls) -> bool {
     flush_if_ready(calls)
 }
 
-pub fn on_before_compact(reason: &str) {
+pub fn on_before_compact(reason: &str, interrupted: bool) {
     let mut state = lock();
     if reason != "manual" {
         return;
     }
     state.manual_compaction = true;
-    state.interrupted_parent = state.parent_active;
-    // A manual compaction aborts the active parent run before the hook; the
-    // parent is no longer "active" for the wake gate.
+    // The host captured `is_streaming()` before `compact()` aborted the run;
+    // `agent_end` has already cleared the extension-side flag by now.
+    state.interrupted_parent = interrupted || state.parent_active;
     state.parent_active = false;
 }
 
@@ -236,7 +236,7 @@ mod tests {
     fn idle_manual_compaction_does_not_wake_the_parent() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset(true);
-        on_before_compact("manual");
+        on_before_compact("manual", false);
         assert!(!on_compact_end(&calls(), "manual", true));
         STATE.with(|state| assert!(state.borrow().1.is_empty()));
     }
@@ -251,7 +251,7 @@ mod tests {
         };
         let _handle = crate::runner::background::start_run(&run_id, Some("s"), &body);
         on_agent_start();
-        on_before_compact("manual");
+        on_before_compact("manual", true);
         assert!(on_compact_end(&calls(), "manual", true));
         STATE.with(|state| {
             let messages = &state.borrow().1;
@@ -270,7 +270,7 @@ mod tests {
     fn deferred_notice_wakes_after_the_compaction() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset(true);
-        on_before_compact("manual");
+        on_before_compact("manual", false);
         assert!(defer_wake(Some("s")));
         assert!(on_compact_end(&calls(), "manual", false));
         STATE.with(|state| assert_eq!(state.borrow().1.len(), 1));

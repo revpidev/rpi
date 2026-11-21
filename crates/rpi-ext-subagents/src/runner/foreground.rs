@@ -330,9 +330,14 @@ fn signal_pid(pid: u32, signal: Signal) {
             Signal::Term => libc::SIGTERM,
             Signal::Kill => libc::SIGKILL,
         };
-        // Safety: kill(2) with a checked pid.
+        // Safety: kill(2) with a checked pid. The child is its own process
+        // group leader (`process_group(0)`), so signal the whole group first
+        // to terminate a launcher wrapper's children too; fall back to the
+        // direct pid if the group is already gone.
         unsafe {
-            libc::kill(pid as i32, signum);
+            if libc::kill(-(pid as i32), signum) != 0 {
+                libc::kill(pid as i32, signum);
+            }
         }
     }
     #[cfg(not(unix))]

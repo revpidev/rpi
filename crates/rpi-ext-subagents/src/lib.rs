@@ -823,6 +823,29 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                         "subagent_wait registration denied for nested coordinator"
                     );
                 }
+                if child_wait_config.wait_tool_enabled()
+                    && child_wait_config.wait_tool_name() != "subagent_wait"
+                    && let Err(error) = register(
+                        "registerTool",
+                        json!({
+                            "name": "subagent_wait",
+                            "label": "Subagent wait",
+                            "description": "Compatibility alias for the configured wait tool (default bg_wait).",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "all": { "type": "boolean" },
+                                    "nonBlocking": { "type": "boolean" },
+                                    "timeoutMs": { "type": "integer" },
+                                    "stopOnAttention": { "type": "boolean" }
+                                }
+                            },
+                        }),
+                    )
+                {
+                    tracing::warn!(error = %error.to_string(), "subagent_wait alias registration denied for nested coordinator");
+                }
             }
             // Steer inbox consumer (FR-P1-04, subagent-prompt-runtime.ts
             // registerSteeringInbox L333): when the parent launched this
@@ -1005,6 +1028,31 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             {
                 return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
+            // Compatibility alias: the v0.1.8 default name stays callable even
+            // though the v0.1.9 default is `bg_wait`.
+            if config.wait_tool_enabled()
+                && config.wait_tool_name() != "subagent_wait"
+                && let Err(error) = register(
+                    "registerTool",
+                    json!({
+                        "name": "subagent_wait",
+                        "label": "Subagent wait",
+                        "description": "Compatibility alias for the configured wait tool (default bg_wait).",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "all": { "type": "boolean" },
+                                "nonBlocking": { "type": "boolean" },
+                                "timeoutMs": { "type": "integer" },
+                                "stopOnAttention": { "type": "boolean" }
+                            }
+                        },
+                    }),
+                )
+            {
+                tracing::warn!(error = %error.to_string(), "subagent_wait alias registration denied");
+            }
             // Startup: stale async-run reconciliation (ADR-0019 crash branch)
             // + artifact cleanup (index.ts:371-372).
             // Orchestration skill ships to the user skill dir (FR-P1-07;
@@ -1148,7 +1196,9 @@ fn dispatch_message(message: &Value) -> Value {
                     "details": { "mode": "single", "results": [] },
                 });
             }
-            if tool_name == crate::config::load_config().wait_tool_name() {
+            if tool_name == crate::config::load_config().wait_tool_name()
+                || tool_name == "subagent_wait"
+            {
                 let tool_call_id = message
                     .get("toolCallId")
                     .and_then(Value::as_str)
@@ -1431,7 +1481,12 @@ fn dispatch_message(message: &Value) -> Value {
                         .and_then(|payload| payload.get("reason"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    compaction_wake::on_before_compact(reason);
+                    let interrupted = message
+                        .get("payload")
+                        .and_then(|payload| payload.get("interrupted"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    compaction_wake::on_before_compact(reason, interrupted);
                     Value::Null
                 }
                 (PluginMode::Parent, "session_compact") => {
@@ -1578,7 +1633,7 @@ async fn async_move_drain(session_id: Option<&str>) {
     // a run; unset/invalid keeps the 30-minute default (auto-drain.ts:9).
     let timeout_ms = config::load_config()
         .resolve_default_timeout_ms()
-        .unwrap_or(30 * 60 * 1000);
+        .unwrap_or(crate::runner::foreground::DEFAULT_FOREGROUND_TIMEOUT_MS);
     if let Err(message) = runner::background::drain_outstanding_work(timeout_ms, session_id).await {
         tracing::error!(%message, "auto-drain failed");
     }
@@ -1657,7 +1712,7 @@ fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Opti
         // the built-in 30 minutes.
         .or_else(|| config.wait_tool_default_timeout_ms())
         .or_else(|| config.resolve_default_timeout_ms())
-        .unwrap_or(30 * 60 * 1000);
+        .unwrap_or(crate::runner::foreground::DEFAULT_FOREGROUND_TIMEOUT_MS);
     // Supervisor asks always stop the wait (#1315). Since TE51,
     // `stopOnAttention` also gates the long-running guard's
     // `needs_attention` state; `false` keeps waiting through guard attention.

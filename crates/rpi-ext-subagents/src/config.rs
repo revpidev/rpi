@@ -91,13 +91,13 @@ pub struct ExtensionConfig {
     /// `intercomBridge` (FR-P1-10): `{ mode?: "always"|"fork-only"|"off",
     /// instructionFile?, resultDelivery? }` (intercom-bridge.ts:82-89).
     pub intercom_bridge: Option<Value>,
-    /// `waitTool.defaultTimeoutMs` (#1591): default `subagent_wait` window
+    /// `waitTool.defaultTimeoutMs` (#1591): default `bg_wait` window
     /// when the call omits `timeoutMs` (positive integer; env
     /// `RPI_SUBAGENT_WAIT_TOOL_DEFAULT_TIMEOUT_MS` overrides). None = the
     /// built-in 30-minute default.
     pub wait_tool_default_timeout_ms: Option<u64>,
     /// `waitTool.name` (#3167): tool name override, validated at load. The
-    /// rpi default is `subagent_wait` (upstream's `bg_wait` counterpart);
+    /// default is `bg_wait` (the v0.1.8 `subagent_wait` name stays an alias);
     /// `None` keeps the default.
     pub wait_tool_name: Option<String>,
     /// `defaultInheritGlobalContext` (#3206): inherit the global AGENTS.md
@@ -272,12 +272,12 @@ impl ExtensionConfig {
         self.wait_tool_default_timeout_ms
     }
 
-    /// `waitTool.name` (#3167): configured override or the rpi default
-    /// `subagent_wait` (upstream `bg_wait` counterpart, TE-D46 naming).
+    /// `waitTool.name` (#3167): configured override or the upstream default
+    /// `bg_wait`. `subagent_wait` remains a registered compatibility alias.
     pub fn wait_tool_name(&self) -> String {
         self.wait_tool_name
             .clone()
-            .unwrap_or_else(|| "subagent_wait".to_string())
+            .unwrap_or_else(|| "bg_wait".to_string())
     }
 
     /// `defaultInheritGlobalContext` (#3206): default false.
@@ -2513,7 +2513,7 @@ mod wait_tool_name_tests {
 
     #[test]
     fn wait_tool_name_defaults_and_validates() {
-        assert_eq!(parse("{}").unwrap().wait_tool_name(), "subagent_wait");
+        assert_eq!(parse("{}").unwrap().wait_tool_name(), "bg_wait");
         assert_eq!(
             parse(r#"{"waitTool":{"name":"my_wait"}}"#)
                 .unwrap()

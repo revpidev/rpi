@@ -199,3 +199,73 @@ pub fn reset_for_test() {
     let mut state = lock();
     state.pending = None;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    thread_local! {
+        static SESSION: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    extern "C" fn host(
+        _cookie: rpi_ext_host::native::PluginCookie,
+        request: abi_stable::std_types::RVec<u8>,
+    ) -> abi_stable::std_types::RVec<u8> {
+        let request: Value = serde_json::from_slice(&request[..]).unwrap_or(Value::Null);
+        let method = request["call"].as_str().unwrap_or("");
+        let reply = match method {
+            "ctx.sessionFile" => SESSION.with(|session| {
+                session
+                    .borrow()
+                    .as_ref()
+                    .map(|id| json!({ "ok": { "id": id } }))
+                    .unwrap_or_else(|| json!({ "ok": null }))
+            }),
+            "ctx.hasUI" => json!({ "ok": false }),
+            _ => json!({ "error": { "message": "unknown" } }),
+        };
+        abi_stable::std_types::RVec::from(serde_json::to_vec(&reply).unwrap_or_default())
+    }
+
+    fn calls() -> AsyncHostCalls {
+        AsyncHostCalls {
+            call: host,
+            cookie: 0,
+        }
+    }
+
+    fn set_session(id: Option<&str>) {
+        SESSION.with(|session| *session.borrow_mut() = id.map(str::to_string));
+    }
+
+    #[test]
+    fn take_moves_the_trusted_owner_generation() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let run_id = format!("switch-{}", crate::runner::budget::random_run_id());
+        let body = crate::runner::background::AsyncBody::Single {
+            spec: Box::new(crate::p1::launch_child::ChildSpec::default()),
+        };
+        let handle = crate::runner::background::start_run(&run_id, Some("old"), &body);
+        set_session(Some("old"));
+        assert_eq!(outstanding_for("old").active_runs, 1);
+        assert!(before_switch(&calls(), "new").is_null());
+        set_session(Some("new"));
+        session_start(&calls(), "new");
+        assert_eq!(
+            handle.status.read().unwrap_or_else(|e| e.into_inner())["sessionId"],
+            json!("new")
+        );
+        crate::runner::background::ASYNC_RUNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id);
+        let _ = std::fs::remove_dir_all(crate::runner::background::async_runs_dir().join(&run_id));
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+        reset_for_test();
+    }
+}

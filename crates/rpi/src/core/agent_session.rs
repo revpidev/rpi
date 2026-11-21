@@ -5772,10 +5772,14 @@ impl AgentSession {
         &self,
         custom_instructions: Option<&str>,
     ) -> Result<CompactionResult, RpiError> {
+        // S45: capture before abort() emits agent_end and clears the
+        // extension's active-parent bit.
+        let interrupted = self.is_streaming();
         self.abort().await;
         self.sync_compaction_model().await;
         let result = {
             let mut runner = self.inner.compaction.lock().await;
+            runner.set_manual_interrupted(interrupted);
             runner.compact(custom_instructions).await
         };
         // `_clearManualCompactionState` (agent-session.ts:1926-1929

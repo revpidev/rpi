@@ -312,6 +312,7 @@ impl ExtensionRunner for ExtensionHostAdapter {
             "customInstructions": event.custom_instructions,
             "reason": event.reason,
             "willRetry": event.will_retry,
+            "interrupted": event.interrupted,
         });
         let result = self
             .host
