@@ -1334,15 +1334,15 @@ fn handle_management_action_inner(
             // V19-03 S11: the trusted record is the lifecycle authority;
             // run-dir status is diagnostics. An interrupt whose status write
             // failed leaves status `running` while the record is `paused` —
-            // resume must follow the record, not the stale diagnostic.
-            let trusted_state = crate::recovery::read_record(&id)
-                .ok()
-                .flatten()
-                .map(|record| record.state)
-                .unwrap_or_else(|| status["state"].as_str().unwrap_or("").to_string());
-            if matches!(trusted_state.as_str(), "running" | "queued") {
+            // resume must follow the record, not the stale diagnostic. A
+            // legacy run without a record skips this gate and is refused by
+            // `trusted_resume_child` with the relaunch hint.
+            if let Some(record) = crate::recovery::read_record(&id).ok().flatten()
+                && matches!(record.state.as_str(), "running" | "queued")
+            {
                 return ToolOutcome::error(format!(
-                    "Background run {id} is still {trusted_state}; resume applies to interrupted or stopped runs."
+                    "Background run {id} is still {}; resume applies to interrupted or stopped runs.",
+                    record.state
                 ));
             }
             let steps = status["steps"].as_array().cloned().unwrap_or_default();
