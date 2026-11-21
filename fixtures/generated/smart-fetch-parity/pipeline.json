@@ -3095,6 +3095,283 @@
     }
   },
   {
+    "name": "empty-extraction-alternate-first",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/shell"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><link rel=\"alternate\" type=\"text/markdown\" href=\"/shell.md\"></head><body><article><p>nav shell text that should not win because the declared alternate is the better source here and the fallback article body is deliberately long enough to clear the thin content threshold so the old order keeps this paragraph instead of following the alternate link that the page declares for readers without javascript rendering support at all</p></article></body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/markdown"
+          },
+          "body": "# Full Alternate\n\nThis alternate response carries a comfortable amount of words for the fallback threshold."
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/shell",
+        "finalUrl": "https://ex.com/shell",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 56,
+        "content": "nav shell text that should not win because the declared alternate is the better source here and the fallback article body is deliberately long enough to clear the thin content threshold so the old order keeps this paragraph instead of following the alternate link that the page declares for readers without javascript rendering support at all",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "empty-extraction-alternate-empty",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/shell-empty"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><link rel=\"alternate\" type=\"text/markdown\" href=\"/empty.md\"></head><body>nav shell text</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><body></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "No content extracted from https://ex.com/empty.md. May need JS rendering or is blocked.",
+        "code": "no_content",
+        "phase": "processing",
+        "retryable": false,
+        "timeoutMs": 15000,
+        "url": "https://ex.com/empty.md",
+        "finalUrl": "https://ex.com/empty.md",
+        "mimeType": "text/html"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        }
+      ]
+    }
+  },
+  {
+    "name": "empty-extraction-no-alternate-dom",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/shell-no-alt"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><body>dom fallback text stays</body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/shell-no-alt",
+        "finalUrl": "https://ex.com/shell-no-alt",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 4,
+        "content": "dom fallback text stays",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
     "name": "alternate-thin-content-unqualified-type-kept",
     "input": {
       "opts": {

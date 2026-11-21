@@ -1191,12 +1191,13 @@ impl FetchPipeline {
 
         let (mut extracted_content, mut word_count) =
             if extracted.content.as_deref().unwrap_or("").is_empty() || extracted.word_count == 0 {
+                // F02 (extract.ts:1617-1621 @ feb6da00): a matching declared
+                // alternate is a better source than raw DOM text, which on
+                // JS-rendered shells is mostly navigation/account templates.
+                if let Some(alternate_result) = try_alternate().await {
+                    return alternate_result;
+                }
                 if fallback_text.is_empty() {
-                    // extract.ts:1619-1621: alternate fallback before the
-                    // no_content terminal.
-                    if let Some(alternate_result) = try_alternate().await {
-                        return alternate_result;
-                    }
                     return FetchOutcome::Error(FetchError {
                         error: format!(
                             "No content extracted from {}. May need JS rendering or is blocked.",
@@ -1354,6 +1355,130 @@ mod tests {
             extract_client_side_redirect("<html></html>", "https://example.com/"),
             None
         );
+    }
+
+    /// F02 (extract.ts:1617-1621 @ feb6da00): when Defuddle returns no
+    /// content, a matching declared alternate is followed before the raw DOM
+    /// text fallback, which on JS-rendered shells is mostly navigation.
+    struct EmptyExtractor;
+    impl crate::extract::Extractor for EmptyExtractor {
+        fn extract(
+            &self,
+            _html: &str,
+            _url: &str,
+            _options: &crate::extract::ExtractOptions,
+        ) -> crate::types::ExtractedContent {
+            crate::types::ExtractedContent {
+                content: Some(String::new()),
+                word_count: 0,
+                ..Default::default()
+            }
+        }
+    }
+
+    fn scripted_transport(
+        pages: &'static [(&'static str, &'static str, &'static str)],
+    ) -> TransportFn {
+        std::sync::Arc::new(move |request: crate::http::HttpRequest| {
+            let page = pages
+                .iter()
+                .find(|(url, _, _)| *url == request.url)
+                .map(|(_, content_type, body)| (*content_type, *body));
+            futures_boxed::boxed(async move {
+                let (content_type, body) = page.unwrap_or(("text/html", ""));
+                let mut headers = std::collections::HashMap::new();
+                headers.insert("content-type".to_string(), content_type.to_string());
+                Ok(crate::http::HttpResponse {
+                    final_url: request.url.clone(),
+                    status: 200,
+                    status_text: "OK".to_string(),
+                    headers,
+                    body: crate::http::ResponseBody::Full(body.as_bytes().to_vec()),
+                })
+            })
+        })
+    }
+
+    fn pipeline_with(
+        pages: &'static [(&'static str, &'static str, &'static str)],
+    ) -> FetchPipeline {
+        FetchPipeline {
+            extractor: Box::new(EmptyExtractor),
+            transport: scripted_transport(pages),
+            hooks: FetchExecutionHooks::default(),
+        }
+    }
+
+    fn markdown_opts(url: &str) -> crate::types::FetchOptions {
+        crate::types::FetchOptions {
+            url: url.to_string(),
+            browser: None,
+            os: None,
+            headers: None,
+            format: Some(OutputFormat::Markdown),
+            max_chars: Some(50_000),
+            remove_images: Some(false),
+            include_replies: Some(IncludeReplies::None),
+            proxy: None,
+            timeout_ms: Some(15_000),
+            temp_dir: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_extraction_follows_alternate_before_dom_fallback() {
+        let pipeline = pipeline_with(&[
+            (
+                "https://example.com/post",
+                "text/html",
+                "<html><head><link rel=\"alternate\" type=\"text/markdown\" href=\"/md\"></head><body>nav shell text that should not win</body></html>",
+            ),
+            ("https://example.com/md", "text/markdown", "alternate body"),
+        ]);
+        let outcome = pipeline
+            .fetch(&markdown_opts("https://example.com/post"))
+            .await;
+        let crate::types::FetchOutcome::Result(result) = outcome else {
+            panic!("expected alternate result");
+        };
+        assert_eq!(result.final_url, "https://example.com/md");
+        assert!(result.content.contains("alternate body"));
+        assert!(!result.content.contains("nav shell"));
+    }
+
+    #[tokio::test]
+    async fn empty_extraction_without_alternate_uses_dom_fallback() {
+        let pipeline = pipeline_with(&[(
+            "https://example.com/post",
+            "text/html",
+            "<html><body>dom fallback text</body></html>",
+        )]);
+        let outcome = pipeline
+            .fetch(&markdown_opts("https://example.com/post"))
+            .await;
+        let crate::types::FetchOutcome::Result(result) = outcome else {
+            panic!("expected DOM fallback result");
+        };
+        assert!(result.content.contains("dom fallback text"));
+    }
+
+    #[tokio::test]
+    async fn empty_alternate_result_safely_ends_in_no_content() {
+        let pipeline = pipeline_with(&[
+            (
+                "https://example.com/post",
+                "text/html",
+                "<html><head><link rel=\"alternate\" type=\"text/markdown\" href=\"/md\"></head><body>shell</body></html>",
+            ),
+            ("https://example.com/md", "text/html", ""),
+        ]);
+        let outcome = pipeline
+            .fetch(&markdown_opts("https://example.com/post"))
+            .await;
+        let crate::types::FetchOutcome::Error(error) = outcome else {
+            panic!("expected no_content");
+        };
+        assert_eq!(error.code, Some(crate::types::FetchErrorCode::NoContent));
     }
 
     #[test]

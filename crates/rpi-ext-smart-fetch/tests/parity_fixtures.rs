@@ -33,8 +33,19 @@ const FIXTURES: &str = concat!(
     "/../../fixtures/generated/smart-fetch-parity"
 );
 
+/// V19-03 target track: fixtures generated from agent-smart-fetch v0.3.23
+/// (feb6da00) by `RPI_SF_TRACK=target scripts/smart-fetch-parity/run.sh gen`.
+const FIXTURES_TARGET_V0323: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/generated/smart-fetch-parity-v0323"
+);
+
 fn load(name: &str) -> Value {
-    let path = format!("{FIXTURES}/{name}");
+    load_in(FIXTURES, name)
+}
+
+fn load_in(dir: &str, name: &str) -> Value {
+    let path = format!("{dir}/{name}");
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {path}: {error} — run gen-fixtures.mjs first"));
     serde_json::from_str(&raw).expect("fixture JSON parses")
@@ -532,9 +543,13 @@ fn options_from_json(value: &Value) -> FetchOptions {
     }
 }
 
-#[tokio::test]
-async fn parity_pipeline_scenarios() {
-    let scenarios = load("pipeline.json");
+async fn replay_pipeline(fixtures_dir: &str) {
+    let scenarios = load_in(fixtures_dir, "pipeline.json");
+    // F02 is an intentional behavior change (v0.3.23 follows a matching
+    // declared alternate before the DOM text fallback). The regression track
+    // records the retired order as scope evidence, so its result assertion is
+    // not applicable; the target track asserts it.
+    let f02_regression_scope = fixtures_dir == FIXTURES;
     let scenarios = scenarios.as_array().cloned().unwrap_or_default();
     assert!(!scenarios.is_empty(), "pipeline fixtures missing");
 
@@ -553,6 +568,9 @@ async fn parity_pipeline_scenarios() {
     let mut failures = Vec::new();
     for scenario in &scenarios {
         let name = str_field(scenario, "name");
+        if f02_regression_scope && name == "empty-extraction-alternate-first" {
+            continue;
+        }
         let input = scenario.get("input").expect("input");
         let opts = options_from_json(input.get("opts").expect("opts"));
         let scripted_extraction = ScriptedExtractor(extracted_from_json(
@@ -779,6 +797,16 @@ async fn parity_pipeline_scenarios() {
     // last run's bytes behind only invites cross-run confusion (V14-22
     // tracking-item hygiene closure).
     let _ = std::fs::remove_dir_all(std::path::Path::new(PARITY_DOWNLOAD_TEMP_DIR));
+}
+
+#[tokio::test]
+async fn parity_pipeline_scenarios() {
+    // V19-03 dual track, sequential because both share the fixed download
+    // sandbox. The F02 alternate-order cases differ between tracks by design:
+    // the regression track keeps the v0.3.17 DOM-first order as scope
+    // evidence, the target track is the v0.3.23 oracle.
+    replay_pipeline(FIXTURES).await;
+    replay_pipeline(FIXTURES_TARGET_V0323).await;
 }
 
 /// TE08 FR-P2-C: replay the batch-progress fixtures (concurrency 1 on both

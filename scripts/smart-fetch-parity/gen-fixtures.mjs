@@ -27,8 +27,9 @@ const tool = await import(join(STAGING, "core-src/tool.ts"));
 const settings = await import(join(STAGING, "upstream-src/settings.ts"));
 const extract = await import(join(STAGING, "core-src/extract.ts"));
 
-const OUT_DIR = new URL("../../fixtures/generated/smart-fetch-parity/", import.meta.url)
-  .pathname;
+const OUT_DIR =
+  process.env.RPI_SF_OUT_DIR ??
+  new URL("../../fixtures/generated/smart-fetch-parity/", import.meta.url).pathname;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -646,6 +647,49 @@ const pipelineScenarios = [
       { status: 200, headers: { "content-type": "text/markdown" }, body: "# Full Alternate\n\nThis alternate response carries a comfortable amount of words for the thin-content fallback threshold." },
     ],
     defuddleResult: { content: "too thin", wordCount: 2 },
+  },
+  {
+    // F02 (v0.3.23): Defuddle returns no content; the matching declared
+    // alternate is followed before the raw DOM text fallback.
+    name: "empty-extraction-alternate-first",
+    opts: { url: "https://ex.com/shell" },
+    fetchScript: [
+      {
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: `<html><head><link rel="alternate" type="text/markdown" href="/shell.md"></head><body><article><p>nav shell text that should not win because the declared alternate is the better source here and the fallback article body is deliberately long enough to clear the thin content threshold so the old order keeps this paragraph instead of following the alternate link that the page declares for readers without javascript rendering support at all</p></article></body></html>`,
+      },
+      { status: 200, headers: { "content-type": "text/markdown" }, body: "# Full Alternate\n\nThis alternate response carries a comfortable amount of words for the fallback threshold." },
+    ],
+    defuddleResult: { content: undefined, wordCount: 0 },
+  },
+  {
+    // F02: an alternate that yields no content ends in no_content (the DOM
+    // fallback of the alternate page is empty too).
+    name: "empty-extraction-alternate-empty",
+    opts: { url: "https://ex.com/shell-empty" },
+    fetchScript: [
+      {
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: `<html><head><link rel="alternate" type="text/markdown" href="/empty.md"></head><body>nav shell text</body></html>`,
+      },
+      { status: 200, headers: { "content-type": "text/html" }, body: "<html><body></body></html>" },
+    ],
+    defuddleResult: { content: undefined, wordCount: 0 },
+  },
+  {
+    // F02: without a qualified alternate the existing DOM fallback is kept.
+    name: "empty-extraction-no-alternate-dom",
+    opts: { url: "https://ex.com/shell-no-alt" },
+    fetchScript: [
+      {
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: `<html><body>dom fallback text stays</body></html>`,
+      },
+    ],
+    defuddleResult: { content: undefined, wordCount: 0 },
   },
   {
     name: "alternate-thin-content-unqualified-type-kept",

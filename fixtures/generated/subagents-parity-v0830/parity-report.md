@@ -1,4 +1,4 @@
-# subagents parity report (target track: pi-subagents v0.83.0 @ 3a63e0ad snapshot, ADR-0038)
+# subagents parity report (regression track: pi-subagents v0.83.0 @ 3a63e0ad snapshot, ADR-0048)
 
 
 ## args

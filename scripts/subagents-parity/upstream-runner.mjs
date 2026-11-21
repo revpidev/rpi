@@ -1,9 +1,10 @@
 // Upstream leg of the subagents parity harness (TE04 G3; dual-track TE13;
 // re-rotated by TE37 for v0.1.5, by TE45 for v0.1.6 (ADR-0034), by TE48 for
-// v0.1.7 (ADR-0036) and by TE51 for v0.1.8 (ADR-0038)).
+// v0.1.7 (ADR-0036), by TE51 for v0.1.8 (ADR-0038) and by V19-03 for v0.1.9
+// (ADR-0048)).
 //
-// Track `target` (default since the TE45 rotation): the v0.83.0 snapshot =
-// the v0.1.8 target pin once TE51 switches it (see setup-target-source.sh).
+// Track `target` (default since the TE45 rotation): the v0.88.1 snapshot =
+// the v0.1.9 target pin once V19-03 switches it (see setup-target-source.sh).
 //
 // Mode roots (verified against both pins):
 //   - frontmatter / final-output / discovery / notify: the track root
@@ -32,13 +33,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TRACK = process.env.RPI_SUBAGENTS_PARITY_TRACK ?? "regression";
-// regression = the retired v0.76.1 snapshot (7d072b91d);
-// target = the v0.83.0 snapshot (3a63e0ad, the ADR-0038 target pin).
+// regression = the retired v0.83.0 snapshot (3a63e0ad);
+// target = the v0.88.1 snapshot (83cf25f8, the ADR-0048 target pin).
 // Both are extracted by setup-target-source.sh.
 const REGRESSION_ROOT =
-	process.env.RPI_SUBAGENTS_REGRESSION_SRC ?? "/tmp/rpi-subagents-parity-regression-v0761";
+	process.env.RPI_SUBAGENTS_REGRESSION_SRC ?? "/tmp/rpi-subagents-parity-regression-v0830";
 const TARGET_ROOT =
-	process.env.RPI_SUBAGENTS_TARGET_SRC ?? "/tmp/rpi-subagents-parity-target-v0830";
+	process.env.RPI_SUBAGENTS_TARGET_SRC ?? "/tmp/rpi-subagents-parity-target-v0881";
 const ARGS_GOLDEN = resolve(HERE, "args-golden-v048.json");
 
 // Normalize an argv array the same way the Rust runner does.

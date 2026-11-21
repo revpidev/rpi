@@ -14,9 +14,10 @@ points with the same fixture set, then diffs the normalized outputs item by item
 Track names rotate each rebase cycle (TE13 convention): the v0.1.5 window named the then-current
 pin `regression` (default) and the new pin `target`; **TE45 kept the default on `target` and moved
 the tracks one release window forward** (2026-10, pin v0.70.0 -> v0.74.0 with M0.75), and **TE48
-moved them again** (2026-10-16, pin v0.74.0 -> v0.76.1 with V17-00), and **TE51** moved them for
+moved them again** (2026-10-16, pin v0.74.0 -> v0.76.1 with V17-00), **TE51** moved them for
 the v0.1.8 window (2026-11-01, pin v0.76.1 -> v0.83.0 under ADR-0038; the gitlink was switched
-atomically by TE51). The retired v0.48
+atomically by TE51), and **V19-03** moved them for the v0.1.9 window (2026-11-21, pin
+v0.83.0 -> v0.88.1 under ADR-0048; the gitlink switches atomically with V19-03). The retired v0.48
 archaeology face (live `pi-args.ts`) was removed with the TE37 rotation — the args leg is the
 frozen v0.48 golden on both tracks. The two fixture files (`fixtures.json`, `fixtures-target.json`)
 are shared and concatenated on both tracks. Both upstream legs read **snapshots** extracted by
@@ -32,11 +33,11 @@ mkdir -p /tmp/rpi-subagents-parity-deps && cd /tmp/rpi-subagents-parity-deps \
 
 cd <repo-root>
 
-# Default track (v0.83.0 snapshot = the v0.1.8 target pin, ADR-0038)
-bash scripts/subagents-parity/setup-target-source.sh   # extracts BOTH snapshots (target v0.83.0 + regression v0.76.1) + prod deps
+# Default track (v0.88.1 snapshot = the v0.1.9 target pin, ADR-0048)
+bash scripts/subagents-parity/setup-target-source.sh   # extracts BOTH snapshots (target v0.88.1 + regression v0.83.0) + prod deps
 node scripts/subagents-parity/run-parity.mjs
 
-# The retired v0.76.1 snapshot track (archaeology)
+# The retired v0.83.0 snapshot track (zero-regression baseline)
 node scripts/subagents-parity/run-parity.mjs --track=regression
 
 # Re-record the argv/env frozen baseline ([RPI-OWN], ADR-0025 §4; v0.48-era worktree + RPI_SUBAGENTS_PARITY_ARGS_LEGACY=1 required)

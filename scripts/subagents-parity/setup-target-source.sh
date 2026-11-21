@@ -2,17 +2,18 @@
 # Extract the parity-harness source snapshots out-of-repo (TE13, design
 # §3.6 / ADR-0025 §9; re-rotated by TE37 under ADR-0029 for v0.1.5, by
 # TE45 for the v0.1.6 window under ADR-0034, by TE48 for the v0.1.7 window
-# under ADR-0036, and by TE51 for the v0.1.8 window under ADR-0038).
+# under ADR-0036, by TE51 for the v0.1.8 window under ADR-0038, and by V19-03
+# for the v0.1.9 window under ADR-0048).
 #
 # Two snapshots (both read-only against external/: `git archive` reads the
 # object database only — no checkout, no `git worktree add` — so
 # `git -C external/pi-subagents status --porcelain` stays empty and the
 # submodule HEAD is untouched):
 #
-#   1. TARGET snapshot — the v0.1.8 target pin v0.83.0 @ 3a63e0ad (ADR-0038;
-#      the gitlink only switches once TE51 lands, which rotates the harness).
-#   2. REGRESSION snapshot — the retired v0.76.1 pin snapshot (7d072b91d;
-#      the v0.1.7 zero-regression baseline). The live worktree cannot serve
+#   1. TARGET snapshot — the v0.1.9 target pin v0.88.1 @ 83cf25f8 (ADR-0048;
+#      the gitlink only switches once V19-03 lands, which rotates the harness).
+#   2. REGRESSION snapshot — the retired v0.83.0 pin snapshot (3a63e0ad;
+#      the v0.1.8 zero-regression baseline). The live worktree cannot serve
 #      as the upstream leg directly because the discovery chain (agents.ts)
 #      imports the `yaml` package, which is unresolvable from a pristine
 #      external/ (no node_modules may be written there) — hence the snapshot
@@ -29,19 +30,19 @@
 #   bash scripts/subagents-parity/setup-target-source.sh [--skip-regression]
 #
 # Environment:
-#   RPI_SUBAGENTS_TARGET_SRC     target snapshot dir (default /tmp/rpi-subagents-parity-target-v0830)
-#   RPI_SUBAGENTS_TARGET_PIN     target commit (default 3a63e0ad..., v0.83.0)
-#   RPI_SUBAGENTS_REGRESSION_SRC  regression snapshot dir (default /tmp/rpi-subagents-parity-regression-v0761)
-#   RPI_SUBAGENTS_REGRESSION_PIN  regression commit (default 7d072b91d..., v0.76.1)
+#   RPI_SUBAGENTS_TARGET_SRC     target snapshot dir (default /tmp/rpi-subagents-parity-target-v0881)
+#   RPI_SUBAGENTS_TARGET_PIN     target commit (default 83cf25f8..., v0.88.1)
+#   RPI_SUBAGENTS_REGRESSION_SRC  regression snapshot dir (default /tmp/rpi-subagents-parity-regression-v0830)
+#   RPI_SUBAGENTS_REGRESSION_PIN  regression commit (default 3a63e0ad..., v0.83.0)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 SUBMODULE="$REPO/external/pi-subagents"
-TARGET_PIN="${RPI_SUBAGENTS_TARGET_PIN:-3a63e0ad8898cf116ce671feabb0f8a7b31731a4}"
-TARGET_DEST="${RPI_SUBAGENTS_TARGET_SRC:-/tmp/rpi-subagents-parity-target-v0830}"
-REGRESSION_PIN_DEFAULT="7d072b91dca7e1aa915282f0159cec0175d65efa"
-REGRESSION_DEST="${RPI_SUBAGENTS_REGRESSION_SRC:-/tmp/rpi-subagents-parity-regression-v0761}"
+TARGET_PIN="${RPI_SUBAGENTS_TARGET_PIN:-83cf25f86b6a70ab917a7e198d0153bc32309f29}"
+TARGET_DEST="${RPI_SUBAGENTS_TARGET_SRC:-/tmp/rpi-subagents-parity-target-v0881}"
+REGRESSION_PIN_DEFAULT="3a63e0ad8898cf116ce671feabb0f8a7b31731a4"
+REGRESSION_DEST="${RPI_SUBAGENTS_REGRESSION_SRC:-/tmp/rpi-subagents-parity-regression-v0830}"
 
 extract_snapshot() {
   local pin="$1" dest="$2" label="$3"

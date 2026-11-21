@@ -448,3 +448,326 @@ impl From<OutputFormatSerde> for OutputFormat {
         }
     }
 }
+
+/// Marker appended by `truncate_content` when content exceeds maxChars
+/// (upstream index.ts:159 `TRUNCATION_MARKER`).
+pub const TRUNCATION_MARKER: &str = "\n\n[... truncated]";
+
+/// `WebFetchContentSummary` / `WebFetchFileSummary` (index.ts:105-134 @
+/// feb6da00): compact, persistable summary of a successful `web_fetch`
+/// result. The extracted page text travels in the tool `content` payload, so
+/// `details` keeps only metadata and never duplicates the body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WebFetchResultSummary {
+    Content {
+        url: String,
+        final_url: String,
+        ok: bool,
+        char_count: u64,
+        word_count: u64,
+        truncated: bool,
+        title: String,
+        published: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_type: Option<String>,
+    },
+    File {
+        url: String,
+        final_url: String,
+        ok: bool,
+        file_path: String,
+        file_size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
+}
+
+/// `wasTruncatedAtMaxChars` (index.ts:163-165): the trailing marker is the
+/// only evidence a legacy result carries. `chars().count()` keeps the
+/// registered UTF-16-code-unit → Rust-char [VARIANT].
+pub fn was_truncated_at_max_chars(content: &str, max_chars: u64) -> bool {
+    content.chars().count() as u64 > max_chars && content.ends_with(TRUNCATION_MARKER)
+}
+
+impl WebFetchResultSummary {
+    /// `buildFetchResultSummary` (index.ts:167-205).
+    pub fn from_result(result: &FetchResult, max_chars: u64) -> Self {
+        if result.is_file() {
+            return WebFetchResultSummary::File {
+                url: result.url.clone(),
+                final_url: result.final_url.clone(),
+                ok: true,
+                file_path: result.file_path.clone().unwrap_or_default(),
+                file_size: result.file_size.unwrap_or(0),
+                mime_type: result.mime_type.clone().filter(|mime| !mime.is_empty()),
+            };
+        }
+        WebFetchResultSummary::Content {
+            url: result.url.clone(),
+            final_url: result.final_url.clone(),
+            ok: true,
+            char_count: result.content.chars().count() as u64,
+            word_count: result.word_count,
+            truncated: was_truncated_at_max_chars(&result.content, max_chars),
+            title: result.title.clone(),
+            published: result.published.clone(),
+            content_type: result.content_type.clone().filter(|mime| !mime.is_empty()),
+        }
+    }
+
+    /// Legacy read path (`resolveWebFetchSummary`, index.ts:207-238): a
+    /// session persisted before the compact summary stored the full result;
+    /// derive the summary in memory and never write the body back. The
+    /// legacy `details.maxChars` may be the settings default rather than the
+    /// call's limit, so the trailing marker is also consulted (best-effort;
+    /// page text that literally ends with the marker is reported truncated,
+    /// matching upstream).
+    pub fn from_legacy_result(result: &FetchResult, max_chars: u64) -> Self {
+        let mut summary = Self::from_result(result, max_chars);
+        if let WebFetchResultSummary::Content {
+            truncated,
+            char_count,
+            ..
+        } = &mut summary
+        {
+            *truncated |= result.content.ends_with(TRUNCATION_MARKER);
+            // Keep the field order/typing obvious for the JSON golden: the
+            // char count is recomputed from the same body.
+            *char_count = result.content.chars().count() as u64;
+        }
+        summary
+    }
+
+    pub fn url(&self) -> &str {
+        match self {
+            WebFetchResultSummary::Content { url, .. } => url,
+            WebFetchResultSummary::File { url, .. } => url,
+        }
+    }
+
+    pub fn final_url(&self) -> &str {
+        match self {
+            WebFetchResultSummary::Content { final_url, .. } => final_url,
+            WebFetchResultSummary::File { final_url, .. } => final_url,
+        }
+    }
+}
+
+/// `BatchFetchItemSummary` (index.ts:136-151): per-item metadata only; the
+/// item's extracted body is not persisted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchFetchItemSummary {
+    pub index: u64,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_url: Option<String>,
+    pub ok: bool,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub char_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub word_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+/// `BatchFetchResultSummary` (index.ts:153-160).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchFetchResultSummary {
+    pub total: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub batch_concurrency: u64,
+    pub duration_ms: u64,
+    pub items: Vec<BatchFetchItemSummary>,
+}
+
+/// `resolveWebFetchSummary` (index.ts:207-238): prefer the compact summary;
+/// otherwise derive one from a legacy `fetchResult`. Malformed payloads
+/// degrade to `None` instead of failing the render.
+pub fn resolve_web_fetch_summary(
+    details: &serde_json::Value,
+    default_max_chars: u64,
+) -> Option<WebFetchResultSummary> {
+    if let Some(summary) = details.get("fetchSummary")
+        && let Ok(summary) = serde_json::from_value::<WebFetchResultSummary>(summary.clone())
+    {
+        return Some(summary);
+    }
+    let legacy = details.get("fetchResult")?;
+    let result = serde_json::from_value::<FetchResult>(legacy.clone()).ok()?;
+    let max_chars = details
+        .get("maxChars")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(default_max_chars);
+    Some(WebFetchResultSummary::from_legacy_result(
+        &result, max_chars,
+    ))
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn content_result() -> FetchResult {
+        let mut result = FetchResult::content(
+            "https://ex.com/a",
+            "https://ex.com/final",
+            12,
+            "hello world body",
+            "chrome_145",
+            "windows",
+        );
+        result.title = "T".to_string();
+        result.published = "2026-01-01".to_string();
+        result.content_type = Some("text/html".to_string());
+        result
+    }
+
+    fn keys(value: &Value) -> Vec<String> {
+        let mut keys: Vec<String> = value.as_object().expect("object").keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn content_summary_golden_camel_case_keys() {
+        let summary = WebFetchResultSummary::from_result(&content_result(), 50_000);
+        let value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            keys(&value),
+            vec![
+                "charCount",
+                "contentType",
+                "finalUrl",
+                "kind",
+                "ok",
+                "published",
+                "title",
+                "truncated",
+                "url",
+                "wordCount",
+            ]
+        );
+        assert_eq!(value["kind"], json!("content"));
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["charCount"], json!(16));
+        assert_eq!(value["truncated"], json!(false));
+        let text = value.to_string();
+        for snake in [
+            "final_url",
+            "char_count",
+            "word_count",
+            "content_type",
+            "file_path",
+            "file_size",
+            "mime_type",
+        ] {
+            assert!(!text.contains(snake), "snake_case leaked: {snake}");
+        }
+    }
+
+    #[test]
+    fn file_summary_golden_camel_case_keys() {
+        let mut result = FetchResult::content(
+            "https://ex.com/report",
+            "https://ex.com/report.pdf",
+            0,
+            "",
+            "chrome_145",
+            "windows",
+        );
+        result.kind = "file".to_string();
+        result.file_path = Some("/tmp/report.pdf".to_string());
+        result.file_size = Some(123);
+        result.mime_type = Some("application/pdf".to_string());
+        let summary = WebFetchResultSummary::from_result(&result, 50_000);
+        let value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            keys(&value),
+            vec![
+                "filePath", "fileSize", "finalUrl", "kind", "mimeType", "ok", "url"
+            ]
+        );
+        assert_eq!(value["kind"], json!("file"));
+        assert_eq!(value["fileSize"], json!(123));
+    }
+
+    #[test]
+    fn optional_fields_are_omitted_when_absent() {
+        let summary = WebFetchResultSummary::from_result(&content_result(), 50_000);
+        let mut value = serde_json::to_value(&summary).unwrap();
+        value.as_object_mut().unwrap().remove("contentType");
+        let value: WebFetchResultSummary = serde_json::from_value(value).unwrap();
+        let rendered = serde_json::to_value(&value).unwrap();
+        assert!(rendered.get("contentType").is_none());
+    }
+
+    #[test]
+    fn truncation_requires_length_and_marker() {
+        let long = format!("{}{}", "a".repeat(11), TRUNCATION_MARKER);
+        assert!(was_truncated_at_max_chars(&long, 10));
+        assert!(!was_truncated_at_max_chars(&long, 100));
+        assert!(!was_truncated_at_max_chars("short body", 10));
+    }
+
+    #[test]
+    fn resolve_prefers_summary_then_legacy() {
+        let result = content_result();
+        let summary = WebFetchResultSummary::from_result(&result, 50_000);
+        let details = json!({
+            "fetchSummary": serde_json::to_value(&summary).unwrap(),
+            "fetchResult": serde_json::to_value(&result).unwrap(),
+        });
+        let resolved = resolve_web_fetch_summary(&details, 50_000).unwrap();
+        assert!(matches!(resolved, WebFetchResultSummary::Content { .. }));
+
+        let legacy_only = json!({
+            "maxChars": 50_000,
+            "fetchResult": serde_json::to_value(&result).unwrap(),
+        });
+        assert!(resolve_web_fetch_summary(&legacy_only, 50_000).is_some());
+        assert!(resolve_web_fetch_summary(&json!({}), 50_000).is_none());
+        assert!(
+            resolve_web_fetch_summary(&json!({ "fetchResult": { "kind": "content" } }), 50_000)
+                .is_none(),
+            "malformed legacy result degrades"
+        );
+    }
+
+    #[test]
+    fn legacy_marker_marks_truncated_even_with_default_max_chars() {
+        let mut result = content_result();
+        result.content = format!("{}{}", "a".repeat(20), TRUNCATION_MARKER);
+        let details = json!({
+            // Legacy sessions persisted the settings default, not the call's
+            // limit: the marker still reports truncation (index.ts:228-236).
+            "maxChars": 1000,
+            "fetchResult": serde_json::to_value(&result).unwrap(),
+        });
+        let Some(WebFetchResultSummary::Content { truncated, .. }) =
+            resolve_web_fetch_summary(&details, 1000)
+        else {
+            panic!("content summary");
+        };
+        assert!(truncated);
+    }
+}

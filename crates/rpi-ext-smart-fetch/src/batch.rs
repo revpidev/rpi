@@ -705,10 +705,16 @@ pub fn fetch_options_json(opts: &FetchOptions) -> serde_json::Value {
     Value::Object(map)
 }
 
-/// The details payload `execute` returns (index.ts:749-765): `batchProgress`
-/// is the final snapshot (`completed === total`), `batchResult` the full
-/// result — both structures ported shape-for-shape for the P2 TUI renderer.
-pub fn batch_details_json(result: &BatchFetchResult, verbose: bool) -> serde_json::Value {
+/// The details payload `execute` returns (index.ts:923-936 @ feb6da00):
+/// `batchProgress` is the final snapshot (`completed === total`) and
+/// `batchSummary` the compact metadata record. The full `batchResult` is no
+/// longer written — item bodies already travel in the agent `content`.
+pub fn batch_details_json(
+    result: &BatchFetchResult,
+    verbose: bool,
+    defaults_max_chars: u64,
+    duration_ms: u64,
+) -> serde_json::Value {
     let progress_items: Vec<serde_json::Value> = result
         .items
         .iter()
@@ -743,47 +749,81 @@ pub fn batch_details_json(result: &BatchFetchResult, verbose: bool) -> serde_jso
         "batchConcurrency": result.batch_concurrency,
     });
 
-    let result_items: Vec<serde_json::Value> = result
+    let summary_items: Vec<crate::types::BatchFetchItemSummary> = result
         .items
         .iter()
         .map(|item| {
-            let mut map = serde_json::Map::new();
-            map.insert("index".to_string(), json!(item.index));
-            insert_some(
-                &mut map,
-                "request",
-                item.request.as_ref().map(fetch_options_json),
-            );
-            map.insert("status".to_string(), json!(item.status));
-            map.insert("progress".to_string(), json!(PROGRESS_DONE));
-            insert_some(
-                &mut map,
-                "error",
-                item.error.clone().map(|error| json!(error)),
-            );
-            insert_some(
-                &mut map,
-                "result",
-                item.result
+            let item_max_chars = item
+                .request
+                .as_ref()
+                .and_then(|request| request.max_chars)
+                .unwrap_or(defaults_max_chars);
+            let mut summary = crate::types::BatchFetchItemSummary {
+                index: item.index as u64,
+                url: item
+                    .request
                     .as_ref()
-                    .map(|fetch| serde_json::to_value(fetch).unwrap_or(serde_json::Value::Null)),
-            );
-            serde_json::Value::Object(map)
+                    .map(|opts| opts.url.clone())
+                    .unwrap_or_else(|| item.request_url.clone()),
+                final_url: None,
+                ok: item.status == "done",
+                status: item.status.to_string(),
+                error: None,
+                char_count: None,
+                word_count: None,
+                truncated: None,
+                kind: None,
+                file_path: None,
+                file_size: None,
+                mime_type: None,
+            };
+            if item.status == "error" {
+                summary.error = Some(
+                    item.error
+                        .clone()
+                        .unwrap_or_else(|| "Unknown error".to_string()),
+                );
+                return summary;
+            }
+            let Some(result) = item.result.as_ref() else {
+                // A completed item always carries its result; guard only
+                // defends a rehydrated or malformed payload (index.ts:264-269).
+                summary.ok = false;
+                summary.error = Some("No result was recorded for this item.".to_string());
+                return summary;
+            };
+            summary.final_url = Some(result.final_url.clone());
+            if result.is_file() {
+                summary.kind = Some("file".to_string());
+                summary.file_path = Some(result.file_path.clone().unwrap_or_default());
+                summary.file_size = Some(result.file_size.unwrap_or(0));
+                summary.mime_type = result.mime_type.clone().filter(|mime| !mime.is_empty());
+            } else {
+                summary.kind = Some("content".to_string());
+                summary.char_count = Some(result.content.chars().count() as u64);
+                summary.word_count = Some(result.word_count);
+                summary.truncated = Some(crate::types::was_truncated_at_max_chars(
+                    &result.content,
+                    item_max_chars,
+                ));
+            }
+            summary
         })
         .collect();
-    let batch_result = json!({
-        "items": result_items,
-        "total": result.total,
-        "succeeded": result.succeeded,
-        "failed": result.failed,
-        "batchConcurrency": result.batch_concurrency,
-    });
+    let summary = crate::types::BatchFetchResultSummary {
+        total: result.total,
+        succeeded: result.succeeded,
+        failed: result.failed,
+        batch_concurrency: result.batch_concurrency,
+        duration_ms,
+        items: summary_items,
+    };
 
     json!({
         "verbose": verbose,
         "started": true,
         "batchProgress": final_progress,
-        "batchResult": batch_result,
+        "batchSummary": serde_json::to_value(summary).unwrap_or(serde_json::Value::Null),
     })
 }
 
@@ -1050,4 +1090,98 @@ fn batch_snapshot_error_change_fires_and_rounds_progress() {
     // error set → new signature → push.
     state.update(0, "error", Some("boom".to_string()), Some(1.0));
     assert_eq!(emitted.lock().unwrap().len(), after_second + 2);
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    fn item(
+        index: usize,
+        status: &'static str,
+        result: Option<FetchResult>,
+    ) -> BatchFetchItemResult {
+        BatchFetchItemResult {
+            index,
+            request_url: format!("https://ex.com/{index}"),
+            status,
+            error: if status == "error" {
+                Some("Invalid URL".to_string())
+            } else {
+                None
+            },
+            result,
+            request: None,
+        }
+    }
+
+    #[test]
+    fn batch_summary_shape_has_no_body_and_no_batch_result() {
+        let result = BatchFetchResult {
+            items: vec![
+                item(
+                    0,
+                    "done",
+                    Some(FetchResult::content(
+                        "https://ex.com/0",
+                        "https://ex.com/0",
+                        3,
+                        "body text",
+                        "chrome_145",
+                        "windows",
+                    )),
+                ),
+                item(1, "error", None),
+            ],
+            total: 2,
+            succeeded: 1,
+            failed: 1,
+            batch_concurrency: 4,
+        };
+        let details = batch_details_json(&result, false, 50_000, 42);
+        assert!(details.get("batchResult").is_none());
+        assert!(details.get("fetchResult").is_none());
+        assert!(!details.to_string().contains("body text"));
+        let summary = details.get("batchSummary").expect("summary");
+        assert_eq!(summary["total"], json!(2));
+        assert_eq!(summary["succeeded"], json!(1));
+        assert_eq!(summary["failed"], json!(1));
+        assert_eq!(summary["batchConcurrency"], json!(4));
+        assert_eq!(summary["durationMs"], json!(42));
+        let items = summary["items"].as_array().unwrap();
+        assert_eq!(items[0]["index"], json!(0));
+        assert_eq!(items[0]["status"], json!("done"));
+        assert_eq!(items[0]["ok"], json!(true));
+        assert_eq!(items[0]["kind"], json!("content"));
+        assert_eq!(items[0]["charCount"], json!(9));
+        assert_eq!(items[1]["ok"], json!(false));
+        assert_eq!(items[1]["error"], json!("Invalid URL"));
+        let text = details.to_string();
+        for snake in [
+            "batch_concurrency",
+            "duration_ms",
+            "char_count",
+            "final_url",
+        ] {
+            assert!(!text.contains(snake), "snake_case leaked: {snake}");
+        }
+    }
+
+    #[test]
+    fn batch_summary_missing_result_is_defensive() {
+        let result = BatchFetchResult {
+            items: vec![item(0, "done", None)],
+            total: 1,
+            succeeded: 1,
+            failed: 0,
+            batch_concurrency: 1,
+        };
+        let details = batch_details_json(&result, false, 50_000, 1);
+        let summary = &details["batchSummary"]["items"][0];
+        assert_eq!(summary["ok"], json!(false));
+        assert_eq!(
+            summary["error"],
+            json!("No result was recorded for this item.")
+        );
+    }
 }
