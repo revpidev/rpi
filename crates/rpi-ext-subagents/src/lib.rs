@@ -952,6 +952,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                 "session_shutdown",
                 "session_before_switch",
                 "session_before_fork",
+                "session_before_compact",
                 "session_compact",
                 "session_compact_failed",
                 "agent_start",

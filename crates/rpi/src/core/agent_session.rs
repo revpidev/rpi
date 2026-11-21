@@ -5773,8 +5773,9 @@ impl AgentSession {
         custom_instructions: Option<&str>,
     ) -> Result<CompactionResult, RpiError> {
         // S45: capture before abort() emits agent_end and clears the
-        // extension's active-parent bit.
-        let interrupted = self.is_streaming();
+        // extension's active-parent bit. An already-requested user abort is
+        // Esc, not a compaction interruption.
+        let interrupted = self.is_streaming() && !self.is_abort_requested();
         self.abort().await;
         self.sync_compaction_model().await;
         let result = {

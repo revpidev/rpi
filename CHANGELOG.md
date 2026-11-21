@@ -31,7 +31,7 @@ This section covers the V19-01 implementation work including its M06-OUT handoff
 ### Breaking changes (V19-03)
 
 - **Recovery trust**: background resume/auto-resume now requires the parent-owned `recovery.json`; runs created by older versions without it are refused with a relaunch/`reuseFrom` hint instead of trusting `status.json`.
-- **Capability ceiling identity**: rpi has no session-file-path capability registry; the descendant allowlist is carried by the session's inherited environment and resolved per launch, so an old path registration cannot remain active. Capability checks are session-scoped, not path-scoped.
+- **Capability ceiling identity**: rpi has no session-file-path capability registry; the descendant allowlist is carried by the session's inherited environment and resolved per launch, so an old path registration cannot remain active. The ceiling is resolved from the session's inherited environment at launch, not from a session-file-path registry.
 - **Structured output**: a child with `outputSchema` must finish through `structured_output`; the raw JSON value is validated before coercion, so `"42"`/`"x"`/null no longer pass for numeric/string-typed schemas.
 - **smart-fetch details**: new tool results persist compact summaries instead of full `fetchResult`/`batchResult` bodies; old sessions remain readable in memory and are not rewritten.
 

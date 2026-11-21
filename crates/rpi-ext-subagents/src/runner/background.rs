@@ -1390,7 +1390,7 @@ pub async fn drive_run(
                     }
                 }
                 Err(error) => {
-                    if handle.control.stop_requested() {
+                    if handle.control.stop_requested() || handle.control.drain_requested() {
                         finish(&handle, STATE_STOPPED, &error, &notify).await
                     } else {
                         finish_failed(&handle, &error, &notify).await
@@ -2083,7 +2083,8 @@ async fn finish_with_handoff(
     handoff_path: Option<&Path>,
     notify: &AsyncNotify,
 ) {
-    let stopped = handle.control.stop_requested();
+    let drained = handle.control.drain_requested();
+    let stopped = handle.control.stop_requested() || drained;
     let state = if stopped { STATE_STOPPED } else { state };
     update_status(handle, |status| {
         status["state"] = json!(state);
@@ -2093,7 +2094,11 @@ async fn finish_with_handoff(
         });
         if stopped {
             status["stopped"] = json!(true);
-            status["stoppedReason"] = json!("stop-request");
+            status["stoppedReason"] = json!(if drained {
+                "drain-request"
+            } else {
+                "stop-request"
+            });
         }
         if let Some(object) = status.as_object_mut() {
             object.remove("activityState");
@@ -2129,6 +2134,10 @@ async fn finish_with_handoff(
 }
 
 async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &AsyncNotify) {
+    if handle.control.stop_requested() || handle.control.drain_requested() {
+        finish(handle, STATE_STOPPED, error, notify).await;
+        return;
+    }
     // A stop request wins over a child/launch failure, exactly like
     // `finish_with_handoff`: the single/tasks Err paths must not record
     // `failed` after the caller already stopped the run (upstream

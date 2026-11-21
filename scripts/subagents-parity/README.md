@@ -1,4 +1,4 @@
-# subagents parity harness (TE04 G3; dual-track rebase TE13)
+# subagents parity harness (TE04 G3; dual-track V19-03 rotation)
 
 Drives the pinned upstream pi-subagents and this crate's `build_rpi_args` / frontmatter parser /
 `get_finalOutput` / context-overflow classifier / model-resolution vectors / discovery entry
