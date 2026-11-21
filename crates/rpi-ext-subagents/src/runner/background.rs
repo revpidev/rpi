@@ -34,9 +34,38 @@ pub fn async_results_dir() -> PathBuf {
 /// keeps the single-window fallback.
 static CURRENT_SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
 
-pub fn bind_current_session(session_id: Option<&str>) {
+/// Tests mutate the process-global binding; production binds on
+/// `session_start`. Test builds serialize every write through this lock so a
+/// concurrent `session_start` test cannot change the owner observed by a
+/// completion-delivery test. Tests that need to bind and then assert across
+/// an await hold the guard and use [`set_current_session_for_test`].
+#[cfg(test)]
+pub(crate) static CURRENT_SESSION_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn set_current_session(session_id: Option<&str>) {
     *CURRENT_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) =
         session_id.filter(|id| !id.is_empty()).map(str::to_string);
+}
+
+pub fn bind_current_session(session_id: Option<&str>) {
+    #[cfg(test)]
+    let _guard = CURRENT_SESSION_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    set_current_session(session_id);
+}
+
+/// Test seam: write the binding while the caller holds
+/// [`CURRENT_SESSION_TEST_MUTEX`].
+#[cfg(test)]
+pub(crate) fn set_current_session_for_test(session_id: Option<&str>) {
+    set_current_session(session_id);
+}
+
+/// Test seam: clear the process-global binding.
+#[cfg(test)]
+pub(crate) fn reset_current_session_for_test() {
+    set_current_session(None);
 }
 
 fn current_session_id() -> Option<String> {
@@ -4443,7 +4472,15 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn failed_completion_notice_is_kept_and_resent_on_session_start() {
+        let _registry = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _session = CURRENT_SESSION_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_current_session_for_test();
         let run_id = format!(
             "resend-{}-{}",
             std::process::id(),
@@ -4508,6 +4545,7 @@ pub(crate) mod tests {
             FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst) > before,
             "resend issued a sendMessage"
         );
+        reset_current_session_for_test();
         let _ = std::fs::remove_dir_all(&run_dir);
     }
 
@@ -4517,6 +4555,10 @@ pub(crate) mod tests {
         let _guard = REGISTRY_TEST_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _session = CURRENT_SESSION_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_current_session_for_test();
         let run_id = format!("notify-owner-{}", std::process::id());
         let run_dir = async_runs_dir().join(&run_id);
         let _ = std::fs::remove_dir_all(&run_dir);
@@ -4551,7 +4593,7 @@ pub(crate) mod tests {
 
         FAKE_SEND_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
         let before = FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst);
-        bind_current_session(Some("session-new"));
+        set_current_session_for_test(Some("session-new"));
         notify.send(&handle, STATE_COMPLETE, "done", None).await;
         assert_eq!(
             FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst),
@@ -4562,14 +4604,14 @@ pub(crate) mod tests {
         let events = std::fs::read_to_string(run_dir.join("events.jsonl")).unwrap_or_default();
         assert!(events.contains("run.completion_deferred"), "{events}");
 
-        bind_current_session(Some("session-old"));
+        set_current_session_for_test(Some("session-old"));
         notify.send(&handle, STATE_COMPLETE, "done", None).await;
         assert!(
             FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst) > before,
             "owner session receives the completion"
         );
         assert!(!result_path.exists());
-        bind_current_session(None);
+        reset_current_session_for_test();
         let _ = std::fs::remove_dir_all(&run_dir);
     }
 
@@ -4583,6 +4625,10 @@ pub(crate) mod tests {
         let _guard = REGISTRY_TEST_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _session = CURRENT_SESSION_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_current_session_for_test();
         let run_id = format!("notify-take-{}", std::process::id());
         let run_dir = async_runs_dir().join(&run_id);
         let _ = std::fs::remove_dir_all(&run_dir);
@@ -4618,7 +4664,7 @@ pub(crate) mod tests {
 
         FAKE_SEND_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
         let before = FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst);
-        bind_current_session(Some("session-new"));
+        set_current_session_for_test(Some("session-new"));
         notify.send(&handle, STATE_COMPLETE, "done", None).await;
         assert_eq!(
             FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst),
@@ -4643,7 +4689,7 @@ pub(crate) mod tests {
             "new owner receives the pending completion"
         );
         assert!(!result_path.exists());
-        bind_current_session(None);
+        reset_current_session_for_test();
         let _ = std::fs::remove_dir_all(&run_dir);
     }
 
@@ -5005,6 +5051,51 @@ pub(crate) mod tests {
                 "parent must never be signalled"
             );
         }
+    }
+
+    /// The ledger is advisory: even a forged entry must pass the process
+    /// group-leader check before any signal. A child sharing the host's
+    /// process group is not a subagent child and must be left alone.
+    #[cfg(unix)]
+    #[test]
+    fn reconciler_skips_a_pid_that_is_not_a_process_group_leader() {
+        use std::process::Command;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as u64;
+        let run_id = format!("recon-nonleader-{}", std::process::id());
+        let dir = async_runs_dir().join(&run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::artifacts::append_jsonl(
+            &crate::recovery::child_pid_ledger_path(&run_id),
+            &json!({ "pid": pid, "bootId": process_boot_id(pid) }).to_string(),
+        );
+        crate::artifacts::write_metadata(
+            &dir.join("status.json"),
+            &json!({
+                "runId": run_id,
+                "state": STATE_RUNNING,
+                "ownerPid": 4000000,
+            }),
+        )
+        .unwrap();
+        reconcile_stale_runs();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            pid_alive(pid),
+            "a non-leader pid must not be signalled even when the ledger names it"
+        );
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+        assert!(events.contains("run.reconcile_skipped_pid"), "{events}");
+        assert!(events.contains("unsafe-target"), "{events}");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
     }
 
     #[cfg(unix)]

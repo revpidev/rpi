@@ -1400,3 +1400,80 @@ async fn session_compact_handler_observes_idle_after_lock_release() {
         .expect("session_compact recorded");
     assert_eq!(compact.1["idle"], json!(true), "{:?}", compact.1);
 }
+
+/// V19-03 S45 cancellation: `session_before_compact` returning
+/// `{cancel:true}` is an aborted compaction, but upstream still emits
+/// `session_compact_failed` from the catch block (`aborted:true`, no
+/// `errorMessage`). The deferred event must observe the post-lock idle state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compact_failed_observes_idle_on_cancellation() {
+    let failed: Records = Arc::new(Mutex::new(Vec::new()));
+    let cancel: ExtensionFactory = Arc::new(|api| {
+        api.on(
+            "session_before_compact",
+            Arc::new(move |_payload, _ctx| Box::pin(async { Ok(json!({"cancel": true})) })),
+        )
+        .expect("register cancel handler");
+        Box::pin(async { Ok(()) })
+    });
+    let host = NativeExtensionHost::new("/compact-cancel-idle");
+    let errors = host
+        .load_inline(&[
+            InlineExtension::Anonymous(cancel),
+            idle_recording_ext(failed.clone(), "session_compact_failed"),
+        ])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let fixture = fixture_with_settings(
+        Vec::new(),
+        host,
+        8192,
+        r#"{"compaction":{"reserveTokens":1,"keepRecentTokens":1}}"#,
+    )
+    .await;
+    {
+        let manager = fixture.session.session_manager();
+        let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        for (text, role) in [
+            (format!("q1 {}", "x".repeat(2000)), "user"),
+            (format!("a1 {}", "y".repeat(2000)), "assistant"),
+            (format!("q2 {}", "x".repeat(2000)), "user"),
+        ] {
+            let message = if role == "user" {
+                serde_json::from_value(json!({
+                    "role": "user",
+                    "content": text,
+                    "timestamp": 1,
+                }))
+                .expect("user message")
+            } else {
+                rpi_agent::messages::AgentMessage::Assistant(faux_assistant_message(
+                    text,
+                    FauxAssistantOptions::default(),
+                ))
+            };
+            manager.append_message(message).expect("append message");
+        }
+    }
+    let error = fixture.session.compact(None).await.expect_err("cancelled");
+    assert!(
+        error.to_string().contains("Compaction cancelled"),
+        "{error}"
+    );
+    let records = failed.lock().unwrap_or_else(|e| e.into_inner());
+    let failed_event = records
+        .iter()
+        .find(|(event, _)| event == "session_compact_failed")
+        .expect("session_compact_failed recorded");
+    assert_eq!(failed_event.1["idle"], json!(true), "{:?}", failed_event.1);
+    assert_eq!(failed_event.1["payload"]["reason"], json!("manual"));
+    assert_eq!(failed_event.1["payload"]["aborted"], json!(true));
+    assert_eq!(failed_event.1["payload"]["willRetry"], json!(false));
+    assert_eq!(failed_event.1["payload"]["fromExtension"], json!(false));
+    assert!(
+        failed_event.1["payload"].get("errorMessage").is_none(),
+        "cancellation omits errorMessage: {:?}",
+        failed_event.1
+    );
+}

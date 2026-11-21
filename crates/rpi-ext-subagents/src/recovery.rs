@@ -517,6 +517,29 @@ pub fn validate_require_launcher_shape(
     Ok(())
 }
 
+/// A managed worktree is created by `git worktree add`, which writes a
+/// `.git` file pointing at `<repo>/.git/worktrees/<name>`. Requiring that
+/// marker keeps an unrelated cwd whose *ancestor* merely shares the
+/// `rpi-worktree-<run>-` name from being mistaken for a managed worktree.
+fn looks_like_managed_worktree_root(candidate: &Path) -> bool {
+    let git = candidate.join(".git");
+    if git.is_dir() {
+        // A main checkout, not a linked worktree.
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(&git) else {
+        return false;
+    };
+    raw.trim()
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .is_some_and(|gitdir| {
+            Path::new(gitdir)
+                .components()
+                .any(|component| component.as_os_str() == "worktrees")
+        })
+}
+
 /// S01: a managed worktree whose cleanup has not finalized cannot be a
 /// resume target (upstream `parallel-handoff.ts:200`). The recorded cwd names
 /// the worktree (`<base>/rpi-worktree-<run>-<index>`); its sibling
@@ -525,12 +548,15 @@ fn worktree_resume_block(cwd: &str, run_id: &str) -> Option<String> {
     let path = Path::new(cwd);
     let prefix = format!("rpi-worktree-{run_id}-");
     // The recorded cwd may be a worktree subdirectory; walk up to the
-    // managed worktree root before looking for its handoff manifest.
+    // managed worktree root before looking for its handoff manifest. The
+    // `.git` marker is a second confirmation: a same-named ancestor that is
+    // not a linked worktree is not ours.
     let root = path.ancestors().find(|candidate| {
         candidate
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with(&prefix))
+            && looks_like_managed_worktree_root(candidate)
     })?;
     let manifest = root
         .parent()?
@@ -901,6 +927,14 @@ mod tests {
         let run_id = unique("run");
         let cwd = base.join(format!("rpi-worktree-{run_id}-0"));
         std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            cwd.join(".git"),
+            format!(
+                "gitdir: {}/.git/worktrees/rpi-worktree-{run_id}-0\n",
+                base.display()
+            ),
+        )
+        .unwrap();
         let cwd_text = cwd.to_string_lossy().to_string();
         // No handoff manifest yet: cleanup is still finalizing.
         assert!(worktree_resume_block(&cwd_text, &run_id).is_some());
@@ -937,6 +971,36 @@ mod tests {
             "reason": "capture failed",
         }));
         assert!(worktree_resume_block(&cwd_text, &run_id).is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// S01 false positive: an unrelated ancestor whose name matches the
+    /// managed-worktree prefix is not a managed worktree unless it carries
+    /// the `git worktree add` marker (and a matching manifest).
+    #[test]
+    fn unrelated_ancestor_name_does_not_block_resume() {
+        let base = std::env::temp_dir().join(unique("rpi-worktree-false-positive"));
+        let run_id = unique("run");
+        let nested = base.join(format!("rpi-worktree-{run_id}-0")).join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(
+            worktree_resume_block(&nested.to_string_lossy(), &run_id).is_none(),
+            "a same-named ancestor without the worktree marker is not ours"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A plain `.git` directory is a main checkout, not a linked worktree.
+    #[test]
+    fn main_checkout_with_matching_name_is_not_a_managed_worktree() {
+        let base = std::env::temp_dir().join(unique("rpi-worktree-main-checkout"));
+        let run_id = unique("run");
+        let repo = base.join(format!("rpi-worktree-{run_id}-0"));
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        assert!(
+            worktree_resume_block(&repo.to_string_lossy(), &run_id).is_none(),
+            "a main checkout is not a linked worktree"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -213,15 +213,44 @@ pub fn read_requests(dir: &Path) -> Vec<Value> {
     requests
 }
 
+/// Result of atomically claiming a terminal tombstone.
+enum TerminalClaim {
+    Claimed,
+    Existing(Value),
+    Unavailable,
+}
+
+/// Read an existing tombstone. The winner creates the file before writing
+/// its body, so retry briefly instead of mistaking an in-flight tombstone
+/// for a missing one.
+fn read_terminal_tombstone(path: &Path) -> Option<Value> {
+    for _ in 0..20 {
+        if let Ok(raw) = std::fs::read_to_string(path)
+            && let Ok(value) = serde_json::from_str::<Value>(&raw)
+        {
+            return Some(value);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    None
+}
+
 /// Persist a terminal tombstone so a late reply can be classified.
-fn write_terminal_tombstone(channel_dir: &Path, request: &Value, kind: &str) {
+///
+/// Terminal kinds are first-writer-wins (S18): a child timeout and a parent
+/// reply can land at the same instant. The loser observes the winner's kind
+/// instead of overwriting it, so an `answered` tombstone is never replaced
+/// by `timeout` (or vice versa) after the fact.
+fn claim_terminal(channel_dir: &Path, request: &Value, kind: &str) -> TerminalClaim {
     let Some(id) = request["id"].as_str() else {
-        return;
+        return TerminalClaim::Unavailable;
     };
     if crate::paths::ensure_safe_component(id, "supervisor request id").is_err() {
-        return;
+        return TerminalClaim::Unavailable;
     }
-    let _ = ensure_channel_dir(channel_dir);
+    if ensure_channel_dir(channel_dir).is_err() {
+        return TerminalClaim::Unavailable;
+    }
     let tombstone = json!({
         "id": id,
         "runId": request["runId"],
@@ -231,17 +260,97 @@ fn write_terminal_tombstone(channel_dir: &Path, request: &Value, kind: &str) {
         "terminalKind": kind,
         "closedAt": crate::artifacts::format_iso8601(now_millis()),
     });
-    let _ = std::fs::write(
-        channel_dir.join("terminal").join(format!("{id}.json")),
-        tombstone.to_string(),
-    );
+    let path = channel_dir.join("terminal").join(format!("{id}.json"));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            if file.write_all(tombstone.to_string().as_bytes()).is_ok() {
+                TerminalClaim::Claimed
+            } else {
+                let _ = std::fs::remove_file(&path);
+                TerminalClaim::Unavailable
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            match read_terminal_tombstone(&path) {
+                Some(value) => TerminalClaim::Existing(value),
+                None => TerminalClaim::Unavailable,
+            }
+        }
+        Err(_) => TerminalClaim::Unavailable,
+    }
 }
 
-/// Child-side timeout: the child stops polling, so the request must not keep
-/// a later wait/drain yielding; a late parent reply sees `timeout`.
-fn expire_request(channel_dir: &Path, request: &Value, request_path: &Path) {
-    write_terminal_tombstone(channel_dir, request, "timeout");
-    let _ = std::fs::remove_file(request_path);
+/// Write the reply through a unique temp file + rename so the child never
+/// observes a partially written JSON body.
+fn write_reply_atomic(reply_path: &Path, reply: &Value) -> std::io::Result<()> {
+    let tmp = reply_path.with_extension(format!("{}.tmp", crate::runner::budget::random_run_id()));
+    std::fs::write(&tmp, reply.to_string())?;
+    match std::fs::rename(&tmp, reply_path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(error)
+        }
+    }
+}
+
+/// Consume a reply file, if present.
+fn take_reply(reply_path: &Path) -> Option<Value> {
+    let raw = std::fs::read_to_string(reply_path).ok()?;
+    let _ = std::fs::remove_file(reply_path);
+    Some(serde_json::from_str::<Value>(&raw).unwrap_or(json!({})))
+}
+
+/// Child-side timeout outcome: the child stops polling, so the request must
+/// not keep a later wait/drain yielding. A reply that landed between the
+/// last poll and the deadline wins over the timeout.
+enum ExpireOutcome {
+    TimedOut,
+    Answered(Value),
+}
+
+fn expire_request(
+    channel_dir: &Path,
+    request: &Value,
+    request_path: &Path,
+    reply_path: &Path,
+) -> ExpireOutcome {
+    // Re-check the inbox immediately before claiming the timeout: the parent
+    // may have written the reply after the last loop iteration.
+    if let Some(reply) = take_reply(reply_path) {
+        let _ = claim_terminal(channel_dir, request, "answered");
+        let _ = std::fs::remove_file(request_path);
+        return ExpireOutcome::Answered(reply);
+    }
+    match claim_terminal(channel_dir, request, "timeout") {
+        TerminalClaim::Claimed => {
+            let _ = std::fs::remove_file(request_path);
+            ExpireOutcome::TimedOut
+        }
+        TerminalClaim::Existing(tombstone) => {
+            // The parent writes the reply before claiming `answered`; if the
+            // claim won, the reply file is already on disk.
+            let reply = if tombstone["terminalKind"].as_str() == Some("answered") {
+                take_reply(reply_path)
+            } else {
+                None
+            };
+            let _ = std::fs::remove_file(request_path);
+            match reply {
+                Some(reply) => ExpireOutcome::Answered(reply),
+                None => ExpireOutcome::TimedOut,
+            }
+        }
+        TerminalClaim::Unavailable => {
+            let _ = std::fs::remove_file(request_path);
+            ExpireOutcome::TimedOut
+        }
+    }
 }
 
 /// Drop every pending request owned by `run_id` when the run reaches a
@@ -282,10 +391,12 @@ pub fn close_requests_for_run_with_kind(run_id: &str, kind: &str) -> usize {
             if request["id"].as_str().is_none() {
                 continue;
             }
+            // Claim before removing: a concurrent reply may already have
+            // recorded `answered`, and the close must not overwrite it.
+            let _ = claim_terminal(&channel.path(), &request, kind);
             if std::fs::remove_file(&path).is_err() {
                 continue;
             }
-            write_terminal_tombstone(&channel.path(), &request, kind);
             closed += 1;
         }
     }
@@ -436,39 +547,47 @@ impl ChildSupervisorContext {
             .join(format!("{request_id}.json"));
         let deadline = Instant::now() + Duration::from_millis(DEFAULT_ASK_TIMEOUT_MS);
         loop {
-            if let Ok(raw) = std::fs::read_to_string(&reply_path) {
-                let _ = std::fs::remove_file(&reply_path);
-                let reply: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
-                let message = reply
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if reason == "interview_request" {
-                    // Fenced JSON extraction (L179-189).
-                    if let Some(start) = message.find("```")
-                        && let Some(body) = message[start + 3..]
-                            .strip_prefix("json\n")
-                            .or_else(|| message[start + 3..].split_once('\n').map(|(_, rest)| rest))
-                        && let Some(end) = body.find("```")
-                        && let Ok(parsed) = serde_json::from_str::<Value>(body[..end].trim())
-                    {
-                        return json!({
-                            "content": [{ "type": "text", "text": message }],
-                            "details": { "structured": parsed },
-                            "isError": false,
-                        });
-                    }
-                }
-                return ok_result(&message);
+            if let Some(reply) = take_reply(&reply_path) {
+                return reply_result(reason, &reply);
             }
             if Instant::now() >= deadline {
-                expire_request(&self.channel_dir, &request, &request_path);
-                return error_result("Timed out waiting for the supervisor's reply.");
+                match expire_request(&self.channel_dir, &request, &request_path, &reply_path) {
+                    ExpireOutcome::Answered(reply) => return reply_result(reason, &reply),
+                    ExpireOutcome::TimedOut => {
+                        return error_result("Timed out waiting for the supervisor's reply.");
+                    }
+                }
             }
             std::thread::sleep(Duration::from_millis(500));
         }
     }
+}
+
+/// Build the tool result for a consumed reply (`interview_request` parses
+/// fenced JSON, everything else returns the text).
+fn reply_result(reason: &str, reply: &Value) -> Value {
+    let message = reply
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if reason == "interview_request" {
+        // Fenced JSON extraction (L179-189).
+        if let Some(start) = message.find("```")
+            && let Some(body) = message[start + 3..]
+                .strip_prefix("json\n")
+                .or_else(|| message[start + 3..].split_once('\n').map(|(_, rest)| rest))
+            && let Some(end) = body.find("```")
+            && let Ok(parsed) = serde_json::from_str::<Value>(body[..end].trim())
+        {
+            return json!({
+                "content": [{ "type": "text", "text": message }],
+                "details": { "structured": parsed },
+                "isError": false,
+            });
+        }
+    }
+    ok_result(&message)
 }
 
 fn ok_result(text: &str) -> Value {
@@ -745,12 +864,51 @@ pub fn parent_supervisor_action(
                         .path()
                         .join("replies")
                         .join(format!("{reply_to}.json"));
-                    if let Err(error) = std::fs::write(&reply_path, reply.to_string()) {
+                    if let Err(error) = write_reply_atomic(&reply_path, &reply) {
                         return error_result(&format!("failed to write the reply: {error}"));
                     }
-                    write_terminal_tombstone(&channel.path(), &request, "answered");
-                    let _ = std::fs::remove_file(&request_path);
-                    return ok_result(&format!("Replied to supervisor request {reply_to}."));
+                    // Write the reply before claiming `answered`: the child's
+                    // deadline branch re-checks the inbox before claiming
+                    // `timeout`, so a reply landing at the deadline wins.
+                    match claim_terminal(&channel.path(), &request, "answered") {
+                        TerminalClaim::Claimed => {
+                            let _ = std::fs::remove_file(&request_path);
+                            return ok_result(&format!(
+                                "Replied to supervisor request {reply_to}."
+                            ));
+                        }
+                        TerminalClaim::Existing(tombstone) => {
+                            let kind = tombstone["terminalKind"].as_str().unwrap_or("closed");
+                            if kind != "answered" {
+                                // Timeout/close won the race: our reply must not
+                                // survive for a child that already stopped.
+                                let _ = std::fs::remove_file(&reply_path);
+                                return error_result(&format!(
+                                    "Supervisor request '{reply_to}' is already {kind}; it cannot be answered."
+                                ));
+                            }
+                            // A concurrent duplicate reply: the request is
+                            // already answered. Keep the reply file for the
+                            // child (either writer's message is acceptable).
+                            if !request_path.exists() {
+                                // The child consumed a reply at the deadline
+                                // and claimed `answered`; our reply was already
+                                // delivered or this is a duplicate of it.
+                                return ok_result(&format!(
+                                    "Replied to supervisor request {reply_to}."
+                                ));
+                            }
+                            return error_result(&format!(
+                                "Supervisor request '{reply_to}' is already answered; it cannot be answered again."
+                            ));
+                        }
+                        TerminalClaim::Unavailable => {
+                            let _ = std::fs::remove_file(&reply_path);
+                            return error_result(&format!(
+                                "Supervisor request '{reply_to}' is already closed; it cannot be answered."
+                            ));
+                        }
+                    }
                 }
                 // S18: a late reply to a request the run already closed gets
                 // the terminal reason instead of the generic "no match".
@@ -1115,9 +1273,17 @@ mod tests {
         });
         let request_path = channel.join("requests").join("req-timeout.json");
         std::fs::write(&request_path, request.to_string()).unwrap();
-        expire_request(&channel, &request, &request_path);
+        let reply_path = channel.join("replies").join("req-timeout.json");
+        assert!(matches!(
+            expire_request(&channel, &request, &request_path, &reply_path),
+            ExpireOutcome::TimedOut
+        ));
         assert!(!request_path.exists());
-        assert!(channel.join("terminal").join("req-timeout.json").exists());
+        let tombstone: Value = serde_json::from_str(
+            &std::fs::read_to_string(channel.join("terminal").join("req-timeout.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tombstone["terminalKind"], json!("timeout"));
         let reply = parent_supervisor_action(
             "reply",
             Some("req-timeout"),
@@ -1132,7 +1298,171 @@ mod tests {
                 .contains("already timeout"),
             "{reply}"
         );
+        let tombstone: Value = serde_json::from_str(
+            &std::fs::read_to_string(channel.join("terminal").join("req-timeout.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tombstone["terminalKind"], json!("timeout"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// S18: the terminal kind is first-writer-wins. A reply that lands at
+    /// the deadline is consumed instead of being overwritten by `timeout`.
+    #[test]
+    fn timeout_at_the_deadline_consumes_a_reply_that_already_landed() {
+        let root = channels_root().join(format!("deadline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let channel = root.join("runs-worker-0");
+        ensure_channel(&channel);
+        let request = json!({
+            "type": "subagent.supervisor.request",
+            "id": "req-deadline",
+            "createdAt": "2026-08-14T00:00:00.000Z",
+            "reason": "need_decision",
+            "message": "Ship?",
+            "orchestratorSessionId": "session-a",
+            "runId": "runs",
+        });
+        let request_path = channel.join("requests").join("req-deadline.json");
+        std::fs::write(&request_path, request.to_string()).unwrap();
+        let reply_path = channel.join("replies").join("req-deadline.json");
+        // The parent wrote the reply but has not claimed `answered` yet.
+        std::fs::write(&reply_path, json!({ "message": "Ship it." }).to_string()).unwrap();
+        match expire_request(&channel, &request, &request_path, &reply_path) {
+            ExpireOutcome::Answered(reply) => {
+                assert_eq!(reply["message"], json!("Ship it."));
+            }
+            ExpireOutcome::TimedOut => panic!("a landed reply must win the deadline race"),
+        }
+        assert!(!request_path.exists());
+        assert!(!reply_path.exists());
+        let tombstone: Value = serde_json::from_str(
+            &std::fs::read_to_string(channel.join("terminal").join("req-deadline.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tombstone["terminalKind"], json!("answered"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// S18: when the timeout claim wins, a racing reply claim must observe
+    /// `timeout` and must not rewrite the tombstone.
+    #[test]
+    fn terminal_claim_is_first_writer_wins() {
+        let root = channels_root().join(format!("claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let channel = root.join("runc-worker-0");
+        ensure_channel(&channel);
+        let request = json!({
+            "type": "subagent.supervisor.request",
+            "id": "req-claim",
+            "createdAt": "2026-08-14T00:00:00.000Z",
+            "reason": "need_decision",
+            "message": "Ship?",
+            "orchestratorSessionId": "session-a",
+            "runId": "runc",
+        });
+        assert!(matches!(
+            claim_terminal(&channel, &request, "timeout"),
+            TerminalClaim::Claimed
+        ));
+        match claim_terminal(&channel, &request, "answered") {
+            TerminalClaim::Existing(tombstone) => {
+                assert_eq!(tombstone["terminalKind"], json!("timeout"));
+            }
+            _ => panic!("the losing claim must observe the existing tombstone"),
+        }
+        let tombstone: Value = serde_json::from_str(
+            &std::fs::read_to_string(channel.join("terminal").join("req-claim.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tombstone["terminalKind"], json!("timeout"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// S18: concurrent timeout/reply claims record exactly one kind. This is
+    /// the core of the race closure: the tombstone is created with
+    /// `create_new`, so only the first writer wins and the file is never
+    /// rewritten by the loser.
+    #[test]
+    fn concurrent_terminal_claims_record_exactly_one_kind() {
+        use std::sync::{Arc, Barrier};
+        let root = channels_root().join(format!("claim-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let channel = root.join("runr-worker-0");
+        ensure_channel(&channel);
+        let request = json!({
+            "type": "subagent.supervisor.request",
+            "id": "req-claim-race",
+            "createdAt": "2026-08-14T00:00:00.000Z",
+            "reason": "need_decision",
+            "message": "Ship?",
+            "orchestratorSessionId": "session-a",
+            "runId": "runr",
+        });
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = |kind: &'static str| {
+            let channel = channel.clone();
+            let request = request.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                matches!(
+                    claim_terminal(&channel, &request, kind),
+                    TerminalClaim::Claimed
+                )
+            })
+        };
+        let timeout = spawn("timeout");
+        let answered = spawn("answered");
+        let claimed = [timeout.join().unwrap(), answered.join().unwrap()]
+            .into_iter()
+            .filter(|claimed| *claimed)
+            .count();
+        assert_eq!(claimed, 1, "exactly one writer claims the terminal kind");
+        let tombstone: Value = serde_json::from_str(
+            &std::fs::read_to_string(channel.join("terminal").join("req-claim-race.json")).unwrap(),
+        )
+        .unwrap();
+        let kind = tombstone["terminalKind"].as_str().unwrap();
+        assert!(matches!(kind, "timeout" | "answered"), "{tombstone}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// S18: closing a run cleans up a request but never rewrites an existing
+    /// `answered` tombstone.
+    #[test]
+    fn close_does_not_overwrite_an_answered_tombstone() {
+        let run_id = format!("runw-close-answered-{}", std::process::id());
+        let channel = channels_root().join(format!("{run_id}-worker-0"));
+        let _ = std::fs::remove_dir_all(&channel);
+        ensure_channel(&channel);
+        let request = json!({
+            "type": "subagent.supervisor.request",
+            "id": "req-close-answered",
+            "createdAt": "2026-08-14T00:00:00.000Z",
+            "reason": "need_decision",
+            "message": "Ship?",
+            "orchestratorSessionId": "session-a",
+            "runId": run_id,
+        });
+        let request_path = channel.join("requests").join("req-close-answered.json");
+        std::fs::write(&request_path, request.to_string()).unwrap();
+        assert!(matches!(
+            claim_terminal(&channel, &request, "answered"),
+            TerminalClaim::Claimed
+        ));
+        // The request file is still present (the reply path has not removed
+        // it yet); the run close must not turn `answered` into `closed`.
+        assert!(request_path.exists());
+        close_requests_for_run_with_kind(&run_id, "closed");
+        assert!(!request_path.exists());
+        let tombstone: Value = serde_json::from_str(
+            &std::fs::read_to_string(channel.join("terminal").join("req-close-answered.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tombstone["terminalKind"], json!("answered"));
+        let _ = std::fs::remove_dir_all(&channel);
     }
 
     #[test]

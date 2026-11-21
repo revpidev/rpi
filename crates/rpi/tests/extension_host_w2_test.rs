@@ -582,8 +582,12 @@ impl CompactionFixture {
 #[tokio::test]
 async fn w2_session_before_compact_cancel_aborts_manual_compaction() {
     // agent-session.ts:1819-1821：cancel → "Compaction cancelled" →
-    // compaction_end{aborted:true, errorMessage:undefined}。
-    let host = host_with(vec![inline_ext(|api| {
+    // compaction_end{aborted:true, errorMessage:undefined}.
+    // Upstream still emits `session_compact_failed` from the catch block
+    // (:2437-2450 @ a6b1dbceb): `aborted:true`, `errorMessage` undefined.
+    let failed = Arc::new(Mutex::new(Vec::new()));
+    let sink = failed.clone();
+    let host = host_with(vec![inline_ext(move |api| {
         on_json(api, ext::EVENT_SESSION_BEFORE_COMPACT, |event| {
             // Payload-completeness check: preparation/branchEntries/reason/willRetry.
             assert!(event["preparation"].is_object());
@@ -596,6 +600,11 @@ async fn w2_session_before_compact_cancel_aborts_manual_compaction() {
             assert_eq!(event["willRetry"], false);
             Ok(json!({"cancel": true}))
         });
+        let sink = sink.clone();
+        on_json(api, ext::EVENT_SESSION_COMPACT_FAILED, move |event| {
+            sink.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+            Ok(Value::Null)
+        });
     })])
     .await;
     let runner_ref = new_extension_runner_ref(
@@ -607,19 +616,55 @@ async fn w2_session_before_compact_cancel_aborts_manual_compaction() {
 
     let error = fixture.runner.compact(None).await.expect_err("cancelled");
     assert_eq!(error.to_string(), "session error: Compaction cancelled");
-    let events = fixture.events.lock().expect("events");
-    let end = events
+    {
+        let events = fixture.events.lock().expect("events");
+        let end = events
+            .iter()
+            .find_map(|event| match event {
+                rpi::core::compaction_runner::CompactionEvent::CompactionEnd {
+                    aborted,
+                    error_message,
+                    ..
+                } => Some((*aborted, error_message.clone())),
+                _ => None,
+            })
+            .expect("compaction_end");
+        assert_eq!(end, (true, None));
+    }
+
+    // S45: cancellation is a failure event (`aborted:true`) deferred until
+    // the compaction lock is released, exactly like a summarization failure.
+    let pending = fixture
+        .runner
+        .take_pending_session_compact_failed()
+        .expect("deferred session_compact_failed on cancellation");
+    assert_eq!(pending.reason.as_str(), "manual");
+    assert!(pending.aborted);
+    assert_eq!(pending.error_message, None);
+    assert!(!pending.will_retry);
+    assert!(!pending.from_extension);
+    read_runner(&runner_ref)
+        .emit_session_compact_failed(
+            pending.reason.as_str(),
+            pending.error_message.as_deref(),
+            pending.aborted,
+            pending.will_retry,
+            pending.from_extension,
+        )
+        .await;
+    let failed = failed.lock().unwrap_or_else(|e| e.into_inner());
+    let payload = failed
         .iter()
-        .find_map(|event| match event {
-            rpi::core::compaction_runner::CompactionEvent::CompactionEnd {
-                aborted,
-                error_message,
-                ..
-            } => Some((*aborted, error_message.clone())),
-            _ => None,
-        })
-        .expect("compaction_end");
-    assert_eq!(end, (true, None));
+        .find(|payload| payload["type"] == "session_compact_failed")
+        .expect("session_compact_failed delivered");
+    assert_eq!(payload["reason"], "manual");
+    assert_eq!(payload["aborted"], true);
+    assert_eq!(payload["willRetry"], false);
+    assert_eq!(payload["fromExtension"], false);
+    assert!(
+        payload.get("errorMessage").is_none(),
+        "cancellation omits errorMessage: {payload}"
+    );
 }
 
 #[tokio::test]
