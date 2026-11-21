@@ -7,7 +7,6 @@
 //! trusted owner generation (the parent session id); the old fork never keeps
 //! delivering the same run.
 
-use std::collections::HashSet;
 use std::sync::Mutex;
 
 use serde_json::{Value, json};
@@ -30,9 +29,6 @@ enum Choice {
 struct SwitchState {
     /// A switch attempt in progress: the source session and the chosen fate.
     pending: Option<(String, Choice)>,
-    /// Sessions that chose to leave their work behind. A resumed source keeps
-    /// its own work; the mark is cleared when that session shuts down again.
-    kept: HashSet<String>,
 }
 
 static STATE: std::sync::LazyLock<Mutex<SwitchState>> =
@@ -169,7 +165,7 @@ pub fn before_switch(calls: &AsyncHostCalls, reason: &str) -> Value {
 }
 
 /// Apply a committed switch once the new session id is known.
-pub fn session_start(calls: &AsyncHostCalls, reason: &str) {
+pub fn session_start(calls: &AsyncHostCalls, _reason: &str) {
     let Some(new_session) = current_session(calls) else {
         return;
     };
@@ -182,24 +178,19 @@ pub fn session_start(calls: &AsyncHostCalls, reason: &str) {
                 crate::p1::supervisor::reassign_owner(&old_session, &new_session);
             }
             Choice::Leave => {
-                lock().kept.insert(old_session);
+                // Leave keeps the old owner: no trusted record or in-memory
+                // run is reassigned, so the source session still owns it.
             }
             Choice::Stay => {}
         }
     }
-    // Reopening the source session keeps its own work.
-    if matches!(reason, "resume" | "startup") {
-        lock().kept.remove(&new_session);
-    }
 }
 
-/// Record a committed leave at shutdown; any other shutdown releases the mark.
+/// Drop a pending switch choice at shutdown; a committed leave is already
+/// represented by the unchanged owner generation.
 pub fn session_shutdown(reason: &str) {
     let _ = reason;
-    let mut state = lock();
-    state.pending = None;
-    // `kept` is per source session and is cleared when that session starts
-    // again; nothing else to do here.
+    lock().pending = None;
 }
 
 /// Test seam: reset the process-global switch state.
@@ -207,5 +198,4 @@ pub fn session_shutdown(reason: &str) {
 pub fn reset_for_test() {
     let mut state = lock();
     state.pending = None;
-    state.kept.clear();
 }

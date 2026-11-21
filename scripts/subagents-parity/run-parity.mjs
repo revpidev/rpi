@@ -6,14 +6,14 @@
 //   node scripts/subagents-parity/run-parity.mjs [--track=regression|target]
 //   node scripts/subagents-parity/run-parity.mjs --record-args-golden
 //
-// v0.1.8 rotation (TE51; the pin switches with TE51 itself, not V18-00):
-//   - `target` (DEFAULT) = the v0.1.8 target pin snapshot, pi-subagents
-//     v0.83.0 @ 3a63e0ad (ADR-0038), extracted read-only by
+// v0.1.9 rotation (V19-03; the pin switches with V19-03 itself):
+//   - `target` (DEFAULT) = the v0.1.9 target pin snapshot, pi-subagents
+//     v0.88.1 @ 83cf25f8 (ADR-0048), extracted read-only by
 //     setup-target-source.sh into /tmp/rpi-subagents-parity-target-v0881.
 //     Writes fixtures/generated/subagents-parity-v0881/. Diffs are
 //     attributed through expected-target-diffs-v0881.json
 //     (`upstream-semantics` vs `rpi-deviation`, each with R + owner task).
-//   - `regression` = the retired v0.76.1 snapshot @ 7d072b91d (the v0.1.7
+//   - `regression` = the retired v0.83.0 snapshot @ 3a63e0ad (the v0.1.8
 //     zero-regression baseline). Writes
 //     fixtures/generated/subagents-parity-v0830/; attributed through the
 //     historical expected-target-diffs-v0830.json.

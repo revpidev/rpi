@@ -130,28 +130,33 @@ pub fn tool_parameters(schema: &Value) -> Value {
     })
 }
 
+/// S27 (#3191): secret-looking environment values that typed JSON output
+/// must not echo. Ordinary values (for example `KDE_FULL_SESSION=true`) are
+/// not included.
+pub fn env_secret_values() -> Vec<String> {
+    std::env::vars()
+        .filter(|(key, value)| {
+            value.len() >= 4
+                && ["TOKEN", "SECRET", "PASSWORD", "API_KEY", "APIKEY"]
+                    .iter()
+                    .any(|marker| key.to_ascii_uppercase().contains(marker))
+        })
+        .map(|(_, value)| value)
+        .collect()
+}
+
 /// Extract and validate the raw `value` from a `structured_output` call.
+/// The validated value is redacted before it is persisted or returned.
 pub fn capture(schema: &Value, args: &Value) -> Result<Value, String> {
     let Some(value) = args.get("value") else {
         return Err("structured_output requires a `value` field.".to_string());
     };
     validate_value(schema, value)?;
-    Ok(value.clone())
+    Ok(redact_secrets(value, &env_secret_values()))
 }
 
 /// Whether a captured value is a validated structured output (used by S39's
 /// length rule: a validated answer still succeeds).
-/// S27 (#3191): parse typed JSON acceptance output first, then redact
-/// secret-looking strings/keys/numbers recursively. Ordinary values such as
-/// `KDE_FULL_SESSION=true` are left intact; invalid JSON fails safely.
-#[allow(dead_code)]
-pub fn parse_and_redact_typed_json(text: &str, secrets: &[String]) -> Result<Value, String> {
-    let value: Value = serde_json::from_str(text)
-        .map_err(|error| format!("invalid typed JSON output: {error}"))?;
-    Ok(redact_secrets(&value, secrets))
-}
-
-#[allow(dead_code)]
 pub fn redact_secrets(value: &Value, secrets: &[String]) -> Value {
     let filtered: Vec<&str> = secrets
         .iter()
@@ -229,17 +234,25 @@ mod tests {
     }
 
     #[test]
-    fn typed_json_redaction_keeps_ordinary_values() {
-        let value = parse_and_redact_typed_json(
-            r#"{"token":"abc123","nested":{"KDE_FULL_SESSION":true,"password":"abc123"},"count":42}"#,
-            &["abc123".to_string()],
-        )
-        .expect("valid json");
-        assert_eq!(value["token"], json!("[redacted]"));
-        assert_eq!(value["nested"]["KDE_FULL_SESSION"], json!(true));
-        assert_eq!(value["nested"]["password"], json!("[redacted]"));
-        assert_eq!(value["count"], json!(42));
-        assert!(parse_and_redact_typed_json("{", &[]).is_err());
+    fn redaction_keeps_ordinary_values_and_capture_applies_it() {
+        let value = json!({
+            "token": "abc123",
+            "nested": {"KDE_FULL_SESSION": true, "password": "abc123"},
+            "count": 42
+        });
+        let redacted = redact_secrets(&value, &["abc123".to_string()]);
+        assert_eq!(redacted["token"], json!("[redacted]"));
+        assert_eq!(redacted["nested"]["KDE_FULL_SESSION"], json!(true));
+        assert_eq!(redacted["nested"]["password"], json!("[redacted]"));
+        assert_eq!(redacted["count"], json!(42));
+
+        let schema = json!({"type": "object"});
+        let key = "RPI_TEST_STRUCTURED_SECRET_VALUE";
+        // SAFETY: test-only unique variable; restored immediately.
+        unsafe { std::env::set_var(key, "s3cr3t-value") };
+        let captured = capture(&schema, &json!({"value": {"token": "s3cr3t-value"}})).unwrap();
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(captured["token"], json!("[redacted]"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! Serde types mirroring upstream `packages/core/src/types.ts` @ b0111612
-//! (smart-fetch-core v0.3.17). Field names serialize camelCase to keep the
+//! Serde types mirroring upstream `packages/core/src/types.ts` @ feb6da00
+//! (smart-fetch-core v0.3.23). Field names serialize camelCase to keep the
 //! details/JSON shape byte-compatible with the upstream tool results.
 
 use serde::{Deserialize, Serialize};

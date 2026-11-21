@@ -8,8 +8,8 @@ points with the same fixture set, then diffs the normalized outputs item by item
 
 | Track | Upstream | Purpose | Report directory |
 |----|------|------|----------|
-| `target` (**default since the TE51 rotation**) | the v0.1.8 target pin v0.83.0 (`3a63e0ad`, an out-of-repo snapshot) | active parity baseline (full mode set) | `fixtures/generated/subagents-parity-v0830/` |
-| `regression` | the retired v0.76.1 snapshot (`7d072b91d`, the v0.1.7 zero-regression baseline) | archaeology only | `fixtures/generated/subagents-parity-v0761/` |
+| `target` (**default**) | the v0.1.9 target pin v0.88.1 (`83cf25f8`, an out-of-repo snapshot) | active parity baseline (full mode set) | `fixtures/generated/subagents-parity-v0881/` |
+| `regression` | the retired v0.83.0 snapshot (`3a63e0ad`, the v0.1.8 zero-regression baseline) | zero-regression baseline | `fixtures/generated/subagents-parity-v0830/` |
 
 Track names rotate each rebase cycle (TE13 convention): the v0.1.5 window named the then-current
 pin `regression` (default) and the new pin `target`; **TE45 kept the default on `target` and moved
@@ -133,7 +133,8 @@ track uses the v0.1.7 `expected-target-diffs-v0761.json`), or the report lands i
 | `fixtures-target.json` | Target-track additions: frontmatter (inherit/false, excludeTools, broken frontmatter, thinking), final-output, fallback vectors (post-#2270/TE39: context-overflow only), discovery tree (TE15), notify (TE17), **inline argv [RPI-OWN] goldens (TE18: the excludeTools surface, no upstream recorder; expectations inline in the cases) and model-resolution vectors (TE18 R7.1.4.4/.5, re-anchored by TE39 at v0.70 `model-resolution.ts`)** |
 | `args-golden-v048.json` | The frozen argv/env golden file ([RPI-OWN]; covers only the 9 cases of fixtures.json; `--record-args-golden` re-records only the non-inline cases) |
 | `expected-target-diffs.json` | The regression-track difference attribution list (historical, emptied by TE14) |
-| `expected-target-diffs-v0830.json` | The v0.1.8 target-track attribution manifest (TE51 seed, empty by design) |
+| `expected-target-diffs-v0881.json` | The v0.1.9 target-track attribution manifest (V19-03; S10 provider hint as `rpi-deviation`) |
+| `expected-target-diffs-v0830.json` | The v0.1.8 target-track attribution manifest, reused as the v0.1.9 regression-track manifest (S10 hint as `upstream-semantics`) |
 | `expected-target-diffs-v0761.json` | The v0.1.7 target-track manifest, reused as TE51's regression-track manifest: it carries the two `upstream-semantics` frontmatter cases (#2995/#3017) the v0.83.0 implementation intentionally changes |
 | `expected-target-diffs-v074.json` | The v0.1.6 target-track attribution manifest (TE45 seed; closed empty; historical) |
 | `expected-target-diffs-v070.json` | The v0.1.5 target-track attribution manifest (TE37 seed; closed empty by TE38/TE39; historical) |

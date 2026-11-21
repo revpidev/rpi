@@ -449,7 +449,7 @@ pub fn resolve_launch_tool_plan(
             continue;
         }
         let normalized = selector.replace('-', "_");
-        let name = if let Some((server, tool)) = normalized.split_once('.') {
+        let name = if let Some((server, tool)) = normalized.split_once(['.', '/']) {
             if tool == "*" {
                 format!("mcp__{server}__*")
             } else {
@@ -769,7 +769,9 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
         );
         tool_diagnostic_path = Some(path);
     }
-    // MCP direct tools are P2: always the upstream "__none__" sentinel.
+    // The upstream `MCP_DIRECT_TOOLS` carrier has no rpi host reader; keep
+    // the frozen v0.48 golden value for third-party readers, while the
+    // selected tools ride the normal `--tools` allowlist above.
     env.insert("MCP_DIRECT_TOOLS".into(), Some("__none__".into()));
     let _ = &input.mcp_direct_tools;
     env.insert(SUBAGENT_CHILD_ENV.into(), Some("1".into()));
@@ -1253,6 +1255,26 @@ mod tests {
         let tools = vec!["read".to_string(), "subagent".to_string()];
         let plan = resolve_launch_tool_plan(Some(&tools), &[], &[], None, None, false, None);
         assert!(plan.fanout_authorized);
+        // S32/S47: both upstream `server/tool` and rpi `server.tool` selectors
+        // map to the host MCP tool name.
+        let tools = vec!["read".to_string()];
+        let plan = resolve_launch_tool_plan(
+            Some(&tools),
+            &[],
+            &["github/search".to_string(), "docs.fetch".to_string()],
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            plan.effective_tool_allowlist
+                .contains(&"mcp__github__search".to_string())
+        );
+        assert!(
+            plan.effective_tool_allowlist
+                .contains(&"mcp__docs__fetch".to_string())
+        );
     }
 
     #[test]
