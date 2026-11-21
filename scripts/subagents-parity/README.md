@@ -4,7 +4,7 @@ Drives the pinned upstream pi-subagents and this crate's `build_rpi_args` / fron
 `get_finalOutput` / context-overflow classifier / model-resolution vectors / discovery entry
 points with the same fixture set, then diffs the normalized outputs item by item.
 
-## Dual tracks (v0.1.7 rotation, TE48 / ADR-0036)
+## Dual tracks (V19-03 rotation, ADR-0048)
 
 | Track | Upstream | Purpose | Report directory |
 |----|------|------|----------|

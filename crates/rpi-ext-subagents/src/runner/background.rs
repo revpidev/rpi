@@ -2138,27 +2138,15 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
         finish(handle, STATE_STOPPED, error, notify).await;
         return;
     }
-    // A stop request wins over a child/launch failure, exactly like
-    // `finish_with_handoff`: the single/tasks Err paths must not record
-    // `failed` after the caller already stopped the run (upstream
-    // `stopRunner` outranks any child failure).
-    let stopped = handle.control.stop_requested();
-    let state = if stopped { STATE_STOPPED } else { STATE_FAILED };
-    let output = if stopped {
-        "Stopped before completion."
-    } else {
-        error
-    };
+    // A stop/drain request already routed to `finish` above; this path is
+    // only a genuine failure (upstream `stopRunner` outranks child failures).
+    let state = STATE_FAILED;
     update_status(handle, |status| {
         status["state"] = json!(state);
         status["processTerminal"] = json!({
             "kind": "runner-exit",
             "at": iso8601(now_millis()),
         });
-        if stopped {
-            status["stopped"] = json!(true);
-            status["stoppedReason"] = json!("stop-request");
-        }
         status["error"] = json!(error);
         if let Some(object) = status.as_object_mut() {
             object.remove("activityState");
@@ -2167,30 +2155,18 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
         // A failed chain leaves its last step with live activity fields
         // (currentTool/activityState); terminal steps must not keep them, or
         // `subagent_wait` can report attention for a dead run.
-        if stopped {
-            settle_unfinished_steps(status, "stopped", output);
-        } else {
-            settle_unfinished_steps(status, "failed", error);
-        }
+        settle_unfinished_steps(status, "failed", error);
         clear_steps_terminal(status);
     });
-    if stopped {
-        append_event(
-            handle.run_dir.as_path(),
-            "run.finished",
-            json!({ "runId": handle.run_id, "state": STATE_STOPPED }),
-        );
-    } else {
-        append_event(
-            handle.run_dir.as_path(),
-            "run.failed",
-            json!({ "runId": handle.run_id, "error": error }),
-        );
-    }
+    append_event(
+        handle.run_dir.as_path(),
+        "run.failed",
+        json!({ "runId": handle.run_id, "error": error }),
+    );
     flush_pending_status_write_failure(handle);
     crate::recovery::finish_record(&handle.run_id, state);
     crate::p1::supervisor::close_requests_for_run(&handle.run_id);
-    notify.send(handle, state, output, None).await;
+    notify.send(handle, state, error, None).await;
     prune_terminal_runs();
 }
 
@@ -4318,6 +4294,31 @@ pub(crate) mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&channel);
+    }
+
+    #[tokio::test]
+    async fn drained_finish_marks_queued_steps_stopped() {
+        let run_id = format!("drain-finish-{}", std::process::id());
+        let body = AsyncBody::Single {
+            spec: Box::new(crate::p1::launch_child::ChildSpec::default()),
+        };
+        let handle = start_run(&run_id, Some("s"), &body);
+        handle.control.request_drain();
+        let notify = AsyncNotify {
+            calls: None,
+            session_id: Some("s".to_string()),
+        };
+        finish_with_handoff(&handle, STATE_FAILED, "child failed", None, &notify).await;
+        let status = status_snapshot(&handle);
+        assert_eq!(status["state"], json!(STATE_STOPPED));
+        assert_eq!(status["stoppedReason"], json!("drain-request"));
+        assert_eq!(status["steps"][0]["status"], json!("stopped"));
+        ASYNC_RUNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id);
+        let _ = std::fs::remove_dir_all(async_runs_dir().join(&run_id));
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
     }
 
     #[test]

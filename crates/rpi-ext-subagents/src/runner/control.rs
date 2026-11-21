@@ -271,10 +271,10 @@ pub fn derive_activity_state(
 /// `isToolTimeoutExempt` (`tool-timeout.ts`): tools that may legitimately run
 /// long without producing a notice.
 pub fn is_tool_timeout_exempt(tool: &str) -> bool {
-    matches!(
-        tool,
-        "contact_supervisor" | "intercom" | "subagent_wait" | "bg_wait"
-    )
+    tool == "contact_supervisor"
+        || tool == "intercom"
+        || tool == "subagent_wait"
+        || tool == crate::config::configured_wait_tool_name()
 }
 
 /// `shouldEmitOpenToolAttention` (`subagent-control.ts:114-124`).

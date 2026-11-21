@@ -389,6 +389,24 @@ impl ExtensionConfig {
     }
 }
 
+static CONFIGURED_WAIT_TOOL_NAME: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Remember the effective `waitTool.name` for pure helpers (the long-running
+/// guard's timeout-exempt list) that cannot load config per event.
+pub fn remember_wait_tool_name(name: &str) {
+    *CONFIGURED_WAIT_TOOL_NAME
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(name.to_string());
+}
+
+pub fn configured_wait_tool_name() -> String {
+    CONFIGURED_WAIT_TOOL_NAME
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| "bg_wait".to_string())
+}
+
 /// `getConfigPath` (config.ts:70-72) with the ADR-0001 root swap.
 pub fn get_config_path() -> PathBuf {
     paths::get_agent_dir()

@@ -798,6 +798,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                     );
                 }
                 let child_wait_config = config::load_config();
+                config::remember_wait_tool_name(&child_wait_config.wait_tool_name());
                 if child_wait_config.wait_tool_enabled()
                     && let Err(error) = register(
                         "registerTool",
@@ -884,6 +885,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         }
         PluginMode::Parent => {
             let config = config::load_config();
+            config::remember_wait_tool_name(&config.wait_tool_name());
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             // #2803/#2805: description discovery must not read project
             // settings/agents/custom text when trust is declined. Old hosts
