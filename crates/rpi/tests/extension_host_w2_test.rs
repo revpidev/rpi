@@ -584,7 +584,8 @@ async fn w2_session_before_compact_cancel_aborts_manual_compaction() {
     // agent-session.ts:1819-1821：cancel → "Compaction cancelled" →
     // compaction_end{aborted:true, errorMessage:undefined}.
     // Upstream still emits `session_compact_failed` from the catch block
-    // (:2437-2450 @ a6b1dbceb): `aborted:true`, `errorMessage` undefined.
+    // (v1.5.2 agent-session.ts:3044-3064 @ b4afdddf): `aborted:true`,
+    // `errorMessage` undefined.
     let failed = Arc::new(Mutex::new(Vec::new()));
     let sink = failed.clone();
     let host = host_with(vec![inline_ext(move |api| {
