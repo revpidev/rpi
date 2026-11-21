@@ -463,19 +463,30 @@ struct FaultedTask {
     record: TaskRecord,
     message: String,
     durable: bool,
+    reserve_id: u64,
 }
 
-/// Unsubscribes a temporary commit listener even if `reserve` is dropped.
-struct ListenerGuard(Option<Subscription>);
+/// Unsubscribes a temporary commit listener and drops that reserve's pending
+/// faults even if `reserve` is dropped before it can report them.
+struct ListenerGuard {
+    subscription: Option<Subscription>,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
+}
 
 impl ListenerGuard {
-    fn new(subscription: Subscription) -> Self {
-        Self(Some(subscription))
+    fn new(subscription: Subscription, cleanup: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            subscription: Some(subscription),
+            cleanup: Some(Box::new(cleanup)),
+        }
     }
 
     fn unsubscribe(&mut self) {
-        if let Some(subscription) = self.0.take() {
+        if let Some(subscription) = self.subscription.take() {
             subscription.unsubscribe();
+        }
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
         }
     }
 }
@@ -520,6 +531,7 @@ struct SchedulerInner {
     candidate_visits: AtomicU64,
     invocations: Mutex<BTreeMap<TaskId, Arc<Invocation>>>,
     faulted: Mutex<Vec<FaultedTask>>,
+    next_fault_reserve: AtomicU64,
     task_waiters: Waiters<TaskId, SettledTask<JsonValue>>,
     idle_waiters: Waiters<Option<ConversationId>, ()>,
     /// Definition whose migration failed per task; retried only for another definition.
@@ -588,6 +600,7 @@ impl SchedulerInner {
             candidate_visits: AtomicU64::new(0),
             invocations: Mutex::new(BTreeMap::new()),
             faulted: Mutex::new(Vec::new()),
+            next_fault_reserve: AtomicU64::new(1),
             task_waiters: Waiters::new(),
             idle_waiters: Waiters::new(),
             failed_migrations: Mutex::new(BTreeMap::new()),
@@ -2777,45 +2790,53 @@ impl SchedulerInner {
         let out: Arc<Mutex<Vec<Reservation>>> = Arc::new(Mutex::new(Vec::new()));
         let this = Arc::clone(self);
         let out_commit = Arc::clone(&out);
+        let reserve_id = self.next_fault_reserve.fetch_add(1, Ordering::SeqCst);
+        let cleanup = Arc::clone(self);
         // A restart-limit fault is recorded in the commit callback, before
         // storage. Mark it durable from the publication of the terminal task;
         // the actual report stays after the commit (reserve) or after the
         // waiter's terminal publication, as upstream `#reserve` does.
         let listener = Arc::clone(self);
-        let mut subscription = ListenerGuard::new(self.session.subscribe_commits(Arc::new(
-            move |publication, _| {
-                if let Ok(mut values) = listener.faulted.lock() {
-                    for fault in values.iter_mut() {
-                        if !fault.durable
-                            && publication.changes.iter().any(|change| {
-                                matches!(
-                                    change,
-                                    CommitChange::Table(StorageWrite::Task { value })
-                                        if value.id == fault.record.id
-                                            && matches!(
-                                                value.state,
-                                                TaskState::Terminal {
-                                                    outcome: TaskOutcome::Faulted { .. }
-                                                } | TaskState::Completing {
-                                                    outcome: TaskOutcome::Faulted { .. }
-                                                }
-                                            )
-                                )
-                            })
-                        {
-                            fault.durable = true;
+        let mut subscription = ListenerGuard::new(
+            self.session
+                .subscribe_commits(Arc::new(move |publication, _| {
+                    if let Ok(mut values) = listener.faulted.lock() {
+                        for fault in values.iter_mut() {
+                            if !fault.durable
+                                && publication.changes.iter().any(|change| {
+                                    matches!(
+                                        change,
+                                        CommitChange::Table(StorageWrite::Task { value })
+                                            if value.id == fault.record.id
+                                                && matches!(
+                                                    value.state,
+                                                    TaskState::Terminal {
+                                                        outcome: TaskOutcome::Faulted { .. }
+                                                    } | TaskState::Completing {
+                                                        outcome: TaskOutcome::Faulted { .. }
+                                                    }
+                                                )
+                                    )
+                                })
+                            {
+                                fault.durable = true;
+                            }
                         }
                     }
+                })),
+            move || {
+                if let Ok(mut values) = cleanup.faulted.lock() {
+                    values.retain(|fault| fault.durable || fault.reserve_id != reserve_id);
                 }
             },
-        )));
+        );
         let result = self
             .session
             .commit_with(
                 commit_fn(move |tx| {
                     let this = Arc::clone(&this);
                     let out = Arc::clone(&out_commit);
-                    Box::pin(async move { this.reserve_in(tx, &out).await })
+                    Box::pin(async move { this.reserve_in(tx, &out, reserve_id).await })
                 }),
                 &self.context,
                 None,
@@ -2850,6 +2871,7 @@ impl SchedulerInner {
         self: &Arc<Self>,
         tx: &mut Transaction,
         out: &Arc<Mutex<Vec<Reservation>>>,
+        reserve_id: u64,
     ) -> SessionResult<()> {
         self.session.wait_for_all_writers().await?;
         if !self.enabled.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) {
@@ -2938,6 +2960,7 @@ impl SchedulerInner {
                         record,
                         message,
                         durable: false,
+                        reserve_id,
                     });
                 }
                 continue;
@@ -5328,11 +5351,17 @@ mod tests {
     fn listener_guard_unsubscribes_on_drop() {
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&called);
-        let guard = ListenerGuard::new(Subscription::new(move || {
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        }));
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_flag = Arc::clone(&cleaned);
+        let guard = ListenerGuard::new(
+            Subscription::new(move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+            move || cleanup_flag.store(true, std::sync::atomic::Ordering::SeqCst),
+        );
         drop(guard);
         assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

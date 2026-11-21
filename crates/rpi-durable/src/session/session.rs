@@ -1439,6 +1439,8 @@ impl SessionImpl {
             return;
         }
         let mut timer = None;
+        // A poisoned lock means the deferred state is unrecoverable; the
+        // Session is already failing, so no timer is armed.
         if let Ok(mut deferred) = self.deferred.lock() {
             if let Some(mut held) = remaining {
                 if held.deadline != previous_deadline {
