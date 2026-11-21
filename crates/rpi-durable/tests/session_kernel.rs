@@ -1472,6 +1472,126 @@ async fn outcomes_after_an_earlier_storage_failure_are_session_failed() {
     }
 }
 
+/// A cache miss is fenced behind earlier outcomes (upstream `#enqueue`): an
+/// unrelated, never-loaded document must not read through an admitted failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_of_an_uncached_unrelated_key_is_fenced_behind_an_earlier_failure() {
+    let harness = open_test_session();
+    let gate = harness.storage.hold_commits();
+    harness
+        .storage
+        .fail_next_commit_after_receipt(StorageError::message("snapshot fence"));
+    let first = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .commit(
+                    commit_fn(|tx| {
+                        Box::pin(async move {
+                            tx.doc(counter(), DocOwner::Session, None).await?.write()?["count"] =
+                                serde_json::json!(1);
+                            Ok(())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    gate.entered().await;
+    let snapshot = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .snapshot(
+                    session_family(),
+                    DocOwner::Family("unrelated"),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !snapshot.is_finished(),
+        "a cache-miss snapshot passed an admitted failure"
+    );
+    gate.release();
+    assert!(matches!(
+        first.await.unwrap(),
+        Err(SessionError::Storage(_))
+    ));
+    assert!(matches!(
+        snapshot.await.unwrap(),
+        Err(SessionError::Failed { cause }) if cause == "snapshot fence"
+    ));
+}
+
+/// A deferred commit is an outcome too: after an earlier storage failure it
+/// must be delivered as `SessionFailed`, not as a held success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_commit_after_an_earlier_failure_is_session_failed() {
+    let harness = open_test_session();
+    let conversation = create_conversation(&harness.session).await;
+    let gate = harness.storage.hold_commits();
+    harness
+        .storage
+        .fail_next_commit_after_receipt(StorageError::message("first deferred failure"));
+    let first = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .commit(
+                    commit_fn(|tx| {
+                        Box::pin(async move {
+                            tx.doc(counter(), DocOwner::Session, None).await?.write()?["count"] =
+                                serde_json::json!(1);
+                            Ok(())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                )
+                .await
+        }
+    });
+    gate.entered().await;
+    let deferred = tokio::spawn({
+        let session = Arc::clone(&harness.session);
+        async move {
+            session
+                .commit_with_options(
+                    commit_fn(move |tx| {
+                        Box::pin(async move {
+                            tx.doc(live(), DocOwner::Conversation(conversation), None)
+                                .await?
+                                .write()?["message"] = serde_json::json!("held");
+                            Ok(())
+                        })
+                    }),
+                    &BACKGROUND_CONTEXT,
+                    None,
+                    CommitOptions {
+                        persistence: Some(CommitPersistence::Deferred {
+                            within_ms: Some(60_000.0),
+                        }),
+                    },
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!deferred.is_finished(), "deferred outcome passed the gate");
+    gate.release();
+    assert!(matches!(
+        first.await.unwrap(),
+        Err(SessionError::Storage(_))
+    ));
+    assert!(matches!(
+        deferred.await.unwrap(),
+        Err(SessionError::Failed { cause }) if cause == "first deferred failure"
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_part_gate_opens_only_after_the_session_has_failed() {
     let harness = open_test_session();

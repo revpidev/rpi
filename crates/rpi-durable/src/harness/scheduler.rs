@@ -459,6 +459,12 @@ struct AbortCommit {
 }
 
 /// Shared scheduler state. Methods take `self: &Arc<Self>` so they can spawn.
+struct FaultedTask {
+    record: TaskRecord,
+    message: String,
+    durable: bool,
+}
+
 struct SchedulerInner {
     session: Arc<SessionImpl>,
     storage: Arc<dyn Storage>,
@@ -492,7 +498,7 @@ struct SchedulerInner {
     full_idle_checks: AtomicU64,
     candidate_visits: AtomicU64,
     invocations: Mutex<BTreeMap<TaskId, Arc<Invocation>>>,
-    faulted: Mutex<Vec<(TaskRecord, String)>>,
+    faulted: Mutex<Vec<FaultedTask>>,
     task_waiters: Waiters<TaskId, SettledTask<JsonValue>>,
     idle_waiters: Waiters<Option<ConversationId>, ()>,
     /// Definition whose migration failed per task; retried only for another definition.
@@ -2717,9 +2723,19 @@ impl SchedulerInner {
         let faulted = self
             .faulted
             .lock()
-            .map(|mut values| std::mem::take(&mut *values))
+            .ok()
+            .map(|mut values| {
+                let all = std::mem::take(&mut *values);
+                let (ready, pending): (Vec<_>, Vec<_>) =
+                    all.into_iter().partition(|fault| fault.durable);
+                *values = pending;
+                ready
+            })
             .unwrap_or_default();
-        for (record, message) in faulted {
+        for FaultedTask {
+            record, message, ..
+        } in faulted
+        {
             self.report_error(
                 message,
                 crate::harness::types::ReportInfo::new(
@@ -2740,6 +2756,38 @@ impl SchedulerInner {
         let out: Arc<Mutex<Vec<Reservation>>> = Arc::new(Mutex::new(Vec::new()));
         let this = Arc::clone(self);
         let out_commit = Arc::clone(&out);
+        // A restart-limit fault is recorded in the commit callback, before
+        // storage. Mark it durable from the publication of the terminal task;
+        // the actual report stays after the commit (reserve) or after the
+        // waiter's terminal publication, as upstream `#reserve` does.
+        let listener = Arc::clone(self);
+        let subscription = self
+            .session
+            .subscribe_commits(Arc::new(move |publication, _| {
+                if let Ok(mut values) = listener.faulted.lock() {
+                    for fault in values.iter_mut() {
+                        if !fault.durable
+                            && publication.changes.iter().any(|change| {
+                                matches!(
+                                    change,
+                                    CommitChange::Table(StorageWrite::Task { value })
+                                        if value.id == fault.record.id
+                                            && matches!(
+                                                value.state,
+                                                TaskState::Terminal {
+                                                    outcome: TaskOutcome::Faulted { .. }
+                                                } | TaskState::Completing {
+                                                    outcome: TaskOutcome::Faulted { .. }
+                                                }
+                                            )
+                                )
+                            })
+                        {
+                            fault.durable = true;
+                        }
+                    }
+                }
+            }));
         let result = self
             .session
             .commit_with(
@@ -2752,6 +2800,7 @@ impl SchedulerInner {
                 None,
             )
             .await;
+        subscription.unsubscribe();
         let reservations = out
             .lock()
             .map(|mut values| std::mem::take(&mut *values))
@@ -2864,7 +2913,11 @@ impl SchedulerInner {
                 )
                 .await?;
                 if let Ok(mut values) = self.faulted.lock() {
-                    values.push((record, message));
+                    values.push(FaultedTask {
+                        record,
+                        message,
+                        durable: false,
+                    });
                 }
                 continue;
             }

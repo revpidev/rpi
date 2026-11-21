@@ -38,6 +38,11 @@ use crate::session::{
 use crate::timers::Timers;
 use crate::types::{ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, Storage};
 
+tokio::task_local! {
+    /// Set while a fenced job runs on the mutation line in this task.
+    static ON_LINE: ();
+}
+
 /// Wall clock used for task lifecycle times (upstream `Date.now`).
 pub type NowFn = Arc<dyn Fn() -> f64 + Send + Sync>;
 
@@ -625,6 +630,11 @@ impl SessionImpl {
         document
     }
 
+    /// Whether the caller is already running a fenced job on the mutation line.
+    fn is_on_line(&self) -> bool {
+        ON_LINE.try_with(|_| ()).is_ok()
+    }
+
     /// Set the default deferred persistence deadline; `None` means no timer.
     pub fn set_persist_within_ms(&self, within_ms: Option<f64>) {
         if let Ok(mut slot) = self.persist_within_ms.lock() {
@@ -1104,9 +1114,11 @@ impl SessionImpl {
         let guard = self.line.lock().await;
         let index = self.next_job_index.fetch_add(1, Ordering::SeqCst);
         let mut job = LineJob::new(&self, index);
-        let result = std::panic::AssertUnwindSafe(
-            Arc::clone(&self).run_commit_on_line(guard, &mut job, change, context, scope, options),
-        )
+        let result = std::panic::AssertUnwindSafe(ON_LINE.scope((), async {
+            Arc::clone(&self)
+                .run_commit_on_line(guard, &mut job, change, context, scope, options)
+                .await
+        }))
         .catch_unwind()
         .await
         .unwrap_or_else(|payload| {
@@ -1204,6 +1216,14 @@ impl SessionImpl {
                             .map(|_| ()),
                         JobOutcome::Discard => {
                             tx.discard();
+                            let has_deferred = this
+                                .deferred
+                                .lock()
+                                .ok()
+                                .is_some_and(|deferred| deferred.is_some());
+                            if !has_deferred {
+                                this.deferred_pending.store(false, Ordering::SeqCst);
+                            }
                             Ok(())
                         }
                         JobOutcome::Stored(_) => unreachable!(),
@@ -1745,12 +1765,12 @@ impl SessionImpl {
             let guard = this.line.lock().await;
             let index = this.next_job_index.fetch_add(1, Ordering::SeqCst);
             let line_job = LineJob::new(&this, index);
-            let result = std::panic::AssertUnwindSafe(async {
+            let result = std::panic::AssertUnwindSafe(ON_LINE.scope((), async {
                 let _guard = guard;
                 let _current = CurrentJobGuard::new(&this, index, &line_job.outcome);
                 this.assert_healthy()?;
                 job().await
-            })
+            }))
             .catch_unwind()
             .await
             .unwrap_or_else(|payload| {
@@ -1795,10 +1815,35 @@ impl SessionImpl {
         address: DocumentAddress,
         context: &Context,
     ) -> SessionResult<Option<JsonObject>> {
-        let _guard = self.line.lock().await;
-        self.assert_healthy()?;
+        self.assert_usable()?;
+        // A read is fenced behind earlier outcomes, including a cache hit:
+        // the load still waits for the target key's write gate.
+        if self.is_on_line() {
+            return self
+                .snapshot_load_on_line(definition, &address_id, &address, context)
+                .await;
+        }
+        let this = Arc::clone(self);
+        let definition = Arc::clone(definition);
+        let context = context.clone();
+        self.read_on_line(move || {
+            Box::pin(async move {
+                this.snapshot_load_on_line(&definition, &address_id, &address, &context)
+                    .await
+            })
+        })
+        .await
+    }
+
+    async fn snapshot_load_on_line(
+        self: &Arc<Self>,
+        definition: &Arc<crate::documents::DocDefinition>,
+        address_id: &str,
+        address: &DocumentAddress,
+        context: &Context,
+    ) -> SessionResult<Option<JsonObject>> {
         let loaded = self
-            .load_document(definition, &address_id, &address, context)
+            .load_document(definition, address_id, address, context)
             .await?;
         let Some(loaded) = loaded else {
             return Ok(None);
@@ -1838,10 +1883,33 @@ impl SessionImpl {
         address: DocumentAddress,
         context: &Context,
     ) -> SessionResult<Option<crate::chord::state::AttachedReplicatedState>> {
-        let _guard = self.line.lock().await;
-        self.assert_healthy()?;
+        self.assert_usable()?;
+        if self.is_on_line() {
+            return self
+                .document_state_on_line(definition, &address_id, &address, context)
+                .await;
+        }
+        let this = Arc::clone(self);
+        let definition = Arc::clone(definition);
+        let context = context.clone();
+        self.read_on_line(move || {
+            Box::pin(async move {
+                this.document_state_on_line(&definition, &address_id, &address, &context)
+                    .await
+            })
+        })
+        .await
+    }
+
+    async fn document_state_on_line(
+        self: &Arc<Self>,
+        definition: &Arc<crate::documents::DocDefinition>,
+        address_id: &str,
+        address: &DocumentAddress,
+        context: &Context,
+    ) -> SessionResult<Option<crate::chord::state::AttachedReplicatedState>> {
         let loaded = self
-            .load_document(definition, &address_id, &address, context)
+            .load_document(definition, address_id, address, context)
             .await?;
         let Some(loaded) = loaded else {
             return Ok(None);
@@ -1886,9 +1954,9 @@ impl SessionImpl {
             subscription_close.unsubscribe();
             return Err(error);
         }
-        self.attach_document(&address_id, record_id);
+        self.attach_document(address_id, record_id);
         let weak = Arc::downgrade(self);
-        let attached = address_id.clone();
+        let attached = address_id.to_string();
         source.set_release(Box::new(move || {
             subscription_commit.unsubscribe();
             subscription_close.unsubscribe();
@@ -1997,13 +2065,51 @@ impl SessionImpl {
         if signal.as_ref().is_some_and(|signal| signal.is_cancelled()) {
             return Err(SessionError::Aborted);
         }
-        let _guard = self.line.lock().await;
-        self.assert_healthy()?;
+        if self.is_on_line() {
+            return self
+                .watch_doc_on_line(
+                    definition,
+                    &address_id,
+                    &address,
+                    context,
+                    signal,
+                    owner_task,
+                )
+                .await;
+        }
+        let this = Arc::clone(self);
+        let definition = Arc::clone(definition);
+        let context = context.clone();
+        self.read_on_line(move || {
+            Box::pin(async move {
+                this.watch_doc_on_line(
+                    &definition,
+                    &address_id,
+                    &address,
+                    &context,
+                    signal,
+                    owner_task,
+                )
+                .await
+            })
+        })
+        .await
+    }
+
+    async fn watch_doc_on_line(
+        self: &Arc<Self>,
+        definition: &Arc<crate::documents::DocDefinition>,
+        address_id: &str,
+        address: &DocumentAddress,
+        context: &Context,
+        signal: Option<AbortSignal>,
+        owner_task: Option<crate::ids::TaskId>,
+    ) -> SessionResult<Option<CommittedWatch>> {
         if signal.as_ref().is_some_and(|signal| signal.is_cancelled()) {
             return Err(SessionError::Aborted);
         }
         let loaded = self
-            .load_document(definition, &address_id, &address, context)
+            .load_document(definition, address_id, address, context)
             .await?;
         if signal.as_ref().is_some_and(|signal| signal.is_cancelled()) {
             return Err(SessionError::Aborted);
@@ -2018,7 +2124,7 @@ impl SessionImpl {
         let observed_id = Arc::new(AtomicU64::new(loaded.record.id.get()));
         let record_id = loaded.record.id;
         let watch_commit = watch.clone();
-        let watched_address = address_id.clone();
+        let watched_address = address_id.to_string();
         let watch_owner = watch.clone();
         let watch_session = Arc::downgrade(self);
         let detach_id = Arc::clone(&observed_id);
@@ -2096,9 +2202,9 @@ impl SessionImpl {
             subscription_close.unsubscribe();
             return Err(error);
         }
-        self.attach_document(&address_id, record_id);
+        self.attach_document(address_id, record_id);
         let weak = Arc::downgrade(self);
-        let attached = address_id.clone();
+        let attached = address_id.to_string();
         watch.set_detach(Box::new(move || {
             subscription_commit.unsubscribe();
             subscription_close.unsubscribe();
@@ -2149,14 +2255,37 @@ impl SessionImpl {
     }
 
     async fn snapshot_as_of_resolved(
-        &self,
+        self: &Arc<Self>,
         definition: &Arc<crate::documents::DocDefinition>,
         conversation: ConversationId,
         at: EntryId,
         context: &Context,
     ) -> SessionResult<Option<JsonObject>> {
-        let _guard = self.line.lock().await;
-        self.assert_healthy()?;
+        self.assert_usable()?;
+        if self.is_on_line() {
+            return self
+                .snapshot_as_of_on_line(definition, conversation, at, context)
+                .await;
+        }
+        let this = Arc::clone(self);
+        let definition = Arc::clone(definition);
+        let context = context.clone();
+        self.read_on_line(move || {
+            Box::pin(async move {
+                this.snapshot_as_of_on_line(&definition, conversation, at, &context)
+                    .await
+            })
+        })
+        .await
+    }
+
+    async fn snapshot_as_of_on_line(
+        self: &Arc<Self>,
+        definition: &Arc<crate::documents::DocDefinition>,
+        conversation: ConversationId,
+        at: EntryId,
+        context: &Context,
+    ) -> SessionResult<Option<JsonObject>> {
         let stored_entry = self
             .storage()
             .entry_in_conversation(conversation, at, context)
