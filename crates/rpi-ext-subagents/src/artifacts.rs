@@ -584,18 +584,34 @@ fn newest_write(path: &Path) -> Option<std::time::SystemTime> {
 /// protection). The run id is checked first: a queued run may not have
 /// recorded its fork session file yet, and upstream protects by run id.
 fn active_fork_runs() -> ActiveForkRuns {
+    active_fork_runs_in(&crate::runner::background::async_runs_dir())
+}
+
+/// `asyncRunActive` (artifacts.ts:363-372 @ v0.88.1): a missing status is not
+/// active, but an unreadable or unparseable status may still belong to a live
+/// run, so it protects the copy (upstream throws and the catch returns true).
+fn active_fork_runs_in(runs: &Path) -> ActiveForkRuns {
     let mut active = ActiveForkRuns::default();
-    let runs = crate::runner::background::async_runs_dir();
     let Ok(entries) = std::fs::read_dir(runs) else {
         return active;
     };
     for entry in entries.flatten() {
+        let run_id = entry.file_name().to_string_lossy().to_string();
         let status_path = entry.path().join("status.json");
-        let Ok(raw) = std::fs::read_to_string(&status_path) else {
-            continue;
+        let raw = match std::fs::read_to_string(&status_path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                active.run_ids.insert(run_id);
+                continue;
+            }
         };
-        let Ok(status) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
+        let status = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(status) => status,
+            Err(_) => {
+                active.run_ids.insert(run_id);
+                continue;
+            }
         };
         if !matches!(
             status["state"].as_str().unwrap_or(""),
@@ -603,9 +619,7 @@ fn active_fork_runs() -> ActiveForkRuns {
         ) {
             continue;
         }
-        active
-            .run_ids
-            .insert(entry.file_name().to_string_lossy().to_string());
+        active.run_ids.insert(run_id);
         for step in status["steps"].as_array().into_iter().flatten() {
             if let Some(file) = step["sessionFile"].as_str()
                 && let Ok(path) = PathBuf::from(file).canonicalize()
@@ -772,6 +786,40 @@ mod tests {
             );
             assert!(!stale.exists(), "unreferenced idle copies are removed");
             let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// S42/upstream `asyncRunActive`: a status that exists but cannot be
+        /// read or parsed may still belong to a live run, so it protects the
+        /// copy; a missing status is not active.
+        #[test]
+        fn fork_cleanup_treats_an_unreadable_status_as_active() {
+            let base = std::env::temp_dir().join(format!("rpi-fork-status-{}", std::process::id()));
+            let runs = std::env::temp_dir().join(format!("rpi-fork-runs-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&runs);
+            let broken = fork_run(
+                &base,
+                "--proj--",
+                "parent-stem",
+                "broken-status",
+                30 * 86_400,
+            );
+            let missing = fork_run(
+                &base,
+                "--proj--",
+                "parent-stem",
+                "missing-status",
+                30 * 86_400,
+            );
+            std::fs::create_dir_all(runs.join("broken-status")).unwrap();
+            std::fs::write(runs.join("broken-status").join("status.json"), "{not json").unwrap();
+            // `missing-status` has no run folder at all: not active.
+            let active = active_fork_runs_in(&runs);
+            cleanup_fork_copies_at(&base, 7, &active);
+            assert!(broken.exists(), "an unreadable status protects the copy");
+            assert!(!missing.exists(), "a missing status is not active");
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&runs);
         }
 
         /// `cleanupDays: 0` disables the sweep (upstream `cleanupDays` gate).
