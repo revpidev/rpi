@@ -484,11 +484,35 @@ fn has_reference_definitions(source: &str, code_block_lines: &[(usize, usize)]) 
         {
             continue;
         }
-        if is_reference_definition(line) {
+        if is_reference_definition(line) || opens_unterminated_label(line) {
             return true;
         }
     }
     false
+}
+
+/// A line that starts a link label without closing it on the same line: the
+/// label (and its `]:`) may continue on the next line, which CommonMark
+/// accepts. Conservative: an unterminated `[` in ordinary prose also disables
+/// block reuse, which only loses the optimization.
+fn opens_unterminated_label(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut index = content_start(line);
+    while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'[') {
+        return false;
+    }
+    let mut cursor = index + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor += 2,
+            b']' => return false,
+            _ => cursor += 1,
+        }
+    }
+    true
 }
 
 /// 1-based inclusive source line ranges of every parsed code block (fenced or
@@ -4326,6 +4350,20 @@ mod tests {
             "> ```\n> unclosed\n\n[a][x]\n\n[x]: https://one.example",
             "> ```\n> unclosed\n\n[a][x]\n\n[x]: https://two.example",
         );
+        // A link label may span lines (CommonMark); the definition must still
+        // disable block reuse.
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n[x\n]: https://one.example",
+            "[a][x]\n\n[x\n]: https://two.example",
+        );
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n> [x\n> ]: https://one.example",
+            "[a][x]\n\n> [x\n> ]: https://two.example",
+        );
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n- [x\n  ]: https://one.example",
+            "[a][x]\n\n- [x\n  ]: https://two.example",
+        );
 
         crate::terminal_image::set_capabilities(original);
     }
@@ -4362,6 +4400,10 @@ mod tests {
         // Escaped closing brackets do not end the label.
         assert!(has_reference_definitions(
             "[x\\]]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "[x\n]: https://example.com\n",
             &[]
         ));
         assert!(!has_reference_definitions("plain [x] text\n", &[]));
