@@ -270,6 +270,8 @@ pub struct Image {
     cache: RefCell<Option<ImageCache>>,
     /// Monotonic revision for [`Component::cache_revision`] (V19-04 FR-E).
     revision: Cell<u64>,
+    /// Last observed capabilities generation; a change bumps `revision`.
+    last_capability_generation: Cell<u64>,
 }
 
 impl Image {
@@ -303,6 +305,7 @@ impl Image {
             png_data: RefCell::new(None),
             cache: RefCell::new(None),
             revision: Cell::new(0),
+            last_capability_generation: Cell::new(0),
         }
     }
 
@@ -439,8 +442,14 @@ impl Component for Image {
 
     fn cache_revision(&self) -> Option<u64> {
         // The rendered image depends on the terminal capabilities (protocol)
-        // as well as the component's own state.
-        Some(self.revision.get().wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ capabilities_generation())
+        // as well as the component's own state. Keep the returned value
+        // monotonic: a generation change bumps the local revision.
+        let capabilities = capabilities_generation();
+        if self.last_capability_generation.get() != capabilities {
+            self.last_capability_generation.set(capabilities);
+            self.revision.set(self.revision.get().wrapping_add(1));
+        }
+        Some(self.revision.get())
     }
 }
 
@@ -912,5 +921,31 @@ mod tests {
         cache.insert(PngKey::new("new", "image/jpeg"), None);
         assert!(cache.get(&first_key).is_some());
         assert!(cache.get(&PngKey::new("image-1", "image/jpeg")).is_none());
+    }
+
+    #[test]
+    fn cache_revision_is_monotonic_and_tracks_capabilities() {
+        let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let original = crate::terminal_image::get_capabilities();
+        let image = Image::new(
+            JPEG,
+            "image/jpeg",
+            ImageTheme {
+                fallback_color: Box::new(|value: &str| value.to_string()),
+            },
+            None,
+            None,
+        );
+        let first = image.cache_revision().expect("Image is trusted");
+        assert!(image.cache_revision().expect("revision") >= first);
+
+        crate::terminal_image::set_capabilities(no_image_caps());
+        let second = image.cache_revision().expect("revision");
+        assert!(
+            second > first,
+            "a capabilities-generation change must bump the revision"
+        );
+
+        crate::terminal_image::set_capabilities(original);
     }
 }

@@ -48,9 +48,29 @@ use crate::core::themes::Theme;
 /// indented code is not a fence. The first info word must be `mermaid`
 /// (ASCII case-insensitive).
 fn contains_mermaid_candidate(source: &str) -> bool {
-    source
+    let precise = source
         .split_inclusive('\n')
-        .any(|line| fence_info_word(line).is_some_and(|word| word.eq_ignore_ascii_case("mermaid")))
+        .any(|line| fence_info_word(line).is_some_and(|word| word.eq_ignore_ascii_case("mermaid")));
+    // Fallback (conservative): a real Mermaid fence's info string always
+    // contains the word. This catches container/nested-list indentation the
+    // line scanner cannot model without a full CommonMark block parser. False
+    // positives only run the normal parse and return the source unchanged.
+    precise || contains_ascii_case_insensitive(source, "mermaid")
+}
+
+/// Allocation-free ASCII case-insensitive substring scan.
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    })
 }
 
 /// The first info word of a fence that starts at `line`, if any.
@@ -68,11 +88,11 @@ fn fence_info_word(line: &str) -> Option<&str> {
         match bytes.get(index) {
             Some(b'>') => {
                 index += 1;
-                if bytes.get(index) == Some(&b' ') {
+                if matches!(bytes.get(index), Some(b' ' | b'\t')) {
                     index += 1;
                 }
             }
-            Some(b'-' | b'*' | b'+') if bytes.get(index + 1) == Some(&b' ') => {
+            Some(b'-' | b'*' | b'+') if matches!(bytes.get(index + 1), Some(b' ' | b'\t')) => {
                 index += 2;
             }
             Some(b'0'..=b'9') => {
@@ -81,7 +101,7 @@ fn fence_info_word(line: &str) -> Option<&str> {
                     index += 1;
                 }
                 if matches!(bytes.get(index), Some(b'.' | b')'))
-                    && bytes.get(index + 1) == Some(&b' ')
+                    && matches!(bytes.get(index + 1), Some(b' ' | b'\t'))
                 {
                     index += 2;
                 } else {
@@ -104,8 +124,8 @@ fn fence_info_word(line: &str) -> Option<&str> {
         return None;
     }
     index += fence_len;
-    // Optional spaces, then the first info word.
-    while bytes.get(index) == Some(&b' ') {
+    // Optional spaces/tabs, then the first info word.
+    while matches!(bytes.get(index), Some(b' ' | b'\t')) {
         index += 1;
     }
     let word_start = index;
@@ -178,7 +198,13 @@ impl MermaidTransformCache {
     }
 
     fn insert(&mut self, key: MermaidTransformKey, value: Arc<str>) {
-        self.bytes += key.source.len() + value.len();
+        let retained = key.source.len() + value.len();
+        // A single entry larger than the whole budget cannot satisfy it;
+        // leave it uncached (the next render re-parses it).
+        if retained > MERMAID_CACHE_MAX_BYTES {
+            return;
+        }
+        self.bytes += retained;
         self.entries.push_back((key, value));
         while self.entries.len() > MERMAID_CACHE_MAX_ENTRIES
             || (self.bytes > MERMAID_CACHE_MAX_BYTES && self.entries.len() > 1)
@@ -719,26 +745,58 @@ mod tests {
             "1. ```mermaid\ngraph TD\n```",
             "  - ~~~ mermaid\ngraph TD\n~~~",
             "paragraph\n\n```mermaid\ngraph TD\n```\n",
+            ">\t```mermaid\ngraph TD\n```",
+            "-\t~~~mermaid\ngraph TD\n~~~",
+            "- a\n  - b\n\n    ```mermaid\ngraph TD\n```",
         ] {
             assert!(
                 contains_mermaid_candidate(source),
                 "must detect a Mermaid candidate in {source:?}"
             );
         }
-        // Four-space indentation is an indented code block, never a fence.
+        // Four-space indentation is an indented code block, never a fence for
+        // the precise scanner. The conservative substring fallback may still
+        // classify it as a candidate (it then parses and returns the source
+        // unchanged), so the precise scanner is asserted directly.
+        for line in [
+            "    ```mermaid",
+            "```rust",
+            "```",
+            "```mermaidx",
+            "```mermaidish",
+        ] {
+            assert!(
+                !fence_info_word(line).is_some_and(|word| word.eq_ignore_ascii_case("mermaid")),
+                "precise scanner must not treat {line:?} as a Mermaid fence"
+            );
+        }
+        // No word occurrence: the fallback does not fire either.
         for source in [
-            "    ```mermaid\ngraph TD\n    ```",
             "```rust\nfn main() {}\n```",
-            "```\nmermaid\n```",
-            "```mermaidx\ngraph TD\n```",
-            "plain prose mentioning mermaid",
-            "```mermaidish\ngraph TD\n```",
+            "```\nplain code\n```",
+            "plain prose without the word",
         ] {
             assert!(
                 !contains_mermaid_candidate(source),
-                "must not treat {source:?} as a Mermaid fence"
+                "must not treat {source:?} as a Mermaid candidate"
             );
         }
+        // Conservative fallback: a word occurrence without a valid fence is
+        // still a candidate (false positives only run the normal parse).
+        assert!(contains_mermaid_candidate(
+            "    ```mermaid\ngraph TD\n    ```"
+        ));
+    }
+
+    #[test]
+    fn prose_mentioning_mermaid_is_a_false_positive_but_stays_unchanged() {
+        MERMAID_PARSE_COUNT.with(|count| count.set(0));
+        let f = create_mermaid_markdown_transformer(move || MermaidRenderingMode::Streaming, None);
+        let prose = "plain prose mentioning mermaid without a fence\n".to_string();
+        assert_eq!(apply(&f, prose.clone(), false, "assistant", 100), prose);
+        // The fallback candidate scan runs the normal parse; it must not
+        // rewrite prose.
+        assert_eq!(MERMAID_PARSE_COUNT.with(|count| count.get()), 1);
     }
 
     #[test]
@@ -787,6 +845,24 @@ mod tests {
             );
         }
         assert!(cache.entries.len() <= MERMAID_CACHE_MAX_ENTRIES);
+        assert!(cache.bytes <= MERMAID_CACHE_MAX_BYTES);
+
+        // A single source larger than the whole budget is not retained.
+        let large = format!("```mermaid\n{}\n```", "x".repeat(MERMAID_CACHE_MAX_BYTES));
+        let before = cache.entries.len();
+        cache.insert(
+            MermaidTransformKey {
+                source: large.clone(),
+                width: 100,
+                message_type: "assistant".to_string(),
+                is_streaming: true,
+                mode: MermaidRenderingMode::Streaming,
+                theme: 0,
+                capability_generation: 0,
+            },
+            Arc::from(large.as_str()),
+        );
+        assert_eq!(cache.entries.len(), before);
         assert!(cache.bytes <= MERMAID_CACHE_MAX_BYTES);
     }
 

@@ -929,6 +929,9 @@ mod tests {
         let theme = theme();
         let state = RendererStateSlot::default();
         let context = context(&state);
+        let _generation_guard = crate::core::themes::THEME_GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let args = json!({"code": "await tools.read({});"});
         reset_highlight_call_count();
         let first = CodemodeToolRenderer

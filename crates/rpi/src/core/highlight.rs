@@ -541,9 +541,11 @@ pub const GRAMMAR_GENERATION: u64 = 1;
 struct HighlightEntry {
     code: String,
     lang: Option<String>,
-    /// Identity of the `Theme` instance; renderers cannot tell a theme change
-    /// from any other redraw, so the highlighter compares what its result
-    /// depends on.
+    /// Monotonic theme generation (the primary identity; a bare pointer is
+    /// only a secondary fast check).
+    theme_generation: u64,
+    /// Identity of the `Theme` instance; a different instance with the same
+    /// generation still recomputes.
     theme: usize,
     grammar_generation: u64,
     lines: Arc<[String]>,
@@ -575,6 +577,7 @@ impl CodeHighlighter {
     /// changed.
     pub fn highlight(&self, code: &str, lang: Option<&str>, theme: &Theme) -> Arc<[String]> {
         let theme_identity = theme as *const Theme as usize;
+        let theme_generation = crate::core::themes::theme_generation();
         let mut last = self
             .last
             .lock()
@@ -582,6 +585,7 @@ impl CodeHighlighter {
         if let Some(entry) = last.as_ref()
             && entry.code == code
             && entry.lang.as_deref() == lang
+            && entry.theme_generation == theme_generation
             && entry.theme == theme_identity
             && entry.grammar_generation == GRAMMAR_GENERATION
         {
@@ -591,6 +595,7 @@ impl CodeHighlighter {
         *last = Some(HighlightEntry {
             code: code.to_string(),
             lang: lang.map(str::to_string),
+            theme_generation,
             theme: theme_identity,
             grammar_generation: GRAMMAR_GENERATION,
             lines: Arc::clone(&lines),
@@ -980,6 +985,9 @@ mod tests {
         let theme = theme();
         let other_theme = load_theme("light", None).expect("builtin light theme");
         let highlighter = CodeHighlighter::new();
+        let _generation_guard = crate::core::themes::THEME_GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         reset_highlight_call_count();
 
         let first = highlighter.highlight("fn main() {}", Some("rust"), &theme);
@@ -997,5 +1005,15 @@ mod tests {
         // A different theme instance is a different result.
         let _ = highlighter.highlight("fn main() { 1 }", Some("python"), &other_theme);
         assert_eq!(highlight_call_count(), 4);
+
+        // A theme-generation bump (theme reload/apply) invalidates the last
+        // result even if the same instance were passed again.
+        drop(_generation_guard);
+        let before = crate::core::themes::theme_generation();
+        let _ = load_theme("dark", None).expect("builtin dark theme");
+        assert!(crate::core::themes::theme_generation() > before);
+        let before_calls = highlight_call_count();
+        let _ = highlighter.highlight("fn main() { 1 }", Some("python"), &other_theme);
+        assert_eq!(highlight_call_count(), before_calls + 1);
     }
 }

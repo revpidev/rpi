@@ -5551,6 +5551,7 @@ impl InteractiveUi {
             .session()
             .settings_manager(|settings| settings.get_code_block_indent());
         *lock(&self.active_theme_name) = theme.name.clone();
+        crate::core::themes::bump_theme_generation();
         *lock(&self.theme) = Arc::clone(&theme);
         *lock(&self.scrollbar_theme) = Arc::clone(&theme);
         let markdown = {

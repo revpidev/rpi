@@ -11,8 +11,9 @@
 //!   component stores its own clone.
 
 use std::boxed::Box as StdBox;
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use rpi_ai::types::{AssistantContent, AssistantMessage, SharedAssistantMessage, StopReason};
@@ -70,14 +71,16 @@ pub struct AssistantMessageComponent {
     /// Lazy `isStreaming` source read by the transform closure, so one
     /// Markdown instance survives `true -> false`.
     streaming_flag: Arc<AtomicBool>,
-    /// Monotonic streaming-flag generation (part of the Markdown revision).
-    streaming_generation: Arc<AtomicU64>,
     /// Whether the built-in transform's revision source is trusted. Set by
     /// the interactive mode (the Mermaid transformer is the only built-in
     /// one); opaque extension transformers keep `cache_revision()` at None.
     trust_transform_revision: bool,
     /// Monotonic rebuild revision for [`Component::cache_revision`].
     revision: u64,
+    /// Monotonic aggregate returned by `cache_revision()`.
+    aggregated_revision: Cell<u64>,
+    /// Last combined child/rebuild value; a change bumps the aggregate.
+    last_combined_revision: Cell<Option<u64>>,
     has_tool_calls: bool,
     theme: Arc<Theme>,
     /// Extension-registered Markdown transformers (assistant-message.ts:20).
@@ -262,9 +265,10 @@ impl AssistantMessageComponent {
             last_global_key: None,
             markdown_slots: Vec::new(),
             streaming_flag: Arc::new(AtomicBool::new(false)),
-            streaming_generation: Arc::new(AtomicU64::new(0)),
             trust_transform_revision: false,
             revision: 0,
+            aggregated_revision: Cell::new(0),
+            last_combined_revision: Cell::new(None),
             has_tool_calls: false,
             theme,
             markdown_transformers,
@@ -350,10 +354,7 @@ impl AssistantMessageComponent {
     pub fn update_content(&mut self, shared_message: &SharedAssistantMessage, is_streaming: bool) {
         // The transform closure reads the flag lazily (V19-04 FR-B), so a
         // stream end does not require rebuilding the Markdown instances; the
-        // generation is part of their `cache_revision()`.
-        if self.is_streaming != is_streaming {
-            self.streaming_generation.fetch_add(1, Ordering::Relaxed);
-        }
+        // flag itself is part of their transform revision.
         self.is_streaming = is_streaming;
         self.streaming_flag.store(is_streaming, Ordering::Relaxed);
 
@@ -785,11 +786,18 @@ impl Component for AssistantMessageComponent {
         // itself is a `Container` with publicly mutable children, so it
         // deliberately returns `None`; this component owns the child list and
         // aggregates it here.
-        let mut revision = self.revision;
+        let mut combined = self.revision;
         for child in &self.content_container.children {
-            revision = revision.wrapping_mul(0x0000_0100_0000_01b3) ^ child.cache_revision()?;
+            combined = combined.wrapping_mul(0x0000_0100_0000_01b3) ^ child.cache_revision()?;
         }
-        Some(revision)
+        // The hash combination is only an equality key; the returned value is
+        // a monotonic counter so consumers may compare with `>`.
+        if self.last_combined_revision.get() != Some(combined) {
+            self.last_combined_revision.set(Some(combined));
+            self.aggregated_revision
+                .set(self.aggregated_revision.get().wrapping_add(1));
+        }
+        Some(self.aggregated_revision.get())
     }
 }
 

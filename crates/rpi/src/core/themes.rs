@@ -31,7 +31,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, OnceLock};
 
 use rpi_tui::colors as tui_colors;
@@ -115,6 +115,31 @@ pub fn terminal_colors_pending() -> bool {
 /// `detectColorFgBgTheme` (theme.ts:697-705 @ b4afdddf): the last numeric
 /// `COLORFGBG` field is an ANSI index classified like Vim — 0-6 and 8 dark,
 /// 7 and 9-15 light; anything else has no answer.
+/// Monotonic generation of the active theme instance(s) (V19-04 FR-D).
+/// `CodeHighlighter` keys on it so a theme change invalidates its last result
+/// without treating a bare pointer as the only identity.
+static THEME_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Serializes generation bumps with tests that assert exact highlighter reuse
+/// (test-only; production never holds it).
+#[cfg(test)]
+pub(crate) static THEME_GENERATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Current theme generation.
+pub fn theme_generation() -> u64 {
+    THEME_GENERATION.load(AtomicOrdering::Relaxed)
+}
+
+/// Bump the theme generation (called on every successful theme construction
+/// and when the interactive mode applies a theme).
+pub(crate) fn bump_theme_generation() {
+    #[cfg(test)]
+    let _guard = THEME_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    THEME_GENERATION.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
 pub fn detect_color_fg_bg_theme(colorfgbg: Option<&str>) -> Option<TerminalTheme> {
     let background = colorfgbg?.rsplit(';').next()?.trim();
     if background.is_empty()
@@ -1963,6 +1988,7 @@ impl Theme {
                 colors.insert(token.clone(), mixed);
             }
         }
+        bump_theme_generation();
         Ok(Theme {
             name,
             source_path,

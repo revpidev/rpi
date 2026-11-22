@@ -339,6 +339,8 @@ pub struct Markdown {
     /// Blocks of the previous render, kept for one generation so a text
     /// change can reuse the blocks it did not touch (V19-04 R3.2.5).
     previous_blocks: RefCell<BlockMap>,
+    /// `render_latex` generation of `previous_blocks`; a mismatch drops them.
+    previous_blocks_render_latex: Cell<Option<bool>>,
     /// Highlighted code of the block currently being rendered (upstream
     /// `blockHighlightedCode`). Set only while `render_block` runs.
     block_highlighted_code: RefCell<Option<HashMap<HighlightKey, Arc<[String]>>>>,
@@ -465,17 +467,17 @@ fn block_raw(block: &Block<'_>, source: &str, index: &LineIndex) -> String {
 /// `Object.keys(tokens.links).length === 0` (markdown.ts @ 0f21a3319): a
 /// reference link resolves through a definition anywhere in the document, so
 /// blocks with the same source can render differently. Such documents render
-/// without block reuse. Conservative: any line outside a top-level fenced
-/// code block that starts with a reference definition disables reuse (false
-/// positives only lose the optimization).
+/// without block reuse.
+///
+/// Comrak resolves definitions inside blockquotes and list items too, so the
+/// scanner strips container prefixes before the check. Conservative: any
+/// definition-shaped line (even in an indented code block) disables reuse;
+/// false positives only lose the optimization.
 fn has_reference_definitions(source: &str) -> bool {
     let mut open_fence: Option<(u8, usize)> = None;
     for line in source.split_inclusive('\n') {
+        let start = content_start(line);
         let bytes = line.as_bytes();
-        let mut start = 0usize;
-        while start < 3 && bytes.get(start) == Some(&b' ') {
-            start += 1;
-        }
         if let Some((fence_char, fence_len)) = open_fence {
             let mut run = 0usize;
             while bytes.get(start + run) == Some(&fence_char) {
@@ -504,18 +506,70 @@ fn has_reference_definitions(source: &str) -> bool {
                 continue;
             }
         }
-        let trimmed = &line[start..];
-        if !trimmed.starts_with('[') {
-            continue;
-        }
-        let Some(close) = trimmed.find(']') else {
-            continue;
-        };
-        if close > 1 && trimmed.as_bytes().get(close + 1) == Some(&b':') {
+        if is_reference_definition(line) {
             return true;
         }
     }
     false
+}
+
+/// Byte offset where a line's content starts after up to three spaces of
+/// indentation and any blockquote/list container prefixes.
+fn content_start(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    loop {
+        let mut spaces = 0usize;
+        while spaces < 3 && bytes.get(index) == Some(&b' ') {
+            spaces += 1;
+            index += 1;
+        }
+        match bytes.get(index) {
+            Some(b'>') => {
+                index += 1;
+                if matches!(bytes.get(index), Some(b' ' | b'\t')) {
+                    index += 1;
+                }
+            }
+            Some(b'-' | b'*' | b'+') if matches!(bytes.get(index + 1), Some(b' ' | b'\t')) => {
+                index += 2;
+            }
+            Some(b'0'..=b'9') => {
+                let digits_start = index;
+                while index - digits_start < 9 && bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                    index += 1;
+                }
+                if matches!(bytes.get(index), Some(b'.' | b')'))
+                    && matches!(bytes.get(index + 1), Some(b' ' | b'\t'))
+                {
+                    index += 2;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    index
+}
+
+/// Whether a line is a reference definition (`[label]: ...`) after container
+/// prefixes and any indentation. Indented code is treated as a definition on
+/// purpose (conservative: it only disables block reuse).
+fn is_reference_definition(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut index = content_start(line);
+    while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'[') {
+        return false;
+    }
+    let rest = &line[index..];
+    let Some(close) = rest.find(']') else {
+        return false;
+    };
+    close > 1 && rest.as_bytes().get(close + 1) == Some(&b':')
 }
 
 /// ECMA-262 `\s` (WhiteSpace + LineTerminator + U+FEFF); used for marked
@@ -1492,6 +1546,7 @@ impl Markdown {
             default_style_prefix: RefCell::new(None),
             cache: RefCell::new(None),
             previous_blocks: RefCell::new(BlockMap::new()),
+            previous_blocks_render_latex: Cell::new(None),
             block_highlighted_code: RefCell::new(None),
             revision: Cell::new(0),
             last_external_revision: Cell::new(0),
@@ -1509,7 +1564,14 @@ impl Markdown {
             return;
         }
         if let Some(cache) = self.cache.get_mut().take() {
-            *self.previous_blocks.get_mut() = cache.blocks;
+            if cache.render_latex == self.options.render_latex {
+                *self.previous_blocks.get_mut() = cache.blocks;
+                self.previous_blocks_render_latex
+                    .set(Some(cache.render_latex));
+            } else {
+                self.previous_blocks.get_mut().clear();
+                self.previous_blocks_render_latex.set(None);
+            }
         }
         self.text = text.into();
         self.bump_revision();
@@ -1616,6 +1678,10 @@ impl Markdown {
         // define them render without block reuse (upstream `tokens.links`).
         let reuse_blocks = !has_reference_definitions(normalized_text);
         let mut previous_blocks = std::mem::take(&mut *self.previous_blocks.borrow_mut());
+        if self.previous_blocks_render_latex.get() != Some(self.options.render_latex) {
+            previous_blocks.clear();
+        }
+        self.previous_blocks_render_latex.set(None);
         if let Some(cache) = self.cache.borrow_mut().take()
             && cache.render_latex == self.options.render_latex
         {
@@ -3143,6 +3209,7 @@ impl Component for Markdown {
     fn invalidate(&mut self) {
         *self.cache.get_mut() = None;
         self.previous_blocks.get_mut().clear();
+        self.previous_blocks_render_latex.set(None);
         *self.block_highlighted_code.get_mut() = None;
         *self.default_style_prefix.get_mut() = None;
         self.bump_revision();
@@ -4178,10 +4245,48 @@ mod tests {
     }
 
     #[test]
+    fn reference_definitions_inside_containers_disable_block_reuse() {
+        let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let original = crate::terminal_image::get_capabilities();
+        crate::terminal_image::set_capabilities(caps(false));
+
+        for (first_source, second_source) in [
+            (
+                "[a][x]\n\n> [x]: https://one.example",
+                "[a][x]\n\n> [x]: https://two.example",
+            ),
+            (
+                "[a][x]\n\n- [x]: https://one.example",
+                "[a][x]\n\n- [x]: https://two.example",
+            ),
+            (
+                "[a][x]\n\n1. [x]: https://one.example",
+                "[a][x]\n\n1. [x]: https://two.example",
+            ),
+        ] {
+            let mut markdown = md(first_source);
+            let first = plain(&markdown, 80).join("\n");
+            assert!(first.contains("one.example"), "{first}");
+            markdown.set_text(second_source);
+            let second = plain(&markdown, 80).join("\n");
+            assert!(second.contains("two.example"), "{second}");
+            assert!(!second.contains("one.example"), "{second}");
+        }
+
+        crate::terminal_image::set_capabilities(original);
+    }
+
+    #[test]
     fn reference_definition_detection_is_conservative() {
         assert!(has_reference_definitions("[x]: https://example.com\n"));
         assert!(has_reference_definitions("   [x]: https://example.com\n"));
-        assert!(!has_reference_definitions("    [x]: https://example.com\n"));
+        // Conservative: an indented code block containing a definition-like
+        // line disables reuse (it only loses the optimization).
+        assert!(has_reference_definitions("    [x]: https://example.com\n"));
+        assert!(has_reference_definitions("> [x]: https://example.com\n"));
+        assert!(has_reference_definitions("- [x]: https://example.com\n"));
+        assert!(has_reference_definitions("1. [x]: https://example.com\n"));
+        assert!(has_reference_definitions("> - [x]: https://example.com\n"));
         assert!(!has_reference_definitions("plain [x] text\n"));
         assert!(!has_reference_definitions("```\n[x]: y\n```\n"));
     }
