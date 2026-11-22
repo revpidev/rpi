@@ -658,6 +658,41 @@ mod tests {
         }
     }
 
+    /// S36: the row shows the most recent child progress text (by monotonic
+    /// receive time) and its age, and clearing the run removes it.
+    #[test]
+    fn fleet_row_uses_the_latest_progress_and_age() {
+        let run_id = format!("fleet-progress-{}", crate::runner::budget::random_run_id());
+        let first = crate::p1::supervisor::channel_dir(&run_id, "scout", 0);
+        let second = crate::p1::supervisor::channel_dir(&run_id, "worker", 1);
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+        crate::p1::supervisor::write_progress(&first, &run_id, "step zero");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        crate::p1::supervisor::write_progress(&second, &run_id, "step one");
+        let status = json!({
+            "mode": "parallel",
+            "state": "running",
+            "steps": [
+                { "agent": "scout", "status": "running" },
+                { "agent": "worker", "status": "running" },
+            ],
+        });
+        let projected = fleet_row(&run_id, &status, 0, 10_000);
+        assert_eq!(projected.progress.as_deref(), Some("step one"));
+        assert!(
+            projected.progress_age_ms.is_some(),
+            "a live progress record carries its monotonic age"
+        );
+
+        crate::p1::supervisor::clear_progress_for_run(&run_id);
+        let projected = fleet_row(&run_id, &status, 0, 10_000);
+        assert!(projected.progress.is_none());
+        assert!(projected.progress_age_ms.is_none());
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
     #[test]
     fn collapsed_line_counts_runs_and_capacity() {
         let snapshot = FleetSnapshot {

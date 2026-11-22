@@ -209,6 +209,9 @@ mod tests {
 
     thread_local! {
         static SESSION: RefCell<Option<String>> = const { RefCell::new(None) };
+        static HAS_UI: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static SELECTED: RefCell<Option<String>> = const { RefCell::new(None) };
+        static SELECT_OPTIONS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
 
     extern "C" fn host(
@@ -225,7 +228,18 @@ mod tests {
                     .map(|id| json!({ "ok": { "id": id } }))
                     .unwrap_or_else(|| json!({ "ok": null }))
             }),
-            "ctx.hasUI" => json!({ "ok": false }),
+            "ctx.hasUI" => json!({ "ok": HAS_UI.with(|has_ui| has_ui.get()) }),
+            "ui.select" => {
+                let options: Vec<String> = request["args"]["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|option| option.as_str().map(str::to_string))
+                    .collect();
+                SELECT_OPTIONS.with(|slot| *slot.borrow_mut() = options);
+                let selected = SELECTED.with(|slot| slot.borrow().clone());
+                json!({ "ok": selected })
+            }
             _ => json!({ "error": { "message": "unknown" } }),
         };
         abi_stable::std_types::RVec::from(serde_json::to_vec(&reply).unwrap_or_default())
@@ -240,6 +254,53 @@ mod tests {
 
     fn set_session(id: Option<&str>) {
         SESSION.with(|session| *session.borrow_mut() = id.map(str::to_string));
+    }
+
+    fn set_ui(has_ui: bool, selected: Option<&str>) {
+        HAS_UI.with(|slot| slot.set(has_ui));
+        SELECTED.with(|slot| *slot.borrow_mut() = selected.map(str::to_string));
+        SELECT_OPTIONS.with(|slot| slot.borrow_mut().clear());
+    }
+
+    /// S12: the prompt offers exactly stay/take/leave, stay cancels, and leave
+    /// keeps the old owner. Take is covered by the owner-move test above.
+    #[test]
+    fn switch_prompt_offers_three_choices_and_honours_stay_and_leave() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let run_id = format!("switch-ui-{}", crate::runner::budget::random_run_id());
+        let body = crate::runner::background::AsyncBody::Single {
+            spec: Box::new(crate::p1::launch_child::ChildSpec::default()),
+        };
+        let handle = crate::runner::background::start_run(&run_id, Some("ui-old"), &body);
+        set_session(Some("ui-old"));
+        assert_eq!(outstanding_for("ui-old").active_runs, 1);
+
+        // Stay cancels the switch and does not record a pending choice.
+        set_ui(true, Some(STAY));
+        assert_eq!(before_switch(&calls(), "new"), json!({ "cancel": true }));
+        let options = SELECT_OPTIONS.with(|slot| slot.borrow().clone());
+        assert_eq!(options, vec![STAY, TAKE, LEAVE]);
+
+        // Leave commits the switch but keeps the old owner.
+        set_ui(true, Some(LEAVE));
+        assert!(before_switch(&calls(), "new").is_null());
+        set_session(Some("ui-new"));
+        session_start(&calls(), "new");
+        assert_eq!(
+            handle.status.read().unwrap_or_else(|e| e.into_inner())["sessionId"],
+            json!("ui-old"),
+            "leave keeps the source session as the owner"
+        );
+
+        set_ui(false, None);
+        crate::runner::background::ASYNC_RUNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id);
+        let _ = std::fs::remove_dir_all(crate::runner::background::async_runs_dir().join(&run_id));
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+        reset_for_test();
     }
 
     #[test]

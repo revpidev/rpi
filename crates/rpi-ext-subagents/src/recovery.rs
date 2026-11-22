@@ -612,20 +612,46 @@ fn worktree_resume_block(cwd: &str, run_id: &str) -> Option<String> {
         .filter_map(|group| group["cleanup"]["tasks"].as_array())
         .flatten()
         .find(|task| task["path"].as_str() == Some(root_text.as_ref()));
-    match task {
-        Some(task)
-            if task["worktreeRemoved"].as_bool() == Some(true)
-                && task["preserved"].as_bool() != Some(true) =>
-        {
-            None
-        }
-        Some(_) => Some(format!(
-            "Background run {run_id} child working directory '{cwd}' is a managed worktree whose cleanup is preserved or pending; resume is refused."
-        )),
-        None => Some(format!(
+    let Some(task) = task else {
+        return Some(format!(
             "Background run {run_id} child working directory '{cwd}' is not recorded as a finalized worktree cleanup; resume is refused."
-        )),
+        ));
+    };
+    // Upstream `resolveRetainedWorktreeCwd` (parallel-handoff.ts:200-215):
+    // a removed worktree/branch is never resumable, and the pending durable
+    // capture marker means the runner is about to remove it without the locks
+    // that guard resume admission. A retained (`preserved: true`) worktree is
+    // the normal resume target: the root and recorded cwd must still exist and
+    // the cwd must stay inside the root.
+    if task["worktreeRemoved"].as_bool() == Some(true)
+        || task["branchRemoved"].as_bool() == Some(true)
+    {
+        return Some(format!(
+            "Background run {run_id} required managed worktree was removed: '{cwd}'; resume is refused."
+        ));
     }
+    if task["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("pending durable handoff capture"))
+    {
+        return Some(format!(
+            "Background run {run_id} child working directory '{cwd}' is still finalizing its managed worktree; resume is refused until the run settles."
+        ));
+    }
+    let root_is_usable = std::fs::symlink_metadata(root)
+        .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        .unwrap_or(false);
+    let cwd_is_usable = path.is_dir();
+    let cwd_inside_root = match (root.canonicalize(), path.canonicalize()) {
+        (Ok(root), Ok(cwd)) => cwd.starts_with(&root),
+        _ => false,
+    };
+    if !root_is_usable || !cwd_is_usable || !cwd_inside_root {
+        return Some(format!(
+            "Background run {run_id} required managed worktree cwd is missing or outside its root: '{cwd}'; resume is refused."
+        ));
+    }
+    None
 }
 
 /// Resume-side validation: load and verify the trusted record for `run_id`.
@@ -985,24 +1011,100 @@ mod tests {
             "preserved": true,
             "reason": "cleanup pending durable handoff capture",
         }));
-        assert!(worktree_resume_block(&cwd_text, &run_id).is_some());
-        write(json!({
-            "path": cwd_text,
-            "worktreeRemoved": true,
-            "preserved": false,
-        }));
-        assert!(worktree_resume_block(&cwd_text, &run_id).is_none());
-        // A recorded cwd inside the worktree resolves to the same root.
-        let nested = cwd.join("src");
-        std::fs::create_dir_all(&nested).unwrap();
-        assert!(worktree_resume_block(&nested.to_string_lossy(), &run_id).is_none());
+        assert!(
+            worktree_resume_block(&cwd_text, &run_id).is_some(),
+            "the pending durable-capture marker still blocks resume"
+        );
+        // A retained (preserved) worktree is the normal resume target once the
+        // runner is not finalizing it (upstream resolveRetainedWorktreeCwd).
         write(json!({
             "path": cwd_text,
             "worktreeRemoved": false,
             "preserved": true,
             "reason": "capture failed",
         }));
-        assert!(worktree_resume_block(&cwd_text, &run_id).is_some());
+        assert!(
+            worktree_resume_block(&cwd_text, &run_id).is_none(),
+            "a preserved worktree with its cwd present is resumable"
+        );
+        // A recorded cwd inside the worktree resolves to the same root.
+        let nested = cwd.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(worktree_resume_block(&nested.to_string_lossy(), &run_id).is_none());
+        // Removed worktree or branch is never resumable.
+        write(json!({
+            "path": cwd_text,
+            "worktreeRemoved": true,
+            "preserved": false,
+        }));
+        assert!(
+            worktree_resume_block(&cwd_text, &run_id).is_some(),
+            "a removed worktree is refused"
+        );
+        write(json!({
+            "path": cwd_text,
+            "worktreeRemoved": false,
+            "branchRemoved": true,
+            "preserved": true,
+        }));
+        assert!(
+            worktree_resume_block(&cwd_text, &run_id).is_some(),
+            "a removed branch is refused"
+        );
+        // A preserved record whose recorded cwd disappeared is refused.
+        write(json!({
+            "path": cwd_text,
+            "worktreeRemoved": false,
+            "preserved": true,
+        }));
+        assert!(
+            worktree_resume_block(&nested.join("missing").to_string_lossy(), &run_id).is_some(),
+            "a missing recorded cwd is refused"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A symlinked worktree root is not a resumable managed worktree
+    /// (upstream requires `lstatSync(cleanup.path).isDirectory()` and not a
+    /// symlink).
+    #[test]
+    fn symlinked_worktree_root_blocks_resume() {
+        let base = std::env::temp_dir().join(unique("rpi-worktree-symlink-root"));
+        let run_id = unique("run");
+        let real = base.join("real-worktree");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(
+            real.join(".git"),
+            format!("gitdir: {}/.git/worktrees/real-worktree\n", base.display()),
+        )
+        .unwrap();
+        let link = base.join(format!("rpi-worktree-{run_id}-0"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&real, &link).unwrap();
+        let manifest = base.join("handoffs").join(format!("{run_id}.json"));
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest,
+            json!({
+                "groups": [{
+                    "cleanup": {
+                        "tasks": [{
+                            "path": link.to_string_lossy(),
+                            "worktreeRemoved": false,
+                            "preserved": true,
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            worktree_resume_block(&link.to_string_lossy(), &run_id).is_some(),
+            "a symlinked worktree root is refused"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1040,8 +1142,8 @@ mod tests {
                     "cleanup": {
                         "tasks": [{
                             "path": cwd.to_string_lossy(),
-                            "worktreeRemoved": false,
-                            "preserved": true,
+                            "worktreeRemoved": true,
+                            "preserved": false,
                         }]
                     }
                 }]

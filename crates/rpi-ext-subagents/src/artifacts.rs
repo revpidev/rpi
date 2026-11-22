@@ -7,6 +7,7 @@
 //! inspects package.json/.npmignore for npm publish leakage, which has no
 //! rpi equivalent (deviation TE-D18).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -460,45 +461,93 @@ fn cleanup_dir_recursive(dir: &Path, root: &Path, cutoff: u64) {
     }
 }
 
-/// Fork session copies under `<agent sessions>/*/forks/` (V19-03 S42,
-/// #3232): delete a copy only when no active background run references it
-/// and nothing wrote to it for `cleanup_days`. The walker never leaves the
-/// sessions root and never follows symlinks.
+/// Fork session copies under `<agent sessions>/<project>/<session>/forks/`
+/// (V19-03 S42, #3232): delete a copy only when no active background run
+/// references it and nothing wrote to it for `cleanup_days`. Mirrors upstream
+/// `removeOldForkCopies` (artifacts.ts:310-380 @ v0.88.1): two directory
+/// levels (project → session), a `forks` directory that must not be a
+/// symlink, and per-run directories. Explicit `sessionDir` copies live under
+/// a user-owned root and are intentionally never swept here.
 pub fn cleanup_fork_copies(cleanup_days: u64) {
     if cleanup_days == 0 {
         return;
     }
     let sessions_base = paths::get_agent_dir().join("sessions");
-    let Ok(session_dirs) = std::fs::read_dir(&sessions_base) else {
+    let active = active_fork_runs();
+    cleanup_fork_copies_at(&sessions_base, cleanup_days, &active);
+}
+
+/// Active-run protection for the fork sweep: the run ids that are still
+/// queued/running/paused (upstream `asyncRunActive`) plus the session files
+/// they already recorded (a resumed run may write an older copy).
+#[derive(Debug, Default)]
+struct ActiveForkRuns {
+    run_ids: BTreeSet<String>,
+    session_files: Vec<PathBuf>,
+}
+
+fn cleanup_fork_copies_at(sessions_base: &Path, cleanup_days: u64, active: &ActiveForkRuns) {
+    if cleanup_days == 0 {
         return;
-    };
+    }
     let cutoff = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(cleanup_days * 24 * 60 * 60))
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    let active = active_run_session_files();
-    for session_dir in session_dirs.flatten() {
-        let forks = session_dir.path().join("forks");
-        let Ok(entries) = std::fs::read_dir(&forks) else {
+    let Ok(project_dirs) = std::fs::read_dir(sessions_base) else {
+        return;
+    };
+    for project_dir in project_dirs.flatten() {
+        // `DirEntry::file_type` does not follow symlinks, matching upstream's
+        // `Dirent.isDirectory()`: a symlinked project/session dir is skipped.
+        if !project_dir.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Ok(session_dirs) = std::fs::read_dir(project_dir.path()) else {
             continue;
         };
-        let root = forks.canonicalize().unwrap_or_else(|_| forks.clone());
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(canonical) = path.canonicalize() else {
+        for session_dir in session_dirs.flatten() {
+            if !session_dir.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let forks = session_dir.path().join("forks");
+            // Never follow a symlinked `forks` folder: the deletes below would
+            // land in its target (upstream `lstatSync(forksDir).isDirectory()`).
+            let Ok(forks_meta) = std::fs::symlink_metadata(&forks) else {
                 continue;
             };
-            if !canonical.starts_with(&root) {
+            if !forks_meta.is_dir() || forks_meta.file_type().is_symlink() {
                 continue;
             }
-            if active
-                .iter()
-                .any(|active| canonical.starts_with(active) || active.starts_with(&canonical))
-            {
+            let Ok(run_dirs) = std::fs::read_dir(&forks) else {
                 continue;
-            }
-            let newest = newest_write(&path);
-            if newest.is_some_and(|newest| newest < cutoff) {
-                let _ = std::fs::remove_dir_all(&path);
+            };
+            let root = forks.canonicalize().unwrap_or_else(|_| forks.clone());
+            for run_dir in run_dirs.flatten() {
+                if !run_dir.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    continue;
+                }
+                let run_id = run_dir.file_name().to_string_lossy().to_string();
+                if active.run_ids.contains(&run_id) {
+                    continue;
+                }
+                let path = run_dir.path();
+                let Ok(canonical) = path.canonicalize() else {
+                    continue;
+                };
+                if !canonical.starts_with(&root) {
+                    continue;
+                }
+                if active
+                    .session_files
+                    .iter()
+                    .any(|active| canonical.starts_with(active) || active.starts_with(&canonical))
+                {
+                    continue;
+                }
+                let newest = newest_write(&path);
+                if newest.is_some_and(|newest| newest < cutoff) {
+                    let _ = std::fs::remove_dir_all(&path);
+                }
             }
         }
     }
@@ -531,13 +580,15 @@ fn newest_write(path: &Path) -> Option<std::time::SystemTime> {
     newest
 }
 
-/// Session files of non-terminal async runs (fork-copy protection).
-fn active_run_session_files() -> Vec<PathBuf> {
+/// Session files and run ids of non-terminal async runs (fork-copy
+/// protection). The run id is checked first: a queued run may not have
+/// recorded its fork session file yet, and upstream protects by run id.
+fn active_fork_runs() -> ActiveForkRuns {
+    let mut active = ActiveForkRuns::default();
     let runs = crate::runner::background::async_runs_dir();
     let Ok(entries) = std::fs::read_dir(runs) else {
-        return Vec::new();
+        return active;
     };
-    let mut active = Vec::new();
     for entry in entries.flatten() {
         let status_path = entry.path().join("status.json");
         let Ok(raw) = std::fs::read_to_string(&status_path) else {
@@ -552,11 +603,14 @@ fn active_run_session_files() -> Vec<PathBuf> {
         ) {
             continue;
         }
+        active
+            .run_ids
+            .insert(entry.file_name().to_string_lossy().to_string());
         for step in status["steps"].as_array().into_iter().flatten() {
             if let Some(file) = step["sessionFile"].as_str()
                 && let Ok(path) = PathBuf::from(file).canonicalize()
             {
-                active.push(path);
+                active.session_files.push(path);
             }
         }
     }
@@ -624,6 +678,185 @@ fn civil_from_days(days: i64) -> (i64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S42 cleanup tests. They backdate directory mtimes, which the portable
+    /// `File::set_modified` path only supports on Unix; Windows keeps the
+    /// compile probe and the layout/unit tests.
+    #[cfg(unix)]
+    mod fork_cleanup {
+        use super::*;
+
+        fn backdate(path: &Path, age_secs: u64) {
+            let modified = std::time::SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(age_secs))
+                .unwrap();
+            if path.is_dir() {
+                for entry in std::fs::read_dir(path).unwrap().flatten() {
+                    backdate(&entry.path(), age_secs);
+                }
+            }
+            let file = std::fs::File::open(path).unwrap();
+            file.set_modified(modified).unwrap();
+        }
+
+        /// `<base>/<project>/<session>/forks/<run>/fork.jsonl` with a backdated
+        /// tree, matching the writer layout (`fork_session_root`).
+        fn fork_run(
+            base: &Path,
+            project: &str,
+            session: &str,
+            run: &str,
+            age_secs: u64,
+        ) -> PathBuf {
+            let run_dir = base.join(project).join(session).join("forks").join(run);
+            std::fs::create_dir_all(&run_dir).unwrap();
+            let file = run_dir.join("fork.jsonl");
+            std::fs::write(&file, "{\"type\":\"session\"}\n").unwrap();
+            backdate(&file, age_secs);
+            backdate(&run_dir, age_secs);
+            run_dir
+        }
+
+        /// S42: the sweep walks the real two-level layout and removes only idle
+        /// fork run dirs; regular `run-N/` child sessions are never touched.
+        #[test]
+        fn fork_cleanup_removes_only_idle_run_dirs() {
+            let base =
+                std::env::temp_dir().join(format!("rpi-fork-cleanup-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let old = fork_run(&base, "--proj--", "parent-stem", "old-run", 8 * 86_400);
+            let fresh = fork_run(&base, "--proj--", "parent-stem", "fresh-run", 0);
+            let regular = base
+                .join("--proj--")
+                .join("parent-stem")
+                .join("run-0")
+                .join("session.jsonl");
+            std::fs::create_dir_all(regular.parent().unwrap()).unwrap();
+            std::fs::write(&regular, "{}\n").unwrap();
+            backdate(&regular, 30 * 86_400);
+            backdate(regular.parent().unwrap(), 30 * 86_400);
+
+            cleanup_fork_copies_at(&base, 7, &ActiveForkRuns::default());
+
+            assert!(
+                !old.exists(),
+                "idle fork run older than cleanupDays is removed"
+            );
+            assert!(fresh.exists(), "recently written fork run is kept");
+            assert!(regular.exists(), "a regular child session is never swept");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// S42: an active run id protects a fork run even before it records its
+        /// session file (queued run), and a recorded session file protects a
+        /// resumed copy under another run id.
+        #[test]
+        fn fork_cleanup_skips_active_run_ids_and_session_files() {
+            let base = std::env::temp_dir().join(format!("rpi-fork-active-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let by_id = fork_run(&base, "--proj--", "parent-stem", "queued-run", 8 * 86_400);
+            let by_file = fork_run(&base, "--proj--", "parent-stem", "resumed-run", 8 * 86_400);
+            let stale = fork_run(&base, "--proj--", "parent-stem", "stale-run", 8 * 86_400);
+            let mut active = ActiveForkRuns::default();
+            active.run_ids.insert("queued-run".to_string());
+            active
+                .session_files
+                .push(by_file.join("fork.jsonl").canonicalize().unwrap());
+
+            cleanup_fork_copies_at(&base, 7, &active);
+
+            assert!(by_id.exists(), "queued run id keeps its fork copy");
+            assert!(
+                by_file.exists(),
+                "a recorded active session file keeps its copy"
+            );
+            assert!(!stale.exists(), "unreferenced idle copies are removed");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// `cleanupDays: 0` disables the sweep (upstream `cleanupDays` gate).
+        #[test]
+        fn fork_cleanup_zero_days_is_a_noop() {
+            let base = std::env::temp_dir().join(format!("rpi-fork-zero-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let old = fork_run(&base, "--proj--", "parent-stem", "old-run", 30 * 86_400);
+            cleanup_fork_copies_at(&base, 0, &ActiveForkRuns::default());
+            assert!(old.exists());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// S42 safety: a symlinked `forks` directory is never followed, so the
+        /// deletes cannot land in its target.
+        #[test]
+        fn fork_cleanup_does_not_follow_a_symlinked_forks_dir() {
+            let base =
+                std::env::temp_dir().join(format!("rpi-fork-symlink-{}", std::process::id()));
+            let outside =
+                std::env::temp_dir().join(format!("rpi-fork-target-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&outside);
+            let session = base.join("--proj--").join("parent-stem");
+            std::fs::create_dir_all(&session).unwrap();
+            let target = fork_run(&outside, "target", "forks", "old-run", 30 * 86_400);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(outside.join("target").join("forks"), session.join("forks"))
+                .unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_dir(
+                outside.join("target").join("forks"),
+                session.join("forks"),
+            )
+            .unwrap();
+
+            cleanup_fork_copies_at(&base, 7, &ActiveForkRuns::default());
+
+            assert!(target.exists(), "a symlinked forks dir is not swept");
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+
+        /// S42 safety: symlinked project/session directories are skipped the same
+        /// way upstream's `Dirent.isDirectory()` skips them.
+        #[test]
+        fn fork_cleanup_skips_symlinked_project_and_session_dirs() {
+            let base =
+                std::env::temp_dir().join(format!("rpi-fork-dirlink-{}", std::process::id()));
+            let outside = std::env::temp_dir()
+                .join(format!("rpi-fork-dirlink-target-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&outside);
+            std::fs::create_dir_all(&base).unwrap();
+            let target = fork_run(&outside, "--proj--", "parent-stem", "old-run", 30 * 86_400);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(outside.join("--proj--"), base.join("--proj--")).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_dir(outside.join("--proj--"), base.join("--proj--"))
+                .unwrap();
+
+            cleanup_fork_copies_at(&base, 7, &ActiveForkRuns::default());
+
+            assert!(target.exists(), "a symlinked project dir is not swept");
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+
+        /// S42 age rule: one fresh write anywhere below the run dir keeps the
+        /// whole copy (upstream `idleSessionFiles`).
+        #[test]
+        fn fork_cleanup_keeps_a_run_with_one_fresh_nested_write() {
+            let base = std::env::temp_dir().join(format!("rpi-fork-nested-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let run = fork_run(&base, "--proj--", "parent-stem", "old-run", 30 * 86_400);
+            let nested = run.join("nested");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(nested.join("fork-1.jsonl"), "{}\n").unwrap();
+
+            cleanup_fork_copies_at(&base, 7, &ActiveForkRuns::default());
+
+            assert!(run.exists(), "a fresh nested write keeps the copy");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
 
     #[test]
     fn artifact_paths_naming_and_sanitization() {

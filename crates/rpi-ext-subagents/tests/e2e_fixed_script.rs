@@ -2271,16 +2271,34 @@ fn spawn_log(dump: &Path) -> Vec<String> {
 }
 
 fn find_latest_jsonl(dir: &Path) -> Option<PathBuf> {
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
+    fn walk(dir: &Path, depth: usize, best: &mut Option<(std::time::SystemTime, PathBuf)>) {
+        if depth > 4 {
+            return;
         }
-        let modified = entry.metadata().ok()?.modified().ok()?;
-        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
-            best = Some((modified, path));
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                walk(&path, depth + 1, best);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+                *best = Some((modified, path));
+            }
         }
     }
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    walk(dir, 0, &mut best);
     best.map(|(_, path)| path)
 }

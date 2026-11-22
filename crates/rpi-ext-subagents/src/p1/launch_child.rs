@@ -458,6 +458,38 @@ pub enum ForkOutcome {
 /// (upstream #1137 keeps explicit `context: "fork"` fail-fast for the
 /// in-memory/missing-parent cases; ADR-0026 broadened degradation to every
 /// path — the e2e scenario-2 expectation change is registered under G2).
+/// Root of this run's fork copies (V19-03 S42, #3232).
+///
+/// Derived roots mirror upstream `fork-context.ts:184-205`: the copy lives
+/// under `<parent session dir>/<parent stem>/forks/<run id>/`, never loose
+/// next to the parent session file (Pi's non-recursive `-c` discovery would
+/// pick a still-running child over the conversation the user left) and never
+/// next to the `run-N/` result dirs. An explicit `sessionDir` is a user-owned
+/// root, so it keeps the copies but keys them by run id — two fork runs must
+/// never share one `fork.jsonl`. The `cleanupDays` sweep in `artifacts.rs`
+/// only walks the derived layout (plugin-owned), never a user root.
+pub fn fork_session_root(ctx: &RunCtx) -> PathBuf {
+    let base = if ctx.session_root_is_derived {
+        ctx.session_root
+            .parent()
+            .map(|parent| parent.join("forks"))
+            .unwrap_or_else(|| ctx.session_root.join("forks"))
+    } else {
+        ctx.session_root.clone()
+    };
+    base.join(&ctx.run_id)
+}
+
+/// Predictable branch file for one fork child inside [`fork_session_root`].
+pub fn fork_session_file(ctx: &RunCtx, child_index: u32) -> PathBuf {
+    let root = fork_session_root(ctx);
+    if child_index == 0 {
+        root.join("fork.jsonl")
+    } else {
+        root.join(format!("fork-{child_index}.jsonl"))
+    }
+}
+
 pub fn try_fork_session(ctx: &RunCtx, branch_file: &Path, effective_cwd: &Path) -> ForkOutcome {
     if let Some(parent) = &ctx.parent_session
         && parent.file.is_none()
@@ -776,12 +808,7 @@ pub async fn run_child_async(
         // failing the run — covering the in-memory parent (V13-02 FR-A R2),
         // the missing parent session, and `create_fork_session` failures.
         // The effective mode is reflected in the result's `context` field.
-        let branch_file = if spec.child_index == 0 {
-            ctx.session_root.join("fork.jsonl")
-        } else {
-            ctx.session_root
-                .join(format!("fork-{}.jsonl", spec.child_index))
-        };
+        let branch_file = fork_session_file(ctx, spec.child_index);
         match try_fork_session(ctx, &branch_file, &effective_cwd) {
             ForkOutcome::Forked(file) => (Some(file), None),
             ForkOutcome::Degraded(reason) => {
@@ -1489,6 +1516,40 @@ mod te18_fork_tests {
             async_recovery: false,
             detach_ctx: None,
         }
+    }
+
+    /// S42 layout: derived roots mirror upstream `<parent stem>/forks/<run
+    /// id>/`, and an explicit `sessionDir` is keyed by run id so two fork runs
+    /// never share one `fork.jsonl`.
+    #[test]
+    fn fork_copies_live_under_the_parent_forks_dir() {
+        let parent = PathBuf::from("/sessions/--proj--/2026-08-14_parent.jsonl");
+        let mut ctx = ctx_with(None, Some(parent));
+        ctx.session_root = PathBuf::from("/sessions/--proj--/2026-08-14_parent/run-a");
+        ctx.session_root_is_derived = true;
+        assert_eq!(
+            fork_session_root(&ctx),
+            PathBuf::from("/sessions/--proj--/2026-08-14_parent/forks/te18fork1")
+        );
+        assert_eq!(
+            fork_session_file(&ctx, 0),
+            PathBuf::from("/sessions/--proj--/2026-08-14_parent/forks/te18fork1/fork.jsonl")
+        );
+        assert_eq!(
+            fork_session_file(&ctx, 2),
+            PathBuf::from("/sessions/--proj--/2026-08-14_parent/forks/te18fork1/fork-2.jsonl")
+        );
+
+        // Explicit sessionDir: user-owned root, still keyed by run id.
+        ctx.session_root = PathBuf::from("/work/child-sessions");
+        ctx.session_root_is_derived = false;
+        let first = fork_session_file(&ctx, 0);
+        assert_eq!(
+            first,
+            PathBuf::from("/work/child-sessions/te18fork1/fork.jsonl")
+        );
+        ctx.run_id = "te18fork2".to_string();
+        assert_ne!(first, fork_session_file(&ctx, 0));
     }
 
     fn prompt_agent(memory: Option<crate::agents::discover::MemoryConfig>) -> AgentConfig {

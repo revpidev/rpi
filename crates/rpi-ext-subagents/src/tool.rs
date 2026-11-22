@@ -1102,17 +1102,6 @@ fn history_child_context(
     }
 }
 
-fn fork_session_file(
-    ctx: &crate::p1::launch_child::RunCtx,
-    child_index: u32,
-) -> std::path::PathBuf {
-    if child_index == 0 {
-        ctx.session_root.join("fork.jsonl")
-    } else {
-        ctx.session_root.join(format!("fork-{child_index}.jsonl"))
-    }
-}
-
 /// `(session_dir, exact_session_file)` for a launch-time history record.
 /// Fresh children get their per-child root; fork children additionally carry
 /// the predictable branch file. If a fork degrades to fresh, the file is
@@ -1127,8 +1116,8 @@ fn history_child_sessions(
         return (None, None);
     }
     let dir = derived_child_session_dir(ctx, child_index, false);
-    let fork =
-        (context == discover::ContextMode::Fork).then(|| fork_session_file(ctx, child_index));
+    let fork = (context == discover::ContextMode::Fork)
+        .then(|| crate::p1::launch_child::fork_session_file(ctx, child_index));
     (dir, fork)
 }
 

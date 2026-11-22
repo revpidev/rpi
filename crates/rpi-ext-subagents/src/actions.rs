@@ -1429,13 +1429,7 @@ fn handle_management_action_inner(
             if !Path::new(&session_file).is_file() {
                 // S42: a fork copy may have been removed by the cleanupDays
                 // sweep; say so instead of a bare "does not exist".
-                let fork_note = if session_file.contains("/forks/")
-                    || session_file.contains("\\forks\\")
-                {
-                    " (it looks like a fork copy; fork copies older than the configured cleanupDays may have been cleaned up)"
-                } else {
-                    ""
-                };
+                let fork_note = missing_fork_copy_note(&session_file);
                 return ToolOutcome::error(format!(
                     "Async run '{id}' session file does not exist: {session_file}{fork_note}"
                 ));
@@ -3139,9 +3133,44 @@ fn manage_refine(
     }
 }
 
+/// S42 resume hint: a missing session file whose grandparent directory is
+/// `forks` is a fork copy that the `cleanupDays` sweep may have removed
+/// (upstream `missingForkCopyNote`, artifacts.ts:374-377).
+fn missing_fork_copy_note(session_file: &str) -> &'static str {
+    let fork_copy = Path::new(session_file)
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "forks");
+    if fork_copy {
+        " (it looks like a fork copy; fork copies older than the configured cleanupDays may have been cleaned up)"
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_fork_copy_note_matches_the_derived_layout_only() {
+        assert!(
+            missing_fork_copy_note(
+                "/agent/sessions/--proj--/2026-08-14_parent/forks/run-1/fork.jsonl"
+            )
+            .contains("fork copy")
+        );
+        assert!(
+            !missing_fork_copy_note(
+                "/agent/sessions/--proj--/2026-08-14_parent/run-1/session.jsonl"
+            )
+            .contains("fork copy")
+        );
+        assert!(
+            !missing_fork_copy_note("/work/child-sessions/run-1/fork.jsonl").contains("fork copy")
+        );
+    }
 
     /// Registry scratch handle for the action-path tests.
     fn action_test_run(run_id: &str, state: &str, steps: Value) {
@@ -3798,6 +3827,83 @@ mod tests {
                 params: Some(params),
             },
         )
+    }
+
+    /// S37 (#3225): `options.search` matches name/description/alias
+    /// case-insensitively, sorts by name and caps at 30 rows with a
+    /// continuation hint.
+    #[test]
+    fn list_search_matches_name_alias_and_description_with_a_thirty_row_cap() {
+        let root = paths::temp_root_dir().join(format!("mgmt-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        let agents_dir = paths::get_project_config_dir(&project).join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        for index in 0..31 {
+            std::fs::write(
+                agents_dir.join(format!("search-{index:02}.md")),
+                format!("---\nname: search-{index:02}\ndescription: fixture\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            agents_dir.join("alias-hit.md"),
+            "---\nname: alias-hit\ndescription: fixture\naliases: [zzalias]\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agents_dir.join("desc-hit.md"),
+            "---\nname: desc-hit\ndescription: unique-needle\n---\nbody\n",
+        )
+        .unwrap();
+        let trusted = TrustHost {
+            trusted: Some(true),
+            cwd: project.clone(),
+        };
+
+        let capped = manage_with_host(
+            &trusted,
+            json!({ "action": "list", "agentScope": "project",
+                    "options": { "search": "search-" } }),
+        );
+        assert!(!capped.is_error, "{}", capped.text);
+        assert_eq!(
+            capped.text.matches("- search-").count(),
+            30,
+            "search caps at 30 rows: {}",
+            capped.text
+        );
+        assert!(
+            capped
+                .text
+                .contains("Showing the first 30 matches; refine options.search"),
+            "{}",
+            capped.text
+        );
+
+        let alias = manage_with_host(
+            &trusted,
+            json!({ "action": "list", "agentScope": "project", "search": "ZZALIAS" }),
+        );
+        assert!(alias.text.contains("alias-hit"), "{}", alias.text);
+
+        let description = manage_with_host(
+            &trusted,
+            json!({ "action": "list", "agentScope": "project",
+                    "options": { "search": "unique-needle" } }),
+        );
+        assert!(
+            description.text.contains("desc-hit"),
+            "{}",
+            description.text
+        );
+
+        let empty = manage_with_host(
+            &trusted,
+            json!({ "action": "list", "agentScope": "project", "search": "no-such-agent" }),
+        );
+        assert!(empty.text.contains("(none)"), "{}", empty.text);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
