@@ -30,6 +30,16 @@ pub type ImageTranscoder = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Syn
 /// `imageTranscoder` (image.ts:20): the registered converter.
 static IMAGE_TRANSCODER: Mutex<Option<ImageTranscoder>> = Mutex::new(None);
 
+/// Monotonic generation of the registered transcoder (V19-04 FR-E): an Image
+/// rendered before a transcoder was registered must not reuse its fallback
+/// lines after one becomes available.
+static PNG_TRANSCODER_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn transcoder_generation() -> u64 {
+    PNG_TRANSCODER_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 256-bit content digest of the base64 source (V19-04 R1.4.7.1). Four
 /// independent 64-bit lanes over one pass; the cache verifies length and a
 /// short prefix/suffix on every hit, so a collision cannot serve the wrong
@@ -161,6 +171,7 @@ pub fn set_image_transcoder(transcoder: Option<ImageTranscoder>) {
     *IMAGE_TRANSCODER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = transcoder;
+    PNG_TRANSCODER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut cache = PNG_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -270,8 +281,9 @@ pub struct Image {
     cache: RefCell<Option<ImageCache>>,
     /// Monotonic revision for [`Component::cache_revision`] (V19-04 FR-E).
     revision: Cell<u64>,
-    /// Last observed capabilities generation; a change bumps `revision`.
-    last_capability_generation: Cell<u64>,
+    /// Last observed capabilities/transcoder generations; a change bumps
+    /// `revision`.
+    last_capability_generation: Cell<(u64, u64)>,
 }
 
 impl Image {
@@ -305,7 +317,7 @@ impl Image {
             png_data: RefCell::new(None),
             cache: RefCell::new(None),
             revision: Cell::new(0),
-            last_capability_generation: Cell::new(0),
+            last_capability_generation: Cell::new((0, 0)),
         }
     }
 
@@ -444,9 +456,9 @@ impl Component for Image {
         // The rendered image depends on the terminal capabilities (protocol)
         // as well as the component's own state. Keep the returned value
         // monotonic: a generation change bumps the local revision.
-        let capabilities = capabilities_generation();
-        if self.last_capability_generation.get() != capabilities {
-            self.last_capability_generation.set(capabilities);
+        let generations = (capabilities_generation(), transcoder_generation());
+        if self.last_capability_generation.get() != generations {
+            self.last_capability_generation.set(generations);
             self.revision.set(self.revision.get().wrapping_add(1));
         }
         Some(self.revision.get())
@@ -947,5 +959,12 @@ mod tests {
         );
 
         crate::terminal_image::set_capabilities(original);
+
+        // Registering a transcoder after the first render must also bump.
+        let third = image.cache_revision().expect("revision");
+        set_image_transcoder(Some(Arc::new(|_data: &str, _mime: &str| None)));
+        let fourth = image.cache_revision().expect("revision");
+        assert!(fourth > third);
+        set_image_transcoder(None);
     }
 }

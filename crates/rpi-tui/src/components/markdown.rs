@@ -470,47 +470,41 @@ fn block_raw(block: &Block<'_>, source: &str, index: &LineIndex) -> String {
 /// without block reuse.
 ///
 /// Comrak resolves definitions inside blockquotes and list items too, so the
-/// scanner strips container prefixes before the check. Conservative: any
-/// definition-shaped line (even in an indented code block) disables reuse;
-/// false positives only lose the optimization.
-fn has_reference_definitions(source: &str) -> bool {
-    let mut open_fence: Option<(u8, usize)> = None;
-    for line in source.split_inclusive('\n') {
-        let start = content_start(line);
-        let bytes = line.as_bytes();
-        if let Some((fence_char, fence_len)) = open_fence {
-            let mut run = 0usize;
-            while bytes.get(start + run) == Some(&fence_char) {
-                run += 1;
-            }
-            if run >= fence_len
-                && bytes[start + run..]
-                    .iter()
-                    .all(|byte| *byte == b' ' || *byte == b'\t' || *byte == b'\r' || *byte == b'\n')
-            {
-                open_fence = None;
-            }
+/// scanner strips container prefixes before the check. Lines covered by a
+/// parsed code block are skipped using the AST's source ranges (the parser is
+/// the authority for fences, container termination and illegal info strings).
+/// Conservative: any definition-shaped line outside code (even in an indented
+/// code block) disables reuse; false positives only lose the optimization.
+fn has_reference_definitions(source: &str, code_block_lines: &[(usize, usize)]) -> bool {
+    for (index, line) in source.split_inclusive('\n').enumerate() {
+        let line_number = index + 1;
+        if code_block_lines
+            .iter()
+            .any(|(start, end)| line_number >= *start && line_number <= *end)
+        {
             continue;
-        }
-        let fence_char = bytes
-            .get(start)
-            .copied()
-            .filter(|byte| *byte == b'`' || *byte == b'~');
-        if let Some(fence_char) = fence_char {
-            let mut run = 0usize;
-            while bytes.get(start + run) == Some(&fence_char) {
-                run += 1;
-            }
-            if run >= 3 {
-                open_fence = Some((fence_char, run));
-                continue;
-            }
         }
         if is_reference_definition(line) {
             return true;
         }
     }
     false
+}
+
+/// 1-based inclusive source line ranges of every parsed code block (fenced or
+/// indented, including nested blocks).
+fn code_block_line_ranges(root: Node<'_>) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for node in root.descendants() {
+        let data = node.data.borrow();
+        if matches!(data.value, NodeValue::CodeBlock(_)) {
+            let sp = data.sourcepos;
+            if sp.start.line > 0 && sp.end.line >= sp.start.line {
+                ranges.push((sp.start.line, sp.end.line));
+            }
+        }
+    }
+    ranges
 }
 
 /// Byte offset where a line's content starts after up to three spaces of
@@ -555,7 +549,8 @@ fn content_start(line: &str) -> usize {
 
 /// Whether a line is a reference definition (`[label]: ...`) after container
 /// prefixes and any indentation. Indented code is treated as a definition on
-/// purpose (conservative: it only disables block reuse).
+/// purpose (conservative: it only disables block reuse). The closing `]` must
+/// not be backslash-escaped.
 fn is_reference_definition(line: &str) -> bool {
     let bytes = line.as_bytes();
     let mut index = content_start(line);
@@ -565,11 +560,17 @@ fn is_reference_definition(line: &str) -> bool {
     if bytes.get(index) != Some(&b'[') {
         return false;
     }
-    let rest = &line[index..];
-    let Some(close) = rest.find(']') else {
-        return false;
-    };
-    close > 1 && rest.as_bytes().get(close + 1) == Some(&b':')
+    let mut cursor = index + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor += 2,
+            b']' => {
+                return cursor > index + 1 && bytes.get(cursor + 1) == Some(&b':');
+            }
+            _ => cursor += 1,
+        }
+    }
+    false
 }
 
 /// ECMA-262 `\s` (WhiteSpace + LineTerminator + U+FEFF); used for marked
@@ -1676,7 +1677,8 @@ impl Markdown {
         // Reuse rendered top-level blocks (#10971). Reference-link
         // definitions resolve anywhere in the document, so documents that
         // define them render without block reuse (upstream `tokens.links`).
-        let reuse_blocks = !has_reference_definitions(normalized_text);
+        let code_block_lines = code_block_line_ranges(root);
+        let reuse_blocks = !has_reference_definitions(normalized_text, &code_block_lines);
         let mut previous_blocks = std::mem::take(&mut *self.previous_blocks.borrow_mut());
         if self.previous_blocks_render_latex.get() != Some(self.options.render_latex) {
             previous_blocks.clear();
@@ -4276,19 +4278,97 @@ mod tests {
         crate::terminal_image::set_capabilities(original);
     }
 
+    /// The block-reuse oracle for reference-definition edge cases: a streamed
+    /// `set_text` render must match a fresh component rendering the same final
+    /// source (no stale URL from a reused block).
+    fn assert_set_text_matches_fresh(first: &str, second: &str) {
+        let mut streamed = md(first);
+        let _ = streamed.render(80);
+        streamed.set_text(second);
+        let streamed_lines = plain(&streamed, 80);
+        let fresh_lines = plain(&md(second), 80);
+        assert_eq!(
+            streamed_lines, fresh_lines,
+            "stale block after set_text\nfirst: {first:?}\nsecond: {second:?}"
+        );
+    }
+
+    #[test]
+    fn reference_definition_edge_cases_do_not_serve_stale_blocks() {
+        let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let original = crate::terminal_image::get_capabilities();
+        crate::terminal_image::set_capabilities(caps(false));
+
+        // Top-level fence containing a list marker: the AST code-block range
+        // covers it, so the definition after the fence is still detected.
+        assert_set_text_matches_fresh(
+            "```\n- ```\n```\n\n[a][x]\n\n[x]: https://one.example",
+            "```\n- ```\n```\n\n[a][x]\n\n[x]: https://two.example",
+        );
+        // A fence inside a blockquote/list does not hide a later definition.
+        assert_set_text_matches_fresh(
+            "> ```\n> quote\n\n[a][x]\n\n[x]: https://one.example",
+            "> ```\n> quote\n\n[a][x]\n\n[x]: https://two.example",
+        );
+        assert_set_text_matches_fresh(
+            "- ```\n  item\n\n[a][x]\n\n[x]: https://one.example",
+            "- ```\n  item\n\n[a][x]\n\n[x]: https://two.example",
+        );
+        // An illegal backtick info string is a paragraph, not a fence; the
+        // definition after it is detected.
+        assert_set_text_matches_fresh(
+            "```foo```\n\n[a][x]\n\n[x]: https://one.example",
+            "```foo```\n\n[a][x]\n\n[x]: https://two.example",
+        );
+        // An unclosed fence consumes the rest of its container; a definition
+        // after the container is still detected.
+        assert_set_text_matches_fresh(
+            "> ```\n> unclosed\n\n[a][x]\n\n[x]: https://one.example",
+            "> ```\n> unclosed\n\n[a][x]\n\n[x]: https://two.example",
+        );
+
+        crate::terminal_image::set_capabilities(original);
+    }
+
     #[test]
     fn reference_definition_detection_is_conservative() {
-        assert!(has_reference_definitions("[x]: https://example.com\n"));
-        assert!(has_reference_definitions("   [x]: https://example.com\n"));
+        assert!(has_reference_definitions("[x]: https://example.com\n", &[]));
+        assert!(has_reference_definitions(
+            "   [x]: https://example.com\n",
+            &[]
+        ));
         // Conservative: an indented code block containing a definition-like
         // line disables reuse (it only loses the optimization).
-        assert!(has_reference_definitions("    [x]: https://example.com\n"));
-        assert!(has_reference_definitions("> [x]: https://example.com\n"));
-        assert!(has_reference_definitions("- [x]: https://example.com\n"));
-        assert!(has_reference_definitions("1. [x]: https://example.com\n"));
-        assert!(has_reference_definitions("> - [x]: https://example.com\n"));
-        assert!(!has_reference_definitions("plain [x] text\n"));
-        assert!(!has_reference_definitions("```\n[x]: y\n```\n"));
+        assert!(has_reference_definitions(
+            "    [x]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "> [x]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "- [x]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "1. [x]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "> - [x]: https://example.com\n",
+            &[]
+        ));
+        // Escaped closing brackets do not end the label.
+        assert!(has_reference_definitions(
+            "[x\\]]: https://example.com\n",
+            &[]
+        ));
+        assert!(!has_reference_definitions("plain [x] text\n", &[]));
+        // The parsed code-block ranges are authoritative: a definition-shaped
+        // line inside a fence is not a definition.
+        assert!(!has_reference_definitions("```\n[x]: y\n```\n", &[(1, 3)]));
+        assert!(!has_reference_definitions("```\n- ```\n```\n", &[(1, 3)]));
     }
 
     #[test]
