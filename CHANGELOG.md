@@ -4,7 +4,7 @@
 
 ### v0.1.9 draft — implementation in progress
 
-This section covers the V19-01 implementation work including its M06-OUT handoff, the V19-02 B/C/D implementation and completed M06-CHECK, the V19-03 extension rebase remediation, and the V19-04 rendering-reuse implementation. V19-01's final review passed on 2026-11-19; V19-02's D-111 follow-up remediation passed a fresh-context review on 2026-11-21; V19-03's comprehensive review returned BLOCK; after the remediation and P3 closeout it passed a fresh-context review on 2026-11-22 (round 10 plus a narrow round-11 confirmation); V19-04's implementation and self-test completed on 2026-11-22; its first four fresh-context reviews returned BLOCK and the findings are remediated, with a fifth narrow review pending; the V19-08 release gate is still pending.
+This section covers the V19-01 implementation work including its M06-OUT handoff, the V19-02 B/C/D implementation and completed M06-CHECK, the V19-03 extension rebase remediation, and the V19-04 rendering-reuse implementation. V19-01's final review passed on 2026-11-19; V19-02's D-111 follow-up remediation passed a fresh-context review on 2026-11-21; V19-03's comprehensive review returned BLOCK; after the remediation and P3 closeout it passed a fresh-context review on 2026-11-22 (round 10 plus a narrow round-11 confirmation); V19-04's implementation and self-test completed on 2026-11-22; its first five fresh-context reviews returned BLOCK (the fifth found documentation-only issues, now fixed) and the findings are remediated, with a sixth narrow review pending; the V19-08 release gate is still pending.
 
 ### Main line
 
