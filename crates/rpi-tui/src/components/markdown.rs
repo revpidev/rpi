@@ -531,15 +531,15 @@ fn code_block_line_ranges(root: Node<'_>) -> Vec<(usize, usize)> {
     ranges
 }
 
-/// Byte offset where a line's content starts after up to three spaces of
-/// indentation and any blockquote/list container prefixes.
+/// Byte offset where a line's content starts after any indentation and any
+/// blockquote/list container prefixes. The AST code-block ranges already
+/// exclude real code, so widening the indentation only adds conservative
+/// definition candidates (which lose block reuse, never correctness).
 fn content_start(line: &str) -> usize {
     let bytes = line.as_bytes();
     let mut index = 0usize;
     loop {
-        let mut spaces = 0usize;
-        while spaces < 3 && bytes.get(index) == Some(&b' ') {
-            spaces += 1;
+        while matches!(bytes.get(index), Some(b' ' | b'\t')) {
             index += 1;
         }
         match bytes.get(index) {
@@ -4364,6 +4364,23 @@ mod tests {
             "[a][x]\n\n- [x\n  ]: https://one.example",
             "[a][x]\n\n- [x\n  ]: https://two.example",
         );
+        // Nested containers with 4+ spaces of content indentation.
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n- item\n\n    > [x\n    > ]: https://one.example",
+            "[a][x]\n\n- item\n\n    > [x\n    > ]: https://two.example",
+        );
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n- a\n  - b\n\n    - [x\n      ]: https://one.example",
+            "[a][x]\n\n- a\n  - b\n\n    - [x\n      ]: https://two.example",
+        );
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n- a\n  - b\n\n    1. [x\n       ]: https://one.example",
+            "[a][x]\n\n- a\n  - b\n\n    1. [x\n       ]: https://two.example",
+        );
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n- a\n  - b\n\n    > - [x\n    >   ]: https://one.example",
+            "[a][x]\n\n- a\n  - b\n\n    > - [x\n    >   ]: https://two.example",
+        );
 
         crate::terminal_image::set_capabilities(original);
     }
@@ -4395,6 +4412,14 @@ mod tests {
         ));
         assert!(has_reference_definitions(
             "> - [x]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "    > [x]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "    - [x]: https://example.com\n",
             &[]
         ));
         // Escaped closing brackets do not end the label.
