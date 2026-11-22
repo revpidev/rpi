@@ -27,7 +27,8 @@
 //!   is applied inside `rpi_tui::mermaid::render` via `MermaidStyles`
 //!   (mermaid.rs `styled_lines` are already ANSI).
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use comrak::nodes::NodeValue;
 use comrak::{Arena, Options, parse_document};
@@ -37,6 +38,195 @@ use rpi_tui::utils::visible_width;
 
 use crate::core::settings_manager::MermaidRenderingMode;
 use crate::core::themes::Theme;
+
+/// Candidate scan (R3.1.1): the transformer only runs the comrak parse when
+/// the source can contain a Mermaid fence. False positives fall back to the
+/// normal parse; false negatives are not allowed.
+///
+/// A line starts a fence after up to three spaces of indentation plus any
+/// blockquote/list container prefixes (`> `, `- `, `1. `, ...). Four-space
+/// indented code is not a fence. The first info word must be `mermaid`
+/// (ASCII case-insensitive).
+fn contains_mermaid_candidate(source: &str) -> bool {
+    source
+        .split_inclusive('\n')
+        .any(|line| fence_info_word(line).is_some_and(|word| word.eq_ignore_ascii_case("mermaid")))
+}
+
+/// The first info word of a fence that starts at `line`, if any.
+fn fence_info_word(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    loop {
+        // Up to three spaces at this container level (four spaces is an
+        // indented code block, never a fence).
+        let mut spaces = 0usize;
+        while spaces < 3 && bytes.get(index) == Some(&b' ') {
+            spaces += 1;
+            index += 1;
+        }
+        match bytes.get(index) {
+            Some(b'>') => {
+                index += 1;
+                if bytes.get(index) == Some(&b' ') {
+                    index += 1;
+                }
+            }
+            Some(b'-' | b'*' | b'+') if bytes.get(index + 1) == Some(&b' ') => {
+                index += 2;
+            }
+            Some(b'0'..=b'9') => {
+                let digits_start = index;
+                while index - digits_start < 9 && bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                    index += 1;
+                }
+                if matches!(bytes.get(index), Some(b'.' | b')'))
+                    && bytes.get(index + 1) == Some(&b' ')
+                {
+                    index += 2;
+                } else {
+                    return None;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    let fence_char = *bytes.get(index)?;
+    if fence_char != b'`' && fence_char != b'~' {
+        return None;
+    }
+    let mut fence_len = 0usize;
+    while bytes.get(index + fence_len) == Some(&fence_char) {
+        fence_len += 1;
+    }
+    if fence_len < 3 {
+        return None;
+    }
+    index += fence_len;
+    // Optional spaces, then the first info word.
+    while bytes.get(index) == Some(&b' ') {
+        index += 1;
+    }
+    let word_start = index;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        index += 1;
+    }
+    (word_start < index).then(|| &line[word_start..index])
+}
+
+/// Bounded cache for the built-in transform (R3.1.2): at most
+/// [`MERMAID_CACHE_MAX_ENTRIES`] entries and [`MERMAID_CACHE_MAX_BYTES`]
+/// retained source/result bytes. Streaming replaces the current generation;
+/// older deltas are evicted from the front.
+const MERMAID_CACHE_MAX_ENTRIES: usize = 8;
+const MERMAID_CACHE_MAX_BYTES: usize = 512 * 1024;
+
+#[derive(PartialEq, Eq)]
+struct MermaidTransformKey {
+    source: String,
+    width: usize,
+    message_type: String,
+    is_streaming: bool,
+    mode: MermaidRenderingMode,
+    theme: u64,
+    capability_generation: u64,
+}
+
+/// Borrowed lookup form of [`MermaidTransformKey`] (avoids cloning the
+/// source on a cache hit).
+struct MermaidTransformKeyRef<'a> {
+    source: &'a str,
+    width: usize,
+    message_type: &'a str,
+    is_streaming: bool,
+    mode: MermaidRenderingMode,
+    theme: u64,
+    capability_generation: u64,
+}
+
+struct MermaidTransformCache {
+    entries: VecDeque<(MermaidTransformKey, Arc<str>)>,
+    bytes: usize,
+}
+
+impl MermaidTransformCache {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    fn get(&mut self, key: &MermaidTransformKeyRef<'_>) -> Option<Arc<str>> {
+        let position = self.entries.iter().position(|(cached, _)| {
+            cached.source == key.source
+                && cached.width == key.width
+                && cached.message_type == key.message_type
+                && cached.is_streaming == key.is_streaming
+                && cached.mode == key.mode
+                && cached.theme == key.theme
+                && cached.capability_generation == key.capability_generation
+        })?;
+        let entry = self.entries.remove(position)?;
+        let value = Arc::clone(&entry.1);
+        self.entries.push_back(entry);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: MermaidTransformKey, value: Arc<str>) {
+        self.bytes += key.source.len() + value.len();
+        self.entries.push_back((key, value));
+        while self.entries.len() > MERMAID_CACHE_MAX_ENTRIES
+            || (self.bytes > MERMAID_CACHE_MAX_BYTES && self.entries.len() > 1)
+        {
+            if let Some((evicted_key, evicted_value)) = self.entries.pop_front() {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(evicted_key.source.len() + evicted_value.len());
+            }
+        }
+    }
+}
+
+/// Fingerprint of the theme-derived styles captured by the transformer.
+/// The cache is per transformer instance, but the fingerprint keeps the key
+/// self-describing if the closure is ever reused across theme instances.
+fn styles_fingerprint(styles: &MermaidStyles) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn hash_color(color: Option<Color>, hasher: &mut impl Hasher) {
+        match color {
+            None => 0u8.hash(hasher),
+            Some(Color::Rgb(r, g, b)) => {
+                1u8.hash(hasher);
+                r.hash(hasher);
+                g.hash(hasher);
+                b.hash(hasher);
+            }
+            Some(Color::Ansi256(index)) => {
+                2u8.hash(hasher);
+                index.hash(hasher);
+            }
+        }
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for style in [
+        &styles.border,
+        &styles.node_text,
+        &styles.edge,
+        &styles.edge_label,
+        &styles.title,
+    ] {
+        hash_color(style.fg, &mut hasher);
+        hash_color(style.bg, &mut hasher);
+        style.bold.hash(&mut hasher);
+        style.italic.hash(&mut hasher);
+    }
+    hasher.finish()
+}
 
 /// comrak options matching the markdown component's parser view
 /// (markdown.rs `parser_options`): extensions the source may rely on parse
@@ -192,6 +382,13 @@ fn line_span(source: &str, start_line: usize, end_line: usize) -> (usize, usize)
     (start.unwrap_or(end), end)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Counts comrak parses performed by the built-in Mermaid transformer
+    /// (R3.1.1 counting invariant: no candidate must mean zero parses).
+    static MERMAID_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `createMermaidMarkdownTransformer` (mermaid.ts:60-89).
 pub fn create_mermaid_markdown_transformer(
     get_mode: impl Fn() -> MermaidRenderingMode + Send + Sync + 'static,
@@ -201,6 +398,8 @@ pub fn create_mermaid_markdown_transformer(
         .as_deref()
         .map(mermaid_styles)
         .unwrap_or_else(neutral_styles);
+    let theme_fingerprint = styles_fingerprint(&styles);
+    let cache = Mutex::new(MermaidTransformCache::new());
     Arc::new(move |markdown: String, context: MarkdownTransformContext| {
         let mode = get_mode();
         if mode == MermaidRenderingMode::Off
@@ -212,8 +411,35 @@ pub fn create_mermaid_markdown_transformer(
         {
             return markdown;
         }
+        // Fast reject (R3.1.1): no candidate fence means no comrak parse.
+        if !contains_mermaid_candidate(&markdown) {
+            return markdown;
+        }
+
+        // Bounded transform cache (R3.1.2). The capability generation covers
+        // clickable-label hyperlink changes; the theme fingerprint covers the
+        // styles captured above; the mode/streaming/message-type/width are
+        // part of the key. Third-party transformers are not cached here.
+        let capability_generation = rpi_tui::terminal_image::capabilities_generation();
+        if let Some(hit) = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&MermaidTransformKeyRef {
+                source: &markdown,
+                width: context.available_width,
+                message_type: &context.message_type,
+                is_streaming: context.is_streaming,
+                mode,
+                theme: theme_fingerprint,
+                capability_generation,
+            })
+        {
+            return hit.to_string();
+        }
 
         let arena = Arena::new();
+        #[cfg(test)]
+        MERMAID_PARSE_COUNT.with(|count| count.set(count.get() + 1));
         let root = parse_document(&arena, &markdown, &parser_options());
 
         // (start_line, end_line, replacement) for each mermaid block, in
@@ -258,15 +484,45 @@ pub fn create_mermaid_markdown_transformer(
         }
 
         if replacements.is_empty() {
+            cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    MermaidTransformKey {
+                        source: markdown.clone(),
+                        width: context.available_width,
+                        message_type: context.message_type,
+                        is_streaming: context.is_streaming,
+                        mode,
+                        theme: theme_fingerprint,
+                        capability_generation,
+                    },
+                    Arc::from(markdown.as_str()),
+                );
             return markdown;
         }
 
         // Splice bottom-up so earlier spans' offsets stay valid.
-        let mut out = markdown;
+        let mut out = markdown.clone();
         for (start_line, end_line, replacement) in replacements.into_iter().rev() {
             let (start, end) = line_span(&out, start_line, end_line);
             out.replace_range(start..end, &replacement);
         }
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                MermaidTransformKey {
+                    source: markdown,
+                    width: context.available_width,
+                    message_type: context.message_type,
+                    is_streaming: context.is_streaming,
+                    mode,
+                    theme: theme_fingerprint,
+                    capability_generation,
+                },
+                Arc::from(out.as_str()),
+            );
         out
     })
 }
@@ -438,5 +694,177 @@ mod tests {
         assert!(!out.contains("```mermaid"));
         assert!(out.contains("mid"));
         assert!(out.contains('┌') && out.contains('╭'));
+    }
+
+    // ------------------------------------------------------------------
+    // V19-04 FR-A: candidate scan, zero-parse fast reject and bounded cache.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn candidate_scan_covers_fence_forms() {
+        // R3.1.1 matrix: backtick/tilde, 3+/4+ fence characters, optional
+        // spaces before the first info word, 0-3 spaces indentation, and
+        // container prefixes (`> `, list markers).
+        for source in [
+            "```mermaid\ngraph TD\n```",
+            "````mermaid\ngraph TD\n````",
+            "~~~mermaid\ngraph TD\n~~~",
+            "~~~~mermaid\ngraph TD\n~~~~",
+            "```   mermaid extra\ngraph TD\n```",
+            "```MERMAID\ngraph TD\n```",
+            "   ```mermaid\ngraph TD\n```",
+            "> ```mermaid\n> graph TD\n> ```",
+            "> > ```mermaid\ngraph TD\n```",
+            "- ```mermaid\ngraph TD\n```",
+            "1. ```mermaid\ngraph TD\n```",
+            "  - ~~~ mermaid\ngraph TD\n~~~",
+            "paragraph\n\n```mermaid\ngraph TD\n```\n",
+        ] {
+            assert!(
+                contains_mermaid_candidate(source),
+                "must detect a Mermaid candidate in {source:?}"
+            );
+        }
+        // Four-space indentation is an indented code block, never a fence.
+        for source in [
+            "    ```mermaid\ngraph TD\n    ```",
+            "```rust\nfn main() {}\n```",
+            "```\nmermaid\n```",
+            "```mermaidx\ngraph TD\n```",
+            "plain prose mentioning mermaid",
+            "```mermaidish\ngraph TD\n```",
+        ] {
+            assert!(
+                !contains_mermaid_candidate(source),
+                "must not treat {source:?} as a Mermaid fence"
+            );
+        }
+    }
+
+    #[test]
+    fn no_candidate_never_parses() {
+        MERMAID_PARSE_COUNT.with(|count| count.set(0));
+        let f = create_mermaid_markdown_transformer(move || MermaidRenderingMode::Streaming, None);
+        let prose = "# Title\n\nordinary **markdown** without diagrams\n".to_string();
+        assert_eq!(apply(&f, prose.clone(), true, "assistant", 100), prose);
+        assert_eq!(MERMAID_PARSE_COUNT.with(|count| count.get()), 0);
+    }
+
+    #[test]
+    fn candidate_parses_once_and_cache_hits_do_not_parse() {
+        MERMAID_PARSE_COUNT.with(|count| count.set(0));
+        let f = create_mermaid_markdown_transformer(move || MermaidRenderingMode::Streaming, None);
+        let markdown = markdown_with_mermaid();
+        let first = apply(&f, markdown.clone(), false, "assistant", 100);
+        assert_eq!(MERMAID_PARSE_COUNT.with(|count| count.get()), 1);
+        // Same key: cached, no parse.
+        assert_eq!(apply(&f, markdown.clone(), false, "assistant", 100), first);
+        assert_eq!(MERMAID_PARSE_COUNT.with(|count| count.get()), 1);
+        // A different width is a different key.
+        let _ = apply(&f, markdown.clone(), false, "assistant", 90);
+        assert_eq!(MERMAID_PARSE_COUNT.with(|count| count.get()), 2);
+        // Streaming state and mode are part of the key.
+        let _ = apply(&f, markdown.clone(), true, "assistant", 90);
+        assert_eq!(MERMAID_PARSE_COUNT.with(|count| count.get()), 3);
+    }
+
+    #[test]
+    fn cache_is_bounded_and_evicts_old_generations() {
+        let mut cache = MermaidTransformCache::new();
+        for index in 0..(MERMAID_CACHE_MAX_ENTRIES * 3) {
+            let source = format!("```mermaid\ngraph TD\n  A{index} --> B\n```");
+            cache.insert(
+                MermaidTransformKey {
+                    source: source.clone(),
+                    width: 100,
+                    message_type: "assistant".to_string(),
+                    is_streaming: true,
+                    mode: MermaidRenderingMode::Streaming,
+                    theme: 0,
+                    capability_generation: 0,
+                },
+                Arc::from(source.as_str()),
+            );
+        }
+        assert!(cache.entries.len() <= MERMAID_CACHE_MAX_ENTRIES);
+        assert!(cache.bytes <= MERMAID_CACHE_MAX_BYTES);
+    }
+
+    #[test]
+    fn cache_key_includes_capability_generation() {
+        // R3.1.2: clickable-label output depends on the hyperlink capability,
+        // which is represented by the capabilities generation. The renderer's
+        // own test (`click_links_only_labels_when_hyperlinks_are_enabled` in
+        // rpi-tui) covers the output switch; here the cache must not serve a
+        // stale generation.
+        let mut cache = MermaidTransformCache::new();
+        let source = "```mermaid\nflowchart LR\n  A --> B\n```";
+        cache.insert(
+            MermaidTransformKey {
+                source: source.to_string(),
+                width: 100,
+                message_type: "assistant".to_string(),
+                is_streaming: false,
+                mode: MermaidRenderingMode::Streaming,
+                theme: 7,
+                capability_generation: 1,
+            },
+            Arc::from("cached"),
+        );
+        let key = |capability_generation| MermaidTransformKeyRef {
+            source,
+            width: 100,
+            message_type: "assistant",
+            is_streaming: false,
+            mode: MermaidRenderingMode::Streaming,
+            theme: 7,
+            capability_generation,
+        };
+        assert!(cache.get(&key(1)).is_some());
+        assert!(cache.get(&key(2)).is_none());
+    }
+
+    #[test]
+    fn same_transformer_instance_transforms_after_streaming_ends() {
+        // The streaming flag is read per call, so one transformer instance
+        // must switch from "keep raw" to "render" when the stream ends.
+        let markdown = markdown_with_mermaid();
+        let f = create_mermaid_markdown_transformer(move || MermaidRenderingMode::Final, None);
+        assert_eq!(
+            apply(&f, markdown.clone(), true, "assistant", 100),
+            markdown
+        );
+        let rendered = apply(&f, markdown.clone(), false, "assistant", 100);
+        assert_ne!(rendered, markdown);
+        assert!(!rendered.contains("```mermaid"));
+    }
+
+    #[test]
+    fn theme_instances_do_not_share_the_transform_cache() {
+        let dark = Arc::new(load_theme("dark", None).expect("builtin dark theme"));
+        let light = Arc::new(load_theme("light", None).expect("builtin light theme"));
+        let markdown = markdown_with_mermaid();
+        let dark_transformer = create_mermaid_markdown_transformer(
+            move || MermaidRenderingMode::Streaming,
+            Some(dark),
+        );
+        let light_transformer = create_mermaid_markdown_transformer(
+            move || MermaidRenderingMode::Streaming,
+            Some(light),
+        );
+        let dark_out = apply(&dark_transformer, markdown.clone(), false, "assistant", 100);
+        let light_out = apply(
+            &light_transformer,
+            markdown.clone(),
+            false,
+            "assistant",
+            100,
+        );
+        assert_ne!(dark_out, light_out, "styled output must follow the theme");
+        // The same instance still hits its own cache.
+        assert_eq!(
+            apply(&dark_transformer, markdown, false, "assistant", 100),
+            dark_out
+        );
     }
 }

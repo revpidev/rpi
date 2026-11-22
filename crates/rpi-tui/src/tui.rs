@@ -223,6 +223,18 @@ pub trait Component: Send {
     /// Invalidate any cached rendering state (theme change / full re-render).
     fn invalidate(&mut self) {}
 
+    /// Optional monotonic content revision (V19-04 FR-E, additive).
+    ///
+    /// Returning `Some` promises that every state change affecting the
+    /// rendered lines or height (including `invalidate()`, lazy
+    /// streaming/transform context, image/capability generations) bumps the
+    /// value. `None` (the default) means the component is untrusted and must
+    /// render every frame; containers that cannot aggregate their children's
+    /// revisions must return `None`.
+    fn cache_revision(&self) -> Option<u64> {
+        None
+    }
+
     /// Mirror of upstream `isFocusable` (`"focused" in component`, tui.ts:110).
     fn as_focusable(&self) -> Option<&dyn Focusable> {
         None

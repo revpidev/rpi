@@ -183,7 +183,7 @@ impl CustomMessageComponent {
             Some(rpi_tui::components::markdown::MarkdownOptions {
                 transform: create_markdown_transform_with_metadata(
                     "custom",
-                    false,
+                    || false,
                     self.markdown_transformers.clone(),
                     self.message_id.clone(),
                     self.timestamp.clone(),

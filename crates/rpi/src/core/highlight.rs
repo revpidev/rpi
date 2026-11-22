@@ -32,7 +32,7 @@
 //!   syntax-highlight.ts:33-70) via an ordered prefix table — see
 //!   [`SCOPE_STYLES`].
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
@@ -438,6 +438,8 @@ fn render_range(text: &str, stack: &ScopeStack, theme: &Theme) -> String {
 /// built and verified so that none remains (issue #47) — returns the plain
 /// uncolored lines (upstream's `try/catch`, theme.ts:1174-1178).
 pub fn highlight_code(code: &str, lang: Option<&str>, theme: &Theme) -> Vec<String> {
+    #[cfg(test)]
+    HIGHLIGHT_COUNT.with(|count| count.set(count.get() + 1));
     // `validLang = lang && supportsLanguage(lang) ? lang : undefined`
     // (theme.ts:1161-1162).
     let Some(lang) = lang.filter(|l| supports_language(l)) else {
@@ -506,6 +508,95 @@ fn highlight_lines(
         lines.push(String::new());
     }
     Ok(lines)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Counts `highlight_code` calls (V19-04 counting invariants: stable
+    /// blocks must not re-run syntect).
+    static HIGHLIGHT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: number of `highlight_code` calls on this thread.
+#[cfg(test)]
+pub(crate) fn highlight_call_count() -> usize {
+    HIGHLIGHT_COUNT.with(|count| count.get())
+}
+
+/// Test-only: reset the thread-local highlight counter.
+#[cfg(test)]
+pub(crate) fn reset_highlight_call_count() {
+    HIGHLIGHT_COUNT.with(|count| count.set(0));
+}
+
+// ===========================================================================
+// CodeHighlighter (theme.ts @ 0f21a3319, #10971)
+// ===========================================================================
+
+/// Generation of the embedded grammar set. The set is built at compile time
+/// and never hot-reloads today; a future loader that changes it must bump
+/// this value (V19-04 R3.3.1).
+pub const GRAMMAR_GENERATION: u64 = 1;
+
+struct HighlightEntry {
+    code: String,
+    lang: Option<String>,
+    /// Identity of the `Theme` instance; renderers cannot tell a theme change
+    /// from any other redraw, so the highlighter compares what its result
+    /// depends on.
+    theme: usize,
+    grammar_generation: u64,
+    lines: Arc<[String]>,
+}
+
+/// Per-owner syntax highlighter (upstream `CodeHighlighter`): reuses the last
+/// result while the code, the language, the theme instance and the grammar
+/// generation stay the same. Each tool row owns one, so cached results live as
+/// long as the code they show instead of in a process-wide cache. The result
+/// is shared and must not be modified by callers.
+pub struct CodeHighlighter {
+    last: Mutex<Option<HighlightEntry>>,
+}
+
+impl Default for CodeHighlighter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CodeHighlighter {
+    pub fn new() -> Self {
+        Self {
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Highlight `code`, reusing the last result when nothing relevant
+    /// changed.
+    pub fn highlight(&self, code: &str, lang: Option<&str>, theme: &Theme) -> Arc<[String]> {
+        let theme_identity = theme as *const Theme as usize;
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = last.as_ref()
+            && entry.code == code
+            && entry.lang.as_deref() == lang
+            && entry.theme == theme_identity
+            && entry.grammar_generation == GRAMMAR_GENERATION
+        {
+            return Arc::clone(&entry.lines);
+        }
+        let lines: Arc<[String]> = highlight_code(code, lang, theme).into();
+        *last = Some(HighlightEntry {
+            code: code.to_string(),
+            lang: lang.map(str::to_string),
+            theme: theme_identity,
+            grammar_generation: GRAMMAR_GENERATION,
+            lines: Arc::clone(&lines),
+        });
+        lines
+    }
 }
 
 // ===========================================================================
@@ -882,5 +973,29 @@ mod tests {
         ] {
             assert!(!supports_language(name), "{name} must not resolve");
         }
+    }
+
+    #[test]
+    fn code_highlighter_reuses_until_code_language_or_theme_changes() {
+        let theme = theme();
+        let other_theme = load_theme("light", None).expect("builtin light theme");
+        let highlighter = CodeHighlighter::new();
+        reset_highlight_call_count();
+
+        let first = highlighter.highlight("fn main() {}", Some("rust"), &theme);
+        assert_eq!(highlight_call_count(), 1);
+        let second = highlighter.highlight("fn main() {}", Some("rust"), &theme);
+        assert!(Arc::ptr_eq(&first, &second), "same input must reuse");
+        assert_eq!(highlight_call_count(), 1);
+
+        let _ = highlighter.highlight("fn main() { 1 }", Some("rust"), &theme);
+        assert_eq!(highlight_call_count(), 2);
+
+        let _ = highlighter.highlight("fn main() { 1 }", Some("python"), &theme);
+        assert_eq!(highlight_call_count(), 3);
+
+        // A different theme instance is a different result.
+        let _ = highlighter.highlight("fn main() { 1 }", Some("python"), &other_theme);
+        assert_eq!(highlight_call_count(), 4);
     }
 }

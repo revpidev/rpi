@@ -25,7 +25,7 @@ use serde_json::Value;
 use super::render_utils::{
     ToolTimerState, invalid_arg_text, normalize_display_text, replace_tabs, str_value,
 };
-use crate::core::highlight::highlight_code;
+use crate::core::highlight::CodeHighlighter;
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::keybinding_hints::key_hint;
 use crate::modes::interactive::components::tool_execution::{
@@ -286,6 +286,9 @@ fn is_script_header(text: &str) -> bool {
 #[derive(Default)]
 struct CodemodeRenderState {
     timer: ToolTimerState,
+    /// Reuses the script's highlighting across progress, timer ticks,
+    /// expanding and completion (V19-04 FR-D, upstream `CodeHighlighter`).
+    script_highlighter: CodeHighlighter,
 }
 
 /// The codemode tool's render definition (renderer.ts:54-140).
@@ -298,11 +301,8 @@ impl ToolDefinition for CodemodeToolRenderer {
         theme: &Theme,
         context: &ToolRenderContext,
     ) -> Option<Box<dyn Component>> {
-        context
-            .state
-            .get_or_init::<CodemodeRenderState>()
-            .timer
-            .start(context.execution_started);
+        let state = context.state.get_or_init::<CodemodeRenderState>();
+        state.timer.start(context.execution_started);
         // The code includes the `// @options:` line, so options show as
         // part of the script.
         let code = str_value(args.get("code"));
@@ -320,7 +320,10 @@ impl ToolDefinition for CodemodeToolRenderer {
         component.add_child(Box::new(Text::new(title, 0, 0, None)));
         if !code.is_empty() {
             let code = replace_tabs(normalize_display_text(&code).trim_end());
-            let highlighted = highlight_code(&code, Some("javascript"), theme).join("\n");
+            let highlighted = state
+                .script_highlighter
+                .highlight(&code, Some("javascript"), theme)
+                .join("\n");
             if context.expanded {
                 component.add_child(Box::new(Text::new(highlighted, 0, 0, None)));
             } else {
@@ -917,5 +920,26 @@ mod tests {
         assert!(!is_script_header(
             "Script completed\nWall time x seconds\nOutput:\n"
         ));
+    }
+
+    #[test]
+    fn render_call_reuses_the_script_highlight_across_redraws() {
+        use crate::core::highlight::{highlight_call_count, reset_highlight_call_count};
+
+        let theme = theme();
+        let state = RendererStateSlot::default();
+        let context = context(&state);
+        let args = json!({"code": "await tools.read({});"});
+        reset_highlight_call_count();
+        let first = CodemodeToolRenderer
+            .render_call(&args, &theme, &context)
+            .expect("call component");
+        let calls = highlight_call_count();
+        assert_eq!(calls, 1);
+        let second = CodemodeToolRenderer
+            .render_call(&args, &theme, &context)
+            .expect("call component");
+        assert_eq!(highlight_call_count(), calls);
+        assert_eq!(first.render(80), second.render(80));
     }
 }

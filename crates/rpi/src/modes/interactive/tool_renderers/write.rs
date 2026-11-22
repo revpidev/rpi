@@ -27,7 +27,7 @@ use rpi_tui::tui::{Component, Container};
 use serde_json::Value;
 
 use super::render_utils::{normalize_display_text, render_tool_path, replace_tabs, str_value};
-use crate::core::highlight::{get_language_from_path, highlight_code};
+use crate::core::highlight::{CodeHighlighter, get_language_from_path, highlight_code};
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::keybinding_hints::key_hint;
 use crate::modes::interactive::components::tool_execution::{
@@ -84,6 +84,9 @@ struct WriteHighlightCache {
 #[derive(Default)]
 pub struct WriteRenderState {
     cache: Mutex<Option<WriteHighlightCache>>,
+    /// Reuses the whole-file highlighting of a completed call across update
+    /// and expand/collapse renders (V19-04 FR-D, upstream `CodeHighlighter`).
+    highlighter: CodeHighlighter,
 }
 
 /// `highlightSingleLine` (write.ts:65-68): `highlightCode(line, lang)[0] ?? ""`.
@@ -282,12 +285,27 @@ fn preview_max_lines(expanded: bool, total_lines: usize) -> usize {
 /// call. This runs per streaming delta; the cached lines are borrowed in
 /// place and only the rendered prefix (`max_lines` entries) is cloned.
 /// Rendered bytes are identical.
+#[cfg(test)]
 fn format_write_call(
     args: &Value,
     expanded: bool,
     theme: &Theme,
     cache: Option<&WriteHighlightCache>,
     cwd: &str,
+) -> String {
+    format_write_call_with(args, expanded, theme, cache, cwd, None)
+}
+
+/// `formatWriteCall` with an optional per-row highlighter (V19-04 FR-D): the
+/// completed-call path (no incremental cache) reuses its last whole-file
+/// result across update/expand/collapse renders.
+fn format_write_call_with(
+    args: &Value,
+    expanded: bool,
+    theme: &Theme,
+    cache: Option<&WriteHighlightCache>,
+    cwd: &str,
+    highlighter: Option<&CodeHighlighter>,
 ) -> String {
     let raw_path = file_path_or_path(args);
     let file_content = str_value(args.get("content"));
@@ -327,11 +345,11 @@ fn format_write_call(
                     (total, max, body)
                 }
                 None => {
-                    let lines = highlight_code(
-                        &replace_tabs(&normalize_display_text(&file_content)),
-                        lang,
-                        theme,
-                    );
+                    let source = replace_tabs(&normalize_display_text(&file_content));
+                    let lines = match highlighter {
+                        Some(highlighter) => highlighter.highlight(&source, lang, theme),
+                        None => highlight_code(&source, lang, theme).into(),
+                    };
                     let total = trailing_trimmed_len(&lines);
                     let max = preview_max_lines(expanded, total);
                     let body = lines[..max].join("\n");
@@ -457,7 +475,14 @@ impl ToolDefinition for WriteToolRenderer {
             );
         }
         Some(Box::new(Text::new(
-            format_write_call(args, context.expanded, theme, cache.as_ref(), &context.cwd),
+            format_write_call_with(
+                args,
+                context.expanded,
+                theme,
+                cache.as_ref(),
+                &context.cwd,
+                Some(&state.highlighter),
+            ),
             0,
             0,
             None,
@@ -1268,5 +1293,25 @@ mod tests {
         };
         assert!(format_write_result(&empty, &theme, true).is_none());
         assert!(format_write_result(&result, &theme, false).is_none());
+    }
+
+    #[test]
+    fn completed_write_reuses_the_whole_file_highlight() {
+        use crate::core::highlight::{highlight_call_count, reset_highlight_call_count};
+
+        let theme = theme();
+        let highlighter = CodeHighlighter::new();
+        let args = json!({"path": "src/main.rs", "content": "fn main() {}\n"});
+        reset_highlight_call_count();
+        let first = format_write_call_with(&args, true, &theme, None, "/cwd", Some(&highlighter));
+        let calls = highlight_call_count();
+        assert!(calls >= 1);
+        let second = format_write_call_with(&args, true, &theme, None, "/cwd", Some(&highlighter));
+        assert_eq!(first, second);
+        assert_eq!(
+            highlight_call_count(),
+            calls,
+            "unchanged completed content must not re-run syntect"
+        );
     }
 }

@@ -115,6 +115,21 @@ static CELL_DIMENSIONS: Mutex<CellDimensions> = Mutex::new(CellDimensions::DEFAU
 
 static CACHED_CAPABILITIES: Mutex<Option<TerminalCapabilities>> = Mutex::new(None);
 
+/// Monotonic generation of the cached capabilities. Any code that derives
+/// rendered output from capabilities (Mermaid clickable labels, images,
+/// hyperlinks) can include it in a cache key or revision. Bumped whenever the
+/// cached value is replaced or invalidated.
+static CAPABILITIES_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Current capabilities generation (V19-04 R3.1.2 / R4.1.2).
+pub fn capabilities_generation() -> u64 {
+    CAPABILITIES_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn bump_capabilities_generation() {
+    CAPABILITIES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `capabilityOverrides` (terminal-image.ts:29) — programmatic overrides
 /// applied on top of environment detection by `get_capabilities`.
 static CAPABILITY_OVERRIDES: Mutex<TerminalCapabilityOverrides> =
@@ -487,6 +502,7 @@ pub fn get_terminal_color_mode() -> crate::colors::TerminalColorMode {
 /// `resetCapabilitiesCache` (terminal-image.ts:134-136).
 pub fn reset_capabilities_cache() {
     *lock_cached_capabilities() = None;
+    bump_capabilities_generation();
 }
 
 /// `setCapabilityOverrides` (terminal-image.ts:170-182 @ 9841914,
@@ -507,6 +523,7 @@ pub fn set_capability_overrides(overrides: TerminalCapabilityOverrides) {
 /// capabilities. Useful in tests to exercise both code paths.
 pub fn set_capabilities(caps: TerminalCapabilities) {
     *lock_cached_capabilities() = Some(caps);
+    bump_capabilities_generation();
 }
 
 const KITTY_PREFIX: &str = "\x1b_G";

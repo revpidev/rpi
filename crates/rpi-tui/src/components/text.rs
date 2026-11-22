@@ -7,7 +7,7 @@
 //! - The color callback is `Box<dyn Fn(&str) -> String + Send + Sync>` instead
 //!   of the upstream TS `(text: string) => string` type.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crate::tui::Component;
 use crate::utils::{apply_background_to_line, visible_width, wrap_text_with_ansi};
@@ -26,6 +26,8 @@ pub struct Text {
 
     // Cache for rendered output
     cache: RefCell<Option<TextCache>>,
+    /// Monotonic content revision (V19-04 FR-E).
+    revision: Cell<u64>,
 }
 
 struct TextCache {
@@ -47,11 +49,18 @@ impl Text {
             padding_y,
             custom_bg_fn,
             cache: RefCell::new(None),
+            revision: Cell::new(0),
         }
     }
 
     pub fn set_text(&mut self, text: impl Into<String>) {
-        self.text = text.into();
+        // Upstream 0f21a3319: renderers often set the same text on every
+        // update; keep the wrapped lines then.
+        let text: String = text.into();
+        if text == self.text {
+            return;
+        }
+        self.text = text;
         self.invalidate();
     }
 
@@ -63,12 +72,19 @@ impl Text {
     /// `setPaddingX` (text.ts:39-42 @ 18336987a, #10557): runtime padding
     /// change for the outputPad walk.
     pub fn set_padding_x(&mut self, padding_x: usize) {
+        if padding_x == self.padding_x {
+            return;
+        }
         self.padding_x = padding_x;
         self.invalidate();
     }
 
     fn invalidate_cache(&self) {
         *self.cache.borrow_mut() = None;
+    }
+
+    fn bump_revision(&self) {
+        self.revision.set(self.revision.get().wrapping_add(1));
     }
 
     /// Shared render pipeline for an arbitrary text and width, with the same
@@ -167,6 +183,11 @@ impl Component for Text {
 
     fn invalidate(&mut self) {
         self.invalidate_cache();
+        self.bump_revision();
+    }
+
+    fn cache_revision(&self) -> Option<u64> {
+        Some(self.revision.get())
     }
 }
 
@@ -320,5 +341,32 @@ mod tests {
         assert_eq!(strip_ansi(&text.render(10)[0]), " hi       ");
         text.set_padding_x(3);
         assert_eq!(strip_ansi(&text.render(10)[0]), "   hi     ");
+    }
+
+    // V19-04 FR-E: monotonic content revision for the layout cache.
+    #[test]
+    fn cache_revision_is_monotonic_and_tracks_content_state() {
+        let mut text = Text::new("hi", 1, 0, None);
+        let first = text.cache_revision().expect("Text is trusted");
+        assert_eq!(text.cache_revision(), Some(first));
+
+        // Same text is a no-op (upstream 0f21a3319 keeps the wrapped lines).
+        text.set_text("hi");
+        assert_eq!(text.cache_revision(), Some(first));
+
+        text.set_text("hello");
+        let second = text.cache_revision().expect("revision");
+        assert!(second > first);
+
+        text.set_padding_x(2);
+        let third = text.cache_revision().expect("revision");
+        assert!(third > second);
+
+        text.set_custom_bg_fn(Some(Box::new(|line: &str| line.to_string())));
+        let fourth = text.cache_revision().expect("revision");
+        assert!(fourth > third);
+
+        text.invalidate();
+        assert!(text.cache_revision().expect("revision") > fourth);
     }
 }

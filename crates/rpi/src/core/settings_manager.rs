@@ -39,6 +39,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rpi_agent::types::{QueueMode, ThinkingLevel};
 use rpi_ai::types::Transport;
@@ -173,6 +174,20 @@ pub struct ThinkingBudgetsSettings {
     pub low: Option<u64>,
     pub medium: Option<u64>,
     pub high: Option<u64>,
+}
+
+/// Monotonic generation of the `markdown.mermaid` setting (V19-04 FR-E).
+/// Markdown `cache_revision()` reads it cheaply instead of re-reading the
+/// settings document per component per frame.
+static MERMAID_MODE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Current `markdown.mermaid` generation.
+pub fn mermaid_mode_generation() -> u64 {
+    MERMAID_MODE_GENERATION.load(Ordering::Relaxed)
+}
+
+fn bump_mermaid_mode_generation() {
+    MERMAID_MODE_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 /// `MarkdownSettings` (settings-manager.ts:54-56) — file shape.
@@ -1525,6 +1540,9 @@ impl SettingsManager {
     /// Synchronous — the upstream `await this.writeQueue` is unnecessary
     /// because this port writes inline (see module header).
     pub fn reload(&mut self) {
+        // A reload can change `markdown.mermaid` from outside the setter;
+        // bump the generation so layout revisions observe it (V19-04 FR-E).
+        bump_mermaid_mode_generation();
         let (global_settings, global_error) =
             Self::try_load_from_storage(&mut *self.storage, SettingsScope::Global, true);
         match global_error {
@@ -3045,10 +3063,14 @@ impl SettingsManager {
 
     /// `setMermaidRenderingMode` (settings-manager.ts:1268-1273).
     pub fn set_mermaid_rendering_mode(&mut self, mode: MermaidRenderingMode) {
+        let changed = self.get_mermaid_rendering_mode() != mode;
         self.global_settings
             .set_nested("markdown", "mermaid", json_value(&mode));
         self.mark_modified("markdown", Some("mermaid"));
         self.save();
+        if changed {
+            bump_mermaid_mode_generation();
+        }
     }
 
     /// `getTuiMode` (settings-manager.ts:1370-1372 @ 88ff80b98): default

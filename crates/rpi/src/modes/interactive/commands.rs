@@ -593,7 +593,7 @@ impl InteractiveUi {
             Some(rpi_tui::components::markdown::MarkdownOptions {
                 transform: crate::modes::interactive::components::markdown_transform::create_markdown_transform(
                     "changelog",
-                    false,
+                    || false,
                     self.markdown_transformers(),
                 ),
                 ..Default::default()

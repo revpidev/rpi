@@ -2005,7 +2005,7 @@ pub(crate) fn startup_notice_components(
                 Some(rpi_tui::components::markdown::MarkdownOptions {
                     transform: crate::modes::interactive::components::markdown_transform::create_markdown_transform(
                         "changelog",
-                        false,
+                        || false,
                         markdown_transformers.clone(),
                     ),
                     ..Default::default()
@@ -2049,7 +2049,7 @@ pub(crate) fn startup_notice_components(
                 Some(rpi_tui::components::markdown::MarkdownOptions {
                     transform: crate::modes::interactive::components::markdown_transform::create_markdown_transform(
                         "changelog",
-                        false,
+                        || false,
                         markdown_transformers,
                     ),
                     ..Default::default()
@@ -2622,6 +2622,7 @@ impl InteractiveUi {
                                 self.output_pad.load(Ordering::Relaxed),
                                 markdown_transformers,
                             );
+                        component.set_transform_revision_trusted(true);
                         // streaming component: `updateContent(message, true)`
                         // (interactive-mode.ts:3140). MessageStart fires once
                         // per turn — the Arc wrap is a single move.
@@ -4769,7 +4770,7 @@ impl InteractiveUi {
                 Some(rpi_tui::components::markdown::MarkdownOptions {
                     transform: crate::modes::interactive::components::markdown_transform::create_markdown_transform(
                         "changelog",
-                        false,
+                        || false,
                         self.markdown_transformers(),
                     ),
                     ..Default::default()
@@ -5147,6 +5148,7 @@ impl InteractiveUi {
                         self.output_pad.load(Ordering::Relaxed),
                         markdown_transformers,
                     );
+                component.set_transform_revision_trusted(true);
                 component.set_message_metadata(message_id, timestamp);
                 self.add_chat_child(Box::new(component));
             }

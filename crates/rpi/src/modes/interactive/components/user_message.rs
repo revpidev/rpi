@@ -108,7 +108,7 @@ impl UserMessageComponent {
                 // (no registered transformers) is a pass-through.
                 transform: create_markdown_transform_with_metadata(
                     "user",
-                    false,
+                    || false,
                     self.markdown_transformers.clone(),
                     self.message_id.clone(),
                     self.timestamp.clone(),
