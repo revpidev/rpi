@@ -35,7 +35,10 @@
 //!   is dropped, matching [`strip_lone_surrogate_escapes`] and the existing
 //!   preview oracle.
 //! - `NaN` and `Infinity` words are dropped: `serde_json::Value` cannot
-//!   represent them and they never occur in tool-call argument streams.
+//!   represent them and they never occur in tool-call argument streams. A
+//!   number beyond the `f64` range (such as `1e400`) is dropped for the same
+//!   reason where upstream shows `null`; the authoritative final parse rejects
+//!   it with an error instead of accepting `null`.
 //!
 //! Cost: copying the open path costs its member and element count. Each
 //! `append` earns copy credit proportional to its length plus a constant;
@@ -859,18 +862,19 @@ fn pending_scalar_value(token: &str) -> Option<Value> {
             .ok()
             .filter(Value::is_number);
     }
-    // An exponent without digits shows the mantissa.
-    let mantissa = token.strip_suffix(['e', 'E']).or_else(|| {
-        token
-            .strip_suffix("e+")
-            .or_else(|| token.strip_suffix("e-"))
-    })?;
-    if is_number(mantissa) {
-        return serde_json::from_str::<Value>(mantissa)
-            .ok()
-            .filter(Value::is_number);
+    // An exponent without digits shows the mantissa, as the upstream
+    // `NUMBER_WITHOUT_EXPONENT_DIGITS` regex
+    // `/^(-?(?:0|[1-9]\d*)(?:\.\d+)?)[eE][+-]?$/`: the marker is the first
+    // `e` or `E`, the sign after it is optional, and nothing but the marker
+    // and that sign may follow the mantissa (`1e5e` is not a number).
+    let marker = token.find(['e', 'E'])?;
+    let (mantissa, exponent) = (&token[..marker], &token[marker..]);
+    if !matches!(exponent, "e" | "E" | "e+" | "e-" | "E+" | "E-") || !is_number(mantissa) {
+        return None;
     }
-    None
+    serde_json::from_str::<Value>(mantissa)
+        .ok()
+        .filter(Value::is_number)
 }
 
 /// `-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?`, the JSON number grammar.
@@ -1029,6 +1033,22 @@ mod tests {
             snapshot(r#"{"nested":{"x":[1,2"#),
             Some(json!({"nested": {"x": [1, 2]}}))
         );
+    }
+
+    /// Upstream `NUMBER_WITHOUT_EXPONENT_DIGITS`: an exponent marker with an
+    /// optional sign and no digits yet shows the mantissa, whatever the case
+    /// of `e`/`E`, with or without a sign, and nothing else does (`1e5e` is
+    /// dropped).
+    #[test]
+    fn pending_exponent_without_digits_shows_the_mantissa() {
+        assert_eq!(snapshot(r#"{"a":1E"#), Some(json!({"a": 1})));
+        assert_eq!(snapshot(r#"{"a":1E+"#), Some(json!({"a": 1})));
+        assert_eq!(snapshot(r#"{"a":1E-"#), Some(json!({"a": 1})));
+        assert_eq!(snapshot(r#"{"a":1.5E-"#), Some(json!({"a": 1.5})));
+        assert_eq!(snapshot(r#"{"a":-2.5E+"#), Some(json!({"a": -2.5})));
+        assert_eq!(snapshot(r#"{"a":[1E+"#), Some(json!({"a": [1]})));
+        assert_eq!(snapshot(r#"{"a":1e5e"#), Some(json!({})));
+        assert_eq!(snapshot(r#"{"a":1E5E"#), Some(json!({})));
     }
 
     #[test]
@@ -1322,6 +1342,86 @@ mod tests {
                     .cloned()
                     .unwrap_or_default(),
             ),
+            (
+                r#"{"a":1,,"b":2}"#,
+                json!({"a": 1}).as_object().cloned().unwrap_or_default(),
+                json!({"a": 1, "b": 2})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            // A value where a key is expected is read and dropped, and the
+            // parser continues; the old oracle stops at the first one.
+            (
+                r#"{"a" []}"#,
+                json!({}).as_object().cloned().unwrap_or_default(),
+                json!({"a": []}).as_object().cloned().unwrap_or_default(),
+            ),
+            (
+                r#"{1 "a":2}"#,
+                json!({}).as_object().cloned().unwrap_or_default(),
+                json!({"a": 2}).as_object().cloned().unwrap_or_default(),
+            ),
+            (
+                r#"{,"a":1}"#,
+                json!({}).as_object().cloned().unwrap_or_default(),
+                json!({"a": 1}).as_object().cloned().unwrap_or_default(),
+            ),
+            (
+                r#"{[]""["#,
+                json!({}).as_object().cloned().unwrap_or_default(),
+                json!({"": []}).as_object().cloned().unwrap_or_default(),
+            ),
+            // A number beyond the `f64` range: upstream shows `null`, the old
+            // oracle showed the mantissa, the new parser drops the value.
+            (
+                r#"{"a":2e315"#,
+                json!({"a": 2}).as_object().cloned().unwrap_or_default(),
+                json!({}).as_object().cloned().unwrap_or_default(),
+            ),
+            (
+                r#"{"a":2e315,"b":1}"#,
+                json!({"a": 2, "b": 1})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+                json!({"b": 1}).as_object().cloned().unwrap_or_default(),
+            ),
+            // An exponent marker with a sign and no digits yet shows the
+            // mantissa (upstream regex), whatever the case of `e`/`E`; a token
+            // with digits after the marker and another marker (`1e5e`) is
+            // dropped, where the old oracle showed the shorter number.
+            (
+                r#"{"a":1E+"#,
+                json!({}).as_object().cloned().unwrap_or_default(),
+                json!({"a": 1}).as_object().cloned().unwrap_or_default(),
+            ),
+            (
+                r#"{"a":1e5e"#,
+                json!({"a": 100000.0})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+                json!({}).as_object().cloned().unwrap_or_default(),
+            ),
+            // An empty array with one blank inside: the old `parse_arr` did
+            // not skip blanks before its `]` check, never consumed the `]` and
+            // made the enclosing object stop there; the new parser and
+            // upstream read on.
+            (
+                r#"{"a":[ ],"b":3"#,
+                json!({"a": []}).as_object().cloned().unwrap_or_default(),
+                json!({"a": [], "b": 3})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            // The same array without a following member is not a difference.
+            (
+                r#"{"a":[ ],"#,
+                json!({"a": []}).as_object().cloned().unwrap_or_default(),
+                json!({"a": []}).as_object().cloned().unwrap_or_default(),
+            ),
         ];
         for (input, old, new) in cases {
             assert_eq!(
@@ -1334,10 +1434,13 @@ mod tests {
             assert_eq!(stream.arguments(), new, "new preview for {input:?}");
         }
 
-        // The two "same, not a difference" rows are machine-checked too.
+        // The "same, not a difference" rows are machine-checked too. The
+        // multi-byte row used to panic inside the old oracle before its
+        // unchecked colon skip learned to step over a whole character.
         for (input, expected) in [
             (r#"{"a":"x\dy"}"#, json!({"a": "x\\dy"})),
             (r#"{"a":tru}"#, json!({})),
+            ("{\"a\"é", json!({})),
         ] {
             let old = parse_streaming_json(Some(input));
             let mut stream = ToolCallArgumentsStream::default();
@@ -1352,13 +1455,22 @@ mod tests {
         }
 
         // The authoritative final parse is unchanged: complete valid text is
-        // identical to the old oracle.
+        // identical to the old oracle, and a number beyond the `f64` range is
+        // still an error (upstream would accept it as `null`).
         let mut stream = ToolCallArgumentsStream::default();
         stream.append("{\"a\":\"x\ny\"}");
         assert_eq!(
             stream.finish().arguments["a"],
             json!("x\ny"),
             "complete documents still repair like parse_tool_call_arguments"
+        );
+        let mut stream = ToolCallArgumentsStream::default();
+        stream.append(r#"{"a":2e315,"b":1}"#);
+        let parsed = stream.finish();
+        assert!(parsed.arguments.is_empty());
+        assert!(
+            parsed.arguments_error.is_some(),
+            "out-of-range numbers never execute"
         );
     }
 

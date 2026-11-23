@@ -376,7 +376,8 @@ impl PartialParser<'_> {
     }
 
     /// JS `String.prototype.substring(from, to)`: clamps then swaps.
-    /// Every caller passes char boundaries (quote/backslash/`e`/EOF offsets).
+    /// Every cursor advance is a whole character (ASCII bytes, or the
+    /// scalar skipped after a key), so every caller passes char boundaries.
     fn slice(&self, from: usize, to: usize) -> &str {
         let len = self.len();
         let a = from.min(len);
@@ -485,7 +486,14 @@ impl PartialParser<'_> {
                 _ => return Some(Value::Object(obj)),
             };
             self.skip_blank();
-            self.index += 1; // skip colon (unchecked upstream)
+            // Skip the colon without checking it, as upstream does. Upstream
+            // advances one UTF-16 code unit; here the cursor advances one
+            // UTF-8 scalar, so a multi-byte character after the key
+            // (`{"a"é`) never leaves the byte cursor inside a character,
+            // which used to panic in `remaining()`/`slice()`.
+            if let Some(ch) = self.remaining().chars().next() {
+                self.index += ch.len_utf8();
+            }
             match self.parse_any() {
                 Some(value) => {
                     obj.insert(key, value);
@@ -940,6 +948,27 @@ mod tests {
         }
         assert_eq!(last, content);
         assert!(saw_cjk, "the multi-byte payload must have been exercised");
+    }
+
+    /// A multi-byte character right after an object key used to leave the
+    /// byte cursor inside that character (the unchecked colon skip advanced
+    /// one byte) and panic in `remaining()`/`slice()`; the skip now steps
+    /// over a whole character, like upstream's one UTF-16 code unit.
+    #[test]
+    fn partial_parse_object_key_then_multibyte_does_not_panic() {
+        assert_eq!(parse_streaming_json(Some("{\"a\"é")), Map::new());
+        assert_eq!(parse_streaming_json(Some("{\"a\"中")), Map::new());
+        assert_eq!(parse_streaming_json(Some("{\"a\"😀x")), Map::new());
+        assert_eq!(
+            parse_streaming_json(Some("{\"a\":\"b\",\"c\"é")),
+            json!({"a": "b"}).as_object().cloned().unwrap_or_default()
+        );
+        // ASCII keys are unaffected: the skip is still one byte.
+        assert_eq!(
+            parse_streaming_json(Some(r#"{"a" 1}"#)),
+            Map::new(),
+            "the missing-colon rule is unchanged"
+        );
     }
 
     /// rpi#78 A3: small argument payloads materialize every delta; large ones
