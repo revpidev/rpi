@@ -59,14 +59,13 @@ use crate::utils::headers::{
     headers_to_record, identity_headers, merge_headers_chain, model_headers,
     provider_headers_to_header_map,
 };
-use crate::utils::json_parse::{
-    StreamingArgsPreview, parse_json_with_repair, parse_streaming_json,
-};
+use crate::utils::json_parse::{StreamingArgsPreview, parse_json_with_repair};
 use crate::utils::provider_env::get_provider_env_value;
 use crate::utils::provider_retry::{
     ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
+use crate::utils::streaming_json::ToolCallArgumentsStream;
 use crate::utils::transcript::resolve_transcript;
 use crate::utils::transform_messages::transform_messages;
 
@@ -1820,8 +1819,11 @@ fn json_u64(value: &Value) -> Option<u64> {
 #[derive(Debug, Default)]
 struct BlockState {
     event_index: usize,
-    partial_json: String,
-    /// rpi#78 A3: refresh `block.arguments` at display cadence, not per delta.
+    /// #9265: the raw argument text and the incremental parser live in the
+    /// stream state, never on the content block.
+    arguments: ToolCallArgumentsStream,
+    /// rpi#78 A3: materialize `block.arguments` at display cadence, not per
+    /// delta.
     args_preview: StreamingArgsPreview,
 }
 
@@ -2155,16 +2157,17 @@ impl<'a> StreamProcessor<'a> {
                                 .and_then(Value::as_str)
                                 .unwrap_or("");
                             let state = &mut self.block_states[content_index];
-                            state.partial_json.push_str(partial_json);
+                            state.arguments.append(partial_json);
                             // rpi#78 A3: the authoritative arguments are parsed at
                             // `content_block_stop`; the preview may lag one frame.
-                            let refresh = state.args_preview.should_parse(state.partial_json.len());
+                            let refresh = state
+                                .args_preview
+                                .should_refresh(state.arguments.text().len());
                             if let Some(AssistantContent::ToolCall(block)) =
                                 output.content.get_mut(content_index)
                             {
                                 if refresh {
-                                    block.arguments =
-                                        parse_streaming_json(Some(&state.partial_json));
+                                    block.arguments = state.arguments.arguments().clone();
                                 }
                                 events.push(StreamEvent::ToolCallDelta {
                                     content_index,
@@ -2213,9 +2216,7 @@ impl<'a> StreamProcessor<'a> {
                             });
                         }
                         Some(AssistantContent::ToolCall(block)) => {
-                            let parsed = crate::utils::json_parse::parse_tool_call_arguments(Some(
-                                &self.block_states[content_index].partial_json,
-                            ));
+                            let parsed = self.block_states[content_index].arguments.finish();
                             block.arguments = parsed.arguments;
                             block.arguments_error = parsed.arguments_error;
                             events.push(StreamEvent::ToolCallEnd {

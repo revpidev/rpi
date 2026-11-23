@@ -38,8 +38,9 @@ use tokio_util::sync::CancellationToken;
 use crate::api::anthropic_messages::resolve_cache_retention;
 use crate::api::constrained_sampling::{
     GrammarToolInputJsonBuffer, append_grammar_tool_input_json_delta,
-    create_grammar_tool_input_properties, get_grammar_tool_input, get_json_schema_tool_parameters,
-    resolve_grammar_constrained_sampling, resolve_json_schema_strict_sampling,
+    close_grammar_tool_input_json, create_grammar_tool_input_properties, get_grammar_tool_input,
+    get_json_schema_tool_parameters, resolve_grammar_constrained_sampling,
+    resolve_json_schema_strict_sampling,
 };
 use crate::api::copilot_headers::{build_copilot_dynamic_headers, has_copilot_vision_input};
 use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
@@ -66,11 +67,11 @@ use crate::utils::headers::{
     provider_headers_to_header_map,
 };
 use crate::utils::json_parse::StreamingArgsPreview;
-use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_retry::{
     ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
+use crate::utils::streaming_json::ToolCallArgumentsStream;
 use crate::utils::transform_messages::transform_messages;
 
 // ---------------------------------------------------------------------------
@@ -1751,7 +1752,9 @@ struct CustomInputState {
 /// `output.content`, keyed by content index).
 #[derive(Debug, Default)]
 struct ToolScratch {
-    partial_args: Option<String>,
+    /// #9265: JSON function arguments use the shared incremental parser;
+    /// grammar (custom) tools use `custom_input` instead.
+    arguments: Option<ToolCallArgumentsStream>,
     custom_input: Option<CustomInputState>,
     stream_index: Option<usize>,
     /// rpi#78 A3: refresh `block.arguments` at display cadence, not per delta.
@@ -1765,25 +1768,13 @@ enum SseOutcome {
     Done,
 }
 
-/// `getCustomToolCallInput`: the current raw grammar input text.
-fn custom_tool_call_input(block: &ToolCall, scratch: &ToolScratch) -> String {
-    let Some(custom_input) = &scratch.custom_input else {
-        return String::new();
-    };
-    match block.arguments.get(&custom_input.property) {
-        Some(Value::String(input)) => input.clone(),
-        _ => String::new(),
-    }
-}
-
-/// `appendCustomToolCallInput`: advance the grammar JSON buffer and replace
-/// `block.arguments` with `{ property: nextInput }`. Returns the JSON delta to
-/// emit (`None` for a no-op / idempotent close).
+/// `appendCustomToolCallInput`: advance the grammar JSON buffer by one delta
+/// and replace `block.arguments` with `{ property: buffer.input }`. Returns the
+/// JSON delta to emit (`None` for an empty delta).
 fn append_custom_tool_call_input(
     block: &mut ToolCall,
     scratch: &mut ToolScratch,
-    next_input: &str,
-    close: bool,
+    input_delta: &str,
 ) -> Result<Option<String>, String> {
     let Some(custom_input) = &mut scratch.custom_input else {
         return Ok(None);
@@ -1791,11 +1782,33 @@ fn append_custom_tool_call_input(
     let delta = append_grammar_tool_input_json_delta(
         &mut custom_input.json_buffer,
         &custom_input.property,
-        next_input,
-        close,
+        input_delta,
     )?;
     let mut arguments = Map::new();
-    arguments.insert(custom_input.property.clone(), json!(next_input));
+    arguments.insert(
+        custom_input.property.clone(),
+        json!(custom_input.json_buffer.input.clone()),
+    );
+    block.arguments = arguments;
+    Ok(delta)
+}
+
+/// `closeGrammarToolInputJson`: close the grammar input and replace
+/// `block.arguments` with its final value.
+fn close_custom_tool_call_input(
+    block: &mut ToolCall,
+    scratch: &mut ToolScratch,
+) -> Result<Option<String>, String> {
+    let Some(custom_input) = &mut scratch.custom_input else {
+        return Ok(None);
+    };
+    let delta =
+        close_grammar_tool_input_json(&mut custom_input.json_buffer, &custom_input.property, None)?;
+    let mut arguments = Map::new();
+    arguments.insert(
+        custom_input.property.clone(),
+        json!(custom_input.json_buffer.input.clone()),
+    );
     block.arguments = arguments;
     Ok(delta)
 }
@@ -2132,10 +2145,10 @@ impl<'a> CompletionsProcessor<'a> {
             self.scratch.insert(
                 index,
                 ToolScratch {
-                    partial_args: if custom_property.is_some() {
+                    arguments: if custom_property.is_some() {
                         None
                     } else {
-                        Some(String::new())
+                        Some(ToolCallArgumentsStream::default())
                     },
                     custom_input: custom_property.map(|property| CustomInputState {
                         property,
@@ -2210,7 +2223,7 @@ impl<'a> CompletionsProcessor<'a> {
                     property,
                     json_buffer: GrammarToolInputJsonBuffer::default(),
                 });
-                scratch.partial_args = None;
+                scratch.arguments = None;
             }
         }
 
@@ -2368,23 +2381,30 @@ impl<'a> CompletionsProcessor<'a> {
                         .filter(|input| !input.is_empty());
                     if let Some(arguments) = function_arguments {
                         delta_text = arguments.to_owned();
-                        // rpi#78 A3: no O(args) `String` clone per delta and no
-                        // full re-parse beyond display cadence. The authoritative
-                        // arguments are parsed from `partial_args` at block end
-                        // (`parse_tool_call_arguments`), so a skipped preview only
-                        // means the UI shows the previous parse for <33 ms.
+                        // #9265: feed only the new delta to the shared parser;
+                        // materialize the preview at display cadence. The
+                        // authoritative arguments are parsed at block end.
+                        let args_len = {
+                            let scratch = self.scratch.entry(content_index).or_default();
+                            let stream = scratch
+                                .arguments
+                                .get_or_insert_with(ToolCallArgumentsStream::default);
+                            stream.append(arguments);
+                            stream.text().len()
+                        };
                         let refresh = {
                             let scratch = self.scratch.entry(content_index).or_default();
-                            let partial = scratch.partial_args.get_or_insert_with(String::new);
-                            partial.push_str(arguments);
-                            scratch.args_preview.should_parse(partial.len())
+                            scratch.args_preview.should_refresh(args_len)
                         };
                         if refresh {
-                            let scratch = self.scratch.entry(content_index).or_default();
-                            let partial = scratch.partial_args.as_deref().unwrap_or_default();
-                            let parsed = parse_streaming_json(Some(partial));
-                            if let Some(AssistantContent::ToolCall(block)) =
-                                output.content.get_mut(content_index)
+                            let parsed = self
+                                .scratch
+                                .get_mut(&content_index)
+                                .and_then(|scratch| scratch.arguments.as_mut())
+                                .map(|stream| stream.arguments().clone());
+                            if let Some(parsed) = parsed
+                                && let Some(AssistantContent::ToolCall(block)) =
+                                    output.content.get_mut(content_index)
                             {
                                 block.arguments = parsed;
                             }
@@ -2394,11 +2414,8 @@ impl<'a> CompletionsProcessor<'a> {
                         if let Some(AssistantContent::ToolCall(block)) =
                             output.content.get_mut(content_index)
                         {
-                            let next_input =
-                                format!("{}{input}", custom_tool_call_input(block, scratch));
-                            delta_text =
-                                append_custom_tool_call_input(block, scratch, &next_input, false)?
-                                    .unwrap_or_default();
+                            delta_text = append_custom_tool_call_input(block, scratch, input)?
+                                .unwrap_or_default();
                         }
                     }
                     events.push(StreamEvent::ToolCallDelta {
@@ -2479,12 +2496,15 @@ impl<'a> CompletionsProcessor<'a> {
             Some(AssistantContent::ToolCall(block)) => {
                 let scratch = self.scratch.entry(content_index).or_default();
                 if scratch.custom_input.is_some() {
-                    let next_input = custom_tool_call_input(block, scratch);
-                    close_delta = append_custom_tool_call_input(block, scratch, &next_input, true)?;
+                    close_delta = close_custom_tool_call_input(block, scratch)?;
                 } else {
-                    let parsed = crate::utils::json_parse::parse_tool_call_arguments(
-                        scratch.partial_args.as_deref(),
-                    );
+                    let parsed = scratch
+                        .arguments
+                        .as_ref()
+                        .map(ToolCallArgumentsStream::finish)
+                        .unwrap_or_else(|| {
+                            crate::utils::json_parse::parse_tool_call_arguments(None)
+                        });
                     block.arguments = parsed.arguments;
                     block.arguments_error = parsed.arguments_error;
                 }

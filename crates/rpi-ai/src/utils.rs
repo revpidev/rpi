@@ -22,6 +22,7 @@ pub mod provider_retry;
 pub mod retry;
 pub mod rpi_user_agent;
 pub mod sanitize_unicode;
+pub mod streaming_json;
 pub mod text;
 pub mod transcript;
 pub mod transform_messages;

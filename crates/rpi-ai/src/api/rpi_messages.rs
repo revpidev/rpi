@@ -57,8 +57,8 @@ use crate::types::{
 use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::json_parse::StreamingArgsPreview;
-use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_env::get_provider_env_value;
+use crate::utils::streaming_json::ToolCallArgumentsStream;
 
 // ---------------------------------------------------------------------------
 // Options
@@ -359,8 +359,10 @@ fn content_slot(content: &mut Vec<AssistantContent>, index: usize) -> &mut Assis
 /// [`AssistantMessage`] and emits the corresponding [`StreamEvent`]s.
 struct EventConverter {
     partial: SharedAssistantMessage,
-    tool_json: HashMap<usize, String>,
-    /// rpi#78 A3: preview-parse throttle by content index.
+    /// #9265: the raw argument text and the incremental parser by content
+    /// index, never on the content block.
+    arguments: HashMap<usize, ToolCallArgumentsStream>,
+    /// rpi#78 A3: preview materialization throttle by content index.
     args_preview: HashMap<usize, StreamingArgsPreview>,
 }
 
@@ -368,14 +370,34 @@ impl EventConverter {
     fn new(model: &Model) -> Self {
         Self {
             partial: SharedAssistantMessage::new(initial_partial(model)),
-            tool_json: HashMap::new(),
+            arguments: HashMap::new(),
             args_preview: HashMap::new(),
         }
     }
 
-    fn convert(&mut self, event: RpiMessagesEvent) -> StreamEvent {
+    fn convert(&mut self, event: RpiMessagesEvent) -> Result<StreamEvent, String> {
+        // The index comes from the wire and keys the content array. A start
+        // adds the next block; every other event needs an existing one. A
+        // skipped or huge index would otherwise pad a sparse array with
+        // billions of placeholders.
+        if let Some(index) = event.content_index() {
+            let is_start = event.is_content_start();
+            let limit = self.partial.with(|partial| {
+                if is_start {
+                    Some(partial.content.len())
+                } else {
+                    partial.content.len().checked_sub(1)
+                }
+            });
+            if limit.is_none_or(|limit| index > limit) {
+                return Err(format!(
+                    "Invalid contentIndex {index} in pi-messages {} event",
+                    event.kind()
+                ));
+            }
+        }
         let shared = self.partial.clone();
-        shared.with_mut(|partial| match event {
+        Ok(shared.with_mut(|partial| match event {
             RpiMessagesEvent::Done {
                 reason,
                 usage,
@@ -546,7 +568,8 @@ impl EventConverter {
                         namespace: None,
                         arguments_error: None,
                     });
-                self.tool_json.insert(content_index, String::new());
+                self.arguments
+                    .insert(content_index, ToolCallArgumentsStream::default());
                 self.args_preview
                     .insert(content_index, StreamingArgsPreview::default());
                 StreamEvent::ToolCallStart {
@@ -558,21 +581,26 @@ impl EventConverter {
                 content_index,
                 delta,
             } => {
-                // rpi#78 A3: append in place (no O(args) `String` clone per
-                // delta) and refresh the parsed preview at display cadence; the
-                // authoritative arguments arrive with `ToolCallEnd`.
-                let json = self.tool_json.entry(content_index).or_default();
-                json.push_str(&delta);
+                // rpi#78 A3: append only the new delta and materialize the
+                // preview at display cadence; the authoritative arguments
+                // arrive with `ToolCallEnd`.
+                let args_len = {
+                    let stream = self.arguments.entry(content_index).or_default();
+                    stream.append(&delta);
+                    stream.text().len()
+                };
                 let refresh = self
                     .args_preview
                     .entry(content_index)
                     .or_default()
-                    .should_parse(json.len());
-                if refresh
-                    && let AssistantContent::ToolCall(tool_call) =
+                    .should_refresh(args_len);
+                if refresh && let Some(stream) = self.arguments.get_mut(&content_index) {
+                    let parsed = stream.arguments().clone();
+                    if let AssistantContent::ToolCall(tool_call) =
                         content_slot(&mut partial.content, content_index)
-                {
-                    tool_call.arguments = parse_streaming_json(Some(json));
+                    {
+                        tool_call.arguments = parsed;
+                    }
                 }
                 StreamEvent::ToolCallDelta {
                     content_index,
@@ -606,7 +634,7 @@ impl EventConverter {
                         *other = AssistantContent::ToolCall(tool_call);
                     }
                 }
-                self.tool_json.remove(&content_index);
+                self.arguments.remove(&content_index);
                 self.args_preview.remove(&content_index);
                 let AssistantContent::ToolCall(final_call) = &partial.content[content_index] else {
                     unreachable!("slot was just assigned a ToolCall");
@@ -617,7 +645,52 @@ impl EventConverter {
                     partial: shared.clone(),
                 }
             }
-        })
+        }))
+    }
+}
+
+impl RpiMessagesEvent {
+    fn content_index(&self) -> Option<usize> {
+        match self {
+            RpiMessagesEvent::TextStart { content_index }
+            | RpiMessagesEvent::TextDelta { content_index, .. }
+            | RpiMessagesEvent::TextEnd { content_index, .. }
+            | RpiMessagesEvent::ThinkingStart { content_index }
+            | RpiMessagesEvent::ThinkingDelta { content_index, .. }
+            | RpiMessagesEvent::ThinkingEnd { content_index, .. }
+            | RpiMessagesEvent::ToolCallStart { content_index, .. }
+            | RpiMessagesEvent::ToolCallDelta { content_index, .. }
+            | RpiMessagesEvent::ToolCallEnd { content_index, .. } => Some(*content_index),
+            RpiMessagesEvent::Start
+            | RpiMessagesEvent::Done { .. }
+            | RpiMessagesEvent::Error { .. } => None,
+        }
+    }
+
+    fn is_content_start(&self) -> bool {
+        matches!(
+            self,
+            RpiMessagesEvent::TextStart { .. }
+                | RpiMessagesEvent::ThinkingStart { .. }
+                | RpiMessagesEvent::ToolCallStart { .. }
+        )
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            RpiMessagesEvent::Start => "start",
+            RpiMessagesEvent::TextStart { .. } => "text_start",
+            RpiMessagesEvent::TextDelta { .. } => "text_delta",
+            RpiMessagesEvent::TextEnd { .. } => "text_end",
+            RpiMessagesEvent::ThinkingStart { .. } => "thinking_start",
+            RpiMessagesEvent::ThinkingDelta { .. } => "thinking_delta",
+            RpiMessagesEvent::ThinkingEnd { .. } => "thinking_end",
+            RpiMessagesEvent::ToolCallStart { .. } => "toolcall_start",
+            RpiMessagesEvent::ToolCallDelta { .. } => "toolcall_delta",
+            RpiMessagesEvent::ToolCallEnd { .. } => "toolcall_end",
+            RpiMessagesEvent::Done { .. } => "done",
+            RpiMessagesEvent::Error { .. } => "error",
+        }
     }
 }
 
@@ -950,13 +1023,13 @@ async fn run(
         let Some(chunk) = chunk else { break };
         let bytes = chunk.map_err(|error| StreamFailure::plain(error.message()))?;
         let parsed = reader.feed(&bytes).map_err(StreamFailure::plain)?;
-        if push_converted(&mut converter, events, parsed) {
+        if push_converted(&mut converter, events, parsed).map_err(StreamFailure::plain)? {
             // Terminal event pushed: upstream `return`s out of the async IIFE.
             return Ok(());
         }
     }
     let parsed = reader.finish().map_err(StreamFailure::plain)?;
-    if push_converted(&mut converter, events, parsed) {
+    if push_converted(&mut converter, events, parsed).map_err(StreamFailure::plain)? {
         return Ok(());
     }
 
@@ -972,18 +1045,18 @@ fn push_converted(
     converter: &mut EventConverter,
     events: &AssistantMessageEventStream,
     parsed: Vec<RpiMessagesEvent>,
-) -> bool {
+) -> Result<bool, String> {
     for rpi_event in parsed {
         let terminal = matches!(
             rpi_event,
             RpiMessagesEvent::Done { .. } | RpiMessagesEvent::Error { .. }
         );
-        events.push(converter.convert(rpi_event));
+        events.push(converter.convert(rpi_event)?);
         if terminal {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// `stream` (rpi-messages).
@@ -1127,6 +1200,62 @@ mod tests {
                 Some("served-model")
             );
         }
+    }
+
+    #[test]
+    fn test_content_index_must_be_next_or_existing() {
+        let model: Model = serde_json::from_value(json!({
+            "id": "requested", "name": "requested", "api": "rpi-messages", "provider": "radius",
+            "baseUrl": "https://example.com", "reasoning": false, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 1000, "maxTokens": 100
+        }))
+        .expect("model");
+        let mut converter = EventConverter::new(&model);
+
+        // A non-start event needs an existing block.
+        let error = converter
+            .convert(RpiMessagesEvent::TextDelta {
+                content_index: 0,
+                delta: "x".to_owned(),
+            })
+            .expect_err("no block yet");
+        assert!(error.contains("Invalid contentIndex 0"), "{error}");
+
+        // A start may append the next block; later events address it.
+        converter
+            .convert(RpiMessagesEvent::TextStart { content_index: 0 })
+            .expect("start");
+        converter
+            .convert(RpiMessagesEvent::TextDelta {
+                content_index: 0,
+                delta: "x".to_owned(),
+            })
+            .expect("delta");
+
+        // A start may not skip a block.
+        let error = converter
+            .convert(RpiMessagesEvent::TextStart { content_index: 2 })
+            .expect_err("skipped block");
+        assert!(error.contains("Invalid contentIndex 2"), "{error}");
+
+        // A non-start event may not address a future block.
+        let error = converter
+            .convert(RpiMessagesEvent::TextEnd {
+                content_index: 1,
+                content: "x".to_owned(),
+                content_signature: None,
+            })
+            .expect_err("future block");
+        assert!(error.contains("Invalid contentIndex 1"), "{error}");
+    }
+
+    #[test]
+    fn test_content_index_proto_is_rejected_at_parse() {
+        // `contentIndex` keys the content array; a string key must never reach
+        // it (upstream `__proto__` guard).
+        let raw = r#"{"type":"text_delta","contentIndex":"__proto__","delta":"x"}"#;
+        assert!(serde_json::from_str::<RpiMessagesEvent>(raw).is_err());
     }
 
     #[test]

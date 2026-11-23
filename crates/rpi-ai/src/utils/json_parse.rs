@@ -606,18 +606,19 @@ pub fn parse_streaming_json_value(partial_json: Option<&str>) -> Value {
 
 /// Refresh cadence for the streamed tool-call argument PREVIEW (rpi#78 A3).
 ///
-/// `parse_streaming_json` re-parses the whole accumulated argument text, so a
-/// per-delta call is O(args) work per delta and O(args²) per tool call. The
-/// preview only has to keep up with the renderer (a 16 ms frame tick), and the
-/// authoritative arguments always come from [`parse_tool_call_arguments`] when
-/// the block closes, so adapters may skip intermediate refreshes.
+/// The shared [`crate::utils::streaming_json::StreamingJsonParser`] reads each
+/// delta once; this throttle only controls how often the provider materializes
+/// `block.arguments` for the renderer. The preview only has to keep up with the
+/// frame tick, and the authoritative arguments always come from
+/// [`crate::utils::streaming_json::ToolCallArgumentsStream::finish`] when the
+/// block closes, so adapters may skip intermediate materializations.
 pub const STREAMING_ARGS_PREVIEW_INTERVAL: Duration = Duration::from_millis(33);
 
-/// Argument payloads up to this size are parsed on every delta: the parse is
+/// Argument payloads up to this size materialize on every delta: the copy is
 /// cheaper than the bookkeeping and keeps the preview's onset exact.
 const STREAMING_ARGS_PREVIEW_ALWAYS_BYTES: usize = 2048;
 
-/// Per-tool-call preview-parse throttle (see
+/// Per-tool-call preview-materialization throttle (see
 /// [`STREAMING_ARGS_PREVIEW_INTERVAL`]).
 #[derive(Debug, Default)]
 pub struct StreamingArgsPreview {
@@ -627,7 +628,7 @@ pub struct StreamingArgsPreview {
 impl StreamingArgsPreview {
     /// Whether this delta should refresh `block.arguments` for an accumulated
     /// argument text of `args_len` bytes.
-    pub fn should_parse(&mut self, args_len: usize) -> bool {
+    pub fn should_refresh(&mut self, args_len: usize) -> bool {
         if args_len <= STREAMING_ARGS_PREVIEW_ALWAYS_BYTES {
             // Small payloads refresh unconditionally and do not arm the
             // throttle, so the first large delta after a small run still
@@ -941,21 +942,24 @@ mod tests {
         assert!(saw_cjk, "the multi-byte payload must have been exercised");
     }
 
-    /// rpi#78 A3: small argument payloads parse every delta; large ones are
-    /// throttled to the display cadence (the authoritative arguments come from
-    /// `parse_tool_call_arguments` at block end).
+    /// rpi#78 A3: small argument payloads materialize every delta; large ones
+    /// are throttled to the display cadence (the authoritative arguments come
+    /// from `ToolCallArgumentsStream::finish` at block end).
     #[test]
     fn streaming_args_preview_throttles_large_payloads() {
         let mut preview = StreamingArgsPreview::default();
         for _ in 0..10 {
-            assert!(preview.should_parse(64), "small payloads always refresh");
+            assert!(preview.should_refresh(64), "small payloads always refresh");
         }
         assert!(
-            preview.should_parse(4096),
+            preview.should_refresh(4096),
             "the first large delta refreshes"
         );
-        assert!(!preview.should_parse(8192), "immediate re-parse is skipped");
+        assert!(
+            !preview.should_refresh(8192),
+            "immediate re-materialization is skipped"
+        );
         std::thread::sleep(STREAMING_ARGS_PREVIEW_INTERVAL + std::time::Duration::from_millis(5));
-        assert!(preview.should_parse(8192), "the next window refreshes");
+        assert!(preview.should_refresh(8192), "the next window refreshes");
     }
 }

@@ -829,10 +829,18 @@ async fn stream_with_deltas(
                 });
                 let args_json =
                     serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_owned());
+                // #9265: partial arguments come from the same incremental
+                // parser real providers use, so consumers see them grow.
+                let mut arguments =
+                    rpi_ai::utils::streaming_json::ToolCallArgumentsStream::default();
                 for chunk in split_string_by_token_size(&args_json, min_token_size, max_token_size)
                 {
                     schedule_chunk(&chunk, tokens_per_second).await;
                     abort_if_cancelled!();
+                    arguments.append(&chunk);
+                    if let Some(AssistantContent::ToolCall(cur)) = partial.content.get_mut(index) {
+                        cur.arguments = arguments.arguments().clone();
+                    }
                     let _ = tx.send(StreamEvent::ToolCallDelta {
                         content_index: index,
                         delta: chunk,

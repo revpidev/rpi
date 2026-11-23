@@ -175,14 +175,14 @@ fn append_text(message: &mut AssistantMessage, delta: &str, thinking: bool) {
 
 fn apply_tool_delta(
     message: &mut AssistantMessage,
-    tools: &mut HashMap<String, String>,
+    tools: &mut HashMap<String, rpi_ai::utils::streaming_json::ToolCallArgumentsStream>,
     id: &str,
     name: &str,
     delta: &str,
 ) {
-    let raw = tools.entry(id.to_owned()).or_default();
-    raw.push_str(delta);
-    let arguments = rpi_ai::utils::json_parse::parse_streaming_json(Some(raw));
+    let stream = tools.entry(id.to_owned()).or_default();
+    stream.append(delta);
+    let arguments = stream.arguments().clone();
     if let Some(AssistantContent::ToolCall(call)) = message
         .content
         .iter_mut()
@@ -508,7 +508,10 @@ async fn replay(args: &ReplayArgs, bytes: &[u8]) -> Result<Value, String> {
 
     let started = Instant::now();
     let mut current: Option<AssistantMessage> = None;
-    let mut tool_arguments = HashMap::new();
+    let mut tool_arguments: HashMap<
+        String,
+        rpi_ai::utils::streaming_json::ToolCallArgumentsStream,
+    > = HashMap::new();
     let mut input_deltas = 0usize;
     let mut keyboard_inputs = 0usize;
     let mut input_latencies_ns = Vec::new();

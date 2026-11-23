@@ -90,12 +90,12 @@ use crate::utils::error_body::NormalizedProviderError;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{headers_to_record, provider_headers_to_header_map};
 use crate::utils::json_parse::StreamingArgsPreview;
-use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_env::get_provider_env_value;
 use crate::utils::provider_retry::{
     ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
+use crate::utils::streaming_json::ToolCallArgumentsStream;
 use crate::utils::transform_messages::transform_messages;
 
 // ---------------------------------------------------------------------------
@@ -1348,8 +1348,9 @@ struct StreamProcessor<'a> {
     model: &'a Model,
     /// Content index by Bedrock `contentBlockIndex`.
     blocks_by_bedrock_index: HashMap<u64, usize>,
-    /// Tool-call partial JSON by content index.
-    partial_json: HashMap<usize, String>,
+    /// #9265: tool-call argument streams by content index, never on the
+    /// content block.
+    arguments: HashMap<usize, ToolCallArgumentsStream>,
     /// rpi#78 A3: preview-parse throttle by content index.
     args_preview: HashMap<usize, StreamingArgsPreview>,
     /// Scratch buffer for encrypted reasoning deltas (base64-decoded
@@ -1372,7 +1373,7 @@ impl<'a> StreamProcessor<'a> {
             output,
             model,
             blocks_by_bedrock_index: HashMap::new(),
-            partial_json: HashMap::new(),
+            arguments: HashMap::new(),
             args_preview: HashMap::new(),
             redacted_chunks: HashMap::new(),
             failure,
@@ -1532,7 +1533,8 @@ impl<'a> StreamProcessor<'a> {
             }));
         let content_index = output.content.len() - 1;
         self.blocks_by_bedrock_index.insert(index, content_index);
-        self.partial_json.insert(content_index, String::new());
+        self.arguments
+            .insert(content_index, ToolCallArgumentsStream::default());
         self.args_preview
             .insert(content_index, StreamingArgsPreview::default());
         events.push(StreamEvent::ToolCallStart {
@@ -1595,18 +1597,22 @@ impl<'a> StreamProcessor<'a> {
                 && matches!(output.content[index], AssistantContent::ToolCall(_))
             {
                 let input = tool_use.get("input").and_then(Value::as_str).unwrap_or("");
-                let partial = self.partial_json.entry(index).or_default();
-                partial.push_str(input);
+                let args_len = {
+                    let stream = self.arguments.entry(index).or_default();
+                    stream.append(input);
+                    stream.text().len()
+                };
                 // rpi#78 A3: authoritative arguments land at content-block stop.
                 let refresh = self
                     .args_preview
                     .entry(index)
                     .or_default()
-                    .should_parse(partial.len());
-                if let AssistantContent::ToolCall(call) = &mut output.content[index]
-                    && refresh
-                {
-                    call.arguments = parse_streaming_json(Some(partial));
+                    .should_refresh(args_len);
+                if refresh && let Some(stream) = self.arguments.get_mut(&index) {
+                    let parsed = stream.arguments().clone();
+                    if let AssistantContent::ToolCall(call) = &mut output.content[index] {
+                        call.arguments = parsed;
+                    }
                 }
                 events.push(StreamEvent::ToolCallDelta {
                     content_index: index,
@@ -1743,8 +1749,7 @@ impl<'a> StreamProcessor<'a> {
             }
             AssistantContent::ToolCall(call) => {
                 self.args_preview.remove(&index);
-                let partial = self.partial_json.remove(&index).unwrap_or_default();
-                let parsed = crate::utils::json_parse::parse_tool_call_arguments(Some(&partial));
+                let parsed = self.arguments.remove(&index).unwrap_or_default().finish();
                 call.arguments = parsed.arguments;
                 call.arguments_error = parsed.arguments_error;
                 events.push(StreamEvent::ToolCallEnd {

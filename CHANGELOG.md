@@ -4,7 +4,7 @@
 
 ### v0.1.9 draft — implementation in progress
 
-This section covers the V19-01 implementation work including its M06-OUT handoff, the V19-02 B/C/D implementation and completed M06-CHECK, the V19-03 extension rebase remediation, and the V19-04 rendering-reuse implementation. V19-01's final review passed on 2026-11-19; V19-02's D-111 follow-up remediation passed a fresh-context review on 2026-11-21; V19-03's comprehensive review returned BLOCK; after the remediation and P3 closeout it passed a fresh-context review on 2026-11-22 (round 10 plus a narrow round-11 confirmation); V19-04's implementation and self-test completed on 2026-11-22; V19-04 passed its final narrow documentation review on 2026-11-22 and is complete; the V19-08 release gate is still pending.
+This section covers the V19-01 implementation work including its M06-OUT handoff, the V19-02 B/C/D implementation and completed M06-CHECK, the V19-03 extension rebase remediation, the V19-04 rendering-reuse implementation, and the V19-05 streaming tool-argument implementation. V19-01's final review passed on 2026-11-19; V19-02's D-111 follow-up remediation passed a fresh-context review on 2026-11-21; V19-03's comprehensive review returned BLOCK; after the remediation and P3 closeout it passed a fresh-context review on 2026-11-22 (round 10 plus a narrow round-11 confirmation); V19-04's implementation and self-test completed on 2026-11-22; V19-04 passed its final narrow documentation review on 2026-11-22 and is complete; V19-05 completed on 2026-11-22 after three review rounds; the V19-08 release gate is still pending.
 
 ### Main line
 
@@ -30,6 +30,13 @@ This section covers the V19-01 implementation work including its M06-OUT handoff
 - **Revision contract**: `Component::cache_revision()` is an additive default-`None` method with monotonic revisions for Markdown, Text and Spacer and aggregation for assistant messages. `CodeHighlighter` keys on a monotonic theme generation, with the theme pointer only as a secondary check; `Image` revisions also track transcoder registration. Containers whose children are publicly mutable keep returning `None`.
 - **PNG byte budget**: the conversion cache keys on a construction-time 256-bit content digest with prefix/suffix collision checks, shares converted data with `Arc`, and enforces the existing 32-entry limit plus an 8 MiB total-byte LRU. Eviction only drops derived PNGs; session images and Kitty behavior are unchanged.
 - **Evidence**: all 17 replay scenarios are byte-identical to the pre-V19-04 oracle (`590ba19a`). The main Markdown scenario runs at 55.1% CPU and 56.1% pure-compute p95 of that oracle; long-history RES falls 14.2%/16.9% (startup/streaming) with RssAnon down 14.0 MiB (20.3%) and 17.4 MiB (23.4%). New read-only code pages measure 16 KiB SHR / 8 KiB RssFile, within the shared 2 MiB budget.
+
+### Streaming tool arguments (V19-05)
+
+- **Shared incremental parser**: a Rust port of upstream #9265's `StreamingJsonParser` / `ToolCallArgumentsStream` reads each argument delta once. `snapshot()` returns an immutable tolerant value, while the authoritative final arguments still come from one strict `parse_tool_call_arguments` at block close. For JSON function arguments, the 33 ms preview cadence gates materializing `block.arguments`; grammar/custom input keeps its per-delta update (bounded by the input length) and is tracked for V19-08.
+- **Provider coverage**: Anthropic, Bedrock ConverseStream, OpenAI Completions, OpenAI Responses (including Codex/Azure), Mistral, rpi-messages, faux and the agent proxy keep one parser per tool call in stream state, so raw argument text never reaches content blocks or partial messages. Grammar/custom tool input appends deltas and closes explicitly; pi-messages accepts only the next or an existing `contentIndex` and rejects skipped or huge indices.
+- **Preview variant (D-112)**: the streaming preview follows upstream #9265 — an open string keeps trailing whitespace, raw control characters and invalid escapes visible, malformed literal or number suffixes and missing or extra commas/colons follow the upstream tolerant rules, and a very large open container may lag until its copy credit catches up. Complete valid documents are unchanged; the strict final parse still rejects invalid JSON, non-objects and schema failures before any tool runs.
+- **Evidence**: the prefix differential covers every UTF-8 prefix of the corpus (with D-112 counterexamples), an arbitrary-chunk test compares snapshots at shared chunk boundaries, the scan counter proves N bytes are consumed once, and the long-arguments replay records CPU/input_delta, pure-compute p95 and memory against the V19-04 baseline.
 
 ### Extensions rebase (V19-03)
 
@@ -67,7 +74,7 @@ This section covers the V19-01 implementation work including its M06-OUT handoff
 
 ### Internal
 
-- The seven first-party extensions remain on `rpiAbi: 1`; Session JSONL outer framing and durable default isolation are unchanged. R2-A14 belongs to V19-05; V19-02 D16 wires the shared argument validator into durable `afterTool`, and R2-M06 is closed through the M06-IN/OUT/CHECK handoff. No distribution or endpoint update is implied. Offline fixture/loopback evidence and the fresh-context review verdict are recorded in the task file.
+- The seven first-party extensions remain on `rpiAbi: 1`; Session JSONL outer framing and durable default isolation are unchanged. R2-A14's unified incremental tool-argument parser is delivered by V19-05; V19-02 D16 wires the shared argument validator into durable `afterTool`, and R2-M06 is closed through the M06-IN/OUT/CHECK handoff. No distribution or endpoint update is implied. Offline fixture/loopback evidence and the fresh-context review verdict are recorded in the task file.
 
 ## [0.1.8] - 2026-11-12
 

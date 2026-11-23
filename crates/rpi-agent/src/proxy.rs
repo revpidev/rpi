@@ -57,7 +57,7 @@ use rpi_ai::types::{
     ThinkingBudgets, ThinkingContent, ThinkingLevel, ToolCall, TranscriptContext, Transport, Usage,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
-use rpi_ai::utils::json_parse::parse_streaming_json;
+use rpi_ai::utils::streaming_json::ToolCallArgumentsStream;
 use rpi_ai::utils::transport_error::format_reqwest_error;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -300,7 +300,7 @@ pub fn stream_proxy(
         let partial = SharedAssistantMessage::new(initial_partial(&model));
         // Transient `partialJson` per content index (:316-339); see the file
         // header notes for why it lives outside `ToolCall`.
-        let mut partial_jsons: HashMap<usize, String> = HashMap::new();
+        let mut partial_jsons: HashMap<usize, ToolCallArgumentsStream> = HashMap::new();
         match run(
             &model,
             &context,
@@ -347,7 +347,7 @@ async fn run(
     context: &TranscriptContext,
     options: &ProxyStreamOptions,
     partial: &SharedAssistantMessage,
-    partial_jsons: &mut HashMap<usize, String>,
+    partial_jsons: &mut HashMap<usize, ToolCallArgumentsStream>,
     stream: &AssistantMessageEventStream,
 ) -> Result<(), String> {
     let signal = options.signal.as_ref();
@@ -468,7 +468,7 @@ async fn run(
 fn process_data_line(
     line: &str,
     partial: &SharedAssistantMessage,
-    partial_jsons: &mut HashMap<usize, String>,
+    partial_jsons: &mut HashMap<usize, ToolCallArgumentsStream>,
     stream: &AssistantMessageEventStream,
     saw_terminal_event: &mut bool,
 ) -> Result<(), String> {
@@ -596,7 +596,7 @@ impl IncrementalUtf8Decoder {
 fn process_proxy_event(
     proxy_event: ProxyAssistantMessageEvent,
     partial: &SharedAssistantMessage,
-    partial_jsons: &mut HashMap<usize, String>,
+    partial_jsons: &mut HashMap<usize, ToolCallArgumentsStream>,
 ) -> Result<Option<StreamEvent>, String> {
     let shared = partial.clone();
     shared.with_mut(|partial| match proxy_event {
@@ -713,7 +713,7 @@ fn process_proxy_event(
                     arguments_error: None,
                 }),
             )?;
-            partial_jsons.insert(content_index, String::new());
+            partial_jsons.insert(content_index, ToolCallArgumentsStream::default());
             Ok(Some(StreamEvent::ToolCallStart {
                 content_index,
                 partial: shared.clone(),
@@ -731,9 +731,10 @@ fn process_proxy_event(
             else {
                 return Err("Received toolcall_delta for non-toolCall content".to_owned());
             };
-            let accumulated = partial_jsons.entry(content_index).or_default();
-            accumulated.push_str(&delta);
-            call.arguments = parse_streaming_json(Some(accumulated.as_str()));
+            if let Some(stream) = partial_jsons.get_mut(&content_index) {
+                stream.append(&delta);
+                call.arguments = stream.arguments().clone();
+            }
             Ok(Some(StreamEvent::ToolCallDelta {
                 content_index,
                 delta,
