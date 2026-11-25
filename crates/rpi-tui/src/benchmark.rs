@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use crate::tui_base::RenderScheduleStats;
+
 const LOG_ENV: &str = "RPI_V19_BENCHMARK_LOG";
 
 #[derive(Default)]
@@ -51,6 +53,9 @@ struct FrameTiming {
     terminal_io: Duration,
     output_bytes: usize,
     output_hash: Option<u64>,
+    /// Render schedule state when the frame started (V19-06 backpressure
+    /// report): tier and latest-wins counters.
+    backpressure: Option<RenderScheduleStats>,
 }
 
 impl FrameTiming {
@@ -64,8 +69,16 @@ impl FrameTiming {
             terminal_io: Duration::ZERO,
             output_bytes: 0,
             output_hash: None,
+            backpressure: None,
         }
     }
+}
+
+/// Records the render schedule state of the frame being laid out (V19-06
+/// FR-D R5): adaptive tier and latest-wins counters travel with each frame
+/// so the throttled replay report can attribute frames to tiers.
+pub fn note_backpressure(stats: RenderScheduleStats) {
+    with_frame(|frame, _| frame.backpressure = Some(stats));
 }
 
 thread_local! {
@@ -197,6 +210,15 @@ fn record(frame: FrameTiming) {
         "frame_interval_ns": interval.map(|value| value.as_nanos()),
         "output_bytes": frame.output_bytes,
         "output_hash": format!("{output_hash:016x}"),
+        "backpressureTier": frame.backpressure.map(|stats| stats.tier_fps),
+        "requestedGenerations": frame.backpressure.map(|stats| stats.requested_generation),
+        "renderedGenerations": frame.backpressure.map(|stats| stats.rendered_generation),
+        "supersededRequests": frame.backpressure.map(|stats| stats.superseded_requests),
+        "latencyPromotions": frame.backpressure.map(|stats| stats.latency_promotions),
+        "tierChanges": frame.backpressure.map(|stats| stats.tier_changes),
+        "lastFrameCostNs": frame
+            .backpressure
+            .map(|stats| stats.last_frame_cost.as_nanos()),
     });
     let Some(file) = recorder.file.as_mut() else {
         return;

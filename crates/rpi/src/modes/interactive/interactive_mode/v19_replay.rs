@@ -33,6 +33,30 @@ use crate::sdk::{CreateAgentSessionOptions, NoTools, create_agent_session};
 
 const BUNDLE_SCHEMA: &str = "rpi-v19-replay-v1";
 
+/// How the replay drives the renderer after each event (V19-06 FR-D R6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayRenderMode {
+    /// `render_now(false)` once per event: the fixed-cadence CPU gate.
+    Fixed,
+    /// The driver's tick schedule renders: frames fire at the baseline
+    /// interval or at the adaptive backpressure tier, and the frames input
+    /// events owe are latency-class. This is the separate backpressure
+    /// report; its numbers never count towards the fixed-cadence gate.
+    Throttled,
+}
+
+fn replay_render_mode() -> ReplayRenderMode {
+    match std::env::var("RPI_V19_REPLAY_RENDER_MODE").as_deref() {
+        Ok("throttled") => ReplayRenderMode::Throttled,
+        _ => ReplayRenderMode::Fixed,
+    }
+}
+
+/// Upper bound for driving the schedule until an input's frame is visible
+/// (and for draining the final frame): a stalled renderer must fail the
+/// replay instead of hanging the runner.
+const THROTTLED_DRAIN_LIMIT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReplayBundle {
@@ -503,6 +527,7 @@ async fn replay(args: &ReplayArgs, bytes: &[u8]) -> Result<Value, String> {
         None
     };
 
+    let render_mode = replay_render_mode();
     ui.drain_events();
     mode.ui.render_now(true);
 
@@ -515,6 +540,11 @@ async fn replay(args: &ReplayArgs, bytes: &[u8]) -> Result<Value, String> {
     let mut input_deltas = 0usize;
     let mut keyboard_inputs = 0usize;
     let mut input_latencies_ns = Vec::new();
+    // Where an input event's latency goes (V19-06 report): the input pump,
+    // the command drain, the frame and the terminal-simulator read. Marks:
+    // [input started, pump done, drain done].
+    let mut input_latency_breakdown_ns: Vec<[u128; 4]> = Vec::new();
+    let mut input_phase_marks: Option<[Instant; 3]> = None;
     let mut last_session_path = None;
     let mut samples = Vec::new();
     let mut result = Ok(());
@@ -659,6 +689,7 @@ async fn replay(args: &ReplayArgs, bytes: &[u8]) -> Result<Value, String> {
                     keyboard_expected = Some(text);
                     terminal.send_input(text);
                     mode.ui.pump(Some(Duration::ZERO));
+                    input_phase_marks = Some([input_started, Instant::now(), Instant::now()]);
                 }
                 "wait" => {}
                 other => return Err(format!("unknown replay event kind {other}")),
@@ -671,8 +702,27 @@ async fn replay(args: &ReplayArgs, bytes: &[u8]) -> Result<Value, String> {
             break;
         }
         ui.drain_events();
-        mode.ui.render_now(false);
+        let drained =
+            input_phase_marks.map(|[started, pumped, _]| [started, pumped, Instant::now()]);
+        match render_mode {
+            ReplayRenderMode::Fixed => mode.ui.render_now(false),
+            ReplayRenderMode::Throttled => mode.ui.tick(Instant::now()),
+        }
+        let rendered =
+            drained.map(|[started, pumped, drained]| [started, pumped, drained, Instant::now()]);
         if let Some(expected) = keyboard_expected {
+            // Fixed cadence rendered the frame above. Throttled cadence owes
+            // the keystroke a latency-class frame: drive the schedule until
+            // it is on screen and measure the input-to-visible latency.
+            while !terminal.get_viewport().join("\n").contains(expected) {
+                if input_started.elapsed() > THROTTLED_DRAIN_LIMIT {
+                    break;
+                }
+                if render_mode == ReplayRenderMode::Fixed {
+                    break;
+                }
+                mode.ui.pump(Some(Duration::from_millis(1)));
+            }
             let visible = terminal.get_viewport().join("\n").contains(expected);
             if !visible {
                 result = Err(format!(
@@ -681,6 +731,14 @@ async fn replay(args: &ReplayArgs, bytes: &[u8]) -> Result<Value, String> {
                 break;
             }
             input_latencies_ns.push(input_started.elapsed().as_nanos());
+            if let Some([started, pumped, drained, rendered]) = rendered {
+                input_latency_breakdown_ns.push([
+                    pumped.duration_since(started).as_nanos(),
+                    drained.duration_since(pumped).as_nanos(),
+                    rendered.duration_since(drained).as_nanos(),
+                    Instant::now().duration_since(rendered).as_nanos(),
+                ]);
+            }
         }
         if event.kind == "sample" {
             let Some(name) = event.name.as_deref() else {
@@ -695,6 +753,14 @@ async fn replay(args: &ReplayArgs, bytes: &[u8]) -> Result<Value, String> {
         }
     }
 
+    // Throttled cadence: the last event still owes a frame (message_end and
+    // the final state are always delivered); fixed cadence already rendered.
+    if render_mode == ReplayRenderMode::Throttled {
+        let drain_started = Instant::now();
+        while mode.ui.has_pending_work() && drain_started.elapsed() < THROTTLED_DRAIN_LIMIT {
+            mode.ui.pump(Some(Duration::from_millis(1)));
+        }
+    }
     let terminal_bytes = terminal.get_writes();
     let terminal_sha256 = format!("{:x}", Sha256::digest(terminal_bytes.as_bytes()));
     let final_screen = terminal.get_viewport();
@@ -741,6 +807,12 @@ async fn replay(args: &ReplayArgs, bytes: &[u8]) -> Result<Value, String> {
         "samples": samples,
         "imageHistory": bundle.image_history.len(),
         "inputLatenciesNs": input_latencies_ns,
+        // [input pump, command drain, forced frame, terminal read] per input.
+        "inputLatencyBreakdownNs": input_latency_breakdown_ns,
+        "renderMode": match render_mode {
+            ReplayRenderMode::Fixed => "fixed",
+            ReplayRenderMode::Throttled => "throttled",
+        },
         "frames": frames,
         "terminalOutputBytes": terminal_bytes.len(),
         "terminalOutputSha256": terminal_sha256,

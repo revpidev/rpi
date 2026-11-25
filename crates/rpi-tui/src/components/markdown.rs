@@ -346,6 +346,8 @@ pub struct Markdown {
     block_highlighted_code: RefCell<Option<HashMap<HighlightKey, Arc<[String]>>>>,
     /// Monotonic content revision for [`Component::cache_revision`].
     revision: Cell<u64>,
+    /// Process-unique instance id (V19-06).
+    instance_id: u64,
     /// Last observed external (transform-context) revision.
     last_external_revision: Cell<u64>,
 }
@@ -1574,6 +1576,7 @@ impl Markdown {
             previous_blocks_render_latex: Cell::new(None),
             block_highlighted_code: RefCell::new(None),
             revision: Cell::new(0),
+            instance_id: crate::tui::next_cache_instance_id(),
             last_external_revision: Cell::new(0),
         }
     }
@@ -3255,6 +3258,10 @@ impl Component for Markdown {
             self.bump_revision();
         }
         Some(self.revision.get())
+    }
+
+    fn cache_instance_id(&self) -> Option<u64> {
+        Some(self.instance_id)
     }
 }
 

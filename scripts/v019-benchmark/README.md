@@ -71,6 +71,20 @@ python3 scripts/v019-benchmark/run_suite.py --suite memory \
 
 The suite runner writes a host/build/binary/Cargo.lock identity index and links every raw report. Memory bundles use a file-backed SessionManager and the production session factory, so `/new` and `/resume` are real lifecycle transitions. Named sample events synchronize with the runner through marker/ack files; the runner captures the live process before acknowledging, and missing captures fail the run. Memory timing includes those sampling pauses and is never used for the CPU gate.
 
+## Backpressure report (V19-06)
+
+The fixed-cadence CPU gate renders exactly once per replay event through `render_now`, so it never sees the driver's tick-driven schedule. The adaptive 60/30/20 fps backpressure (ADR-0049 decision 5) is measured separately, and its numbers never count towards the gate:
+
+```bash
+python3 scripts/v019-benchmark/run_suite.py --suite backpressure \
+  --binary target/release/rpi-v19-replay --output-dir /tmp/rpi-v19-backpressure \
+  --repeat 3 --source-commit <source-commit> --overlay-sha256 <harness-patch-sha256>
+```
+
+The backpressure suite runs the CPU scenarios with `--render-mode throttled`: the replay leaves `RPI_V19_DISABLE_ADAPTIVE_BACKPRESSURE` unset, drives `tick` after every event instead of `render_now`, waits for the frame a `keyboard_input` event owes (measuring input-to-visible latency on the real schedule) and drains the final frame before reading the terminal. Frame boundaries then depend on measured frame costs, so the runner only requires identical final screens across repeats and reports the per-run frame sequences.
+
+Each frame event carries the schedule state at frame start: `backpressureTier` (60/30/20), `requestedGenerations`/`renderedGenerations` (latest-wins), `supersededRequests` (requests folded into a pending frame), `latencyPromotions` (input frames that bypassed the backoff), `tierChanges` and `lastFrameCostNs`. The run summary exposes them as `backpressure` (`tierFrames` counts frames per tier); the suite report lists them per run under `backpressurePerRun`. Compare the report with the fixed-cadence report of the same binary: the throttled run keeps the same final screens while trading intermediate frames for lower CPU.
+
 ## Stable v0.1.8 source identity and instrumentation
 
 Keep an independent detached worktree at stable commit `16062830e9aa4ee305c41dbc811d91995885b5b1` for read-only source verification. To obtain the same internal frame metrics from stable, use a separate disposable measurement worktree at that commit and apply the reviewed V19-00 measurement overlay. The overlay explicitly contains replay/probe/test-fixture instrumentation, mechanical pin-provenance updates and the user-approved export `template.css/template.js` synchronization; it contains no later functional or optimization commits. Do not describe it as instrumentation-only.

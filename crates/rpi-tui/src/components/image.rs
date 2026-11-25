@@ -281,6 +281,8 @@ pub struct Image {
     cache: RefCell<Option<ImageCache>>,
     /// Monotonic revision for [`Component::cache_revision`] (V19-04 FR-E).
     revision: Cell<u64>,
+    /// Process-unique instance id (V19-06).
+    instance_id: u64,
     /// Last observed capabilities/transcoder generations; a change bumps
     /// `revision`.
     last_capability_generation: Cell<(u64, u64)>,
@@ -317,6 +319,7 @@ impl Image {
             png_data: RefCell::new(None),
             cache: RefCell::new(None),
             revision: Cell::new(0),
+            instance_id: crate::tui::next_cache_instance_id(),
             last_capability_generation: Cell::new((0, 0)),
         }
     }
@@ -462,6 +465,10 @@ impl Component for Image {
             self.revision.set(self.revision.get().wrapping_add(1));
         }
         Some(self.revision.get())
+    }
+
+    fn cache_instance_id(&self) -> Option<u64> {
+        Some(self.instance_id)
     }
 }
 

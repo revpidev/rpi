@@ -79,6 +79,8 @@ pub struct AssistantMessageComponent {
     revision: u64,
     /// Monotonic aggregate returned by `cache_revision()`.
     aggregated_revision: Cell<u64>,
+    /// Process-unique instance id for cross-frame caches (V19-06).
+    instance_id: u64,
     /// Last combined child/rebuild value; a change bumps the aggregate.
     last_combined_revision: Cell<Option<u64>>,
     has_tool_calls: bool,
@@ -156,6 +158,13 @@ impl Component for SlotMarkdownChild {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .cache_revision()
+    }
+
+    fn cache_instance_id(&self) -> Option<u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cache_instance_id()
     }
 }
 
@@ -268,6 +277,7 @@ impl AssistantMessageComponent {
             trust_transform_revision: false,
             revision: 0,
             aggregated_revision: Cell::new(0),
+            instance_id: rpi_tui::tui::next_cache_instance_id(),
             last_combined_revision: Cell::new(None),
             has_tool_calls: false,
             theme,
@@ -779,6 +789,10 @@ impl Component for AssistantMessageComponent {
         if let Some(message) = self.last_message.clone() {
             self.update_content(&message, self.is_streaming);
         }
+    }
+
+    fn cache_instance_id(&self) -> Option<u64> {
+        Some(self.instance_id)
     }
 
     fn cache_revision(&self) -> Option<u64> {

@@ -11,6 +11,8 @@ pub struct Spacer {
     lines: usize,
     /// Monotonic content revision (V19-04 FR-E).
     revision: Cell<u64>,
+    /// Process-unique instance id (V19-06).
+    instance_id: u64,
 }
 
 impl Spacer {
@@ -18,6 +20,7 @@ impl Spacer {
         Self {
             lines,
             revision: Cell::new(0),
+            instance_id: crate::tui::next_cache_instance_id(),
         }
     }
 
@@ -44,6 +47,10 @@ impl Component for Spacer {
 
     fn cache_revision(&self) -> Option<u64> {
         Some(self.revision.get())
+    }
+
+    fn cache_instance_id(&self) -> Option<u64> {
+        Some(self.instance_id)
     }
 }
 

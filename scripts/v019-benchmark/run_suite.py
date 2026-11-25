@@ -30,7 +30,9 @@ def main() -> int:
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument("--suite", choices=("cpu", "memory"), default="cpu")
+    parser.add_argument(
+        "--suite", choices=("cpu", "memory", "backpressure"), default="cpu"
+    )
     parser.add_argument("--arena")
     parser.add_argument("--only", help="comma-separated scenario names for development")
     parser.add_argument("--include-smoke", action="store_true")
@@ -49,8 +51,13 @@ def main() -> int:
     names = [
         name
         for name in sorted(manifest["bundles"])
-        if manifest["bundles"][name].get("suite", "cpu") == args.suite
-        and (args.suite == "memory" or args.include_smoke or name != "smoke-text-regular.json")
+        if manifest["bundles"][name].get("suite", "cpu")
+        in ({"cpu"} if args.suite == "backpressure" else {args.suite})
+        and (
+            args.suite == "memory"
+            or args.include_smoke
+            or name != "smoke-text-regular.json"
+        )
         and (selected is None or name.removesuffix(".json") in selected)
     ]
     if not names or (selected is not None and len(names) != len(selected)):
@@ -76,6 +83,10 @@ def main() -> int:
             "--repeat",
             str(args.repeat),
         ]
+        if args.suite == "backpressure":
+            # The backpressure report is a separate measurement: the driver's
+            # tick-driven schedule with adaptive 60/30/20 fps tiers enabled.
+            command.extend(["--render-mode", "throttled"])
         if args.arena is not None:
             command.extend(["--arena", args.arena])
         with log.open("w") as log_file:
@@ -95,9 +106,15 @@ def main() -> int:
             "frameLogs": report["frameLogs"],
             "processCpuSecondsMedian": report["processCpuSecondsMedian"],
             "processCpuWallRatioMedian": report["processCpuWallRatioMedian"],
+            "cpuPerRenderedFrameSecondsMedian": report["cpuPerRenderedFrameSecondsMedian"],
+            "cpuPerInputDeltaSecondsMedian": report["cpuPerInputDeltaSecondsMedian"],
             "pureComputeP95Ns": report["pureComputeP95Ns"],
+            "frameIntervalP95NsMedian": report["frameIntervalP95NsMedian"],
             "inputFirstVisibleP95NsMedian": report["inputFirstVisibleP95NsMedian"],
         }
+        if args.suite == "backpressure":
+            entry["backpressurePerRun"] = report["backpressurePerRun"]
+            entry["finalScreenSha256"] = report["finalScreenSha256"]
         if args.suite == "memory":
             samples = []
             for run_summary_path in report["runSummaries"]:
@@ -146,8 +163,12 @@ def main() -> int:
         "cargoLock": str((args.cargo_lock or ROOT / "Cargo.lock").resolve()),
         "cargoLockSha256": hash_file(args.cargo_lock or ROOT / "Cargo.lock"),
         "buildProfile": "release",
-        "fixedCadence": True,
-        "adaptiveBackpressure": "disabled-by-test-switch",
+        # The CPU gate runs at a fixed cadence with adaptive backpressure
+        # disabled; the backpressure suite is the separate throttled report.
+        "fixedCadence": args.suite != "backpressure",
+        "adaptiveBackpressure": (
+            "enabled-throttled" if args.suite == "backpressure" else "disabled-by-test-switch"
+        ),
         "runsPerScenario": args.repeat,
         "scenarioCount": len(reports),
         "wallSeconds": time.monotonic() - started,
@@ -165,7 +186,7 @@ def main() -> int:
             "cargo": command_output(["cargo", "--version"]),
         },
         "reports": reports,
-        "note": "Baseline facts only; no v0.1.9 target is claimed. Memory-suite timings include sampling pauses and are not CPU-gate measurements.",
+        "note": "Baseline facts only; no v0.1.9 target is claimed. Memory-suite timings include sampling pauses and are not CPU-gate measurements. Backpressure-suite frame boundaries depend on wall-clock frame costs and never count towards the fixed-cadence CPU gate.",
     }
     suite_path = output / "suite-report.json"
     suite_path.write_text(json.dumps(suite, indent=2) + "\n")

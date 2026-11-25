@@ -230,6 +230,34 @@ def validate_frames(path: Path) -> list[dict[str, object]]:
     return frames
 
 
+def backpressure_summary(frames: list[dict[str, object]]) -> dict[str, object]:
+    """Schedule counters carried by the last frame plus per-tier frame counts.
+
+    Only the throttled render mode (adaptive backpressure enabled) has
+    non-zero tier activity; the fixed-cadence mode pins the 60 fps tier.
+    """
+    tier_frames = {"60": 0, "30": 0, "20": 0}
+    for frame in frames:
+        tier = frame.get("backpressureTier")
+        if isinstance(tier, int):
+            tier_frames[str(tier)] = tier_frames.get(str(tier), 0) + 1
+    # A session restart (`/new`) installs a fresh schedule, so take the last
+    # frame of the schedule that carried the stream.
+    last = next(
+        (frame for frame in reversed(frames) if frame.get("requestedGenerations")),
+        frames[-1] if frames else {},
+    )
+    return {
+        "tierFrames": tier_frames,
+        "requestedGenerations": last.get("requestedGenerations"),
+        "renderedGenerations": last.get("renderedGenerations"),
+        "supersededRequests": last.get("supersededRequests"),
+        "latencyPromotions": last.get("latencyPromotions"),
+        "tierChanges": last.get("tierChanges"),
+        "lastFrameCostNs": last.get("lastFrameCostNs"),
+    }
+
+
 def run_one(
     binary: Path,
     bundle_path: Path,
@@ -238,6 +266,7 @@ def run_one(
     run_dir: Path,
     sandbox: Path,
     arena: str | None,
+    render_mode: str = "fixed",
 ) -> dict[str, object]:
     run_dir.mkdir(parents=True)
     agent, cwd = prepare_agent(bundle, sandbox)
@@ -254,8 +283,13 @@ def run_one(
         # Local-only model availability; replay never opens a provider stream.
         "KIMI_API_KEY": "replay-not-a-credential",
         "ZAI_API_KEY": "replay-not-a-credential",
-        "RPI_V19_DISABLE_ADAPTIVE_BACKPRESSURE": "1",
         "RPI_V19_BENCHMARK_LOG": str(frame_path),
+        # Fixed cadence (the CPU gate): the harness renders exactly once per
+        # replay event and the adaptive backpressure switch is disabled.
+        # Throttled cadence (the separate backpressure report): the driver's
+        # tick-driven schedule renders, with adaptive backpressure enabled.
+        "RPI_V19_DISABLE_ADAPTIVE_BACKPRESSURE": "1" if render_mode == "fixed" else "0",
+        "RPI_V19_REPLAY_RENDER_MODE": render_mode,
     }
     if arena is not None:
         env["MALLOC_ARENA_MAX"] = arena
@@ -342,6 +376,8 @@ def run_one(
     summary.update(
         {
             "command": command,
+            "renderMode": render_mode,
+            "backpressure": backpressure_summary(frames),
             "statuslineWorkerCpuSeconds": statusline_cpu,
             "wallSeconds": wall,
             "processCpuSeconds": cpu,
@@ -367,8 +403,16 @@ def run_one(
 
 def aggregate(scenario: str, input_hash: str, runs: list[dict[str, object]]) -> dict[str, object]:
     hashes = {run["finalScreenSha256"] for run in runs}
-    if len(hashes) != 1 or len({tuple(run["frameHashes"]) for run in runs}) != 1:
+    throttled = runs[0].get("renderMode") == "throttled"
+    # Fixed cadence is deterministic: every repeat renders the same frame
+    # sequence. The throttled mode depends on wall-clock frame costs, so only
+    # the final screen must agree; its frame boundaries are reported per run.
+    if len(hashes) != 1 or (
+        not throttled and len({tuple(run["frameHashes"]) for run in runs}) != 1
+    ):
         raise ValueError("same input/build produced different rendered output")
+    if not throttled and len({run["terminalOutputSha256"] for run in runs}) != 1:
+        raise ValueError("same input/build produced different terminal output")
     all_pure = [
         int(frame["pure_compute_ns"])
         for run in runs
@@ -378,6 +422,7 @@ def aggregate(scenario: str, input_hash: str, runs: list[dict[str, object]]) -> 
         "schema": "rpi-v19-benchmark-report-v1",
         "scenario": scenario,
         "inputSha256": input_hash,
+        "renderMode": runs[0].get("renderMode", "fixed"),
         "runs": len(runs),
         "processCpuSecondsMedian": median([float(run["processCpuSeconds"]) for run in runs]),
         "wallSecondsMedian": median([float(run["wallSeconds"]) for run in runs]),
@@ -408,6 +453,7 @@ def aggregate(scenario: str, input_hash: str, runs: list[dict[str, object]]) -> 
         ),
         "finalScreenSha256": next(iter(hashes)),
         "terminalOutputSha256PerRun": [run["terminalOutputSha256"] for run in runs],
+        "backpressurePerRun": [run["backpressure"] for run in runs],
         "runSummaries": [str(Path(str(run["frameLog"])).parent / "summary.json") for run in runs],
         "frameLogs": [run["frameLog"] for run in runs],
         "terminalOutputs": [run["terminalOutput"] for run in runs],
@@ -429,6 +475,13 @@ def main() -> int:
         help="dedicated logical sandbox root; each scenario is reset before a run",
     )
     parser.add_argument("--input-sha256", help="negative-test override")
+    parser.add_argument(
+        "--render-mode",
+        choices=("fixed", "throttled"),
+        default="fixed",
+        help="fixed: one render per replay event (CPU gate); throttled: the "
+        "driver's tick schedule with adaptive backpressure (separate report)",
+    )
     args = parser.parse_args()
     if args.repeat < 1:
         parser.error("--repeat must be positive")
@@ -462,6 +515,7 @@ def main() -> int:
                 output / f"run-{index + 1}",
                 args.sandbox_root.resolve() / str(bundle["scenario"]),
                 args.arena,
+                args.render_mode,
             )
         )
     report = aggregate(str(bundle["scenario"]), expected_hash, runs)

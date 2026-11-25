@@ -40,7 +40,8 @@ use crate::tui::{
     TuiStopOptions, lock_component, lock_shared, same_component,
 };
 use crate::tui_base::{
-    CursorPos, RenderSchedule, TerminalSizeCache, TuiBase, env_flag_is_1, schedule_render,
+    CursorPos, RenderSchedule, RenderScheduleStats, TerminalSizeCache, TuiBase, env_flag_is_1,
+    promote_pending_render, record_frame_cost, render_schedule_stats, schedule_render,
 };
 use crate::utils::{slice_by_column, visible_width, width_divergence_extra};
 
@@ -304,11 +305,7 @@ impl TuiMainScreen {
         log_directory: Option<PathBuf>,
         size_cache: TerminalSizeCache,
     ) -> TuiMainScreen {
-        let schedule = Arc::new(Mutex::new(RenderSchedule {
-            requested: false,
-            deadline: None,
-            last_render_at: None,
-        }));
+        let schedule = Arc::new(Mutex::new(RenderSchedule::default()));
         let base = TuiBase::new(
             Arc::clone(&terminal),
             show_hardware_cursor,
@@ -787,9 +784,18 @@ impl TuiMainScreen {
             schedule.deadline = None;
             schedule.last_render_at = Some(Instant::now());
         }
+        let started = Instant::now();
         inner.do_render();
+        let frame_cost = started.elapsed();
         drop(inner);
+        record_frame_cost(&self.schedule, frame_cost);
         self.drain_pending_ops();
+    }
+
+    /// Render schedule snapshot (V19-06): latest-wins generations, the
+    /// adaptive backpressure tier and the latest frame cost.
+    pub fn render_schedule_stats(&self) -> RenderScheduleStats {
+        render_schedule_stats(&self.schedule)
     }
 
     /// `captureRenderState` (tui-main-screen.ts:68-78): shallow-copy the
@@ -866,18 +872,28 @@ impl TuiMainScreen {
     /// `handleInput` flow, run queued mutations, then fire the render
     /// deadline and introspection query timeouts that expired by `now`.
     pub fn tick(&self, now: Instant) {
+        let mut dispatched_input = false;
         loop {
             let event = lock_shared(&self.inbox).pop_front();
             match event {
                 Some(InboxEvent::Input(data)) => {
+                    dispatched_input = true;
                     self.lock_inner().handle_input(&data);
                     self.drain_pending_ops();
                 }
-                Some(InboxEvent::Resize) => self.request_render(false),
+                Some(InboxEvent::Resize) => {
+                    dispatched_input = true;
+                    self.request_render(false);
+                }
                 None => break,
             }
         }
         self.drain_pending_ops();
+        // V19-06 FR-D R3: a frame owed to keyboard/mouse/paste/resize input
+        // is latency-class and never waits behind the 30/20 fps backoff.
+        if dispatched_input {
+            promote_pending_render(&self.schedule, now);
+        }
         self.lock_inner().tick(now);
         self.drain_pending_ops();
     }
@@ -1247,6 +1263,7 @@ impl TuiMainScreenInner {
             return;
         }
         let _frame_probe = crate::benchmark::FrameProbe::new("regular");
+        crate::benchmark::note_backpressure(self.schedule_stats());
         // V13-07 S5: read the terminal size ONCE per frame (upstream reads a
         // cached property, tui-main-screen.ts:182-183; each `columns()`/
         // `rows()` here is an ioctl — the old code called them four times,
@@ -1708,7 +1725,9 @@ impl TuiMainScreenInner {
     /// [`TuiMainScreen::tick`].
     fn tick(&mut self, now: Instant) {
         if self.take_render_due(now) {
+            let started = Instant::now();
             self.do_render();
+            record_frame_cost(&self.schedule, started.elapsed());
         }
         self.fire_expired_queries(now);
     }

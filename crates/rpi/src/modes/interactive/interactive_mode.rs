@@ -60,6 +60,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -83,6 +84,7 @@ use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
 use rpi_tui::components::truncated_text::TruncatedText;
 use rpi_tui::keybindings as tui_keybindings;
+use rpi_tui::transcript::{TranscriptDocument, TranscriptStats, TranscriptSync};
 use rpi_tui::tui::{
     Component, Container, Focusable, OverlayHandle, RenderHandle, SharedComponent, TuiMode,
     TuiMouseEvent, TuiMouseHandlerResult, TuiStopOptions, shared_component_from_boxed,
@@ -780,6 +782,92 @@ impl<T: Component> Component for SharedChild<T> {
     /// walk (#59) to the wrapped component.
     fn set_image_width_cells(&mut self, width: usize) {
         lock(&self.0).set_image_width_cells(width);
+    }
+
+    /// V19-06: the wrapper is transparent to the cross-frame identity
+    /// protocol, so a trusted region (an assistant message) is validated by
+    /// its own `(instance id, revision)` in the transcript height index.
+    fn cache_revision(&self) -> Option<u64> {
+        lock(&self.0).cache_revision()
+    }
+
+    fn cache_instance_id(&self) -> Option<u64> {
+        lock(&self.0).cache_instance_id()
+    }
+
+    /// V19-06: a region over a transcript document (a `Container`) exposes
+    /// the document contract, so the fullscreen transcript measures the
+    /// nested regions through their height indexes.
+    fn as_transcript_document(&self) -> Option<&dyn TranscriptDocument> {
+        lock(&self.0).as_transcript_document()?;
+        Some(self)
+    }
+}
+
+impl<T: Component> TranscriptDocument for SharedChild<T> {
+    fn sync(&self, width: usize) -> TranscriptSync {
+        lock(&self.0).as_transcript_document().map_or(
+            TranscriptSync {
+                stamp: 0,
+                height: 0,
+            },
+            |document| document.sync(width),
+        )
+    }
+    fn total_height(&self) -> usize {
+        lock(&self.0)
+            .as_transcript_document()
+            .map_or(0, |d| d.total_height())
+    }
+    fn child_count(&self) -> usize {
+        lock(&self.0)
+            .as_transcript_document()
+            .map_or(0, |d| d.child_count())
+    }
+    fn revision_at(&self, index: usize) -> Option<u64> {
+        lock(&self.0).as_transcript_document()?.revision_at(index)
+    }
+    fn height_at(&self, index: usize) -> Option<usize> {
+        lock(&self.0).as_transcript_document()?.height_at(index)
+    }
+    fn visible_range(&self, scroll_top: usize, viewport: usize, overscan: usize) -> Range<usize> {
+        lock(&self.0)
+            .as_transcript_document()
+            .map_or(0..0, |d| d.visible_range(scroll_top, viewport, overscan))
+    }
+    fn render_range(&self, children: Range<usize>, width: usize) -> Arc<[String]> {
+        lock(&self.0).as_transcript_document().map_or_else(
+            || Arc::from(Vec::new()),
+            |d| d.render_range(children, width),
+        )
+    }
+    fn rows(&self, rows: Range<usize>, width: usize) -> Arc<[String]> {
+        lock(&self.0)
+            .as_transcript_document()
+            .map_or_else(|| Arc::from(Vec::new()), |d| d.rows(rows, width))
+    }
+    fn line(&self, row: usize, width: usize) -> Option<String> {
+        lock(&self.0).as_transcript_document()?.line(row, width)
+    }
+    fn materialize(&self, width: usize) -> Arc<[String]> {
+        lock(&self.0)
+            .as_transcript_document()
+            .map_or_else(|| Arc::from(Vec::new()), |d| d.materialize(width))
+    }
+    fn prompt_rows(&self) -> Vec<usize> {
+        lock(&self.0)
+            .as_transcript_document()
+            .map_or_else(Vec::new, |d| d.prompt_rows())
+    }
+    fn block_row(&self, index: usize) -> usize {
+        lock(&self.0)
+            .as_transcript_document()
+            .map_or(0, |d| d.block_row(index))
+    }
+    fn stats(&self) -> TranscriptStats {
+        lock(&self.0)
+            .as_transcript_document()
+            .map_or_else(TranscriptStats::default, |document| document.stats())
     }
 }
 
@@ -15324,6 +15412,82 @@ mod tests {
             Some(ScrollbarMode::Always),
             "fullscreen switch keeps the value set in regular mode"
         );
+        mode.shutdown().await;
+    }
+
+    /// V19-06 FR-B: the application's document region exposes the transcript
+    /// contract through its `SharedChild` wrappers, so the fullscreen
+    /// transcript is measured through its height index — once measured, a
+    /// stable history is validated by `(instance id, revision)` on every
+    /// frame without a single `render()` of the off-screen messages.
+    #[tokio::test]
+    async fn fullscreen_transcript_measures_history_through_the_height_index() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        assert!(mode.switch_tui_mode(TuiMode::Fullscreen, false, true));
+        for index in 0..40 {
+            mode.ui_state.add_message_to_chat(
+                assistant_message(
+                    vec![rpi_ai::types::AssistantContent::Text(
+                        rpi_ai::types::TextContent {
+                            text: format!("answer {index}\n\nsecond paragraph {index}"),
+                            text_signature: None,
+                        },
+                    )],
+                    StopReason::Stop,
+                ),
+                false,
+            );
+        }
+        let transcript_stats = |mode: &InteractiveMode| -> TranscriptStats {
+            let scroll_view = lock(&mode.ui_state.fullscreen_transcript_scroll_view)
+                .clone()
+                .expect("transcript scroll view retained at init");
+            let child = {
+                let guard = lock(&scroll_view);
+                guard
+                    .as_scroll_view()
+                    .expect("transcript scroll view")
+                    .child()
+            };
+            let guard = lock(&child);
+            guard
+                .as_transcript_document()
+                .expect("the document region is a transcript document")
+                .stats()
+        };
+        mode.ui_state.ui.render_now(true);
+        let first = transcript_stats(&mode);
+        assert!(first.blocks >= 40, "blocks: {first:?}");
+        assert!(
+            first.trusted_blocks >= 40,
+            "assistant messages are trusted: {first:?}"
+        );
+        // Twelve more frames: a stable history is validated by identity, not
+        // re-rendered. The terminal-capability and transcoder generations are
+        // process-wide, and other tests in the parallel suite may bump them
+        // at any moment (the revision protocol then re-measures once, by
+        // design), so the assertion counts the frames in which no trusted
+        // block was rendered or re-fetched instead of comparing against the
+        // very first frame.
+        let mut stable_frames = 0;
+        let mut previous = first;
+        for _ in 0..12 {
+            mode.ui_state.ui.render_now(false);
+            let current = transcript_stats(&mode);
+            if current.trusted_renders == previous.trusted_renders
+                && current.on_demand_renders == previous.on_demand_renders
+            {
+                stable_frames += 1;
+            }
+            previous = current;
+        }
+        assert!(
+            stable_frames >= 8,
+            "frames without a history re-render: {stable_frames}; {previous:?}"
+        );
+        assert_eq!(previous.syncs, first.syncs + 12);
+        assert!(previous.trusted_hits >= first.trusted_hits + 8 * 40);
         mode.shutdown().await;
     }
 

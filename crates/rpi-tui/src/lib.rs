@@ -27,6 +27,7 @@ pub mod autocomplete;
 pub mod benchmark;
 pub mod colors;
 pub mod components;
+pub(crate) mod container_sequence;
 pub mod error;
 pub mod fuzzy;
 pub mod keybindings;
@@ -35,6 +36,7 @@ pub mod kill_ring;
 pub mod kitty_registry;
 pub mod latex;
 pub mod layout;
+pub mod layout_cache;
 pub mod layout_node;
 pub mod mermaid;
 pub mod mouse;
@@ -46,6 +48,7 @@ pub mod stdin_buffer;
 pub mod terminal;
 pub mod terminal_colors;
 pub mod terminal_image;
+pub mod transcript;
 
 #[cfg(any(test, feature = "v19-benchmark"))]
 #[doc(hidden)]
