@@ -359,10 +359,7 @@ mod tests {
         );
         let pending = state.take_awaiting_local().expect("awaiting");
         assert_eq!(pending.message_generation, 1);
-        assert_eq!(
-            state.on_message_end(None, awaiting(true, 1), 0),
-            Settlement::AwaitingLocal
-        );
+        assert!(!state.awaiting_local(), "taken: nothing else queued");
         // Settle: local exact lands without `~`; the view no longer counts a
         // current message.
         state.settle_local(LocalSettlement::Exact(11));
