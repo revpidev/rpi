@@ -541,7 +541,7 @@ impl PlainGap {
 /// The raw added-token layer of one tier.
 struct RawAdded {
     max_added: usize,
-    prefixes: Arc<std::collections::HashSet<Box<[u8]>>>,
+    prefixes: Arc<crate::compact::BytePoolIndex>,
     /// Unresolved raw suffix: a possible partial added token, plus at most
     /// the complete match that contains it when the cut lands inside one.
     open: String,

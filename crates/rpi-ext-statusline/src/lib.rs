@@ -17,6 +17,7 @@
 //! additive `ctx.sessionFile`, ADR-0022), `ui.setFooter`, `ui.setStatus`,
 //! `ui.setWidget`.
 
+pub mod compact;
 pub mod config;
 pub mod editor;
 pub mod fields;
@@ -268,12 +269,21 @@ pub(crate) fn reconcile_subscriptions(
 /// leaves the watermark unknown (the engine hides the field until a boundary
 /// snapshot recovers it); nothing is ever guessed.
 fn terminal_counts_probe() {
+    // Runtime leg of the R5.2.8 budget: a slow probe (a host answering the
+    // full snapshot, or a regression) sends this terminal to the
+    // lower-bound path — never to the full stats.
+    if !with_engine(|engine| engine.terminal_probe_wanted()) {
+        with_engine(|engine| engine.record_lower_bound_watermark());
+        return;
+    }
     let calls = *CHANNEL
         .get()
         .expect("channel cell installed before dispatch")
         .read()
         .unwrap_or_else(|error| error.into_inner());
+    let started = std::time::Instant::now();
     let response = crate::host_call_static(&calls, "ctx.sessionStats", json!({"countsOnly": true}));
+    let elapsed = started.elapsed().as_nanos() as u64;
     let pre_persist = response
         .get("ok")
         .and_then(|ok| ok.get("assistantMessages"))
@@ -284,7 +294,10 @@ fn terminal_counts_probe() {
             "rpi-statusline: counts-only sessionStats probe returned no assistantMessages"
         );
     }
-    with_engine(|engine| engine.record_terminal_probe(pre_persist));
+    with_engine(|engine| {
+        engine.note_terminal_probe_duration(elapsed);
+        engine.record_terminal_probe(pre_persist);
+    });
 }
 
 /// Event dispatch: light state updates + a channel send, nothing more.

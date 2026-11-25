@@ -24,8 +24,10 @@
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::compact::{BytePoolIndex, SortedPairs};
 
 use fancy_regex::Regex as FancyRegex;
 use regex::Regex as AddedTokenRegex;
@@ -355,6 +357,41 @@ pub(crate) fn tokenizer_for_model(model_id: Option<&str>) -> Option<Arc<Tokenize
     loaded
 }
 
+/// Memory-report seam (V19-07 FR-F R4): load the bundled tokenizer of
+/// `model_id` (evicting any other family, like a model switch), run one
+/// official count over `text`, and return the bytes its tables retain.
+/// `None` when the model has no bundled family.
+pub fn load_family_for_memory_report(model_id: &str, text: &str) -> Option<(u64, usize)> {
+    let tokenizer = tokenizer_for_model(Some(model_id))?;
+    let count = tokenizer.count(text);
+    Some((count, tokenizer.retained_bytes()))
+}
+
+/// Drop every parsed tokenizer (the "model switch released the old family"
+/// leg of the memory report).
+pub fn release_tokenizer_cache() {
+    tokenizer_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+}
+
+/// `RssAnon` (KiB) and `VmRSS` of this process from `/proc/self/status`;
+/// `None` where `/proc` is unavailable.
+pub fn process_rss_anon_kib() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let mut rss_anon = None;
+    let mut vm_rss = None;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("RssAnon:") {
+            rss_anon = value.split_whitespace().next()?.parse().ok();
+        } else if let Some(value) = line.strip_prefix("VmRSS:") {
+            vm_rss = value.split_whitespace().next()?.parse().ok();
+        }
+    }
+    Some((rss_anon?, vm_rss?))
+}
+
 // ---------------------------------------------------------------------------
 // Compact asset parsing
 // ---------------------------------------------------------------------------
@@ -372,7 +409,7 @@ pub(crate) struct Tokenizer {
     max_added_token_bytes: usize,
     /// Every proper prefix of every added token: the streaming counter's
     /// "could this raw suffix still become an added token?" oracle.
-    added_prefixes: Option<Arc<HashSet<Box<[u8]>>>>,
+    added_prefixes: Option<Arc<BytePoolIndex>>,
 }
 
 impl Tokenizer {
@@ -392,13 +429,32 @@ impl Tokenizer {
         self.max_added_token_bytes
     }
 
-    pub(crate) fn added_prefixes(&self) -> Option<&Arc<HashSet<Box<[u8]>>>> {
+    pub(crate) fn added_prefixes(&self) -> Option<&Arc<BytePoolIndex>> {
         self.added_prefixes.as_ref()
     }
 
     /// Official count of one final (fully split) piece — the BPE step.
     pub(crate) fn count_piece(&self, piece: &str) -> u64 {
         count_piece(&self.engine, piece, &self.base_ids)
+    }
+
+    /// Bytes retained by the loaded tables (diagnostics and the memory
+    /// report): the engine's pairs/results/vocab or byte pool, plus the
+    /// added-token prefix pool.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let engine = match &self.engine {
+            Engine::Hf(hf) => {
+                hf.pairs.retained_bytes()
+                    + hf.results.capacity() * 4
+                    + hf.vocab.as_ref().map_or(0, BytePoolIndex::retained_bytes)
+            }
+            Engine::Tiktoken(tiktoken) => tiktoken.index.retained_bytes(),
+        };
+        engine
+            + self
+                .added_prefixes
+                .as_ref()
+                .map_or(0, |prefixes| prefixes.retained_bytes())
     }
 
     /// Official tiered full pass over the three tiers with THIS tokenizer
@@ -426,20 +482,25 @@ enum Engine {
     Tiktoken(TiktokenBpe),
 }
 
+/// HF `tokenizers` BPE table (DeepSeek, GLM, Qwen, Hunyuan, MiniMax) in the
+/// compact representation (V19-07 FR-F / R1.4.4): one sorted pair table,
+/// one result vector, and — for `ignore_merges` — one byte pool shared by
+/// the vocabulary membership index. No per-entry allocation.
 struct HfBpe {
     /// Keyed by `(left_id << 32) | right_id`; the value is the merge rank.
-    pairs: HashMap<u64, u32>,
+    pairs: SortedPairs,
     /// Merge rank → the resulting token id.
     results: Vec<u32>,
-    /// Whole-token membership for `ignore_merges` models (GLM/Hunyuan).
-    vocab: Option<HashSet<Box<str>>>,
+    /// Whole-token membership for `ignore_merges` models (GLM/Hunyuan),
+    /// keyed by the ByteLevel-encoded token bytes.
+    vocab: Option<BytePoolIndex>,
 }
 
+/// tiktoken `mergeable_ranks` in the compact representation (Kimi): one
+/// contiguous byte pool, a rank → range table and an open-addressed
+/// collision-safe index. The token bytes are stored exactly once.
 struct TiktokenBpe {
-    /// Rank → token bytes (the tiktoken vocabulary order).
-    tokens: Vec<Box<[u8]>>,
-    /// Token bytes → rank, for the concatenated-pair lookup.
-    ranks: HashMap<Box<[u8]>, u32>,
+    index: BytePoolIndex,
 }
 
 fn pair_key(left: u32, right: u32) -> u64 {
@@ -499,14 +560,34 @@ impl<'a> AssetReader<'a> {
     }
 }
 
-fn added_prefixes(added: &[String]) -> HashSet<Box<[u8]>> {
-    // Every PROPER prefix (byte-exact, any length ≥ 1) of every added token.
-    let mut prefixes: HashSet<Box<[u8]>> = HashSet::new();
+fn added_prefixes(added: &[String]) -> BytePoolIndex {
+    // Every PROPER prefix (byte-exact, any length ≥ 1) of every added token,
+    // in one compact byte pool (shared prefixes are stored once).
+    let count: usize = added
+        .iter()
+        .filter(|token| !token.is_empty())
+        .map(|token| token.len() - 1)
+        .sum();
+    // Σ over prefixes of their lengths: for a token of length L that is
+    // 1 + 2 + … + (L − 1) = L (L − 1) / 2.
+    let bytes: usize = added
+        .iter()
+        .filter(|token| !token.is_empty())
+        .map(|token| token.len() * (token.len() - 1) / 2)
+        .sum();
+    let mut prefixes = BytePoolIndex::with_capacity(count, bytes);
     for token in added.iter().filter(|token| !token.is_empty()) {
         for end in 1..token.len() {
-            prefixes.insert(token.as_bytes()[..end].to_vec().into_boxed_slice());
+            // `push` never overwrites: a prefix already present is skipped.
+            let prefix = &token.as_bytes()[..end];
+            if prefixes.find(prefix).is_none() {
+                prefixes
+                    .push(prefix)
+                    .expect("prefix pool capacity is pre-sized");
+            }
         }
     }
+    prefixes.shrink();
     prefixes
 }
 
@@ -561,17 +642,21 @@ fn parse_asset(compressed: &[u8]) -> Result<Tokenizer, String> {
     let mut engine = match engine_kind {
         0 => {
             let rank_count = reader.u32()? as usize;
-            let mut pairs = HashMap::with_capacity(rank_count);
+            let mut pairs = SortedPairs::with_capacity(rank_count);
             let mut results = Vec::with_capacity(rank_count);
             for rank in 0..rank_count {
                 let left = reader.u32()?;
                 let right = reader.u32()?;
                 let result = reader.u32()?;
-                if pairs.insert(pair_key(left, right), rank as u32).is_some() {
+                if pairs
+                    .insert_sorted(pair_key(left, right), rank as u32)
+                    .is_err()
+                {
                     return Err(format!("duplicate merge pair at rank {rank}"));
                 }
                 results.push(result);
             }
+            pairs.shrink();
             Engine::Hf(HfBpe {
                 pairs,
                 results,
@@ -579,17 +664,22 @@ fn parse_asset(compressed: &[u8]) -> Result<Tokenizer, String> {
             })
         }
         1 => {
+            // The token bytes go straight into ONE contiguous pool; a
+            // duplicate token (same bytes at two ranks) is rejected through
+            // the collision-safe index before it is appended.
             let token_count = reader.u32()? as usize;
-            let mut tokens: Vec<Box<[u8]>> = Vec::with_capacity(token_count);
-            let mut ranks = HashMap::with_capacity(token_count);
+            let mut index = BytePoolIndex::with_capacity(token_count, token_count * 6);
             for rank in 0..token_count {
-                let token = reader.bytes()?.to_vec().into_boxed_slice();
-                if ranks.insert(token.clone(), rank as u32).is_some() {
+                let token = reader.bytes()?;
+                if index.find(token).is_some() {
                     return Err(format!("duplicate tiktoken token at rank {rank}"));
                 }
-                tokens.push(token);
+                index
+                    .push(token)
+                    .map_err(|error| format!("rank {rank}: {error}"))?;
             }
-            Engine::Tiktoken(TiktokenBpe { tokens, ranks })
+            index.shrink();
+            Engine::Tiktoken(TiktokenBpe { index })
         }
         other => return Err(format!("unknown engine id {other}")),
     };
@@ -602,7 +692,7 @@ fn parse_asset(compressed: &[u8]) -> Result<Tokenizer, String> {
         Engine::Tiktoken(tiktoken) => {
             if base_ids
                 .iter()
-                .any(|id| *id as usize >= tiktoken.tokens.len())
+                .any(|id| *id as usize >= tiktoken.index.len())
             {
                 return Err("tiktoken base id outside the vocabulary".to_owned());
             }
@@ -612,10 +702,17 @@ fn parse_asset(compressed: &[u8]) -> Result<Tokenizer, String> {
 
     if flags & 1 != 0 {
         let vocab_count = reader.u32()? as usize;
-        let mut vocab = HashSet::with_capacity(vocab_count);
+        let mut vocab = BytePoolIndex::with_capacity(vocab_count, vocab_count * 6);
         for _ in 0..vocab_count {
-            vocab.insert(reader.string()?.to_owned().into_boxed_str());
+            let token = reader.string()?.as_bytes();
+            if vocab.find(token).is_some() {
+                return Err("duplicate vocabulary entry".to_owned());
+            }
+            vocab
+                .push(token)
+                .map_err(|error| format!("vocabulary: {error}"))?;
         }
+        vocab.shrink();
         match &mut engine {
             Engine::Hf(hf) => {
                 if hf.results.iter().any(|id| *id as usize >= vocab_count) {
@@ -703,7 +800,7 @@ fn count_piece(engine: &Engine, piece: &str, base_ids: &[u32; 256]) -> u64 {
 impl HfBpe {
     fn count(&self, piece: &str, base_ids: &[u32; 256]) -> u64 {
         if let Some(vocab) = &self.vocab
-            && vocab.contains(byte_encode(piece).as_str())
+            && vocab.contains(byte_encode(piece).as_bytes())
         {
             // `ignore_merges`: a pretoken that is already a whole vocabulary
             // entry is emitted as one token without merging.
@@ -716,7 +813,7 @@ impl HfBpe {
             .collect();
         bpe_count(
             &mut symbols,
-            |left, right| self.pairs.get(&pair_key(left, right)).copied(),
+            |left, right| self.pairs.get(&pair_key(left, right)),
             |rank| self.results[rank as usize],
         )
     }
@@ -729,14 +826,16 @@ impl TiktokenBpe {
             .iter()
             .map(|byte| base_ids[*byte as usize])
             .collect();
+        // The concatenated bytes of the candidate pair are built in a
+        // reusable buffer; the index compares the full bytes on lookup.
         let mut scratch = Vec::new();
         bpe_count(
             &mut symbols,
             |left, right| {
                 scratch.clear();
-                scratch.extend_from_slice(&self.tokens[left as usize]);
-                scratch.extend_from_slice(&self.tokens[right as usize]);
-                self.ranks.get(scratch.as_slice()).copied()
+                scratch.extend_from_slice(self.index.entry(left).unwrap_or(&[]));
+                scratch.extend_from_slice(self.index.entry(right).unwrap_or(&[]));
+                self.index.find(&scratch)
             },
             |rank| rank,
         )

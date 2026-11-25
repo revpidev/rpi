@@ -8,6 +8,7 @@
 //! run their own process with their own extension host, so no sidechain
 //! filtering is needed — TE12 verification §1).
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -605,6 +606,15 @@ pub struct EngineState {
     /// `false` in command mode: command keeps its full `rpi.live_output`
     /// payload and never creates pending entries or probes.
     live_total_selected: bool,
+    /// Recent terminal-probe durations (nanoseconds, most recent last) —
+    /// the runtime leg of the R5.2.8 budget: a host whose counts-only probe
+    /// is slow (an old host answering the FULL snapshot, or a regression)
+    /// must not pay O(entries) per terminal, so the probe is replaced by the
+    /// cached `assistant_messages + pending` lower bound (R5.2.8: never a
+    /// fall back to the full stats).
+    probe_durations_ns: VecDeque<u64>,
+    /// How many terminals took the lower-bound path instead of a probe.
+    probe_fallbacks: u64,
     /// Local Git probe cache for project-name/git-branch (TE52 R20 §4.4).
     pub git: GitCache,
     /// Items-mode last rendered value of every live row. Between two
@@ -619,6 +629,14 @@ pub struct EngineState {
     /// emitted a delta event keeps doing so.
     delta_supported: bool,
 }
+
+/// A terminal counts-only probe slower than this (p95 of the recent probes)
+/// sends the following terminals to the lower-bound path: the probe budget of
+/// R5.2.8 is a few hundred nanoseconds on the current host, so a
+/// millisecond-scale probe means the host answered with the full snapshot.
+pub const PROBE_SLOW_NS: u64 = 2_000_000;
+/// Recent probes kept for the p95 estimate.
+const PROBE_SAMPLES: usize = 16;
 
 /// Mtime tolerance below the session-start wall clock: the host creates
 /// the session file shortly BEFORE emitting `session_start`, so the new
@@ -640,6 +658,8 @@ impl Default for EngineState {
             session_stats: SessionStatsCache::default(),
             live_total: LiveTotalState::default(),
             live_total_selected: false,
+            probe_durations_ns: VecDeque::new(),
+            probe_fallbacks: 0,
             git: GitCache::default(),
             last_live_values: Vec::new(),
             delta_supported: false,
@@ -835,6 +855,49 @@ impl EngineState {
             awaiting,
             self.session_stats.current_request_generation(),
         )
+    }
+
+    /// Whether the terminal probe should run: it is skipped once the recent
+    /// probes' p95 exceeds [`PROBE_SLOW_NS`] (with at least half the samples
+    /// in). The caller then records the lower-bound watermark through
+    /// [`Self::record_lower_bound_watermark`].
+    pub fn terminal_probe_wanted(&mut self) -> bool {
+        let mut samples: Vec<u64> = self.probe_durations_ns.iter().copied().collect();
+        samples.sort_unstable();
+        if samples.len() < PROBE_SAMPLES / 2 {
+            return true;
+        }
+        let p95 = samples[samples.len() * 95 / 100];
+        p95 <= PROBE_SLOW_NS
+    }
+
+    /// Record the duration of a terminal probe (nanoseconds).
+    pub fn note_terminal_probe_duration(&mut self, elapsed_ns: u64) {
+        self.probe_durations_ns.push_back(elapsed_ns);
+        while self.probe_durations_ns.len() > PROBE_SAMPLES {
+            self.probe_durations_ns.pop_front();
+        }
+    }
+
+    /// The lower-bound path of the budget: the watermark is the cached
+    /// snapshot's `assistant_messages` plus every queued pending entry
+    /// (each is one message the host is about to persist). It is cleared
+    /// later than a probed watermark at worst — never earlier than the
+    /// persistence, never through the full `sessionStats`.
+    pub fn record_lower_bound_watermark(&mut self) {
+        self.probe_fallbacks += 1;
+        let base = self
+            .session_stats
+            .snapshot()
+            .map_or(0, |stats| stats.assistant_messages);
+        let pending = self.live_total.pending_len() as u64;
+        self.live_total
+            .record_probe(Some(base.saturating_add(pending.max(1) - 1)));
+    }
+
+    /// How many terminals took the lower-bound path (diagnostics).
+    pub fn probe_fallbacks(&self) -> u64 {
+        self.probe_fallbacks
     }
 
     /// Record the ONE terminal counts-only probe for the pending entry that
@@ -1499,6 +1562,68 @@ mod tests {
         // A new session drops the previous session's overlay.
         state.on_session_start(Some("new"));
         assert_eq!(state.live_total_view(), LiveTotalView::default());
+    }
+
+    /// R5.2.8 runtime budget: a slow terminal probe (a host answering the
+    /// full snapshot) switches the following terminals to the cached
+    /// `assistant_messages + pending` lower bound — never the full stats —
+    /// and counts the fallbacks; fast probes keep probing.
+    #[test]
+    fn slow_probes_fall_back_to_the_cached_lower_bound_watermark() {
+        let mut state = EngineState::default();
+        state.arm_live_measure();
+        state.set_live_total_selected(true);
+        assert!(state.terminal_probe_wanted(), "no samples yet: probe");
+        for _ in 0..8 {
+            state.note_terminal_probe_duration(500);
+        }
+        assert!(
+            state.terminal_probe_wanted(),
+            "sub-microsecond probes stay on the probe path"
+        );
+        // Baseline snapshot at 3 assistant messages.
+        let token = state
+            .session_stats
+            .begin_request(crate::session_stats::StatsTrigger::TurnEnd);
+        let mut stats = crate::session_stats::SessionStats {
+            session_id: "s1".into(),
+            session_file: None,
+            started_at: "2026-10-27T10:00:00Z".into(),
+            entry_count: 3,
+            user_messages: 1,
+            assistant_messages: 3,
+            tokens: Default::default(),
+            cost: 0.0,
+        };
+        assert!(state.session_stats.apply(token, stats.clone()).is_some());
+        for _ in 0..8 {
+            state.note_terminal_probe_duration(PROBE_SLOW_NS + 1);
+        }
+        assert!(
+            !state.terminal_probe_wanted(),
+            "p95 above the budget: lower bound"
+        );
+        state.on_message_start(Some("assistant"));
+        state.on_message_end(&json!({"role": "assistant", "usage": {"output": 10}}));
+        state.record_lower_bound_watermark();
+        assert_eq!(state.probe_fallbacks(), 1);
+        // Watermark = cached assistant_messages + pending (the snapshot
+        // that counts this message).
+        assert_eq!(
+            state.live_total.pending()[0].persist_after_assistant,
+            Some(4)
+        );
+        assert!(!state.live_total_view().hidden);
+        // A second pending entry moves the bound up by one.
+        stats.assistant_messages = 3;
+        state.on_message_start(Some("assistant"));
+        state.on_message_end(&json!({"role": "assistant", "usage": {"output": 11}}));
+        state.record_lower_bound_watermark();
+        assert_eq!(
+            state.live_total.pending()[1].persist_after_assistant,
+            Some(5)
+        );
+        assert_eq!(state.probe_fallbacks(), 2);
     }
 
     /// A stream that starts without `message_start` opens the message

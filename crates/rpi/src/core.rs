@@ -31,6 +31,10 @@ pub mod output_guard;
 pub mod package_manager;
 pub mod permission_mode;
 pub mod preferred_providers;
+/// V19-07 counts-only probe cost harness (lib tests only: it installs the
+/// counting global allocator of the lib test binary).
+#[cfg(test)]
+mod probe_bench;
 pub mod prompt_templates;
 pub mod radius;
 pub mod remote_catalog_provider;
