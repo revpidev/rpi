@@ -1532,20 +1532,26 @@ mod tests {
         state.on_message_end(&json!({"role": "assistant", "usage": {"output": 5}}));
         state.record_terminal_probe(None);
         assert!(state.live_total_view().hidden);
-        // Usage-less normal message: local settlement pending; the official
-        // tokenizer result lands without `~`.
+        // Usage-less normal message: local settlement pending — the message
+        // stays CURRENT until the official tokenizer ran, so the total does
+        // not dip between message_end and the settlement.
         state.on_message_start(Some("assistant"));
         state.on_message_update(&delta("text_delta", "hello world"));
         assert_eq!(
             state.on_message_end(&json!({"role": "assistant", "usage": {"output": 0}})),
             Settlement::AwaitingLocal
         );
+        assert!(state.live_total_view().current_open);
         let awaiting = state.take_awaiting_local().expect("awaiting");
         assert_eq!(awaiting.text, "hello world");
         assert!(awaiting.normal_completion);
-        assert!(!state.live_total_view().current_open);
+        assert!(
+            state.live_total_view().current_open,
+            "still current until settled"
+        );
         state.settle_local(crate::live_total::LocalSettlement::Exact(2), None);
         assert_eq!(state.live_total_view().settled_local_exact, 2);
+        assert!(!state.live_total_view().current_open);
         // Aborted message: the final heuristic is dropped.
         state.on_message_start(Some("assistant"));
         state.on_message_update(&delta("text_delta", "partial"));

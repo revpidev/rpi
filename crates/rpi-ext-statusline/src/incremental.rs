@@ -982,6 +982,176 @@ mod tests {
         }
     }
 
+    /// A long mixed answer streamed in `chunk`-byte deltas (≈ 40 KiB).
+    fn answer() -> String {
+        let paragraph = "The assistant explains: 这是一个较长的回答 with **Markdown**, `code`, \
+    \"json\": {\"a\": [1, 2, 3]}\n\n- list item 1\n- list item 2\n\n\tindented code(); // comment\n\
+    你好世界，这是第二段。Numbers 1234567890 and 987 and 1. Contractions: don't, it's, we've, they'll.\n";
+        paragraph.repeat(80)
+    }
+
+    fn chunks(text: &str, chunk: usize) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            let mut end = rest.len().min(chunk);
+            while !rest.is_char_boundary(end) {
+                end += 1;
+            }
+            out.push(&rest[..end]);
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    struct Report {
+        label: String,
+        bpe_calls: u64,
+        ticks: u64,
+        cpu_ms: u128,
+        total: u64,
+        source: TokenSource,
+        fallbacks: u64,
+        recomputes: u64,
+    }
+
+    /// V19-07 FR-G R3 counting benchmark (ADR-0049 decision 10): the same
+    /// streamed input under the three calculation paths of the statusline —
+    /// v0.1.8 `auto` (official full pass per refresh tick), candidate `auto`
+    /// (incremental) and `estimate` (buckets, no tokenizer) — reporting BPE
+    /// piece evaluations, open-tail recomputes, fallbacks, finalize parity
+    /// and CPU time. `cargo test -p rpi-ext-statusline --release --lib
+    /// v19_counting_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "V19-07 counting benchmark; run explicitly with --ignored --nocapture"]
+    fn v19_counting_bench_auto_official_vs_incremental_vs_estimate() {
+        let text = answer();
+        let models = ["glm-5.3", "kimi-k3.1-pro", "deepseek-chat"];
+        let mut reports: Vec<Report> = Vec::new();
+        for model in models {
+            let tokenizer = tokenizer_for_model(Some(model)).expect("bundled family");
+            let delta_chunk = 24; // ≈ 6 tokens per provider delta
+            let deltas = chunks(&text, delta_chunk);
+            let tick_every = 4; // refreshMs tick every 4 deltas
+
+            // 1. v0.1.8 auto: the official full pass at every refresh tick.
+            tokens::reset_bpe_calls();
+            let started = std::time::Instant::now();
+            let mut ticks = 0u64;
+            let mut accumulated = String::new();
+            let mut last = TokenBreakdown::default();
+            for (index, delta) in deltas.iter().enumerate() {
+                accumulated.push_str(delta);
+                if index % tick_every == 0 || index + 1 == deltas.len() {
+                    last = count_breakdown(Some(model), &accumulated, "", "");
+                    ticks += 1;
+                }
+            }
+            let official_calls = tokens::bpe_calls();
+            reports.push(Report {
+                label: format!("{model} auto/official per tick"),
+                bpe_calls: official_calls,
+                ticks,
+                cpu_ms: started.elapsed().as_millis(),
+                total: last.total,
+                source: last.source,
+                fallbacks: 0,
+                recomputes: 0,
+            });
+
+            // 2. Candidate auto: the incremental counter, one provisional per tick.
+            tokens::reset_bpe_calls();
+            let started = std::time::Instant::now();
+            let mut counter = IncrementalCounter::new(Arc::clone(&tokenizer));
+            let mut ticks = 0u64;
+            let mut recomputes = 0u64;
+            let mut previous = 0u64;
+            for (index, delta) in deltas.iter().enumerate() {
+                counter.push(0, delta);
+                if index % tick_every == 0 || index + 1 == deltas.len() {
+                    let provisional = counter.provisional().expect("no fallback").total;
+                    // A provisional below the previous one means a piece was
+                    // re-split (the open tail shrank): counted as a recompute.
+                    if provisional < previous {
+                        recomputes += 1;
+                    }
+                    previous = provisional;
+                    ticks += 1;
+                }
+            }
+            let final_breakdown = counter.finalize().expect("no fallback");
+            let incremental_calls = tokens::bpe_calls();
+            let official_total = tokenizer.count(&text);
+            assert_eq!(
+                final_breakdown.total, official_total,
+                "{model}: finalize == official"
+            );
+            reports.push(Report {
+                label: format!("{model} auto/incremental"),
+                bpe_calls: incremental_calls,
+                ticks,
+                cpu_ms: started.elapsed().as_millis(),
+                total: final_breakdown.total,
+                source: final_breakdown.source,
+                fallbacks: u64::from(counter.fallback() == Some(CountFallback::OpenTooLarge)),
+                recomputes,
+            });
+
+            // 3. estimate: buckets only, no tokenizer.
+            tokens::reset_bpe_calls();
+            let started = std::time::Instant::now();
+            let mut buckets = [CharBuckets::default(); TIERS];
+            for delta in &deltas {
+                buckets[0].push_str(delta);
+            }
+            let estimate = tokens::heuristic_breakdown(&text, "", "");
+            let estimate_calls = tokens::bpe_calls();
+            reports.push(Report {
+                label: format!("{model} estimate (buckets)"),
+                bpe_calls: estimate_calls,
+                ticks: deltas.len() as u64,
+                cpu_ms: started.elapsed().as_millis(),
+                total: estimate.total,
+                source: estimate.source,
+                fallbacks: 0,
+                recomputes: 0,
+            });
+            assert_eq!(buckets[0].tokens(), estimate.text);
+            assert_eq!(estimate.source, TokenSource::Estimated);
+            assert_eq!(estimate_calls, 0, "estimate never runs BPE");
+        }
+        let mut out = String::new();
+        out.push_str(&format!(
+            "V19-07 counting benchmark: {} bytes streamed in 24-byte deltas, one tick per 4 deltas\n",
+            text.len()
+        ));
+        for report in &reports {
+            out.push_str(&format!(
+                "{:<42} BPE piece evals {:>10}  ticks {:>5}  CPU {:>5} ms  total {:>6} ({:?})  fallbacks {} open-tail recomputes {}\n",
+                report.label, report.bpe_calls, report.ticks, report.cpu_ms, report.total, report.source, report.fallbacks, report.recomputes
+            ));
+        }
+        println!("{out}");
+        // The invariants the numbers must show.
+        for window in reports.chunks(3) {
+            let (official, incremental, estimate) = (&window[0], &window[1], &window[2]);
+            assert_eq!(official.total, incremental.total, "same official total");
+            assert!(
+                incremental.bpe_calls * 10 < official.bpe_calls,
+                "{}: incremental {} vs official {} BPE evals",
+                incremental.label,
+                incremental.bpe_calls,
+                official.bpe_calls
+            );
+            assert_eq!(estimate.bpe_calls, 0);
+            assert!(estimate.total > 0 && estimate.source == TokenSource::Estimated);
+            assert_eq!(
+                incremental.fallbacks, 0,
+                "the mixed answer stays on the incremental path"
+            );
+        }
+    }
+
     #[test]
     fn oversized_open_pieces_fall_back_instead_of_miscounting() {
         let tokenizer = tokenizer("glm-5.3");

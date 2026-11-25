@@ -28,7 +28,7 @@ use crate::fields::{self, ContextInfo, FieldData, FieldId, LiveView, ModelInfo, 
 use crate::git::{self, GitInfo};
 use crate::items::ItemsConfig;
 use crate::live_ticker::{LiveFrameInput, LiveTicker, TokenRequirements};
-use crate::live_total::{LiveTotalView, LocalSettlement};
+use crate::live_total::{AwaitingLocal, LiveTotalView, LocalSettlement};
 use crate::payload::{HOOK_EVENT_STATUS, build_stdin_json};
 use crate::render::{footer_tree, status_text};
 use crate::runner::{self, CancelToken, ScriptError};
@@ -474,14 +474,6 @@ pub async fn refresh_loop(
                         }
                         let ctx = fetch_items_ctx(&calls, items);
                         maybe_start_git(&calls, items, &ctx);
-                        // V19-07: a finished message's local contribution is
-                        // settled here — the official full tokenizer runs on
-                        // this loop, outside the engine lock (the dispatch
-                        // path only queued the work at `message_end`).
-                        if reason == "message_end" {
-                            let mut ticker = lock_ticker();
-                            settle_message_end(&calls, &mut ticker);
-                        }
                         let read_stats = reads_session_stats_on(reason);
                         let mut ticker = lock_ticker();
                         let data = refresh_items(
@@ -867,6 +859,12 @@ fn refresh_items(
     reason: &str,
     ticker: &mut LiveTicker,
 ) -> Option<FieldData> {
+    // V19-07: a finished message's local contribution is settled here — the
+    // official full tokenizer runs on this loop, outside the engine lock (the
+    // dispatch path only queued the work at `message_end`). Every items
+    // refresh checks the queue, so a `message_end` trigger coalesced away by
+    // the debounce of another event still settles on the next frame.
+    settle_message_end(calls, ticker);
     if items.needs_session_stats() && read_stats {
         let trigger = StatsTrigger::for_reason(reason).unwrap_or(StatsTrigger::Interval);
         let token = with_engine(|engine| engine.session_stats.begin_request(trigger));
@@ -907,7 +905,13 @@ fn settle_message_end(calls: &AsyncHostCalls, ticker: &mut LiveTicker) {
         return;
     };
     let model_id = current_model_id(calls);
-    let tokenizer = tokens::tokenizer_for_model(model_id.as_deref());
+    settle_awaiting(ticker, model_id.as_deref(), awaiting);
+}
+
+/// Settle one queued message (normally the only one); the loop settles the
+/// next queued message, if any, the same way.
+fn settle_awaiting(ticker: &mut LiveTicker, model_id: Option<&str>, awaiting: AwaitingLocal) {
+    let tokenizer = tokens::tokenizer_for_model(model_id);
     let official = tokenizer.as_ref().map(|tokenizer| {
         tokenizer.count_tiers(&awaiting.text, &awaiting.thinking, &awaiting.toolcall)
     });
@@ -931,6 +935,10 @@ fn settle_message_end(calls: &AsyncHostCalls, ticker: &mut LiveTicker) {
         None => (LocalSettlement::Dropped, None),
     };
     with_engine(|engine| engine.settle_local(settlement, settled_tokens));
+    let model_id = model_id.map(str::to_owned);
+    if let Some(next) = with_engine(|engine| engine.take_awaiting_local()) {
+        settle_awaiting(ticker, model_id.as_deref(), next);
+    }
 }
 
 /// The current model id over one `ctx.model` host call (settlement path only).

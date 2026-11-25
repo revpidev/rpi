@@ -357,6 +357,20 @@ pub(crate) fn tokenizer_for_model(model_id: Option<&str>) -> Option<Arc<Tokenize
     loaded
 }
 
+/// BPE piece evaluations of every loaded tokenizer so far (benchmark and
+/// test counter; a plain atomic increment per piece).
+static BPE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`BPE_CALLS`].
+pub fn bpe_calls() -> u64 {
+    BPE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reset the BPE call counter (benchmark seam).
+pub fn reset_bpe_calls() {
+    BPE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Memory-report seam (V19-07 FR-F R4): load the bundled tokenizer of
 /// `model_id` (evicting any other family, like a model switch), run one
 /// official count over `text`, and return the bytes its tables retain.
@@ -434,7 +448,10 @@ impl Tokenizer {
     }
 
     /// Official count of one final (fully split) piece — the BPE step.
+    /// Every call is counted ([`bpe_calls`]): the V19-07 benchmark reports
+    /// how many piece evaluations each calculation path performs.
     pub(crate) fn count_piece(&self, piece: &str) -> u64 {
+        BPE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         count_piece(&self.engine, piece, &self.base_ids)
     }
 
@@ -782,7 +799,7 @@ impl Tokenizer {
         }
         pieces
             .iter()
-            .map(|piece| count_piece(&self.engine, piece, &self.base_ids))
+            .map(|piece| self.count_piece(piece))
             .fold(0u64, u64::saturating_add)
     }
 }

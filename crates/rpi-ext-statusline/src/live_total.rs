@@ -127,7 +127,9 @@ pub struct LiveTotalState {
     settled_local_exact: u64,
     settled_estimated: u64,
     current_open: bool,
-    awaiting_local: Option<AwaitingLocal>,
+    /// Finished messages whose local settlement the refresh loop still owes
+    /// (normally one; a queue so a stalled loop never loses a message).
+    awaiting_local: VecDeque<AwaitingLocal>,
 }
 
 impl LiveTotalState {
@@ -140,7 +142,7 @@ impl LiveTotalState {
         self.settled_local_exact = 0;
         self.settled_estimated = 0;
         self.current_open = false;
-        self.awaiting_local = None;
+        self.awaiting_local.clear();
         self.session_generation
     }
 
@@ -154,14 +156,18 @@ impl LiveTotalState {
     }
 
     /// `message_end`: move the provisional out and settle it exactly once.
+    /// A provider-exact total is final at once (`current_open` drops); a
+    /// local settlement keeps the message CURRENT until the refresh loop has
+    /// run the official tokenizer — the provisional stays in the total, so
+    /// the row never dips between `message_end` and the settlement.
     pub fn on_message_end(
         &mut self,
         provider_output: Option<u64>,
         awaiting: AwaitingLocal,
         request_generation_at_add: u64,
     ) -> Settlement {
-        self.current_open = false;
         if let Some(output) = provider_output.filter(|output| *output > 0) {
+            self.current_open = false;
             self.pending_provider_exact.push_back(PendingProviderExact {
                 persist_after_assistant: None,
                 output,
@@ -171,7 +177,7 @@ impl LiveTotalState {
             });
             return Settlement::ProviderExact;
         }
-        self.awaiting_local = Some(awaiting);
+        self.awaiting_local.push_back(awaiting);
         Settlement::AwaitingLocal
     }
 
@@ -199,11 +205,14 @@ impl LiveTotalState {
     /// Take the finished message awaiting its local settlement (the refresh
     /// loop computes the official count outside the engine lock).
     pub fn take_awaiting_local(&mut self) -> Option<AwaitingLocal> {
-        self.awaiting_local.take()
+        self.awaiting_local.pop_front()
     }
 
     /// Apply the local settlement computed for the last [`Self::take_awaiting_local`].
     pub fn settle_local(&mut self, settlement: LocalSettlement) {
+        if self.awaiting_local.is_empty() {
+            self.current_open = false;
+        }
         match settlement {
             LocalSettlement::Exact(output) => {
                 self.settled_local_exact = self.settled_local_exact.saturating_add(output);
@@ -283,7 +292,7 @@ impl LiveTotalState {
                 .fold(0u64, |sum, entry| sum.saturating_add(entry.output)),
             settled_local_exact: self.settled_local_exact,
             settled_estimated: self.settled_estimated,
-            current_open: self.current_open,
+            current_open: self.current_open || !self.awaiting_local.is_empty(),
             hidden: self
                 .pending_provider_exact
                 .iter()
@@ -301,7 +310,7 @@ impl LiveTotalState {
 
     /// Whether a finished message still awaits its local settlement.
     pub fn awaiting_local(&self) -> bool {
-        self.awaiting_local.is_some()
+        !self.awaiting_local.is_empty()
     }
 
     pub fn pending_len(&self) -> usize {
