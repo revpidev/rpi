@@ -276,6 +276,8 @@ fn terminal_counts_probe() {
         with_engine(|engine| engine.record_lower_bound_watermark());
         return;
     }
+    // Invariant: `CHANNEL` is installed by the first `install` before any
+    // dispatch can reach this point (the dispatch table is registered there).
     let calls = *CHANNEL
         .get()
         .expect("channel cell installed before dispatch")

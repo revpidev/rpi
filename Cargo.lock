@@ -3571,6 +3571,7 @@ dependencies = [
  "chrono",
  "fancy-regex 0.16.2",
  "fs2",
+ "libc",
  "regex",
  "rpi-ext-host",
  "rpi-ext-sdk",

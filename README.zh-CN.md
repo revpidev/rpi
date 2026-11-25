@@ -191,7 +191,7 @@ rpi auth logout <provider>   # 删除 provider 凭据
 | `builtin:mcp` | 读取 `~/.rpi/agent/mcp.json` 与 `<cwd>/.rpi/mcp.json`：`mcp__*` 工具、资源工具、`/mcp` 与 OAuth。`rpi-mcp-adapter` 已退役，内建客户端是受支持的路径。 |
 | `builtin:llama.cpp` | llama.cpp router 集成（`/llama`）与原生 decision-model classifier。 |
 
-七款第一方扩展以 `.rpix` 形式随宿主版本 lockstep 发布：`rpi-subagents`（委派、后台运行、worktree）、`rpi-smart-fetch`（浏览器指纹 web fetch）、`rpi-statusline`（脚本或 30 字段声明式 footer（含会话总量、轮次/步数与 token 分级统计），含 `/statusline` 编辑器）、`rpi-ask-user-question`（结构化提问）、`rpi-todo`（任务列表）、`rpi-plan-mode`（只读规划与批准流）、`rpi-usage`（八家 provider 的类型化配额/余额 footer，支持 `/usage [--cached] [--json] [provider|all]`、`/usage list|help`；无配额脚本的 provider 只显示本会话本地 token）。
+七款第一方扩展以 `.rpix` 形式随宿主版本 lockstep 发布：`rpi-subagents`（委派、后台运行、worktree）、`rpi-smart-fetch`（浏览器指纹 web fetch）、`rpi-statusline`（脚本或 30 字段声明式 footer（含会话总量、轮次/步数与 token 分级统计），支持 `liveTokens.calculation: auto|estimate`，含 `/statusline` 编辑器）、`rpi-ask-user-question`（结构化提问）、`rpi-todo`（任务列表）、`rpi-plan-mode`（只读规划与批准流）、`rpi-usage`（八家 provider 的类型化配额/余额 footer，支持 `/usage [--cached] [--json] [provider|all]`、`/usage list|help`；无配额脚本的 provider 只显示本会话本地 token）。
 
 全局升级时，如果扩展 manifest 提高了某个配置键的 `defaultSettingsMigration` 版本，且该键在全局设置中缺失，也会补入默认值；已有用户值和项目级安装不受影响。`rpi-statusline` 为 `statusLine` 使用迁移版本 1，因此未播种的旧 RC 安装升级后会直接显示默认 token 行，无需再打开 `/statusline` 手动保存。
 

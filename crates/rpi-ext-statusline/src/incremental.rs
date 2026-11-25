@@ -594,13 +594,16 @@ impl IncrementalCounter {
             .all(|regex| pattern_is_incremental_safe(regex.as_str()));
         let tiers = (0..TIERS)
             .map(|_| TierCounter {
-                raw: tokenizer.added().map(|_| RawAdded {
-                    max_added: tokenizer.max_added_token_bytes(),
-                    prefixes: Arc::clone(
-                        tokenizer.added_prefixes().expect("added tokens ⇒ prefixes"),
-                    ),
-                    open: String::new(),
-                }),
+                // Invariant of the asset reader: added tokens and their
+                // prefix oracle are built together (both or neither).
+                raw: match (tokenizer.added(), tokenizer.added_prefixes()) {
+                    (Some(_), Some(prefixes)) => Some(RawAdded {
+                        max_added: tokenizer.max_added_token_bytes(),
+                        prefixes: Arc::clone(prefixes),
+                        open: String::new(),
+                    }),
+                    _ => None,
+                },
                 gap: PlainGap::new(
                     tokenizer.normalizer(),
                     tokenizer.pretokenizer().to_vec(),
@@ -641,7 +644,13 @@ impl IncrementalCounter {
     }
 
     fn push_tier(&mut self, tier: usize, delta: &str) -> Result<(), CountFallback> {
-        let Some(raw) = self.tiers[tier].raw.as_mut() else {
+        // Invariant of the asset reader: the raw layer exists exactly when the
+        // tokenizer has added tokens; a mismatch degrades to the plain path.
+        let (Some(raw), Some(matcher)) = (self.tiers[tier].raw.as_mut(), self.tokenizer.added())
+        else {
+            if let Some(raw) = self.tiers[tier].raw.as_mut() {
+                raw.open.push_str(delta);
+            }
             return self.tiers[tier].gap.push(delta);
         };
         // One scan over (unresolved raw suffix + delta): every position before
@@ -649,10 +658,6 @@ impl IncrementalCounter {
         let mut whole = std::mem::take(&mut raw.open);
         whole.push_str(delta);
         let end = whole.len();
-        let matcher = self
-            .tokenizer
-            .added()
-            .expect("raw layer exists only with added tokens");
         let matches: Vec<(usize, usize)> = matcher
             .find_iter(&whole)
             .map(|found| (found.start(), found.end()))
@@ -707,7 +712,9 @@ impl IncrementalCounter {
         if cursor < cut {
             self.tiers[tier].gap.push(&whole[cursor..cut])?;
         }
-        self.tiers[tier].raw.as_mut().expect("raw layer").open = whole[cut..].to_owned();
+        if let Some(raw) = self.tiers[tier].raw.as_mut() {
+            raw.open = whole[cut..].to_owned();
+        }
         Ok(())
     }
 
@@ -801,11 +808,9 @@ pub fn last_normalization_boundary(text: &str) -> usize {
     let mut boundary = 0;
     let mut previous: Option<char> = None;
     for (index, ch) in text.char_indices() {
-        if index == 0 {
-            previous = Some(ch);
-            continue;
-        }
-        if is_normalization_boundary(previous.expect("set after the first char"), ch) {
+        if let Some(previous) = previous
+            && is_normalization_boundary(previous, ch)
+        {
             boundary = index;
         }
         previous = Some(ch);
