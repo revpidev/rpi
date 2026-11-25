@@ -43,7 +43,7 @@ python3 scripts/v019-benchmark/run_replay.py \
   --repeat 3
 ```
 
-Every repeat is a fresh process. The logical cwd is `<sandbox-root>/<scenario>` (default `/tmp/rpi-v19-replay-sandbox/<scenario>`), not a child of the evidence output directory. The runner resets that dedicated sandbox before each process, so separate baseline/candidate output roots still render identical paths. Use `--sandbox-root` only for another dedicated, non-shared location; do not run the same scenario concurrently. The runner:
+Every repeat is a fresh process. The logical cwd is `<sandbox-root>/<scenario>` (default `/tmp/rpi-v19-replay-sandbox/<scenario>`), not a child of the evidence output directory. The footer renders that logical cwd, so `finalScreenSha256` and `terminalOutputSha256` depend on the sandbox path: only compare hashes produced under the same `--sandbox-root` (the default for the formal suites); a run under another root is compared against an oracle run under that same root. The runner resets that dedicated sandbox before each process, so separate baseline/candidate output roots still render identical paths. Use `--sandbox-root` only for another dedicated, non-shared location; do not run the same scenario concurrently. The runner:
 
 - verifies the input against the manifest and passes the expected SHA-256 to the child;
 - sets `RPI_V19_DISABLE_ADAPTIVE_BACKPRESSURE=1` for the candidate-side internal switch (the stable build simply ignores it);

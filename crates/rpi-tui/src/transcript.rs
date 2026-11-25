@@ -24,7 +24,15 @@
 //! Kitty residual crops) go through the same contract: [`TranscriptDocument::rows`]
 //! materializes a row range on demand and [`TranscriptDocument::materialize`]
 //! builds the lazy full-text corpus used by search, cached per width and
-//! content stamp and dropped as soon as a frame does not consume it.
+//! content stamp and dropped once two syncs go by without a consumer.
+//!
+//! Known costs (bounded, by design): the first full-text consumer (opening a
+//! search, copying a whole history) renders every evicted block once and
+//! retains the whole history for up to two frames before the LRU caps apply
+//! again; while a search is open, any untrusted block (re-rendered every
+//! frame) changes the content stamp every frame, so the corpus is
+//! re-concatenated per frame from the reused per-block segments (an O(rows)
+//! copy, never a re-render of unchanged trusted blocks).
 
 use std::ops::Range;
 use std::sync::Arc;

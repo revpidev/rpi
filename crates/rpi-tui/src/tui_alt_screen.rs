@@ -100,7 +100,7 @@ use crate::tui::{
 };
 use crate::tui_base::{
     RenderSchedule, RenderScheduleStats, TerminalSizeCache, TuiBase, promote_pending_render,
-    record_frame_cost, render_schedule_stats, schedule_render,
+    record_frame_cost, render_schedule_stats, schedule_render, take_render_synchronous,
 };
 use crate::utils::{
     extract_ansi_code, get_grapheme_cell_range, get_osc8_link_at_column, get_word_segmenter,
@@ -1456,12 +1456,7 @@ impl TuiAltScreen {
         if force {
             inner.reset_render_state();
         }
-        {
-            let mut schedule = lock_shared(&self.schedule);
-            schedule.requested = false;
-            schedule.deadline = None;
-            schedule.last_render_at = Some(Instant::now());
-        }
+        take_render_synchronous(&self.schedule, Instant::now());
         let started = Instant::now();
         inner.do_render();
         let frame_cost = started.elapsed();
@@ -9392,6 +9387,51 @@ mod tests {
             "full redraw after the resize"
         );
         assert!(!tui.has_pending_work());
+        stop(&tui);
+    }
+
+    #[test]
+    fn removed_children_drop_their_layout_cache_entries() {
+        let terminal = VirtualTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let leaf = text("leaf");
+        let dock = text("dock");
+        let replacement = text("replacement");
+        // The same shared components are TUI children and layout-root leaves,
+        // so the cross-frame cache holds entries for them.
+        tui.add_child(leaf.clone());
+        tui.add_child(dock.clone());
+        tui.set_layout_root(Some(shared_component(VStack::new(
+            vec![
+                StackChild::Component(leaf.clone()),
+                StackChild::Component(dock.clone()),
+            ],
+            StackOptions::default(),
+        ))));
+        tui.start();
+        settle(&tui);
+        {
+            let inner = tui.lock_inner();
+            assert_eq!(
+                inner.render_cache.stats().retained_entries,
+                2,
+                "both trusted leaves are retained"
+            );
+        }
+        tui.remove_child(&leaf);
+        {
+            let inner = tui.lock_inner();
+            assert_eq!(inner.render_cache.stats().retained_entries, 1);
+        }
+        tui.swap_child(&dock, &replacement);
+        {
+            let inner = tui.lock_inner();
+            assert_eq!(
+                inner.render_cache.stats().retained_entries,
+                0,
+                "the swapped-out leaf is forgotten"
+            );
+        }
         stop(&tui);
     }
 }

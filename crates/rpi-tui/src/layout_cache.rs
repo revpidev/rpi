@@ -123,6 +123,12 @@ impl LayoutRenderCache {
         lines: Arc<[String]>,
     ) {
         self.stats.misses += 1;
+        if lines.len() > MAX_CACHE_LINES {
+            // A single component larger than the whole line budget could
+            // never stay cached (insert-then-evict every frame); keep the
+            // per-frame render instead of churning the LRU.
+            return;
+        }
         let key = Arc::as_ptr(&owner) as usize;
         let touch = self.tick();
         let bucket = self.entries.entry(key).or_default();

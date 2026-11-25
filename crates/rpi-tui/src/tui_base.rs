@@ -452,6 +452,17 @@ pub(crate) fn record_frame_cost(schedule: &Mutex<RenderSchedule>, cost: Duration
     }
 }
 
+/// `renderNow` bookkeeping (V19-06): the synchronous frame covers every state
+/// requested so far and ends any pending latency-class promotion.
+pub(crate) fn take_render_synchronous(schedule: &Mutex<RenderSchedule>, now: Instant) {
+    let mut schedule = lock_shared(schedule);
+    schedule.requested = false;
+    schedule.deadline = None;
+    schedule.latency_pending = false;
+    schedule.last_render_at = Some(now);
+    schedule.rendered_generation = schedule.requested_generation;
+}
+
 /// Snapshot of the schedule for tests, the benchmark probe and diagnostics.
 pub(crate) fn render_schedule_stats(schedule: &Mutex<RenderSchedule>) -> RenderScheduleStats {
     let schedule = lock_shared(schedule);

@@ -42,6 +42,7 @@ use crate::tui::{
 use crate::tui_base::{
     CursorPos, RenderSchedule, RenderScheduleStats, TerminalSizeCache, TuiBase, env_flag_is_1,
     promote_pending_render, record_frame_cost, render_schedule_stats, schedule_render,
+    take_render_synchronous,
 };
 use crate::utils::{slice_by_column, visible_width, width_divergence_extra};
 
@@ -778,12 +779,7 @@ impl TuiMainScreen {
         if force {
             inner.reset_render_state();
         }
-        {
-            let mut schedule = lock_shared(&self.schedule);
-            schedule.requested = false;
-            schedule.deadline = None;
-            schedule.last_render_at = Some(Instant::now());
-        }
+        take_render_synchronous(&self.schedule, Instant::now());
         let started = Instant::now();
         inner.do_render();
         let frame_cost = started.elapsed();

@@ -94,13 +94,23 @@ impl RetainedSet {
         touch: u64,
         window: bool,
     ) {
+        let previous_window_touch = self
+            .entries
+            .get(&identity)
+            .and_then(|entry| entry.window_touch);
         if let Some(previous) = self.entries.insert(
             identity,
             RetainedLines {
                 revision,
                 lines,
                 touch,
-                window_touch: window.then_some(touch),
+                // A re-measured working-set block keeps its window touch:
+                // eviction must not pick it before the next row access.
+                window_touch: if window {
+                    Some(touch)
+                } else {
+                    previous_window_touch
+                },
             },
         ) {
             self.lines = self.lines.saturating_sub(previous.lines.len());
@@ -315,10 +325,12 @@ impl SequenceState {
         if self
             .corpus
             .as_ref()
-            .is_some_and(|corpus| corpus.last_used_frame.wrapping_add(1) < self.frame)
+            .is_some_and(|corpus| corpus.last_used_frame.wrapping_add(2) < self.frame)
         {
-            // No consumer asked for the corpus in the previous frame
-            // (search closed): release the full-text copy.
+            // No consumer asked for the corpus in the previous two syncs
+            // (search closed): release the full-text copy. Two syncs, not
+            // one: a search reveal renders two layouts in the same frame,
+            // and the corpus must survive that second sync.
             self.corpus = None;
         }
         if self.slots.len() != children.len() {
@@ -561,10 +573,13 @@ impl SequenceState {
                 }
             }
         } else if let Slot::Opaque(slot) = &self.slots[index]
-            && slot.identity.is_none()
-            && slot.revision.is_none()
+            && slot.identity == identity
+            && slot.revision == revision
             && let Some(lines) = &slot.lines
         {
+            // Any block without the full identity protocol (no revision, or
+            // no id and no revision) is untrusted; its frame-local lines
+            // come from the latest sync, whatever its instance id says.
             return lines.clone();
         }
         self.stats.on_demand_renders += 1;

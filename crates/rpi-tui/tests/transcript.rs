@@ -1078,3 +1078,120 @@ fn resize_frames_match_the_oracle_when_the_width_and_height_change_between_frame
         }
     }
 }
+
+// ---- round-1 review findings ---------------------------------------------
+
+/// A block with an instance id but no trusted revision (a Markdown behind an
+/// opaque extension transformer, an assistant message with one untrusted
+/// child): untrusted, and still rendered exactly once per frame.
+struct IdentityOnlyBlock {
+    renders: Arc<AtomicU64>,
+    id: u64,
+    lines: Vec<String>,
+}
+
+impl Component for IdentityOnlyBlock {
+    fn render(&self, _width: usize) -> Vec<String> {
+        self.renders.fetch_add(1, Ordering::Relaxed);
+        self.lines.clone()
+    }
+    fn cache_instance_id(&self) -> Option<u64> {
+        Some(self.id)
+    }
+}
+
+#[test]
+fn identity_without_a_revision_is_an_untrusted_block_rendered_once_per_frame() {
+    let container = Arc::new(Mutex::new(Container::new()));
+    let renders = Arc::new(AtomicU64::new(0));
+    lock(&container).children.push(Box::new(IdentityOnlyBlock {
+        renders: Arc::clone(&renders),
+        id: next_cache_instance_id(),
+        lines: vec!["status line".to_string(), "second row".to_string()],
+    }));
+    let (block, _, _) = trusted(vec!["stable answer".to_string()]);
+    lock(&container).children.push(block);
+    let fx = Fixture {
+        container: Arc::clone(&container),
+        trusted: Vec::new(),
+        untrusted_renders: Vec::new(),
+    };
+    let (oracle, virtual_) = pair(&fx, ScrollbarMode::Hidden, Follow::End);
+    let mut oracle_cache = LayoutRenderCache::new();
+    let mut virtual_cache = LayoutRenderCache::new();
+    let mut child = None;
+    for _ in 0..11 {
+        let (oracle_frame, virtual_frame) = frames_at(
+            &oracle,
+            &virtual_,
+            0,
+            20,
+            4,
+            &mut oracle_cache,
+            &mut virtual_cache,
+        );
+        assert_eq!(oracle_frame.lines, virtual_frame.lines);
+        child = Some(child_of(
+            virtual_frame.primary_scroll_view.as_ref().expect("primary"),
+        ));
+    }
+    assert_eq!(
+        renders.load(Ordering::Relaxed),
+        22,
+        "one render per frame in each view"
+    );
+    with_transcript(&child.expect("child"), |document| {
+        let stats = document.stats();
+        assert_eq!(stats.fallback_blocks, 1);
+        assert_eq!(stats.fallback_renders, 11, "the sync render only");
+        assert_eq!(
+            stats.on_demand_renders, 0,
+            "the window reuses the frame's lines"
+        );
+    });
+}
+
+#[test]
+fn search_corpus_survives_a_double_sync_frame_and_is_released_after_two_idle_syncs() {
+    // Trusted blocks only: an untrusted block changes the content stamp every
+    // frame, which would rebuild the corpus regardless of the release rule.
+    let container = Arc::new(Mutex::new(Container::new()));
+    let (block, _, _) = trusted((0..40).map(|index| format!("row {index}")).collect());
+    lock(&container).children.push(block);
+    let (_, virtual_) = pair(
+        &Fixture {
+            container,
+            trusted: Vec::new(),
+            untrusted_renders: Vec::new(),
+        },
+        ScrollbarMode::Hidden,
+        Follow::End,
+    );
+    let mut cache = LayoutRenderCache::new();
+    let child = child_of(
+        frame(&virtual_, 20, 4, &mut cache)
+            .primary_scroll_view
+            .as_ref()
+            .expect("primary"),
+    );
+    with_transcript(&child, |document| {
+        assert_eq!(document.materialize(20).len(), 40);
+        assert_eq!(document.stats().corpus_rebuilds, 1);
+        // A search reveal lays out twice in one real frame: the corpus must
+        // survive a sync that does not consume it.
+        document.sync(20);
+        assert_eq!(document.materialize(20).len(), 40);
+        assert_eq!(
+            document.stats().corpus_rebuilds,
+            1,
+            "no rebuild after one idle sync"
+        );
+        // Search closed: the copy survives two idle syncs and is released at
+        // the third; the next consumer rebuilds it exactly once.
+        document.sync(20);
+        document.sync(20);
+        document.sync(20);
+        assert_eq!(document.materialize(20).len(), 40);
+        assert_eq!(document.stats().corpus_rebuilds, 2);
+    });
+}
