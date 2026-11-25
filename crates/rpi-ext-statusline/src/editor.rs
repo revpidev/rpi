@@ -69,7 +69,7 @@ enum State {
     Applied,
 }
 
-const OPTION_ROWS: usize = 5;
+const OPTION_ROWS: usize = 6;
 
 /// The editor draft and its component state.
 struct Editor {
@@ -265,7 +265,16 @@ impl Editor {
                     (config::Placement::Status, false) => config::Placement::Widget,
                 };
             }
-            _ => self.draft.live_tokens.enabled = !self.draft.live_tokens.enabled,
+            4 => self.draft.live_tokens.enabled = !self.draft.live_tokens.enabled,
+            // V19-07 FR-A R3: the Options page offers exactly `auto` and
+            // `estimate`; the cycle only flips the draft's policy (the preview
+            // below renders real data under it, never a fabricated source).
+            _ => {
+                self.draft.live_tokens.calculation = match self.draft.live_tokens.calculation {
+                    config::LiveCalculation::Auto => config::LiveCalculation::Estimate,
+                    config::LiveCalculation::Estimate => config::LiveCalculation::Auto,
+                }
+            }
         }
         self.message = None;
     }
@@ -320,6 +329,15 @@ impl Editor {
                     "on"
                 } else {
                     "off (pending live fields are hidden)"
+                }
+            ),
+            format!(
+                "calculation: {}",
+                match self.draft.live_tokens.calculation {
+                    config::LiveCalculation::Auto => "auto (provider → tokenizer → heuristic)",
+                    config::LiveCalculation::Estimate => {
+                        "estimate (heuristic while streaming, exact at message_end)"
+                    }
                 }
             ),
         ]
@@ -918,16 +936,23 @@ fn fetch_data(
     });
     let stats = value("ctx.sessionStats")
         .and_then(|value| serde_json::from_value::<SessionStats>(value).ok());
+    // The editor preview is a one-shot frame: the full-text accounting is fine
+    // here (the items live tick is the path that must not deep-copy).
     let live = crate::with_engine(|engine| {
         let now = std::time::Instant::now();
         engine.live_peek(now)
     })
-    .map(|peek| peek.into_view(model.as_ref().map(|model| model.id.as_str())));
+    .map(|peek| {
+        peek.into_view(
+            model.as_ref().map(|model| model.id.as_str()),
+            config::LiveCalculation::Auto,
+        )
+    });
     let palette = use_colors
         .then(|| value("ui.theme"))
         .flatten()
         .map(|theme| Palette::from_theme(&theme));
-    let pending_output = crate::with_engine(|engine| engine.pending_output());
+    let live_total = crate::with_engine(|engine| engine.live_total_view());
     FieldData {
         cwd: value("ctx.cwd").and_then(|value| value.as_str().map(str::to_owned)),
         model,
@@ -937,7 +962,7 @@ fn fetch_data(
         context,
         session_name: value("getSessionName").and_then(|value| value.as_str().map(str::to_owned)),
         stats,
-        pending_output,
+        live_total,
         live,
         // The editor preview renders placeholders for missing values; it never
         // shows the footer's held live values.
@@ -1066,7 +1091,7 @@ fn config_text(snapshot: &config::SettingsSnapshot) -> String {
     };
     match status_line {
         StatusLine::Command(config) => format!(
-            "rpi-statusline: command ({:?})\ncommand: {}\nrefreshInterval: {}\nliveTokens: {}\nEdit in the TUI with /statusline.",
+            "rpi-statusline: command ({:?})\ncommand: {}\nrefreshInterval: {}\nliveTokens: {} ({})\nEdit in the TUI with /statusline.",
             config.placement,
             config.command,
             config
@@ -1078,6 +1103,7 @@ fn config_text(snapshot: &config::SettingsSnapshot) -> String {
             } else {
                 "off"
             },
+            config.live_tokens.calculation.as_str(),
         ),
         StatusLine::Items(config) => {
             let items = config
@@ -1087,7 +1113,7 @@ fn config_text(snapshot: &config::SettingsSnapshot) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "rpi-statusline: items ({:?})\nitems: {items}\nseparator: {:?}\nplacement: {:?}\nnumberFormat: {:?}  useColors: {}  padding: {}\nrefreshInterval: {}s\nliveTokens: {}\nEdit in the TUI with /statusline.",
+                "rpi-statusline: items ({:?})\nitems: {items}\nseparator: {:?}\nplacement: {:?}\nnumberFormat: {:?}  useColors: {}  padding: {}\nrefreshInterval: {}s\nliveTokens: {} (calculation: {})\nEdit in the TUI with /statusline.",
                 config.placement,
                 config.separator,
                 config.placement,
@@ -1100,6 +1126,7 @@ fn config_text(snapshot: &config::SettingsSnapshot) -> String {
                 } else {
                     "off"
                 },
+                config.live_tokens.calculation.as_str(),
             )
         }
     }
@@ -1120,7 +1147,9 @@ live-thinking-tokens, live-toolcall-tokens.\n\
 \n\
 Live tokens prefer provider usage, then the bundled tokenizer for the\n\
 model family (DeepSeek, Kimi, GLM, Qwen, Hunyuan, MiniMax), then a\n\
-CJK-aware estimate (~ prefix).\n\
+CJK-aware estimate (~ prefix). `liveTokens.calculation` is `auto` (that\n\
+order) or `estimate` (always the heuristic with ~ while streaming; the\n\
+finished message switches to the exact value); both correct at message_end.\n\
 \n\
 Default items: live-total-tokens + live-output-rate only (all other\n\
 fields off); adjust them in the editor.\n\
@@ -1344,6 +1373,89 @@ mod tests {
         editor.cycle_option(true);
         assert!(!editor.draft.live_tokens.enabled);
         assert!(!editor.draft.live_enabled());
+    }
+
+    /// V19-07 FR-A R3: the Options page offers exactly `auto` ↔ `estimate`
+    /// (one row, cycling only the policy); the row renders, the key navigation
+    /// reaches it, and a save writes the legal enum through the A+B path.
+    #[test]
+    fn calculation_option_cycles_between_auto_and_estimate_and_saves_the_enum() {
+        let mut editor = editor();
+        assert_eq!(
+            editor.draft.live_tokens.calculation,
+            config::LiveCalculation::Auto
+        );
+        let rows = editor.option_rows();
+        assert_eq!(rows.len(), OPTION_ROWS);
+        assert_eq!(rows.len(), 6);
+        assert!(rows[5].starts_with("calculation: auto"), "{}", rows[5]);
+        editor.option_cursor = 5;
+        editor.cycle_option(true);
+        assert_eq!(
+            editor.draft.live_tokens.calculation,
+            config::LiveCalculation::Estimate
+        );
+        assert!(editor.option_rows()[5].starts_with("calculation: estimate"));
+        // The policy row does not touch the switch or any other option.
+        assert!(editor.draft.live_tokens.enabled);
+        editor.cycle_option(false);
+        assert_eq!(
+            editor.draft.live_tokens.calculation,
+            config::LiveCalculation::Auto
+        );
+        // Down from the last row clamps onto it; up leaves it.
+        editor.page = Page::Options;
+        editor.option_cursor = OPTION_ROWS - 1;
+        editor.handle_input("\x1b[B");
+        assert_eq!(editor.option_cursor, 5);
+        editor.handle_input("\x1b[A");
+        assert_eq!(editor.option_cursor, 4);
+        // The options page renders the row.
+        editor.option_cursor = 5;
+        editor.height = Some(40);
+        let lines = editor.render(100);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("calculation") && line.contains("auto (provider")),
+            "{lines:#?}"
+        );
+
+        // Save: `estimate` is written as the legal enum inside `liveTokens`;
+        // a default draft saves the legacy `true` spelling (no new key).
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-statusline-editor-calculation-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{\"statusLine\":{\"type\":\"items\",\"items\":[\"live-output-tokens\",\"live-output-rate\"]}}")
+            .expect("write");
+        let (opened, fingerprint) = settings_write::read_status_line(&path).expect("read");
+        editor.opened = opened
+            .get("statusLine")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        editor.fingerprint = fingerprint;
+        editor.draft.live_tokens.calculation = config::LiveCalculation::Estimate;
+        editor.path = path.clone();
+        editor.save();
+        assert_eq!(editor.state, State::Applied);
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(
+            parsed["statusLine"]["liveTokens"],
+            json!({"refreshMs": crate::config::DEFAULT_LIVE_REFRESH_MS, "calculation": "estimate"})
+        );
+        // Re-opening keeps the policy (the raw parser reads it back).
+        let reopened = parse_draft(parsed["statusLine"].as_object().expect("object"));
+        assert_eq!(
+            reopened.live_tokens.calculation,
+            config::LiveCalculation::Estimate
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

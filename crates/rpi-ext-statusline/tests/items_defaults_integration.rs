@@ -74,12 +74,25 @@ extern "C" fn fake_host_call(_cookie: PluginCookie, request: RVec<u8>) -> RVec<u
 }
 
 fn session_stats(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Value {
+    session_stats_with(input, output, cache_read, cache_write, 3)
+}
+
+/// V19-07: the snapshot's `assistantMessages` is the pending watermark — a
+/// consistent snapshot that counts the finished message carries both its
+/// usage and the next assistant count.
+fn session_stats_with(
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    assistant_messages: u64,
+) -> Value {
     json!({
         "sessionId": "s1",
         "startedAt": "2020-01-01T00:00:00Z",
         "entryCount": 4,
         "userMessages": 2,
-        "assistantMessages": 3,
+        "assistantMessages": assistant_messages,
         "tokens": {
             "input": input,
             "output": output,
@@ -320,21 +333,59 @@ fn fresh_install_preset_is_live_session_total_plus_rate() {
         "the provider-exact pending part drops the marker: {text:?}"
     );
 
-    // ── 6. The committed snapshot (input 20 + output 62 + cacheRead 30 +
-    //        cacheWrite 50 = 162) replaces the pending part on `turn_end`:
-    //        the row stays at 162 instead of double counting to 204.
-    set_canned("ctx.sessionStats", session_stats(20, 62, 30, 50));
+    // ── 6. V19-07 (R5.2.8): the pending exact total is cleared by the
+    //        snapshot's `assistantMessages` WATERMARK, never by the trigger.
+    //        A snapshot read that does not yet count the message (issued
+    //        before the persistence: assistantMessages still 3, usage still
+    //        20) keeps the pending part: 120 + 42 = 162, nothing dropped.
+    let frames_before_settled = status_texts(&records()).len();
+    set_canned("ctx.sessionStats", session_stats(20, 20, 30, 50));
+    send_event("turn_end", json!({"type": "turn_end"}));
+    let uncovered = poll_until("uncovered snapshot frame", |records| {
+        status_texts(records).len() > frames_before_settled
+            && status_texts(records)
+                .last()
+                .is_some_and(|text| text.starts_with("162 · "))
+    });
+    let text = status_texts(&uncovered).last().cloned().unwrap_or_default();
+    assert!(
+        text.starts_with("162 · ") && !text.contains('~'),
+        "the uncovered snapshot keeps the pending 42: {text:?}"
+    );
+    // The committed snapshot (input 20 + output 62 + cacheRead 30 +
+    // cacheWrite 50 = 162, assistantMessages 4) covers the watermark: the
+    // pending part goes away and the row stays at 162 instead of double
+    // counting to 204.
+    let frames_before_uncovered = status_texts(&uncovered).len();
+    set_canned("ctx.sessionStats", session_stats_with(20, 62, 30, 50, 4));
     send_event("turn_end", json!({"type": "turn_end"}));
     let committed = poll_until("committed total after snapshot refresh", |records| {
-        status_texts(records)
-            .last()
-            .is_some_and(|text| text.starts_with("162 · "))
+        status_texts(records).len() > frames_before_uncovered
+            && status_texts(records)
+                .last()
+                .is_some_and(|text| text.starts_with("162 · "))
     });
     let text = status_texts(&committed).last().cloned().unwrap_or_default();
     assert!(
         !text.contains("204"),
         "pending must not double count: {text:?}"
     );
+    // Exactly one terminal counts-only probe ran for the finished message
+    // (at `message_end`, before the host persisted it), and none of the
+    // snapshot reads above used the counts-only argument.
+    let counts_only = calls_of(&committed, "ctx.sessionStats")
+        .into_iter()
+        .filter(|args| args.get("countsOnly") == Some(&json!(true)))
+        .count();
+    assert_eq!(
+        counts_only, 1,
+        "one counts-only probe per assistant terminal"
+    );
+    let full_reads = calls_of(&committed, "ctx.sessionStats")
+        .into_iter()
+        .filter(|args| args.get("countsOnly").is_none())
+        .count();
+    assert!(full_reads >= 3, "snapshot reads stay full: {full_reads}");
 
     let _ = std::fs::remove_dir_all(&agent);
 }

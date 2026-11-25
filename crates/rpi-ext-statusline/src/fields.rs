@@ -28,7 +28,9 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::config::LiveCalculation;
 use crate::git::GitInfo;
+use crate::live_total::LiveTotalView;
 use crate::session_stats::SessionStats;
 use crate::tokens::TokenBreakdown;
 
@@ -418,6 +420,13 @@ pub struct LiveView {
     /// (rpi#78 B). The rate row holds the previous reading instead of
     /// publishing a number that mixes bases.
     pub rate_source_switched: bool,
+    /// The calculation policy this frame was produced under (V19-07 FR-B).
+    pub policy: LiveCalculation,
+    /// The frame describes a FINISHED message whose breakdown is the
+    /// authoritative settlement (local exact / final heuristic / provider
+    /// exact): once set, the provider total is applied even if it was not
+    /// yet reported while streaming.
+    pub settled: bool,
 }
 
 impl LiveView {
@@ -425,16 +434,25 @@ impl LiveView {
     /// while in flight or once the stream settles, otherwise the local
     /// bundled tokenizer/heuristic breakdown (R20 §4.3 + the 2026-11 realtime
     /// estimate extension).
+    ///
+    /// V19-07 FR-B R2/R3: under `estimate` a STREAMING frame always reports
+    /// the heuristic numerator marked `~`, even when the provider already
+    /// reports a running exact total (no early exact display); the settled
+    /// frame switches to the authoritative value. `TokenSource` keeps
+    /// recording the real source — the policy never relabels a number.
     pub fn reported_output(self) -> Option<TokenBreakdown> {
-        let estimated = self.tokens.unwrap_or_default();
+        let local = self.tokens.unwrap_or_default();
+        if self.streaming && self.policy == LiveCalculation::Estimate {
+            return (local.total > 0).then_some(local);
+        }
         let provider = if self.streaming {
             self.output_tokens.or(self.output_tokens_exact)
         } else {
             self.output_tokens_exact.or(self.output_tokens)
         };
         match provider {
-            Some(total) if total > 0 => Some(estimated.with_provider_total(total)),
-            _ if estimated.total > 0 => Some(estimated),
+            Some(total) if total > 0 => Some(local.with_provider_total(total)),
+            _ if local.total > 0 => Some(local),
             _ => None,
         }
     }
@@ -475,9 +493,10 @@ pub struct FieldData {
     pub context: Option<ContextInfo>,
     pub session_name: Option<String>,
     pub stats: Option<SessionStats>,
-    /// Exact output tokens of assistant messages that ended after the last
-    /// applied `ctx.sessionStats` snapshot (`live-total-tokens` only).
-    pub pending_output: u64,
+    /// The `live-total-tokens` overlay (V19-07): pending provider-exact
+    /// totals not yet in the snapshot, the local exact/estimated settled
+    /// sums, whether a message is current, and the unknown-watermark hide.
+    pub live_total: LiveTotalView,
     pub live: Option<LiveView>,
     /// Last rendered value of every live row (items mode): a row with no
     /// fresh value in this frame (the gap between two assistant messages, the
@@ -694,27 +713,42 @@ fn raw_value(id: FieldId, data: &FieldData) -> Option<FieldValue> {
             ))
         }
         FieldId::LiveTotalTokens => {
-            // The snapshot total plus the not-yet-committed assistant output:
-            // the exact output of messages that ended since the last applied
-            // snapshot (`pending_output`), plus the current message's live
-            // output while it streams. Estimates keep the `~` marker; the
-            // snapshot handoff clears the pending part, so the row never
-            // double counts a committed message.
+            // V19-07 (R5.2.5): authoritative baseline + pending provider
+            // exact + settled local exact + settled estimated + the current
+            // message's provisional output. The baseline comes from the
+            // applied `ctx.sessionStats` snapshot (omitted without one); the
+            // overlay parts are cleared by watermarks/settlements, never by
+            // the next message. A pending entry with an unknown watermark
+            // hides the row (R5.2.8) rather than guessing. Any settled or
+            // current estimate keeps the `~` marker on the whole total — a
+            // settled estimate stays marked even when later messages report
+            // provider-exact usage.
             let tokens = data.stats.as_ref()?.tokens;
+            if data.live_total.hidden {
+                return None;
+            }
             let mut total = tokens
                 .input
                 .saturating_add(tokens.output)
                 .saturating_add(tokens.cache_read)
                 .saturating_add(tokens.cache_write)
-                .saturating_add(data.pending_output);
-            let mut marker = "";
+                .saturating_add(data.live_total.pending_output)
+                .saturating_add(data.live_total.settled_local_exact)
+                .saturating_add(data.live_total.settled_estimated);
+            let mut marker = if data.live_total.settled_estimated > 0 {
+                "~"
+            } else {
+                ""
+            };
             if let Some(output) = data
                 .live
-                .filter(|live| live.streaming)
+                .filter(|_| data.live_total.current_open)
                 .and_then(LiveView::reported_output)
             {
                 total = total.saturating_add(output.total);
-                marker = output.total_marker();
+                if !output.source.is_exact() {
+                    marker = "~";
+                }
             }
             Some(FieldValue::new(
                 format!("{marker}{}", format_tokens(total, data.number_format)),
@@ -1081,7 +1115,10 @@ mod tests {
             }),
             session_name: Some("te52".into()),
             stats: Some(stats()),
-            pending_output: 0,
+            live_total: LiveTotalView {
+                current_open: true,
+                ..LiveTotalView::default()
+            },
             live: Some(LiveView {
                 streaming: true,
                 output_tokens: Some(123),
@@ -1094,6 +1131,8 @@ mod tests {
                     TokenSource::Estimated,
                 )),
                 rate_source_switched: false,
+                policy: LiveCalculation::Auto,
+                settled: false,
             }),
             live_held: Vec::new(),
             git: Some(GitInfo {
@@ -1131,6 +1170,8 @@ mod tests {
                     TokenSource::Estimated,
                 )),
                 rate_source_switched: switched,
+                policy: LiveCalculation::Auto,
+                settled: false,
             };
 
         data.live = Some(frame(true, None, None, false));
@@ -1224,11 +1265,16 @@ mod tests {
         );
     }
 
+    /// V19-07 (R5.2.5/R5.2.7/R5.2.8): the live total is baseline + pending
+    /// provider exact + settled local exact + settled estimated + current
+    /// provisional; a settled estimate keeps `~` even when later messages
+    /// report exact usage; the finished message is never counted twice; an
+    /// unknown watermark hides the row; no snapshot omits it.
     #[test]
-    fn live_total_adds_pending_and_streaming_output() {
+    fn live_total_combines_every_overlay_term_once() {
         // Snapshot total = 10 + 20 + 30 + 40 = 100.
         let mut data = data();
-        data.pending_output = 7;
+        data.live_total.pending_output = 7;
         // Streaming with a provider exact output (123): no estimate marker.
         assert_eq!(value(FieldId::LiveTotalTokens, &data).unwrap().text, "230");
         // Only the local estimate is available while streaming: keep the
@@ -1241,32 +1287,155 @@ mod tests {
             decode_ms: 1_000,
             tokens: Some(TokenBreakdown::from_tiers(2, 0, 0, TokenSource::Estimated)),
             rate_source_switched: false,
+            policy: LiveCalculation::Auto,
+            settled: false,
         });
         assert_eq!(
             value(FieldId::LiveTotalTokens, &estimated).unwrap().text,
             "~109"
         );
-        // Settled: the frozen output is already in the pending/snapshot sum,
-        // so the live part is not added again.
+        // Settled: the finished message moved into pending/settled, so the
+        // live part is not added again.
         let mut settled = data.clone();
+        settled.live_total.current_open = false;
         settled.live = Some(LiveView {
             streaming: false,
+            settled: true,
             ..data.live.expect("fixture live view")
         });
         assert_eq!(
             value(FieldId::LiveTotalTokens, &settled).unwrap().text,
             "107"
         );
-        // Live disarmed: the row still renders the snapshot + pending total.
+        // Awaiting the local settlement (message_end, tokenizer pending): the
+        // provisional stays current so the total does not dip.
+        let mut awaiting = settled.clone();
+        awaiting.live_total.current_open = true;
+        assert_eq!(
+            value(FieldId::LiveTotalTokens, &awaiting).unwrap().text,
+            "230"
+        );
+        // Local exact settled sum: added without `~`.
+        settled.live_total.settled_local_exact = 11;
+        assert_eq!(
+            value(FieldId::LiveTotalTokens, &settled).unwrap().text,
+            "118"
+        );
+        // Settled estimate: added WITH `~`, and the marker persists even when
+        // the only other terms are exact.
+        settled.live_total.settled_estimated = 4;
+        assert_eq!(
+            value(FieldId::LiveTotalTokens, &settled).unwrap().text,
+            "~122"
+        );
+        settled.live_total.pending_output = 0;
+        settled.live_total.settled_local_exact = 0;
+        assert_eq!(
+            value(FieldId::LiveTotalTokens, &settled).unwrap().text,
+            "~104"
+        );
+        // Unknown watermark: omitted (never guessed).
+        let mut hidden = data.clone();
+        hidden.live_total.hidden = true;
+        assert_eq!(value(FieldId::LiveTotalTokens, &hidden), None);
+        // Live disarmed: the row still renders the snapshot + overlay total.
         let mut disarmed = data.clone();
+        disarmed.live_total.current_open = false;
         disarmed.live = None;
         assert_eq!(
             value(FieldId::LiveTotalTokens, &disarmed).unwrap().text,
             "107"
         );
-        // No snapshot (old host): omitted, like the other session totals.
+        // No snapshot (old host / no first frame): omitted, like the other
+        // session totals.
         disarmed.stats = None;
         assert_eq!(value(FieldId::LiveTotalTokens, &disarmed), None);
+    }
+
+    /// V19-07 FR-B R2/R3: under `estimate` a streaming frame never shows the
+    /// provider's running exact total — the heuristic numerator carries `~`
+    /// for total, tiers and rate; the settled frame switches to the exact
+    /// value (no `~`), and `auto` keeps the v0.1.8 precedence.
+    #[test]
+    fn estimate_policy_marks_streaming_values_and_settles_exact() {
+        let base = data();
+        let mut estimate = base.clone();
+        estimate.live = Some(LiveView {
+            streaming: true,
+            output_tokens: Some(123),
+            output_tokens_exact: None,
+            decode_ms: 2_500,
+            tokens: Some(TokenBreakdown::from_tiers(
+                100,
+                20,
+                3,
+                TokenSource::Estimated,
+            )),
+            rate_source_switched: false,
+            policy: LiveCalculation::Estimate,
+            settled: false,
+        });
+        assert_eq!(
+            value(FieldId::LiveOutputTokens, &estimate).unwrap().text,
+            "~123"
+        );
+        assert_eq!(
+            value(FieldId::LiveTextTokens, &estimate).unwrap().text,
+            "~100 text"
+        );
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &estimate).unwrap().text,
+            "~49.2 tok/s"
+        );
+        assert_eq!(
+            value(FieldId::LiveTotalTokens, &estimate).unwrap().text,
+            "~223"
+        );
+        let reported = estimate
+            .live
+            .expect("view")
+            .reported_output()
+            .expect("output");
+        assert_eq!(reported.source, TokenSource::Estimated);
+        assert_eq!(
+            (reported.text, reported.thinking, reported.toolcall),
+            (100, 20, 3)
+        );
+        // message_end: the settled frame uses the authoritative exact value.
+        estimate.live = Some(LiveView {
+            streaming: false,
+            settled: true,
+            output_tokens_exact: Some(130),
+            tokens: Some(TokenBreakdown::from_tiers(
+                100,
+                20,
+                3,
+                TokenSource::Estimated,
+            )),
+            ..estimate.live.expect("view")
+        });
+        assert_eq!(
+            value(FieldId::LiveOutputTokens, &estimate).unwrap().text,
+            "130"
+        );
+        assert_eq!(
+            value(FieldId::LiveOutputRate, &estimate).unwrap().text,
+            "52.0 tok/s"
+        );
+        // Settled without any exact source: the final heuristic keeps `~`.
+        estimate.live = Some(LiveView {
+            output_tokens: None,
+            output_tokens_exact: None,
+            ..estimate.live.expect("view")
+        });
+        assert_eq!(
+            value(FieldId::LiveOutputTokens, &estimate).unwrap().text,
+            "~123"
+        );
+        // auto: the provider running total wins while streaming (v0.1.8).
+        let auto = base;
+        assert_eq!(auto.live.expect("view").policy, LiveCalculation::Auto);
+        assert_eq!(value(FieldId::LiveOutputTokens, &auto).unwrap().text, "123");
     }
 
     #[test]
@@ -1435,6 +1604,8 @@ mod tests {
                     TokenSource::Estimated,
                 )),
                 rate_source_switched: false,
+                policy: LiveCalculation::Auto,
+                settled: true,
             }),
             ..data.clone()
         };
@@ -1499,6 +1670,8 @@ mod tests {
             decode_ms: 1_200,
             tokens: Some(TokenBreakdown::from_tiers(7, 0, 0, TokenSource::Estimated)),
             rate_source_switched: false,
+            policy: LiveCalculation::Auto,
+            settled: false,
         });
         assert_eq!(value(FieldId::LiveOutputTokens, &fresh).unwrap().text, "7");
         assert_eq!(
@@ -1546,6 +1719,8 @@ mod tests {
                 decode_ms: 150,
                 tokens: Some(TokenBreakdown::from_tiers(2, 1, 0, TokenSource::Estimated)),
                 rate_source_switched: false,
+                policy: LiveCalculation::Auto,
+                settled: false,
             }),
             ..data()
         };

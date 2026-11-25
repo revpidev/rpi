@@ -16,21 +16,25 @@
 //!   after a config save.
 
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::config::{self, DEFAULT_LIVE_REFRESH_MS, Placement, StatusLine};
-use crate::fields::{self, ContextInfo, FieldData, FieldId, ModelInfo, Palette};
+use crate::config::{self, DEFAULT_LIVE_REFRESH_MS, LiveCalculation, Placement, StatusLine};
+use crate::fields::{self, ContextInfo, FieldData, FieldId, LiveView, ModelInfo, Palette};
 use crate::git::{self, GitInfo};
 use crate::items::ItemsConfig;
+use crate::live_ticker::{LiveFrameInput, LiveTicker, TokenRequirements};
+use crate::live_total::{LiveTotalView, LocalSettlement};
 use crate::payload::{HOOK_EVENT_STATUS, build_stdin_json};
 use crate::render::{footer_tree, status_text};
 use crate::runner::{self, CancelToken, ScriptError};
-use crate::session_stats::SessionStats;
+use crate::session_stats::{SessionStats, StatsTrigger};
 use crate::state::{EngineState, Snapshot};
+use crate::tokens;
 use crate::{AsyncHostCalls, ENGINE, host_ok};
 
 /// `ui.setStatus` key (the `status` placement channel). Distinct from the
@@ -124,6 +128,9 @@ pub async fn refresh_loop(
     let mut duration_deadline: Option<Instant> = None;
     let mut last_items_data: Option<FieldData> = None;
     let mut last_items_fingerprint: Option<String> = None;
+    // V19-07: the items streaming counter lives in the process-global cell
+    // (the refresh loop is its only writer; tests and diagnostics read the
+    // counters) — the dispatch thread never runs a tokenizer.
 
     loop {
         // The current host channel (rebind-aware; see the fn doc).
@@ -195,7 +202,7 @@ pub async fn refresh_loop(
                 if accepted && bridge_ready && !bridge_abandoned {
                     let settings = config::load_settings_snapshot();
                     if let Some(StatusLine::Items(items)) = settings.status_line.as_ref() {
-                        publish_items_from_cache(&calls, items, last_items_data.as_mut());
+                        publish_items_from_cache(&calls, items, last_items_data.as_mut(), None);
                     }
                 }
             }
@@ -270,9 +277,23 @@ pub async fn refresh_loop(
                             // estimated tokens/rate are visible immediately.
                             if last_items_data.is_none() {
                                 let ctx = fetch_items_ctx(&calls, &items);
-                                last_items_data = refresh_items(&calls, &items, Some(ctx), false);
+                                let mut ticker = lock_ticker();
+                                last_items_data = refresh_items(
+                                    &calls,
+                                    &items,
+                                    Some(ctx),
+                                    false,
+                                    "message_start",
+                                    &mut ticker,
+                                );
                             } else {
-                                publish_items_from_cache(&calls, &items, last_items_data.as_mut());
+                                let mut ticker = lock_ticker();
+                                publish_items_from_cache(
+                                    &calls,
+                                    &items,
+                                    last_items_data.as_mut(),
+                                    Some(&mut ticker),
+                                );
                             }
                         }
                     }
@@ -375,7 +396,9 @@ pub async fn refresh_loop(
                         if last_items_fingerprint.as_ref() != Some(&fingerprint) {
                             last_items_fingerprint = Some(fingerprint);
                             maybe_start_git(&calls, items, &ctx);
-                            let data = refresh_items(&calls, items, Some(ctx), true);
+                            let mut ticker = lock_ticker();
+                            let data =
+                                refresh_items(&calls, items, Some(ctx), true, "poll", &mut ticker);
                             if data.is_some() {
                                 last_items_data = data;
                             }
@@ -451,8 +474,24 @@ pub async fn refresh_loop(
                         }
                         let ctx = fetch_items_ctx(&calls, items);
                         maybe_start_git(&calls, items, &ctx);
+                        // V19-07: a finished message's local contribution is
+                        // settled here — the official full tokenizer runs on
+                        // this loop, outside the engine lock (the dispatch
+                        // path only queued the work at `message_end`).
+                        if reason == "message_end" {
+                            let mut ticker = lock_ticker();
+                            settle_message_end(&calls, &mut ticker);
+                        }
                         let read_stats = reads_session_stats_on(reason);
-                        let data = refresh_items(&calls, items, Some(ctx), read_stats);
+                        let mut ticker = lock_ticker();
+                        let data = refresh_items(
+                            &calls,
+                            items,
+                            Some(ctx),
+                            read_stats,
+                            reason,
+                            &mut ticker,
+                        );
                         if data.is_some() {
                             last_items_data = data;
                         }
@@ -674,24 +713,42 @@ fn snapshot_from_engine(
     });
     // Token accounting runs AFTER the engine lock is released: a large
     // model tokenizer must never block the streaming dispatch thread.
+    // Command mode keeps the complete `rpi.live_output` payload (an external
+    // script may read the full text), so it still materializes and counts
+    // the message per run (R5.3.6). V19-07: under `estimate` a STREAMING run
+    // uses the heuristic (0 BPE) and marks `~`; once the message settled both
+    // policies publish the official full pass, computed once and cached on
+    // the frozen measurement (idle re-runs do not repeat the BPE).
     if let Some(live) = snapshot.live_output.as_mut() {
+        let policy = current_calculation_policy();
         let model_id = snapshot
             .model
             .as_ref()
             .and_then(|model| model.get("id"))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let mut tokens = crate::tokens::count_breakdown(
-            model_id.as_deref(),
-            &live.text,
-            &live.thinking,
-            &live.toolcall,
-        );
+        let local = if live.streaming && policy == LiveCalculation::Estimate {
+            crate::tokens::heuristic_breakdown(&live.text, &live.thinking, &live.toolcall)
+        } else if live.streaming {
+            crate::tokens::count_breakdown(
+                model_id.as_deref(),
+                &live.text,
+                &live.thinking,
+                &live.toolcall,
+            )
+        } else {
+            with_engine(|engine| engine.cached_settled_local(model_id.as_deref()))
+        };
+        let mut tokens = local;
         // Same precedence as the UI fields: a provider-reported running/exact
         // total overrides the local estimate while the tier split keeps its
-        // proportions.
+        // proportions. Under `estimate` the streaming numerator stays the
+        // heuristic (FR-B R2); the settled frame takes the exact value.
         let provider_total = if live.streaming {
-            live.output_tokens.or(live.output_tokens_exact)
+            match policy {
+                LiveCalculation::Estimate => None,
+                LiveCalculation::Auto => live.output_tokens.or(live.output_tokens_exact),
+            }
         } else {
             live.output_tokens_exact.or(live.output_tokens)
         };
@@ -800,22 +857,29 @@ fn maybe_start_git(calls: &AsyncHostCalls, items: &ItemsConfig, ctx: &CtxData) {
 
 /// One items-mode refresh: fetch/refresh the absolute session snapshot, build
 /// the frame data, render and publish. Returns the data for later local ticks.
+/// `reason` is the trigger that owns the read (V19-07: the applied request's
+/// trigger decides whether an unknown-watermark pending entry may be cleared).
 fn refresh_items(
     calls: &AsyncHostCalls,
     items: &ItemsConfig,
     ctx_override: Option<CtxData>,
     read_stats: bool,
+    reason: &str,
+    ticker: &mut LiveTicker,
 ) -> Option<FieldData> {
     if items.needs_session_stats() && read_stats {
-        let token = with_engine(|engine| engine.session_stats.begin_request());
+        let trigger = StatsTrigger::for_reason(reason).unwrap_or(StatsTrigger::Interval);
+        let token = with_engine(|engine| engine.session_stats.begin_request(trigger));
         match fetch_session_stats(calls) {
             Some(stats) => {
+                let assistant_messages = stats.assistant_messages;
                 with_engine(|engine| {
-                    if engine.session_stats.apply(token, stats) {
-                        // The snapshot now counts every committed message:
-                        // drop the live-total pending contribution so it is
-                        // not added twice.
-                        engine.clear_pending_output();
+                    if let Some(applied) = engine.session_stats.apply(token, stats) {
+                        // The snapshot counts every message its
+                        // `assistant_messages` watermark covers: clear exactly
+                        // those pending entries (never the local settled sums,
+                        // which the host does not persist — V19-07 R5.2.8).
+                        engine.on_snapshot_applied(assistant_messages, &applied);
                     }
                 });
             }
@@ -823,9 +887,57 @@ fn refresh_items(
         }
     }
     let ctx = ctx_override.unwrap_or_else(|| fetch_items_ctx(calls, items));
-    let mut data = build_field_data(items, &ctx);
+    let mut data = build_field_data(items, &ctx, Some(ticker));
     publish_items_from_data(calls, items, &mut data);
     Some(data)
+}
+
+/// V19-07: settle the finished message's local contribution. The dispatch
+/// path queued the message's full text at `message_end`; the official full
+/// tokenizer (or, for a normally completed message without one, the final
+/// heuristic) runs HERE, outside the engine lock, exactly once. The
+/// incremental counter is finalized and compared with the official value
+/// (a disagreement is diagnosed and counted; the official value is used).
+fn settle_message_end(calls: &AsyncHostCalls, ticker: &mut LiveTicker) {
+    let awaiting = with_engine(|engine| engine.take_awaiting_local());
+    let Some(awaiting) = awaiting else {
+        // Provider-exact settlement (or nothing to settle): the ticker keeps
+        // the finished message's state for the settled frames; it restarts
+        // on the next `message_start`.
+        return;
+    };
+    let model_id = current_model_id(calls);
+    let tokenizer = tokens::tokenizer_for_model(model_id.as_deref());
+    let official = tokenizer.as_ref().map(|tokenizer| {
+        tokenizer.count_tiers(&awaiting.text, &awaiting.thinking, &awaiting.toolcall)
+    });
+    let incremental = ticker.finalize_exact(official.as_ref().map(|breakdown| breakdown.total));
+    if let Some(incremental) = incremental {
+        tracing::debug!(
+            incremental,
+            official = official.as_ref().map(|breakdown| breakdown.total),
+            "rpi-statusline: message_end official correction"
+        );
+    }
+    let (settlement, settled_tokens) = match official {
+        Some(breakdown) => (LocalSettlement::Exact(breakdown.total), Some(breakdown)),
+        None if awaiting.normal_completion => {
+            let breakdown =
+                tokens::heuristic_breakdown(&awaiting.text, &awaiting.thinking, &awaiting.toolcall);
+            (LocalSettlement::Estimated(breakdown.total), Some(breakdown))
+        }
+        // Aborted/errored without any exact source: the final heuristic is
+        // dropped (v0.1.8 semantics) — never promoted into the total.
+        None => (LocalSettlement::Dropped, None),
+    };
+    with_engine(|engine| engine.settle_local(settlement, settled_tokens));
+}
+
+/// The current model id over one `ctx.model` host call (settlement path only).
+fn current_model_id(calls: &AsyncHostCalls) -> Option<String> {
+    host_ok(calls, "ctx.model", json!({}))
+        .and_then(|model| model.get("id").and_then(Value::as_str).map(str::to_owned))
+        .filter(|id| !id.is_empty())
 }
 
 /// Whether an items event owns a session-totals refresh (R20 §4.4). A
@@ -867,7 +979,84 @@ fn warn_missing_session_stats_once() {
     }
 }
 
-fn build_field_data(items: &ItemsConfig, ctx: &CtxData) -> FieldData {
+/// The policy the current settings select (both modes read it per tick).
+fn current_calculation_policy() -> LiveCalculation {
+    config::load_settings_snapshot()
+        .status_line
+        .map(|config| config.live_tokens().calculation)
+        .unwrap_or(LiveCalculation::Auto)
+}
+
+/// The items live view for the CURRENT message (V19-07 FR-G R1): under the
+/// engine lock only the cheap status, the overlay and the bytes that arrived
+/// since the previous tick are copied; the counter runs outside the lock.
+/// The full text is copied only when the ticker asks for a one-time rebuild
+/// (policy switch / fallback).
+fn items_live_view(
+    ticker: &mut LiveTicker,
+    items: &ItemsConfig,
+    model_id: Option<&str>,
+    policy: LiveCalculation,
+) -> (Option<LiveView>, LiveTotalView) {
+    let now = Instant::now();
+    let processed = ticker.processed();
+    let (status, deltas, overlay, session_generation, message_generation, settled) =
+        with_engine(|engine| {
+            let live = engine.live.as_ref();
+            let status = live.map(|live| live.status(now)).unwrap_or_default();
+            let deltas = live
+                .map(|live| live.unprocessed_text(processed))
+                .unwrap_or_default();
+            (
+                status,
+                deltas,
+                engine.live_total_view(),
+                engine.live_total.session_generation(),
+                engine.live_total.message_generation(),
+                live.and_then(|live| live.settled_tokens()),
+            )
+        });
+    let Some(_measure) = items.live_enabled().then_some(()) else {
+        return (None, overlay);
+    };
+    // `estimate` never loads or runs BPE while streaming (R5.3.2); `auto`
+    // loads the family tokenizer only when a local number is needed.
+    let tokenizer = if policy == LiveCalculation::Auto && status.streaming {
+        tokens::tokenizer_for_model(model_id)
+    } else {
+        None
+    };
+    let requirements = TokenRequirements::for_items(items);
+    let full_text = || {
+        with_engine(|engine| {
+            engine
+                .live
+                .as_ref()
+                .map(|live| live.full_text())
+                .unwrap_or_default()
+        })
+    };
+    let view = ticker.live_view(
+        LiveFrameInput {
+            status: &status,
+            deltas,
+            session_generation,
+            message_generation,
+            policy,
+            requirements,
+            tokenizer,
+            settled,
+        },
+        full_text,
+    );
+    (Some(view), overlay)
+}
+
+fn build_field_data(
+    items: &ItemsConfig,
+    ctx: &CtxData,
+    ticker: Option<&mut LiveTicker>,
+) -> FieldData {
     let model = ctx.model.as_ref().and_then(|model| {
         let id = model.get("id").and_then(Value::as_str)?.to_owned();
         let name = model.get("name").and_then(Value::as_str).map(str::to_owned);
@@ -881,20 +1070,14 @@ fn build_field_data(items: &ItemsConfig, ctx: &CtxData) -> FieldData {
             .unwrap_or(0),
         percent: usage.get("percent").and_then(Value::as_f64),
     });
-    let now = Instant::now();
-    let (stats, pending_output, live_peek, git) = with_engine(|engine| {
-        (
-            engine.session_stats.snapshot().cloned(),
-            engine.pending_output(),
-            items
-                .live_enabled()
-                .then(|| engine.live_peek(now))
-                .flatten(),
-            engine.git.info().cloned(),
-        )
-    });
-    let model_id = model.as_ref().map(|model| model.id.as_str());
-    let live = live_peek.map(|peek| peek.into_view(model_id));
+    let stats = with_engine(|engine| engine.session_stats.snapshot().cloned());
+    let git = with_engine(|engine| engine.git.info().cloned());
+    let model_id = model.as_ref().map(|model| model.id.clone());
+    let policy = current_calculation_policy();
+    let (live, live_total) = match ticker {
+        Some(ticker) => items_live_view(ticker, items, model_id.as_deref(), policy),
+        None => (None, with_engine(|engine| engine.live_total_view())),
+    };
     let live_held = with_engine(|engine| engine.live_held_values());
     FieldData {
         cwd: Some(ctx.cwd.clone()).filter(|cwd| !cwd.is_empty()),
@@ -905,7 +1088,7 @@ fn build_field_data(items: &ItemsConfig, ctx: &CtxData) -> FieldData {
         context,
         session_name: ctx.session_name.clone(),
         stats,
-        pending_output,
+        live_total,
         live,
         live_held,
         git,
@@ -919,30 +1102,34 @@ fn build_field_data(items: &ItemsConfig, ctx: &CtxData) -> FieldData {
     }
 }
 
-/// Re-render from the cached data (duration tick / live tick / Git result):
-/// no host calls at all.
+/// Re-render from the cached data. The live tick (`ticker` given) rebuilds
+/// the live view from the deltas that arrived; the duration tick and Git
+/// results keep the cached live view and only refresh the overlay. No host
+/// calls at all.
 fn publish_items_from_cache(
     calls: &AsyncHostCalls,
     items: &ItemsConfig,
     data: Option<&mut FieldData>,
+    ticker: Option<&mut LiveTicker>,
 ) {
     let Some(data) = data else {
         return;
     };
-    let now = Instant::now();
-    let model_id = data.model.as_ref().map(|model| model.id.clone());
-    let (live_peek, pending_output, git) = with_engine(|engine| {
-        (
-            items
-                .live_enabled()
-                .then(|| engine.live_peek(now))
-                .flatten(),
-            engine.pending_output(),
-            engine.git.info().cloned(),
-        )
-    });
-    data.live = live_peek.map(|peek| peek.into_view(model_id.as_deref()));
-    data.pending_output = pending_output;
+    let git = with_engine(|engine| engine.git.info().cloned());
+    match ticker {
+        Some(ticker) => {
+            let model_id = data.model.as_ref().map(|model| model.id.clone());
+            let policy = current_calculation_policy();
+            let (live, overlay) = items_live_view(ticker, items, model_id.as_deref(), policy);
+            if live.is_some() {
+                data.live = live;
+            }
+            data.live_total = overlay;
+        }
+        None => {
+            data.live_total = with_engine(|engine| engine.live_total_view());
+        }
+    }
     data.live_held = with_engine(|engine| engine.live_held_values());
     data.git = git;
     data.now = Some(Utc::now());
@@ -1095,6 +1282,40 @@ fn restore_if_mounted(calls: &AsyncHostCalls) {
             );
         }
         None => {}
+    }
+}
+
+/// The process-global streaming counter (V19-07): written only by the refresh
+/// loop, read by tests/diagnostics through [`ticker_stats`]. A rebind
+/// restarts the loop on the same cell, so the counters survive a session
+/// switch like the engine state does.
+static TICKER: OnceLock<Mutex<LiveTicker>> = OnceLock::new();
+
+fn lock_ticker() -> std::sync::MutexGuard<'static, LiveTicker> {
+    TICKER
+        .get_or_init(|| Mutex::new(LiveTicker::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// Counters of the items streaming counter (CountReset / CountFallback /
+/// finalize mismatches) for diagnostics and the V19-07 fixtures.
+pub fn ticker_stats() -> crate::live_ticker::TickerStats {
+    TICKER
+        .get()
+        .map(|ticker| {
+            ticker
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .stats()
+        })
+        .unwrap_or_default()
+}
+
+/// Reset the streaming counter (test seam between scenarios).
+pub fn reset_ticker_for_test() {
+    if let Some(ticker) = TICKER.get() {
+        *ticker.lock().unwrap_or_else(|error| error.into_inner()) = LiveTicker::new();
     }
 }
 

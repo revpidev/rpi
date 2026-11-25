@@ -12,7 +12,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::config::{DEFAULT_LIVE_REFRESH_MS, LiveTokens, Placement};
+use crate::config::{DEFAULT_LIVE_REFRESH_MS, LiveCalculation, LiveTokens, Placement};
 use crate::fields::{FieldId, NumberFormat, valid_separator};
 
 /// Default `separator` (R20 §4.1).
@@ -78,6 +78,7 @@ impl Default for ItemsConfig {
             live_tokens: LiveTokens {
                 enabled: true,
                 refresh_ms: DEFAULT_LIVE_REFRESH_MS,
+                calculation: LiveCalculation::Auto,
             },
         }
     }
@@ -164,15 +165,23 @@ fn placement_name(placement: Placement) -> &'static str {
     }
 }
 
+/// Serialize `liveTokens`: `false` when off; `true` when on with the
+/// defaults; otherwise an object. `calculation` is written only when it is
+/// not `auto`, so an old install never gains a key it did not have (R5.1.2:
+/// no silent migration) and only the two legal enum values are ever saved.
 fn live_tokens_value(live: LiveTokens) -> Value {
     if !live.enabled {
         return json!(false);
     }
-    if live.refresh_ms == DEFAULT_LIVE_REFRESH_MS {
-        json!(true)
-    } else {
-        json!({"refreshMs": live.refresh_ms})
+    if live.refresh_ms == DEFAULT_LIVE_REFRESH_MS && live.calculation == LiveCalculation::Auto {
+        return json!(true);
     }
+    let mut object = Map::new();
+    object.insert("refreshMs".into(), json!(live.refresh_ms));
+    if live.calculation != LiveCalculation::Auto {
+        object.insert("calculation".into(), json!(live.calculation.as_str()));
+    }
+    Value::Object(object)
 }
 
 /// Parse a `statusLine` object of `type:"items"`.
@@ -431,6 +440,7 @@ mod tests {
             live_tokens: LiveTokens {
                 enabled: true,
                 refresh_ms: 500,
+                calculation: LiveCalculation::Auto,
             },
             ..ItemsConfig::default()
         };
@@ -446,5 +456,55 @@ mod tests {
         assert_eq!(object["useColors"], json!(true));
         assert_eq!(object["numberFormat"], json!("compact"));
         assert_eq!(object["liveTokens"], json!({"refreshMs": 500}));
+    }
+
+    /// V19-07 FR-A R1/R3: `calculation` parses strictly; only the legal enum
+    /// is written back, and `auto` keeps the legacy `true`/`{refreshMs}`
+    /// spellings so an old install never gains a key it did not have.
+    #[test]
+    fn calculation_parses_strictly_and_round_trips_only_the_legal_enum() {
+        for (value, expected) in [
+            (json!(true), LiveCalculation::Auto),
+            (json!({"refreshMs": 500}), LiveCalculation::Auto),
+            (json!({"calculation": "auto"}), LiveCalculation::Auto),
+            (
+                json!({"calculation": "estimate"}),
+                LiveCalculation::Estimate,
+            ),
+            (
+                json!({"refreshMs": 250, "calculation": "estimate"}),
+                LiveCalculation::Estimate,
+            ),
+            // Illegal/unknown values fall back to auto for this plugin's own
+            // policy (diagnosed once; the host's strict scope is separate).
+            (json!({"calculation": "fast"}), LiveCalculation::Auto),
+            (json!({"calculation": "AUTO"}), LiveCalculation::Auto),
+            (json!({"calculation": 1}), LiveCalculation::Auto),
+        ] {
+            let config = parse(
+                json!({"type": "items", "items": ["live-output-tokens"], "liveTokens": value.clone()}),
+            );
+            assert_eq!(config.live_tokens.calculation, expected, "{value}");
+        }
+        let estimate = ItemsConfig {
+            live_tokens: LiveTokens {
+                enabled: true,
+                refresh_ms: DEFAULT_LIVE_REFRESH_MS,
+                calculation: LiveCalculation::Estimate,
+            },
+            ..ItemsConfig::default()
+        };
+        let object = estimate.to_settings_object();
+        assert_eq!(
+            object["liveTokens"],
+            json!({"refreshMs": DEFAULT_LIVE_REFRESH_MS, "calculation": "estimate"})
+        );
+        // The round trip is stable and the default install stays `true`.
+        let reparsed = parse_items(&estimate.to_settings_object());
+        assert_eq!(reparsed.live_tokens, estimate.live_tokens);
+        assert_eq!(
+            ItemsConfig::default().to_settings_object()["liveTokens"],
+            json!(true)
+        );
     }
 }

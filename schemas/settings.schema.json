@@ -1319,8 +1319,25 @@
           "format": "uint64",
           "minimum": 0,
           "default": null
+        },
+        "calculation": {
+          "description": "Missing = `auto`; `estimate` shows the lightweight heuristic with `~` while streaming.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StatusLineLiveCalculation"
+            }
+          ],
+          "default": null
         }
       }
+    },
+    "StatusLineLiveCalculation": {
+      "description": "`statusLine.liveTokens.calculation` (ADR-0049 decision 6 / V19-07): the\nstreaming calculation policy. The host schema is a strict enum: an\nillegal value is a `statusLine` scope validation error (startup: empty\nsettings plus the error; reload: the previous in-memory settings stay),\nwhile the statusline plugin's own raw parser only falls its own policy\nback to `auto`. The two channels are deliberately not the same guarantee.",
+      "type": "string",
+      "enum": [
+        "auto",
+        "estimate"
+      ]
     },
     "StatusLineNumberFormat": {
       "type": "string",

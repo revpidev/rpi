@@ -4326,6 +4326,76 @@ mod tests {
         );
     }
 
+    /// V19-07 FR-A R2 (R5.1.3): the host typed `statusLine` scope rejects an
+    /// illegal `liveTokens.calculation`. At startup the scope is empty and the
+    /// error is recorded; on reload the previous in-memory host settings stay.
+    /// A missing `calculation` (and the legacy bool/object shapes) stay valid.
+    #[test]
+    fn test_status_line_calculation_scope_is_strict() {
+        let dirs = test_dirs();
+        // Legacy shapes and the two legal values load.
+        for live_tokens in [
+            json!(true),
+            json!({"refreshMs": 400}),
+            json!({"calculation": "auto"}),
+            json!({"calculation": "estimate"}),
+        ] {
+            write_json(
+                &global_path(&dirs),
+                json!({"theme": "dark", "statusLine": {"type": "items", "liveTokens": live_tokens}}),
+            );
+            let manager = create(&dirs);
+            assert!(
+                manager.global_settings_load_error.is_none(),
+                "{live_tokens}"
+            );
+            assert_eq!(manager.get_theme().as_deref(), Some("dark"));
+        }
+        // Startup with an illegal value: empty settings plus the error.
+        write_json(
+            &global_path(&dirs),
+            json!({"theme": "dark", "statusLine": {"type": "items", "liveTokens": {"calculation": "fast"}}}),
+        );
+        let mut manager = create(&dirs);
+        let error = manager
+            .global_settings_load_error
+            .as_ref()
+            .expect("illegal calculation fails the scope");
+        assert!(error.to_string().contains("statusLine"), "{error}");
+        assert_eq!(
+            manager.get_theme(),
+            None,
+            "startup failure leaves the scope empty"
+        );
+        assert!(
+            manager.drain_errors().iter().any(|issue| {
+                issue.scope == SettingsScope::Global
+                    && issue.error.to_string().contains("statusLine")
+            }),
+            "the startup error is reported"
+        );
+        // A valid file reloads cleanly, then an illegal value keeps the
+        // previous in-memory host settings.
+        write_json(
+            &global_path(&dirs),
+            json!({"theme": "light", "statusLine": {"type": "items", "liveTokens": {"calculation": "estimate"}}}),
+        );
+        manager.reload();
+        assert!(manager.global_settings_load_error.is_none());
+        assert_eq!(manager.get_theme().as_deref(), Some("light"));
+        write_json(
+            &global_path(&dirs),
+            json!({"theme": "solarized", "statusLine": {"type": "items", "liveTokens": {"calculation": "Auto"}}}),
+        );
+        manager.reload();
+        assert!(manager.global_settings_load_error.is_some());
+        assert_eq!(
+            manager.get_theme().as_deref(),
+            Some("light"),
+            "reload failure keeps the previous host settings"
+        );
+    }
+
     // =======================================================================
     // describe("externalEditor")
     // =======================================================================

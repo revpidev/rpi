@@ -34,14 +34,51 @@ pub const DEFAULT_LIVE_REFRESH_MS: u64 = 1000;
 pub const MIN_LIVE_REFRESH_MS: u64 = 300;
 pub const MAX_LIVE_REFRESH_MS: u64 = 5000;
 
-/// Parsed `statusLine.liveTokens` (bool | object). Both `enabled` and
-/// `refresh_ms` are re-read on every poll/tick: enabling or disabling the
-/// switch reconciles the streaming subscriptions dynamically (no restart),
-/// and `refresh_ms` applies immediately.
+/// `statusLine.liveTokens.calculation` (ADR-0049 decision 6 / V19-07 FR-A):
+/// the streaming calculation *policy*. A policy is not a data source —
+/// [`crate::tokens::TokenSource`] keeps recording where a number came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LiveCalculation {
+    /// The current algorithm: Provider exact total, else the incremental
+    /// bundled tokenizer, else the incremental Han/other heuristic (`~`).
+    #[default]
+    Auto,
+    /// Always the incremental heuristic while streaming (every total/tier/
+    /// rate value carries `~`, even when the provider already reports an
+    /// exact running total; zero BPE while streaming). The `message_end`
+    /// correction still switches to the authoritative exact value.
+    Estimate,
+}
+
+impl LiveCalculation {
+    /// The settings spelling (the only two legal values).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Estimate => "estimate",
+        }
+    }
+
+    /// Strict parse: `auto` | `estimate`, nothing else.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "estimate" => Some(Self::Estimate),
+            _ => None,
+        }
+    }
+}
+
+/// Parsed `statusLine.liveTokens` (bool | object). `enabled`, `refresh_ms`
+/// and `calculation` are re-read on every poll/tick: enabling or disabling
+/// the switch reconciles the streaming subscriptions dynamically (no
+/// restart), `refresh_ms` applies immediately, and a calculation change
+/// rebuilds the current message counter on the next refresh (R5.1.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveTokens {
     pub enabled: bool,
     pub refresh_ms: u64,
+    pub calculation: LiveCalculation,
 }
 
 impl Default for LiveTokens {
@@ -49,6 +86,7 @@ impl Default for LiveTokens {
         LiveTokens {
             enabled: false,
             refresh_ms: DEFAULT_LIVE_REFRESH_MS,
+            calculation: LiveCalculation::Auto,
         }
     }
 }
@@ -264,12 +302,50 @@ pub(crate) fn parse_live_tokens_with_default(
             if let Some(refresh) = object.get("refreshMs").and_then(Value::as_u64) {
                 live.refresh_ms = refresh.clamp(MIN_LIVE_REFRESH_MS, MAX_LIVE_REFRESH_MS);
             }
+            live.calculation = parse_calculation(object.get("calculation"));
         }
         _ => {
             live.enabled = default_enabled;
         }
     }
     live
+}
+/// `calculation`: missing or `"auto"`/`"estimate"` parse strictly; any other
+/// value falls back to `Auto` for THIS plugin's own policy and is diagnosed
+/// once per distinct value (R5.1.3). The fallback says nothing about the
+/// rest of the file: the host validates the whole `statusLine` scope with a
+/// strict enum on its own channel.
+fn parse_calculation(value: Option<&Value>) -> LiveCalculation {
+    match value {
+        None => LiveCalculation::Auto,
+        Some(Value::String(text)) => match LiveCalculation::parse(text) {
+            Some(calculation) => calculation,
+            None => {
+                diagnose_unknown_calculation(text);
+                LiveCalculation::Auto
+            }
+        },
+        Some(other) => {
+            diagnose_unknown_calculation(&other.to_string());
+            LiveCalculation::Auto
+        }
+    }
+}
+
+/// One diagnostic per distinct illegal `calculation` value per process (the
+/// config is re-read every tick).
+fn diagnose_unknown_calculation(raw: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut seen = seen.lock().unwrap_or_else(|error| error.into_inner());
+    if seen.insert(raw.to_owned()) {
+        tracing::warn!(
+            value = raw,
+            "rpi-statusline: unknown statusLine.liveTokens.calculation value; using auto"
+        );
+    }
 }
 
 /// Load-time subscription evaluation for COMMAND mode (§1.5 启用时机注记):
@@ -377,6 +453,7 @@ mod tests {
             LiveTokens {
                 enabled: true,
                 refresh_ms: DEFAULT_LIVE_REFRESH_MS,
+                calculation: LiveCalculation::Auto,
             }
         );
         assert_eq!(
@@ -384,6 +461,7 @@ mod tests {
             LiveTokens {
                 enabled: true,
                 refresh_ms: 500,
+                calculation: LiveCalculation::Auto,
             }
         );
         assert_eq!(
@@ -403,8 +481,69 @@ mod tests {
             LiveTokens {
                 enabled: true,
                 refresh_ms: DEFAULT_LIVE_REFRESH_MS,
+                calculation: LiveCalculation::Auto,
             }
         );
+    }
+
+    /// V19-07 FR-A R1: the legacy bool form, the `refreshMs`-only object and
+    /// a missing `calculation` are all `auto`; the object form enables the
+    /// switch; no `enabled` alias exists; the object keeps `calculation` for
+    /// both modes (command/items share the policy).
+    #[test]
+    fn calculation_defaults_to_auto_for_every_legacy_shape() {
+        for value in [
+            Some(json!(true)),
+            Some(json!({"refreshMs": 800})),
+            Some(json!({"calculation": "auto"})),
+        ] {
+            let live = parse_live_tokens(value.as_ref());
+            assert!(live.enabled, "{value:?}");
+            assert_eq!(live.calculation, LiveCalculation::Auto, "{value:?}");
+        }
+        // Missing key: command mode's own default (off) with the auto policy;
+        // items mode's default (on) with the same policy.
+        let missing = parse_live_tokens(None);
+        assert!(!missing.enabled);
+        assert_eq!(missing.calculation, LiveCalculation::Auto);
+        assert_eq!(
+            parse_live_tokens_with_default(None, true),
+            LiveTokens {
+                enabled: true,
+                refresh_ms: DEFAULT_LIVE_REFRESH_MS,
+                calculation: LiveCalculation::Auto,
+            }
+        );
+        assert_eq!(
+            parse_live_tokens(Some(&json!({"calculation": "estimate"}))).calculation,
+            LiveCalculation::Estimate
+        );
+        // `false` stays off (and still auto).
+        let off = parse_live_tokens(Some(&json!(false)));
+        assert!(!off.enabled);
+        assert_eq!(off.calculation, LiveCalculation::Auto);
+        // No `enabled` alias: an object with it is still just "on".
+        assert!(parse_live_tokens(Some(&json!({"enabled": false}))).enabled);
+        // Command mode reads the same policy as items mode.
+        let command = command(json!({
+            "type": "command", "command": "x",
+            "liveTokens": {"refreshMs": 700, "calculation": "estimate"}
+        }));
+        assert_eq!(command.live_tokens.calculation, LiveCalculation::Estimate);
+        assert_eq!(command.live_tokens.refresh_ms, 700);
+        let items = parse(json!({
+            "type": "items", "items": ["live-output-tokens"],
+            "liveTokens": {"calculation": "estimate"}
+        }))
+        .expect("items");
+        assert_eq!(items.live_tokens().calculation, LiveCalculation::Estimate);
+        assert_eq!(LiveCalculation::default(), LiveCalculation::Auto);
+        assert_eq!(LiveCalculation::Estimate.as_str(), "estimate");
+        assert_eq!(
+            LiveCalculation::parse("estimate"),
+            Some(LiveCalculation::Estimate)
+        );
+        assert_eq!(LiveCalculation::parse("Auto"), None);
     }
 
     #[test]
