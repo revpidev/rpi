@@ -312,6 +312,11 @@ impl LiveTicker {
         } else if let Some(exact) = self.exact.as_mut() {
             for (tier, delta) in deltas.iter().enumerate() {
                 exact.counter.push(tier, delta);
+                // The base advances with every byte fed to the counter: the
+                // next tick's deltas start where this one ended (a stale base
+                // re-fed everything since the rebuild on every tick — V19-07
+                // review round 3).
+                self.processed[tier] += delta.len();
             }
             if exact.counter.fallback().is_some() && !exact.reported_fallback {
                 exact.reported_fallback = true;
@@ -481,6 +486,81 @@ mod tests {
     fn requirements(items: Value) -> TokenRequirements {
         let config = parse_items(items.as_object().expect("object"));
         TokenRequirements::for_items(&config)
+    }
+
+    /// Counting-benchmark leg through the ticker protocol (the way the
+    /// items live tick feeds the counter): one provisional per tick, BPE piece
+    /// evaluations counted by the tokenizer. `--ignored --release --nocapture`.
+    #[test]
+    #[ignore = "counting benchmark leg; run explicitly with --ignored --nocapture"]
+    fn v19_counting_bench_ticker_protocol_leg() {
+        let text: String = "The assistant explains: 这是一个较长的回答 with **Markdown**, `code`, \
+\"json\": {\"a\": [1, 2, 3]}\n\n- list item 1\n- item 2\n"
+            .repeat(60);
+        for model in ["glm-5.3", "kimi-k3.1-pro", "deepseek-chat"] {
+            let tokenizer = tokenizer_for_model(Some(model)).expect("bundled family");
+            let loader = move || tokenizer_for_model(Some(model));
+            let config = parse_items(
+                json!({"type": "items", "items": ["live-output-tokens"]})
+                    .as_object()
+                    .expect("object"),
+            );
+            let req = TokenRequirements::for_items(&config);
+            let mut ticker = LiveTicker::new();
+            let mut fed = String::new();
+            let mut rest = text.as_str();
+            tokens::reset_bpe_calls();
+            let started = std::time::Instant::now();
+            let mut ticks = 0u64;
+            while !rest.is_empty() {
+                let mut end = rest.len().min(24);
+                while !rest.is_char_boundary(end) {
+                    end += 1;
+                }
+                for _ in 0..4 {
+                    fed.push_str(&rest[..end.min(rest.len())]);
+                    let base = ticker.processed_for(1, 1);
+                    let deltas = [fed[base[0]..].to_owned(), String::new(), String::new()];
+                    let status = LiveStatus {
+                        streaming: true,
+                        ..LiveStatus::default()
+                    };
+                    let full = [fed.clone(), String::new(), String::new()];
+                    let _ = ticker.live_view(
+                        LiveFrameInput {
+                            status: &status,
+                            deltas,
+                            session_generation: 1,
+                            message_generation: 1,
+                            policy: LiveCalculation::Auto,
+                            requirements: req,
+                            tokenizer: &loader,
+                            settled: None,
+                        },
+                        || full.clone(),
+                    );
+                    ticks += 1;
+                    rest = &rest[end.min(rest.len())..];
+                    if rest.is_empty() {
+                        break;
+                    }
+                    end = rest.len().min(24);
+                    while !rest.is_char_boundary(end) {
+                        end += 1;
+                    }
+                }
+            }
+            let elapsed = started.elapsed();
+            let official = tokenizer.count(&text);
+            let finalized = ticker.finalize_exact(Some(official), 1);
+            let calls = tokens::bpe_calls();
+            println!(
+                "{model:<16} ticker protocol: {ticks} ticks, BPE piece evals {calls}, CPU {elapsed:?}, finalize {finalized:?} vs official {official}, mismatches {}",
+                ticker.stats().finalize_mismatches
+            );
+            assert_eq!(finalized, Some(official));
+            assert_eq!(ticker.stats().finalize_mismatches, 0);
+        }
     }
 
     #[test]
@@ -827,6 +907,84 @@ mod tests {
             [0, 0, 0],
             "the old session is gone"
         );
+    }
+
+    /// V19-07 review round 3 (P1): with the exact counter present, three
+    /// ticks under the caller's base/deltas protocol of `items_live_view`
+    /// (each tick feeds `text[base..]`) — every frame equals the official
+    /// count of the text so far, the base tracks the text length, and no
+    /// finalize disagreement is reported. The counter used to leave the
+    /// base at the rebuild length, re-feeding everything since then on every
+    /// tick (frames 4 → 16 → 49 for an official 15).
+    #[test]
+    fn three_ticks_with_the_exact_counter_feed_each_byte_once() {
+        let tokenizer = tokenizer_for_model(Some("glm-5.3")).expect("glm");
+        let loader = || Some(Arc::clone(&tokenizer));
+        let config = parse_items(
+            json!({"type": "items", "items": ["live-output-tokens"]})
+                .as_object()
+                .expect("object"),
+        );
+        let req = TokenRequirements::for_items(&config);
+        let mut ticker = LiveTicker::new();
+        let mut text = String::new();
+        for piece in [
+            "The quick brown",
+            " fox jumps over",
+            " the lazy dog. 你好世界",
+        ] {
+            text.push_str(piece);
+            let base = ticker.processed_for(1, 1);
+            let deltas = [text[base[0]..].to_owned(), String::new(), String::new()];
+            let status = LiveStatus {
+                streaming: true,
+                ..LiveStatus::default()
+            };
+            let full = [text.clone(), String::new(), String::new()];
+            let view = ticker.live_view(
+                LiveFrameInput {
+                    status: &status,
+                    deltas,
+                    session_generation: 1,
+                    message_generation: 1,
+                    policy: LiveCalculation::Auto,
+                    requirements: req,
+                    tokenizer: &loader,
+                    settled: None,
+                },
+                || full.clone(),
+            );
+            let official = tokenizer.count(&text);
+            assert_eq!(
+                view.tokens.expect("tokens").total,
+                official,
+                "after {piece:?}"
+            );
+            assert_eq!(ticker.processed_for(1, 1), [text.len(), 0, 0]);
+        }
+        // An idle tick (no new bytes) changes nothing.
+        let status = LiveStatus {
+            streaming: true,
+            ..LiveStatus::default()
+        };
+        let full = [text.clone(), String::new(), String::new()];
+        let view = ticker.live_view(
+            LiveFrameInput {
+                status: &status,
+                deltas: [String::new(), String::new(), String::new()],
+                session_generation: 1,
+                message_generation: 1,
+                policy: LiveCalculation::Auto,
+                requirements: req,
+                tokenizer: &loader,
+                settled: None,
+            },
+            || full.clone(),
+        );
+        let official = tokenizer.count(&text);
+        assert_eq!(view.tokens.expect("tokens").total, official);
+        assert_eq!(ticker.finalize_exact(Some(official), 1), Some(official));
+        assert_eq!(ticker.stats().finalize_mismatches, 0);
     }
 
     /// V19-07 review round 2: when the provider starts reporting a running

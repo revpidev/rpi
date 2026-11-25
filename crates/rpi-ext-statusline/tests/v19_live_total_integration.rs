@@ -758,6 +758,37 @@ fn v19_live_total_policies_probe_and_switches() {
     );
     end_message(None, None);
     let _ = next_frame(frames(), "new session settled");
+
+    // ── J. Round-3 review: auto + bundled GLM + no provider running total,
+    //        three deltas each landing in its own refresh tick — every
+    //        streaming frame's local exact count equals the official count
+    //        of the text so far (the base used to stay at the rebuild length
+    //        and re-feed everything since then on every tick: 4 → 16 → 49
+    //        for an official 15). Back to `auto` first (scenario H left the
+    //        policy on `estimate`, whose frames are the heuristic by design).
+    write_status_line(items(json!({"refreshMs": 300})));
+    std::thread::sleep(Duration::from_millis(1200));
+    let pieces = [
+        "The quick brown fox",
+        " jumps over the lazy",
+        " dog. 你好世界，再见",
+    ];
+    let mut text = String::new();
+    start_message();
+    for piece in pieces {
+        text.push_str(piece);
+        delta(piece, None);
+        std::thread::sleep(Duration::from_millis(750));
+        let (_, local) = numbers(&last_status(&current_records()));
+        let official = rpi_ext_statusline::tokens::load_family_for_memory_report("glm-5.3", &text)
+            .map(|(count, _)| count)
+            .expect("glm count");
+        assert_eq!(local, official, "streaming exact after {piece:?}");
+    }
+    assert_eq!(rpi_ext_statusline::ticker_stats().finalize_mismatches, 0);
+    end_message(None, None);
+    let _ = next_frame(frames(), "three-tick message settled");
+    assert_eq!(rpi_ext_statusline::ticker_stats().finalize_mismatches, 0);
     let _ = std::fs::remove_dir_all(agent_dir());
 }
 
