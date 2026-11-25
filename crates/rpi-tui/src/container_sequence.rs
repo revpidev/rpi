@@ -645,7 +645,10 @@ impl SequenceState {
             Slot::Opaque(slot) => SegmentKey::Opaque {
                 identity: slot.identity,
                 revision: slot.revision,
-                frame: if slot.identity.is_some() {
+                // Only a fully trusted block (id and revision) has stable
+                // lines between syncs; anything without the revision half
+                // is re-rendered every frame and must refresh its segment.
+                frame: if slot.identity.is_some() && slot.revision.is_some() {
                     0
                 } else {
                     self.frame

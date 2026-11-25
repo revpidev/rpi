@@ -1195,3 +1195,69 @@ fn search_corpus_survives_a_double_sync_frame_and_is_released_after_two_idle_syn
         assert_eq!(document.stats().corpus_rebuilds, 2);
     });
 }
+
+/// An identity-only block whose content the test can change between frames.
+struct MutableIdentityOnlyBlock {
+    renders: Arc<AtomicU64>,
+    id: u64,
+    lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl Component for MutableIdentityOnlyBlock {
+    fn render(&self, _width: usize) -> Vec<String> {
+        self.renders.fetch_add(1, Ordering::Relaxed);
+        lock(&self.lines).clone()
+    }
+    fn cache_instance_id(&self) -> Option<u64> {
+        Some(self.id)
+    }
+}
+
+#[test]
+fn search_corpus_follows_the_latest_render_of_an_identity_only_block() {
+    // Round-2 review finding: the corpus segment of an untrusted block that
+    // exposes an instance id must not be reused across frames, or an open
+    // search keeps matching the block's first render.
+    let container = Arc::new(Mutex::new(Container::new()));
+    let renders = Arc::new(AtomicU64::new(0));
+    let lines = Arc::new(Mutex::new(vec!["alpha one".to_string()]));
+    lock(&container)
+        .children
+        .push(Box::new(MutableIdentityOnlyBlock {
+            renders: Arc::clone(&renders),
+            id: next_cache_instance_id(),
+            lines: Arc::clone(&lines),
+        }));
+    let fx = Fixture {
+        container: Arc::clone(&container),
+        trusted: Vec::new(),
+        untrusted_renders: Vec::new(),
+    };
+    let (_, virtual_) = pair(&fx, ScrollbarMode::Hidden, Follow::End);
+    let mut cache = LayoutRenderCache::new();
+    let child = child_of(
+        frame(&virtual_, 20, 4, &mut cache)
+            .primary_scroll_view
+            .as_ref()
+            .expect("primary"),
+    );
+    let corpus = |width: usize| {
+        with_transcript(&child, |document| {
+            document
+                .materialize(width)
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .expect("document")
+    };
+    assert_eq!(corpus(20), vec!["alpha one".to_string()]);
+    // The block changes: the next sync re-renders it (untrusted), and both
+    // the visible rows and the search corpus must show the new content.
+    *lock(&lines) = vec!["beta two".to_string()];
+    let next = frame(&virtual_, 20, 4, &mut cache);
+    assert!(visible(&next.lines)[0].starts_with("beta two"));
+    assert_eq!(corpus(20), vec!["beta two".to_string()]);
+    assert!(corpus(20).iter().all(|line| !line.contains("alpha")));
+    assert!(renders.load(Ordering::Relaxed) >= 2);
+}
