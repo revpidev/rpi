@@ -676,21 +676,21 @@ fn parse_asset(compressed: &[u8]) -> Result<Tokenizer, String> {
     let mut engine = match engine_kind {
         0 => {
             let rank_count = reader.u32()? as usize;
+            // Merge ranks come in priority order, not key order: append every
+            // pair, then sort once (a sorted middle insert per pair is
+            // quadratic — seconds of cold load per family).
             let mut pairs = SortedPairs::with_capacity(rank_count);
             let mut results = Vec::with_capacity(rank_count);
             for rank in 0..rank_count {
                 let left = reader.u32()?;
                 let right = reader.u32()?;
                 let result = reader.u32()?;
-                if pairs
-                    .insert_sorted(pair_key(left, right), rank as u32)
-                    .is_err()
-                {
-                    return Err(format!("duplicate merge pair at rank {rank}"));
-                }
+                pairs.push(pair_key(left, right), rank as u32);
                 results.push(result);
             }
-            pairs.shrink();
+            pairs
+                .finish()
+                .map_err(|error| format!("{error} (rank table of {rank_count} pairs)"))?;
             Engine::Hf(HfBpe {
                 pairs,
                 results,
@@ -1220,6 +1220,33 @@ mod tests {
         #[serde(rename = "formatVersion")]
         format_version: u32,
         families: Vec<ManifestFamily>,
+    }
+
+    /// Cold load (+ first count) of every bundled family, one at a time
+    /// with the previous family released — `--ignored --nocapture`. The
+    /// merge table is built by append + one sort; V19-07 review round 2
+    /// caught a quadratic middle-insert fallback here (0.6–3.8 s per family
+    /// instead of ~20–50 ms).
+    #[test]
+    #[ignore = "cold-load timing report; run explicitly with --ignored --nocapture"]
+    fn cold_load_report() {
+        let sample = "The quick brown fox jumps over the lazy dog. 中文测试 with numbers 0123456789 and <|im_start|> special tokens.\n";
+        for builtin in BUILTINS {
+            let model_id = match builtin.id {
+                "hunyuan" => "hy3-preview",
+                other => other,
+            };
+            release_tokenizer_cache();
+            let started = std::time::Instant::now();
+            let breakdown = count_breakdown(Some(model_id), sample, "", "");
+            let elapsed = started.elapsed();
+            println!(
+                "{:<10} cold load + first count {elapsed:>10.3?} (count {})",
+                builtin.id, breakdown.total
+            );
+            assert!(breakdown.total > 0);
+        }
+        release_tokenizer_cache();
     }
 
     #[test]

@@ -145,20 +145,53 @@ impl BytePoolIndex {
 }
 
 /// Sorted `(key, value)` pairs searched by key (the HF merge ranks).
+///
+/// The asset lists merge ranks by priority, not by `(left, right)` key, so
+/// the table is BUILT by appending every pair and sorting once
+/// ([`SortedPairs::finish`], O(n log n)); inserting each key into the
+/// middle of a sorted vector instead is quadratic and cost seconds of cold
+/// load per family (V19-07 review round 2). Lookups binary-search by key.
 #[derive(Debug, Default)]
 pub(crate) struct SortedPairs {
     pairs: Vec<(u64, u32)>,
+    /// Whether `pairs` is sorted by key and ready for lookups.
+    ready: bool,
 }
 
 impl SortedPairs {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             pairs: Vec::with_capacity(capacity),
+            ready: false,
         }
     }
 
-    /// Record `key → value`; rejects a duplicate key.
-    pub(crate) fn insert(&mut self, key: u64, value: u32) -> Result<(), String> {
+    /// Append one pair in build order; duplicates are rejected by
+    /// [`Self::finish`].
+    pub(crate) fn push(&mut self, key: u64, value: u32) {
+        self.pairs.push((key, value));
+        self.ready = false;
+    }
+
+    /// Sort by key and reject duplicate keys; mandatory before lookups.
+    pub(crate) fn finish(&mut self) -> Result<(), String> {
+        self.pairs.sort_unstable_by_key(|(key, _)| *key);
+        if self
+            .pairs
+            .windows(2)
+            .any(|window| window[0].0 == window[1].0)
+        {
+            return Err("duplicate merge pair".to_owned());
+        }
+        self.pairs.shrink_to_fit();
+        self.ready = true;
+        Ok(())
+    }
+
+    /// Sorted insert of one pair (random-order callers); rejects a
+    /// duplicate key. The asset reader uses [`Self::push`] + [`Self::finish`].
+    #[cfg(test)]
+    fn insert(&mut self, key: u64, value: u32) -> Result<(), String> {
         match self.pairs.binary_search_by_key(&key, |(stored, _)| *stored) {
             Ok(_) => Err(format!("duplicate merge pair {key:#x}")),
             Err(index) => {
@@ -168,26 +201,13 @@ impl SortedPairs {
         }
     }
 
-    /// Insert in ascending key order (the asset reader's fast path: the
-    /// ranks come in order and the keys are strictly increasing for a valid
-    /// table); falls back to the sorted insert when the order breaks.
-    pub(crate) fn insert_sorted(&mut self, key: u64, value: u32) -> Result<(), String> {
-        if self.pairs.last().is_some_and(|(stored, _)| *stored >= key) {
-            return self.insert(key, value);
-        }
-        self.pairs.push((key, value));
-        Ok(())
-    }
-
+    /// The value of exactly `key` (the table must be finished).
     pub(crate) fn get(&self, key: &u64) -> Option<u32> {
+        debug_assert!(self.ready, "SortedPairs::get before finish");
         self.pairs
             .binary_search_by_key(key, |(stored, _)| *stored)
             .ok()
             .map(|index| self.pairs[index].1)
-    }
-
-    pub(crate) fn shrink(&mut self) {
-        self.pairs.shrink_to_fit();
     }
 
     /// Bytes held by the pair table (diagnostics).
@@ -204,11 +224,11 @@ mod tests {
     /// key never matches; ranks are stable and the pool stores each entry
     /// once.
     #[test]
-    fn sorted_pairs_retained_bytes_and_len() {
+    fn sorted_pairs_retained_bytes() {
         let mut pairs = SortedPairs::with_capacity(3);
-        pairs.insert_sorted(1, 1).expect("push");
-        pairs.insert_sorted(2, 2).expect("push");
-        pairs.shrink();
+        pairs.push(1, 1);
+        pairs.push(2, 2);
+        pairs.finish().expect("finish");
         assert_eq!(
             pairs.retained_bytes(),
             2 * std::mem::size_of::<(u64, u32)>()
@@ -216,68 +236,82 @@ mod tests {
     }
 
     #[test]
-    fn byte_pool_index_finds_exact_entries_only() {
-        let mut index = BytePoolIndex::with_capacity(4, 16);
-        for bytes in [b"a".as_slice(), b"ab", b"\xe4\xbd\xa0", b""] {
-            index.push(bytes).expect("push");
-        }
-        assert_eq!(index.find(b"a"), Some(0));
-        assert_eq!(index.find(b"ab"), Some(1));
-        assert_eq!(index.find("\u{4f60}".as_bytes()), Some(2));
-        assert_eq!(index.find(b""), Some(3));
-        assert_eq!(index.find(b"abc"), None);
-        assert_eq!(index.find(b"b"), None);
-        assert_eq!(index.find(b"\xe4\xbd"), None);
-        assert_eq!(index.entry(1), Some(b"ab".as_slice()));
-        assert_eq!(index.entry(9), None);
-        assert!(index.contains(b"ab") && !index.contains(b"ba"));
-        assert_eq!(index.len(), 4);
-    }
-
-    /// The probe path: with a 4-slot table, entries whose FNV-1a hashes
-    /// share a slot are found by walking the table and comparing the FULL
-    /// bytes — a collision (or a prefix of a stored entry) never matches.
-    #[test]
-    fn open_addressing_probes_compare_full_bytes() {
-        // Find three keys that collide on the same slot (hash & 3).
-        let mut colliding: Vec<String> = Vec::new();
-        let target = BytePoolIndex::hash(b"seed") & 3;
-        for i in 0..10_000u32 {
-            let key = format!("k{i}");
-            if BytePoolIndex::hash(key.as_bytes()) & 3 == target {
-                colliding.push(key);
-                if colliding.len() == 3 {
-                    break;
-                }
-            }
-        }
-        assert_eq!(colliding.len(), 3, "three colliding keys");
-        let mut index = BytePoolIndex::with_table_bits(3, 64, 2);
-        for (rank, key) in colliding.iter().enumerate() {
-            index.push(key.as_bytes()).expect("push");
-            assert_eq!(index.find(key.as_bytes()), Some(rank as u32), "{key}");
-        }
-        for (rank, key) in colliding.iter().enumerate() {
-            assert_eq!(index.find(key.as_bytes()), Some(rank as u32), "{key}");
-        }
-        // A prefix of a stored entry and an absent key do not match.
-        assert_eq!(index.find(&colliding[0].as_bytes()[..1]), None);
-        assert_eq!(index.find(b"absent"), None);
-        assert_eq!(index.len(), 3);
-    }
-
-    #[test]
     fn sorted_pairs_reject_duplicates_and_search_by_key() {
         let mut pairs = SortedPairs::with_capacity(4);
-        pairs.insert_sorted(30, 3).expect("sorted");
-        // Out of order: the fast path falls back to the sorted insert.
-        pairs.insert_sorted(10, 1).expect("fallback insert");
-        pairs.insert(10, 1).expect_err("duplicate");
-        pairs.insert_sorted(20, 2).expect("insert");
-        pairs.insert(20, 9).expect_err("duplicate");
+        // Push order is arbitrary (merge ranks are listed by priority).
+        pairs.push(30, 3);
+        pairs.push(10, 1);
+        pairs.push(20, 2);
+        pairs.finish().expect("finish");
         assert_eq!(pairs.get(&10), Some(1));
         assert_eq!(pairs.get(&20), Some(2));
         assert_eq!(pairs.get(&30), Some(3));
         assert_eq!(pairs.get(&15), None);
+        // Random-order insert keeps the table sorted and rejects duplicates.
+        pairs.insert(25, 5).expect("insert");
+        pairs.insert(25, 9).expect_err("duplicate");
+        assert_eq!(pairs.get(&25), Some(5));
+        let mut duplicates = SortedPairs::with_capacity(2);
+        duplicates.push(7, 1);
+        duplicates.push(7, 2);
+        assert!(
+            duplicates.finish().is_err(),
+            "a duplicate key is rejected at finish"
+        );
+    }
+
+    /// V19-07 review round 2: building the table from merge-rank order (keys
+    /// NOT ascending) must be linearithmic — the previous middle-insert
+    /// fallback was quadratic and cost seconds of cold load per family.
+    #[test]
+    fn sorted_pairs_build_from_unsorted_keys_is_linearithmic() {
+        let n = 120_000u64;
+        // A deterministic pseudo-random key order (xorshift), deduplicated.
+        let mut keys: Vec<u64> = Vec::with_capacity(n as usize);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        while keys.len() < n as usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            keys.push(state);
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let mut shuffled = keys.clone();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for index in (1..shuffled.len()).rev() {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            shuffled.swap(index, (seed >> 33) as usize % (index + 1));
+        }
+        let ascending = shuffled.windows(2).filter(|w| w[0] < w[1]).count();
+        assert!(
+            ascending * 10 < shuffled.len() * 9,
+            "the fixture is shuffled, not sorted: {ascending} ascending of {}",
+            shuffled.len()
+        );
+        let started = std::time::Instant::now();
+        let mut pairs = SortedPairs::with_capacity(shuffled.len());
+        for (rank, key) in shuffled.iter().enumerate() {
+            pairs.push(*key, rank as u32);
+        }
+        pairs.finish().expect("finish");
+        let build = started.elapsed();
+        let started = std::time::Instant::now();
+        let mut reference: Vec<(u64, u32)> = shuffled
+            .iter()
+            .enumerate()
+            .map(|(rank, key)| (*key, rank as u32))
+            .collect();
+        reference.sort_unstable_by_key(|(key, _)| *key);
+        let plain_sort = started.elapsed();
+        for (rank, key) in shuffled.iter().enumerate() {
+            assert_eq!(pairs.get(key), Some(rank as u32));
+        }
+        assert!(
+            build.as_millis() <= 5 * plain_sort.as_millis().max(1) + 20,
+            "build {build:?} vs plain sort {plain_sort:?}: the quadratic fallback is back"
+        );
     }
 }

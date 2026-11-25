@@ -721,6 +721,43 @@ fn v19_live_total_policies_probe_and_switches() {
     );
     end_message(None, None);
     let _ = next_frame(frames(), "third estimate message settled");
+
+    // ── I. Review round 2: the delta base is keyed by the session
+    //        generation too. After `/new` the message counter restarts, so
+    //        the new session's first message (same message number as the old
+    //        session's) must count from byte 0.
+    rpi_ext_statusline::reset_ticker_for_test();
+    trigger("session_start");
+    start_message();
+    let previous = "the only message of the previous session";
+    delta(previous, None);
+    let frame = poll_until("previous session frame", |records| {
+        last_status(records).starts_with('~') && last_status(records).contains(" tok/s")
+    });
+    let (_, tokens) = numbers(&last_status(&frame));
+    assert_eq!(tokens, heuristic(previous), "{}", last_status(&frame));
+    end_message(None, None);
+    let settled = next_frame(frames(), "previous session settled");
+    let _ = settled;
+    let fresh = "brand new session, first message, with a much longer body than the previous one";
+    let before = frames();
+    trigger("session_start");
+    start_message();
+    delta(fresh, None);
+    let frame = poll_until("new session first frame", |records| {
+        status_texts(records).len() > before
+            && last_status(records).starts_with('~')
+            && last_status(records).contains(" tok/s")
+    });
+    let (_, tokens) = numbers(&last_status(&frame));
+    assert_eq!(
+        tokens,
+        heuristic(fresh),
+        "the first message after /new counts from byte 0: {}",
+        last_status(&frame)
+    );
+    end_message(None, None);
+    let _ = next_frame(frames(), "new session settled");
     let _ = std::fs::remove_dir_all(agent_dir());
 }
 

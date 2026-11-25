@@ -156,11 +156,19 @@ impl LiveTicker {
     }
 
     /// The byte base for [`LiveMeasure::unprocessed_text`] when the frame
-    /// describes `message_generation`: the bytes already fed when it is the
-    /// message this ticker counted, zero for a message it has not seen (the
-    /// deltas of a new message start from its first byte).
-    pub fn processed_for(&self, message_generation: u64) -> [usize; TIERS] {
-        if message_generation == self.message_generation {
+    /// describes `(session_generation, message_generation)`: the bytes
+    /// already fed when it is the message of the session this ticker
+    /// counted, zero otherwise (the deltas of a new message — or of the first
+    /// message after `/new`, whose message counter restarts — start from
+    /// their first byte).
+    pub fn processed_for(
+        &self,
+        session_generation: u64,
+        message_generation: u64,
+    ) -> [usize; TIERS] {
+        if session_generation == self.session_generation
+            && message_generation == self.message_generation
+        {
             self.processed
         } else {
             [0; TIERS]
@@ -283,30 +291,36 @@ impl LiveTicker {
         }
         // The exact counter runs only under `auto`, only when a local number
         // is needed and the provider total does not suffice — the tokenizer
-        // is loaded exactly then (and never for `estimate`).
-        if policy == LiveCalculation::Auto && local_needed && !provider_suffices {
-            if self.exact.is_none()
-                && let Some(loaded) = tokenizer()
-            {
+        // is loaded exactly then (and never for `estimate`). A counter that
+        // is no longer needed (the provider started reporting mid-message,
+        // or the tier rows were deselected) is DROPPED rather than starved:
+        // a starved counter would disagree with the official pass at
+        // message_end; without a counter no comparison is owed and the
+        // official pass settles the message if the provider reports nothing.
+        let need_exact = policy == LiveCalculation::Auto && local_needed && !provider_suffices;
+        if !need_exact {
+            self.drop_exact();
+        } else if self.exact.is_none() {
+            if let Some(loaded) = tokenizer() {
                 // First local number of this message, or the family tokenizer
-                // just became needed: one rebuild pass over the message so
-                // far (the deltas of this tick are already in it).
+                // just became needed again: one rebuild pass over the message
+                // so far (the deltas of this tick are already in it).
                 let text = full_text();
                 self.rebuild_exact(&text, Some(loaded));
                 self.processed = [text[0].len(), text[1].len(), text[2].len()];
-            } else if let Some(exact) = self.exact.as_mut() {
-                for (tier, delta) in deltas.iter().enumerate() {
-                    exact.counter.push(tier, delta);
-                }
-                if exact.counter.fallback().is_some() && !exact.reported_fallback {
-                    exact.reported_fallback = true;
-                    self.stats.count_fallbacks += 1;
-                }
+            }
+        } else if let Some(exact) = self.exact.as_mut() {
+            for (tier, delta) in deltas.iter().enumerate() {
+                exact.counter.push(tier, delta);
+            }
+            if exact.counter.fallback().is_some() && !exact.reported_fallback {
+                exact.reported_fallback = true;
+                self.stats.count_fallbacks += 1;
             }
         }
         if self.exact.is_none() {
-            for (tier, delta) in deltas.iter().enumerate() {
-                self.processed[tier] += delta.len();
+            for (index, delta) in deltas.iter().enumerate() {
+                self.processed[index] += delta.len();
             }
         }
         for delta in deltas.iter() {
@@ -607,7 +621,7 @@ mod tests {
             ),
             || [String::new(), String::new(), String::new()],
         );
-        assert_eq!(ticker.processed_for(1), [9, 0, 0]);
+        assert_eq!(ticker.processed_for(1, 1), [9, 0, 0]);
         let view = ticker.live_view(
             frame(
                 &status,
@@ -626,7 +640,7 @@ mod tests {
         // Message 2 starts: the base for its generation is zero, so the
         // caller hands the whole new text so far.
         assert_eq!(
-            ticker.processed_for(2),
+            ticker.processed_for(1, 2),
             [0, 0, 0],
             "a new message starts from byte 0"
         );
@@ -641,7 +655,7 @@ mod tests {
             ),
             || [String::new(), String::new(), String::new()],
         );
-        assert_eq!(ticker.processed_for(2), [20, 0, 0]);
+        assert_eq!(ticker.processed_for(1, 2), [20, 0, 0]);
         let view = ticker.live_view(
             frame(
                 &status,
@@ -756,6 +770,148 @@ mod tests {
             || [String::new(), String::new(), String::new()],
         );
         assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(ticker.stats().finalize_mismatches, 0);
+    }
+
+    /// V19-07 review round 2: the delta base is keyed by the SESSION
+    /// generation too — `/new` restarts the message counter, so the first
+    /// message of the new session would otherwise reuse the previous
+    /// session's offsets for the same message number.
+    #[test]
+    fn delta_base_follows_the_session_generation() {
+        let mut ticker = LiveTicker::new();
+        let status = LiveStatus {
+            streaming: true,
+            ..LiveStatus::default()
+        };
+        let config = parse_items(
+            json!({"type": "items", "items": ["live-output-tokens"]})
+                .as_object()
+                .expect("object"),
+        );
+        let req = TokenRequirements::for_items(&config);
+        let previous = "the only message of the previous session";
+        ticker.live_view(
+            frame(
+                &status,
+                [previous.into(), "".into(), "".into()],
+                7,
+                1,
+                LiveCalculation::Estimate,
+                req,
+            ),
+            || [String::new(), String::new(), String::new()],
+        );
+        assert_eq!(ticker.processed_for(7, 1), [previous.len(), 0, 0]);
+        // The new session's first message is generation (8, 1): base zero.
+        assert_eq!(ticker.processed_for(8, 1), [0, 0, 0]);
+        let fresh = "brand new session, first message, much longer";
+        let view = ticker.live_view(
+            frame(
+                &status,
+                [fresh.into(), "".into(), "".into()],
+                8,
+                1,
+                LiveCalculation::Estimate,
+                req,
+            ),
+            || [String::new(), String::new(), String::new()],
+        );
+        assert_eq!(
+            view.tokens.expect("tokens").total,
+            tokens::heuristic_tokens(fresh)
+        );
+        assert_eq!(ticker.processed_for(8, 1), [fresh.len(), 0, 0]);
+        assert_eq!(
+            ticker.processed_for(7, 1),
+            [0, 0, 0],
+            "the old session is gone"
+        );
+    }
+
+    /// V19-07 review round 2: when the provider starts reporting a running
+    /// total after the exact counter already ran, the counter is dropped
+    /// (no BPE while the provider suffices, no starved counter) — no
+    /// finalize comparison is owed for that message, and the byte base keeps
+    /// advancing so a later local need rebuilds from the full text.
+    #[test]
+    fn provider_total_mid_message_drops_the_exact_counter() {
+        let tokenizer = tokenizer_for_model(Some("glm-5.3")).expect("glm");
+        let loader = || Some(Arc::clone(&tokenizer));
+        let config = parse_items(
+            json!({"type": "items", "items": ["live-output-tokens"]})
+                .as_object()
+                .expect("object"),
+        );
+        let req = TokenRequirements::for_items(&config);
+        let mut ticker = LiveTicker::new();
+        let mut text = String::new();
+        let tick =
+            |ticker: &mut LiveTicker, text: &mut String, delta: &str, provider: Option<u64>| {
+                text.push_str(delta);
+                let base = ticker.processed_for(1, 1);
+                let deltas = [text[base[0]..].to_owned(), String::new(), String::new()];
+                let status = LiveStatus {
+                    streaming: true,
+                    output_tokens: provider,
+                    ..LiveStatus::default()
+                };
+                let full = [text.clone(), String::new(), String::new()];
+                ticker.live_view(
+                    LiveFrameInput {
+                        status: &status,
+                        deltas,
+                        session_generation: 1,
+                        message_generation: 1,
+                        policy: LiveCalculation::Auto,
+                        requirements: req,
+                        tokenizer: &loader,
+                        settled: None,
+                    },
+                    || full.clone(),
+                );
+            };
+        tick(&mut ticker, &mut text, "hello world", None);
+        assert!(ticker.has_exact_for(1));
+        // The provider starts reporting: the counter is dropped, the base
+        // keeps advancing, and nothing is compared at message_end.
+        tick(&mut ticker, &mut text, " again and again", Some(500));
+        assert!(!ticker.has_exact_for(1));
+        assert_eq!(ticker.processed_for(1, 1), [text.len(), 0, 0]);
+        assert_eq!(ticker.finalize_exact(Some(tokenizer.count(&text)), 1), None);
+        assert_eq!(ticker.stats().finalize_comparisons, 0);
+        assert_eq!(ticker.stats().finalize_mismatches, 0);
+        // A later local need (tiers selected again) rebuilds from the full
+        // text and finalizes equal to the official pass.
+        text.push_str(" tail");
+        let status = LiveStatus {
+            streaming: true,
+            output_tokens: Some(501),
+            ..LiveStatus::default()
+        };
+        let full = [text.clone(), String::new(), String::new()];
+        let view = ticker.live_view(
+            LiveFrameInput {
+                status: &status,
+                deltas: [" tail".into(), "".into(), "".into()],
+                session_generation: 1,
+                message_generation: 1,
+                policy: LiveCalculation::Auto,
+                requirements: TokenRequirements {
+                    needs_total: true,
+                    needs_tiers: true,
+                },
+                tokenizer: &loader,
+                settled: None,
+            },
+            || full.clone(),
+        );
+        assert_eq!(
+            view.tokens.expect("tokens").source,
+            TokenSource::ExactTokenizer
+        );
+        let official = tokenizer.count(&text);
+        assert_eq!(ticker.finalize_exact(Some(official), 1), Some(official));
         assert_eq!(ticker.stats().finalize_mismatches, 0);
     }
 }

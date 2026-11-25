@@ -1028,21 +1028,27 @@ fn items_live_view(
     // The delta base is per message generation: a message the ticker has
     // not counted yet starts from byte 0 (its first frame carries everything
     // that arrived), the current message from the bytes already fed.
-    let generation = with_engine(|engine| engine.live_total.message_generation());
-    let processed = ticker.processed_for(generation);
+    // Both generations are read under one lock with the deltas, so the base
+    // can never be computed against a different message than the text.
     let (status, deltas, overlay, session_generation, message_generation, settled) =
         with_engine(|engine| {
             let live = engine.live.as_ref();
             let status = live.map(|live| live.status(now)).unwrap_or_default();
+            let session_generation = engine.live_total.session_generation();
+            let message_generation = engine.live_total.message_generation();
             let deltas = live
-                .map(|live| live.unprocessed_text(processed))
+                .map(|live| {
+                    live.unprocessed_text(
+                        ticker.processed_for(session_generation, message_generation),
+                    )
+                })
                 .unwrap_or_default();
             (
                 status,
                 deltas,
                 engine.live_total_view(),
-                engine.live_total.session_generation(),
-                engine.live_total.message_generation(),
+                session_generation,
+                message_generation,
                 live.and_then(|live| live.settled_tokens()),
             )
         });
