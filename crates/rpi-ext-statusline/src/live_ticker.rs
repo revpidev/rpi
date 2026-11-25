@@ -54,12 +54,19 @@ impl TokenRequirements {
 /// `full_text` closure when the ticker asks for a rebuild).
 pub(crate) struct LiveFrameInput<'a> {
     pub status: &'a LiveStatus,
+    /// The bytes that arrived since the last tick — computed by the caller
+    /// from the base [`LiveTicker::processed_for`] returns for this frame's
+    /// message generation (a new message starts from zero).
     pub deltas: [String; TIERS],
     pub session_generation: u64,
     pub message_generation: u64,
     pub policy: LiveCalculation,
     pub requirements: TokenRequirements,
-    pub tokenizer: Option<Arc<Tokenizer>>,
+    /// Lazy family-tokenizer loader: called ONLY when the frame needs a
+    /// local exact count (`auto` without a sufficient provider total), so
+    /// `estimate` and provider-satisfied `auto` frames never load or run
+    /// the tokenizer (R5.3.2).
+    pub tokenizer: &'a dyn Fn() -> Option<Arc<Tokenizer>>,
     pub settled: Option<TokenBreakdown>,
 }
 
@@ -72,6 +79,8 @@ pub struct TickerStats {
     pub count_fallbacks: u64,
     /// `finalize()` results that disagreed with the official full pass.
     pub finalize_mismatches: u64,
+    /// `finalize()` results that were compared with the official pass.
+    pub finalize_comparisons: u64,
 }
 
 #[derive(Debug, Default)]
@@ -104,7 +113,7 @@ pub struct LiveTicker {
     session_generation: u64,
     message_generation: u64,
     policy: Option<LiveCalculation>,
-    /// Byte counts of each tier buffer already fed.
+    /// Byte counts of each tier buffer already fed for the CURRENT message.
     processed: [usize; TIERS],
     /// Whether any delta of the current message was fed (a policy change
     /// before the first delta is not a mid-stream switch).
@@ -117,9 +126,6 @@ pub struct LiveTicker {
 struct ExactState {
     tokenizer: Arc<Tokenizer>,
     counter: IncrementalCounter,
-    /// Whether the exact counter is wanted for the current message (policy
-    /// `auto` + a local number needed).
-    active: bool,
     /// The CountFallback of this message was already counted.
     reported_fallback: bool,
 }
@@ -131,6 +137,7 @@ impl std::fmt::Debug for LiveTicker {
             .field("message_generation", &self.message_generation)
             .field("policy", &self.policy)
             .field("processed", &self.processed)
+            .field("fed", &self.fed)
             .field("exact", &self.exact.as_ref().map(|_| "exact"))
             .field("stats", &self.stats)
             .finish()
@@ -143,22 +150,32 @@ impl LiveTicker {
     }
 
     /// Drop the exact counter only (the heuristic buckets stay valid — they
-    /// are policy independent). Returns whether a counter was discarded.
-    fn drop_exact(&mut self) -> bool {
-        self.exact.take().is_some()
+    /// are policy independent).
+    fn drop_exact(&mut self) {
+        self.exact = None;
     }
 
-    /// Build the frame's live view for the CURRENT message.
-    ///
-    /// * `status` — the cheap live status (no text);
-    /// * `deltas` — the bytes that arrived since the last tick per tier;
-    /// * `full_text` — a one-time shared full-text snapshot, requested only
-    ///   for a rebuild (policy switch, or a family tokenizer that just
-    ///   became known) and for the full-recount fallback;
-    /// * `policy` — the policy read from the settings for this tick.
-    ///
-    /// `full_text` is a closure so the caller copies the message only when
-    /// this function asks for it.
+    /// The byte base for [`LiveMeasure::unprocessed_text`] when the frame
+    /// describes `message_generation`: the bytes already fed when it is the
+    /// message this ticker counted, zero for a message it has not seen (the
+    /// deltas of a new message start from its first byte).
+    pub fn processed_for(&self, message_generation: u64) -> [usize; TIERS] {
+        if message_generation == self.message_generation {
+            self.processed
+        } else {
+            [0; TIERS]
+        }
+    }
+
+    /// The message generation this ticker's counters belong to.
+    pub fn message_generation(&self) -> u64 {
+        self.message_generation
+    }
+
+    /// Build the frame's live view for the CURRENT message. `full_text` is a
+    /// closure so the caller copies the message only when this function asks
+    /// for it (a policy switch, a tokenizer that just became needed, or the
+    /// full-recount fallback).
     pub(crate) fn live_view(
         &mut self,
         input: LiveFrameInput<'_>,
@@ -191,7 +208,7 @@ impl LiveTicker {
         if !status.streaming {
             let tokens = settled.or_else(|| {
                 (self.message_generation == message_generation)
-                    .then(|| self.last_breakdown(policy, requirements, tokenizer.as_ref()))
+                    .then(|| self.last_breakdown(requirements))
                     .flatten()
             });
             return LiveView {
@@ -214,13 +231,16 @@ impl LiveTicker {
             self.buckets = None;
             self.exact = None;
         }
+        let local_needed = requirements.needs_total || requirements.needs_tiers;
+        let provider_streaming = status.output_tokens.or(status.output_tokens_exact);
+        let provider_suffices = policy == LiveCalculation::Auto
+            && !requirements.needs_tiers
+            && provider_streaming.is_some_and(|total| total > 0);
         // Policy switch mid-stream: discard the old policy's counter state
         // and rebuild ONCE from the shared full text (CountReset). A change
         // noticed before the first delta of a message has nothing to rebuild.
         let switched = self.policy.is_some_and(|previous| previous != policy);
-        if switched && !self.fed {
-            self.policy = Some(policy);
-        } else if switched {
+        if switched && self.fed {
             if let Some(previous) = self.policy {
                 match (previous, policy) {
                     // auto → estimate: no BPE ever again this message; the
@@ -237,18 +257,11 @@ impl LiveTicker {
                     }
                     // estimate → auto: adopt the provider's streaming exact
                     // total directly when there is one and no tier is needed;
-                    // otherwise rebuild the local counter from the buckets'
-                    // text (one pass, one BPE run over the message so far).
-                    (LiveCalculation::Estimate, LiveCalculation::Auto) => {
-                        let provider_exact = status.output_tokens.or(status.output_tokens_exact);
-                        if provider_exact.is_some_and(|total| total > 0)
-                            && !requirements.needs_tiers
-                        {
-                            self.drop_exact();
-                        } else {
-                            let text = full_text();
-                            self.rebuild_exact(&text, policy, requirements, tokenizer.clone());
-                        }
+                    // otherwise rebuild the local counter from the full text
+                    // (one pass, one BPE run over the message so far).
+                    (LiveCalculation::Estimate, LiveCalculation::Auto) if !provider_suffices => {
+                        let text = full_text();
+                        self.rebuild_exact(&text, tokenizer());
                     }
                     _ => {}
                 }
@@ -259,40 +272,29 @@ impl LiveTicker {
                 policy = policy.as_str(),
                 "rpi-statusline: CountReset (calculation policy switched mid-stream)"
             );
-            self.policy = Some(policy);
-        } else {
-            self.policy = Some(policy);
         }
-        // Feed the new bytes.
-        let local_needed = requirements.needs_total || requirements.needs_tiers;
+        self.policy = Some(policy);
+        // Feed the new bytes to the policy-independent buckets.
         if local_needed {
             let buckets = self.buckets.get_or_insert_with(Buckets::default);
             for (tier, delta) in deltas.iter().enumerate() {
                 buckets.push(tier, delta);
             }
         }
-        let provider_streaming = status.output_tokens.or(status.output_tokens_exact);
-        let provider_suffices = policy == LiveCalculation::Auto
-            && !requirements.needs_tiers
-            && provider_streaming.is_some_and(|total| total > 0);
-        let want_exact = policy == LiveCalculation::Auto
-            && local_needed
-            && !provider_suffices
-            && tokenizer.is_some();
-        if want_exact {
-            if self.exact.is_none() && tokenizer.is_some() {
-                // First local number of this message after the provider stopped
-                // satisfying it, or the family tokenizer just became known:
-                // one rebuild pass over the message so far.
-                let already = self.processed;
-                let text = full_text();
-                self.rebuild_exact(&text, policy, requirements, tokenizer.clone());
-                self.processed = [text[0].len(), text[1].len(), text[2].len()];
-                let _ = already;
-            }
-            if let Some(exact) = self.exact.as_mut()
-                && exact.active
+        // The exact counter runs only under `auto`, only when a local number
+        // is needed and the provider total does not suffice — the tokenizer
+        // is loaded exactly then (and never for `estimate`).
+        if policy == LiveCalculation::Auto && local_needed && !provider_suffices {
+            if self.exact.is_none()
+                && let Some(loaded) = tokenizer()
             {
+                // First local number of this message, or the family tokenizer
+                // just became needed: one rebuild pass over the message so
+                // far (the deltas of this tick are already in it).
+                let text = full_text();
+                self.rebuild_exact(&text, Some(loaded));
+                self.processed = [text[0].len(), text[1].len(), text[2].len()];
+            } else if let Some(exact) = self.exact.as_mut() {
                 for (tier, delta) in deltas.iter().enumerate() {
                     exact.counter.push(tier, delta);
                 }
@@ -302,14 +304,17 @@ impl LiveTicker {
                 }
             }
         }
-        for (tier, delta) in deltas.iter().enumerate() {
-            self.processed[tier] += delta.len();
+        if self.exact.is_none() {
+            for (tier, delta) in deltas.iter().enumerate() {
+                self.processed[tier] += delta.len();
+            }
+        }
+        for delta in deltas.iter() {
             if !delta.is_empty() {
                 self.fed = true;
             }
         }
-        let local = self.local_breakdown(policy, requirements, tokenizer.as_ref(), &mut full_text);
-        let _ = provider_streaming;
+        let local = self.local_breakdown(policy, requirements, provider_suffices, &mut full_text);
         LiveView {
             streaming: true,
             output_tokens: status.output_tokens,
@@ -322,21 +327,13 @@ impl LiveTicker {
         }
     }
 
-    /// The settled view of the message that just ended: the caller passes
-    /// the authoritative settlement breakdown (provider exact is overlaid
-    /// by `reported_output`), or `None` to keep the last provisional.
-    fn last_breakdown(
-        &mut self,
-        _policy: LiveCalculation,
-        requirements: TokenRequirements,
-        _tokenizer: Option<&Arc<Tokenizer>>,
-    ) -> Option<TokenBreakdown> {
+    /// The settled view of the message that just ended: the last provisional
+    /// of the message this ticker counted (exact counter, else buckets).
+    fn last_breakdown(&mut self, requirements: TokenRequirements) -> Option<TokenBreakdown> {
         if !requirements.needs_total && !requirements.needs_tiers {
             return None;
         }
-        if let Some(exact) = self.exact.as_mut()
-            && exact.active
-        {
+        if let Some(exact) = self.exact.as_mut() {
             return exact.counter.provisional();
         }
         self.buckets
@@ -345,30 +342,19 @@ impl LiveTicker {
             .or(Some(TokenBreakdown::default()))
     }
 
-    fn rebuild_exact(
-        &mut self,
-        text: &[String; 3],
-        policy: LiveCalculation,
-        requirements: TokenRequirements,
-        tokenizer: Option<Arc<Tokenizer>>,
-    ) {
+    /// Rebuild the exact counter from the full text of the current message.
+    fn rebuild_exact(&mut self, text: &[String; 3], tokenizer: Option<Arc<Tokenizer>>) {
         self.exact = None;
         let Some(tokenizer) = tokenizer else {
             return;
         };
-        if policy != LiveCalculation::Auto
-            || !(requirements.needs_total || requirements.needs_tiers)
-        {
-            return;
-        }
-        let mut counter = IncrementalCounter::new(Arc::clone(&tokenizer));
+        let mut counter = IncrementalCounter::new(tokenizer.clone());
         for (tier, text) in text.iter().enumerate() {
             counter.push(tier, text);
         }
         self.exact = Some(ExactState {
             tokenizer,
             counter,
-            active: true,
             reported_fallback: false,
         });
     }
@@ -378,7 +364,7 @@ impl LiveTicker {
         &mut self,
         policy: LiveCalculation,
         requirements: TokenRequirements,
-        tokenizer: Option<&Arc<Tokenizer>>,
+        provider_suffices: bool,
         full_text: &mut impl FnMut() -> [String; 3],
     ) -> TokenBreakdown {
         let local_needed = requirements.needs_total || requirements.needs_tiers;
@@ -393,7 +379,7 @@ impl LiveTicker {
                 .unwrap_or_default();
         }
         match self.exact.as_mut() {
-            Some(exact) if exact.active => match exact.counter.provisional() {
+            Some(exact) => match exact.counter.provisional() {
                 Some(provisional) => provisional,
                 // CountFallback: full recount at refresh cadence (the
                 // message left the incremental path), never a wrong number.
@@ -402,41 +388,41 @@ impl LiveTicker {
                     exact.tokenizer.count_tiers(&text[0], &text[1], &text[2])
                 }
             },
-            _ => match tokenizer {
-                // No local exact counter (provider total suffices so far):
-                // an empty local split; `with_provider_total` places the
-                // provider total.
-                Some(_) => TokenBreakdown::default(),
-                None => self
-                    .buckets
-                    .as_ref()
-                    .map(Buckets::breakdown)
-                    .unwrap_or_default(),
-            },
+            // No local exact counter: the provider total suffices (an empty
+            // local split; `with_provider_total` places the total), or no
+            // bundled tokenizer exists for the model (the heuristic).
+            None if provider_suffices => TokenBreakdown::default(),
+            None => self
+                .buckets
+                .as_ref()
+                .map(Buckets::breakdown)
+                .unwrap_or_default(),
         }
     }
 
-    /// Finalize the exact counter for the message that just ended and
-    /// return its per-tier counts, or `None` when no exact counter ran.
-    /// `official` is the official full pass for the comparison.
-    pub fn finalize_exact(&mut self, official: Option<u64>) -> Option<u64> {
-        let exact = self.exact.as_mut()?;
-        if !exact.active {
+    /// Finalize the exact counter of `generation`'s message and return its
+    /// per-tier total, or `None` when no exact counter ran for it. `official`
+    /// is the official full pass for the comparison (counted once per
+    /// comparison); a counter of another generation is never compared.
+    pub fn finalize_exact(&mut self, official: Option<u64>, generation: u64) -> Option<u64> {
+        if generation != self.message_generation {
             return None;
         }
+        let exact = self.exact.as_mut()?;
         match exact.counter.finalize() {
             Some(finalized) => {
-                if let Some(official) = official
-                    && official != finalized.total
-                {
-                    self.stats.finalize_mismatches += 1;
-                    tracing::warn!(
-                        incremental = finalized.total,
-                        official,
-                        "rpi-statusline: incremental count disagreed with the official tokenizer; \
-                         the official value is used and the incremental path is disabled for \
-                         this message"
-                    );
+                if let Some(official) = official {
+                    self.stats.finalize_comparisons += 1;
+                    if official != finalized.total {
+                        self.stats.finalize_mismatches += 1;
+                        tracing::warn!(
+                            incremental = finalized.total,
+                            official,
+                            "rpi-statusline: incremental count disagreed with the official \
+                             tokenizer; the official value is used and the incremental path is \
+                             disabled for this message"
+                        );
+                    }
                 }
                 Some(finalized.total)
             }
@@ -450,6 +436,12 @@ impl LiveTicker {
         }
     }
 
+    /// Whether an exact counter ran for `generation`'s message (the
+    /// official comparison of a provider-exact message only runs then).
+    pub fn has_exact_for(&self, generation: u64) -> bool {
+        generation == self.message_generation && self.exact.is_some()
+    }
+
     pub fn fallback(&self) -> Option<CountFallback> {
         self.exact.as_ref()?.counter.fallback()
     }
@@ -458,8 +450,7 @@ impl LiveTicker {
         self.stats
     }
 
-    /// Bytes of each tier buffer already consumed (the caller asks the
-    /// engine for the text past these offsets).
+    /// Bytes of each tier buffer already consumed for the current message.
     pub fn processed(&self) -> [usize; TIERS] {
         self.processed
     }
@@ -470,6 +461,7 @@ mod tests {
     use super::*;
     use crate::fields::ALL_FIELDS;
     use crate::items::parse_items;
+    use crate::tokens::tokenizer_for_model;
     use serde_json::{Value, json};
 
     fn requirements(items: Value) -> TokenRequirements {
@@ -519,6 +511,28 @@ mod tests {
         }
     }
 
+    fn frame<'a>(
+        status: &'a LiveStatus,
+        deltas: [String; TIERS],
+        session_generation: u64,
+        message_generation: u64,
+        policy: LiveCalculation,
+        requirements: TokenRequirements,
+    ) -> LiveFrameInput<'a> {
+        LiveFrameInput {
+            status,
+            deltas,
+            session_generation,
+            message_generation,
+            policy,
+            requirements,
+            tokenizer: &|| None,
+            settled: None,
+        }
+    }
+
+    /// Buckets are fed from the deltas alone: each tier's `ceil` is taken
+    /// once at display, never per delta.
     #[test]
     fn heuristic_buckets_feed_from_deltas_only() {
         let mut ticker = LiveTicker::new();
@@ -526,38 +540,222 @@ mod tests {
             streaming: true,
             ..LiveStatus::default()
         };
-        let items = json!({"type": "items", "items": ["live-output-tokens"]});
-        let config = parse_items(items.as_object().expect("object"));
+        let config = parse_items(
+            json!({"type": "items", "items": ["live-output-tokens"]})
+                .as_object()
+                .expect("object"),
+        );
         let req = TokenRequirements::for_items(&config);
         let view = ticker.live_view(
-            LiveFrameInput {
-                status: &status,
-                deltas: ["你好".into(), "".into(), "".into()],
-                session_generation: 1,
-                message_generation: 1,
-                policy: LiveCalculation::Estimate,
-                requirements: req,
-                tokenizer: None,
-                settled: None,
-            },
+            frame(
+                &status,
+                ["你好".into(), "".into(), "".into()],
+                1,
+                1,
+                LiveCalculation::Estimate,
+                req,
+            ),
             || [String::new(), String::new(), String::new()],
         );
         assert_eq!(view.tokens.expect("tokens").total, 2);
         let view = ticker.live_view(
-            LiveFrameInput {
-                status: &status,
-                deltas: [" hello".into(), "".into(), "".into()],
-                session_generation: 1,
-                message_generation: 1,
-                policy: LiveCalculation::Estimate,
-                requirements: req,
-                tokenizer: None,
-                settled: None,
-            },
+            frame(
+                &status,
+                [" hello".into(), "".into(), "".into()],
+                1,
+                1,
+                LiveCalculation::Estimate,
+                req,
+            ),
             || [String::new(), String::new(), String::new()],
         );
         // ceil((2/1.2) + (6/3.5)) = ceil(3.37) = 4, not 2 + 2.
         assert_eq!(view.tokens.expect("tokens").total, 4);
         assert_eq!(ticker.stats().count_resets, 0);
+    }
+
+    /// V19-07 review P1-1: the delta base is per message generation. The
+    /// caller computes the deltas of a NEW message from zero
+    /// ([`LiveTicker::processed_for`]), so its first frame counts the whole
+    /// new text and the second message's estimate equals its full-text
+    /// heuristic — never the previous message's offsets applied to it.
+    #[test]
+    fn delta_base_follows_the_message_generation() {
+        let mut ticker = LiveTicker::new();
+        let status = LiveStatus {
+            streaming: true,
+            ..LiveStatus::default()
+        };
+        let config = parse_items(
+            json!({"type": "items", "items": ["live-output-tokens"]})
+                .as_object()
+                .expect("object"),
+        );
+        let req = TokenRequirements::for_items(&config);
+        let first = "hello world, hello"; // 18 chars → ceil(18/3.5) = 6
+        let second = "a much longer second message with 你好 in it"; // 44 chars: 2 Han + 42 other
+        let expected_second = tokens::heuristic_tokens(second);
+        // Message 1: two ticks.
+        ticker.live_view(
+            frame(
+                &status,
+                [first[..9].into(), "".into(), "".into()],
+                1,
+                1,
+                LiveCalculation::Estimate,
+                req,
+            ),
+            || [String::new(), String::new(), String::new()],
+        );
+        assert_eq!(ticker.processed_for(1), [9, 0, 0]);
+        let view = ticker.live_view(
+            frame(
+                &status,
+                [first[9..].into(), "".into(), "".into()],
+                1,
+                1,
+                LiveCalculation::Estimate,
+                req,
+            ),
+            || [String::new(), String::new(), String::new()],
+        );
+        assert_eq!(
+            view.tokens.expect("tokens").total,
+            tokens::heuristic_tokens(first)
+        );
+        // Message 2 starts: the base for its generation is zero, so the
+        // caller hands the whole new text so far.
+        assert_eq!(
+            ticker.processed_for(2),
+            [0, 0, 0],
+            "a new message starts from byte 0"
+        );
+        ticker.live_view(
+            frame(
+                &status,
+                [second[..20].into(), "".into(), "".into()],
+                1,
+                2,
+                LiveCalculation::Estimate,
+                req,
+            ),
+            || [String::new(), String::new(), String::new()],
+        );
+        assert_eq!(ticker.processed_for(2), [20, 0, 0]);
+        let view = ticker.live_view(
+            frame(
+                &status,
+                [second[20..].into(), "".into(), "".into()],
+                1,
+                2,
+                LiveCalculation::Estimate,
+                req,
+            ),
+            || [String::new(), String::new(), String::new()],
+        );
+        assert_eq!(
+            view.tokens.expect("tokens").total,
+            expected_second,
+            "the second message's estimate is its own full-text heuristic"
+        );
+        // The wrong base (message 1's offsets) would have lost the head of
+        // the message.
+        assert_ne!(
+            tokens::heuristic_tokens(&second[18..]),
+            expected_second,
+            "the fixture distinguishes the two bases"
+        );
+        assert_eq!(ticker.message_generation(), 2);
+    }
+
+    /// `estimate` frames and provider-satisfied `auto` frames never ask for
+    /// the tokenizer (R5.3.2 / FR-B R7): the loader closure counts its calls.
+    #[test]
+    fn tokenizer_loads_only_when_a_local_exact_count_is_needed() {
+        let status = LiveStatus {
+            streaming: true,
+            output_tokens: Some(500),
+            ..LiveStatus::default()
+        };
+        let config = parse_items(
+            json!({"type": "items", "items": ["live-output-tokens"]})
+                .as_object()
+                .expect("object"),
+        );
+        let req = TokenRequirements::for_items(&config);
+        let loads = std::sync::atomic::AtomicU32::new(0);
+        let loader = || {
+            loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokenizer_for_model(Some("glm-5.3"))
+        };
+        let mut ticker = LiveTicker::new();
+        for policy in [LiveCalculation::Estimate, LiveCalculation::Auto] {
+            let view = ticker.live_view(
+                LiveFrameInput {
+                    status: &status,
+                    deltas: ["hello".into(), "".into(), "".into()],
+                    session_generation: 1,
+                    message_generation: 1,
+                    policy,
+                    requirements: req,
+                    tokenizer: &loader,
+                    settled: None,
+                },
+                || [String::new(), String::new(), String::new()],
+            );
+            // The local split is the heuristic under estimate (ignored by
+            // `reported_output` while streaming) and empty under a
+            // provider-satisfied auto frame; the provider total is placed
+            // either way without any tokenizer load.
+            match policy {
+                LiveCalculation::Estimate => {
+                    assert_eq!(view.tokens.expect("tokens").source, TokenSource::Estimated);
+                    assert_eq!(view.reported_output().expect("output").total, 2);
+                }
+                LiveCalculation::Auto => {
+                    assert_eq!(view.tokens.expect("tokens").total, 0);
+                    assert_eq!(view.reported_output().expect("output").total, 500);
+                }
+            }
+        }
+        assert_eq!(
+            loads.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "estimate never loads; a provider-satisfied auto frame does not either"
+        );
+        // Without a provider total, auto loads exactly once and keeps it.
+        let status = LiveStatus {
+            streaming: true,
+            output_tokens: None,
+            ..LiveStatus::default()
+        };
+        let _ = ticker.live_view(
+            LiveFrameInput {
+                status: &status,
+                deltas: ["hello world".into(), "".into(), "".into()],
+                session_generation: 1,
+                message_generation: 2,
+                policy: LiveCalculation::Auto,
+                requirements: req,
+                tokenizer: &loader,
+                settled: None,
+            },
+            || [String::new(), String::new(), String::new()],
+        );
+        let _ = ticker.live_view(
+            LiveFrameInput {
+                status: &status,
+                deltas: ["!".into(), "".into(), "".into()],
+                session_generation: 1,
+                message_generation: 2,
+                policy: LiveCalculation::Auto,
+                requirements: req,
+                tokenizer: &loader,
+                settled: None,
+            },
+            || [String::new(), String::new(), String::new()],
+        );
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(ticker.stats().finalize_mismatches, 0);
     }
 }

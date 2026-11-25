@@ -687,12 +687,6 @@ impl IncrementalCounter {
                 position += 1;
             }
         }
-        if std::env::var("RPI_V1907_DEBUG_RAW").is_ok() {
-            eprintln!(
-                "raw whole={whole:?} matches={matches:?} cut={cut} max_added={}",
-                raw.max_added
-            );
-        }
         let mut cursor = 0usize;
         for &(start, end) in &matches {
             if end > cut {
@@ -916,6 +910,9 @@ mod tests {
             "ẛᵜṰṹΩ㎧ ﬁ ﬂ ½ ¼ ① ㍿ 🇺🇸 👨‍👩‍👧‍👦 😀 emoji 👍🏽 ✨🚀".to_owned(),
             "Devanagari: नमस्ते दुनिया क़िताब हिन्दी; Bengali: নমস্কার কিতাব; Tamil: வணக்கம்; Thai: สวัสดีครับ".to_owned(),
             "....\n\n\n\n   \n\t\t \n end".to_owned(),
+            // CRLF across delta boundaries (the golden vectors' line shape).
+            "line1\nline2\r\nline3\r\n".to_owned(),
+            "para one\r\n\r\npara two \r\n\tcode\r\n".to_owned(),
             "".to_owned(),
         ];
         // Long whitespace and base64/JSON-string stress (open-tail bounds).

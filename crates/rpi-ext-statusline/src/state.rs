@@ -845,6 +845,7 @@ impl EngineState {
                 .as_ref()
                 .is_none_or(|live| live.stopped_normally()),
             message_generation: self.live_total.message_generation(),
+            diagnostic_only: false,
         };
         let provider_output = message
             .pointer("/usage/output")
@@ -913,15 +914,20 @@ impl EngineState {
         self.live_total.take_awaiting_local()
     }
 
-    /// Apply a local settlement and remember the settled breakdown for the
-    /// frozen frame.
+    /// Apply a local settlement of `generation`'s message and remember the
+    /// settled breakdown for its frozen frame. The breakdown is only written
+    /// when that message is still the current one (a `message_start` that
+    /// landed meanwhile owns the measurement now).
     pub fn settle_local(
         &mut self,
         settlement: crate::live_total::LocalSettlement,
         tokens: Option<crate::tokens::TokenBreakdown>,
+        generation: u64,
     ) {
-        self.live_total.settle_local(settlement);
-        if let Some(live) = self.live.as_mut() {
+        self.live_total.settle_local(settlement, generation);
+        if generation == self.live_total.message_generation()
+            && let Some(live) = self.live.as_mut()
+        {
             live.set_settled_tokens(tokens);
         }
     }
@@ -1542,14 +1548,26 @@ mod tests {
             Settlement::AwaitingLocal
         );
         assert!(state.live_total_view().current_open);
+        // The two provider-exact messages queued diagnostic-only entries
+        // (the official comparison of their incremental counters).
+        for _ in 0..2 {
+            let diagnostic = state.take_awaiting_local().expect("diagnostic");
+            assert!(diagnostic.diagnostic_only);
+            assert_eq!(diagnostic.text, "", "those messages had no text");
+        }
         let awaiting = state.take_awaiting_local().expect("awaiting");
+        assert!(!awaiting.diagnostic_only);
         assert_eq!(awaiting.text, "hello world");
         assert!(awaiting.normal_completion);
         assert!(
             state.live_total_view().current_open,
             "still current until settled"
         );
-        state.settle_local(crate::live_total::LocalSettlement::Exact(2), None);
+        state.settle_local(
+            crate::live_total::LocalSettlement::Exact(2),
+            None,
+            awaiting.message_generation,
+        );
         assert_eq!(state.live_total_view().settled_local_exact, 2);
         assert!(!state.live_total_view().current_open);
         // Aborted message: the final heuristic is dropped.
@@ -1558,7 +1576,11 @@ mod tests {
         state.on_message_end(&json!({"role": "assistant", "stopReason": "aborted"}));
         let awaiting = state.take_awaiting_local().expect("awaiting");
         assert!(!awaiting.normal_completion);
-        state.settle_local(crate::live_total::LocalSettlement::Dropped, None);
+        state.settle_local(
+            crate::live_total::LocalSettlement::Dropped,
+            None,
+            awaiting.message_generation,
+        );
         assert_eq!(state.live_total_view().settled_estimated, 0);
         // Non-assistant ends settle nothing.
         assert_eq!(

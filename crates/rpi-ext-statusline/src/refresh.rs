@@ -911,11 +911,24 @@ fn settle_message_end(calls: &AsyncHostCalls, ticker: &mut LiveTicker) {
 /// Settle one queued message (normally the only one); the loop settles the
 /// next queued message, if any, the same way.
 fn settle_awaiting(ticker: &mut LiveTicker, model_id: Option<&str>, awaiting: AwaitingLocal) {
+    if awaiting.diagnostic_only && !ticker.has_exact_for(awaiting.message_generation) {
+        // Nothing ran incrementally for this message: no comparison owed,
+        // and the provider total needs no official pass.
+        if let Some(next) = with_engine(|engine| engine.take_awaiting_local()) {
+            settle_awaiting(ticker, model_id, next);
+        }
+        return;
+    }
     let tokenizer = tokens::tokenizer_for_model(model_id);
     let official = tokenizer.as_ref().map(|tokenizer| {
         tokenizer.count_tiers(&awaiting.text, &awaiting.thinking, &awaiting.toolcall)
     });
-    let incremental = ticker.finalize_exact(official.as_ref().map(|breakdown| breakdown.total));
+    // The comparison runs for every queued message (also the provider-exact
+    // ones, R5.3.5); a counter of another generation is never compared.
+    let incremental = ticker.finalize_exact(
+        official.as_ref().map(|breakdown| breakdown.total),
+        awaiting.message_generation,
+    );
     if let Some(incremental) = incremental {
         tracing::debug!(
             incremental,
@@ -923,24 +936,29 @@ fn settle_awaiting(ticker: &mut LiveTicker, model_id: Option<&str>, awaiting: Aw
             "rpi-statusline: message_end official correction"
         );
     }
-    let (settlement, settled_tokens) = match official {
-        Some(breakdown) => (LocalSettlement::Exact(breakdown.total), Some(breakdown)),
-        None if awaiting.normal_completion => {
-            let breakdown =
-                tokens::heuristic_breakdown(&awaiting.text, &awaiting.thinking, &awaiting.toolcall);
-            (LocalSettlement::Estimated(breakdown.total), Some(breakdown))
-        }
-        // Aborted/errored without any exact source: the final heuristic is
-        // dropped (v0.1.8 semantics) — never promoted into the total.
-        None => (LocalSettlement::Dropped, None),
-    };
-    with_engine(|engine| engine.settle_local(settlement, settled_tokens));
-    let model_id = model_id.map(str::to_owned);
+    if !awaiting.diagnostic_only {
+        let (settlement, settled_tokens) = match official {
+            Some(breakdown) => (LocalSettlement::Exact(breakdown.total), Some(breakdown)),
+            None if awaiting.normal_completion => {
+                let breakdown = tokens::heuristic_breakdown(
+                    &awaiting.text,
+                    &awaiting.thinking,
+                    &awaiting.toolcall,
+                );
+                (LocalSettlement::Estimated(breakdown.total), Some(breakdown))
+            }
+            // Aborted/errored without any exact source: the final heuristic is
+            // dropped (v0.1.8 semantics) — never promoted into the total.
+            None => (LocalSettlement::Dropped, None),
+        };
+        with_engine(|engine| {
+            engine.settle_local(settlement, settled_tokens, awaiting.message_generation)
+        });
+    }
     if let Some(next) = with_engine(|engine| engine.take_awaiting_local()) {
-        settle_awaiting(ticker, model_id.as_deref(), next);
+        settle_awaiting(ticker, model_id, next);
     }
 }
-
 /// The current model id over one `ctx.model` host call (settlement path only).
 fn current_model_id(calls: &AsyncHostCalls) -> Option<String> {
     host_ok(calls, "ctx.model", json!({}))
@@ -1007,7 +1025,11 @@ fn items_live_view(
     policy: LiveCalculation,
 ) -> (Option<LiveView>, LiveTotalView) {
     let now = Instant::now();
-    let processed = ticker.processed();
+    // The delta base is per message generation: a message the ticker has
+    // not counted yet starts from byte 0 (its first frame carries everything
+    // that arrived), the current message from the bytes already fed.
+    let generation = with_engine(|engine| engine.live_total.message_generation());
+    let processed = ticker.processed_for(generation);
     let (status, deltas, overlay, session_generation, message_generation, settled) =
         with_engine(|engine| {
             let live = engine.live.as_ref();
@@ -1027,13 +1049,11 @@ fn items_live_view(
     let Some(_measure) = items.live_enabled().then_some(()) else {
         return (None, overlay);
     };
-    // `estimate` never loads or runs BPE while streaming (R5.3.2); `auto`
-    // loads the family tokenizer only when a local number is needed.
-    let tokenizer = if policy == LiveCalculation::Auto && status.streaming {
-        tokens::tokenizer_for_model(model_id)
-    } else {
-        None
-    };
+    // Lazy loader: `estimate` never loads or runs BPE while streaming
+    // (R5.3.2) and `auto` loads the family tokenizer only when a local exact
+    // number is needed.
+    let model_id = model_id.map(str::to_owned);
+    let tokenizer = move || tokens::tokenizer_for_model(model_id.as_deref());
     let requirements = TokenRequirements::for_items(items);
     let full_text = || {
         with_engine(|engine| {
@@ -1052,7 +1072,7 @@ fn items_live_view(
             message_generation,
             policy,
             requirements,
-            tokenizer,
+            tokenizer: &tokenizer,
             settled,
         },
         full_text,

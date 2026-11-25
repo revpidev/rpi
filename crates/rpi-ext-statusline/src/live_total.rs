@@ -70,6 +70,10 @@ pub struct AwaitingLocal {
     /// is set: only then may a final heuristic be kept as `settled_estimated`.
     pub normal_completion: bool,
     pub message_generation: u64,
+    /// `true` for a provider-exact message: the refresh loop only compares
+    /// the incremental finalize with the official pass (R5.3.5) and settles
+    /// nothing locally — the provider total is the value of record.
+    pub diagnostic_only: bool,
 }
 
 /// What `message_end` decided for the finished message.
@@ -175,6 +179,11 @@ impl LiveTotalState {
                 survived_snapshots: 0,
                 diagnosed: false,
             });
+            // The official comparison still runs for the incremental
+            // counter (diagnostic only; nothing settles locally).
+            let mut awaiting = awaiting;
+            awaiting.diagnostic_only = true;
+            self.awaiting_local.push_back(awaiting);
             return Settlement::ProviderExact;
         }
         self.awaiting_local.push_back(awaiting);
@@ -209,8 +218,12 @@ impl LiveTotalState {
     }
 
     /// Apply the local settlement computed for the last [`Self::take_awaiting_local`].
-    pub fn settle_local(&mut self, settlement: LocalSettlement) {
-        if self.awaiting_local.is_empty() {
+    /// `generation` is the message the settlement belongs to: the current
+    /// flag only drops when that message is still the current one (a newer
+    /// `message_start` that landed while the tokenizer ran keeps its own
+    /// provisional in the total).
+    pub fn settle_local(&mut self, settlement: LocalSettlement, generation: u64) {
+        if self.awaiting_local.is_empty() && generation == self.message_generation {
             self.current_open = false;
         }
         match settlement {
@@ -292,7 +305,13 @@ impl LiveTotalState {
                 .fold(0u64, |sum, entry| sum.saturating_add(entry.output)),
             settled_local_exact: self.settled_local_exact,
             settled_estimated: self.settled_estimated,
-            current_open: self.current_open || !self.awaiting_local.is_empty(),
+            // A diagnostic-only entry (provider-exact message) never keeps
+            // a message current.
+            current_open: self.current_open
+                || self
+                    .awaiting_local
+                    .iter()
+                    .any(|awaiting| !awaiting.diagnostic_only),
             hidden: self
                 .pending_provider_exact
                 .iter()
@@ -342,6 +361,7 @@ mod tests {
             toolcall: String::new(),
             normal_completion: normal,
             message_generation: generation,
+            diagnostic_only: false,
         }
     }
 
@@ -362,7 +382,7 @@ mod tests {
         assert!(!state.awaiting_local(), "taken: nothing else queued");
         // Settle: local exact lands without `~`; the view no longer counts a
         // current message.
-        state.settle_local(LocalSettlement::Exact(11));
+        state.settle_local(LocalSettlement::Exact(11), 1);
         let view = state.view();
         assert_eq!((view.settled_local_exact, view.settled_estimated), (11, 0));
         assert!(!view.current_open);
@@ -374,20 +394,20 @@ mod tests {
         );
         state.on_message_end(None, awaiting(true, 2), 0);
         state.take_awaiting_local();
-        state.settle_local(LocalSettlement::Estimated(5));
+        state.settle_local(LocalSettlement::Estimated(5), 2);
         let view = state.view();
         assert_eq!((view.settled_local_exact, view.settled_estimated), (11, 5));
         // An aborted message without any exact source drops its estimate.
         state.begin_message();
         state.on_message_end(None, awaiting(false, 3), 0);
         state.take_awaiting_local();
-        state.settle_local(LocalSettlement::Dropped);
+        state.settle_local(LocalSettlement::Dropped, 3);
         assert_eq!(state.view().settled_estimated, 5);
         // But its official tokenizer result still settles as exact.
         state.begin_message();
         state.on_message_end(None, awaiting(false, 4), 0);
         state.take_awaiting_local();
-        state.settle_local(LocalSettlement::Exact(7));
+        state.settle_local(LocalSettlement::Exact(7), 4);
         assert_eq!(state.view().settled_local_exact, 18);
         // A new session clears every generation.
         state.begin_session();
@@ -505,6 +525,48 @@ mod tests {
         assert_eq!(state.view().pending_output, 5);
         state.on_snapshot_applied(3, &applied(99, StatsTrigger::TurnEnd));
         assert_eq!(state.view().pending_output, 0);
+    }
+
+    /// V19-07 review P2-1: a settlement that lands after the NEXT message
+    /// started (the tokenizer ran outside the engine lock) must not drop the
+    /// new message's provisional from the total.
+    #[test]
+    fn late_settlement_keeps_the_next_message_current() {
+        let mut state = LiveTotalState::default();
+        state.begin_session();
+        state.begin_message();
+        state.on_message_end(None, awaiting(true, 1), 0);
+        let taken = state.take_awaiting_local().expect("awaiting");
+        assert_eq!(taken.message_generation, 1);
+        // The next message starts before the settlement lands.
+        state.begin_message();
+        assert!(state.view().current_open);
+        state.settle_local(LocalSettlement::Exact(5), taken.message_generation);
+        let view = state.view();
+        assert_eq!(view.settled_local_exact, 5, "the old message still settles");
+        assert!(view.current_open, "the new message stays current");
+        // Settling the current message itself drops the flag.
+        state.on_message_end(None, awaiting(true, 2), 0);
+        state.take_awaiting_local();
+        state.settle_local(LocalSettlement::Exact(3), 2);
+        assert!(!state.view().current_open);
+        assert_eq!(state.view().settled_local_exact, 8);
+    }
+
+    /// Provider-exact messages queue a diagnostic-only settlement.
+    #[test]
+    fn provider_exact_messages_queue_a_diagnostic_only_settlement() {
+        let mut state = LiveTotalState::default();
+        state.begin_session();
+        state.begin_message();
+        assert_eq!(
+            state.on_message_end(Some(9), awaiting(true, 1), 0),
+            Settlement::ProviderExact
+        );
+        assert!(state.awaiting_local());
+        let taken = state.take_awaiting_local().expect("diagnostic");
+        assert!(taken.diagnostic_only);
+        assert!(!state.view().current_open);
     }
 
     #[test]

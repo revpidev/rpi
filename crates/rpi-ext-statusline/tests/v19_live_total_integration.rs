@@ -352,6 +352,13 @@ fn v19_live_total_policies_probe_and_switches() {
         "still estimated: {frame}"
     );
     assert!(!frame.contains("310"), "{frame}");
+    // R5.3.2: `estimate` streaming never loaded a tokenizer (the official
+    // pass is allowed at message_end only).
+    assert_eq!(
+        rpi_ext_statusline::tokens::tokenizer_loads(),
+        0,
+        "estimate streaming: 0 loads"
+    );
     // message_end: the authoritative exact value, no `~`, and the pending
     // exact total joins the live total (100 + 320).
     end_message(Some(320), None);
@@ -551,11 +558,17 @@ fn v19_live_total_policies_probe_and_switches() {
     // F2: estimate → auto while the provider reports a running exact total:
     //     adopted directly (no `~`; no tier row selected ⇒ no BPE needed).
     delta(" ", Some(900));
+    let loads_before = rpi_ext_statusline::tokens::tokenizer_loads();
     let before = frames();
     write_status_line(items(json!({"refreshMs": 300, "calculation": "auto"})));
     let frame = next_frame(before, "auto frame after the switch");
     let (total, tokens) = numbers(&frame);
     assert_eq!(tokens, 900, "provider exact adopted directly: {frame}");
+    assert_eq!(
+        rpi_ext_statusline::tokens::tokenizer_loads(),
+        loads_before,
+        "a provider-satisfied auto frame never loads the tokenizer"
+    );
     assert_eq!(total, baseline + 900, "{frame}");
     assert!(!frame.contains('~'), "{frame}");
     assert_eq!(rpi_ext_statusline::ticker_stats().count_resets, 2);
@@ -645,5 +658,78 @@ fn v19_live_total_policies_probe_and_switches() {
         "command mode creates no pending and runs no probe"
     );
     assert!(full_reads(&current_records()) >= 4);
+
+    // ── H. Review P1-1 regression: the SECOND estimate message of a
+    //        session counts from its own first byte — its streaming value is
+    //        its full-text heuristic (never the previous message's offsets).
+    write_status_line(items(json!({"refreshMs": 300, "calculation": "estimate"})));
+    std::thread::sleep(Duration::from_millis(1200));
+    // Let the poll apply the configuration and publish an idle items frame.
+    let idle = poll_until("items idle frame after command mode", |records| {
+        let last = last_status(records);
+        last.contains(" · ")
+            && last
+                .split(" · ")
+                .next()
+                .is_some_and(|f| f.parse::<u64>().is_ok())
+    });
+    let second = "second estimate message, with its own bytes";
+    let expected = heuristic(second);
+    start_message();
+    delta(&second[..20], None);
+    let frame = poll_until("second estimate message frame", |records| {
+        status_texts(records).len() > status_texts(&idle).len()
+            && last_status(records).starts_with('~')
+            && last_status(records).contains(" tok/s")
+    });
+    let (first_total, first_tokens) = numbers(&last_status(&frame));
+    assert_eq!(
+        first_tokens,
+        heuristic(&second[..20]),
+        "{:?}",
+        last_status(&frame)
+    );
+    // Second delta: the estimate is the full-text heuristic and the total
+    // grew by exactly the difference (no head lost, nothing double counted).
+    let before = frames();
+    delta(&second[20..], None);
+    let frame = next_frame(before, "second estimate message second frame");
+    let (total, tokens) = numbers(&frame);
+    assert_eq!(
+        tokens, expected,
+        "the second message's estimate is its own heuristic: {frame}"
+    );
+    assert_eq!(
+        total - tokens,
+        first_total - first_tokens,
+        "the session part of the total is unchanged between the two ticks: {frame}"
+    );
+    // The third message, shorter than the second, also counts from zero.
+    end_message(None, None);
+    let _ = next_frame(frames(), "second estimate message settled");
+    start_message();
+    delta("tiny", None);
+    // "tiny" = 4 chars → ceil(4 / 3.5) = 2.
+    let frame = poll_until("third estimate message frame", |records| {
+        last_status(records).starts_with('~') && last_status(records).contains("~2 · ")
+    });
+    assert_eq!(
+        numbers(&last_status(&frame)).1,
+        heuristic("tiny"),
+        "the third message starts from byte 0: {}",
+        last_status(&frame)
+    );
+    end_message(None, None);
+    let _ = next_frame(frames(), "third estimate message settled");
     let _ = std::fs::remove_dir_all(agent_dir());
+}
+
+/// The heuristic the `estimate` frames must show for a text.
+fn heuristic(text: &str) -> u64 {
+    let han = text
+        .chars()
+        .filter(|ch| rpi_ext_statusline::tokens::is_han_text(*ch))
+        .count() as u64;
+    let other = text.chars().count() as u64 - han;
+    ((han as f64 / 1.2 + other as f64 / 3.5).ceil()) as u64
 }

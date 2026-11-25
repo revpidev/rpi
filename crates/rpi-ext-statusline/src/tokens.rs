@@ -34,6 +34,12 @@ use regex::Regex as AddedTokenRegex;
 use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
 
+/// Whether `ch` is a Han ideograph (the reference heuristic's CJK class);
+/// public for fixtures that compute the expected heuristic.
+pub fn is_han_text(ch: char) -> bool {
+    is_han(ch)
+}
+
 /// Where a token count came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -327,6 +333,16 @@ fn tokenizer_cache() -> &'static TokenizerCache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// How many times a bundled tokenizer asset was PARSED (a cache hit does
+/// not count): the V19-07 fixtures assert that `estimate` streaming and
+/// provider-satisfied `auto` frames never load a tokenizer (R5.3.2).
+static TOKENIZER_LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`TOKENIZER_LOADS`].
+pub fn tokenizer_loads() -> u64 {
+    TOKENIZER_LOADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn tokenizer_for_model(model_id: Option<&str>) -> Option<Arc<Tokenizer>> {
     let model_id = model_id.filter(|id| !id.is_empty())?;
     let builtin = builtin_for_model(model_id)?;
@@ -338,6 +354,7 @@ pub(crate) fn tokenizer_for_model(model_id: Option<&str>) -> Option<Arc<Tokenize
             return entry.clone();
         }
     }
+    TOKENIZER_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let loaded = match parse_asset(builtin.asset) {
         Ok(tokenizer) => Some(Arc::new(tokenizer)),
         Err(error) => {
