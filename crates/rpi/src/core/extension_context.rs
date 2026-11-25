@@ -295,6 +295,34 @@ impl ContextActions for SessionContextActions {
         })
     }
 
+    /// `ctx.sessionStats({countsOnly:true})` (rpi additive, ADR-0049
+    /// decision 8 / V19-07 R5.2.8): the identity and the three counts of
+    /// the snapshot above, and nothing else. O(1) under the session lock:
+    /// the manager maintains the user/assistant message counts and the
+    /// entry total incrementally, so this probe neither clones nor
+    /// iterates entries and never aggregates usage. The statusline reads it
+    /// once per finished assistant message (inside the `message_end`
+    /// extension callback, before the host persists that message) to learn
+    /// the `assistant_messages` watermark the pending exact total will be
+    /// covered by; the full snapshot stays on its own cadence.
+    fn session_counts(&self) -> Option<rpi_ext_host::types::SessionCountsSnapshot> {
+        let session = self.session()?;
+        let manager = session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        let header = manager.get_header()?;
+        let counts = manager.message_counts();
+        Some(rpi_ext_host::types::SessionCountsSnapshot {
+            session_id: manager.get_session_id().to_owned(),
+            session_file: manager
+                .get_session_file()
+                .map(|path| path.to_string_lossy().into_owned()),
+            started_at: header.timestamp.clone(),
+            entry_count: manager.entry_total(),
+            user_messages: counts.user,
+            assistant_messages: counts.assistant,
+        })
+    }
+
     /// `compact` — fire-and-forget with the callback pair
     /// (agent-session.ts:2423-2433).
     fn compact(&self, options: CompactOptions) {
@@ -754,6 +782,52 @@ mod tests {
         assert_eq!(stats.assistant_messages, footer_stats.assistant_messages);
         assert_eq!(stats.user_messages, 1, "appended user message");
         assert_eq!(stats.assistant_messages, 1, "appended assistant message");
+    }
+
+    /// V19-07 (R5.2.8): `session_counts()` carries exactly the identity and
+    /// the three counts of the full snapshot — same session id, header
+    /// timestamp, entry count, user/assistant counts — across appended
+    /// messages of every kind, so a consumer may mix both shapes freely
+    /// (the full snapshot on its cadence, the O(1) probe as the watermark).
+    #[tokio::test]
+    async fn session_counts_probe_matches_the_full_snapshot_counts() {
+        let fixture = crate::modes::interactive::test_support::build_test_session().await;
+        let compare = |session: &AgentSession, label: &str| {
+            let stats = actions(session)
+                .session_stats()
+                .unwrap_or_else(|| panic!("{label}: full snapshot"));
+            let counts = actions(session)
+                .session_counts()
+                .unwrap_or_else(|| panic!("{label}: counts probe"));
+            assert_eq!(counts.session_id, stats.session_id, "{label}");
+            assert_eq!(counts.session_file, stats.session_file, "{label}");
+            assert_eq!(counts.started_at, stats.started_at, "{label}");
+            assert_eq!(counts.entry_count, stats.entry_count, "{label}");
+            assert_eq!(counts.user_messages, stats.user_messages, "{label}");
+            assert_eq!(
+                counts.assistant_messages, stats.assistant_messages,
+                "{label}"
+            );
+        };
+        compare(&fixture.session, "fresh");
+        {
+            let manager = fixture.session.session_manager();
+            let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            manager.append_message(user_message("hello")).expect("user");
+            manager
+                .append_message(assistant_message(usage(1, 2, 3, 4, 0.1, 0)))
+                .expect("assistant");
+            manager
+                .append_message(tool_result_message(usage(10, 20, 30, 40, 1.0, 0)))
+                .expect("tool result");
+            manager
+                .append_message(assistant_message(usage(1, 2, 3, 4, 0.1, 0)))
+                .expect("assistant 2");
+        }
+        compare(&fixture.session, "after appends");
+        let stats = actions(&fixture.session).session_stats().expect("snapshot");
+        assert_eq!(stats.user_messages, 1);
+        assert_eq!(stats.assistant_messages, 2);
     }
 
     /// A fresh session has zeroed components, `entryCount = 0` and the

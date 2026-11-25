@@ -2293,6 +2293,16 @@ impl AgentSession {
         }
 
         // Emit to extensions first (agent-session.ts:619) — no-op seam.
+        //
+        // ORDER CONTRACT (ADR-0049 decision 8 / V19-07 R5.2.8): the assistant
+        // `message_end` extension handlers are AWAITED here, BEFORE the
+        // session persistence below appends the message. rpi-statusline
+        // reads the counts-only `ctx.sessionStats({countsOnly:true})`
+        // watermark inside that handler, so the value it sees must not yet
+        // include the message it is about to account for. Keep persistence
+        // after this point; `extension_host_agent_event_payload_test::
+        // message_end_handlers_run_before_the_message_is_persisted` guards
+        // the order.
         let replaced = self.emit_extension_event(&event).await;
         let event = match replaced {
             Some(message) => AgentEvent::MessageEnd { message },

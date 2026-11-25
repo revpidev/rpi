@@ -1435,6 +1435,15 @@ pub trait ContextActions: Send + Sync {
     fn session_stats(&self) -> Option<crate::types::SessionStatsSnapshot> {
         None
     }
+
+    /// `ctx.sessionStats({countsOnly:true})` (rpi additive, ADR-0049
+    /// decision 8 / V19-07): identity plus counts, answered in O(1) by a
+    /// host that implements it. `None` when unbound or not implemented; the
+    /// dispatch layer then falls back to the full snapshot so an old host
+    /// stays compatible (`rpiAbi` unchanged).
+    fn session_counts(&self) -> Option<crate::types::SessionCountsSnapshot> {
+        None
+    }
 }
 
 /// `withSession` callback (types.ts:358): receives the
@@ -2254,6 +2263,15 @@ impl ExtensionContext {
         Ok(self
             .context_actions()?
             .and_then(|actions| actions.session_stats()))
+    }
+
+    /// `ctx.sessionStats({countsOnly:true})` — the O(1) identity + counts
+    /// probe. `None` when the host does not implement it (the dispatch layer
+    /// falls back to the full snapshot) or is unbound.
+    pub fn session_counts(&self) -> Result<Option<crate::types::SessionCountsSnapshot>, ExtError> {
+        Ok(self
+            .context_actions()?
+            .and_then(|actions| actions.session_counts()))
     }
 }
 

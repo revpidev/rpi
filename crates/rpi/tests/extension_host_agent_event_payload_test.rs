@@ -174,6 +174,15 @@ struct Fixture {
 /// tool-call turn followed by a plain text turn; inline extension records
 /// the agent-event payloads.
 async fn fixture(responses: Vec<FauxResponseStep>, host: NativeExtensionHost) -> Fixture {
+    fixture_shared(responses, Arc::new(host)).await
+}
+
+/// [`fixture`] for a host shared with the test (binding the session-backed
+/// context actions needs the same `Arc` the session's runner slot holds).
+async fn fixture_shared(
+    responses: Vec<FauxResponseStep>,
+    host: Arc<NativeExtensionHost>,
+) -> Fixture {
     let tmp = TempDir::new();
     let cwd = tmp.path().join("cwd");
     let agent_dir = tmp.path().join("agent");
@@ -234,7 +243,6 @@ async fn fixture(responses: Vec<FauxResponseStep>, host: NativeExtensionHost) ->
         .expect("in-memory session"),
     ));
 
-    let host = Arc::new(host);
     let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
         cwd: Some(cwd),
         agent_dir: Some(agent_dir),
@@ -282,6 +290,95 @@ fn records_of(records: &Records, event: &str) -> Vec<Value> {
         .filter(|(name, _)| name == event)
         .map(|(_, payload)| payload.clone())
         .collect()
+}
+
+/// Records the session counts observed INSIDE each assistant `message_end`
+/// handler: the counts-only probe, the full snapshot's counts and the
+/// session file identity (V19-07 R5.2.8 regression fixture).
+fn watermark_recording_ext(records: Records) -> InlineExtension {
+    let factory: ExtensionFactory = Arc::new(move |api| {
+        let records = records.clone();
+        api.on(
+            "message_end",
+            Arc::new(move |payload, ctx| {
+                let probe = ctx.session_counts().map_err(|error| error.to_string());
+                let full = ctx.session_stats().map_err(|error| error.to_string());
+                let role = payload
+                    .pointer("/message/role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                records.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    "message_end".to_owned(),
+                    json!({
+                        "role": role,
+                        "probe": probe,
+                        "full": full,
+                    }),
+                ));
+                Box::pin(async { Ok(Value::Null) })
+            }),
+        )
+        .expect("register handler");
+        Box::pin(async { Ok(()) })
+    });
+    InlineExtension::Anonymous(factory)
+}
+
+/// V19-07 (R5.2.8 / ADR-0049 decision 8) — host ORDER contract: the host
+/// awaits the assistant `message_end` extension handlers BEFORE persisting
+/// that message. The statusline reads the counts-only watermark inside that
+/// handler; if the order ever flipped, the watermark would already include
+/// the finished message and the pending exact total would be double counted.
+/// This fixture goes red the moment persistence moves ahead of the handlers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn message_end_handlers_run_before_the_message_is_persisted() {
+    let records: Records = Arc::new(Mutex::new(Vec::new()));
+    let host = NativeExtensionHost::new("/payload-cwd");
+    let errors = host
+        .load_inline(&[watermark_recording_ext(records.clone())])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+    let host = Arc::new(host);
+    let fixture = fixture_shared(vec![text_step("done")], host.clone()).await;
+    // The real app binds the session-backed context actions at boot; the
+    // SDK fixture does not, so bind them here (the probe needs the
+    // session-bound `SessionContextActions`).
+    rpi::core::extension_actions::bind_session_actions(&host, &fixture.session).await;
+    run_prompt(&fixture).await;
+
+    let ends = records_of(&records, "message_end");
+    let observed = ends
+        .iter()
+        .find(|payload| payload["role"] == "assistant")
+        .expect("one assistant message_end");
+    let probe = &observed["probe"]["Ok"];
+    let full = &observed["full"]["Ok"];
+    assert!(probe.is_object(), "{observed}");
+    // Inside the handler the finished message is NOT yet persisted: both
+    // the O(1) probe and the full snapshot agree and do not count it.
+    assert_eq!(probe["assistantMessages"], 0, "{probe}");
+    assert_eq!(full["assistantMessages"], 0, "{full}");
+    assert_eq!(
+        probe["entryCount"], full["entryCount"],
+        "probe == snapshot entryCount"
+    );
+    assert_eq!(probe["sessionId"], full["sessionId"]);
+    assert!(probe.get("tokens").is_none(), "the probe carries no usage");
+    // After the run the message IS persisted: the manager counts it, so the
+    // statusline's `pre_persist_assistant_messages + 1` watermark is the
+    // snapshot value that will cover the pending exact total.
+    let persisted = {
+        let manager = fixture.session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        (manager.message_counts().assistant, manager.entry_total())
+    };
+    assert_eq!(persisted.0, 1);
+    assert_eq!(
+        probe["entryCount"].as_u64().expect("entryCount") + 1,
+        persisted.1,
+        "exactly one entry (the assistant message) landed after the handler"
+    );
 }
 
 async fn run_prompt(fixture: &Fixture) {
@@ -806,7 +903,6 @@ async fn fixture_with_settings(
         .expect("in-memory session"),
     ));
 
-    let host = Arc::new(host);
     let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
         cwd: Some(cwd),
         agent_dir: Some(agent_dir),
@@ -816,7 +912,7 @@ async fn fixture_with_settings(
         custom_tools: vec![Arc::new(UpdatingTool)],
         services: Some(services),
         session_manager: Some(session_manager),
-        extension_host: Some(host),
+        extension_host: Some(Arc::new(host)),
         ..Default::default()
     })
     .await

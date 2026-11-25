@@ -85,6 +85,66 @@ fn in_memory_sessions_omit_session_file_on_both_sides() {
     assert!(native_json.get("sessionFile").is_none());
 }
 
+/// V19-07 (ADR-0049 decision 8): the counts-only shape is byte-identical
+/// on both sides (no `tokens`, no `cost`) and round-trips through the SDK's
+/// `SessionStatsReply::Counts` accessor.
+#[test]
+fn session_counts_wire_shape_is_identical() {
+    use rpi_ext_host::types::SessionCountsSnapshot;
+    let native = SessionCountsSnapshot {
+        session_id: "s1".to_owned(),
+        session_file: Some("/tmp/s1.jsonl".to_owned()),
+        started_at: "2026-10-27T10:00:00Z".to_owned(),
+        entry_count: 12,
+        user_messages: 4,
+        assistant_messages: 7,
+    };
+    let native_json = serde_json::to_value(&native).expect("native json");
+    assert!(native_json.get("tokens").is_none());
+    assert!(native_json.get("cost").is_none());
+    let sdk: rpi_ext_sdk::session_stats::SessionCounts =
+        serde_json::from_value(native_json.clone()).expect("sdk decode");
+    assert_eq!(
+        serde_json::to_value(sdk).expect("sdk json"),
+        native_json,
+        "byte-identical counts shape"
+    );
+    let back: SessionCountsSnapshot =
+        serde_json::from_value(native_json.clone()).expect("native decode");
+    assert_eq!(back, native);
+    // The reply classifier tells the counts shape from the full snapshot.
+    struct H(serde_json::Value);
+    impl rpi_ext_sdk::interactive_ui::HostCall for H {
+        fn call(
+            &self,
+            _method: &str,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value, rpi_ext_sdk::interactive_ui::InteractiveUiError> {
+            Ok(self.0.clone())
+        }
+    }
+    let reply = rpi_ext_sdk::session_stats::session_counts(&H(native_json.clone()))
+        .expect("probe")
+        .expect("bound");
+    assert_eq!(reply.assistant_messages(), 7);
+    assert_eq!(reply.entry_count(), 12);
+    assert!(matches!(
+        reply,
+        rpi_ext_sdk::session_stats::SessionStatsReply::Counts(_)
+    ));
+    let full = rpi_ext_sdk::session_stats::session_counts(&H(serde_json::to_value(
+        native_snapshot(),
+    )
+    .expect("native json")))
+    .expect("probe")
+    .expect("bound");
+    assert!(matches!(
+        full,
+        rpi_ext_sdk::session_stats::SessionStatsReply::Full(_)
+    ));
+    assert_eq!(full.assistant_messages(), 7);
+}
+
 fn overlay_host(state: serde_json::Value) -> impl rpi_ext_sdk::interactive_ui::HostCall {
     struct H(serde_json::Value);
     impl rpi_ext_sdk::interactive_ui::HostCall for H {

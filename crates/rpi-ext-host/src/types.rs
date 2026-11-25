@@ -1032,6 +1032,29 @@ pub struct SessionStatsSnapshot {
     pub cost: f64,
 }
 
+/// `ctx.sessionStats({countsOnly:true})` result (rpi additive host-call
+/// argument, ADR-0049 decision 8 / V19-07 R5.2.8): the identity and the
+/// three counts of [`SessionStatsSnapshot`] and nothing else. The host
+/// answers it in O(1): no entry is cloned, iterated or aggregated, so the
+/// cost does not grow with a long session. Consumers use it as a cheap
+/// watermark probe (`assistantMessages`) between full snapshots; the token
+/// components and cost are never part of this shape. `rpiAbi` stays 1: the
+/// argument is optional and an older host ignores it (answer: the full
+/// snapshot), which consumers must tolerate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCountsSnapshot {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<String>,
+    pub started_at: String,
+    pub entry_count: u64,
+    #[serde(default)]
+    pub user_messages: u64,
+    #[serde(default)]
+    pub assistant_messages: u64,
+}
+
 /// Four token components of [`SessionStatsSnapshot`] (camelCase on the
 /// wire: `cacheRead` / `cacheWrite`). `total` is deliberately absent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

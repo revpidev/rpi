@@ -1157,6 +1157,62 @@ pub struct SessionManager {
     /// session-manager.ts:1447-1451).
     labels_order: Vec<String>,
     leaf_id: Option<String>,
+    /// Persisted user/assistant message counts, maintained incrementally by
+    /// [`Self::build_index`] and [`Self::append_entry`] so the counts-only
+    /// `ctx.sessionStats({countsOnly:true})` probe (V19-07 / R5.2.8) is O(1):
+    /// it must neither iterate nor clone entries, so its cost cannot grow
+    /// with the entry count of a long session. Same discriminator as
+    /// `get_entries()` + `AgentMessage::{User, Assistant}`.
+    message_counts: MessageRoleCounts,
+    /// Non-header record count (the O(1) twin of `get_entries().len()`,
+    /// which includes id-less records unlike [`Self::entry_count`]).
+    entry_total: u64,
+}
+
+/// Persisted `message` entry counts by role (header excluded), the O(1)
+/// twin of counting `AgentMessage::{User, Assistant}` over `get_entries()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessageRoleCounts {
+    /// Conversation turns (`role == "user"`).
+    pub user: u64,
+    /// Model outputs/steps (`role == "assistant"`).
+    pub assistant: u64,
+}
+
+impl MessageRoleCounts {
+    fn add(&mut self, role: MessageRole) {
+        match role {
+            MessageRole::User => self.user += 1,
+            MessageRole::Assistant => self.assistant += 1,
+        }
+    }
+
+    fn remove(&mut self, role: MessageRole) {
+        match role {
+            MessageRole::User => self.user = self.user.saturating_sub(1),
+            MessageRole::Assistant => self.assistant = self.assistant.saturating_sub(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageRole {
+    User,
+    Assistant,
+}
+
+/// The role a non-header record contributes to [`MessageRoleCounts`], or
+/// `None` for every other entry kind. Read off the already-parsed typed
+/// record: no clone, no allocation.
+fn message_role_of(record: &FileEntryRecord) -> Option<MessageRole> {
+    match record.typed()? {
+        FileEntry::Message(entry) => match &entry.message {
+            AgentMessage::User(_) => Some(MessageRole::User),
+            AgentMessage::Assistant(_) => Some(MessageRole::Assistant),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 impl SessionManager {
@@ -1186,6 +1242,8 @@ impl SessionManager {
             labels_by_id: HashMap::new(),
             labels_order: Vec::new(),
             leaf_id: None,
+            message_counts: MessageRoleCounts::default(),
+            entry_total: 0,
         };
 
         if let Some(file) = session_file {
@@ -1321,6 +1379,8 @@ impl SessionManager {
         self.labels_by_id.clear();
         self.labels_order.clear();
         self.leaf_id = None;
+        self.message_counts = MessageRoleCounts::default();
+        self.entry_total = 0;
         self.flushed = false;
 
         self.session_file = None;
@@ -1361,9 +1421,17 @@ impl SessionManager {
         // Label ops are collected during the scan and applied afterwards so
         // the records borrow can end first (order of ops is replay order).
         let mut label_ops: Vec<(String, Option<String>, String)> = Vec::new();
+        self.message_counts = MessageRoleCounts::default();
+        self.entry_total = 0;
         for (i, record) in self.records.iter().enumerate() {
             if record.is_header() {
                 continue;
+            }
+            self.entry_total += 1;
+            // Counted before the id check: `get_entries()` keeps id-less
+            // records too, and the counts must agree with it exactly.
+            if let Some(role) = message_role_of(record) {
+                self.message_counts.add(role);
             }
             let Some(id) = record.entry_id() else {
                 continue;
@@ -1497,6 +1565,11 @@ impl SessionManager {
         let record = FileEntryRecord::from_typed(typed)?;
         let id = record.entry_id().unwrap_or_default().to_owned();
         let previous_leaf_id = self.leaf_id.clone();
+        let role = message_role_of(&record);
+        if let Some(role) = role {
+            self.message_counts.add(role);
+        }
+        self.entry_total += 1;
         self.records.push(record);
         self.by_id.insert(id.clone(), self.records.len() - 1);
         self.leaf_id = Some(id.clone());
@@ -1504,6 +1577,10 @@ impl SessionManager {
             self.records.pop();
             self.by_id.remove(&id);
             self.leaf_id = previous_leaf_id;
+            self.entry_total = self.entry_total.saturating_sub(1);
+            if let Some(role) = role {
+                self.message_counts.remove(role);
+            }
             return Err(error);
         }
         Ok(id)
@@ -2287,6 +2364,22 @@ impl SessionManager {
         self.by_id.len()
     }
 
+    /// Persisted user/assistant message counts in O(1) (V19-07 / R5.2.8):
+    /// unlike [`Self::get_entries`] this neither clones nor iterates entries,
+    /// so the statusline counts-only `ctx.sessionStats({countsOnly:true})`
+    /// probe costs the same on a short and on a multi-thousand-entry
+    /// session. The values equal counting `AgentMessage::{User, Assistant}`
+    /// over `get_entries()`.
+    pub fn message_counts(&self) -> MessageRoleCounts {
+        self.message_counts
+    }
+
+    /// `get_entries().len()` in O(1) (header excluded, id-less records
+    /// included), for the same counts-only probe.
+    pub fn entry_total(&self) -> u64 {
+        self.entry_total
+    }
+
     /// `getSessionFile` — `None` for in-memory sessions.
     pub fn get_session_file(&self) -> Option<&Path> {
         self.session_file.as_deref()
@@ -2515,6 +2608,8 @@ impl SessionManager {
                 labels_by_id: HashMap::new(),
                 labels_order: Vec::new(),
                 leaf_id: None,
+                message_counts: MessageRoleCounts::default(),
+                entry_total: 0,
             };
             let selected = source_manager.entries_to_fork(&options)?;
             let mut lines = Vec::new();
