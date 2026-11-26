@@ -240,8 +240,11 @@ async fn v19_counts_probe_bench_short_vs_long_history() {
     let mut runs = 0usize;
     let mut short_p95s = Vec::new();
     let mut long_p95s = Vec::new();
-    let mut short_allocs = u64::MAX;
-    let mut long_allocs = u64::MAX;
+    // Per-PROBE figures (batch totals divided by the batch's probe count),
+    // so every report line — per run and final — carries the same numbers
+    // as the budget assertions, even when later runs double the batch size.
+    let mut short_allocs_per_probe = u64::MAX;
+    let mut long_allocs_per_probe = u64::MAX;
     let mut short_bytes_per_probe = u64::MAX;
     let mut long_bytes_per_probe = u64::MAX;
     let mut report = String::new();
@@ -252,10 +255,14 @@ async fn v19_counts_probe_bench_short_vs_long_history() {
             let long_batch = run_batch(&long.session, probes_per_batch);
             short_p95s.push(short_batch.p95_ns);
             long_p95s.push(long_batch.p95_ns);
-            short_allocs = short_allocs.min(short_batch.allocations);
-            long_allocs = long_allocs.min(long_batch.allocations);
-            short_bytes_per_probe = short_bytes_per_probe.min(short_batch.allocated_bytes);
-            long_bytes_per_probe = long_bytes_per_probe.min(long_batch.allocated_bytes);
+            short_allocs_per_probe =
+                short_allocs_per_probe.min(short_batch.allocations / probes_per_batch);
+            long_allocs_per_probe =
+                long_allocs_per_probe.min(long_batch.allocations / probes_per_batch);
+            short_bytes_per_probe =
+                short_bytes_per_probe.min(short_batch.allocated_bytes / probes_per_batch);
+            long_bytes_per_probe =
+                long_bytes_per_probe.min(long_batch.allocated_bytes / probes_per_batch);
         }
         let short_median = median(&mut short_p95s.clone());
         let long_median = median(&mut long_p95s.clone());
@@ -270,9 +277,7 @@ async fn v19_counts_probe_bench_short_vs_long_history() {
                 || ratio_percent.saturating_sub(5) > BUDGET_PERCENT);
         report.push_str(&format!(
             "run {runs}: probes/batch {probes_per_batch}  short p95 {short_median} ns  long p95 {long_median} ns  ratio {ratio_percent}%  \
-             allocs/probe short {} long {}  bytes/probe short {short_bytes_per_probe} long {long_bytes_per_probe}\n",
-            short_allocs / probes_per_batch,
-            long_allocs / probes_per_batch,
+             allocs/probe short {short_allocs_per_probe} long {long_allocs_per_probe}  bytes/probe short {short_bytes_per_probe} long {long_bytes_per_probe}\n",
         ));
         if decided || runs >= 6 {
             break decided;
@@ -284,19 +289,12 @@ async fn v19_counts_probe_bench_short_vs_long_history() {
     // Percent of the short-history p95 (0 when the short p95 is below the
     // timer's resolution — then the run is not decidable and grows).
     let ratio_percent = percent_of(long_median, short_median);
-    // Temporary allocations per probe (the batch totals divided by the probe
-    // count) — the same figures the budget assertions below use.
-    let short_bytes_per_probe = short_bytes_per_probe / probes_per_batch;
-    let long_bytes_per_probe = long_bytes_per_probe / probes_per_batch;
     println!(
         "V19-07 counts-only probe bench\nshort history: {short_bytes} bytes, {base_entries} entries\n\
          long history: {long_bytes} bytes, {} entries ({} assistant messages)\n{report}\n\
          result: short p95 {short_median} ns, long p95 {long_median} ns, ratio {ratio_percent}% (budget ≤ {BUDGET_PERCENT}%), \
          allocations/probe short {} long {}, bytes/probe short {short_bytes_per_probe} long {long_bytes_per_probe}, decided={decided}, runs={runs}",
-        long_entries.0,
-        long_entries.2,
-        short_allocs / probes_per_batch,
-        long_allocs / probes_per_batch,
+        long_entries.0, long_entries.2, short_allocs_per_probe, long_allocs_per_probe,
     );
     // Temporary allocations must not grow with the entry count (per probe:
     // the two identity strings of the counts shape).
