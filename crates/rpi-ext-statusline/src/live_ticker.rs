@@ -118,6 +118,10 @@ pub struct LiveTicker {
     /// Whether any delta of the current message was fed (a policy change
     /// before the first delta is not a mid-stream switch).
     fed: bool,
+    /// Whether this message's `CountFallback` was already counted (once per
+    /// message: a rebuilt counter that falls back again is the same message
+    /// leaving the incremental path).
+    fallback_counted: bool,
     buckets: Option<Buckets>,
     exact: Option<ExactState>,
     pub stats: TickerStats,
@@ -140,8 +144,6 @@ fn unreachable_invariant(message: &'static str) -> ! {
 struct ExactState {
     tokenizer: Arc<Tokenizer>,
     counter: IncrementalCounter,
-    /// The CountFallback of this message was already counted.
-    reported_fallback: bool,
 }
 
 impl std::fmt::Debug for LiveTicker {
@@ -167,6 +169,16 @@ impl LiveTicker {
     /// are policy independent).
     fn drop_exact(&mut self) {
         self.exact = None;
+    }
+
+    /// Count a message's `CountFallback` once (R5.3.5: the MESSAGE leaves the
+    /// incremental path; a rebuilt counter that falls back again is the same
+    /// message).
+    fn note_fallback(&mut self, fell_back: bool) {
+        if fell_back && !self.fallback_counted {
+            self.fallback_counted = true;
+            self.stats.count_fallbacks += 1;
+        }
     }
 
     /// The byte base for [`LiveMeasure::unprocessed_text`] when the frame
@@ -220,6 +232,7 @@ impl LiveTicker {
             self.message_generation = 0;
             self.processed = [0; TIERS];
             self.fed = false;
+            self.fallback_counted = false;
             self.buckets = None;
             self.exact = None;
             self.policy = None;
@@ -250,6 +263,7 @@ impl LiveTicker {
             self.message_generation = message_generation;
             self.processed = [0; TIERS];
             self.fed = false;
+            self.fallback_counted = false;
             self.buckets = None;
             self.exact = None;
         }
@@ -342,6 +356,14 @@ impl LiveTicker {
                 self.rebuild_exact(&text, Some(loaded));
                 self.processed = [text[0].len(), text[1].len(), text[2].len()];
                 feed = Feed::Full(text);
+                // The rebuilt counter may already be past the open-piece
+                // bound (a very long first word): the message is on the
+                // fallback path from here on.
+                let fell_back = self
+                    .exact
+                    .as_ref()
+                    .is_some_and(|exact| exact.counter.fallback().is_some());
+                self.note_fallback(fell_back);
             }
         } else if let Some(exact) = self.exact.as_mut() {
             // `feed` is `Deltas` here: a rebuild tick dropped the counter
@@ -357,10 +379,8 @@ impl LiveTicker {
                 // review round 3).
                 self.processed[tier] += delta.len();
             }
-            if exact.counter.fallback().is_some() && !exact.reported_fallback {
-                exact.reported_fallback = true;
-                self.stats.count_fallbacks += 1;
-            }
+            let fell_back = exact.counter.fallback().is_some();
+            self.note_fallback(fell_back);
         }
         if self.exact.is_none() {
             // No exact counter (none needed, or none loadable): the base
@@ -382,7 +402,9 @@ impl LiveTicker {
                     self.fed = true;
                 }
             }
-            Feed::Full(_) => self.fed = true,
+            // An empty rebuild (a live tick before the first delta) does not
+            // make a later policy change a mid-stream switch.
+            Feed::Full(text) => self.fed |= text.iter().any(|text| !text.is_empty()),
         }
         let local = self.local_breakdown(
             policy,
@@ -428,11 +450,7 @@ impl LiveTicker {
         for (tier, text) in text.iter().enumerate() {
             counter.push(tier, text);
         }
-        self.exact = Some(ExactState {
-            tokenizer,
-            counter,
-            reported_fallback: false,
-        });
+        self.exact = Some(ExactState { tokenizer, counter });
     }
 
     /// The local breakdown for a streaming frame under the policy.
@@ -490,7 +508,9 @@ impl LiveTicker {
             return None;
         }
         let exact = self.exact.as_mut()?;
-        match exact.counter.finalize() {
+        let finalized = exact.counter.finalize();
+        let fell_back = exact.counter.fallback().is_some();
+        match finalized {
             Some(finalized) => {
                 if let Some(official) = official {
                     self.stats.finalize_comparisons += 1;
@@ -508,10 +528,7 @@ impl LiveTicker {
                 Some(finalized.total)
             }
             None => {
-                if !exact.reported_fallback {
-                    exact.reported_fallback = true;
-                    self.stats.count_fallbacks += 1;
-                }
+                self.note_fallback(fell_back);
                 None
             }
         }
@@ -1724,5 +1741,145 @@ mod tests {
                 failures.join("\n  ")
             );
         }
+    }
+
+    /// V19-07 review round 6: a live tick before the first delta rebuilds
+    /// from an EMPTY full text — that is not a fed message, so a policy
+    /// change before the first byte is still not a mid-stream switch.
+    #[test]
+    fn an_empty_rebuild_tick_does_not_make_a_later_switch_a_reset() {
+        let tokenizer = tokenizer_for_model(Some("glm-5.3")).expect("glm");
+        let loader = || Some(Arc::clone(&tokenizer));
+        let config = parse_items(
+            json!({"type": "items", "items": ["live-output-tokens"]})
+                .as_object()
+                .expect("object"),
+        );
+        let req = TokenRequirements::for_items(&config);
+        let mut ticker = LiveTicker::new();
+        let status = LiveStatus {
+            streaming: true,
+            ..LiveStatus::default()
+        };
+        let empty = [String::new(), String::new(), String::new()];
+        let view = ticker.live_view(
+            LiveFrameInput {
+                status: &status,
+                deltas: [String::new(), String::new(), String::new()],
+                session_generation: 1,
+                message_generation: 1,
+                policy: LiveCalculation::Auto,
+                requirements: req,
+                tokenizer: &loader,
+                settled: None,
+            },
+            || empty.clone(),
+        );
+        assert_eq!(view.tokens.expect("tokens").total, 0);
+        // Switch before the first byte: no CountReset.
+        let _ = ticker.live_view(
+            LiveFrameInput {
+                status: &status,
+                deltas: [String::new(), String::new(), String::new()],
+                session_generation: 1,
+                message_generation: 1,
+                policy: LiveCalculation::Estimate,
+                requirements: req,
+                tokenizer: &loader,
+                settled: None,
+            },
+            || empty.clone(),
+        );
+        assert_eq!(ticker.stats().count_resets, 0);
+        // After a real delta the switch counts once.
+        let full = ["hello".to_owned(), String::new(), String::new()];
+        let _ = ticker.live_view(
+            LiveFrameInput {
+                status: &status,
+                deltas: ["hello".to_owned(), String::new(), String::new()],
+                session_generation: 1,
+                message_generation: 1,
+                policy: LiveCalculation::Estimate,
+                requirements: req,
+                tokenizer: &loader,
+                settled: None,
+            },
+            || full.clone(),
+        );
+        let _ = ticker.live_view(
+            LiveFrameInput {
+                status: &status,
+                deltas: [String::new(), String::new(), String::new()],
+                session_generation: 1,
+                message_generation: 1,
+                policy: LiveCalculation::Auto,
+                requirements: req,
+                tokenizer: &loader,
+                settled: None,
+            },
+            || full.clone(),
+        );
+        assert_eq!(ticker.stats().count_resets, 1);
+    }
+
+    /// V19-07 review round 6: `CountFallback` is counted once per MESSAGE —
+    /// a message that falls back, is switched to estimate and back (the
+    /// counter is rebuilt and falls back again) still counts once.
+    #[test]
+    fn count_fallbacks_is_per_message() {
+        let tokenizer = tokenizer_for_model(Some("glm-5.3")).expect("glm");
+        let loader = || Some(Arc::clone(&tokenizer));
+        let config = parse_items(
+            json!({"type": "items", "items": ["live-output-tokens"]})
+                .as_object()
+                .expect("object"),
+        );
+        let req = TokenRequirements::for_items(&config);
+        let mut ticker = LiveTicker::new();
+        let status = LiveStatus {
+            streaming: true,
+            ..LiveStatus::default()
+        };
+        let word = "a".repeat(70_000);
+        let full = [word.clone(), String::new(), String::new()];
+        let tick = |ticker: &mut LiveTicker, policy: LiveCalculation, deltas: [String; TIERS]| {
+            ticker.live_view(
+                LiveFrameInput {
+                    status: &status,
+                    deltas,
+                    session_generation: 1,
+                    message_generation: 1,
+                    policy,
+                    requirements: req,
+                    tokenizer: &loader,
+                    settled: None,
+                },
+                || full.clone(),
+            )
+        };
+        tick(
+            &mut ticker,
+            LiveCalculation::Auto,
+            [word.clone(), String::new(), String::new()],
+        );
+        assert_eq!(ticker.stats().count_fallbacks, 1);
+        tick(
+            &mut ticker,
+            LiveCalculation::Estimate,
+            [String::new(), String::new(), String::new()],
+        );
+        tick(
+            &mut ticker,
+            LiveCalculation::Auto,
+            [String::new(), String::new(), String::new()],
+        );
+        assert_eq!(
+            ticker.stats().count_fallbacks,
+            1,
+            "the same message counts once"
+        );
+        // finalize also reports the fallback only once.
+        let _ = ticker.finalize_exact(None, 1);
+        assert_eq!(ticker.stats().count_fallbacks, 1);
     }
 }

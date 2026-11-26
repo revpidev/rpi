@@ -284,6 +284,10 @@ async fn v19_counts_probe_bench_short_vs_long_history() {
     // Percent of the short-history p95 (0 when the short p95 is below the
     // timer's resolution — then the run is not decidable and grows).
     let ratio_percent = percent_of(long_median, short_median);
+    // Temporary allocations per probe (the batch totals divided by the probe
+    // count) — the same figures the budget assertions below use.
+    let short_bytes_per_probe = short_bytes_per_probe / probes_per_batch;
+    let long_bytes_per_probe = long_bytes_per_probe / probes_per_batch;
     println!(
         "V19-07 counts-only probe bench\nshort history: {short_bytes} bytes, {base_entries} entries\n\
          long history: {long_bytes} bytes, {} entries ({} assistant messages)\n{report}\n\
@@ -296,8 +300,6 @@ async fn v19_counts_probe_bench_short_vs_long_history() {
     );
     // Temporary allocations must not grow with the entry count (per probe:
     // the two identity strings of the counts shape).
-    let short_bytes_per_probe = short_bytes_per_probe / probes_per_batch;
-    let long_bytes_per_probe = long_bytes_per_probe / probes_per_batch;
     println!(
         "bytes per probe: short {short_bytes_per_probe}, long {long_bytes_per_probe};          short p95 {short_median} ns, long p95 {long_median} ns, ratio {ratio_percent}%"
     );

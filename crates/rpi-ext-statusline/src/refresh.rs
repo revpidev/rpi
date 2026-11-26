@@ -207,11 +207,12 @@ pub async fn refresh_loop(
                 }
             }
             Trigger::Live => {
-                // One settings read per live event (the switch was already
-                // re-read here): also reconcile the subscriptions and the
-                // engine's live caches on the FIRST live event of a stream,
+                // The FIRST live event of a stream reads the settings once and
+                // reconciles the subscriptions and the engine's live caches,
                 // so a configuration change (e.g. to command mode) is in
-                // effect before the stream's `message_end` can probe.
+                // effect before the stream's `message_end` can probe; later
+                // live events of the same stream only keep the cadence (the
+                // switch itself is re-read on every live tick).
                 if live_deadline.is_none() {
                     let settings = config::load_settings_snapshot();
                     crate::reconcile_subscriptions(&calls, &settings);
@@ -529,8 +530,9 @@ fn drain_triggers(rx: &mut UnboundedReceiver<Trigger>) -> (bool, bool) {
     }
 }
 
-/// Whether the current configuration enables live measurement (both modes
-/// are read from the current settings on every tick).
+/// Whether the given settings snapshot enables live measurement (the caller
+/// supplies the snapshot it read for the current tick; both modes use the
+/// same rule).
 fn live_currently_enabled(settings: &config::SettingsSnapshot) -> bool {
     match settings.status_line.as_ref() {
         Some(StatusLine::Command(config)) => config.live_tokens.enabled,
