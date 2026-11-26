@@ -12562,8 +12562,17 @@ mod tests {
     async fn startup_notices_show_whats_new_for_rc_to_rc_on_the_same_base() {
         let (mut mode, _terminal, session) = mode_harness().await;
         let base = VERSION.split('-').next().unwrap_or(VERSION);
+        // The previous RC on the same base must differ from the running build
+        // (an exact match is deduplicated); the first RC of a base is the
+        // lowest prerelease, so a `-rc.1` workspace uses `rc.0` as its
+        // predecessor instead of itself.
+        let previous = if VERSION == format!("{base}-rc.1") {
+            format!("{base}-rc.0")
+        } else {
+            format!("{base}-rc.1")
+        };
         session.settings_manager(|settings| {
-            settings.set_last_changelog_version(&format!("{base}-rc.1"));
+            settings.set_last_changelog_version(&previous);
         });
         mode.init().await;
 
