@@ -207,12 +207,19 @@ pub async fn refresh_loop(
                 }
             }
             Trigger::Live => {
-                if !live_currently_enabled() {
-                    continue;
-                }
-                // Arm the streaming ticker (idempotent): the first live
-                // bookkeeping of a stream starts the refreshMs cadence.
+                // One settings read per live event (the switch was already
+                // re-read here): also reconcile the subscriptions and the
+                // engine's live caches on the FIRST live event of a stream,
+                // so a configuration change (e.g. to command mode) is in
+                // effect before the stream's `message_end` can probe.
                 if live_deadline.is_none() {
+                    let settings = config::load_settings_snapshot();
+                    crate::reconcile_subscriptions(&calls, &settings);
+                    if !live_currently_enabled(&settings) {
+                        continue;
+                    }
+                    // Arm the streaming ticker (idempotent): the first live
+                    // bookkeeping of a stream starts the refreshMs cadence.
                     live_deadline = Some(Instant::now() + live_refresh_interval());
                 }
             }
@@ -432,11 +439,11 @@ pub async fn refresh_loop(
                     }
                     break;
                 }
-                if saw_live && live_deadline.is_none() && live_currently_enabled() {
-                    live_deadline = Some(Instant::now() + live_refresh_interval());
-                }
                 let settings = config::load_settings_snapshot();
                 crate::reconcile_subscriptions(&calls, &settings);
+                if saw_live && live_deadline.is_none() && live_currently_enabled(&settings) {
+                    live_deadline = Some(Instant::now() + live_refresh_interval());
+                }
                 match settings.status_line.as_ref() {
                     None => {
                         if let Some(token) = inflight.take() {
@@ -524,9 +531,8 @@ fn drain_triggers(rx: &mut UnboundedReceiver<Trigger>) -> (bool, bool) {
 
 /// Whether the current configuration enables live measurement (both modes
 /// are read from the current settings on every tick).
-fn live_currently_enabled() -> bool {
-    let snapshot = config::load_settings_snapshot();
-    match snapshot.status_line {
+fn live_currently_enabled(settings: &config::SettingsSnapshot) -> bool {
+    match settings.status_line.as_ref() {
         Some(StatusLine::Command(config)) => config.live_tokens.enabled,
         Some(StatusLine::Items(items)) => items.live_enabled(),
         None => false,

@@ -644,7 +644,14 @@ fn v19_live_total_policies_probe_and_switches() {
         "placement": "status",
         "liveTokens": {"refreshMs": 300},
     }));
-    let _ = next_frame(frames(), "config change to command mode");
+    // Wait for the command script's own frame: it is published by the poll
+    // tick that also reconciled the subscriptions and the engine's live
+    // caches, so the `message_end` below is judged in command mode (an
+    // items interval frame published before that reconcile would leave a
+    // transitional window in which the dispatch cache still says items).
+    let _ = poll_until("command mode frame (script output)", |records| {
+        last_status(records) == "hi"
+    });
     start_message();
     delta("command mode", Some(3));
     end_message(Some(33), None);
