@@ -2320,7 +2320,12 @@ impl DefaultPackageManager {
 
         // Write the marker before resetting; cleaned up on successful
         // clean+install (b06dc76fd).
-        let _ = std::fs::write(&marker_path, "");
+        std::fs::write(&marker_path, "").map_err(|error| {
+            format!(
+                "Could not write Git update recovery marker {}: {error}",
+                marker_path.display()
+            )
+        })?;
 
         self.runner.run(
             &CommandRequest::new("git", &["reset", "--hard", &commit_ref]).with_cwd(target_dir),
@@ -6590,6 +6595,38 @@ mod tests {
             .unwrap();
         // After successful update, marker should not exist.
         assert!(!marker.exists(), "marker should be cleaned after update");
+    }
+
+    #[test]
+    fn test_install_git_does_not_reset_when_recovery_marker_cannot_be_written() {
+        let dirs = TestDirs::new();
+        let target = dirs.agent_dir.join("git/github.com/user/repo");
+        write_file(&target.join("package.json"), "{}");
+        let marker = target.parent().unwrap().join(".repo.rpi-update-incomplete");
+        std::fs::create_dir(&marker).unwrap();
+
+        let runner = FakeRunner::new(|request| {
+            if request.command == "git"
+                && request.args.first().map(String::as_str) == Some("rev-parse")
+            {
+                let commit = if request.args.iter().any(|arg| arg == "HEAD") {
+                    "a"
+                } else {
+                    "b"
+                };
+                return Ok(commit.repeat(40));
+            }
+            Ok(String::new())
+        });
+        let manager = test_manager(&dirs, runner.clone());
+        let error = manager
+            .install("git:github.com/user/repo@v1", false)
+            .expect_err("update must stop when writing the recovery marker fails");
+
+        assert!(error.contains(&marker.display().to_string()), "{error}");
+        assert!(runner.find_calls("git", "reset").is_empty());
+        assert!(runner.find_calls("git", "clean").is_empty());
+        assert!(runner.find_calls("npm", "install").is_empty());
     }
 
     #[test]

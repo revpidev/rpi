@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Git extension updates stop before resetting the checkout if rpi cannot write the recovery marker. The error identifies the marker path.
+
 ## [0.1.8] - 2026-11-12
 
 ### Main line
