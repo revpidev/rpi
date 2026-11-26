@@ -244,35 +244,18 @@ impl LiveTicker {
         let provider_suffices = policy == LiveCalculation::Auto
             && !requirements.needs_tiers
             && provider_streaming.is_some_and(|total| total > 0);
-        // Policy switch mid-stream: discard the old policy's counter state
-        // and rebuild ONCE from the shared full text (CountReset). A change
-        // noticed before the first delta of a message has nothing to rebuild.
+        let mut deltas = deltas;
+        // Policy switch mid-stream (CountReset): the old policy's counter
+        // state is discarded — the exact counter always goes (no BPE under
+        // `estimate`; under `auto` it is rebuilt from the full text below),
+        // and auto → estimate also drops the buckets so they are rebuilt
+        // from the shared full text by the rule below. A change noticed
+        // before the first delta of a message has nothing to rebuild.
         let switched = self.policy.is_some_and(|previous| previous != policy);
         if switched && self.fed {
-            if let Some(previous) = self.policy {
-                match (previous, policy) {
-                    // auto → estimate: no BPE ever again this message; the
-                    // Han/other buckets are rebuilt from the full text.
-                    (LiveCalculation::Auto, LiveCalculation::Estimate) => {
-                        self.drop_exact();
-                        self.buckets = None;
-                        let text = full_text();
-                        let mut buckets = Buckets::default();
-                        for (tier, text) in text.iter().enumerate() {
-                            buckets.push(tier, text);
-                        }
-                        self.buckets = Some(buckets);
-                    }
-                    // estimate → auto: adopt the provider's streaming exact
-                    // total directly when there is one and no tier is needed;
-                    // otherwise rebuild the local counter from the full text
-                    // (one pass, one BPE run over the message so far).
-                    (LiveCalculation::Estimate, LiveCalculation::Auto) if !provider_suffices => {
-                        let text = full_text();
-                        self.rebuild_exact(&text, tokenizer());
-                    }
-                    _ => {}
-                }
+            self.drop_exact();
+            if self.policy == Some(LiveCalculation::Auto) && policy == LiveCalculation::Estimate {
+                self.buckets = None;
             }
             self.stats.count_resets += 1;
             tracing::info!(
@@ -282,7 +265,20 @@ impl LiveTicker {
             );
         }
         self.policy = Some(policy);
-        // Feed the new bytes to the policy-independent buckets.
+        // Rebuild rule: the heuristic buckets are needed but were not fed
+        // from the first byte of this message (a live row was selected
+        // mid-message, or the policy switched to `estimate`) — restart from
+        // the shared full text so every counter sees the whole message
+        // exactly once. The normal path below then feeds the full text to
+        // the buckets, rebuilds the exact counter when needed, and advances
+        // the base to the text length.
+        if local_needed && self.buckets.is_none() && self.processed != [0; TIERS] {
+            let text = full_text();
+            self.processed = [0; TIERS];
+            self.drop_exact();
+            deltas = [text[0].clone(), text[1].clone(), text[2].clone()];
+        }
+        // The heuristic buckets are policy independent: every delta feeds them.
         if local_needed {
             let buckets = self.buckets.get_or_insert_with(Buckets::default);
             for (tier, delta) in deltas.iter().enumerate() {
@@ -1071,5 +1067,502 @@ mod tests {
         let official = tokenizer.count(&text);
         assert_eq!(ticker.finalize_exact(Some(official), 1), Some(official));
         assert_eq!(ticker.stats().finalize_mismatches, 0);
+    }
+
+    /// Round-4 review probes (adopted): driven exactly like `refresh.rs::items_live_view`: the base is read
+    // from `processed_for(sg, mg)` before the tick, the deltas are
+    // `text[base..]`, and `full_text` hands the ticker the whole message.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProbeExpect {
+        Official,
+        Heuristic,
+        ProviderOnly,
+    }
+
+    fn probe_requirements(tiers: bool, live: bool) -> TokenRequirements {
+        let mut items = vec!["streaming".to_owned()];
+        if live {
+            items.extend([
+                "live-output-tokens".to_owned(),
+                "live-output-rate".to_owned(),
+                "live-total-tokens".to_owned(),
+            ]);
+        }
+        if tiers {
+            items.extend([
+                "live-text-tokens".to_owned(),
+                "live-thinking-tokens".to_owned(),
+                "live-toolcall-tokens".to_owned(),
+            ]);
+        }
+        TokenRequirements::for_items(&parse_items(
+            json!({"type": "items", "items": items})
+                .as_object()
+                .expect("object"),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn probe_tick(
+        ticker: &mut LiveTicker,
+        tokenizer: &Arc<Tokenizer>,
+        full: &[String; 3],
+        provider: Option<u64>,
+        policy: LiveCalculation,
+        req: TokenRequirements,
+    ) -> LiveView {
+        let base = ticker.processed_for(1, 1);
+        // A base past the text or off a char boundary is itself an
+        // inconsistency; feed nothing rather than panicking so the table
+        // lists every tick.
+        let deltas = std::array::from_fn(|tier| {
+            if base[tier] <= full[tier].len() && full[tier].is_char_boundary(base[tier]) {
+                full[tier][base[tier]..].to_owned()
+            } else {
+                String::new()
+            }
+        });
+        let status = LiveStatus {
+            streaming: true,
+            output_tokens: provider,
+            ..LiveStatus::default()
+        };
+        let loader = || Some(Arc::clone(tokenizer));
+        let snapshot = full.clone();
+        ticker.live_view(
+            LiveFrameInput {
+                status: &status,
+                deltas,
+                session_generation: 1,
+                message_generation: 1,
+                policy,
+                requirements: req,
+                tokenizer: &loader,
+                settled: None,
+            },
+            || snapshot.clone(),
+        )
+    }
+
+    fn probe_check(
+        ticker: &LiveTicker,
+        view: &LiveView,
+        tokenizer: &Tokenizer,
+        full: &[String; 3],
+        provider: Option<u64>,
+        expect: ProbeExpect,
+        label: &str,
+    ) -> Result<String, String> {
+        let lens = [full[0].len(), full[1].len(), full[2].len()];
+        let processed = ticker.processed_for(1, 1);
+        let mut problems = Vec::new();
+        if processed != lens {
+            problems.push(format!("processed {processed:?} != text lengths {lens:?}"));
+        }
+        let tokens = view.tokens.expect("tokens");
+        let line = format!(
+            "{label:<40} {:<8} provider={:<4} local={:<5} {:<14} processed={processed:?}",
+            format!("{:?}", view.policy),
+            format!("{provider:?}"),
+            tokens.total,
+            format!("{:?}", tokens.source),
+        );
+        match expect {
+            ProbeExpect::Official => {
+                let official = TokenBreakdown::from_tiers(
+                    tokenizer.count(&full[0]),
+                    tokenizer.count(&full[1]),
+                    tokenizer.count(&full[2]),
+                    TokenSource::ExactTokenizer,
+                );
+                if (tokens.text, tokens.thinking, tokens.toolcall)
+                    != (official.text, official.thinking, official.toolcall)
+                {
+                    problems.push(format!(
+                        "local tiers ({},{},{}) != official ({},{},{})",
+                        tokens.text,
+                        tokens.thinking,
+                        tokens.toolcall,
+                        official.text,
+                        official.thinking,
+                        official.toolcall
+                    ));
+                }
+                if tokens.source != TokenSource::ExactTokenizer {
+                    problems.push(format!("source {:?}", tokens.source));
+                }
+            }
+            ProbeExpect::Heuristic => {
+                let heuristic = tokens::heuristic_breakdown(&full[0], &full[1], &full[2]);
+                if (tokens.text, tokens.thinking, tokens.toolcall)
+                    != (heuristic.text, heuristic.thinking, heuristic.toolcall)
+                {
+                    problems.push(format!(
+                        "local tiers ({},{},{}) != heuristic ({},{},{})",
+                        tokens.text,
+                        tokens.thinking,
+                        tokens.toolcall,
+                        heuristic.text,
+                        heuristic.thinking,
+                        heuristic.toolcall
+                    ));
+                }
+                if tokens.source != TokenSource::Estimated {
+                    problems.push(format!("source {:?}", tokens.source));
+                }
+            }
+            ProbeExpect::ProviderOnly => {
+                if tokens.total != 0 {
+                    problems.push(format!("local split {} is not empty", tokens.total));
+                }
+                if view.output_tokens != provider {
+                    problems.push(format!(
+                        "view.output_tokens {:?} != {provider:?}",
+                        view.output_tokens
+                    ));
+                }
+            }
+        }
+        if problems.is_empty() {
+            Ok(line)
+        } else {
+            Err(format!("{line}  ← {}", problems.join("; ")))
+        }
+    }
+
+    /// One message, 14 ticks: auto → estimate → auto, the provider starts
+    /// and stops reporting mid-stream, tier rows are selected and
+    /// deselected, idle ticks in between. Every frame's local value must be
+    /// the official count (auto, local needed), the heuristic (estimate) or
+    /// the empty split under a sufficient provider total; the base must
+    /// equal the text lengths after every tick.
+    #[test]
+    fn fourteen_ticks_policy_provider_and_tier_switches_stay_consistent() {
+        let tokenizer = tokenizer_for_model(Some("glm-5.3")).expect("glm");
+        let plain = probe_requirements(false, true);
+        let tiers = probe_requirements(true, true);
+        let mut ticker = LiveTicker::new();
+        let mut full = [String::new(), String::new(), String::new()];
+        let text = [
+            "The quick brown fox jumps over the lazy dog. ",
+            "你好世界，这是一个较长的回答。",
+            " It continues with **Markdown**, `code` and ",
+            "JSON: {\"a\": [1, 2, 3], \"b\": \"你好\"}. ",
+            "The final piece of the answer. 结束。",
+        ];
+        let think = ["Let me think about this. ", "先分析问题，", "then decide. "];
+        let tool = [
+            "{\"name\": \"read\", \"path\": ",
+            "\"/tmp/a.txt\", \"limit\": 10}",
+        ];
+        let mut lines = Vec::new();
+        let mut failures = Vec::new();
+        let mut tick = |label: &str,
+                        push: &[&str; 3],
+                        provider: Option<u64>,
+                        policy: LiveCalculation,
+                        req: TokenRequirements,
+                        expect: ProbeExpect| {
+            for (tier, piece) in push.iter().enumerate() {
+                full[tier].push_str(piece);
+            }
+            let view = probe_tick(&mut ticker, &tokenizer, &full, provider, policy, req);
+            match probe_check(&ticker, &view, &tokenizer, &full, provider, expect, label) {
+                Ok(line) => lines.push(line),
+                Err(line) => failures.push(line),
+            }
+        };
+        tick(
+            "t01 auto first delta",
+            &[text[0], think[0], tool[0]],
+            None,
+            LiveCalculation::Auto,
+            plain,
+            ProbeExpect::Official,
+        );
+        tick(
+            "t02 auto delta",
+            &[text[1], "", ""],
+            None,
+            LiveCalculation::Auto,
+            plain,
+            ProbeExpect::Official,
+        );
+        tick(
+            "t03 auto delta",
+            &[text[2], think[1], ""],
+            None,
+            LiveCalculation::Auto,
+            plain,
+            ProbeExpect::Official,
+        );
+        tick(
+            "t04 auto idle",
+            &["", "", ""],
+            None,
+            LiveCalculation::Auto,
+            plain,
+            ProbeExpect::Official,
+        );
+        tick(
+            "t05 SWITCH auto→estimate +delta",
+            &[text[3], "", tool[1]],
+            None,
+            LiveCalculation::Estimate,
+            plain,
+            ProbeExpect::Heuristic,
+        );
+        tick(
+            "t06 estimate delta",
+            &["", think[2], ""],
+            None,
+            LiveCalculation::Estimate,
+            plain,
+            ProbeExpect::Heuristic,
+        );
+        tick(
+            "t07 estimate idle",
+            &["", "", ""],
+            None,
+            LiveCalculation::Estimate,
+            plain,
+            ProbeExpect::Heuristic,
+        );
+        tick(
+            "t08 estimate + provider starts",
+            &[text[4], "", ""],
+            Some(900),
+            LiveCalculation::Estimate,
+            plain,
+            ProbeExpect::Heuristic,
+        );
+        tick(
+            "t09 estimate provider idle",
+            &["", "", ""],
+            Some(900),
+            LiveCalculation::Estimate,
+            plain,
+            ProbeExpect::Heuristic,
+        );
+        tick(
+            "t10 SWITCH est→auto provider",
+            &["", "", ""],
+            Some(900),
+            LiveCalculation::Auto,
+            plain,
+            ProbeExpect::ProviderOnly,
+        );
+        tick(
+            "t11 auto tier rows SELECTED",
+            &["", "", ""],
+            Some(900),
+            LiveCalculation::Auto,
+            tiers,
+            ProbeExpect::Official,
+        );
+        tick(
+            "t12 auto tier rows deselected",
+            &["", "", ""],
+            Some(900),
+            LiveCalculation::Auto,
+            plain,
+            ProbeExpect::ProviderOnly,
+        );
+        tick(
+            "t13 auto provider STOPS",
+            &["", "", ""],
+            None,
+            LiveCalculation::Auto,
+            plain,
+            ProbeExpect::Official,
+        );
+        tick(
+            "t14 auto idle",
+            &["", "", ""],
+            None,
+            LiveCalculation::Auto,
+            plain,
+            ProbeExpect::Official,
+        );
+        let official =
+            tokenizer.count(&full[0]) + tokenizer.count(&full[1]) + tokenizer.count(&full[2]);
+        let finalized = ticker.finalize_exact(Some(official), 1);
+        for line in &lines {
+            eprintln!("  OK   {line}");
+        }
+        for line in &failures {
+            eprintln!("  FAIL {line}");
+        }
+        eprintln!(
+            "  stats {:?} finalized {finalized:?} official {official}",
+            ticker.stats()
+        );
+        assert_eq!(ticker.stats().count_resets, 2, "two mid-stream switches");
+        assert!(
+            failures.is_empty(),
+            "{} inconsistent frame(s):\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
+        assert_eq!(finalized, Some(official));
+        assert_eq!(ticker.stats().finalize_mismatches, 0);
+    }
+
+    /// One message without any provider total: auto → estimate → auto with
+    /// NEW BYTES on both switch ticks (the way a refresh tick lands on a
+    /// streaming message).
+    #[test]
+    fn switch_ticks_that_carry_deltas_rebuild_from_the_full_text() {
+        let tokenizer = tokenizer_for_model(Some("glm-5.3")).expect("glm");
+        let plain = probe_requirements(false, true);
+        let mut ticker = LiveTicker::new();
+        let mut full = [String::new(), String::new(), String::new()];
+        let text = [
+            "The quick brown fox jumps over the lazy dog. ",
+            "你好世界，这是一个较长的回答。",
+            " It continues with **Markdown**, `code` and ",
+            "JSON: {\"a\": [1, 2, 3], \"b\": \"你好\"}. ",
+            "The final piece of the answer. 结束。",
+        ];
+        let think = ["Let me think about this. ", "先分析问题，", "then decide. "];
+        let tool = [
+            "{\"name\": \"read\", \"path\": ",
+            "\"/tmp/a.txt\", \"limit\": 10}",
+        ];
+        let mut lines = Vec::new();
+        let mut failures = Vec::new();
+        let mut tick =
+            |label: &str, push: &[&str; 3], policy: LiveCalculation, expect: ProbeExpect| {
+                for (tier, piece) in push.iter().enumerate() {
+                    full[tier].push_str(piece);
+                }
+                let view = probe_tick(&mut ticker, &tokenizer, &full, None, policy, plain);
+                match probe_check(&ticker, &view, &tokenizer, &full, None, expect, label) {
+                    Ok(line) => lines.push(line),
+                    Err(line) => failures.push(line),
+                }
+            };
+        tick(
+            "u01 auto first delta",
+            &[text[0], think[0], ""],
+            LiveCalculation::Auto,
+            ProbeExpect::Official,
+        );
+        tick(
+            "u02 auto delta",
+            &[text[1], "", ""],
+            LiveCalculation::Auto,
+            ProbeExpect::Official,
+        );
+        tick(
+            "u03 SWITCH auto→estimate +delta",
+            &[text[2], think[1], ""],
+            LiveCalculation::Estimate,
+            ProbeExpect::Heuristic,
+        );
+        tick(
+            "u04 estimate delta",
+            &[text[3], "", ""],
+            LiveCalculation::Estimate,
+            ProbeExpect::Heuristic,
+        );
+        tick(
+            "u05 SWITCH est→auto +delta",
+            &[text[4], think[2], tool[0]],
+            LiveCalculation::Auto,
+            ProbeExpect::Official,
+        );
+        tick(
+            "u06 auto delta",
+            &["", "", tool[1]],
+            LiveCalculation::Auto,
+            ProbeExpect::Official,
+        );
+        tick(
+            "u07 auto idle",
+            &["", "", ""],
+            LiveCalculation::Auto,
+            ProbeExpect::Official,
+        );
+        let official =
+            tokenizer.count(&full[0]) + tokenizer.count(&full[1]) + tokenizer.count(&full[2]);
+        let finalized = ticker.finalize_exact(Some(official), 1);
+        for line in &lines {
+            eprintln!("  OK   {line}");
+        }
+        for line in &failures {
+            eprintln!("  FAIL {line}");
+        }
+        eprintln!(
+            "  stats {:?} finalized {finalized:?} official {official}",
+            ticker.stats()
+        );
+        assert!(
+            failures.is_empty(),
+            "{} inconsistent frame(s):\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
+        assert_eq!(finalized, Some(official));
+        assert_eq!(ticker.stats().finalize_mismatches, 0);
+    }
+
+    /// Edge next to the tier rows: a live field is selected mid-message
+    /// while the rows before it selected nothing live (no counter), under
+    /// both policies.
+    #[test]
+    fn a_live_field_selected_mid_message_counts_the_whole_message() {
+        let tokenizer = tokenizer_for_model(Some("glm-5.3")).expect("glm");
+        let nothing = probe_requirements(false, false);
+        let plain = probe_requirements(false, true);
+        for policy in [LiveCalculation::Estimate, LiveCalculation::Auto] {
+            let mut ticker = LiveTicker::new();
+            let mut full = [String::new(), String::new(), String::new()];
+            let mut lines = Vec::new();
+            let mut failures = Vec::new();
+            let expect = if policy == LiveCalculation::Estimate {
+                ProbeExpect::Heuristic
+            } else {
+                ProbeExpect::Official
+            };
+            // Two ticks with no live field selected, then the field is
+            // selected with new bytes on that very tick, then one more.
+            for (index, (piece, req)) in [
+                ("Alpha beta gamma delta ", nothing),
+                ("epsilon zeta eta. 汉字汉字", nothing),
+                ("theta iota kappa. 更多汉字", plain),
+                (" lambda mu nu. 结束", plain),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                full[0].push_str(piece);
+                let view = probe_tick(&mut ticker, &tokenizer, &full, None, policy, req);
+                let label = format!("v{:02} {:?} live={}", index + 1, policy, req.needs_total);
+                let expect_here = if req.needs_total {
+                    expect
+                } else {
+                    ProbeExpect::ProviderOnly
+                };
+                // ProviderOnly asserts `view.output_tokens == provider`
+                // (both `None` here) and an empty local split.
+                match probe_check(&ticker, &view, &tokenizer, &full, None, expect_here, &label) {
+                    Ok(line) => lines.push(line),
+                    Err(line) => failures.push(line),
+                }
+            }
+            for line in &lines {
+                eprintln!("  OK   {line}");
+            }
+            for line in &failures {
+                eprintln!("  FAIL {line}");
+            }
+            assert!(
+                failures.is_empty(),
+                "{policy:?}: {} inconsistent frame(s):\n  {}",
+                failures.len(),
+                failures.join("\n  ")
+            );
+        }
     }
 }
