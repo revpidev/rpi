@@ -123,6 +123,20 @@ pub struct LiveTicker {
     pub stats: TickerStats,
 }
 
+/// What one tick feeds the counters.
+enum Feed {
+    /// The bytes past the base (`items_live_view`'s `unprocessed_text`).
+    Deltas([String; TIERS]),
+    /// The shared full-text snapshot of a rebuild tick.
+    Full([String; 3]),
+}
+
+#[cold]
+fn unreachable_invariant(message: &'static str) -> ! {
+    // A violated invariant is a bug: fail loudly instead of guessing a count.
+    panic!("{message}")
+}
+
 struct ExactState {
     tokenizer: Arc<Tokenizer>,
     counter: IncrementalCounter,
@@ -244,7 +258,11 @@ impl LiveTicker {
         let provider_suffices = policy == LiveCalculation::Auto
             && !requirements.needs_tiers
             && provider_streaming.is_some_and(|total| total > 0);
-        let mut deltas = deltas;
+        // What this tick feeds the counters: the bytes past the base, or —
+        // on a rebuild tick — the shared full text (taken ONCE per tick and
+        // reused for the buckets and the exact counter, so both always see
+        // the same snapshot).
+        let mut feed = Feed::Deltas(deltas);
         // Policy switch mid-stream (CountReset): the old policy's counter
         // state is discarded — the exact counter always goes (no BPE under
         // `estimate`; under `auto` it is rebuilt from the full text below),
@@ -273,17 +291,32 @@ impl LiveTicker {
         // the buckets, rebuilds the exact counter when needed, and advances
         // the base to the text length.
         if local_needed && self.buckets.is_none() && self.processed != [0; TIERS] {
-            let text = full_text();
             self.processed = [0; TIERS];
             self.drop_exact();
-            deltas = [text[0].clone(), text[1].clone(), text[2].clone()];
+            feed = Feed::Full(full_text());
         }
-        // The heuristic buckets are policy independent: every delta feeds them.
+        // The heuristic buckets are policy independent and are fed every
+        // byte of the message while a local number is needed. A frame that
+        // needs no local number (the `streaming` item alone keeps the tick
+        // alive) cannot vouch for its bytes: the buckets are dropped so a
+        // later selection restarts from the shared full text (V19-07 review
+        // round 5).
         if local_needed {
             let buckets = self.buckets.get_or_insert_with(Buckets::default);
-            for (tier, delta) in deltas.iter().enumerate() {
-                buckets.push(tier, delta);
+            match &feed {
+                Feed::Deltas(deltas) => {
+                    for (tier, delta) in deltas.iter().enumerate() {
+                        buckets.push(tier, delta);
+                    }
+                }
+                Feed::Full(text) => {
+                    for (tier, text) in text.iter().enumerate() {
+                        buckets.push(tier, text);
+                    }
+                }
             }
+        } else {
+            self.buckets = None;
         }
         // The exact counter runs only under `auto`, only when a local number
         // is needed and the provider total does not suffice — the tokenizer
@@ -300,12 +333,22 @@ impl LiveTicker {
             if let Some(loaded) = tokenizer() {
                 // First local number of this message, or the family tokenizer
                 // just became needed again: one rebuild pass over the message
-                // so far (the deltas of this tick are already in it).
-                let text = full_text();
+                // so far (this tick's bytes are already in it) on the same
+                // snapshot the buckets saw.
+                let text = match feed {
+                    Feed::Full(text) => text,
+                    Feed::Deltas(_) => full_text(),
+                };
                 self.rebuild_exact(&text, Some(loaded));
                 self.processed = [text[0].len(), text[1].len(), text[2].len()];
+                feed = Feed::Full(text);
             }
         } else if let Some(exact) = self.exact.as_mut() {
+            // `feed` is `Deltas` here: a rebuild tick dropped the counter
+            // and the branch above rebuilt it.
+            let Feed::Deltas(deltas) = &feed else {
+                unreachable_invariant("an exact counter never survives a rebuild tick")
+            };
             for (tier, delta) in deltas.iter().enumerate() {
                 exact.counter.push(tier, delta);
                 // The base advances with every byte fed to the counter: the
@@ -320,16 +363,34 @@ impl LiveTicker {
             }
         }
         if self.exact.is_none() {
-            for (index, delta) in deltas.iter().enumerate() {
-                self.processed[index] += delta.len();
+            // No exact counter (none needed, or none loadable): the base
+            // follows the bytes this tick accounted for.
+            match &feed {
+                Feed::Deltas(deltas) => {
+                    for (index, delta) in deltas.iter().enumerate() {
+                        self.processed[index] += delta.len();
+                    }
+                }
+                Feed::Full(text) => {
+                    self.processed = [text[0].len(), text[1].len(), text[2].len()];
+                }
             }
         }
-        for delta in deltas.iter() {
-            if !delta.is_empty() {
-                self.fed = true;
+        match &feed {
+            Feed::Deltas(deltas) => {
+                if deltas.iter().any(|delta| !delta.is_empty()) {
+                    self.fed = true;
+                }
             }
+            Feed::Full(_) => self.fed = true,
         }
-        let local = self.local_breakdown(policy, requirements, provider_suffices, &mut full_text);
+        let local = self.local_breakdown(
+            policy,
+            requirements,
+            provider_suffices,
+            &feed,
+            &mut full_text,
+        );
         LiveView {
             streaming: true,
             output_tokens: status.output_tokens,
@@ -380,6 +441,7 @@ impl LiveTicker {
         policy: LiveCalculation,
         requirements: TokenRequirements,
         provider_suffices: bool,
+        feed: &Feed,
         full_text: &mut impl FnMut() -> [String; 3],
     ) -> TokenBreakdown {
         let local_needed = requirements.needs_total || requirements.needs_tiers;
@@ -397,11 +459,15 @@ impl LiveTicker {
             Some(exact) => match exact.counter.provisional() {
                 Some(provisional) => provisional,
                 // CountFallback: full recount at refresh cadence (the
-                // message left the incremental path), never a wrong number.
-                None => {
-                    let text = full_text();
-                    exact.tokenizer.count_tiers(&text[0], &text[1], &text[2])
-                }
+                // message left the incremental path), never a wrong number —
+                // on this tick's snapshot when one was taken.
+                None => match feed {
+                    Feed::Full(text) => exact.tokenizer.count_tiers(&text[0], &text[1], &text[2]),
+                    Feed::Deltas(_) => {
+                        let text = full_text();
+                        exact.tokenizer.count_tiers(&text[0], &text[1], &text[2])
+                    }
+                },
             },
             // No local exact counter: the provider total suffices (an empty
             // local split; `with_provider_total` places the total), or no
@@ -489,7 +555,7 @@ mod tests {
     /// evaluations counted by the tokenizer. `--ignored --release --nocapture`.
     #[test]
     #[ignore = "counting benchmark leg; run explicitly with --ignored --nocapture"]
-    fn v19_counting_bench_ticker_protocol_leg() {
+    fn ticker_protocol_counting_bench() {
         let text: String = "The assistant explains: 这是一个较长的回答 with **Markdown**, `code`, \
 \"json\": {\"a\": [1, 2, 3]}\n\n- list item 1\n- item 2\n"
             .repeat(60);
@@ -1560,6 +1626,100 @@ mod tests {
             assert!(
                 failures.is_empty(),
                 "{policy:?}: {} inconsistent frame(s):\n  {}",
+                failures.len(),
+                failures.join("\n  ")
+            );
+        }
+    }
+
+    /// V19-07 review round 5 (P2): a frame that needs no local number (only
+    /// the `streaming` item is selected) keeps the tick alive but cannot
+    /// vouch for its bytes — after "live rows → streaming only → live rows
+    /// again" the heuristic buckets must restart from the whole message
+    /// (they used to keep the gap and under-count every later frame: 13 vs
+    /// the heuristic 23). Estimate and auto without a bundled tokenizer show
+    /// the heuristic; auto with GLM shows the official count.
+    #[test]
+    fn live_rows_deselected_then_selected_again_count_the_whole_message() {
+        let nothing = probe_requirements(false, false);
+        let plain = probe_requirements(false, true);
+        for (model, policy) in [
+            ("test-model", LiveCalculation::Estimate),
+            ("test-model", LiveCalculation::Auto),
+            ("glm-5.3", LiveCalculation::Auto),
+        ] {
+            let tokenizer = tokenizer_for_model(Some(model));
+            let loader = || tokenizer.clone();
+            let mut ticker = LiveTicker::new();
+            let mut full = [String::new(), String::new(), String::new()];
+            let mut failures = Vec::new();
+            for (index, (piece, req)) in [
+                ("Alpha beta gamma delta ", plain),
+                ("epsilon zeta eta. 汉字汉字", plain),
+                ("theta iota kappa. 更多汉字", nothing),
+                (" lambda mu nu. 结束", nothing),
+                (" xi omicron pi. 完", plain),
+                (" rho sigma tau.", plain),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                full[0].push_str(piece);
+                let base = ticker.processed_for(1, 1);
+                let deltas = [full[0][base[0]..].to_owned(), String::new(), String::new()];
+                let status = LiveStatus {
+                    streaming: true,
+                    ..LiveStatus::default()
+                };
+                let snapshot = full.clone();
+                let view = ticker.live_view(
+                    LiveFrameInput {
+                        status: &status,
+                        deltas,
+                        session_generation: 1,
+                        message_generation: 1,
+                        policy,
+                        requirements: req,
+                        tokenizer: &loader,
+                        settled: None,
+                    },
+                    || snapshot.clone(),
+                );
+                let label = format!(
+                    "{model} {policy:?} w{:02} live={}",
+                    index + 1,
+                    req.needs_total
+                );
+                let expect = if !req.needs_total {
+                    ProbeExpect::ProviderOnly
+                } else if let Some(tokenizer) = tokenizer.as_ref() {
+                    let _ = tokenizer;
+                    if policy == LiveCalculation::Auto {
+                        ProbeExpect::Official
+                    } else {
+                        ProbeExpect::Heuristic
+                    }
+                } else {
+                    ProbeExpect::Heuristic
+                };
+                let check_tokenizer = tokenizer.clone().unwrap_or_else(|| {
+                    tokenizer_for_model(Some("glm-5.3")).expect("glm for the heuristic oracle")
+                });
+                if let Err(line) = probe_check(
+                    &ticker,
+                    &view,
+                    &check_tokenizer,
+                    &full,
+                    None,
+                    expect,
+                    &label,
+                ) {
+                    failures.push(line);
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "{model} {policy:?}: {} inconsistent frame(s):\n  {}",
                 failures.len(),
                 failures.join("\n  ")
             );

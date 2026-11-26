@@ -374,18 +374,23 @@ pub(crate) fn tokenizer_for_model(model_id: Option<&str>) -> Option<Arc<Tokenize
     loaded
 }
 
-/// BPE piece evaluations of every loaded tokenizer so far (benchmark and
-/// test counter; a plain atomic increment per piece).
-static BPE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// BPE piece evaluations of every loaded tokenizer so far on the CURRENT
+// thread (benchmark and test counter; a plain increment per piece). Thread
+// local so two `--ignored` counting benchmarks running in parallel in the
+// same test binary cannot pollute each other's numbers (V19-07 review
+// round 5); the statusline's refresh loop is single-threaded.
+thread_local! {
+    static BPE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// See [`BPE_CALLS`].
 pub fn bpe_calls() -> u64 {
-    BPE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+    BPE_CALLS.with(std::cell::Cell::get)
 }
 
 /// Reset the BPE call counter (benchmark seam).
 pub fn reset_bpe_calls() {
-    BPE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+    BPE_CALLS.with(|calls| calls.set(0));
 }
 
 /// Memory-report seam (V19-07 FR-F R4): load the bundled tokenizer of
@@ -468,7 +473,7 @@ impl Tokenizer {
     /// Every call is counted ([`bpe_calls`]): the V19-07 benchmark reports
     /// how many piece evaluations each calculation path performs.
     pub(crate) fn count_piece(&self, piece: &str) -> u64 {
-        BPE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        BPE_CALLS.with(|calls| calls.set(calls.get() + 1));
         count_piece(&self.engine, piece, &self.base_ids)
     }
 
