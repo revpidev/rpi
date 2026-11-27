@@ -2796,20 +2796,14 @@ fn manage_disable_enable(
     // document atomically.
     let result = crate::settings_lease::with_settings_file_lease(
         &settings_path,
-        || -> Result<(), String> {
-            let mut root: Value = match std::fs::read_to_string(&settings_path) {
-                Ok(raw) if !raw.trim().is_empty() => {
-                    serde_json::from_str(&raw).map_err(|error| {
-                        format!(
-                            "settings.json is not valid JSON; refusing to overwrite it: {error}"
-                        )
-                    })?
-                }
-                Ok(_) => json!({}),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
-                Err(error) => {
-                    return Err(format!("cannot read settings.json: {error}"));
-                }
+        |file| -> Result<(), String> {
+            // The content was read through the host lock handle; a path read
+            // here would be a second handle, which Windows denies under A.
+            let mut root: Value = match file.content() {
+                raw if !raw.trim().is_empty() => serde_json::from_str(raw).map_err(|error| {
+                    format!("settings.json is not valid JSON; refusing to overwrite it: {error}")
+                })?,
+                _ => json!({}),
             };
             let Some(root_object) = root.as_object_mut() else {
                 return Err("settings root is not an object.".to_string());
@@ -2841,8 +2835,7 @@ fn manage_disable_enable(
             } else {
                 entry_object.remove("disabled");
             }
-            crate::settings_lease::write_settings_json(&settings_path, &root)
-                .map_err(|error| error.to_string())
+            file.write(&root).map_err(|error| error.to_string())
         },
     );
     let _ = settings;
@@ -2886,17 +2879,10 @@ fn manage_reset(
         // file's cross-session lease; the save is atomic.
         let reset_result = crate::settings_lease::with_settings_file_lease(
             &settings_path,
-            || -> Result<bool, String> {
-                let raw = match std::fs::read_to_string(&settings_path) {
-                    Ok(raw) => raw,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(false);
-                    }
-                    Err(error) => {
-                        return Err(format!("cannot read settings.json: {error}"));
-                    }
-                };
-                let mut root: Value = serde_json::from_str(&raw).map_err(|error| {
+            |file| -> Result<bool, String> {
+                // Read through the host lock handle (see the override write).
+                let raw = file.content();
+                let mut root: Value = serde_json::from_str(raw).map_err(|error| {
                     format!("settings.json is not valid JSON; refusing to overwrite it: {error}")
                 })?;
                 if !root.is_object() {
@@ -2920,8 +2906,7 @@ fn manage_reset(
                     }
                 }
                 if changed {
-                    crate::settings_lease::write_settings_json(&settings_path, &root)
-                        .map_err(|error| error.to_string())?;
+                    file.write(&root).map_err(|error| error.to_string())?;
                 }
                 Ok(changed)
             },

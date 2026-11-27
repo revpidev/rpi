@@ -18,6 +18,16 @@
 //! to a `.retired-<token>` fence before the new owner claims it, so a delayed
 //! reclaimer cannot rename a replacement over the destination.
 //!
+//! Two platform rules shape the Windows paths (the host coordinator in
+//! `crates/rpi/src/core/settings_write.rs` follows the same two). (1) A
+//! `LockFileEx` range is mandatory for every *other* handle, including
+//! handles of the locking process itself, so the re-read under A goes through
+//! the handle that owns the lock ([`read_locked`]); a path read would fail
+//! with `ERROR_LOCK_VIOLATION` (33) on every write. (2) A directory cannot
+//! be renamed while it contains an open handle, so lease directories are
+//! moved aside by [`retire_lease`], which closes the handle first and
+//! re-verifies the token when the held-handle rename is refused.
+//!
 //! rpi ports the same protocol with `std::fs` primitives only (no new
 //! dependencies); the process-start identity reuses the crate's
 //! `/proc/<pid>/stat` field-22 reader (`runner::background::process_boot_id`).
@@ -74,15 +84,22 @@ impl LeaseGuard {
         if !read_owner(&self.lock_path).is_some_and(|owner| owner.token == self.token) {
             return;
         }
-        // Move the directory aside while the lease.lock handle is still held,
-        // then release the OS lock and remove the retired directory.
+        // Move the directory aside, then release the OS lock and remove the
+        // released directory. A concurrent reclaimer never observes a
+        // half-removed live lease. The platform rules are those of
+        // `retire_lease`: Unix renames while the lease.lock handle is still
+        // held; Windows closes the handle first and re-checks the token.
         let released = PathBuf::from(format!(
             "{}.released-{}",
             self.lock_path.display(),
             self.token
         ));
-        let renamed = std::fs::rename(&self.lock_path, &released).is_ok();
-        self.lock_file.take();
+        let renamed = retire_lease(
+            &self.lock_path,
+            &released,
+            self.lock_file.take(),
+            Some(self.token.as_str()),
+        );
         if renamed {
             // The released path is ours alone; no new owner can appear there.
             let _ = std::fs::remove_dir_all(&released);
@@ -150,13 +167,81 @@ pub(crate) fn resolve_settings_write_target(file_path: &Path) -> io::Result<Path
     }
 }
 
+/// Bytes of a file held under lock A, read through the handle that owns the
+/// lock (the only handle Windows lets read a locked range; see the module
+/// notes).
+fn read_locked(file: &std::fs::File) -> io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut reader = file;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut text = String::new();
+    reader.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Move a lease directory aside to `retired` and report whether it moved.
+/// On Unix the rename happens while `lock_handle` (the claimed `lease.lock`
+/// handle, `None` for a legacy lease without one) is still held, so no second
+/// reclaimer can race the take-over. Windows cannot rename a directory that
+/// contains an open handle (`ERROR_ACCESS_DENIED`): the first attempt failing
+/// costs nothing, and the retry runs after the handle is closed, only while
+/// the directory still carries the expected token (`None` for an ownerless
+/// directory). A peer that claimed and replaced the lease in between writes
+/// a fresh token, and a replacement lease is never renamed aside by a late
+/// reclaimer — on any platform, so the token gate runs before the first
+/// attempt too.
+fn retire_lease(
+    lock_path: &Path,
+    retired: &Path,
+    lock_handle: Option<std::fs::File>,
+    expected_token: Option<&str>,
+) -> bool {
+    let lease_unchanged =
+        || read_owner(lock_path).map(|owner| owner.token) == expected_token.map(str::to_owned);
+    if !lease_unchanged() {
+        return false;
+    }
+    let Some(lock_handle) = lock_handle else {
+        return std::fs::rename(lock_path, retired).is_ok();
+    };
+    if std::fs::rename(lock_path, retired).is_ok() {
+        return true;
+    }
+    drop(lock_handle);
+    lease_unchanged() && std::fs::rename(lock_path, retired).is_ok()
+}
+
+/// The leased settings document handed to the action: the content read
+/// through the A handle (see [`read_locked`]) and the atomic writer that
+/// keeps that content's trailing-newline state.
+pub(crate) struct LeasedSettingsFile<'a> {
+    target: &'a Path,
+    content: &'a str,
+}
+
+impl LeasedSettingsFile<'_> {
+    /// Current document as read under A. A file the A acquisition just
+    /// created reads as `""`, exactly like upstream's `readFileSync` of a
+    /// fresh empty file; callers treat blank content as `{}`.
+    pub(crate) fn content(&self) -> &str {
+        self.content
+    }
+
+    /// Replaces the document atomically (temp file + rename) with the mode
+    /// and trailing-newline state of the content read under A.
+    pub(crate) fn write(&self, root: &serde_json::Value) -> io::Result<()> {
+        write_settings_document(self.target, root, self.content.ends_with('\n'))
+    }
+}
+
 /// Hold the physical settings file's lease for a whole read-modify-write
 /// (`withSettingsFileLease`, settings-file-lease.ts:34-38). Creates the
 /// settings directory first (upstream `mkdirSync` recursive), so a read-only
-/// directory fails here — before any read — exactly like upstream.
+/// directory fails here — before any read — exactly like upstream. The
+/// action receives the content read under A through the lock handle.
 pub(crate) fn with_settings_file_lease<T>(
     file_path: &Path,
-    action: impl FnOnce() -> Result<T, String>,
+    action: impl FnOnce(&LeasedSettingsFile<'_>) -> Result<T, String>,
 ) -> Result<T, String> {
     if let Some(parent) = file_path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -166,15 +251,54 @@ pub(crate) fn with_settings_file_lease<T>(
     // V18-02 R3.1.3: fixed A(host fs2) → B(`.write-lock`) order. Old host
     // writers hold only A; old subagents hold only B. Holding both in the
     // fixed order is what lets all three generations interleave safely.
-    let host_lock = acquire_host_lock(&target).map_err(|error| error.to_string())?;
-    let result = with_file_lease(&target, action);
+    let mut host_lock = Some(acquire_host_lock(&target).map_err(|error| error.to_string())?);
+    let result = lease_and_run(&target, &mut host_lock, action);
+    if let Some(host_lock) = host_lock.take() {
+        let _ = fs2::FileExt::unlock(&host_lock);
+    }
     // A failed first write must not leave the empty file `create(true)` made.
     let failed = !matches!(&result, Ok(Ok(_)));
     if failed && !existed && std::fs::metadata(&target).is_ok_and(|metadata| metadata.len() == 0) {
         let _ = std::fs::remove_file(&target);
     }
-    let _ = fs2::FileExt::unlock(&host_lock);
-    result.map_err(|error| error.to_string())?
+    result?
+}
+
+/// B → re-read through A → the action. The outer `Err` is a lease or read
+/// failure; the inner result is the action's. Windows cannot replace an open
+/// file while the legacy handle is held, so A is unlocked and closed
+/// (`host_lock` is taken) once the content was read and before the action
+/// writes; the authoritative B lease stays held (the host coordinator does
+/// the same). Every other platform keeps A across the action.
+fn lease_and_run<T>(
+    target: &Path,
+    host_lock: &mut Option<std::fs::File>,
+    action: impl FnOnce(&LeasedSettingsFile<'_>) -> Result<T, String>,
+) -> Result<Result<T, String>, String> {
+    let guard = acquire_file_lease(target).map_err(|error| error.to_string())?;
+    // Re-read through the A handle: Windows denies a second handle the
+    // locked range (module notes, rule 1).
+    let content = read_locked(
+        host_lock
+            .as_ref()
+            .expect("the host lock is held until it is released"),
+    )
+    .map_err(|error| format!("cannot read settings.json: {error}"))?;
+    #[cfg(windows)]
+    {
+        let released = host_lock
+            .take()
+            .expect("the host lock is held until it is released");
+        let _ = fs2::FileExt::unlock(&released);
+        drop(released);
+    }
+    let leased = LeasedSettingsFile {
+        target,
+        content: &content,
+    };
+    let result = action(&leased);
+    drop(guard);
+    Ok(result)
 }
 
 fn acquire_host_lock(path: &Path) -> io::Result<std::fs::File> {
@@ -202,9 +326,10 @@ fn acquire_host_lock(path: &Path) -> io::Result<std::fs::File> {
     Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "settings lock is held")))
 }
 
-/// Hold a lease beside `file_path` for a short synchronous update, waiting at
-/// most [`LEASE_WAIT_MS`] for another owner (`withFileLease`, file-lease.ts).
-fn with_file_lease<T>(requested: &Path, action: impl FnOnce() -> T) -> io::Result<T> {
+/// Claim the lease beside `requested`, waiting at most [`LEASE_WAIT_MS`] for
+/// another owner (`withFileLease`, file-lease.ts). The caller runs its
+/// critical section and drops the guard.
+fn acquire_file_lease(requested: &Path) -> io::Result<LeaseGuard> {
     let absolute = match requested.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
             std::fs::canonicalize(parent)?.join(requested.file_name().unwrap_or_default())
@@ -213,9 +338,9 @@ fn with_file_lease<T>(requested: &Path, action: impl FnOnce() -> T) -> io::Resul
     };
     let lock_path = PathBuf::from(format!("{}.write-lock", absolute.display()));
     let deadline = Instant::now() + Duration::from_millis(LEASE_WAIT_MS);
-    let guard = loop {
+    loop {
         match try_lease(&lock_path)? {
-            Some(guard) => break guard,
+            Some(guard) => return Ok(guard),
             None => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -230,10 +355,7 @@ fn with_file_lease<T>(requested: &Path, action: impl FnOnce() -> T) -> io::Resul
                 std::thread::sleep(remaining.min(Duration::from_millis(LEASE_RETRY_MS)));
             }
         }
-    };
-    let result = action();
-    drop(guard);
-    Ok(result)
+    }
 }
 
 fn ownerless_lease_is_stale(lock_path: &Path) -> bool {
@@ -282,11 +404,14 @@ fn try_lease(lock_path: &Path) -> io::Result<Option<LeaseGuard>> {
                         );
                         let retired =
                             PathBuf::from(format!("{}.retired-{}", lock_path.display(), token));
-                        let renamed = std::fs::rename(lock_path, &retired).is_ok();
-                        drop(dead_lock);
-                        if renamed {
-                            // Keep the retired directory as the protocol
-                            // fence; never delete it.
+                        // Keep the retired directory as the protocol
+                        // fence; never delete it.
+                        if retire_lease(
+                            lock_path,
+                            &retired,
+                            Some(dead_lock),
+                            previous.as_ref().map(|owner| owner.token.as_str()),
+                        ) {
                             return try_lease(lock_path);
                         }
                         return Ok(None);
@@ -307,7 +432,7 @@ fn try_lease(lock_path: &Path) -> io::Result<Option<LeaseGuard>> {
                                 lock_path.display(),
                                 new_token()
                             ));
-                            if std::fs::rename(lock_path, &retired).is_ok() {
+                            if retire_lease(lock_path, &retired, None, None) {
                                 return try_lease(lock_path);
                             }
                         }
@@ -324,6 +449,8 @@ fn try_lease(lock_path: &Path) -> io::Result<Option<LeaseGuard>> {
                         lock_path.display(),
                         previous.token
                     ));
+                    // No handle is open inside a legacy lease directory, so
+                    // the plain rename holds on every platform.
                     match std::fs::rename(lock_path, &retired) {
                         Ok(()) => {}
                         Err(error) => {
@@ -528,35 +655,50 @@ fn new_token() -> String {
     format!("{:x}-{:x}-{:x}", std::process::id(), counter, nanos)
 }
 
-/// Atomic settings write (`writeSettingsFile`, agents.ts @ 7d072b91d): the
-/// existing file mode is preserved, a trailing newline is kept, and the new
-/// document is written to a same-directory temp file then renamed over the
-/// resolved physical path. A read-only target fails before the write, like
-/// upstream `accessSync(W_OK)`.
+/// Atomic settings write outside a lease (`writeSettingsFile`, agents.ts @
+/// 7d072b91d): the existing file mode is preserved, a trailing newline is
+/// kept, and the new document is written to a same-directory temp file then
+/// renamed over the resolved physical path. A read-only target fails before
+/// the write, like upstream `accessSync(W_OK)`. Production writes run inside
+/// a lease through [`LeasedSettingsFile::write`], which takes the newline
+/// state from the content read under lock A instead of a second path read;
+/// this path-reading form stays as the unit-test entry point of the same
+/// replacement.
+#[cfg(test)]
 pub(crate) fn write_settings_json(file_path: &Path, root: &serde_json::Value) -> io::Result<()> {
     let target = resolve_settings_write_target(file_path)?;
-    let existing_mode = match std::fs::metadata(&target) {
+    // Preserve the original trailing-newline state (V18-02 R3.1.4). A new
+    // file matches the host/upstream serializer: no trailing newline.
+    let had_newline = std::fs::read_to_string(&target)
+        .map(|raw| raw.ends_with('\n'))
+        .unwrap_or(false);
+    write_settings_document(&target, root, had_newline)
+}
+
+/// The atomic replacement behind [`write_settings_json`] and
+/// [`LeasedSettingsFile::write`] over an already resolved physical target.
+fn write_settings_document(
+    target: &Path,
+    root: &serde_json::Value,
+    had_newline: bool,
+) -> io::Result<()> {
+    let existing_mode = match std::fs::metadata(target) {
         Ok(metadata) => Some(file_mode(&metadata)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
     if existing_mode.is_some() {
         // Write-access validation only; the handle is dropped immediately.
-        std::fs::OpenOptions::new().write(true).open(&target)?;
+        std::fs::OpenOptions::new().write(true).open(target)?;
     }
-    // Preserve the original trailing-newline state (V18-02 R3.1.4). A new
-    // file matches the host/upstream serializer: no trailing newline.
-    let had_newline = std::fs::read_to_string(&target)
-        .map(|raw| raw.ends_with('\n'))
-        .unwrap_or(false);
     let serialized = serde_json::to_string_pretty(root).unwrap_or_default();
     let body = if had_newline {
         format!("{serialized}\n")
     } else {
         serialized
     };
-    let temp = temp_path_for(&target);
-    let result = write_temp_then_rename(&temp, &target, &body, existing_mode);
+    let temp = temp_path_for(target);
+    let result = write_temp_then_rename(&temp, target, &body, existing_mode);
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
@@ -680,8 +822,8 @@ mod tests {
     fn new_file_has_no_trailing_newline() {
         let dir = temp_dir("new-no-newline");
         let path = dir.join("settings.json");
-        with_settings_file_lease(&path, || {
-            write_settings_json(&path, &serde_json::json!({"subagents": {}}))
+        with_settings_file_lease(&path, |file| {
+            file.write(&serde_json::json!({"subagents": {}}))
                 .map_err(|error| error.to_string())
         })
         .unwrap();
@@ -707,12 +849,9 @@ mod tests {
         std::fs::write(lock.join("owner.json"), serde_json::to_vec(&owner).unwrap()).unwrap();
         std::fs::write(lock.join(LEASE_LOCK_FILE), b"").unwrap();
 
-        with_settings_file_lease(&path, || {
-            write_settings_json(
-                &path,
-                &serde_json::json!({"subagents": {"recovered": true}}),
-            )
-            .map_err(|error| error.to_string())
+        with_settings_file_lease(&path, |file| {
+            file.write(&serde_json::json!({"subagents": {"recovered": true}}))
+                .map_err(|error| error.to_string())
         })
         .expect("free lease.lock is reclaimed");
         assert!(
@@ -737,6 +876,114 @@ mod tests {
         )));
     }
 
+    /// The content handed to the action is read through the A handle. The
+    /// pre-fix action re-read the path (`read_to_string(path)`) through a
+    /// second handle, which Windows denies with `ERROR_LOCK_VIOLATION` (33)
+    /// while A holds the exclusive `LockFileEx` range — "cannot read
+    /// settings.json" on every subagents settings write on Windows.
+    #[test]
+    fn leased_content_is_read_through_the_host_lock_handle() {
+        let dir = temp_dir("leased-content");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{\n  \"old\": true\n}\n").unwrap();
+        // Under A only the lock handle itself reads the range (Windows rule
+        // 1 of the module notes); the pre-fix action's path read is denied.
+        let host_lock = acquire_host_lock(&path).unwrap();
+        #[cfg(windows)]
+        {
+            let error = std::fs::read_to_string(&path)
+                .expect_err("a second handle cannot read the locked range");
+            assert_eq!(error.raw_os_error(), Some(33), "{error}");
+        }
+        assert_eq!(read_locked(&host_lock).unwrap(), "{\n  \"old\": true\n}\n");
+        drop(host_lock);
+        let mut seen = None;
+        with_settings_file_lease(&path, |file| {
+            seen = Some(file.content().to_owned());
+            file.write(&serde_json::json!({"subagents": {"agentOverrides": {}}}))
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert_eq!(seen.as_deref(), Some("{\n  \"old\": true\n}\n"));
+        // The newline state came from the leased content, not a path read.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.ends_with("}\n"), "trailing newline preserved: {raw:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A new file reads as empty content under the lease (upstream
+    /// `readFileSync` of the fresh empty file), and its first write carries no
+    /// trailing newline.
+    #[test]
+    fn leased_content_of_a_new_file_is_empty() {
+        let dir = temp_dir("leased-new");
+        let path = dir.join("settings.json");
+        let mut seen = None;
+        with_settings_file_lease(&path, |file| {
+            seen = Some(file.content().to_owned());
+            file.write(&serde_json::json!({"subagents": {}}))
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert_eq!(seen.as_deref(), Some(""));
+        assert!(!std::fs::read_to_string(&path).unwrap().ends_with('\n'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale lease directory with its `lease.lock` already claimed (the
+    /// `LeaseLockState::Dead` handle) and the owner metadata the test names.
+    fn dead_lease_dir(lock: &Path, token: &str) -> std::fs::File {
+        use fs2::FileExt;
+        std::fs::create_dir_all(lock).unwrap();
+        let owner = LeaseOwner {
+            token: token.to_owned(),
+            pid: std::process::id() as u64,
+            hostname: local_hostname().unwrap_or_default(),
+            process_start: None,
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_vec(&owner).unwrap()).unwrap();
+        std::fs::write(lock.join(LEASE_LOCK_FILE), b"").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock.join(LEASE_LOCK_FILE))
+            .unwrap();
+        file.try_lock_exclusive().unwrap();
+        file
+    }
+
+    /// A dead lease is retired with its claimed handle open: Unix renames
+    /// around the open handle, Windows retries after closing it. Either way
+    /// the stale directory leaves `settings.json.write-lock`, which used to
+    /// be impossible on Windows (rename refused, 200 ms wait, "Timed out
+    /// waiting for another process" on every later write).
+    #[test]
+    fn retire_lease_moves_a_dead_lease_while_its_lock_handle_is_open() {
+        let dir = temp_dir("retire-dead");
+        let lock = dir.join("settings.json.write-lock");
+        let retired = dir.join("settings.json.write-lock.retired-stale");
+        let dead = dead_lease_dir(&lock, "stale");
+        assert!(retire_lease(&lock, &retired, Some(dead), Some("stale")));
+        assert!(!lock.exists(), "stale lease left the live path");
+        assert!(retired.is_dir(), "kept as the protocol fence");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peer that claimed and replaced the lease after the dead owner
+    /// vanished writes a fresh token; the late reclaimer must leave it alone.
+    #[test]
+    fn retire_lease_never_moves_a_replacement_lease() {
+        let dir = temp_dir("retire-fresh");
+        let lock = dir.join("settings.json.write-lock");
+        let retired = dir.join("settings.json.write-lock.retired-stale");
+        let claimed = dead_lease_dir(&lock, "fresh");
+        assert!(!retire_lease(&lock, &retired, None, Some("stale")));
+        assert!(!retire_lease(&lock, &retired, Some(claimed), Some("stale")));
+        assert!(lock.is_dir(), "replacement lease retained");
+        assert!(!retired.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// V18-02 FR-A R4/R6 + TE51 FR-F R2: two new-protocol writers (host-style
     /// and subagents-style, both A+B) and an old host holding only A
     /// interleave on one file. Every writer re-reads under the lock, so no
@@ -750,29 +997,26 @@ mod tests {
         let path_b = path.clone();
         let path_c = path.clone();
         let a = std::thread::spawn(move || {
-            with_settings_file_lease(&path_a, || {
-                let mut root: serde_json::Value =
-                    serde_json::from_str(&std::fs::read_to_string(&path_a).unwrap()).unwrap();
+            with_settings_file_lease(&path_a, |file| {
+                let mut root: serde_json::Value = serde_json::from_str(file.content()).unwrap();
                 root["defaultModel"] = serde_json::json!("model-a");
-                write_settings_json(&path_a, &root).map_err(|error| error.to_string())
+                file.write(&root).map_err(|error| error.to_string())
             })
             .unwrap();
         });
         let b = std::thread::spawn(move || {
-            with_settings_file_lease(&path_b, || {
-                let mut root: serde_json::Value =
-                    serde_json::from_str(&std::fs::read_to_string(&path_b).unwrap()).unwrap();
+            with_settings_file_lease(&path_b, |file| {
+                let mut root: serde_json::Value = serde_json::from_str(file.content()).unwrap();
                 root["subagents"] = serde_json::json!({"agentOverrides": {}});
-                write_settings_json(&path_b, &root).map_err(|error| error.to_string())
+                file.write(&root).map_err(|error| error.to_string())
             })
             .unwrap();
         });
         let c = std::thread::spawn(move || {
-            with_settings_file_lease(&path_c, || {
-                let mut root: serde_json::Value =
-                    serde_json::from_str(&std::fs::read_to_string(&path_c).unwrap()).unwrap();
+            with_settings_file_lease(&path_c, |file| {
+                let mut root: serde_json::Value = serde_json::from_str(file.content()).unwrap();
                 root["statusLine"] = serde_json::json!({"type": "command"});
-                write_settings_json(&path_c, &root).map_err(|error| error.to_string())
+                file.write(&root).map_err(|error| error.to_string())
             })
             .unwrap();
         });
@@ -803,7 +1047,7 @@ mod tests {
         std::fs::write(lock.join("owner.json"), serde_json::to_vec(&owner).unwrap()).unwrap();
         std::fs::write(lock.join(LEASE_LOCK_FILE), b"").unwrap();
 
-        let error = with_settings_file_lease(&path, || Ok::<(), String>(()))
+        let error = with_settings_file_lease(&path, |_file| Ok::<(), String>(()))
             .expect_err("foreign lease is not evicted");
         assert!(error.contains("Timed out"), "{error}");
         assert!(lock.exists(), "foreign lease retained");
@@ -827,7 +1071,7 @@ mod tests {
             .unwrap();
         held.lock_exclusive().unwrap();
 
-        let error = with_settings_file_lease(&path, || Ok::<(), String>(()))
+        let error = with_settings_file_lease(&path, |_file| Ok::<(), String>(()))
             .expect_err("held lease.lock blocks");
         assert!(error.contains("Timed out"), "{error}");
 
@@ -876,9 +1120,9 @@ mod tests {
         let dir = temp_dir("lease");
         let path = dir.join("settings.json");
         std::fs::write(&path, "{}\n").unwrap();
-        let held = with_settings_file_lease(&path, || {
+        let held = with_settings_file_lease(&path, |_file| {
             // A nested acquisition (simulating another session) must time out.
-            let nested = with_settings_file_lease(&path, || Ok(()));
+            let nested = with_settings_file_lease(&path, |_nested| Ok(()));
             // The outer writer holds A; the nested attempt stops at A
             // (or at B when another generation only holds B). Either way the
             // nested writer must not enter the critical section.
@@ -887,7 +1131,7 @@ mod tests {
         });
         held.unwrap();
         // The lease is released: a later acquisition succeeds.
-        with_settings_file_lease(&path, || Ok(())).unwrap();
+        with_settings_file_lease(&path, |_file| Ok(())).unwrap();
         assert!(!dir.join("settings.json.write-lock").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -907,7 +1151,7 @@ mod tests {
             process_start: Some(1),
         };
         std::fs::write(lock.join("owner.json"), serde_json::to_vec(&dead).unwrap()).unwrap();
-        with_settings_file_lease(&path, || Ok(())).unwrap();
+        with_settings_file_lease(&path, |_file| Ok(())).unwrap();
         assert!(!lock.exists(), "dead-owner lock was reclaimed and released");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -920,7 +1164,7 @@ mod tests {
         let lock = dir.join("settings.json.write-lock");
         std::fs::create_dir_all(&lock).unwrap();
         std::fs::write(lock.join("owner.json"), b"not json").unwrap();
-        let result = with_settings_file_lease(&path, || Ok(()));
+        let result = with_settings_file_lease(&path, |_file| Ok(()));
         assert!(
             result
                 .err()

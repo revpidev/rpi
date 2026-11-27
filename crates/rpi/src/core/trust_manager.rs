@@ -248,9 +248,12 @@ fn with_trust_file_lock<T>(
         match file.try_lock_exclusive() {
             Ok(()) => break,
             // Retry only on contention (proper-lockfile retries on
-            // `ELOCKED` and fails on anything else; T14 review m3).
+            // `ELOCKED` and fails on anything else; T14 review m3). Windows
+            // reports a held lock as `ERROR_LOCK_VIOLATION` (33), not
+            // `WouldBlock`.
             Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock && attempt < MAX_ATTEMPTS =>
+                if crate::core::settings_write::is_lock_contended(&error)
+                    && attempt < MAX_ATTEMPTS =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }

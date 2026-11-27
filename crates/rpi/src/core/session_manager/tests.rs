@@ -3693,6 +3693,11 @@ fn migrate_float_version_2_0_is_not_treated_as_v1() {
 // Symlink session directory discovery (da66636cc, #7552)
 // ---------------------------------------------------------------------------
 
+/// Unix-only: creating a file-system symlink needs a privilege on Windows,
+/// and the `std::os::unix` call kept the whole lib test target from
+/// compiling there (the Windows settings-lock regressions live in the same
+/// target).
+#[cfg(unix)]
 #[test]
 fn list_all_discovers_sessions_through_symlinked_directories() {
     // da66636cc (#7552): session directories that are symlinks to external

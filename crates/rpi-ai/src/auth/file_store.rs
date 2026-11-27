@@ -99,6 +99,22 @@ fn parse_credential(value: &Value) -> Result<Credential, ModelsError> {
         .map_err(|error| auth_error("Failed to parse stored credential", &error.to_string()))
 }
 
+/// A held flock: `WouldBlock` on Unix. Windows `LockFileEx` reports a held
+/// lock as `ERROR_LOCK_VIOLATION` (33) instead; both mean contention.
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        return error.raw_os_error() == Some(33);
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn auth_error(message: impl Into<String>, cause: &str) -> ModelsError {
     ModelsError::with_cause(ModelsErrorCode::Auth, message, cause)
 }
@@ -277,6 +293,22 @@ impl FileAuthStorageBackend {
             .open(&self.auth_path)
     }
 
+    /// Bytes of the locked store, read through the handle that owns the
+    /// flock. A `LockFileEx` range (Windows) is mandatory for every *other*
+    /// handle — including a second handle of the locking process — so a path
+    /// read under the lock failed with `ERROR_LOCK_VIOLATION` (33) there:
+    /// the initial snapshot came back empty and every write reported the
+    /// store as locked. The read-only `BOM` handling matches the previous
+    /// `read_to_string` path (none).
+    fn read_locked(file: &std::fs::File) -> std::io::Result<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut reader = file;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut text = String::new();
+        reader.read_to_string(&mut text)?;
+        Ok(text)
+    }
+
     /// Async lock with the proper-lockfile retry policy (see [`RetryConfig`]).
     /// Returns the locked file handle; the flock releases on drop.
     async fn acquire_lock_with_retry(&self) -> Result<std::fs::File, ModelsError> {
@@ -293,7 +325,7 @@ impl FileAuthStorageBackend {
             })?;
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(file),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if is_lock_contended(&error) => {
                     last_error = Some(error);
                     if attempt < self.retry.retries {
                         tokio::time::sleep(self.retry.delay(attempt)).await;
@@ -336,7 +368,7 @@ impl FileAuthStorageBackend {
             })?;
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(file),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if is_lock_contended(&error) => {
                     last_error = Some(error);
                     if attempt < MAX_ATTEMPTS {
                         std::thread::sleep(Duration::from_millis(20));
@@ -387,8 +419,10 @@ impl FileAuthStorageBackend {
             )
         })?;
 
-        let lock_file = self.acquire_lock_with_retry().await?;
-        let current = match std::fs::read_to_string(&self.auth_path) {
+        // Only Windows takes the handle out before the replace (below).
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut lock_file = Some(self.acquire_lock_with_retry().await?);
+        let current = match Self::read_locked(lock_file.as_ref().expect("lock held")) {
             Ok(content) => Some(content),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
@@ -403,6 +437,11 @@ impl FileAuthStorageBackend {
         };
         let LockResult { result, next } = f(current).await?;
         if let Some(next) = next {
+            // Windows replaces the file by rename; close the locked handle
+            // first (the settings coordinator releases its legacy lock the
+            // same way) — the read above already ran under it.
+            #[cfg(windows)]
+            drop(lock_file.take());
             self.write_file(&next).map_err(|error| {
                 auth_error(
                     format!(
@@ -425,7 +464,7 @@ impl FileAuthStorageBackend {
         self.ensure_parent_dir().ok()?;
         self.ensure_file_exists().ok()?;
         let lock_file = self.acquire_lock_sync_with_retry().ok()?;
-        let content = std::fs::read_to_string(&self.auth_path).ok();
+        let content = Self::read_locked(&lock_file).ok();
         drop(lock_file);
         content
     }
@@ -1169,6 +1208,55 @@ mod tests {
             })
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The store is read through the handle that owns the flock. The
+    /// pre-fix read (`read_to_string(path)`) was a second handle, which
+    /// Windows denies with `ERROR_LOCK_VIOLATION` (33) while the first one
+    /// holds the exclusive `LockFileEx` range — the startup snapshot came
+    /// back empty and every write failed with "Failed to read auth storage
+    /// file" there.
+    #[test]
+    fn locked_store_is_read_through_the_lock_handle() {
+        let dir = temp_dir();
+        let auth_path = dir.join("auth.json");
+        write_auth_json(
+            &auth_path,
+            json!({ "anthropic": { "type": "api_key", "key": "stored" } }),
+        );
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&auth_path)
+            .expect("open");
+        lock.try_lock_exclusive().expect("lock");
+        #[cfg(windows)]
+        {
+            let error = std::fs::read_to_string(&auth_path)
+                .expect_err("a second handle cannot read the locked range");
+            assert_eq!(error.raw_os_error(), Some(33), "{error}");
+        }
+        let content =
+            FileAuthStorageBackend::read_locked(&lock).expect("read through the lock handle");
+        let parsed: Value = serde_json::from_str(&content).expect("json");
+        assert_eq!(parsed["anthropic"]["key"], "stored");
+        lock.unlock().expect("unlock");
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_lock_violation_counts_as_contention() {
+        assert!(is_lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        #[cfg(windows)]
+        assert!(is_lock_contended(&std::io::Error::from_raw_os_error(33)));
+        #[cfg(not(windows))]
+        assert!(!is_lock_contended(&std::io::Error::from_raw_os_error(33)));
+        assert!(!is_lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
     }
 
     #[cfg(unix)]

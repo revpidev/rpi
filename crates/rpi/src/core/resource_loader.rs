@@ -1593,7 +1593,9 @@ pub fn migrate_keybindings_config_file_at(path: &Path) -> Result<bool, RpiError>
                 file = Some(opened);
                 break;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            // Contention includes Windows `ERROR_LOCK_VIOLATION` (33), which
+            // `LockFileEx` reports instead of `WouldBlock`.
+            Err(error) if crate::core::settings_write::is_lock_contended(&error) => {
                 if attempt == LOCK_MAX_ATTEMPTS {
                     return Err(RpiError::Resource(format!(
                         "Failed to acquire keybindings lock for {}: {error}",
@@ -1612,14 +1614,25 @@ pub fn migrate_keybindings_config_file_at(path: &Path) -> Result<bool, RpiError>
         )));
     };
 
-    let result = migrate_locked_keybindings(path, &file);
+    let result = migrate_locked_keybindings(&file);
     // Explicit release mirroring upstream's `finally { release() }`.
     let _ = file.unlock();
     result
 }
 
-fn migrate_locked_keybindings(path: &Path, file: &std::fs::File) -> Result<bool, RpiError> {
-    let content = std::fs::read_to_string(path)?;
+fn migrate_locked_keybindings(file: &std::fs::File) -> Result<bool, RpiError> {
+    // Read through the handle that holds the lock: Windows denies a second
+    // handle the locked range with `ERROR_LOCK_VIOLATION` (33), which used to
+    // fail the startup migration of every `keybindings.json` there (the same
+    // rule the settings coordinator documents in `settings_write.rs`).
+    let content = {
+        use std::io::Read;
+        let mut reader = file;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut text = String::new();
+        reader.read_to_string(&mut text)?;
+        text
+    };
     let parsed: serde_json::Value = match serde_json::from_str(&content) {
         Ok(parsed) => parsed,
         // Malformed JSON is ignored, exactly like upstream's catch-all.
