@@ -604,12 +604,9 @@ impl TranscriptDocument for Container {
     }
 
     fn render_range(&self, children: Range<usize>, width: usize) -> Arc<[String]> {
-        let rows = {
-            let state = self.sequence.borrow();
-            state.block_row(&self.children, children.start)
-                ..state.block_row(&self.children, children.end)
-        };
-        self.rows(rows, width)
+        self.sequence
+            .borrow_mut()
+            .render_range(&self.children, children, width)
     }
 
     fn rows(&self, rows: Range<usize>, width: usize) -> Arc<[String]> {

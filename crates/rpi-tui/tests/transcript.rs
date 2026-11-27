@@ -1261,3 +1261,164 @@ fn search_corpus_follows_the_latest_render_of_an_identity_only_block() {
     assert!(corpus(20).iter().all(|line| !line.contains("alpha")));
     assert!(renders.load(Ordering::Relaxed) >= 2);
 }
+
+// ---- Driver/session race: a restructure between a sync and a read --------
+//
+// The application mounts the chat container behind an `Arc<Mutex<..>>` and
+// the session thread restructures it (a `/clear`, a theme rebuild, an
+// append) while the driver thread sits between a frame's `sync` and a row
+// access (the layout's `rows`, the residual image crop, a selection copy).
+// The readers must follow the children instead of indexing them with a
+// position from the stale slot vector (the `rpi-tui-driver` panic
+// `index out of bounds: the len is 0 but the index is 3`).
+
+#[test]
+fn document_readers_follow_a_restructure_between_sync_and_read() {
+    let container = Arc::new(Mutex::new(Container::new()));
+    let mut renders = Vec::new();
+    for index in 0..4 {
+        let (block, block_renders, _) =
+            trusted((0..3).map(|line| format!("old {index}.{line}")).collect());
+        lock(&container).children.push(block);
+        renders.push(block_renders);
+    }
+    // A nested document at index 4: the readers that resolve into it index
+    // `children` with the slot position.
+    let nested = Arc::new(Mutex::new(Container::new()));
+    let (block, nested_renders, _) = trusted(vec![
+        format!("{OSC133_PROMPT_START}nested"),
+        "nested 1".to_string(),
+    ]);
+    lock(&nested).children.push(block);
+    lock(&container).children.push(Box::new(NestedDoc {
+        container: Arc::clone(&nested),
+    }));
+    let wrapper = DocWrapper {
+        container: Arc::clone(&container),
+        expose: true,
+        full_renders: Arc::new(AtomicU64::new(0)),
+    };
+    let document = &wrapper as &dyn TranscriptDocument;
+    let synced = document.sync(40);
+    assert_eq!(synced.height, 4 * 3 + 2);
+    assert_eq!(document.prompt_rows(), vec![12]);
+    let old_renders = || {
+        renders
+            .iter()
+            .map(|renders| renders.load(Ordering::Relaxed))
+            .sum::<u64>()
+            + nested_renders.load(Ordering::Relaxed)
+    };
+    assert_eq!(old_renders(), 5);
+
+    // `/clear` lands between the sync and the read.
+    lock(&container).children.clear();
+    // Index readers answer "unmeasured" until the next sync.
+    assert!(document.prompt_rows().is_empty());
+    assert_eq!(document.visible_range(0, 8, TRANSCRIPT_OVERSCAN_ROWS), 0..0);
+    assert_eq!(document.height_at(2), None);
+    assert_eq!(document.revision_at(4), None);
+    assert_eq!(document.block_row(4), synced.height);
+    // Row readers re-measure first: the stale window clamps to the (now
+    // empty) content instead of indexing the empty `children`.
+    assert_eq!(document.line(3, 40), None);
+    assert_eq!(document.rows(0..synced.height, 40).len(), 0);
+    assert_eq!(document.render_range(0..5, 40).len(), 0);
+    assert_eq!(document.materialize(40).len(), 0);
+    assert_eq!(document.total_height(), 0);
+    assert_eq!(document.child_count(), 0);
+    assert_eq!(
+        document.stats().syncs,
+        2,
+        "one re-measure for the stale read; the rest find the index aligned"
+    );
+
+    // A rebuild (clear + re-add) lands between a sync and the read: the
+    // rows are the new content, measured exactly once, and the next frame's
+    // sync reuses that measurement.
+    let mut new_renders = Vec::new();
+    let mut expected = Vec::new();
+    for index in 0..3 {
+        let (block, block_renders, _) =
+            trusted((0..2).map(|line| format!("new {index}.{line}")).collect());
+        lock(&container).children.push(block);
+        new_renders.push(block_renders);
+        expected.extend((0..2).map(|line| format!("new {index}.{line}")));
+    }
+    let new_renders_total = || {
+        new_renders
+            .iter()
+            .map(|renders| renders.load(Ordering::Relaxed))
+            .sum::<u64>()
+    };
+    assert_eq!(
+        document.rows(0..synced.height, 40).as_ref(),
+        expected.as_slice()
+    );
+    assert_eq!(document.line(3, 40).as_deref(), Some("new 1.1"));
+    assert_eq!(document.render_range(1..3, 40).as_ref(), &expected[2..6]);
+    assert_eq!(document.materialize(40).as_ref(), expected.as_slice());
+    assert_eq!(new_renders_total(), 3, "each new block renders once");
+    document.sync(40);
+    assert_eq!(
+        new_renders_total(),
+        3,
+        "the next frame's sync reuses the re-measurement"
+    );
+    assert_eq!(document.total_height(), 6);
+    assert_eq!(document.child_count(), 3);
+}
+
+#[test]
+fn scroll_content_reads_follow_a_restructure_between_frames() {
+    // The between-frame consumers (residual image crop, selection copy)
+    // read through the previous frame's `ScrollContent::Virtual`, whose
+    // `height` is the stale frame's.
+    let fx = fixture();
+    let (_, virtual_) = pair(&fx, ScrollbarMode::Hidden, Follow::None);
+    let mut cache = LayoutRenderCache::new();
+    frame(&virtual_, 40, 8, &mut cache);
+    with_scroll_view(&virtual_, |view| view.scroll_to(30));
+    let scrolled = frame(&virtual_, 40, 8, &mut cache);
+    let stale_height = {
+        let content = scroll_box(&scrolled)
+            .scroll_content()
+            .expect("virtual content");
+        assert!(content.len() > 4);
+        assert!(content.line(3).is_some());
+        content.len()
+    };
+
+    // `/clear` between the frame and a consumer read.
+    lock(&fx.container).children.clear();
+    let content = scroll_box(&scrolled)
+        .scroll_content()
+        .expect("virtual content");
+    assert_eq!(content.len(), stale_height, "the frame's snapshot");
+    assert_eq!(content.line(3), None);
+    assert_eq!(content.rows(0..stale_height).len(), 0);
+    assert_eq!(content.to_lines().len(), 0);
+    // The next frame lays out the empty document without a panic.
+    let empty = frame(&virtual_, 40, 8, &mut cache);
+    assert!(visible(&empty.lines).iter().all(|line| line.is_empty()));
+
+    // An append between a frame and a consumer read: the rows come from the
+    // re-measured content (read through the tall stale snapshot, which
+    // still admits the row; a snapshot shorter than the row answers `None`
+    // without touching the document).
+    let (block, block_renders, _) =
+        trusted(vec!["appended 0".to_string(), "appended 1".to_string()]);
+    lock(&fx.container).children.push(block);
+    let content = scroll_box(&scrolled)
+        .scroll_content()
+        .expect("virtual content");
+    assert_eq!(content.line(1).as_deref(), Some("appended 1"));
+    assert_eq!(
+        content.rows(0..stale_height).as_ref(),
+        ["appended 0".to_string(), "appended 1".to_string()].as_slice()
+    );
+    assert_eq!(block_renders.load(Ordering::Relaxed), 1);
+    let grown = frame(&virtual_, 40, 8, &mut cache);
+    assert_eq!(visible(&grown.lines)[..2], ["appended 0", "appended 1"]);
+    assert_eq!(block_renders.load(Ordering::Relaxed), 1);
+}

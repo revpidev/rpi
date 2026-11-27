@@ -96,6 +96,20 @@ pub struct TranscriptStats {
 /// at the frame's width before asking for ranges; the row accessors also
 /// work outside a frame (they render what they need on demand), which is how
 /// selection copy and prompt jumps read rows between frames.
+///
+/// The document may be restructured between a sync and a read: the
+/// application shares the chat container with the session thread through an
+/// `Arc<Mutex<..>>`, so a `/clear`, a theme rebuild or an append can land
+/// while the driver thread is mid-frame (between the layout's `sync` and its
+/// `rows`, or before the residual image crop) or between frames. The row
+/// accessors ([`Self::rows`], [`Self::line`], [`Self::render_range`],
+/// [`Self::materialize`]) follow the children — a restructured document is
+/// re-measured first (the next sync, moved ahead of the read), so the rows
+/// returned are always the current content's. The index accessors
+/// ([`Self::revision_at`], [`Self::height_at`], [`Self::visible_range`],
+/// [`Self::prompt_rows`], [`Self::block_row`]) answer "unmeasured" until the
+/// next sync (`None`, `0..0`, empty, the content end) rather than report a
+/// displaced block; a row window computed from them clamps to the content.
 pub trait TranscriptDocument {
     /// Brings the height index up to date for `width`: measures every block
     /// whose identity or revision changed (and every untrusted block), then

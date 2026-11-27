@@ -254,6 +254,31 @@ impl SequenceState {
             .sum()
     }
 
+    /// Whether the slot vector still describes `children` one-to-one. The
+    /// application mounts the chat container behind an `Arc<Mutex<..>>` and
+    /// restructures it from the session thread (a `/clear`, a theme rebuild,
+    /// an append) while the driver thread sits between a frame's `sync` and
+    /// a later read (the layout's `rows`, the residual image crop, a
+    /// selection copy) — so a read can meet a `children` vector that no
+    /// longer matches `slots`/`starts`. The `&self` readers then answer
+    /// "unmeasured" until the next sync; the row readers re-measure first
+    /// ([`Self::resync_if_restructured`]).
+    fn aligned(&self, children: &[Box<dyn Component>]) -> bool {
+        self.slots.len() == children.len()
+    }
+
+    /// Brings the height index back in step with `children` after a
+    /// restructure that landed since the last sync, so a row reader never
+    /// indexes `children` with a position from the stale slot vector. This
+    /// is the next frame's `sync` moved ahead of the read: trusted blocks
+    /// keep their heights through the identity carry-over, so only the
+    /// blocks that actually changed render.
+    fn resync_if_restructured(&mut self, children: &[Box<dyn Component>], width: usize) {
+        if !self.aligned(children) {
+            self.sync(children, width);
+        }
+    }
+
     /// Rebuilds the slot vector after a structural change, carrying trusted
     /// opaque slots over by identity (a shifted block keeps its height and
     /// retained lines; a replaced block starts unknown).
@@ -467,6 +492,9 @@ impl SequenceState {
     }
 
     pub(crate) fn revision_at(&self, children: &[Box<dyn Component>], index: usize) -> Option<u64> {
+        if !self.aligned(children) {
+            return None;
+        }
         let (child, local) = self.resolve(index)?;
         match &self.slots[child] {
             Slot::Opaque(slot) => slot.revision,
@@ -479,6 +507,9 @@ impl SequenceState {
     }
 
     pub(crate) fn height_at(&self, children: &[Box<dyn Component>], index: usize) -> Option<usize> {
+        if !self.aligned(children) {
+            return None;
+        }
         let (child, local) = self.resolve(index)?;
         match &self.slots[child] {
             Slot::Opaque(slot) => slot.measured.then_some(slot.height),
@@ -489,6 +520,12 @@ impl SequenceState {
     }
 
     pub(crate) fn block_row(&self, children: &[Box<dyn Component>], index: usize) -> usize {
+        // An unmeasured read resolves to the content end (the out-of-range
+        // convention): a consumer that turns block rows into a `rows` window
+        // asks for no rows rather than rows of a displaced block.
+        if !self.aligned(children) {
+            return self.total_height;
+        }
         match self.resolve(index) {
             Some((child, local)) => {
                 self.starts[child]
@@ -511,7 +548,7 @@ impl SequenceState {
         overscan: usize,
     ) -> Range<usize> {
         let window = clamp_window(scroll_top, viewport, overscan, self.total_height);
-        if window.is_empty() {
+        if window.is_empty() || !self.aligned(children) {
             return 0..0;
         }
         let first_child = self.child_at_row(window.start);
@@ -535,6 +572,9 @@ impl SequenceState {
 
     pub(crate) fn prompt_rows(&self, children: &[Box<dyn Component>]) -> Vec<usize> {
         let mut rows = Vec::new();
+        if !self.aligned(children) {
+            return rows;
+        }
         for (child, slot) in self.slots.iter().enumerate() {
             let start = self.starts[child];
             match slot {
@@ -608,6 +648,7 @@ impl SequenceState {
         rows: Range<usize>,
         width: usize,
     ) -> Arc<[String]> {
+        self.resync_if_restructured(children, width);
         let start = rows.start.min(self.total_height);
         let end = rows.end.min(self.total_height).max(start);
         if start >= end {
@@ -640,6 +681,20 @@ impl SequenceState {
         out.into()
     }
 
+    /// Full lines of flattened blocks `blocks`: the block rows resolve
+    /// against the current children (a restructure since the last sync
+    /// re-measures first), then the row range materializes like [`Self::rows`].
+    pub(crate) fn render_range(
+        &mut self,
+        children: &[Box<dyn Component>],
+        blocks: Range<usize>,
+        width: usize,
+    ) -> Arc<[String]> {
+        self.resync_if_restructured(children, width);
+        let rows = self.block_row(children, blocks.start)..self.block_row(children, blocks.end);
+        self.rows(children, rows, width)
+    }
+
     fn segment_key(&self, index: usize) -> SegmentKey {
         match &self.slots[index] {
             Slot::Opaque(slot) => SegmentKey::Opaque {
@@ -666,6 +721,7 @@ impl SequenceState {
         children: &[Box<dyn Component>],
         width: usize,
     ) -> Arc<[String]> {
+        self.resync_if_restructured(children, width);
         if let Some(corpus) = &mut self.corpus
             && corpus.width == width
             && corpus.stamp == self.stamp
