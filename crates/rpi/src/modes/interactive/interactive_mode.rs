@@ -15465,38 +15465,70 @@ mod tests {
                 .expect("the document region is a transcript document")
                 .stats()
         };
+        // The Mermaid-mode and terminal-capability generations are
+        // process-wide inputs of every trusted block's revision (the built-in
+        // Mermaid transformer folds both into `transform_revision`), and
+        // other tests in the parallel suite bump them at any moment. The
+        // revision protocol then re-measures once, by design, so a frame the
+        // suite crossed counts for nothing: a frame is counted only when both
+        // generations stayed constant from the previous frame's start through
+        // this frame's end, and every counted frame must be free of history
+        // re-renders. Heavily loaded runs need more frames for the same
+        // evidence, never weaker evidence.
+        let generations = || {
+            (
+                crate::core::settings_manager::mermaid_mode_generation(),
+                rpi_tui::terminal_image::capabilities_generation(),
+            )
+        };
+        let generations_before_first = generations();
         mode.ui_state.ui.render_now(true);
         let first = transcript_stats(&mode);
+        let mut previous_generations = (generations_before_first, generations());
         assert!(first.blocks >= 40, "blocks: {first:?}");
         assert!(
             first.trusted_blocks >= 40,
             "assistant messages are trusted: {first:?}"
         );
-        // Twelve more frames: a stable history is validated by identity, not
-        // re-rendered. The terminal-capability and transcoder generations are
-        // process-wide, and other tests in the parallel suite may bump them
-        // at any moment (the revision protocol then re-measures once, by
-        // design), so the assertion counts the frames in which no trusted
-        // block was rendered or re-fetched instead of comparing against the
-        // very first frame.
+        const STABLE_FRAMES_NEEDED: usize = 12;
+        const MAX_FRAMES: usize = STABLE_FRAMES_NEEDED * 50;
         let mut stable_frames = 0;
+        let mut frames = 0;
         let mut previous = first;
-        for _ in 0..12 {
+        while stable_frames < STABLE_FRAMES_NEEDED && frames < MAX_FRAMES {
+            let before = generations();
             mode.ui_state.ui.render_now(false);
             let current = transcript_stats(&mode);
-            if current.trusted_renders == previous.trusted_renders
-                && current.on_demand_renders == previous.on_demand_renders
-            {
+            let after = generations();
+            frames += 1;
+            let crossed = before != after
+                || previous_generations.0 != previous_generations.1
+                || previous_generations.1 != before;
+            if !crossed {
+                assert!(
+                    current.trusted_renders == previous.trusted_renders
+                        && current.on_demand_renders == previous.on_demand_renders,
+                    "a frame with unchanged generations re-rendered the history: {current:?} (previous {previous:?})"
+                );
                 stable_frames += 1;
             }
             previous = current;
+            previous_generations = (before, after);
         }
-        assert!(
-            stable_frames >= 8,
-            "frames without a history re-render: {stable_frames}; {previous:?}"
+        assert_eq!(
+            stable_frames, STABLE_FRAMES_NEEDED,
+            "the suite bumped the process-wide generations in every one of {frames} frames"
         );
-        assert_eq!(previous.syncs, first.syncs + 12);
-        assert!(previous.trusted_hits >= first.trusted_hits + 8 * 40);
+        assert_eq!(
+            previous.syncs,
+            first.syncs + frames as u64,
+            "one sync per frame"
+        );
+        assert!(
+            previous.trusted_hits >= first.trusted_hits + (STABLE_FRAMES_NEEDED * 40) as u64,
+            "hits: {} after {first:?}",
+            previous.trusted_hits
+        );
         mode.shutdown().await;
     }
 

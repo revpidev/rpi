@@ -1711,6 +1711,12 @@ async fn abort_full_chain_returns_on_idle_session() {
 /// A tool that blocks until its abort signal fires, resolving with
 /// "tool aborted" (the upstream 8724 blocking tool).
 struct BlockingTool {
+    /// Signals that the tool started. The signal is permit-storing
+    /// (`notify_one`): the test creates its `notified()` future only after
+    /// the prompt task is spawned, and under parallel load that task can
+    /// reach the tool before the test task gets there. A `notify_waiters()`
+    /// landing with no registered waiter is dropped, and the test then waits
+    /// forever (the load-sensitive hang this used to reproduce).
     started: Arc<tokio::sync::Notify>,
 }
 
@@ -1736,7 +1742,7 @@ impl rpi_agent::types::AgentTool for BlockingTool {
         signal: tokio_util::sync::CancellationToken,
         _on_update: Option<rpi_agent::types::AgentToolUpdateCallback>,
     ) -> Result<rpi_agent::types::AgentToolResult, rpi_agent::AgentError> {
-        self.started.notify_waiters();
+        self.started.notify_one();
         signal.cancelled().await;
         Ok(rpi_agent::types::AgentToolResult {
             content: vec![rpi_ai::types::ToolResultContent::Text(
