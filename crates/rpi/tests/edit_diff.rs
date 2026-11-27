@@ -621,3 +621,288 @@ fn edit_diff_window_matches_whole_file_oracle() {
     );
     assert_eq!(windowed.first_changed_line, Some(40));
 }
+
+/// Lines of CJK text where every line is unique (the line number is repeated
+/// after the multi-byte punctuation).
+fn cjk_lines(count: usize) -> Vec<String> {
+    (1..=count)
+        .map(|line| format!("第 {line} 行。继续修复问题，再运行一段时间 {line} 次。"))
+        .collect()
+}
+
+/// Replace `old_text` on line `changed` (1-indexed) of a CJK file with
+/// `new_text` and return `(old, new, whole-file result, windowed result)`.
+fn windowed_cjk_edit(
+    count: usize,
+    changed: usize,
+    old_text: &str,
+    new_text: &str,
+) -> (String, String, DiffResult, EditDiff) {
+    let old_lines = cjk_lines(count);
+    let mut new_lines = old_lines.clone();
+    new_lines[changed - 1] = new_lines[changed - 1].replacen(old_text, new_text, 1);
+    assert_ne!(old_lines[changed - 1], new_lines[changed - 1]);
+    let old = old_lines.join("\n");
+    let new = new_lines.join("\n");
+    let applied = apply_one(&old, old_text, new_text);
+    assert_eq!(applied.new_content, new);
+    let windowed = generate_edit_diff("notes.md", &old, &new, &applied.replacements, 4);
+    (
+        old.clone(),
+        new.clone(),
+        generate_diff_string(&old, &new, 4),
+        windowed,
+    )
+}
+
+#[test]
+fn edit_diff_window_old_text_starts_after_multibyte_char() {
+    // The byte before the match is the last byte of U+3002: `offset - 1` is
+    // not a char boundary. This is the panic reported from edit_diff.rs:1226.
+    let (_, new, whole, windowed) =
+        windowed_cjk_edit(80, 40, "继续修复问题，再运行一段时间 40", "已经修复问题");
+    assert_eq!(
+        new,
+        cjk_lines(80)[..39].join("\n")
+            + "\n第 40 行。已经修复问题 次。\n"
+            + &cjk_lines(80)[40..].join("\n")
+    );
+    assert_eq!(windowed.diff, whole.diff);
+    assert_eq!(windowed.first_changed_line, Some(40));
+}
+
+#[test]
+fn edit_diff_window_old_text_ends_after_multibyte_char() {
+    // The byte before the match end is the last byte of U+3002.
+    let (old, new, whole, windowed) = windowed_cjk_edit(80, 40, "第 40 行。", "第 40 行！");
+    assert_eq!(windowed.diff, whole.diff);
+    assert_eq!(
+        windowed.patch,
+        generate_unified_patch("notes.md", &old, &new, 4)
+    );
+    assert_eq!(windowed.first_changed_line, Some(40));
+}
+
+#[test]
+fn edit_diff_window_old_text_touches_multibyte_on_both_sides() {
+    // Both edges of the match sit against multi-byte characters, on the first
+    // lines (no margin before) and on the last lines (no margin after).
+    for changed in [1, 2, 3, 4, 5, 39, 40, 41, 76, 77, 78, 79, 80] {
+        let (old, new, whole, windowed) = windowed_cjk_edit(
+            80,
+            changed,
+            &format!("。继续修复问题，再运行一段时间 {changed} 次。"),
+            "。问题已经修复。",
+        );
+        assert_eq!(windowed.diff, whole.diff, "changed line {changed}");
+        assert_eq!(
+            windowed.patch,
+            generate_unified_patch("notes.md", &old, &new, 4),
+            "changed line {changed}"
+        );
+        assert_eq!(windowed.first_changed_line, Some(changed));
+    }
+}
+
+#[test]
+fn edit_diff_window_multibyte_edit_at_end_of_file_without_newline() {
+    let old = "第一行。\n第二行。结尾";
+    let new = "第一行。\n第二行。结尾（已修改）";
+    let applied = apply_one(old, "结尾", "结尾（已修改）");
+    assert_eq!(applied.new_content, new);
+    let windowed = generate_edit_diff("notes.md", old, new, &applied.replacements, 4);
+    assert_eq!(windowed.diff, generate_diff_string(old, new, 4).diff);
+}
+
+#[test]
+fn edit_diff_window_multibyte_multi_edit_separate_and_merged_windows() {
+    // Line 9 and line 70 are further apart than the window margin (separate
+    // windows); lines 40 and 41 share one merged window.
+    let old_lines = cjk_lines(80);
+    let edits = [
+        (9usize, "继续修复问题，再运行一段时间 9"),
+        (40, "。继续修复问题，再运行一段时间 40 次。"),
+        (41, "第 41 行。"),
+        (70, "继续修复问题，再运行一段时间 70"),
+    ];
+    let mut new_lines = old_lines.clone();
+    let replacements: Vec<EditReplacement> = edits
+        .iter()
+        .enumerate()
+        .map(|(index, (line, old_text))| {
+            let new_text = format!("已修改 {index}。");
+            new_lines[line - 1] = new_lines[line - 1].replacen(old_text, &new_text, 1);
+            assert_ne!(old_lines[line - 1], new_lines[line - 1]);
+            EditReplacement {
+                old_text: (*old_text).to_owned(),
+                new_text,
+                edit_index: index,
+            }
+        })
+        .collect();
+    let old = old_lines.join("\n");
+    let new = new_lines.join("\n");
+    let applied =
+        apply_edits_to_normalized_content(&old, &replacements, "notes.md").expect("apply edits");
+    assert_eq!(applied.new_content, new);
+    let windowed = generate_edit_diff("notes.md", &old, &new, &applied.replacements, 4);
+    assert_eq!(windowed.diff, generate_diff_string(&old, &new, 4).diff);
+    assert_eq!(
+        windowed.patch,
+        generate_unified_patch("notes.md", &old, &new, 4)
+    );
+    assert_eq!(windowed.first_changed_line, Some(9));
+}
+
+// ---------------------------------------------------------------------------
+// Randomised whole-file oracle for the diff windows
+// ---------------------------------------------------------------------------
+
+/// xorshift64*: small, dependency-free and deterministic per seed.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
+    }
+}
+
+/// 1-, 2-, 3- and 4-byte characters, so edits land next to every kind of
+/// multi-byte neighbour. No whitespace and nothing the tool's fuzzy
+/// normalisation folds, so a fragment of a line reaches the windowing code
+/// through the tool's own matching unchanged.
+const BODY_TOKENS: [&str; 8] = ["a", "é", "第", "。", "🙂", "あ", "x", "bb"];
+
+const NEW_TEXT_TOKENS: [&str; 8] = ["a", "第", "。", "🙂", "\n", "\n\n", "", "  "];
+
+fn random_text(rng: &mut Rng, tokens: &[&str], max_tokens: usize) -> String {
+    (0..rng.below(max_tokens + 1))
+        .map(|_| tokens[rng.below(tokens.len())])
+        .collect()
+}
+
+#[test]
+fn edit_diff_window_matches_whole_file_on_random_multibyte_edits() {
+    // `RPI_EDIT_DIFF_FUZZ_SEEDS=20000` for a longer local soak.
+    let seeds: u64 = std::env::var("RPI_EDIT_DIFF_FUZZ_SEEDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(600);
+    let mut exercised = 0usize;
+    for seed in 1..=seeds {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let line_count = 1 + rng.below(160);
+        // A line-number prefix keeps every line unique, so the line-level diff
+        // has exactly one alignment and the whole-file oracle is exact. The
+        // `#line#` marker in the middle makes every fragment that covers it
+        // unique as well.
+        let halves: Vec<(String, String)> = (0..line_count)
+            .map(|_| {
+                (
+                    random_text(&mut rng, &BODY_TOKENS, 4),
+                    random_text(&mut rng, &BODY_TOKENS, 4),
+                )
+            })
+            .collect();
+        let old_lines: Vec<String> = halves
+            .iter()
+            .enumerate()
+            .map(|(line, (left, right))| format!("{line:>3} {left}#{line}#{right}"))
+            .collect();
+        let trailing_newline = rng.below(4) != 0;
+        let old = old_lines.join("\n") + if trailing_newline { "\n" } else { "" };
+
+        // Distinct lines, ascending, so the edits never overlap.
+        let wanted = 1 + rng.below(5.min(line_count));
+        let mut lines: Vec<usize> = Vec::new();
+        while lines.len() < wanted {
+            let line = rng.below(line_count);
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+        lines.sort_unstable();
+
+        let mut new_lines = old_lines.clone();
+        let mut replacements: Vec<EditReplacement> = Vec::new();
+        for &line in &lines {
+            let (left, right) = &halves[line];
+            let body = format!("{left}#{line}#{right}");
+            let chars: Vec<char> = body.chars().collect();
+            let left_chars = left.chars().count();
+            let marker_end = left_chars + format!("#{line}#").chars().count();
+            // Either edge of the fragment may sit right against a multi-byte
+            // token; the fragment always covers the `#line#` marker.
+            let start = rng.below(left_chars + 1);
+            let end = marker_end + rng.below(chars.len() - marker_end + 1);
+            let old_text: String = chars[start..end].iter().collect();
+            // Invariants of the generator: the tool finds the fragment once,
+            // unchanged by its fuzzy normalisation. A violation is a bug in
+            // this test, not something to skip silently.
+            assert_eq!(
+                old.matches(&old_text).count(),
+                1,
+                "seed {seed}: fragment {old_text:?} of line {line} is not unique"
+            );
+            assert_eq!(
+                normalize_for_fuzzy_match(&old_text),
+                old_text,
+                "seed {seed}: fragment {old_text:?} is rewritten by the fuzzy normalisation"
+            );
+            let mut new_text = random_text(&mut rng, &NEW_TEXT_TOKENS, 4);
+            if new_text == old_text {
+                new_text = "π".to_owned();
+            }
+            new_lines[line] = new_lines[line].replacen(&old_text, &new_text, 1);
+            replacements.push(EditReplacement {
+                old_text,
+                new_text,
+                edit_index: replacements.len(),
+            });
+        }
+        if new_lines == old_lines {
+            continue;
+        }
+
+        let new = new_lines.join("\n") + if trailing_newline { "\n" } else { "" };
+        let context_lines = rng.below(7);
+        let applied = apply_edits_to_normalized_content(&old, &replacements, "random.txt")
+            .unwrap_or_else(|err| panic!("seed {seed}: {err}"));
+        assert_eq!(applied.new_content, new, "seed {seed}");
+        exercised += 1;
+
+        let windowed = generate_edit_diff(
+            "random.txt",
+            &old,
+            &new,
+            &applied.replacements,
+            context_lines,
+        );
+        let whole = generate_diff_string(&old, &new, context_lines);
+        assert_eq!(windowed.diff, whole.diff, "seed {seed} (display diff)");
+        assert_eq!(
+            windowed.patch,
+            generate_unified_patch("random.txt", &old, &new, context_lines),
+            "seed {seed} (patch)"
+        );
+        assert_eq!(
+            windowed.first_changed_line, whole.first_changed_line,
+            "seed {seed} (first changed line)"
+        );
+    }
+    // Seeds whose fragments were all skipped must stay the exception, or the
+    // oracle would go green without comparing anything.
+    assert!(
+        exercised * 2 >= seeds as usize,
+        "only {exercised} of {seeds} seeds reached the comparison"
+    );
+}

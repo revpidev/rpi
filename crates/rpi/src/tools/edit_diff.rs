@@ -1219,19 +1219,32 @@ struct DiffWindow {
     new_line: usize,
 }
 
+/// Start of the line that owns the byte at `offset - 1`, where a `\n` byte is
+/// owned by the line it terminates. Returns 0 for `offset == 0`.
+///
+/// `offset` only has to satisfy `offset <= content.len()`. When a match starts
+/// or ends right next to a multi-byte character (U+3002, U+884C, an emoji,
+/// ...) the byte before it is a continuation byte, and slicing the `str` at
+/// `offset - 1` panics with "not a char boundary". `\n` is ASCII and never
+/// part of a multi-byte sequence, so a plain byte search gives the same
+/// answer regardless.
 fn line_start_before(content: &str, offset: usize) -> usize {
     if offset == 0 {
         return 0;
     }
-    content[..offset - 1]
-        .rfind('\n')
+    content.as_bytes()[..offset - 1]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
         .map_or(0, |index| index + 1)
 }
 
+/// Number of `\n` bytes in `content[start..end]`. Byte-based for the same
+/// reason as [`line_start_before`]: the range need not start or end on a char
+/// boundary.
 fn count_line_feeds(content: &str, start: usize, end: usize) -> usize {
-    content[start..end]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
+    content.as_bytes()[start..end]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
         .count()
 }
 
@@ -1250,6 +1263,10 @@ fn diff_windows(base_content: &str, replacements: &[TextReplacement]) -> Vec<Dif
             }
             start = line_start_before(base_content, start - 1);
         }
+        // End of the last line touched by the match, then the margin. `search`
+        // may sit inside a multi-byte character (the last one of the match),
+        // so the line feed is looked up by byte rather than with a `str`
+        // slice, which would panic on such an index.
         let mut end = match_end;
         for index in 0..=DIFF_WINDOW_MARGIN_LINES {
             if end >= base_content.len() {
@@ -1260,8 +1277,9 @@ fn diff_windows(base_content: &str, replacements: &[TextReplacement]) -> Vec<Dif
             } else {
                 end
             };
-            end = base_content[search..]
-                .find('\n')
+            end = base_content.as_bytes()[search..]
+                .iter()
+                .position(|&byte| byte == b'\n')
                 .map_or(base_content.len(), |line_feed| search + line_feed + 1);
         }
         let replacement_offset_delta =
@@ -1318,6 +1336,14 @@ fn shift_display_line(line: &str, old_line: usize, new_line: usize, width: usize
         .next()
         .unwrap_or_default();
     let Ok(number) = digits.parse::<usize>() else {
+        // The fold marker (` ...`) is laid out with the window's line-number
+        // width, which is narrower than the whole file's whenever the window
+        // does not reach the higher line numbers. Re-layout it with the
+        // whole-file width so it matches a whole-file diff and so adjacent
+        // windows' markers compare equal and collapse into one.
+        if prefix == ' ' && trimmed == "..." {
+            return format!(" {:>width$} ...", "", width = width);
+        }
         return line.to_owned();
     };
     let shifted = if prefix == '+' {
@@ -1389,15 +1415,17 @@ pub fn generate_edit_diff(
             first_changed_line = shown.first_changed_line.map(|line| line + window.new_line);
         }
         for line in shown.diff.lines() {
-            if output.last().is_some_and(|last| last == &skip_marker) && line == skip_marker {
+            let shifted =
+                shift_display_line(line, window.old_line, window.new_line, line_num_width);
+            // Two windows that do not overlap end and start with a fold
+            // marker right next to each other. A whole-file diff folds the
+            // gap between them once, so keep a single marker. This has to be
+            // decided on the re-layouted line: the raw one still carries the
+            // window's (narrower) line-number width.
+            if shifted == skip_marker && output.last() == Some(&skip_marker) {
                 continue;
             }
-            output.push(shift_display_line(
-                line,
-                window.old_line,
-                window.new_line,
-                line_num_width,
-            ));
+            output.push(shifted);
         }
         let patch = generate_unified_patch(path, old_text, new_text, context_lines);
         for line in patch.lines().skip(2) {
