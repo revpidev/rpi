@@ -135,6 +135,7 @@ function Show-Matrix {
         @('re-stage the rolled-back version with --force; resume an interrupted rollback', 'rollback + manual'),
         @('three cleanup notices; update --cleanup', 'switched (reminder/in-use) + cleanup'),
         @('pre-rc.4 instance running during GC: its old generation is neither renamed nor half-deleted (live by the refused rename, in-use warning)', 'extensions + manual (keep a pre-rc.4 rpi open; update.log says the rename was refused; the next start after it exits cleans up)'),
+        @('lock-busy start during an open first boot: a one-shot command or a TUI instance neither confirms nor rolls back; the confirmation waits for a later start', 'manual: stage, then start rpi twice at once (the second start finds the lock busy); no rollback line in update.log, update-result.json stays applied/confirmed as expected'),
         @('existing flat installs keep loading; update --extensions migrates; old dir cleaned', 'extensions'),
         @('install.ps1: fresh generational install; parked-exe preflight; re-run with rpi closed', 'manual (installer prompts)'),
         @('Defender interference', 'manual: note any "still in use"/"access denied" warning and the update.log lines'),
