@@ -343,7 +343,7 @@ fn register_sigint_restore() {
                 });
             }
             rpi_tui::recovery::emergency_restore();
-            std::process::exit(130);
+            crate::process_exit::exit(130);
         });
     }
 }
@@ -354,6 +354,8 @@ fn register_sigint_restore() {
 /// restore writes). The handler thread signals the run loop's shutdown watch
 /// channel; the run loop performs the shutdown.
 fn register_signal_handlers(shutdown_tx: watch::Sender<bool>) {
+    #[cfg(not(unix))]
+    let _ = shutdown_tx;
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -2045,9 +2047,33 @@ pub(crate) struct ExtensionChangelogUpdate {
     pub(crate) markdown: String,
 }
 
+/// V19-09 (ADR-0050): the update notices of this start, already rendered
+/// (the first-boot reminder, a rollback or a degradation, then at most one
+/// warning). Windows only; elsewhere there are none.
+fn update_startup_notice_lines() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        crate::core::windows_update::startup::interactive_notices()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+fn mark_update_notices_read() {
+    #[cfg(windows)]
+    {
+        crate::core::windows_update::startup::mark_notices_read();
+    }
+}
+
 /// The `showStartupNoticesIfNeeded` body (interactive-mode.ts:856-887 @
-/// b4afdddf): host and extension changelogs in one bordered notice.
+/// b4afdddf): host and extension changelogs in one bordered notice. The
+/// update notices of a Windows start (V19-09, ADR-0050) open the box
+/// ahead of What's New.
 pub(crate) fn startup_notice_components(
+    update_notice_lines: &[String],
     changelog_markdown: Option<&str>,
     extension_updates: &[ExtensionChangelogUpdate],
     collapse_changelog: bool,
@@ -2059,6 +2085,17 @@ pub(crate) fn startup_notice_components(
     let border = Box::new(move |text: &str| border_theme.fg("border", text));
     let mut components: Vec<Box<dyn rpi_tui::tui::Component>> = Vec::new();
     components.push(Box::new(DynamicBorder::new(border.clone())));
+    if !update_notice_lines.is_empty() {
+        let whats_new_follows = changelog_markdown.is_some() || !extension_updates.is_empty();
+        components.push(Box::new(Spacer::new(1)));
+        for line in update_notice_lines {
+            components.push(Box::new(Text::new(line.clone(), 1, 0, None)));
+        }
+        components.push(Box::new(Spacer::new(1)));
+        if !whats_new_follows {
+            components.pop();
+        }
+    }
     if let Some(changelog_markdown) = changelog_markdown {
         if collapse_changelog {
             let version = crate::core::changelog::parse_changelog(changelog_markdown)
@@ -4137,13 +4174,18 @@ impl InteractiveUi {
         }
         let changelog_markdown = lock(&self.changelog_markdown).clone();
         let extension_updates = lock(&self.extension_changelog_updates).clone();
-        if changelog_markdown.is_none() && extension_updates.is_empty() {
+        let update_notice_lines = update_startup_notice_lines();
+        if changelog_markdown.is_none()
+            && extension_updates.is_empty()
+            && update_notice_lines.is_empty()
+        {
             return;
         }
         let collapse_changelog = self
             .session()
             .settings_manager(|settings| settings.get_collapse_changelog());
         let components = startup_notice_components(
+            &update_notice_lines,
             changelog_markdown.as_deref(),
             &extension_updates,
             collapse_changelog,
@@ -4158,6 +4200,8 @@ impl InteractiveUi {
         chat.children.extend(components);
         drop(chat);
         self.render_handle.request_render();
+        // Shown in the interactive start: the result is read (V19-09).
+        mark_update_notices_read();
     }
 
     /// `showLoadedResources` (interactive-mode.ts:1421-1627): the loaded
@@ -7236,6 +7280,12 @@ impl InteractiveMode {
                 })
                 .expect("spawn TUI driver thread"),
         );
+        // V19-09 (ADR-0050, Windows): the main loop is up — a confirmation
+        // point for the first boot of an applied update.
+        #[cfg(windows)]
+        crate::core::windows_update::startup::confirm_point(
+            crate::core::windows_update::startup::ConfirmPoint::TuiReady,
+        );
 
         // Auto theme (theme-controller.ts:37-45): resolve `light/dark`-style
         // settings against the terminal appearance and follow color scheme
@@ -8136,7 +8186,7 @@ impl InteractiveMode {
             unsubscribe();
         }
         self.stop_interactive_tui(fatal_exit_output());
-        std::process::exit(1);
+        crate::process_exit::exit_fatal(1);
     }
 
     /// `shutdown` (interactive-mode.ts:3555-3594, 6380-6398) — S4b version

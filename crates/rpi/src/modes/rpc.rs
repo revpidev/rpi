@@ -1303,6 +1303,7 @@ async fn read_record<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result
 // Entry point
 // ============================================================================
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownPhase {
     Requested,
@@ -1313,6 +1314,8 @@ enum ShutdownPhase {
 /// The first signal enters the same cleanup path as EOF. A repeated signal is
 /// the only forced exit, so a pending MCP refresh or tool result can settle.
 fn register_signal_handlers(shutdown: mpsc::UnboundedSender<i32>) {
+    #[cfg(not(unix))]
+    let _ = shutdown;
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -1340,7 +1343,7 @@ fn register_signal_handlers(shutdown: mpsc::UnboundedSender<i32>) {
                             }
                             ShutdownPhase::Draining | ShutdownPhase::Forced => {
                                 *phase = ShutdownPhase::Forced;
-                                std::process::exit(code);
+                                crate::process_exit::exit(code);
                             }
                         }
                     }
@@ -1366,6 +1369,12 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
     let output = RawStdout::new(out);
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<i32>();
     register_signal_handlers(shutdown_tx.clone());
+
+    // V19-09 (ADR-0050, Windows): the resident stdio mode is ready.
+    #[cfg(windows)]
+    crate::core::windows_update::startup::confirm_point(
+        crate::core::windows_update::startup::ConfirmPoint::RpcReady,
+    );
 
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
     let initial_session = runtime.lock().await.session().clone();

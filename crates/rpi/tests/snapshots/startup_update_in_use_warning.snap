@@ -1,0 +1,5 @@
+[38;2;95;168;204m────────────────────────────────────────────────────────────────────────────────[39m
+
+ Old version files are still in use by 2 running rpi instances. rpi removes     
+ them on a later start; run "rpi update --cleanup" to retry.                    
+[38;2;95;168;204m────────────────────────────────────────────────────────────────────────────────[39m

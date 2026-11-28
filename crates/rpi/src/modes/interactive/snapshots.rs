@@ -357,6 +357,7 @@ fn startup_notice_full_block() {
         Arc::new(Mutex::new(dark_theme()));
     let markdown_theme = Mutex::new(markdown_theme(&load_theme("dark", None).unwrap()));
     let components = crate::modes::interactive::interactive_mode::startup_notice_components(
+        &[],
         Some("## [0.1.7] - 2026-10-15\n\n### Fixed\n\n- Something fixed.\n"),
         &[],
         false,
@@ -379,6 +380,7 @@ fn startup_notice_condensed_line() {
         Arc::new(Mutex::new(dark_theme()));
     let markdown_theme = Mutex::new(markdown_theme(&load_theme("dark", None).unwrap()));
     let components = crate::modes::interactive::interactive_mode::startup_notice_components(
+        &[],
         Some("## [0.1.7] - 2026-10-15\n\n### Fixed\n\n- Something fixed.\n"),
         &[],
         true,
@@ -413,6 +415,7 @@ fn startup_notice_extensions_only_collapses_one_line_per_package() {
         },
     ];
     let components = crate::modes::interactive::interactive_mode::startup_notice_components(
+        &[],
         None,
         &updates,
         true,
@@ -431,6 +434,123 @@ fn startup_notice_extensions_only_collapses_one_line_per_package() {
         "{rendered}"
     );
     assert!(!rendered.contains("What's New"), "{rendered}");
+}
+
+// --- startup update notices (V19-09, ADR-0050; new frames, G14) ------------
+
+fn startup_update_notice_frame(name: &str, lines: &[&str]) {
+    use std::sync::Mutex;
+
+    let theme: crate::modes::interactive::components::ThemeHandle =
+        Arc::new(Mutex::new(dark_theme()));
+    let markdown_theme = Mutex::new(markdown_theme(&load_theme("dark", None).unwrap()));
+    let notices: Vec<String> = lines.iter().map(|line| (*line).to_owned()).collect();
+    let components = crate::modes::interactive::interactive_mode::startup_notice_components(
+        &notices,
+        None,
+        &[],
+        false,
+        &theme,
+        &markdown_theme,
+        Vec::new(),
+    );
+    let rendered: Vec<String> = components
+        .iter()
+        .flat_map(|component| component.render(80))
+        .collect();
+    assert_snapshot(name, &rendered);
+}
+
+#[test]
+fn startup_update_first_boot_reminder() {
+    startup_update_notice_frame(
+        "startup_update_first_boot_reminder",
+        &[
+            "Updated rpi 0.1.9-rc.3 → 0.1.9-rc.4. The previous version is removed automatically the next time rpi starts after you exit this session. 1 other running rpi instance is still on rpi 0.1.9-rc.3; they switch over after they restart.",
+        ],
+    );
+}
+
+#[test]
+fn startup_update_in_use_warning() {
+    startup_update_notice_frame(
+        "startup_update_in_use_warning",
+        &[
+            "Old version files are still in use by 2 running rpi instances. rpi removes them on a later start; run \"rpi update --cleanup\" to retry.",
+        ],
+    );
+}
+
+#[test]
+fn startup_update_stuck_warning() {
+    startup_update_notice_frame(
+        "startup_update_stuck_warning",
+        &[
+            "3 old version files could not be removed (access denied, in use). See C:\\Users\\me\\AppData\\Local\\rpi\\logs\\update.log. Run \"rpi update --cleanup\" to retry.",
+        ],
+    );
+}
+
+#[test]
+fn startup_update_notice_precedes_whats_new_in_the_same_box() {
+    use std::sync::Mutex;
+
+    let theme: crate::modes::interactive::components::ThemeHandle =
+        Arc::new(Mutex::new(dark_theme()));
+    let markdown_theme = Mutex::new(markdown_theme(&load_theme("dark", None).unwrap()));
+    let notices = vec![
+        "Updated rpi 0.1.9-rc.3 → 0.1.9-rc.4. The previous version has been removed.".to_owned(),
+    ];
+    let components = crate::modes::interactive::interactive_mode::startup_notice_components(
+        &notices,
+        Some("## [0.1.9] - 2026-11-27\n\n### Added\n\n- Something."),
+        &[],
+        true,
+        &theme,
+        &markdown_theme,
+        Vec::new(),
+    );
+    // Strip the SGR color sequences to look at the frame structure.
+    fn strip_ansi(line: &str) -> String {
+        let mut out = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out.trim().to_owned()
+    }
+    let rendered: Vec<String> = components
+        .iter()
+        .flat_map(|component| component.render(100))
+        .map(|line| strip_ansi(&line))
+        .collect();
+    let text = rendered.join("\n");
+    let reminder = text.find("Updated rpi 0.1.9-rc.3").expect("reminder");
+    let whats_new = text
+        .find("Updated to v0.1.9")
+        .expect("condensed What's New");
+    assert!(reminder < whats_new, "{text}");
+    // One box: a single top border and a single bottom border.
+    let borders = rendered
+        .iter()
+        .filter(|line| !line.is_empty() && line.chars().all(|ch| ch == '─'))
+        .count();
+    assert_eq!(borders, 2, "{text}");
+    assert!(
+        rendered
+            .first()
+            .is_some_and(|line| line.chars().all(|ch| ch == '─')),
+        "{text}"
+    );
 }
 
 // --- editor-border status spinners (c1d4c8011, V15-07 FR-C) ----------------

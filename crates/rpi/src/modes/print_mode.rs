@@ -47,6 +47,10 @@ fn register_signal_handlers(
     session: crate::core::agent_session::AgentSession,
     exit_code: std::sync::Arc<std::sync::atomic::AtomicI32>,
 ) {
+    #[cfg(not(unix))]
+    {
+        let _ = (session, exit_code);
+    }
     #[cfg(unix)]
     {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -69,7 +73,7 @@ fn register_signal_handlers(
                             stream.recv().await;
                         });
                         if signal_count.fetch_add(1, Ordering::SeqCst) > 0 {
-                            std::process::exit(code);
+                            crate::process_exit::exit(code);
                         }
                         session.request_abort();
                         exit_code.store(code, Ordering::SeqCst);
@@ -130,6 +134,14 @@ pub async fn run_print_mode(
 ) -> i32 {
     let signal_exit_code = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
     let mut exit_code = 0;
+
+    // V19-09 (ADR-0050, Windows): the resident JSON output mode is ready.
+    #[cfg(windows)]
+    if options.mode == PrintOutputMode::Json {
+        crate::core::windows_update::startup::confirm_point(
+            crate::core::windows_update::startup::ConfirmPoint::JsonReady,
+        );
+    }
 
     // JSON mode: header line first (print-mode.ts:122-127).
     if options.mode == PrintOutputMode::Json {
