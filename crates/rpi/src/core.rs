@@ -57,3 +57,4 @@ pub mod usage_providers;
 pub mod usage_totals;
 pub mod version_check;
 pub mod virtual_models;
+pub mod windows_update;

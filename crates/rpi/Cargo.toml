@@ -83,6 +83,20 @@ syntect-assets.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# V19-09 (ADR-0050): Win32 calls of the startup self-update — the
+# trampoline launch (process attribute list, job object), the console
+# control handler, process start times and DELETE-access probes. No new
+# crate: the workspace already pins windows-sys for the TUI console mode.
+windows-sys = { workspace = true, features = [
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Environment",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 rpi-test-support.workspace = true
 rpi-test-env.workspace = true

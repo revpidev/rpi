@@ -50,14 +50,21 @@ use crate::core::version_check::{
     UpdateChannel, channel_probe_url, get_latest_rpi_release_with, is_newer_package_version,
     release_channel_label, version_check_endpoint, version_transition,
 };
-use std::path::Path;
+use crate::core::windows_update::fs::UpdateFs as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// `getPackageCommandUsage("update")` (package-manager-cli.ts:86). The
 /// literal `rpi` mirrors `APP_NAME` (config.rs); the
 /// `usage_lines_start_with_app_name` test binds the two so a rename cannot
 /// silently leave the help text stale (T14 review N-1).
-pub const UPDATE_USAGE: &str = "rpi update [source|self|rpi] [--self|--extensions|--models|--all] [--extension <source>] [--version <ver>] [--rc] [--approve|--no-approve] [--force] [--yes]";
+pub const UPDATE_USAGE: &str = "rpi update [source|self|rpi] [--self|--extensions|--models|--all] [--extension <source>] [--version <ver>] [--rc] [--cleanup] [--approve|--no-approve] [--force] [--yes]";
+
+/// V19-09 (ADR-0050, R7.6.2): the hidden preflight flag. `rpi
+/// --verify-extension <path>` loads the extension at `<path>` in a
+/// throwaway process and exits 0 when it loads; `rpi update` starts it as
+/// a short-lived child. It never appears in a help text.
+pub const VERIFY_EXTENSION_USAGE: &str = "rpi --verify-extension <path>";
 
 /// V18-12 exact version grammar: a full semver version, optional leading
 /// `v`, no range operators. Returns the canonical string without the `v`.
@@ -107,6 +114,10 @@ pub struct ParsedUpdate {
     /// （RC）。与全部 target 旗标正交组合，不新增互斥（R6.1.2）；
     /// 对 `--models` 无效果（模型目录无通道概念，R6.5.4）。
     pub rc: bool,
+    /// V19-09 (rpi-specific, ADR-0050 R7.6.1): run the old-version cleanup
+    /// scan instead of updating. Orthogonal to every target flag in the
+    /// parser; when no target flag is given nothing is updated.
+    pub cleanup: bool,
 }
 
 /// `parsePackageCommand` restricted to `update` (package-manager-cli.ts:
@@ -156,6 +167,10 @@ pub fn parse_update_args(args: &[String]) -> ParsedUpdate {
             // self and extensions targets; orthogonal to every target
             // flag — no new conflicts (FR-A R1).
             parsed.rc = true;
+        } else if arg == "--cleanup" {
+            // V19-09 (rpi-specific): retry the old-version cleanup instead
+            // of updating; orthogonal to the target flags like `--rc`.
+            parsed.cleanup = true;
         } else if arg == "--version" {
             // V18-12 FR-G/FR-H: exact version pin; consumes one value.
             if version_seen {
@@ -335,6 +350,9 @@ Options:
   --force                 Reinstall rpi even if the current version is latest
   --yes                   Skip the native (L0) extension confirmation prompt
                           (registry/github: extension installs and updates)
+  --cleanup               Retry removing old-version files instead of
+                          updating (Windows: leftover executables and
+                          extension generations; exits 1 when some remain)
 
 Short forms:
   {APP_NAME} update                Update rpi only
@@ -351,6 +369,26 @@ Short forms:
                                    @version/@ref syntax instead)
 "#
     )
+}
+
+/// Parse the hidden preflight invocation `rpi --verify-extension <path>`
+/// (V19-09). `args` is the full argument vector after the program name;
+/// `None` when the first argument is anything else.
+pub fn parse_verify_extension(args: &[String]) -> Option<Result<PathBuf, String>> {
+    if args.first().map(String::as_str) != Some(crate::core::windows_update::VERIFY_EXTENSION_FLAG)
+    {
+        return None;
+    }
+    Some(match args.get(1) {
+        Some(path) if !path.starts_with('-') && args.len() == 2 => Ok(PathBuf::from(path)),
+        Some(path) => Err(format!(
+            "Usage: {VERIFY_EXTENSION_USAGE} (got {path} and {} more argument(s))",
+            args.len().saturating_sub(2)
+        )),
+        None => Err(format!(
+            "Missing value for --verify-extension. Usage: {VERIFY_EXTENSION_USAGE}"
+        )),
+    })
 }
 
 /// `refreshModelCatalogs` (package-manager-cli.ts:397-421): create the
@@ -470,51 +508,29 @@ async fn get_self_update_plan(
     })
 }
 
-/// The Binary branch of the self target (T18, ADR-0011 §4): download +
-/// sha256 integrity check + atomic replace via
-/// [`crate::core::self_update::run_binary_self_update`]. `seam` is the
-/// test injection; production (`None`) resolves the current executable,
-/// the built-in release base URLs (GitHub + official-site mirror), and the
-/// reqwest transport. On Windows
-/// the phase-1 outcome is manual-replace instructions (no auto replace).
-async fn run_binary_self_update_branch(
-    plan: &SelfUpdatePlan,
-    seam: Option<BinarySelfUpdateSeam>,
-    observer: &dyn crate::core::download::DownloadObserver,
-    all_targets: bool,
-    extensions_skipped: bool,
-) -> i32 {
-    let seam = match seam {
-        Some(seam) => seam,
-        None => {
-            let exe_path = match std::env::current_exe() {
-                Ok(path) => path,
-                Err(error) => {
-                    eprintln!("Error: could not locate the {APP_NAME} executable: {error}");
-                    return 1;
-                }
-            };
-            BinarySelfUpdateSeam {
-                exe_path,
-                base_urls: vec![
-                    crate::core::self_update::RELEASE_DOWNLOAD_BASE_URL.to_string(),
-                    crate::core::self_update::SITE_DOWNLOAD_BASE_URL.to_string(),
-                ],
-                transport: Arc::new(crate::core::self_update::ReqwestBinaryDownloadTransport),
-            }
-        }
-    };
-    if !crate::core::self_update::binary_inplace_replace_supported() {
-        // Windows cannot rename over a running executable (ADR-0011 §4).
-        eprintln!(
-            "{}",
-            crate::core::self_update::windows_manual_update_instructions(
-                &plan.version,
-                &seam.exe_path
-            )
-        );
-        return 1;
-    }
+/// Production resolves the current executable, the built-in release base
+/// URLs (GitHub + official-site mirror) and the reqwest transport.
+fn production_binary_seam() -> Result<BinarySelfUpdateSeam, String> {
+    let exe_path = std::env::current_exe()
+        .map_err(|error| format!("could not locate the {APP_NAME} executable: {error}"))?;
+    Ok(BinarySelfUpdateSeam {
+        exe_path,
+        base_urls: vec![
+            crate::core::self_update::RELEASE_DOWNLOAD_BASE_URL.to_string(),
+            crate::core::self_update::SITE_DOWNLOAD_BASE_URL.to_string(),
+        ],
+        transport: Arc::new(crate::core::self_update::ReqwestBinaryDownloadTransport),
+        stage_for_next_start: None,
+    })
+}
+
+fn resolve_binary_seam(seam: Option<BinarySelfUpdateSeam>) -> Result<BinarySelfUpdateSeam, String> {
+    seam.map(Ok).unwrap_or_else(production_binary_seam)
+}
+
+/// The plan lines shared by both landings: the transition, the downgrade
+/// and channel warnings, the asset name.
+fn print_self_update_plan(plan: &SelfUpdatePlan, extensions_skipped: bool) {
     let target = crate::config::build_target();
     let channel = release_channel_label(&plan.version);
     let mut plan_line = format!("{} · {channel}", version_transition(VERSION, &plan.version));
@@ -544,6 +560,28 @@ async fn run_binary_self_update_branch(
             crate::core::self_update::asset_file_name(&plan.version, target)
         );
     }
+}
+
+/// The Binary branch of the self target (T18, ADR-0011 §4) on Unix:
+/// download + sha256 integrity check + atomic replace via
+/// [`crate::core::self_update::run_binary_self_update`]. `seam` is the
+/// test injection; production (`None`) uses [`production_binary_seam`].
+async fn run_binary_self_update_branch(
+    plan: &SelfUpdatePlan,
+    seam: Option<BinarySelfUpdateSeam>,
+    observer: &dyn crate::core::download::DownloadObserver,
+    all_targets: bool,
+    extensions_skipped: bool,
+) -> i32 {
+    let seam = match resolve_binary_seam(seam) {
+        Ok(seam) => seam,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            return 1;
+        }
+    };
+    print_self_update_plan(plan, extensions_skipped);
+    let target = crate::config::build_target();
     let request = BinarySelfUpdateRequest {
         exe_path: &seam.exe_path,
         version: &plan.version,
@@ -591,6 +629,190 @@ async fn run_binary_self_update_branch(
                 crate::core::self_update::manual_download_instruction(&plan.version, target)
             );
             eprintln!("Releases: {}", crate::config::SELF_UPDATE_DOWNLOAD_URL);
+            1
+        }
+    }
+}
+
+/// The inputs of the Windows staging branch of the self target.
+struct StageBranch<'a> {
+    plan: &'a SelfUpdatePlan,
+    seam: Option<BinarySelfUpdateSeam>,
+    observer: &'a dyn crate::core::download::DownloadObserver,
+    extensions: Vec<crate::core::windows_update::records::StagedExtension>,
+    channel: UpdateChannel,
+    force: bool,
+    pinned: bool,
+    all_targets: bool,
+    extensions_skipped: bool,
+}
+
+/// The self branch on Windows (V19-09, ADR-0050 P0): download, verify and
+/// stage the executable — and the extensions of the same `--all` batch —
+/// without touching anything in place; the next start applies them. The
+/// installed executable is only replaced by the startup transaction.
+async fn run_binary_stage_branch(branch: StageBranch<'_>) -> i32 {
+    use crate::core::windows_update::records::StagedExtension;
+    use crate::core::windows_update::staging::{self, PendingState, StageOutcome, StageRequest};
+    let StageBranch {
+        plan,
+        seam,
+        observer,
+        extensions,
+        channel,
+        force,
+        pinned,
+        all_targets,
+        extensions_skipped,
+    } = branch;
+    let seam = match resolve_binary_seam(seam) {
+        Ok(seam) => seam,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            return 1;
+        }
+    };
+    print_self_update_plan(plan, extensions_skipped);
+    let target = crate::config::build_target();
+    let paths = crate::core::windows_update::layout::UpdatePaths::for_exe(
+        &seam.exe_path,
+        &crate::config::get_agent_dir(),
+        std::env::current_dir().ok().as_deref(),
+    );
+    let fs = crate::core::windows_update::fs::RealFs;
+    let log = |message: &str| {
+        let (event, detail) = message.split_once(": ").unwrap_or((message, ""));
+        crate::core::windows_update::update_log::log_event(
+            &fs,
+            Some(paths.log_path.as_path()),
+            event,
+            detail,
+        );
+    };
+    let drop_staged_extensions = |extensions: &[StagedExtension]| {
+        for extension in extensions {
+            let _ = fs.remove_dir_all(&extension.staged_path);
+        }
+    };
+    // An applied update waits for its first start: nothing new is staged
+    // on top of it, and nothing is downloaded (R7.2.6).
+    match staging::pending_state(&fs, &paths) {
+        PendingState::Applied { version } => {
+            println!("{}", staging::awaiting_first_boot_line(&version));
+            return 0;
+        }
+        PendingState::Staged { version } if version == plan.version && extensions.is_empty() => {
+            // The same version is already staged and complete: idempotent,
+            // nothing is downloaded again.
+            let complete = crate::core::windows_update::records::read_record::<
+                crate::core::windows_update::records::PendingUpdate,
+            >(&fs, &paths.pending_path())
+            .is_some_and(|pending| {
+                fs.sha256_file(&pending.binary.staged_path)
+                    .is_ok_and(|sha| sha.eq_ignore_ascii_case(&pending.binary.sha256))
+            });
+            if complete {
+                println!(
+                    "rpi {} is already downloaded. It takes effect the next time rpi starts.",
+                    plan.version
+                );
+                return 0;
+            }
+        }
+        _ => {}
+    }
+    let request = BinarySelfUpdateRequest {
+        exe_path: &seam.exe_path,
+        version: &plan.version,
+        target,
+    };
+    let verified = match crate::core::self_update::download_release_asset(
+        &request,
+        seam.transport.as_ref(),
+        &seam.base_urls,
+        observer,
+    )
+    .await
+    {
+        Ok(verified) => verified,
+        Err(message) => {
+            drop_staged_extensions(&extensions);
+            eprintln!("Error: {message}");
+            eprintln!("{}", failure_line(all_targets));
+            eprintln!("Retry: {APP_NAME} update --self");
+            eprintln!(
+                "Manual: {}",
+                crate::core::self_update::manual_download_instruction(&plan.version, target)
+            );
+            return 1;
+        }
+    };
+    let exe = match target {
+        Some(target) => crate::core::self_update::extract_release_binary(target, &verified.archive),
+        None => Err(
+            "This build does not know its target triple, so the release archive cannot be read."
+                .to_owned(),
+        ),
+    };
+    let exe = match exe {
+        Ok(exe) => exe,
+        Err(message) => {
+            drop_staged_extensions(&extensions);
+            eprintln!("Error: {message}");
+            eprintln!("{}", failure_line(all_targets));
+            return 1;
+        }
+    };
+    let stage = StageRequest {
+        target_version: &plan.version,
+        channel,
+        force,
+        pinned,
+        running_version: VERSION,
+        release: &verified,
+        exe: &exe,
+        target: target.unwrap_or_default(),
+        extensions,
+    };
+    let staged_extensions = stage.extensions.clone();
+    match staging::stage_update(&fs, &paths, &stage, &log) {
+        Ok(StageOutcome::Staged {
+            version,
+            extensions,
+            replaced_previous,
+        }) => {
+            if replaced_previous {
+                eprintln!("Replaced the previously staged update.");
+            }
+            println!("{}", staging::staged_success_line(&version, &extensions));
+            if let Some(note) = &plan.note {
+                print_self_update_note(note);
+            }
+            println!("Staged: {}", paths.binary_staging_dir(&version).display());
+            println!("Changelog: https://revpi.dev/changelog");
+            0
+        }
+        Ok(StageOutcome::AlreadyStaged { version, .. }) => {
+            println!(
+                "rpi {version} is already downloaded. It takes effect the next time rpi starts."
+            );
+            0
+        }
+        Ok(StageOutcome::AwaitingFirstBoot { version }) => {
+            println!("{}", staging::awaiting_first_boot_line(&version));
+            0
+        }
+        Err(message) => {
+            drop_staged_extensions(&staged_extensions);
+            eprintln!("Error: {message}");
+            eprintln!("{}", failure_line(all_targets));
+            eprintln!(
+                "{}",
+                crate::core::self_update::windows_manual_update_instructions(
+                    &plan.version,
+                    &seam.exe_path
+                )
+            );
             1
         }
     }
@@ -846,6 +1068,9 @@ pub async fn run_update_in(
         eprintln!("Usage: {UPDATE_USAGE}");
         return 1;
     }
+    if parsed.cleanup {
+        return run_update_cleanup();
+    }
     let Some(target) = parsed.target else {
         return 1;
     };
@@ -915,6 +1140,8 @@ pub async fn run_update_in(
     let progress: Arc<dyn crate::core::download::DownloadObserver> =
         Arc::new(crate::cli::progress::ProgressRenderer::new());
 
+    let mut staged_extensions: Vec<crate::core::windows_update::records::StagedExtension> =
+        Vec::new();
     if matches!(target, UpdateTarget::All | UpdateTarget::Extensions { .. }) {
         let update_source = match &target {
             UpdateTarget::Extensions { source } => source.clone(),
@@ -963,6 +1190,20 @@ pub async fn run_update_in(
         })));
         manager.set_install_confirm_callback(build_install_confirm(parsed.yes));
         manager.set_download_observer(Some(progress.clone()));
+        // V19-09 (ADR-0050): on Windows an extension lands as a new
+        // generation; with `--all` it waits in staging for the startup
+        // transaction together with the executable.
+        let generational = binary_seam
+            .as_ref()
+            .map(|seam| seam.stage_for_next_start.unwrap_or(cfg!(windows)))
+            .unwrap_or(cfg!(windows));
+        if generational {
+            manager.set_extension_activation(if target == UpdateTarget::All {
+                crate::core::windows_update::generations::ExtensionActivation::Stage
+            } else {
+                crate::core::windows_update::generations::ExtensionActivation::Generational
+            });
+        }
         if let (Some(version), Some(extension_source)) = (&parsed.version, &update_source)
             && let Some(error) = DefaultPackageManager::exact_version_source_error(extension_source)
         {
@@ -998,9 +1239,18 @@ pub async fn run_update_in(
         }
         print_update_summary(&summary);
         if let Some(message) = error {
+            if manager.extension_activation()
+                == crate::core::windows_update::generations::ExtensionActivation::Stage
+            {
+                // Nothing is staged on top of a partial batch.
+                for extension in manager.take_staged_extensions() {
+                    let _ = std::fs::remove_dir_all(&extension.staged_path);
+                }
+            }
             eprintln!("Error: {message}");
             return 1;
         }
+        staged_extensions = manager.take_staged_extensions();
     }
 
     if matches!(target, UpdateTarget::All | UpdateTarget::Self_) {
@@ -1064,6 +1314,30 @@ pub async fn run_update_in(
         // gone. The install method is always Binary (D-055): rpi is
         // distributed only as a GitHub Releases binary, so there is no
         // package-manager branch and no Windows npm/pnpm gate.
+        // V19-09 (ADR-0050): Windows stages the executable for the next
+        // start instead of replacing it in place.
+        let stage = binary_seam
+            .as_ref()
+            .is_some_and(|seam| seam.stage_for_next_start.unwrap_or(cfg!(windows)))
+            || (binary_seam.is_none() && cfg!(windows));
+        if stage {
+            return run_binary_stage_branch(StageBranch {
+                plan: &plan,
+                seam: binary_seam,
+                observer: progress.as_ref(),
+                extensions: staged_extensions,
+                channel: if parsed.rc {
+                    UpdateChannel::PreRelease
+                } else {
+                    UpdateChannel::Stable
+                },
+                force: parsed.force,
+                pinned: parsed.version.is_some(),
+                all_targets: target == UpdateTarget::All,
+                extensions_skipped: parsed.show_extensions_skipped_note,
+            })
+            .await;
+        }
         return run_binary_self_update_branch(
             &plan,
             binary_seam,
@@ -1074,6 +1348,20 @@ pub async fn run_update_in(
         .await;
     }
     0
+}
+
+/// `rpi update --cleanup` (V19-09, R7.6.1): Windows retries the old-version
+/// cleanup and exits 1 while something remains; elsewhere it is a no-op.
+fn run_update_cleanup() -> i32 {
+    #[cfg(windows)]
+    {
+        crate::core::windows_update::startup::run_cleanup_command()
+    }
+    #[cfg(not(windows))]
+    {
+        println!("Nothing to clean up (the startup cleanup only runs on Windows).");
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2492,6 +2780,7 @@ mod update_cli_tests {
     /// Scripted binary-download transport: exact-URL map.
     struct StubBinaryTransport {
         responses: std::collections::HashMap<String, Result<Vec<u8>, String>>,
+        downloads: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl crate::core::self_update::BinaryDownloadTransport for StubBinaryTransport {
@@ -2500,6 +2789,8 @@ mod update_cli_tests {
             url: &'a str,
             _timeout: Duration,
         ) -> BoxFuture<'a, Result<Vec<u8>, String>> {
+            self.downloads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let response = self
                 .responses
                 .get(url)
@@ -2534,6 +2825,20 @@ mod update_cli_tests {
         version: &str,
         binary: &[u8],
     ) -> (PathBuf, BinarySelfUpdateSeam) {
+        let (exe, seam, _downloads) = binary_seam_with_counter(dirs, version, binary);
+        (exe, seam)
+    }
+
+    /// [`binary_seam`] plus the download counter of the stub transport.
+    fn binary_seam_with_counter(
+        dirs: &TestDirs,
+        version: &str,
+        binary: &[u8],
+    ) -> (
+        PathBuf,
+        BinarySelfUpdateSeam,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let exe = dirs.root.join("bin").join("rpi");
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, b"old-binary").unwrap();
@@ -2541,6 +2846,7 @@ mod update_cli_tests {
         let asset_url =
             crate::core::self_update::asset_url("https://releases.test", version, target);
         let (tarball, sidecar) = fake_release_tarball(binary);
+        let downloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let transport = StubBinaryTransport {
             responses: std::collections::HashMap::from([
                 (asset_url.clone(), Ok(tarball)),
@@ -2549,13 +2855,15 @@ mod update_cli_tests {
                     Ok(sidecar.into_bytes()),
                 ),
             ]),
+            downloads: Arc::clone(&downloads),
         };
         let seam = BinarySelfUpdateSeam {
             exe_path: exe.clone(),
             base_urls: vec!["https://releases.test".to_string()],
             transport: Arc::new(transport),
+            stage_for_next_start: None,
         };
-        (exe, seam)
+        (exe, seam, downloads)
     }
 
     fn args(input: &[&str]) -> Vec<String> {
@@ -3334,6 +3642,389 @@ mod update_cli_tests {
         );
         assert_eq!(transport.call_count(), 1);
         assert_eq!(std::fs::read(&exe).unwrap(), b"new-binary");
+    }
+
+    // ---- V19-09 (ADR-0050): the Windows staging landing ----------------------
+
+    /// A seam that forces the Windows landing (`stage_for_next_start`).
+    fn staged_binary_seam(
+        dirs: &TestDirs,
+        version: &str,
+        binary: &[u8],
+    ) -> (
+        PathBuf,
+        BinarySelfUpdateSeam,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (exe, mut seam, downloads) = binary_seam_with_counter(dirs, version, binary);
+        seam.stage_for_next_start = Some(true);
+        (exe, seam, downloads)
+    }
+
+    fn staged_paths(exe: &Path) -> crate::core::windows_update::layout::UpdatePaths {
+        crate::core::windows_update::layout::UpdatePaths::for_exe(
+            exe,
+            Path::new("/nonexistent-agent"),
+            None,
+        )
+    }
+
+    #[test]
+    fn update_cleanup_flag_is_orthogonal_to_targets_and_listed_in_the_help() {
+        // V19-09 (rpi-specific, R7.6.1): `--cleanup` adds no conflict with
+        // any target flag, exactly like `--rc`.
+        for (input, target) in [
+            (vec!["update", "--cleanup"], Some(UpdateTarget::Self_)),
+            (
+                vec!["update", "--cleanup", "--self"],
+                Some(UpdateTarget::Self_),
+            ),
+            (
+                vec!["update", "--cleanup", "--all"],
+                Some(UpdateTarget::All),
+            ),
+            (
+                vec!["update", "--cleanup", "--extensions"],
+                Some(UpdateTarget::Extensions { source: None }),
+            ),
+            (
+                vec!["update", "--cleanup", "--rc", "--extension", "rpi-todo"],
+                Some(UpdateTarget::Extensions {
+                    source: Some("rpi-todo".to_owned()),
+                }),
+            ),
+        ] {
+            let parsed = parse_update_args(&args(&input));
+            assert!(parsed.cleanup, "{input:?}");
+            assert_eq!(parsed.target, target, "{input:?}");
+            assert!(parsed.conflicting_options.is_none(), "{input:?}");
+        }
+        let parsed = parse(&["--self"]);
+        assert!(!parsed.cleanup);
+        let help = update_help();
+        assert!(help.contains("--cleanup"), "{help}");
+        assert!(!help.contains("--verify-extension"), "{help}");
+        assert!(UPDATE_USAGE.contains("[--cleanup]"));
+        assert!(!UPDATE_USAGE.contains("verify-extension"));
+        // `rpi --help` (the main help) does not list the hidden flag either.
+        let main_help = crate::cli::args::print_help(&[], false);
+        assert!(!main_help.contains("--verify-extension"));
+    }
+
+    #[test]
+    fn the_verify_extension_flag_is_hidden_and_parsed_strictly() {
+        // Usage: `rpi --verify-extension <path>` — one value, nothing else.
+        let ok = parse_verify_extension(&args(&["--verify-extension", "/staging/rpi-todo"]));
+        assert_eq!(ok, Some(Ok(PathBuf::from("/staging/rpi-todo"))));
+        assert!(parse_verify_extension(&args(&["update", "--verify-extension", "x"])).is_none());
+        assert!(parse_verify_extension(&args(&["--version"])).is_none());
+        assert!(parse_verify_extension(&args(&[])).is_none());
+        let Some(Err(message)) = parse_verify_extension(&args(&["--verify-extension"])) else {
+            panic!("a missing value is a usage error")
+        };
+        assert!(message.contains("Missing value"), "{message}");
+        let Some(Err(message)) = parse_verify_extension(&args(&["--verify-extension", "--force"]))
+        else {
+            panic!("a flag is not a path")
+        };
+        assert!(message.contains("Usage:"), "{message}");
+        let Some(Err(message)) = parse_verify_extension(&args(&["--verify-extension", "a", "b"]))
+        else {
+            panic!("one value only")
+        };
+        assert!(message.contains("1 more argument"), "{message}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn update_cleanup_is_a_no_op_outside_windows() {
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
+        let dirs = TestDirs::new();
+        let transport = StubTransport::newer_version();
+        let code = run_update_in(
+            &args(&["update", "--cleanup"]),
+            &dirs.cwd,
+            &dirs.agent_dir,
+            Some(FakeRunner::npm_view_latest()),
+            Some(transport.clone()),
+            None,
+        )
+        .await;
+        if cfg!(windows) {
+            // The Windows leg runs the real scan (nothing installed: exit 0).
+            assert_eq!(code, 0);
+        } else {
+            assert_eq!(code, 0);
+        }
+        assert_eq!(transport.call_count(), 0, "no version probe");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn update_self_on_windows_stages_instead_of_replacing() {
+        // V19-09 P0 (ADR-0050, R7.2): nothing in place is touched; the
+        // executable is staged and a pending record is written for the
+        // next start.
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
+        let dirs = TestDirs::new();
+        let transport = StubTransport::newer_version();
+        let (exe, seam, downloads) = staged_binary_seam(&dirs, "99.0.0", b"new-binary");
+        let code = run_update_in(
+            &args(&["update", "--self"]),
+            &dirs.cwd,
+            &dirs.agent_dir,
+            Some(FakeRunner::npm_view_latest()),
+            Some(transport.clone()),
+            Some(seam),
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(downloads.load(Ordering::SeqCst), 2, "asset + sidecar");
+        assert_eq!(
+            std::fs::read(&exe).unwrap(),
+            b"old-binary",
+            "the installed executable is untouched"
+        );
+        assert!(
+            crate::config::read_install_manifest_for(&exe).is_none(),
+            "the manifest is untouched"
+        );
+        let fs = crate::core::windows_update::fs::RealFs;
+        let paths = crate::core::windows_update::layout::UpdatePaths::for_exe(
+            &exe,
+            &dirs.agent_dir,
+            Some(&dirs.cwd),
+        );
+        let pending = crate::core::windows_update::records::read_record::<
+            crate::core::windows_update::records::PendingUpdate,
+        >(&fs, &paths.pending_path())
+        .expect("pending.json");
+        assert_eq!(pending.target_version, "99.0.0");
+        assert!(!pending.applied);
+        assert_eq!(
+            pending.from_version,
+            crate::config::VERSION,
+            "no manifest: the running version"
+        );
+        assert!(pending.first_boot_protocol);
+        assert!(!pending.allow_non_monotonic);
+        assert_eq!(pending.channel, "stable");
+        assert_eq!(
+            std::fs::read(&pending.binary.staged_path).unwrap(),
+            b"new-binary"
+        );
+        let result = crate::core::windows_update::records::read_record::<
+            crate::core::windows_update::records::UpdateResult,
+        >(&fs, &paths.result_path())
+        .unwrap();
+        assert_eq!(
+            result.state,
+            crate::core::windows_update::records::UpdateState::Staged
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn update_self_on_windows_is_idempotent_for_a_complete_staging() {
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
+        let dirs = TestDirs::new();
+        let transport = StubTransport::newer_version();
+        let (exe, seam, downloads) = staged_binary_seam(&dirs, "99.0.0", b"new-binary");
+        let run = |seam: Option<BinarySelfUpdateSeam>, transport: Arc<StubTransport>| {
+            let cwd = dirs.cwd.clone();
+            let agent_dir = dirs.agent_dir.clone();
+            async move {
+                run_update_in(
+                    &args(&["update", "--self"]),
+                    &cwd,
+                    &agent_dir,
+                    Some(FakeRunner::npm_view_latest()),
+                    Some(transport),
+                    seam,
+                )
+                .await
+            }
+        };
+        assert_eq!(run(Some(seam.clone()), transport.clone()).await, 0);
+        assert_eq!(downloads.load(Ordering::SeqCst), 2);
+        // The same update again: nothing is downloaded again, the staged
+        // executable stays as it was.
+        assert_eq!(run(Some(seam), transport).await, 0);
+        assert_eq!(downloads.load(Ordering::SeqCst), 2, "idempotent");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old-binary");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn update_self_on_windows_stages_nothing_over_an_applied_update() {
+        // R7.2.6: an applied update waits for its first start; a new
+        // `rpi update` prints that and exits 0 without downloading.
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
+        let dirs = TestDirs::new();
+        let transport = StubTransport::newer_version();
+        let (exe, seam, downloads) = staged_binary_seam(&dirs, "99.0.0", b"new-binary");
+        let paths = crate::core::windows_update::layout::UpdatePaths::for_exe(
+            &exe,
+            &dirs.agent_dir,
+            Some(&dirs.cwd),
+        );
+        let mut pending = crate::core::windows_update::records::PendingUpdate {
+            schema_version: 1,
+            target_version: "99.0.0".to_owned(),
+            channel: "stable".to_owned(),
+            written_at: "2026-11-28T00:00:00Z".to_owned(),
+            from_version: "0.1.9-rc.3".to_owned(),
+            allow_non_monotonic: false,
+            first_boot_protocol: true,
+            applied: true,
+            binary: crate::core::windows_update::records::StagedBinary {
+                staged_path: dirs.root.join("staged/rpi.exe"),
+                sha256: "0".repeat(64),
+                source_url: String::new(),
+                asset_sha256: "0".repeat(64),
+                target: "t".to_owned(),
+            },
+            extensions: Vec::new(),
+        };
+        let fs = crate::core::windows_update::fs::RealFs;
+        crate::core::windows_update::records::write_record(
+            &fs,
+            &paths.pending_path(),
+            Some(&pending),
+        )
+        .unwrap();
+        let code = run_update_in(
+            &args(&["update", "--self"]),
+            &dirs.cwd,
+            &dirs.agent_dir,
+            Some(FakeRunner::npm_view_latest()),
+            Some(transport.clone()),
+            Some(seam),
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(downloads.load(Ordering::SeqCst), 0, "nothing is downloaded");
+        let after = crate::core::windows_update::records::read_record::<
+            crate::core::windows_update::records::PendingUpdate,
+        >(&fs, &paths.pending_path())
+        .unwrap();
+        pending.binary.staged_path = after.binary.staged_path.clone();
+        assert_eq!(after, pending, "the applied pending is left alone");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn update_self_on_windows_failure_changes_nothing() {
+        // The asset is missing: the update fails, nothing is staged and
+        // the manual fallback is printed.
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
+        let dirs = TestDirs::new();
+        let transport = StubTransport::newer_version();
+        let (exe, mut seam, _downloads) = staged_binary_seam(&dirs, "99.0.0", b"new-binary");
+        // Drop the asset, keep nothing: every base fails.
+        seam.base_urls = vec!["https://empty.test".to_owned()];
+        let code = run_update_in(
+            &args(&["update", "--self"]),
+            &dirs.cwd,
+            &dirs.agent_dir,
+            Some(FakeRunner::npm_view_latest()),
+            Some(transport.clone()),
+            Some(seam),
+        )
+        .await;
+        assert_eq!(code, 1);
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old-binary");
+        let paths = crate::core::windows_update::layout::UpdatePaths::for_exe(
+            &exe,
+            &dirs.agent_dir,
+            Some(&dirs.cwd),
+        );
+        assert!(!paths.pending_path().exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn update_all_on_windows_stages_the_executable_after_the_extensions() {
+        // `--all`: the extensions update first (an npm source here), then
+        // the executable is staged for the next start.
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
+        let dirs = TestDirs::new();
+        let runner = FakeRunner::npm_view_latest();
+        let transport = StubTransport::newer_version();
+        let mut settings_manager = SettingsManager::create(
+            &dirs.cwd,
+            Some(&dirs.agent_dir),
+            SettingsManagerCreateOptions {
+                project_trusted: false,
+            },
+        );
+        settings_manager.set_packages(vec![crate::core::settings_manager::PackageSource::Source(
+            "npm:foo".to_string(),
+        )]);
+        drop(settings_manager);
+        let (exe, seam, _downloads) = staged_binary_seam(&dirs, "99.0.0", b"new-binary");
+        let code = run_update_in(
+            &args(&["update", "--all"]),
+            &dirs.cwd,
+            &dirs.agent_dir,
+            Some(runner.clone()),
+            Some(transport.clone()),
+            Some(seam),
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|call| call.contains("foo@latest"))
+        );
+        assert_eq!(
+            std::fs::read(&exe).unwrap(),
+            b"old-binary",
+            "staged, not replaced"
+        );
+        let paths = crate::core::windows_update::layout::UpdatePaths::for_exe(
+            &exe,
+            &dirs.agent_dir,
+            Some(&dirs.cwd),
+        );
+        assert!(paths.pending_path().exists());
+    }
+
+    #[test]
+    fn staged_success_and_awaiting_lines_are_stable() {
+        use crate::core::windows_update::staging::{awaiting_first_boot_line, staged_success_line};
+        assert_eq!(
+            staged_success_line(
+                "0.1.9-rc.4",
+                &["rpi-todo".to_owned(), "rpi-subagents".to_owned()]
+            ),
+            "Downloaded rpi 0.1.9-rc.4 (with extensions: rpi-todo, rpi-subagents). It takes effect the next time rpi starts."
+        );
+        assert_eq!(
+            awaiting_first_boot_line("0.1.9-rc.4"),
+            "rpi 0.1.9-rc.4 is already downloaded and waits for its first start to be confirmed. Start rpi once to switch to it."
+        );
+        let _ = staged_paths(Path::new("/x/rpi.exe"));
     }
 
     #[test]
