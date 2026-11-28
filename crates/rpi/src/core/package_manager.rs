@@ -80,6 +80,7 @@ use crate::core::skills::{
     matches_any_exact_pattern, matches_any_pattern, split_patterns,
 };
 use crate::core::version_check::{UpdateChannel, channel_of_version, is_newer_package_version};
+use crate::core::windows_update;
 use crate::tools::path_utils::resolve_path;
 
 /// `NETWORK_TIMEOUT_MS` (package-manager.ts:38).
@@ -1278,6 +1279,19 @@ pub struct DefaultPackageManager {
     /// Built-in extension names (`builtin:<name>` resources,
     /// package-manager.ts:825).
     builtin_extensions: Vec<String>,
+    /// V19-09 (ADR-0050): where an extension this process just extracted
+    /// goes — the in-place swap on Unix, a generation directory on
+    /// Windows, or the staging area of an `--all` self-update batch.
+    extension_activation: windows_update::generations::ExtensionActivation,
+    /// V19-09: the load preflight a staged extension must pass before it is
+    /// placed (`None`: the platform default — a child process on Windows,
+    /// nothing to prove on Unix, where nothing is loaded ahead).
+    extension_preflight: Option<windows_update::preflight::Preflight>,
+    /// V19-09: extensions extracted for the self-update batch (activation
+    /// `Stage`), handed to the staging step by
+    /// [`Self::take_staged_extensions`]. Interior-mutable: the install
+    /// paths run behind `&self`.
+    staged_extensions: std::sync::Mutex<Vec<windows_update::records::StagedExtension>>,
 }
 
 /// `getExtensionTempFolder` (package-manager.ts:221-226): create
@@ -1337,7 +1351,148 @@ impl DefaultPackageManager {
             install_confirm: None,
             download_observer: None,
             builtin_extensions: options.builtin_extensions,
+            extension_activation:
+                windows_update::generations::ExtensionActivation::platform_default(),
+            extension_preflight: None,
+            staged_extensions: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// V19-09: choose where the next extension installs go.
+    pub fn set_extension_activation(
+        &mut self,
+        activation: windows_update::generations::ExtensionActivation,
+    ) {
+        self.extension_activation = activation;
+    }
+
+    /// V19-09: inject the load preflight (tests and the platform default).
+    pub fn set_extension_preflight(&mut self, preflight: windows_update::preflight::Preflight) {
+        self.extension_preflight = Some(preflight);
+    }
+
+    /// V19-09: the extensions the `Stage` activation recorded, in plan
+    /// order; the self-update batch stages them with the executable.
+    pub fn take_staged_extensions(&mut self) -> Vec<windows_update::records::StagedExtension> {
+        std::mem::take(
+            &mut self
+                .staged_extensions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+    }
+
+    /// The activation in effect for the next install.
+    pub fn extension_activation(&self) -> windows_update::generations::ExtensionActivation {
+        self.extension_activation
+    }
+
+    /// The preflight to run: the injected one, else a child process on
+    /// Windows and an always-accepting one elsewhere (the Unix in-place
+    /// activation loads nothing in this process).
+    fn preflight(&self) -> windows_update::preflight::Preflight {
+        if let Some(preflight) = &self.extension_preflight {
+            return Arc::clone(preflight);
+        }
+        #[cfg(windows)]
+        {
+            windows_update::preflight::child_process_preflight()
+        }
+        #[cfg(not(windows))]
+        {
+            windows_update::preflight::accept_all()
+        }
+    }
+
+    /// The pins of live rpi processes (the generational placement keeps
+    /// every directory a pin names).
+    fn live_extension_pins(&self) -> Vec<windows_update::records::PinRecord> {
+        let fs = windows_update::fs::RealFs;
+        let pins = self
+            .agent_dir
+            .join("extensions")
+            .join(windows_update::layout::EXTENSION_PINS_DIR);
+        let probe = windows_update::boot::SystemProcessProbe::new();
+        windows_update::pins::live_pins(&fs, &pins, &probe)
+    }
+
+    /// Land a verified extraction by the activation in effect
+    /// (V19-09, design §11.4 step 6 / §11.8).
+    fn land_extracted(
+        &self,
+        extracted: extension_registry::ExtractedRpix,
+        root: &Path,
+        name: &str,
+        marker_source: Option<&str>,
+    ) -> Result<(), String> {
+        use windows_update::generations::ExtensionActivation;
+        use windows_update::preflight::PreflightOutcome;
+        let version = extracted.manifest.version.clone();
+        if self.extension_activation == ExtensionActivation::InPlace {
+            extension_registry::activate_rpix(extracted, root, name, marker_source)?;
+            println!("Installed {name} {version}");
+            return Ok(());
+        }
+        let outcome = (self.preflight())(&extracted.temp_dir);
+        if outcome != PreflightOutcome::Loaded {
+            extracted.cleanup();
+            return Err(format!(
+                "{name} {version} was not installed: {}",
+                match &outcome {
+                    PreflightOutcome::Rejected(reason) =>
+                        format!("the load preflight failed ({reason})"),
+                    PreflightOutcome::TimedOut => format!(
+                        "the load preflight did not finish within {} seconds",
+                        windows_update::VERIFY_EXTENSION_TIMEOUT.as_secs()
+                    ),
+                    PreflightOutcome::NotStarted(reason) =>
+                        format!("the load preflight could not be started ({reason})"),
+                    PreflightOutcome::Loaded => String::new(),
+                }
+            ));
+        }
+        let fs = windows_update::fs::RealFs;
+        let container = root.join(name);
+        if let Some(source) = marker_source {
+            // The `github:` marker stays at the container level (design §11.8).
+            std::fs::create_dir_all(&container).map_err(|error| error.to_string())?;
+            std::fs::write(
+                container.join(extension_registry::GITHUB_INSTALL_MARKER_FILE),
+                format!("{source}\n"),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        match self.extension_activation {
+            ExtensionActivation::Generational => {
+                let pins = self.live_extension_pins();
+                windows_update::generations::place_generation(
+                    &fs,
+                    root,
+                    name,
+                    &version,
+                    &extracted.temp_dir,
+                    &pins,
+                )?;
+                println!("Installed {name} {version}");
+            }
+            ExtensionActivation::Stage => {
+                let staged = windows_update::staging::describe_staged_extension(
+                    &fs,
+                    root,
+                    name,
+                    &version,
+                    &extracted.temp_dir,
+                )
+                .map_err(|error| format!("could not record the staged {name}: {error}"))?;
+                println!("Staged {name} {version} for the next start");
+                self.staged_extensions
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(staged);
+            }
+            ExtensionActivation::InPlace => {}
+        }
+        Ok(())
     }
 
     /// `setProgressCallback` (package-manager.ts:809-811).
@@ -2756,14 +2911,31 @@ impl DefaultPackageManager {
             .on_download_event(&DownloadEvent::Installing {
                 target: root.join(&resolved.info.name),
             });
-        extension_registry::materialize_rpix(
+        let extracted = self.extract_for_activation(
             &bytes,
             &root,
             &resolved.info.name,
             &resolved.info.version,
         )?;
-        println!("Installed {} {}", resolved.info.name, resolved.info.version);
-        Ok(())
+        self.land_extracted(extracted, &root, &resolved.info.name, None)
+    }
+
+    /// Extract and verify a `.rpix` into the directory the activation in
+    /// effect uses (V19-09: `.staging/<name>-<version>-<pid>` on Windows).
+    fn extract_for_activation<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        root: &Path,
+        name: &str,
+        version: &str,
+    ) -> Result<extension_registry::ExtractedRpix, String> {
+        let temp_dir = windows_update::generations::extraction_dir(
+            root,
+            name,
+            version,
+            self.extension_activation,
+        );
+        extension_registry::extract_and_verify_rpix_in(bytes, temp_dir, name, version)
     }
 
     /// `github:` channel install (design §7.1): download → sidecar sha256
@@ -2833,7 +3005,7 @@ impl DefaultPackageManager {
             ));
         }
         let root = self.get_registry_install_root(scope)?;
-        let extracted = extension_registry::extract_and_verify_rpix(
+        let extracted = self.extract_for_activation(
             &bytes,
             &root,
             &resolved.info.name,
@@ -2879,14 +3051,7 @@ impl DefaultPackageManager {
             .on_download_event(&DownloadEvent::Installing {
                 target: root.join(&resolved.info.name),
             });
-        extension_registry::activate_rpix(
-            extracted,
-            &root,
-            &resolved.info.name,
-            Some(source_string),
-        )?;
-        println!("Installed {} {}", resolved.info.name, resolved.info.version);
-        Ok(())
+        self.land_extracted(extracted, &root, &resolved.info.name, Some(source_string))
     }
 
     fn install_registry_source(
@@ -2941,7 +3106,7 @@ impl DefaultPackageManager {
         let entries = std::fs::read_dir(root).ok()?;
         for entry in entries.flatten() {
             let dir = entry.path();
-            if !dir.is_dir() {
+            if !dir.is_dir() || rpi_ext_host::install_layout::is_retired(&dir) {
                 continue;
             }
             let Ok(marker) =
@@ -2962,10 +3127,7 @@ impl DefaultPackageManager {
     fn remove_registry_install(&self, name: &str, scope: SourceScope) -> Result<(), String> {
         let root = self.get_registry_install_root(scope)?;
         let dir = root.join(name);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
-        }
-        Ok(())
+        self.remove_install_container(&dir)
     }
 
     fn remove_github_install(
@@ -2974,7 +3136,28 @@ impl DefaultPackageManager {
         scope: SourceScope,
     ) -> Result<(), String> {
         if let Some(dir) = self.find_github_install_dir(source, scope) {
-            std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+            return self.remove_install_container(&dir);
+        }
+        Ok(())
+    }
+
+    /// Remove an extension install container. Under the generational
+    /// layout (V19-09, R7.4.8 — every Windows install) the container is
+    /// *retired*: pointer dropped, `.retired` written, so running instances
+    /// keep their generation and every reader sees "not installed"; the
+    /// startup cleanup scan removes the files once nobody uses them. The
+    /// in-place layout (Unix) keeps the direct removal.
+    fn remove_install_container(&self, dir: &Path) -> Result<(), String> {
+        use crate::core::windows_update::generations::ExtensionActivation;
+        if self.extension_activation != ExtensionActivation::InPlace {
+            return crate::core::windows_update::generations::retire_container(
+                &crate::core::windows_update::fs::RealFs,
+                dir,
+            )
+            .map_err(|error| error.to_string());
+        }
+        if dir.exists() {
+            std::fs::remove_dir_all(dir).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -3213,7 +3396,11 @@ impl DefaultPackageManager {
             }
             ParsedSource::Registry(registry) => {
                 let root = self.get_registry_install_root(scope).ok()?;
-                let path = root.join(&registry.name);
+                // ADR-0050 (V19-09): the container resolves to its live
+                // generation (or the legacy flat directory); a container
+                // retired by `rpi remove` is not installed.
+                let path =
+                    rpi_ext_host::install_layout::resolve_install_dir(&root.join(&registry.name))?;
                 path.exists().then_some(path)
             }
             ParsedSource::GithubRelease(github) => self.find_github_install_dir(&github, scope),
@@ -3771,7 +3958,23 @@ impl DefaultPackageManager {
                                 entry.current.clone()
                             };
                             let next = self.installed_update_version(entry);
-                            if previous != next {
+                            if self.extension_activation
+                                == windows_update::generations::ExtensionActivation::Stage
+                            {
+                                // V19-09 `--all` on Windows: the extension
+                                // is staged with the executable.
+                                self.emit_progress(&ProgressEvent {
+                                    kind: ProgressKind::Result,
+                                    action: ProgressAction::Update,
+                                    source: entry.source.clone(),
+                                    message: Some(format!(
+                                        "{} staged {} -> {} (takes effect the next time rpi starts)",
+                                        entry.source,
+                                        previous.as_deref().unwrap_or("(none)"),
+                                        entry.target.as_deref().unwrap_or("(none)")
+                                    )),
+                                });
+                            } else if previous != next {
                                 self.emit_progress(&ProgressEvent {
                                     kind: ProgressKind::Result,
                                     action: ProgressAction::Update,
@@ -3842,13 +4045,25 @@ impl DefaultPackageManager {
             };
             for entry in entries.flatten() {
                 let dir = entry.path();
-                if !dir.join("rpi-extension.json").is_file() {
+                if !dir.is_dir() {
                     continue;
                 }
                 let Some(dir_name) = dir.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
-                if dir_name.contains(".tmp-") || dir_name.contains(".old-") {
+                if dir_name.contains(".tmp-")
+                    || dir_name.contains(".old-")
+                    || rpi_ext_host::install_layout::is_reserved_container_entry(dir_name)
+                {
+                    continue;
+                }
+                // ADR-0050 (V19-09): the manifest lives in the generation the
+                // container's pointer names (flat: the container itself); a
+                // retired container is no install.
+                let Some(install) = rpi_ext_host::install_layout::resolve_install_dir(&dir) else {
+                    continue;
+                };
+                if !install.join("rpi-extension.json").is_file() {
                     continue;
                 }
                 let source = match std::fs::read_to_string(
@@ -5430,6 +5645,9 @@ fn read_rpi_manifest(package_root: &Path) -> Option<RpiManifest> {
 /// wasm extension packages — `rpi-extension.json` with a `wasm` field, or
 /// `index.wasm` (mirrors the ext-host loader's directory rules).
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
+    // ADR-0050 (V19-09): an extension install container resolves to its live
+    // generation (flat: itself; retired: no extension).
+    let dir = &rpi_ext_host::install_layout::resolve_install_dir(dir)?;
     let package_json_path = dir.join("package.json");
     if package_json_path.exists()
         && let Some(manifest) = read_rpi_manifest(dir)
@@ -10335,6 +10553,334 @@ mod registry_tests {
         let discovered = manager.discover_installed_extension_sources();
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].source, "ext-a");
+    }
+
+    /// ADR-0050 (V19-09 FR-W5): a generational container reads through the
+    /// same resolver on every path — tracked resolution, untracked discovery
+    /// and loader auto-discovery all see the generation the pointer names,
+    /// never the legacy flat files left in the container root.
+    #[test]
+    fn test_generational_container_resolves_through_every_read_path() {
+        let dirs = TestDirs::new();
+        place_untracked_extension(&dirs, "ext-gen", "0.1.0");
+        let root = dirs.agent_dir.join("extensions");
+        let container = root.join("ext-gen");
+        let generation = container.join("0.2.0");
+        std::fs::create_dir_all(generation.join("dist")).unwrap();
+        std::fs::write(
+            generation.join("rpi-extension.json"),
+            r#"{"name":"ext-gen","version":"0.2.0","wasm":"dist/ext-gen.wasm","capabilities":[],"rpiAbi":1}"#,
+        )
+        .unwrap();
+        let entry = generation.join("dist/ext-gen.wasm");
+        std::fs::write(&entry, b"wasm").unwrap();
+        // The `.rpi-install-source` marker stays at the container level.
+        std::fs::write(
+            container.join(GITHUB_INSTALL_MARKER_FILE),
+            "github:acme/gen\n",
+        )
+        .unwrap();
+        std::fs::write(
+            container.join("current.json"),
+            r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0"}"#,
+        )
+        .unwrap();
+        let transport = MapTransport::new();
+        let manager = manager_ok(&dirs, transport);
+
+        // Tracked registry resolution and the manifest readers.
+        assert_eq!(
+            manager.get_installed_path("ext-gen", SourceScope::User),
+            Some(generation.clone())
+        );
+        assert_eq!(
+            extension_registry::installed_extension_version(&container).as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            extension_registry::installed_extension_name(&container).as_deref(),
+            Some("ext-gen")
+        );
+        // Untracked discovery (`rpi list`, `update --extensions`) keeps the
+        // github marker as the source.
+        let discovered = manager.discover_installed_extension_sources();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].source, "github:acme/gen");
+        // `github:` marker scan (`remove`, update targeting).
+        assert_eq!(
+            manager.get_installed_path("github:acme/gen", SourceScope::User),
+            Some(container.clone())
+        );
+        // Loader auto-discovery (`add_auto_resources`) loads the generation's
+        // entry, not the stale flat manifest.
+        assert_eq!(collect_auto_extension_entries(&root), vec![entry.clone()]);
+        // The host loader agrees.
+        assert_eq!(
+            rpi_ext_host::loader::discover_extensions_in_dir(&root),
+            vec![entry.clone()]
+        );
+    }
+
+    /// ADR-0050 (V19-09 FR-W5): the generational activation — what every
+    /// `rpi install` / `rpi update --extensions` does on Windows.
+    #[test]
+    fn test_generational_activation_places_generations_and_flips_the_pointer() {
+        use crate::core::windows_update::generations::ExtensionActivation;
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-gen", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.set_extension_activation(ExtensionActivation::Generational);
+        manager.install_and_persist("ext-gen", false).unwrap();
+        let container = dirs.agent_dir.join("extensions/ext-gen");
+        assert!(
+            container.join("0.1.0/rpi-extension.json").is_file(),
+            "a generation, not a flat install"
+        );
+        assert!(!container.join("rpi-extension.json").exists());
+        let pointer = rpi_ext_host::install_layout::read_generation_pointer(&container).unwrap();
+        assert_eq!(pointer.version, "0.1.0");
+        assert!(pointer.previous.is_none());
+        assert_eq!(
+            manager.get_installed_path("ext-gen", SourceScope::User),
+            Some(container.join("0.1.0"))
+        );
+        assert!(
+            !container
+                .join(format!("ext-gen.tmp-{}", std::process::id()))
+                .exists(),
+            "no legacy temp dir"
+        );
+        assert!(
+            !dirs
+                .agent_dir
+                .join("extensions/.staging")
+                .join(format!("ext-gen-0.1.0-{}", std::process::id()))
+                .exists(),
+            "the staging directory moved"
+        );
+
+        // An update places the next generation and records the previous one.
+        serve_registry_extension(&transport, "ext-gen", "0.2.0", true);
+        manager.update(Some("ext-gen")).unwrap();
+        let pointer = rpi_ext_host::install_layout::read_generation_pointer(&container).unwrap();
+        assert_eq!(pointer.version, "0.2.0");
+        assert_eq!(pointer.previous.as_deref(), Some("0.1.0"));
+        assert!(
+            container.join("0.1.0").is_dir(),
+            "the previous generation stays for running instances"
+        );
+        assert_eq!(
+            extension_registry::installed_extension_version(&container).as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            manager.get_installed_path("ext-gen", SourceScope::User),
+            Some(container.join("0.2.0")),
+            "the planner's cached resolution was refreshed after the flip"
+        );
+        assert_eq!(manager.discover_installed_extension_sources().len(), 1);
+    }
+
+    /// ADR-0050 (V19-09 FR-W5): the `Stage` activation of `--all` — the
+    /// extension waits for the startup transaction together with the
+    /// executable, and nothing in place changes.
+    #[test]
+    fn test_staged_activation_records_the_extension_for_the_self_update() {
+        use crate::core::windows_update::generations::ExtensionActivation;
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-stage", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("ext-stage", false).unwrap();
+        serve_registry_extension(&transport, "ext-stage", "0.2.0", true);
+        manager.set_extension_activation(ExtensionActivation::Stage);
+        let plan = manager
+            .plan_updates(Some("ext-stage"), UpdateChannel::Stable, None)
+            .unwrap();
+        let (summary, error) = manager.apply_update_plan(&plan);
+        assert_eq!(error, None);
+        assert_eq!(summary.updated, 1);
+        let staged = manager.take_staged_extensions();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].name, "ext-stage");
+        assert_eq!(staged[0].version, "0.2.0");
+        assert_eq!(staged[0].install_root, dirs.agent_dir.join("extensions"));
+        assert!(staged[0].staged_path.is_dir(), "extracted under .staging");
+        assert_eq!(staged[0].files.len(), 2, "manifest, SHA256SUMS");
+        assert_eq!(
+            staged[0].generation_path(),
+            dirs.agent_dir.join("extensions/ext-stage/0.2.0")
+        );
+        assert!(
+            manager.take_staged_extensions().is_empty(),
+            "handed over once"
+        );
+        // Nothing in place changed: the flat 0.1.0 install still resolves.
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-stage")
+            )
+            .as_deref(),
+            Some("0.1.0")
+        );
+        assert!(
+            !dirs
+                .agent_dir
+                .join("extensions/ext-stage/current.json")
+                .exists()
+        );
+    }
+
+    /// ADR-0050 (V19-09 FR-W1/W5): a package whose preflight fails is
+    /// rejected alone — nothing is placed, the staging directory goes.
+    #[test]
+    fn test_a_failed_preflight_rejects_only_that_extension() {
+        use crate::core::windows_update::generations::ExtensionActivation;
+        use crate::core::windows_update::preflight::PreflightOutcome;
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-pf", "0.1.0", true);
+        serve_registry_extension(&transport, "ext-ok", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.set_extension_activation(ExtensionActivation::Generational);
+        manager.set_extension_preflight(Arc::new(|path: &Path| {
+            if path.to_string_lossy().contains("ext-pf") {
+                PreflightOutcome::Rejected("simulated load failure".to_owned())
+            } else {
+                PreflightOutcome::Loaded
+            }
+        }));
+        let error = manager.install_and_persist("ext-pf", false).unwrap_err();
+        assert!(
+            error.contains("load preflight failed (simulated load failure)"),
+            "{error}"
+        );
+        assert!(
+            !dirs
+                .agent_dir
+                .join("extensions/ext-pf/current.json")
+                .exists()
+        );
+        assert!(!dirs.agent_dir.join("extensions/ext-pf").exists());
+        assert!(
+            !dirs
+                .agent_dir
+                .join("extensions/.staging")
+                .join(format!("ext-pf-0.1.0-{}", std::process::id()))
+                .exists(),
+            "the rejected staging directory is removed"
+        );
+        // The other package is unaffected.
+        manager.install_and_persist("ext-ok", false).unwrap();
+        assert!(
+            dirs.agent_dir
+                .join("extensions/ext-ok/current.json")
+                .exists()
+        );
+    }
+
+    /// ADR-0050 (V19-09, R7.4.8): `rpi remove` retires the whole container;
+    /// a later `rpi install` clears the retirement.
+    #[test]
+    fn test_remove_retires_a_generational_container_and_reinstall_clears_it() {
+        use crate::core::windows_update::generations::ExtensionActivation;
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-ret", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.set_extension_activation(ExtensionActivation::Generational);
+        manager.install_and_persist("ext-ret", false).unwrap();
+        let container = dirs.agent_dir.join("extensions/ext-ret");
+        let removed = manager.remove_and_persist("ext-ret", false).unwrap();
+        assert!(removed);
+        assert!(
+            rpi_ext_host::install_layout::is_retired(&container),
+            "retired, not deleted"
+        );
+        assert!(
+            container.join("0.1.0").is_dir(),
+            "the files wait for the cleanup scan"
+        );
+        assert!(
+            manager
+                .get_installed_path("ext-ret", SourceScope::User)
+                .is_none()
+        );
+        assert!(manager.discover_installed_extension_sources().is_empty());
+        // Reinstall clears the marker.
+        manager.install_and_persist("ext-ret", false).unwrap();
+        assert!(!rpi_ext_host::install_layout::is_retired(&container));
+        assert_eq!(
+            manager.get_installed_path("ext-ret", SourceScope::User),
+            Some(container.join("0.1.0"))
+        );
+        // The in-place layout (Unix default) still removes directly.
+        let mut inplace = manager_ok(&dirs, transport.clone());
+        serve_registry_extension(&transport, "ext-plain", "0.1.0", true);
+        inplace.install_and_persist("ext-plain", false).unwrap();
+        inplace.remove_and_persist("ext-plain", false).unwrap();
+        assert!(!dirs.agent_dir.join("extensions/ext-plain").exists());
+    }
+
+    /// The retirement itself (the Windows removal path) is platform
+    /// independent and exercised directly on every platform.
+    #[test]
+    fn test_retire_container_drops_the_pointer_and_marks_the_container() {
+        use crate::core::windows_update::fs::RealFs;
+        let dirs = TestDirs::new();
+        let container = dirs.agent_dir.join("extensions/ext-r");
+        std::fs::create_dir_all(container.join("0.2.0")).unwrap();
+        std::fs::write(container.join("0.2.0/rpi-extension.json"), "{}").unwrap();
+        std::fs::write(
+            container.join("current.json"),
+            r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0"}"#,
+        )
+        .unwrap();
+        crate::core::windows_update::generations::retire_container(&RealFs, &container).unwrap();
+        assert!(!container.join("current.json").exists());
+        assert!(rpi_ext_host::install_layout::is_retired(&container));
+        // Retiring a missing container is not an error.
+        crate::core::windows_update::generations::retire_container(
+            &RealFs,
+            &dirs.agent_dir.join("extensions/missing"),
+        )
+        .unwrap();
+    }
+
+    /// ADR-0050 (V19-09 FR-W5): `rpi remove` retires the whole container.
+    /// Every read path then reports "not installed" and never falls back to
+    /// the flat files still queued for delayed removal.
+    #[test]
+    fn test_retired_container_is_not_installed_on_any_read_path() {
+        let dirs = TestDirs::new();
+        place_untracked_extension(&dirs, "ext-retired", "0.1.0");
+        let root = dirs.agent_dir.join("extensions");
+        let container = root.join("ext-retired");
+        std::fs::write(
+            container.join(GITHUB_INSTALL_MARKER_FILE),
+            "github:acme/retired\n",
+        )
+        .unwrap();
+        std::fs::write(container.join(".retired"), b"").unwrap();
+        let transport = MapTransport::new();
+        let manager = manager_ok(&dirs, transport);
+
+        assert_eq!(
+            manager.get_installed_path("ext-retired", SourceScope::User),
+            None
+        );
+        assert_eq!(
+            manager.get_installed_path("github:acme/retired", SourceScope::User),
+            None
+        );
+        assert_eq!(
+            extension_registry::installed_extension_name(&container),
+            None
+        );
+        assert!(manager.discover_installed_extension_sources().is_empty());
+        assert!(collect_auto_extension_entries(&root).is_empty());
+        assert!(rpi_ext_host::loader::discover_extensions_in_dir(&root).is_empty());
     }
 
     #[test]

@@ -186,6 +186,11 @@ fn collect_installed(
         if dir_name.contains(".tmp-") || dir_name.contains(".old-") {
             continue;
         }
+        // ADR-0050 (V19-09): a container retired by `rpi remove` is not an
+        // install, whatever files are still queued for removal.
+        if rpi_ext_host::install_layout::is_retired(&dir) {
+            continue;
+        }
         let Some(name) = installed_extension_dir_name(&dir) else {
             continue;
         };

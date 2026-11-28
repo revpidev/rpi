@@ -949,12 +949,25 @@ pub fn read_rpix_manifest(dir: &Path) -> Result<RpixManifest, String> {
     })
 }
 
+/// The directory holding an installed extension's manifest. `dir` may be
+/// the `<name>/` container or an install directory; a generational
+/// container (ADR-0050) resolves to the generation its pointer names, a
+/// legacy flat one to itself, and a retired container to nothing.
+fn install_manifest_dir(dir: &Path) -> Option<PathBuf> {
+    rpi_ext_host::install_layout::resolve_install_dir(dir)
+}
+
+fn read_installed_manifest(dir: &Path) -> Option<Value> {
+    let manifest_dir = install_manifest_dir(dir)?;
+    let content = std::fs::read_to_string(manifest_dir.join("rpi-extension.json")).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 /// The version recorded in an installed extension directory's manifest
 /// (update skip check); `None` when absent or unreadable.
 pub fn installed_extension_version(dir: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(dir.join("rpi-extension.json")).ok()?;
-    let raw: Value = serde_json::from_str(&content).ok()?;
-    raw.get("version")
+    read_installed_manifest(dir)?
+        .get("version")
         .and_then(Value::as_str)
         .map(str::to_string)
 }
@@ -962,9 +975,10 @@ pub fn installed_extension_version(dir: &Path) -> Option<String> {
 /// The `name` recorded in an installed extension directory's manifest
 /// (untracked-install discovery); `None` when absent or unreadable.
 pub fn installed_extension_name(dir: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(dir.join("rpi-extension.json")).ok()?;
-    let raw: Value = serde_json::from_str(&content).ok()?;
-    raw.get("name").and_then(Value::as_str).map(str::to_string)
+    read_installed_manifest(dir)?
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Optional `defaultSettings` object from an installed extension's
@@ -973,18 +987,20 @@ pub fn installed_extension_name(dir: &Path) -> Option<String> {
 /// when absent, so an install or versioned upgrade can ship a working default
 /// without overwriting user config.
 pub fn installed_extension_default_settings(dir: &Path) -> Option<Map<String, Value>> {
-    let content = std::fs::read_to_string(dir.join("rpi-extension.json")).ok()?;
-    let raw: Value = serde_json::from_str(&content).ok()?;
-    raw.get("defaultSettings")?.as_object().cloned()
+    read_installed_manifest(dir)?
+        .get("defaultSettings")?
+        .as_object()
+        .cloned()
 }
 
 /// Optional per-key migration versions for `defaultSettings`. Missing or
 /// malformed values are treated as no versioned migrations, keeping updates
 /// conservative and preserving the old install-only behavior.
 pub fn installed_extension_default_settings_migration(dir: &Path) -> Option<Map<String, Value>> {
-    let content = std::fs::read_to_string(dir.join("rpi-extension.json")).ok()?;
-    let raw: Value = serde_json::from_str(&content).ok()?;
-    raw.get("defaultSettingsMigration")?.as_object().cloned()
+    read_installed_manifest(dir)?
+        .get("defaultSettingsMigration")?
+        .as_object()
+        .cloned()
 }
 
 /// A verified, still-temporary extraction awaiting activation.
@@ -1032,6 +1048,22 @@ pub fn extract_and_verify_rpix(
     ensure_safe_extension_name(expected_name)?;
     std::fs::create_dir_all(extensions_root).map_err(|e| e.to_string())?;
     let temp_dir = extensions_root.join(format!("{expected_name}.tmp-{}", std::process::id()));
+    extract_and_verify_rpix_in(archive, temp_dir, expected_name, expected_version)
+}
+
+/// [`extract_and_verify_rpix`] into an explicit extraction directory
+/// (V19-09: the generational and staging activations extract under
+/// `<root>/.staging/`, same volume as the install root).
+pub fn extract_and_verify_rpix_in(
+    archive: &[u8],
+    temp_dir: PathBuf,
+    expected_name: &str,
+    expected_version: &str,
+) -> Result<ExtractedRpix, String> {
+    ensure_safe_extension_name(expected_name)?;
+    if let Some(parent) = temp_dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     if temp_dir.exists() {
         std::fs::remove_dir_all(&temp_dir).map_err(|e| e.to_string())?;
     }
