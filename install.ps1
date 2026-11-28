@@ -1894,7 +1894,15 @@ function Install-PluginGeneration {
             Remove-Item -Recurse -Force -Path $Staged -ErrorAction SilentlyContinue
             return
         }
-        Remove-Item -Recurse -Force -Path $generation -ErrorAction Stop
+        # A different build of the same version: move it aside first (same
+        # volume) and delete the copy. A loaded library would otherwise be
+        # left half-deleted; when the move itself fails (a running rpi still
+        # has it loaded) the plugin is reported as failed, not half-installed.
+        $aside = Join-Path (Join-Path $PluginDir '.staging') ("$Plugin-$Version-$PID.replaced")
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $aside) | Out-Null
+        Remove-Item -Recurse -Force -Path $aside -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $generation -Destination $aside -ErrorAction Stop
+        Remove-Item -Recurse -Force -Path $aside -ErrorAction SilentlyContinue
     }
     Move-Item -LiteralPath $Staged -Destination $generation -ErrorAction Stop
     $pointer = [ordered]@{
