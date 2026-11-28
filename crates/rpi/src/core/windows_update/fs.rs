@@ -94,6 +94,20 @@ pub trait UpdateFs: Send + Sync {
     fn file_len(&self, path: &Path) -> io::Result<u64> {
         Ok(self.read(path).map(|bytes| bytes.len() as u64).unwrap_or(0))
     }
+    /// The identity of the image at `path` (length and modification time),
+    /// the same marks a pin records for the image its process started from.
+    fn exe_identity(&self, path: &Path) -> io::Result<super::records::ExeIdentity> {
+        let len = self.file_len(path)?;
+        let modified_unix_ms = self
+            .modified(path)?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_millis();
+        Ok(super::records::ExeIdentity {
+            len,
+            modified_unix_ms: u64::try_from(modified_unix_ms).unwrap_or(u64::MAX),
+        })
+    }
     /// The wall clock, ISO 8601 UTC (`2026-11-28T01:02:03Z`).
     fn now_iso8601(&self) -> String;
     /// The pause between rename retries (tests record it instead).

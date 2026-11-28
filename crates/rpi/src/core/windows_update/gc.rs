@@ -80,6 +80,10 @@ pub struct ScanReport {
     pub live: Vec<LiveLeftover>,
     pub retained: Vec<PathBuf>,
     pub stuck: Vec<StuckLeftover>,
+    /// The instances that run the retained `.old-<version>` image (by
+    /// image identity): the reminder's "other instances still on the
+    /// previous version".
+    pub old_exe_holders: Vec<u32>,
     /// Staging directories skipped because a live process may own them.
     pub skipped_staging: usize,
     /// Whether the old executable of the pending update is gone (removed
@@ -165,14 +169,26 @@ pub fn cleanup_scan_with(fs: &dyn UpdateFs, context: &ScanContext<'_>, remove: b
     report
 }
 
-/// Instances that run `version`'s image. This process counts too: an old
-/// instance that started while an update was being applied runs the parked
-/// image itself.
-fn holders_of_version(context: &ScanContext<'_>, version: &str) -> Vec<u32> {
+/// The instances that run the image at `path` (`rpi.exe.old-<version>` or
+/// `.bad-<version>`): by image identity (length and modification time, the
+/// marks a pin records at start) when both the file and the pin carry
+/// them, by version string otherwise. The version alone would count every
+/// instance of a same-version reinstall — the one that replaced the
+/// parked image included — as a holder of the parked image.
+fn holders_of_exe(
+    fs: &dyn UpdateFs,
+    context: &ScanContext<'_>,
+    path: &Path,
+    version: &str,
+) -> Vec<u32> {
+    let identity = fs.exe_identity(path).ok();
     let mut pids: Vec<u32> = context
         .live_pins
         .iter()
-        .filter(|pin| pin.exe_version == version)
+        .filter(|pin| match (identity, pin.exe_identity) {
+            (Some(file), Some(pin_image)) => file == pin_image,
+            _ => pin.exe_version == version,
+        })
         .map(|pin| pin.pid)
         .collect();
     pids.sort_unstable();
@@ -244,7 +260,7 @@ fn remove_leftover(
             report.live.push(LiveLeftover {
                 kind,
                 path: path.to_path_buf(),
-                holders: holders_for(context, kind, path),
+                holders: holders_for(fs, context, kind, path),
             });
             return;
         }
@@ -253,14 +269,21 @@ fn remove_leftover(
         report.garbage.push((kind, path.to_path_buf()));
         return;
     }
+    // A directory is renamed aside first; `where` is what is left to
+    // delete when the deletion does not finish (the aside name, so the
+    // warning points at what exists).
+    let mut left = path.to_path_buf();
     let result = if directory {
         match rename_aside(fs, context, path) {
-            Ok(aside) => fs.remove_dir_all(&aside),
+            Ok(aside) => {
+                left = aside;
+                fs.remove_dir_all(&left)
+            }
             Err(_) => {
                 report.live.push(LiveLeftover {
                     kind,
                     path: path.to_path_buf(),
-                    holders: holders_for(context, kind, path),
+                    holders: holders_for(fs, context, kind, path),
                 });
                 return;
             }
@@ -275,16 +298,17 @@ fn remove_leftover(
         }
         Err(error) => report.stuck.push(StuckLeftover {
             kind,
-            path: path.to_path_buf(),
+            path: left,
             reason: stuck_reason(&error, kind),
         }),
     }
 }
 
 /// Move a leftover directory aside (`<name>.garbage-<pid>`) so that its
-/// deletion is all-or-nothing with respect to loaded libraries. The
-/// aside name stays garbage for the next scan (no owner pid to parse, no
-/// pointer names it) when the deletion does not finish this time.
+/// deletion is all-or-nothing with respect to loaded libraries. The aside
+/// name stays garbage for the next scan — [`is_garbage_name`] directories
+/// are leftovers whatever a half-finished deletion left inside them —
+/// when the deletion does not finish this time.
 fn rename_aside(
     fs: &dyn UpdateFs,
     context: &ScanContext<'_>,
@@ -312,9 +336,22 @@ fn rename_aside(
     Ok(aside)
 }
 
+/// Whether a directory name is the aside name of a leftover (`<name>
+/// .garbage-<pid>`): a half-deleted tree that no longer carries the marks
+/// the ordinary classification looks for (a generation's manifest, a
+/// retired container's marker).
+fn is_garbage_name(name: &str) -> bool {
+    name.contains(".garbage-")
+}
+
 /// The instances that hold a leftover: old/new images by their version,
 /// everything else by the directories the pins name.
-fn holders_for(context: &ScanContext<'_>, kind: LeftoverKind, path: &Path) -> Vec<u32> {
+fn holders_for(
+    fs: &dyn UpdateFs,
+    context: &ScanContext<'_>,
+    kind: LeftoverKind,
+    path: &Path,
+) -> Vec<u32> {
     let exe_name = context.paths.exe_file_name();
     if matches!(kind, LeftoverKind::OldExe | LeftoverKind::NewExe)
         && let Some(name) = path
@@ -322,7 +359,7 @@ fn holders_for(context: &ScanContext<'_>, kind: LeftoverKind, path: &Path) -> Ve
             .map(|name| name.to_string_lossy().into_owned())
         && let Some(version) = version_from_exe_leftover_name(&exe_name, &name)
     {
-        return holders_of_version(context, &version);
+        return holders_of_exe(fs, context, path, &version);
     }
     holders_of_dir(context, path)
 }
@@ -376,10 +413,11 @@ fn scan_executable_leftovers(
             LeftoverKind::NewExe
         };
         if kind == LeftoverKind::OldExe && old_exe_retained(context, &version) {
+            report.old_exe_holders = holders_of_exe(fs, context, &entry.path, &version);
             report.retained.push(entry.path);
             continue;
         }
-        let holders = holders_of_version(context, &version);
+        let holders = holders_of_exe(fs, context, &entry.path, &version);
         if !holders.is_empty() {
             report.live.push(LiveLeftover {
                 kind,
@@ -512,8 +550,10 @@ fn scan_staging_dir(
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
-        let owner_alive =
-            owner_pid(name).is_some_and(|pid| context.probe.process_start(pid).is_some());
+        // An aside name ends in the renaming process's pid: that is no
+        // owner, the directory is garbage as soon as it exists.
+        let owner_alive = !is_garbage_name(name)
+            && owner_pid(name).is_some_and(|pid| context.probe.process_start(pid).is_some());
         let age = fs
             .modified(&entry.path)
             .ok()
@@ -561,6 +601,20 @@ fn scan_extension_root(
             continue;
         }
         if !entry.is_dir {
+            continue;
+        }
+        if is_garbage_name(name) {
+            // The aside name of a leftover whose deletion did not finish
+            // (round-3 review): a leftover whatever is left inside.
+            let kind = if fs
+                .exists(&entry.path.join(RETIRED_MARKER_FILE))
+                .unwrap_or(false)
+            {
+                LeftoverKind::RetiredContainer
+            } else {
+                LeftoverKind::Staging
+            };
+            remove_leftover(fs, context, kind, &entry.path, report, true, remove);
             continue;
         }
         if name.contains(".tmp-") || name.contains(".old-") {
@@ -620,6 +674,20 @@ fn scan_extension_root(
             let Some(sub_name) = sub.path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
+            if is_garbage_name(sub_name) {
+                // The aside name of a generation whose deletion did not
+                // finish — a leftover even without its manifest.
+                remove_leftover(
+                    fs,
+                    context,
+                    LeftoverKind::Generation,
+                    &sub.path,
+                    report,
+                    true,
+                    remove,
+                );
+                continue;
+            }
             if is_reserved_container_entry(sub_name)
                 || !sub.path.join("rpi-extension.json").is_file()
             {
@@ -755,7 +823,7 @@ mod tests {
     use crate::core::windows_update::fs::{FsOp, SpyFs};
     use crate::core::windows_update::layout::{UpdatePaths as Layout, safe_version_component};
     use crate::core::windows_update::pins::PinHandle;
-    use crate::core::windows_update::records::{FileDigest, StagedBinary};
+    use crate::core::windows_update::records::{FileDigest, StagedBinary, to_json};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -809,13 +877,14 @@ mod tests {
 
         /// A registration of another live instance (left on disk).
         fn pin(&self, pid: u32, exe_version: &str, dirs: Vec<PathBuf>) {
-            let mut record = PinRecord::new(
-                pid,
-                pid as u64 * 10,
-                format!("s{pid}"),
-                exe_version,
-                &self.paths.exe_path,
-            );
+            self.pin_image(pid, exe_version, &self.paths.exe_path.clone(), dirs);
+        }
+
+        /// Pin `pid` as an instance of `exe_version` that started from
+        /// `image` (its identity is what the holder judgement compares).
+        fn pin_image(&self, pid: u32, exe_version: &str, image: &Path, dirs: Vec<PathBuf>) {
+            let mut record =
+                PinRecord::new(pid, pid as u64 * 10, format!("s{pid}"), exe_version, image);
             record.dirs = dirs;
             self.fs
                 .write_atomic(
@@ -1370,6 +1439,79 @@ mod tests {
         );
     }
 
+    /// The aside name of a leftover stays a leftover for the next scan
+    /// (round-3 review): a half-deleted generation that lost its manifest
+    /// and a half-deleted container that lost its marker are removed
+    /// anyway, and a deletion that fails again is reported at the aside
+    /// path — what actually exists.
+    #[test]
+    fn an_aside_directory_stays_a_leftover_whatever_a_half_deletion_left() {
+        let f = Fixture::new();
+        let container = f.root().join("rpi-todo");
+        let current = f.generation("rpi-todo", "0.2.0");
+        f.write(
+            &container.join("current.json"),
+            r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0"}"#,
+        );
+        // The aside of a generation: its manifest is already gone.
+        let aside = container.join("0.1.0.garbage-77");
+        f.write(&aside.join("lib/lib.dll"), "dll");
+        // The aside of a retired container at the root: no marker inside.
+        let aside_root = f.root().join("rpi-gone.retired-77.garbage-78");
+        f.write(&aside_root.join("rpi-extension.json"), "{}");
+        // The aside of a staging directory: its name ends in a live pid.
+        let aside_staging = f.root().join(".staging/rpi-todo-0.3.0-5.garbage-1000");
+        f.write(&aside_staging.join("rpi-extension.json"), "{}");
+        f.probe.spawn(1000, 1);
+        let report = cleanup_scan(&*f.fs, &f.context(UpdateState::Idle));
+        let mut removed: Vec<String> = report
+            .removed
+            .iter()
+            .map(|(kind, path)| format!("{kind:?} {}", path.display()))
+            .collect();
+        removed.sort();
+        let mut expected: Vec<String> = [
+            (LeftoverKind::Generation, &aside),
+            (LeftoverKind::Staging, &aside_root),
+            (LeftoverKind::Staging, &aside_staging),
+        ]
+        .iter()
+        .map(|(kind, path)| format!("{kind:?} {}", path.display()))
+        .collect();
+        expected.sort();
+        assert_eq!(removed, expected, "{report:?}");
+        assert!(!aside.exists() && !aside_root.exists() && !aside_staging.exists());
+        assert!(current.exists());
+
+        // A deletion that fails again is stuck at the aside path.
+        let f = Fixture::new();
+        let container = f.root().join("rpi-todo");
+        f.generation("rpi-todo", "0.2.0");
+        f.write(
+            &container.join("current.json"),
+            r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0"}"#,
+        );
+        let old = f.generation("rpi-todo", "0.1.0");
+        f.fs.fail_with(
+            FsOp::RemoveDirAll,
+            "0.1.0.garbage-",
+            1,
+            std::io::Error::from_raw_os_error(5),
+        );
+        let report = cleanup_scan(&*f.fs, &f.context(UpdateState::Idle));
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(report.stuck.len(), 1, "{report:?}");
+        assert!(
+            report.stuck[0]
+                .path
+                .to_string_lossy()
+                .contains("0.1.0.garbage-"),
+            "{}",
+            report.stuck[0].path.display()
+        );
+        assert!(!old.exists(), "the original name is gone");
+    }
+
     /// A directory is renamed aside before it is deleted: a loaded library
     /// inside makes the rename fail as a whole (Windows refuses it for a
     /// mapped image's directory entry), which classifies the directory as
@@ -1415,6 +1557,86 @@ mod tests {
         assert!(
             names.iter().all(|name| !name.contains(".garbage-")),
             "{names:?}"
+        );
+    }
+
+    /// A same-version reinstall (R7.2.3) parks an image whose version
+    /// string every later instance of that version shares (round-3 review
+    /// R3-B1). The holders of a parked image are the instances that
+    /// started from it — by image identity — not every instance of the
+    /// version: the parked image goes once nobody runs it, even while
+    /// same-version instances (the scanner included) are up.
+    #[test]
+    fn a_same_version_reinstall_parks_an_image_only_its_own_instances_hold() {
+        let f = Fixture::new();
+        let old = f.paths.old_exe_path("0.1.9-rc.4");
+        std::fs::write(&old, b"old build").unwrap();
+        std::fs::write(&f.paths.exe_path, b"new build!").unwrap();
+        let mut confirmed = UpdateResult::new(
+            UpdateState::Confirmed,
+            Some("0.1.9-rc.4".to_owned()),
+            Some("0.1.9-rc.4".to_owned()),
+        );
+        confirmed.first_boot_protocol = true;
+        confirmed.normal_exit_after_confirm = true;
+        // An instance of the same version that started from the new image.
+        f.pin_image(2000, "0.1.9-rc.4", &f.paths.exe_path, vec![]);
+        let report = cleanup_scan(
+            &*f.fs,
+            &f.context_with(UpdateState::Confirmed, None, Some(&confirmed)),
+        );
+        assert!(report.live.is_empty(), "{report:?}");
+        assert_eq!(report.removed, vec![(LeftoverKind::OldExe, old.clone())]);
+        assert!(!old.exists());
+        assert!(report.old_exe_gone);
+
+        // An instance that started from the parked image keeps it live.
+        let f = Fixture::new();
+        let old = f.paths.old_exe_path("0.1.9-rc.4");
+        std::fs::write(&old, b"old build").unwrap();
+        std::fs::write(&f.paths.exe_path, b"new build!").unwrap();
+        f.pin_image(2001, "0.1.9-rc.4", &old, vec![]);
+        f.pin_image(2002, "0.1.9-rc.4", &f.paths.exe_path, vec![]);
+        let report = cleanup_scan(
+            &*f.fs,
+            &f.context_with(UpdateState::Confirmed, None, Some(&confirmed)),
+        );
+        assert_eq!(
+            report.live,
+            vec![LiveLeftover {
+                kind: LeftoverKind::OldExe,
+                path: old.clone(),
+                holders: vec![2001],
+            }]
+        );
+        assert!(old.exists());
+
+        // A pin without an image identity (metadata unavailable at its
+        // start) falls back to the version string.
+        let f = Fixture::new();
+        let old = f.paths.old_exe_path("0.1.9-rc.4");
+        std::fs::write(&old, b"old build").unwrap();
+        std::fs::write(&f.paths.exe_path, b"new build!").unwrap();
+        f.pin(2003, "0.1.9-rc.4", vec![]);
+        let mut no_identity =
+            read_record::<PinRecord>(&*f.fs, &f.paths.pins_dir().join("2003.json")).unwrap();
+        no_identity.exe_identity = None;
+        f.fs.write_atomic(
+            &f.paths.pins_dir().join("2003.json"),
+            to_json(&no_identity).as_bytes(),
+        )
+        .unwrap();
+        let report = cleanup_scan(
+            &*f.fs,
+            &f.context_with(UpdateState::Confirmed, None, Some(&confirmed)),
+        );
+        assert_eq!(
+            report.live,
+            vec![LiveLeftover {
+                kind: LeftoverKind::OldExe,
+                path: old.clone(),
+                holders: vec![2003],
+            }]
         );
     }
 

@@ -134,6 +134,7 @@ function Show-Matrix {
         @('target below 0.1.9-rc.4 switches without the first-start check', 'manual (only when an older RC asset exists)'),
         @('re-stage the rolled-back version with --force; resume an interrupted rollback', 'rollback + manual'),
         @('three cleanup notices; update --cleanup', 'switched (reminder/in-use) + cleanup'),
+        @('pre-rc.4 instance running during GC: its old generation is neither renamed nor half-deleted (live by the refused rename, in-use warning)', 'extensions + manual (keep a pre-rc.4 rpi open; update.log says the rename was refused; the next start after it exits cleans up)'),
         @('existing flat installs keep loading; update --extensions migrates; old dir cleaned', 'extensions'),
         @('install.ps1: fresh generational install; parked-exe preflight; re-run with rpi closed', 'manual (installer prompts)'),
         @('Defender interference', 'manual: note any "still in use"/"access denied" warning and the update.log lines'),
@@ -279,23 +280,23 @@ function Invoke-Rollback {
     Write-Host '  2. Start rpi interactively and, while the TUI is still coming up (before the first frame), end the NEWEST rpi.exe'
     Write-Host '     in Task Manager (Details, by creation time) - the child the trampoline started. Alternatively close the'
     Write-Host '     console window during the first start (the trampoline-absent path: the next start performs the rollback).'
-    Write-Host '  3. Expect: "The update to rpi <new> failed and was rolled back to rpi <old>." and, for step 2 with Task Manager,'
-    Write-Host '     the old version starting again by itself.'
+    Write-Host '  3. Expect: "The update to rpi <ToVersion> failed and was rolled back to rpi <ToVersion>." (a same-version re-stage: <new> and <old> are the same version) and, for step 2 with Task Manager,'
+    Write-Host '     the previous image starting again by itself (rpi.exe.old-<ToVersion> is restored to rpi.exe).'
     Write-Host 'Then run: -Phase rollback'
     $version = Get-RpiVersion
-    Check-Equal $script:FromVersion $version 'rpi --version prints the previous version again'
+    Check-Equal $ToVersion $version 'rpi --version prints the restored (same) version again'
     $blocked = Read-JsonFile (Join-Path $script:UpdateDir 'blocked.json')
     Check-True ($null -ne $blocked) '.update\blocked.json exists'
     if ($blocked) { Check-True (@($blocked.versions) -contains $ToVersion) 'the failed version is on the block list' }
     $state = Read-JsonFile (Join-Path $script:UpdateDir 'update-result.json')
     if ($state) {
         Check-Equal 'rolled_back' ([string]$state.state) 'update-result is rolled_back'
-        Check-Equal $script:FromVersion ([string]$state.fromVersion) 'result names the restored version'
+        Check-Equal $ToVersion ([string]$state.fromVersion) 'result names the restored version'
     }
     Check-True (-not (Test-Path -LiteralPath (Join-Path $script:UpdateDir 'pending.json'))) 'pending.json is gone'
     Check-True (-not (Test-Path -LiteralPath (Join-Path $script:UpdateDir 'undo.json'))) 'undo.json is gone'
     $manifest = Read-JsonFile (Join-Path $script:Prefix 'rpi.install.json')
-    if ($manifest) { Check-Equal $script:FromVersion ([string]$manifest.version) 'the install manifest is the previous one' }
+    if ($manifest) { Check-Equal $ToVersion ([string]$manifest.version) 'the install manifest is the restored one' }
     foreach ($container in @(Get-ChildItem -LiteralPath $script:Extensions -Directory -ErrorAction SilentlyContinue | Where-Object { -not $_.Name.StartsWith('.') })) {
         $pointer = Read-JsonFile (Join-Path $container.FullName 'current.json')
         if ($pointer) {
@@ -307,7 +308,7 @@ function Invoke-Rollback {
     # An exact pin carries its own channel; without --force a blocked version is refused.
     $refused = Invoke-Rpi @('update', '--self', '--version', $ToVersion)
     Write-Host $refused.Output
-    Check-Equal '1' ([string]$refused.ExitCode) 'a plain update to the blocked version is refused'
+    Check-Equal '1' ([string]$refused.ExitCode) 'an update pinned to the blocked version is refused without --force'
     Check-True ($refused.Output -match 'blocked list') 'the refusal names the block list'
     Say 'Counter-cases that must NOT roll back (manual, re-stage with --force first each time): rpi --version, rpi --help, a mistyped flag, a failing one-shot command, Ctrl+C during the first TUI frame, rpi --resume with the picker cancelled (Esc). After each, rpi --version must print the new version and update-result.json must be confirmed (or still applied for the failing one-shot command).'
 }

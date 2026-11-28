@@ -108,9 +108,6 @@ fn installed_version(fs: &dyn UpdateFs, paths: &UpdatePaths, running_version: &s
     super::transaction::installed_version(fs, paths, running_version)
 }
 
-/// Stage the update described by `request`. `log` receives one line per
-/// event. On `Err` nothing of this run remains staged (the caller removes
-/// the extension staging directories it created).
 /// Whether everything a pending names is still in place and intact: the
 /// staged executable by its digest and every staged extension tree by its
 /// recorded file list. The one idempotency criterion of staging, shared
@@ -125,6 +122,9 @@ pub fn staged_update_is_complete(fs: &dyn UpdateFs, pending: &PendingUpdate) -> 
         })
 }
 
+/// Stage the update described by `request`. `log` receives one line per
+/// event. On `Err` nothing of this run remains staged (the caller removes
+/// the extension staging directories it created).
 pub fn stage_update(
     fs: &dyn UpdateFs,
     paths: &UpdatePaths,

@@ -201,6 +201,34 @@ pub struct BootRecord {
     pub normal_exit: bool,
 }
 
+/// The identity of an executable image by metadata only (design §11.9):
+/// its length and its modification time. A rename keeps both, so an
+/// instance keeps matching the image it started from after a startup
+/// transaction parked that image. The version string alone cannot tell a
+/// parked image from the new image of the same version (a same-version
+/// reinstall, R7.2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExeIdentity {
+    pub len: u64,
+    pub modified_unix_ms: u64,
+}
+
+impl ExeIdentity {
+    pub fn of(metadata: std::fs::Metadata) -> Option<Self> {
+        let modified_unix_ms = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        Some(ExeIdentity {
+            len: metadata.len(),
+            modified_unix_ms: u64::try_from(modified_unix_ms).unwrap_or(u64::MAX),
+        })
+    }
+}
+
 /// `.pins/<pid>.json`: one rpi process and the extension directories it
 /// uses (Windows only; design §11.8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +244,11 @@ pub struct PinRecord {
     /// Absolute generation or flat directories this process loads from,
     /// keyed by install root.
     pub dirs: Vec<PathBuf>,
+    /// The image this process started from, by length and modification
+    /// time; `None` when the metadata could not be read (the version string
+    /// is the fallback then).
+    #[serde(default)]
+    pub exe_identity: Option<ExeIdentity>,
 }
 
 impl PinRecord {
@@ -234,6 +267,7 @@ impl PinRecord {
             exe_version: exe_version.to_owned(),
             exe_path: exe_path.to_path_buf(),
             dirs: Vec::new(),
+            exe_identity: std::fs::metadata(exe_path).ok().and_then(ExeIdentity::of),
         }
     }
 }

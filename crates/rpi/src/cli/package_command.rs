@@ -1480,14 +1480,14 @@ fn stage_failure_line(all_targets: bool, dropped_extensions: usize) -> String {
     if dropped_extensions == 0 {
         return failure_line(all_targets);
     }
-    let noun = if dropped_extensions == 1 {
-        "update"
+    let (noun, was) = if dropped_extensions == 1 {
+        ("update", "was")
     } else {
-        "updates"
+        ("updates", "were")
     };
     format!(
         "Nothing changed for {APP_NAME} — {APP_NAME} {VERSION} is still installed. The \
-         {dropped_extensions} extension {noun} staged with it were dropped; run \
+         {dropped_extensions} extension {noun} staged with it {was} dropped; run \
          \"{APP_NAME} update --extensions\" to apply them."
     )
 }
@@ -3023,8 +3023,7 @@ mod update_cli_tests {
     // ---- V14-19: the `--rc` channel flag (rpi-specific, no upstream) ----
 
     /// `--rc` is orthogonal to every target flag: it changes no target
-    /// resolution and adds no mutual exclusion
-    /// （FR-A R1/R3）。
+    /// resolution and adds no mutual exclusion (FR-A R1/R3).
     #[test]
     fn update_rc_flag_is_orthogonal_to_targets() {
         // bare `--rc` → still the default self target + the extensions-skipped note.
@@ -4295,10 +4294,51 @@ mod update_cli_tests {
         );
     }
 
+    /// The landing itself (round-3 review): a staged batch applied now
+    /// becomes generations with flipped pointers and leaves nothing in
+    /// staging — the function every "the executable is not staged" path of
+    /// a Windows `--all` calls.
+    #[test]
+    fn landing_a_staged_batch_now_places_generations_and_clears_staging() {
+        let dirs = TestDirs::new();
+        let exe = dirs.root.join("bin/rpi.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        let paths = crate::core::windows_update::layout::UpdatePaths::for_exe(
+            &exe,
+            &dirs.agent_dir,
+            Some(&dirs.cwd),
+        );
+        let batch = staged_batch(&dirs, "0.1.9-rc.4");
+        let staging = batch[0].staged_path.parent().unwrap().to_path_buf();
+        assert_eq!(land_staged_extensions_now(&paths, &batch), 0);
+        for name in ["rpi-todo", "rpi-plan-mode"] {
+            let container = dirs.agent_dir.join("extensions").join(name);
+            let pointer: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(container.join("current.json")).unwrap())
+                    .unwrap();
+            assert_eq!(pointer["version"], "0.1.9-rc.4", "{name}: landed now");
+            assert!(container.join("0.1.9-rc.4/lib/lib.dll").is_file());
+        }
+        assert!(std::fs::read_dir(&staging).unwrap().next().is_none());
+        // A batch whose staged directory is already gone fails by name and
+        // touches nothing else.
+        let broken = staged_batch(&dirs, "0.1.9-rc.5");
+        std::fs::remove_dir_all(&broken[0].staged_path).unwrap();
+        assert_eq!(land_staged_extensions_now(&paths, &broken), 1);
+        let container = dirs.agent_dir.join("extensions/rpi-plan-mode");
+        let pointer: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(container.join("current.json")).unwrap())
+                .unwrap();
+        assert_eq!(pointer["version"], "0.1.9-rc.5");
+    }
+
     /// `--all` while rpi itself is current (round-2 review: the main
     /// scenario of the round-1 `--all` finding): the executable is not
     /// staged, so the extensions of the batch apply right away instead
-    /// of waiting for a start that never switches them.
+    /// of waiting for a start that never switches them. A smoke test at
+    /// the command level — the npm flow of the fake runner records no
+    /// staged extension, so the landing call itself is covered by
+    /// `landing_a_staged_batch_now_places_generations_and_clears_staging`.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn update_all_on_windows_lands_the_batch_when_self_is_current() {
@@ -4405,6 +4445,10 @@ mod update_cli_tests {
         assert_eq!(
             stage_failure_line(true, 2),
             "Nothing changed for rpi — rpi 0.1.9-rc.4 is still installed. The 2 extension updates staged with it were dropped; run \"rpi update --extensions\" to apply them."
+        );
+        assert_eq!(
+            stage_failure_line(true, 1),
+            "Nothing changed for rpi — rpi 0.1.9-rc.4 is still installed. The 1 extension update staged with it was dropped; run \"rpi update --extensions\" to apply them."
         );
         // The self-only branch never has extensions in its batch.
         assert_eq!(stage_failure_line(false, 0), failure_line(false));

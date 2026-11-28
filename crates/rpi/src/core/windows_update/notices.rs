@@ -211,14 +211,33 @@ pub fn build_notices(input: &NoticeInput<'_>, log_path: &Path) -> Vec<StartupNot
             if let Some((from, to)) = versions
                 && !read
             {
-                let others_on_old = input
-                    .live_pins
-                    .iter()
-                    .filter(|pin| {
-                        pin.exe_version == from
-                            && pin.pid != input.self_pid
-                            && Some(pin.pid) != input.trampoline_pid
-                    })
+                // Other instances still on the previous version: the
+                // holders of the parked `.old` image (by image identity),
+                // plus — for a cross-version update, where the version
+                // string does identify the previous image — every pinned
+                // instance of that version. A same-version reinstall parks
+                // an image whose version string every new instance shares,
+                // so there the image identity alone counts.
+                let mut others_on_old: Vec<u32> = input.scan.old_exe_holders.clone();
+                for live in &input.scan.live {
+                    if live.kind == crate::core::windows_update::gc::LeftoverKind::OldExe {
+                        others_on_old.extend(live.holders.iter().copied());
+                    }
+                }
+                if from != to {
+                    others_on_old.extend(
+                        input
+                            .live_pins
+                            .iter()
+                            .filter(|pin| pin.exe_version == from)
+                            .map(|pin| pin.pid),
+                    );
+                }
+                others_on_old.sort_unstable();
+                others_on_old.dedup();
+                let others_on_old = others_on_old
+                    .into_iter()
+                    .filter(|pid| *pid != input.self_pid && Some(*pid) != input.trampoline_pid)
                     .count();
                 notices.push(StartupNotice::FirstBootReminder {
                     from,
@@ -616,33 +635,6 @@ mod tests {
 
     /// The steady state after a confirmation: the pending is gone, the
     /// update result alone drives the reminder (when unread) and the
-    /// A target without the first-boot protocol cannot show the reminder;
-    /// a later version that reads its result shows nothing stale either.
-    #[test]
-    fn a_target_without_the_protocol_leaves_no_reminder_behind() {
-        let mut result = UpdateResult::new(
-            UpdateState::Confirmed,
-            Some("0.1.9-rc.3".to_owned()),
-            Some("0.1.9-rc.2".to_owned()),
-        );
-        result.first_boot_protocol = false;
-        result.read = false;
-        let notices = build_notices(
-            &NoticeInput {
-                state: UpdateState::Confirmed,
-                result: Some(&result),
-                pending: None,
-                scan: &ScanReport::default(),
-                first_boot_launch: false,
-                self_pid: 4242,
-                trampoline_pid: None,
-                live_pins: &[],
-            },
-            log_path(),
-        );
-        assert!(notices.is_empty(), "{notices:?}");
-    }
-
     /// warnings are still classified.
     #[test]
     fn a_confirmed_result_without_a_pending_still_shows_the_reminder_and_warns() {
@@ -679,8 +671,10 @@ mod tests {
             log_path(),
         );
         assert_eq!(notices.len(), 2);
+        // The instance that holds the old image is "another instance
+        // still on the previous version".
         assert!(
-            matches!(&notices[0], StartupNotice::FirstBootReminder { from, to, cleaned: false, others_on_old: 0 } if from == "0.1.9-rc.3" && to == "0.1.9-rc.4")
+            matches!(&notices[0], StartupNotice::FirstBootReminder { from, to, cleaned: false, others_on_old: 1 } if from == "0.1.9-rc.3" && to == "0.1.9-rc.4")
         );
         assert!(
             matches!(&notices[1], StartupNotice::Warning { line } if line.contains("1 running rpi instance and 1 file could not be removed"))
@@ -705,6 +699,33 @@ mod tests {
         );
         assert_eq!(notices.len(), 1);
         assert!(matches!(&notices[0], StartupNotice::Warning { .. }));
+    }
+
+    /// A target without the first-boot protocol cannot show the reminder;
+    /// a later version that reads its result shows nothing stale either.
+    #[test]
+    fn a_target_without_the_protocol_leaves_no_reminder_behind() {
+        let mut result = UpdateResult::new(
+            UpdateState::Confirmed,
+            Some("0.1.9-rc.3".to_owned()),
+            Some("0.1.9-rc.2".to_owned()),
+        );
+        result.first_boot_protocol = false;
+        result.read = false;
+        let notices = build_notices(
+            &NoticeInput {
+                state: UpdateState::Confirmed,
+                result: Some(&result),
+                pending: None,
+                scan: &ScanReport::default(),
+                first_boot_launch: false,
+                self_pid: 4242,
+                trampoline_pid: None,
+                live_pins: &[],
+            },
+            log_path(),
+        );
+        assert!(notices.is_empty(), "{notices:?}");
     }
 
     #[test]
