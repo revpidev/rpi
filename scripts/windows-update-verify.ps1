@@ -315,15 +315,16 @@ function Invoke-Rollback {
     Check-Equal '1' ([string]$refused.ExitCode) 'an update pinned to the blocked version is refused without --force'
     Check-True ($refused.Output -match 'blocked list') 'the refusal names the block list'
     Say 'Counter-cases that must NOT roll back (manual, re-stage with --force first each time): rpi --version, rpi --help, a mistyped flag, a failing one-shot command, Ctrl+C during the first TUI frame, rpi --resume with the picker cancelled (Esc). After each, rpi --version must print the new version and update-result.json must be confirmed (or still applied for the failing one-shot command).'
-    Say 'Manual steps the matrix maps to this phase (matrix rows 6, 9 and 11):'
+    Say 'Manual steps the matrix maps to this phase (section 5: the gap between the two renames, downgrade / pinned target, re-run installer, interrupted rollback):'
     Write-Host '  - The two renames: the startup transaction renames rpi.exe to rpi.exe.old-<version>, then the staged executable to rpi.exe.'
     Write-Host '    A process that starts exactly between the two renames finds no rpi.exe (one "not found" start at most); to probe it, run'
-    Write-Host '    `while ($true) { rpi --version }` in a second terminal during the switch and note any failed start. The transaction is unaffected.'
-    Write-Host '  - Downgrade / pinned target: rpi update --self --version <older version> --force   (an RC target needs --rc as well;'
-    Write-Host "    without --force the downgrade is refused). Expect the same `Downloaded rpi <older>. It takes effect the next time rpi starts.` line,"
+    Write-Host '    `while ($true) { rpi --version }` in a second terminal during the switch and note any failed start (each rpi --version that'
+    Write-Host '    runs after the switch confirms the update, so re-stage before the next probe). The transaction itself is unaffected.'
+    Write-Host '  - Downgrade / pinned target: rpi update --self --version <older version> --force   (the channel follows the version; a version'
+    Write-Host "    on the block list needs --force). Expect the same `Downloaded rpi <older>. It takes effect the next time rpi starts.` line,"
     Write-Host '    then the switch at the next start. A plain --version <pinned newer> stages without --force.'
     Write-Host '  - A re-run installer invalidates the pending: stage an update, run install.ps1 (rpi closed), start rpi: update.log says'
-    Write-Host '    "superseded by the installer" and .update\pending.json is gone.'
+    Write-Host '    "pending invalidated (the installation changed after the update was staged" and .update\pending.json is gone.'
     Write-Host '  - Interrupted rollback: re-stage, start rpi, end the newest rpi.exe (the child) before the first frame and end the trampoline'
     Write-Host '    (the older rpi.exe) right after update.log shows "rollback:"; start rpi again: the rollback must complete (update.log'
     Write-Host '    "rollback:" lines, rpi --version prints the restored version) and the block list holds the failed version.'
@@ -415,11 +416,13 @@ Write-Host ("transcript: " + $script:Transcript)
 
 $order = @('baseline', 'stage', 'switched', 'extensions', 'rollback', 'cleanup')
 $phases = if ($Phase -eq 'all') { $order } else { @($Phase) }
+if (-not $FromVersion) {
+    # Every later phase compares against the installed version: capture it before anything
+    # runs, whichever phase a standalone run starts at.
+    $FromVersion = Get-RpiVersion
+    $script:FromVersion = $FromVersion
+}
 foreach ($name in $phases) {
-    if ($name -eq 'baseline' -and -not $FromVersion) {
-        # Capture the installed version before anything runs.
-        $FromVersion = Get-RpiVersion
-    }
     switch ($name) {
         'baseline' { Invoke-Baseline }
         'stage' { Invoke-Stage }

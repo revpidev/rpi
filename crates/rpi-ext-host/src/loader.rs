@@ -279,7 +279,7 @@ fn is_extension_file(name: &str) -> bool {
 /// Generational installs (ADR-0050, [`crate::install_layout`]): the manifest
 /// and entry points are looked up in the directory the container resolves
 /// to — the generation its `current.json` names, else the directory itself.
-/// A retired container resolves to nothing.
+/// A retired container (or an aside directory on its way out) resolves to nothing.
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
     let dir = crate::install_layout::resolve_install_dir(dir)?;
     let manifest_path = dir.join("rpi-extension.json");

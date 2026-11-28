@@ -147,9 +147,11 @@ pub fn stage_update(
         && blocked.contains(target)
         && !request.force
     {
+        // The exact re-stage names the version: a plain `--force` follows
+        // the channel's latest, which need not be the blocked version.
         return Err(format!(
             "rpi {target} is on the blocked list because its first start failed. Run \
-             \"rpi update --self --force\" to try it again."
+             \"rpi update --self --version {target} --force\" to stage that version again."
         ));
     }
     let prerelease = crate::core::version_check::is_prerelease_version(target);

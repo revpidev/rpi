@@ -1422,7 +1422,17 @@ pub async fn run_update_in(
                 seam: binary_seam,
                 observer: progress.as_ref(),
                 extensions: staged_extensions,
-                channel: if parsed.rc {
+                // The channel of a pinned target follows the version
+                // (R7.2.2: the pending records the channel `--rc` or
+                // `--version` selected): a pre-release pin is staged on the
+                // pre-release channel without `--rc`, which the parser does
+                // not allow next to `--version` (round-5 review).
+                channel: if parsed.rc
+                    || parsed
+                        .version
+                        .as_deref()
+                        .is_some_and(crate::core::version_check::is_prerelease_version)
+                {
                     UpdateChannel::PreRelease
                 } else {
                     UpdateChannel::Stable
@@ -4081,6 +4091,75 @@ mod update_cli_tests {
         .unwrap();
         pending.binary.staged_path = after.binary.staged_path.clone();
         assert_eq!(after, pending, "the applied pending is left alone");
+    }
+
+    /// A pinned pre-release target is staged on the pre-release channel
+    /// without `--rc` (round-5 review R5-B1): the parser forbids `--rc`
+    /// next to `--version`, so the staging channel follows the pinned
+    /// version (R7.2.2) — before, every `--version <pre-release>` was
+    /// refused as "does not belong to the selected channel".
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn update_self_on_windows_pins_a_prerelease_version_without_rc() {
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
+        let dirs = TestDirs::new();
+        let (exe, seam, _downloads) = staged_binary_seam(&dirs, "99.0.0-rc.1", b"rc-binary");
+        let code = run_update_in(
+            &args(&["update", "--self", "--version", "99.0.0-rc.1"]),
+            &dirs.cwd,
+            &dirs.agent_dir,
+            Some(FakeRunner::npm_view_latest()),
+            Some(StubTransport::newer_version()),
+            Some(seam),
+        )
+        .await;
+        assert_eq!(code, 0);
+        let fs = crate::core::windows_update::fs::RealFs;
+        let paths = crate::core::windows_update::layout::UpdatePaths::for_exe(
+            &exe,
+            &dirs.agent_dir,
+            Some(&dirs.cwd),
+        );
+        let pending = crate::core::windows_update::records::read_record::<
+            crate::core::windows_update::records::PendingUpdate,
+        >(&fs, &paths.pending_path())
+        .expect("pending.json");
+        assert_eq!(
+            pending.channel, "rc",
+            "the channel follows the pinned version"
+        );
+        assert_eq!(pending.target_version, "99.0.0-rc.1");
+        assert!(
+            pending.allow_non_monotonic,
+            "a pin bypasses the version rule"
+        );
+
+        // The same-version re-stage of a blocked pre-release version: the
+        // exact command the block-list message and the verification kit
+        // name, `--version <installed> --force`.
+        crate::core::windows_update::records::write_record::<
+            crate::core::windows_update::records::PendingUpdate,
+        >(&fs, &paths.pending_path(), None)
+        .unwrap();
+        let (_exe, seam, _downloads) = staged_binary_seam(&dirs, "99.0.0-rc.1", b"rc-binary");
+        let code = run_update_in(
+            &args(&["update", "--self", "--version", "99.0.0-rc.1", "--force"]),
+            &dirs.cwd,
+            &dirs.agent_dir,
+            Some(FakeRunner::npm_view_latest()),
+            Some(StubTransport::newer_version()),
+            Some(seam),
+        )
+        .await;
+        assert_eq!(code, 0);
+        let pending = crate::core::windows_update::records::read_record::<
+            crate::core::windows_update::records::PendingUpdate,
+        >(&fs, &paths.pending_path())
+        .expect("pending.json");
+        assert_eq!(pending.channel, "rc");
     }
 
     #[tokio::test]

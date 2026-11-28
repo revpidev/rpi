@@ -116,8 +116,8 @@ pub fn is_retired(container: &Path) -> bool {
 }
 
 /// Whether `name` is the aside name the Windows cleanup scan gives a
-/// leftover directory before deleting it: `<name>.garbage-<pid>` or
-/// `<name>.garbage-<pid>.t<stamp>`, with a non-empty `<name>`. Such a
+/// leftover directory before deleting it (with a non-empty `<name>`):
+/// `<name>.garbage-<pid>`, or `<name>.garbage-<pid>.t<stamp>`. Such a
 /// directory is on its way out — a half-deleted tree may still carry a
 /// pointer and a manifest — and is never resolved as an install.
 pub fn is_garbage_aside_name(name: &str) -> bool {
@@ -131,8 +131,9 @@ pub fn is_garbage_aside_name(name: &str) -> bool {
 }
 
 /// Resolve `container` without consulting the process cache. `None` means
-/// retired (uninstalled); otherwise the directory that holds the extension
-/// files: the generation the pointer names, or the container itself.
+/// retired (uninstalled) or an aside directory on its way out; otherwise
+/// the directory that holds the extension files: the generation the
+/// pointer names, or the container itself.
 ///
 /// A missing or corrupt pointer falls back to the flat layout. So does a
 /// pointer whose generation directory has no manifest (a half-removed
