@@ -198,9 +198,15 @@ pub fn run_startup_transaction(
     if let Err(reason) = reverify(fs, paths, &pending, running_version) {
         log(&format!("transaction: pending invalidated ({reason})"));
         discard_pending(fs, paths, &pending);
+        // What the installation runs now: the manifest's version. That is
+        // the pending's `from` for every ordinary invalidation; it differs
+        // only when the executable was already swapped and the undo record
+        // went missing afterwards (round-3 review), where "still on <from>"
+        // would be wrong.
+        let on = installed_version(fs, paths, running_version);
         let mut result = UpdateResult::new(
             UpdateState::Degraded,
-            Some(pending.from_version.clone()),
+            Some(on.clone()),
             Some(pending.target_version.clone()),
         );
         result.reason = Some(format!("staged update discarded: {reason}"));
@@ -208,7 +214,7 @@ pub fn run_startup_transaction(
         return TransactionOutcome::Degraded {
             message: format!(
                 "The staged update to rpi {} was discarded ({}). rpi is still on {}.",
-                pending.target_version, reason, pending.from_version
+                pending.target_version, reason, on
             ),
             manual: None,
         };
@@ -2195,10 +2201,15 @@ mod tests {
         let _ = f.fs.remove_file(&f.paths.undo_path());
         let outcome = f.run(RUNNING_NEW);
         // Nothing is left to apply: the staged executable is gone, so the
-        // regular path discards the pending instead of marking it applied.
+        // regular path discards the pending instead of marking it applied
+        // — and names the version actually in place (the target), not the
+        // pending's `from` (round-3 review).
+        let TransactionOutcome::Degraded { message, .. } = &outcome else {
+            panic!("{outcome:?}")
+        };
         assert!(
-            matches!(outcome, TransactionOutcome::Degraded { .. }),
-            "{outcome:?}"
+            message.contains(&format!("rpi is still on {RUNNING_NEW}.")),
+            "{message}"
         );
         let stored = read_record::<PendingUpdate>(&*f.fs, &f.paths.pending_path());
         assert!(stored.is_none(), "the stale pending was discarded");
