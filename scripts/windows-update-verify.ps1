@@ -37,8 +37,9 @@
 
 .PARAMETER FromVersion
     The version installed before the update (default: what `rpi --version`
-    prints before the first phase that compares against it — the baseline,
-    or the stage phase of a standalone run).
+    prints before any phase when the run includes the stage phase — `all`,
+    or `stage` on its own; the other phases leave it empty, because
+    `rpi --version` would confirm an update that waits for its first start).
 
 .PARAMETER ToVersion
     The version to update to (default: the version of this source tree, read
@@ -156,8 +157,6 @@ function Show-Matrix {
 function Invoke-Baseline {
     Say 'Phase baseline: the installed state before the update'
     $version = Get-RpiVersion
-    if (-not $FromVersion) { $FromVersion = $version }
-    $script:FromVersion = $FromVersion
     Check-True ([bool]$version) 'rpi --version prints a version'
     Write-Host "  installed: $version (prefix $($script:Prefix))"
     $manifest = Read-JsonFile (Join-Path $script:Prefix 'rpi.install.json')
