@@ -238,7 +238,6 @@ impl Trampoline {
                     &state.paths,
                     state.probe.as_ref(),
                     pid,
-                    code,
                     &StartupOptions::default(),
                     &state.sink(),
                 )

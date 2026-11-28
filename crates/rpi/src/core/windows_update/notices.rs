@@ -193,14 +193,20 @@ pub fn build_notices(input: &NoticeInput<'_>, log_path: &Path) -> Vec<StartupNot
         // first start (`applied`) and from the update result afterwards
         // (`confirmed`, where the confirmation already deleted the pending).
         UpdateState::Applied | UpdateState::Confirmed => {
+            // A target without the first-boot protocol cannot show this
+            // reminder (it has no start notices), so nothing is kept for
+            // it: a later version must not inherit a stale reminder.
             let versions = input
                 .pending
-                .filter(|pending| pending.applied)
+                .filter(|pending| pending.applied && pending.first_boot_protocol)
                 .map(|pending| (pending.from_version.clone(), pending.target_version.clone()))
                 .or_else(|| {
-                    input.result.and_then(|result| {
-                        result.from_version.clone().zip(result.to_version.clone())
-                    })
+                    input
+                        .result
+                        .filter(|result| result.first_boot_protocol)
+                        .and_then(|result| {
+                            result.from_version.clone().zip(result.to_version.clone())
+                        })
                 });
             if let Some((from, to)) = versions
                 && !read
@@ -610,14 +616,42 @@ mod tests {
 
     /// The steady state after a confirmation: the pending is gone, the
     /// update result alone drives the reminder (when unread) and the
+    /// A target without the first-boot protocol cannot show the reminder;
+    /// a later version that reads its result shows nothing stale either.
+    #[test]
+    fn a_target_without_the_protocol_leaves_no_reminder_behind() {
+        let mut result = UpdateResult::new(
+            UpdateState::Confirmed,
+            Some("0.1.9-rc.3".to_owned()),
+            Some("0.1.9-rc.2".to_owned()),
+        );
+        result.first_boot_protocol = false;
+        result.read = false;
+        let notices = build_notices(
+            &NoticeInput {
+                state: UpdateState::Confirmed,
+                result: Some(&result),
+                pending: None,
+                scan: &ScanReport::default(),
+                first_boot_launch: false,
+                self_pid: 4242,
+                trampoline_pid: None,
+                live_pins: &[],
+            },
+            log_path(),
+        );
+        assert!(notices.is_empty(), "{notices:?}");
+    }
+
     /// warnings are still classified.
     #[test]
     fn a_confirmed_result_without_a_pending_still_shows_the_reminder_and_warns() {
-        let result = UpdateResult::new(
+        let mut result = UpdateResult::new(
             UpdateState::Confirmed,
             Some("0.1.9-rc.3".to_owned()),
             Some("0.1.9-rc.4".to_owned()),
         );
+        result.first_boot_protocol = true;
         let mut scan = ScanReport::default();
         scan.live.push(LiveLeftover {
             kind: LeftoverKind::OldExe,

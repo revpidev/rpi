@@ -9808,12 +9808,15 @@ mod registry_tests {
             "{output}"
         );
 
-        let summary = crate::cli::package_command::update_summary_output(&UpdateApplySummary {
-            updated: 1,
-            up_to_date: 6,
-            skipped: 0,
-            failed: 0,
-        });
+        let summary = crate::cli::package_command::update_summary_output(
+            &UpdateApplySummary {
+                updated: 1,
+                up_to_date: 6,
+                skipped: 0,
+                failed: 0,
+            },
+            false,
+        );
         assert_eq!(
             summary,
             "Updated 1 extension · 6 already up to date\nRestart rpi to load the update.\n"

@@ -130,12 +130,14 @@ pub fn run_startup_transaction(
         Ok(lock) => lock,
         Err(LockError::Timeout) => {
             log("transaction: the update lock stayed held by another instance; starting as-is");
+            register_if_in_open_first_boot(fs, paths, probe, running_version, log);
             return TransactionOutcome::LockBusy;
         }
         Err(LockError::Io(error)) => {
             log(&format!(
                 "transaction: could not take the update lock ({error}); starting as-is"
             ));
+            register_if_in_open_first_boot(fs, paths, probe, running_version, log);
             return TransactionOutcome::LockBusy;
         }
     };
@@ -168,13 +170,11 @@ pub fn run_startup_transaction(
     let context = UndoContext { paths, fs, log };
     journal::rollback_uncommitted(&context);
     // A start that died between the journal commit and the pending's
-    // applied flag left the new manifest and the moved executable behind
-    // with nothing to undo: finalize the commit instead of discarding an
+    // applied flag left the new manifest, the moved executable and the
+    // undo record behind: finalize the commit instead of discarding an
     // update that is already in place.
-    if read_record::<crate::config::InstallManifest>(fs, &paths.manifest_path)
-        .is_some_and(|manifest| manifest.version == pending.target_version)
-    {
-        log("transaction: the manifest already names the target; finalizing the committed update");
+    if commit_already_landed(fs, paths, &pending) {
+        log("transaction: the commit already landed; finalizing the applied update");
         let mut committed = pending.clone();
         committed.applied = true;
         let _ = write_record(fs, &paths.pending_path(), Some(&committed));
@@ -186,10 +186,14 @@ pub fn run_startup_transaction(
         result.first_boot_protocol = pending.first_boot_protocol;
         let _ = write_record(fs, &paths.result_path(), Some(&result));
         clear_boot_records(fs, &paths.boot_dir());
-        if !pending.first_boot_protocol {
+        return if pending.first_boot_protocol {
+            register_own_boot_record(fs, paths, probe, &committed, running_version, log)
+        } else {
             confirm_update(fs, paths, &committed);
-        }
-        return register_own_boot_record(fs, paths, probe, &committed, running_version, log);
+            TransactionOutcome::FirstBootOpen {
+                target_version: committed.target_version.clone(),
+            }
+        };
     }
     if let Err(reason) = reverify(fs, paths, &pending, running_version) {
         log(&format!("transaction: pending invalidated ({reason})"));
@@ -409,7 +413,6 @@ pub fn judge_trampoline_child(
     paths: &UpdatePaths,
     probe: &dyn ProcessProbe,
     child_pid: u32,
-    child_exit_code: u32,
     options: &StartupOptions,
     log: &dyn Fn(&str),
 ) -> TrampolineVerdict {
@@ -468,16 +471,10 @@ pub fn judge_trampoline_child(
         // Another instance is still in its first boot: not this child's
         // call.
         FirstBootVerdict::Live => TrampolineVerdict::PassThrough,
-        // No record at all: the child never reached P1. A normal exit code
-        // (a one-shot command that found the lock busy) is not a crash —
-        // the update keeps waiting for a later confirmation; any other
-        // termination is an unmarked one (design §11.7).
-        FirstBootVerdict::NoRecords if child_exit_code == 0 => {
-            log(&format!(
-                "trampoline: child {child_pid} exited normally without a boot record; not a crash"
-            ));
-            TrampolineVerdict::PassThrough
-        }
+        // No record at all: the child never reached P1 — an unmarked
+        // termination (design §11.7). A one-shot command that found the
+        // lock busy is not caught here: P1 writes its own boot record even
+        // without the lock, so its exit is marked normally.
         FirstBootVerdict::NoRecords => {
             log(&format!(
                 "trampoline: child {child_pid} exited without a boot record; rolling back"
@@ -495,6 +492,41 @@ pub fn judge_trampoline_child(
             }
         }
     }
+}
+
+/// A start that found the update lock held still takes part in the open
+/// first boot when it runs the applied target version: it writes its own
+/// boot record so that its exit counts as a marked one (R7.3.6) instead of
+/// letting the trampoline read a lock-busy one-shot command as a crash.
+fn register_if_in_open_first_boot(
+    fs: &dyn UpdateFs,
+    paths: &UpdatePaths,
+    probe: &dyn ProcessProbe,
+    running_version: &str,
+    log: &dyn Fn(&str),
+) {
+    let Some(pending) = read_record::<PendingUpdate>(fs, &paths.pending_path()) else {
+        return;
+    };
+    if pending.applied && pending.first_boot_protocol {
+        log("transaction: lock busy; joining the open first boot as-is");
+        let _ = register_own_boot_record(fs, paths, probe, &pending, running_version, log);
+    }
+}
+
+/// The commit of an interrupted transaction is already in place: the
+/// manifest names the target, the staged executable is gone (the swap moved
+/// it) and the undo record was written before the first change. The
+/// manifest alone is not enough — a same-version reinstall (R7.2.3) names
+/// the installed version as its target while its staged executable still
+/// waits in the staging directory.
+fn commit_already_landed(fs: &dyn UpdateFs, paths: &UpdatePaths, pending: &PendingUpdate) -> bool {
+    let manifest_names_target =
+        read_record::<crate::config::InstallManifest>(fs, &paths.manifest_path)
+            .is_some_and(|manifest| manifest.version == pending.target_version);
+    manifest_names_target
+        && !fs.exists(&pending.binary.staged_path).unwrap_or(true)
+        && read_record::<UndoData>(fs, &paths.undo_path()).is_some()
 }
 
 /// The version the installation reports: the manifest's, else the running
@@ -1738,15 +1770,9 @@ mod tests {
 
     // ---- the trampoline's judgement ----------------------------------------
 
-    /// Judge a child `pid` that exited with `exit_code`, whose boot record
-    /// (`normal_exit` `None`: no record was written) is registered under a
-    /// separate probe.
-    fn judge_child(
-        f: &Fixture,
-        pid: u32,
-        normal_exit: Option<bool>,
-        exit_code: u32,
-    ) -> TrampolineVerdict {
+    /// Judge a child `pid` whose boot record (`normal_exit` `None`: no
+    /// record was written) is registered under a separate probe.
+    fn judge_child(f: &Fixture, pid: u32, normal_exit: Option<bool>) -> TrampolineVerdict {
         let probe = FakeProcessProbe::new(1, 1);
         if let Some(normal_exit) = normal_exit {
             write_boot_record(
@@ -1767,7 +1793,6 @@ mod tests {
             &f.paths,
             &probe,
             pid,
-            exit_code,
             &StartupOptions::default(),
             &|_: &str| {},
         )
@@ -1778,10 +1803,7 @@ mod tests {
         // Still applied and no record at all (the child died before P1):
         // an unmarked termination is a crash.
         let f = applied(false);
-        assert_eq!(
-            judge_child(&f, 5100, None, 1),
-            TrampolineVerdict::RolledBack
-        );
+        assert_eq!(judge_child(&f, 5100, None), TrampolineVerdict::RolledBack);
         assert_eq!(
             std::fs::read(f.prefix().join("rpi.exe")).unwrap(),
             b"old exe"
@@ -1795,7 +1817,7 @@ mod tests {
         // keeps waiting for a later confirmation.
         let f = applied(false);
         assert_eq!(
-            judge_child(&f, 5101, Some(true), 1),
+            judge_child(&f, 5101, Some(true)),
             TrampolineVerdict::PassThrough,
             "normal exit without a confirmation"
         );
@@ -1815,7 +1837,7 @@ mod tests {
         // Exited without the normal-exit mark: a crash.
         let f = applied(false);
         assert_eq!(
-            judge_child(&f, 5102, Some(false), 1),
+            judge_child(&f, 5102, Some(false)),
             TrampolineVerdict::RolledBack,
             "no normal-exit mark"
         );
@@ -1824,7 +1846,7 @@ mod tests {
         let f = applied(false);
         confirm_update(&*f.fs, &f.paths, &f.pending);
         assert_eq!(
-            judge_child(&f, 5103, None, 1),
+            judge_child(&f, 5103, None),
             TrampolineVerdict::PassThrough,
             "confirmed"
         );
@@ -1851,7 +1873,6 @@ mod tests {
                 &f.paths,
                 &*probe,
                 6001,
-                1,
                 &StartupOptions::default(),
                 &|_: &str| {}
             ),
@@ -1876,7 +1897,6 @@ mod tests {
                 &f.paths,
                 &*probe,
                 5100,
-                1,
                 &StartupOptions {
                     lock_wait: Duration::from_millis(50)
                 },
@@ -2107,31 +2127,125 @@ mod tests {
         assert!(
             f.logs()
                 .iter()
-                .any(|line| line.contains("finalizing the committed update")),
+                .any(|line| line.contains("finalizing the applied update")),
             "{:?}",
             f.logs()
         );
     }
 
-    /// A child that exited normally without a boot record (it found the
-    /// lock busy) is not a crash; any other exit without a record is.
+    /// A same-version reinstall (R7.2.3: `--version <installed>`, or a
+    /// forced update of the version already in place) names the installed
+    /// version as its target, so the manifest matches before the first
+    /// change. The transaction still has to run — swap the executable and
+    /// write the undo record — instead of finalizing a commit that never
+    /// happened (round-2 review).
     #[test]
-    fn a_normal_exit_without_a_boot_record_is_not_a_crash() {
-        let f = applied(false);
+    fn a_same_version_reinstall_runs_the_transaction_instead_of_finalizing() {
+        let f = Fixture::staged(false);
+        let mut pending = read_record::<PendingUpdate>(&*f.fs, &f.paths.pending_path()).unwrap();
+        assert_eq!(pending.from_version, RUNNING_OLD);
+        assert!(!pending.allow_non_monotonic);
+        pending.target_version = RUNNING_OLD.to_owned();
+        pending.allow_non_monotonic = true;
+        let staged_dir = f.paths.update_dir.join("staging").join(RUNNING_OLD);
+        std::fs::create_dir_all(&staged_dir).unwrap();
+        let staged_exe = staged_dir.join("rpi.exe");
+        std::fs::rename(&pending.binary.staged_path, &staged_exe).unwrap();
+        pending.binary.staged_path = staged_exe;
+        write_record(&*f.fs, &f.paths.pending_path(), Some(&pending)).unwrap();
         assert_eq!(
-            judge_child(&f, 5100, None, 0),
-            TrampolineVerdict::PassThrough
+            read_record::<crate::config::InstallManifest>(&*f.fs, &f.paths.manifest_path)
+                .unwrap()
+                .version,
+            RUNNING_OLD,
+            "the manifest already names the target before any change"
         );
-        assert!(f.paths.pending_path().exists(), "the update keeps waiting");
+        assert!(matches!(
+            f.run(RUNNING_OLD),
+            TransactionOutcome::Applied {
+                first_boot_protocol: true
+            }
+        ));
         assert_eq!(
             std::fs::read(f.prefix().join("rpi.exe")).unwrap(),
             b"new exe"
         );
+        assert!(
+            f.paths.undo_path().exists(),
+            "the swap wrote its undo record"
+        );
+        assert!(
+            f.paths.old_exe_path(RUNNING_OLD).exists(),
+            "the image that was in place was parked"
+        );
+        assert!(!f.logs().iter().any(|line| line.contains("finalizing")));
+    }
+
+    /// The finalize criterion needs all three marks of a landed commit; a
+    /// missing undo record (a commit that never ran) falls through to the
+    /// regular transaction even when the manifest matches and the staged
+    /// copy is gone.
+    #[test]
+    fn a_commit_without_an_undo_record_is_not_finalized() {
+        let f = applied(false);
+        let mut pending = f.pending.clone();
+        pending.applied = false;
+        f.fs.write_atomic(&f.paths.pending_path(), to_json(&pending).as_bytes())
+            .unwrap();
+        let _ = f.fs.remove_file(&f.paths.undo_path());
+        let outcome = f.run(RUNNING_NEW);
+        // Nothing is left to apply: the staged executable is gone, so the
+        // regular path discards the pending instead of marking it applied.
+        assert!(
+            matches!(outcome, TransactionOutcome::Degraded { .. }),
+            "{outcome:?}"
+        );
+        let stored = read_record::<PendingUpdate>(&*f.fs, &f.paths.pending_path());
+        assert!(stored.is_none(), "the stale pending was discarded");
+        assert_eq!(
+            std::fs::read(f.prefix().join("rpi.exe")).unwrap(),
+            b"new exe",
+            "the executable in place is untouched"
+        );
+    }
+
+    /// A start that finds the update lock busy joins the open first boot
+    /// with its own boot record, so the trampoline's judgement keeps its
+    /// rule: a child without any record is an unmarked termination.
+    #[test]
+    fn a_lock_busy_start_joins_the_open_first_boot_so_its_exit_is_marked() {
+        // The lock is held by the instance that applies the update. The
+        // start that finds it busy runs the applied target version, so P1
+        // writes its own boot record even without the lock; its later
+        // normal exit marks the record instead of leaving an unmarked one.
+        let f = applied(false);
+        let _held =
+            lock::acquire_exclusive(&f.paths.lock_path(), Duration::from_millis(100)).unwrap();
+        assert!(matches!(f.run(RUNNING_NEW), TransactionOutcome::LockBusy));
+        assert!(
+            f.paths.boot_record_path(4242).exists(),
+            "the lock-busy start registered for the open first boot: {:?}",
+            f.logs()
+        );
+        // The judgement itself is not softened: a child that left no record
+        // at all is an unmarked termination, whatever its exit code.
         let f = applied(false);
         assert_eq!(
-            judge_child(&f, 5101, None, 1),
-            TrampolineVerdict::RolledBack
+            judge_child(&f, 5100, None),
+            TrampolineVerdict::RolledBack,
+            "no record at all is a crash (design 11.7, R7.3.6)"
         );
+        assert_eq!(
+            std::fs::read(f.prefix().join("rpi.exe")).unwrap(),
+            b"old exe"
+        );
+        // A start of the previous version does not join: it is not part of
+        // the first boot of the target.
+        let f = applied(false);
+        let _held =
+            lock::acquire_exclusive(&f.paths.lock_path(), Duration::from_millis(100)).unwrap();
+        assert!(matches!(f.run(RUNNING_OLD), TransactionOutcome::LockBusy));
+        assert!(!f.paths.boot_record_path(4242).exists());
     }
 
     #[test]

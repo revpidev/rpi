@@ -214,8 +214,13 @@ fn holders_of_dir(context: &ScanContext<'_>, dir: &Path) -> Vec<u32> {
 /// Delete one leftover (or, in a classify-only scan, only record it).
 /// The DELETE-access probe runs first (design §11.9): a path some process
 /// holds open without share-delete is *live* and is never touched — a
-/// loaded library would otherwise keep a half-deleted tree. `NotFound`
-/// means the path vanished meanwhile and counts as removed.
+/// loaded library would otherwise keep a half-deleted tree. The probe
+/// cannot see an image that is mapped (Windows grants DELETE access to a
+/// running executable) nor a library loaded from inside a directory, so
+/// a directory is additionally renamed aside before it is deleted: the
+/// rename fails as a whole where the recursive delete would stop halfway,
+/// and that failure classifies the directory as live. `NotFound` means
+/// the path vanished meanwhile and counts as removed.
 fn remove_leftover(
     fs: &dyn UpdateFs,
     context: &ScanContext<'_>,
@@ -249,7 +254,17 @@ fn remove_leftover(
         return;
     }
     let result = if directory {
-        fs.remove_dir_all(path)
+        match rename_aside(fs, context, path) {
+            Ok(aside) => fs.remove_dir_all(&aside),
+            Err(_) => {
+                report.live.push(LiveLeftover {
+                    kind,
+                    path: path.to_path_buf(),
+                    holders: holders_for(context, kind, path),
+                });
+                return;
+            }
+        }
     } else {
         fs.remove_file(path)
     };
@@ -264,6 +279,37 @@ fn remove_leftover(
             reason: stuck_reason(&error, kind),
         }),
     }
+}
+
+/// Move a leftover directory aside (`<name>.garbage-<pid>`) so that its
+/// deletion is all-or-nothing with respect to loaded libraries. The
+/// aside name stays garbage for the next scan (no owner pid to parse, no
+/// pointer names it) when the deletion does not finish this time.
+fn rename_aside(
+    fs: &dyn UpdateFs,
+    context: &ScanContext<'_>,
+    path: &Path,
+) -> std::io::Result<PathBuf> {
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no parent",
+        ));
+    };
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut aside = parent.join(format!("{name}.garbage-{}", context.self_pid));
+    if fs.exists(&aside).unwrap_or(false) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        aside = parent.join(format!("{name}.garbage-{}.t{stamp}", context.self_pid));
+    }
+    fs.rename(path, &aside)?;
+    Ok(aside)
 }
 
 /// The instances that hold a leftover: old/new images by their version,
@@ -292,6 +338,12 @@ fn old_exe_retained(context: &ScanContext<'_>, version: &str) -> bool {
     let Some(result) = context.result else {
         return false;
     };
+    // A target without the first-boot protocol has no exit marking: it
+    // would never release the image, and that target cannot read the
+    // pointer layout anyway. Its `.old` is an ordinary leftover.
+    if !result.first_boot_protocol {
+        return false;
+    }
     if result.from_version.as_deref() != Some(version) {
         return false;
     }
@@ -843,12 +895,13 @@ mod tests {
 
         // Applied, first boot open: kept, silently. The update result
         // names the version the old image belongs to (the pending is still
-        // there too).
-        let applied = UpdateResult::new(
+        // there too) and carries the protocol flag of the commit.
+        let mut applied = UpdateResult::new(
             UpdateState::Applied,
             Some("0.1.9-rc.3".to_owned()),
             Some("0.1.9-rc.4".to_owned()),
         );
+        applied.first_boot_protocol = true;
         let report = cleanup_scan(
             &*f.fs,
             &f.context_with(UpdateState::Applied, Some(&pending), Some(&applied)),
@@ -860,11 +913,12 @@ mod tests {
 
         // Confirmed but no normal exit since: still kept. The confirmation
         // deleted the pending; the result alone carries the retention.
-        let confirmed = UpdateResult::new(
+        let mut confirmed = UpdateResult::new(
             UpdateState::Confirmed,
             Some("0.1.9-rc.3".to_owned()),
             Some("0.1.9-rc.4".to_owned()),
         );
+        confirmed.first_boot_protocol = true;
         let report = cleanup_scan(
             &*f.fs,
             &f.context_with(UpdateState::Confirmed, None, Some(&confirmed)),
@@ -880,6 +934,29 @@ mod tests {
         );
         assert_eq!(report.removed, vec![(LeftoverKind::OldExe, old.clone())]);
         assert!(report.old_exe_gone);
+        assert!(!old.exists());
+    }
+
+    /// A target without the first-boot protocol has no exit marking, so
+    /// its previous image is not retained: an ordinary leftover, removed
+    /// as soon as nothing runs it (round-2 review).
+    #[test]
+    fn the_old_exe_of_a_target_without_the_protocol_is_not_retained() {
+        let f = Fixture::new();
+        let old = f.paths.old_exe_path("0.1.9-rc.3");
+        std::fs::write(&old, b"old").unwrap();
+        let mut result = UpdateResult::new(
+            UpdateState::Confirmed,
+            Some("0.1.9-rc.3".to_owned()),
+            Some("0.1.9-rc.2".to_owned()),
+        );
+        result.first_boot_protocol = false;
+        let report = cleanup_scan(
+            &*f.fs,
+            &f.context_with(UpdateState::Confirmed, None, Some(&result)),
+        );
+        assert!(report.retained.is_empty(), "{report:?}");
+        assert_eq!(report.removed, vec![(LeftoverKind::OldExe, old.clone())]);
         assert!(!old.exists());
     }
 
@@ -1290,6 +1367,54 @@ mod tests {
             Some(
                 "Old version files are still in use by another running process. rpi removes them on a later start; run \"rpi update --cleanup\" to retry."
             )
+        );
+    }
+
+    /// A directory is renamed aside before it is deleted: a loaded library
+    /// inside makes the rename fail as a whole (Windows refuses it for a
+    /// mapped image's directory entry), which classifies the directory as
+    /// live and leaves it whole — where a direct recursive delete would
+    /// have removed the files sorted before the library (round-2 review).
+    #[test]
+    fn a_generation_that_cannot_be_renamed_aside_is_live_and_stays_whole() {
+        let f = Fixture::new();
+        let container = f.root().join("rpi-todo");
+        let v1 = f.generation("rpi-todo", "0.1.0");
+        let v2 = f.generation("rpi-todo", "0.2.0");
+        f.write(
+            &container.join("current.json"),
+            r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0"}"#,
+        );
+        f.fs.fail_with(
+            FsOp::Rename,
+            "rpi-todo/0.1.0",
+            1,
+            std::io::Error::from_raw_os_error(5),
+        );
+        let report = cleanup_scan(&*f.fs, &f.context(UpdateState::Idle));
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(report.stuck.is_empty(), "{report:?}");
+        assert_eq!(
+            report.live,
+            vec![LiveLeftover {
+                kind: LeftoverKind::Generation,
+                path: v1.clone(),
+                holders: vec![],
+            }]
+        );
+        assert!(
+            v1.join("rpi-extension.json").is_file(),
+            "nothing inside the directory was deleted"
+        );
+        assert!(v2.exists());
+        // Nothing was left under an aside name.
+        let names: Vec<_> = std::fs::read_dir(&container)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains(".garbage-")),
+            "{names:?}"
         );
     }
 

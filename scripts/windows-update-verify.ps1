@@ -128,7 +128,7 @@ function Show-Matrix {
         @('two instances coexist; old instance unaffected; subagent child starts no transaction', 'extensions + manual (keep one rpi open)'),
         @('trampoline: prompt returns after the new instance exits; exit code; quoted args; kill; Ctrl+C', 'switched (automated exit code) + manual in cmd/PowerShell/Windows Terminal/VS Code'),
         @('exe gap between the two renames', 'manual: see the "two renames" note printed by the rollback phase'),
-        @('pipe modes: rpi mcp / --mode json through the trampoline', 'manual (switched phase prints the commands)'),
+        @('pipe modes: rpi --mode rpc / --mode json through the trampoline', 'manual (switched phase prints the commands)'),
         @('first-start watchdog: --version / --help / argument error / failing one-shot / Ctrl+C / crash', 'rollback (+ switched for the non-crash counter-cases)'),
         @('--force downgrade and --version pin apply at the next start; a re-run installer invalidates the pending', 'manual: stage with -ToVersion <older> -Channel stable --force... see the note'),
         @('target below 0.1.9-rc.4 switches without the first-start check', 'manual (only when an older RC asset exists)'),
@@ -243,7 +243,7 @@ function Invoke-Switched {
     }
     Say 'Pipe modes through the trampoline (manual, a pipe parent must not see rpi end early and stdout must carry only protocol bytes):'
     Write-Host '  rpi --mode json -p "say hi" | Select-Object -First 3'
-    Write-Host '  (an MCP client) rpi mcp   -- the stdio server must answer initialize'
+    Write-Host '  (an RPC client) rpi --mode rpc   -- the JSON-RPC server must answer; stdout carries only protocol bytes'
 }
 
 function Invoke-Extensions {

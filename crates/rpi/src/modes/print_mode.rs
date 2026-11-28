@@ -203,7 +203,7 @@ pub async fn run_print_mode(
             // `toJsonEvent` can throw on invariant violations
             // (json-event.ts:50, :24-26); upstream's unguarded call crashes
             // the process. rpi rejects the event instead — stderr
-            // diagnostic, no wire line (V14-03 §5 实现取舍).
+            // diagnostic, no wire line (the V14-03 section 5 implementation choice).
             match to_json_event(&event) {
                 Ok(wire) => {
                     if let Ok(mut line) = serde_json::to_string(&wire) {

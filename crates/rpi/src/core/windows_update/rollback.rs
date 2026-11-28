@@ -99,9 +99,14 @@ pub fn rollback_applied_update(
     let old_path = prefix.join(&old_name);
 
     // 1. The executable at its path is still the new one → set it aside.
-    let at_path_is_new = fs
+    // The undo record is the proof that the swap ever happened: without
+    // it a matching digest proves nothing for a same-version reinstall
+    // (R7.2.3), whose previous executable is the very image the update
+    // would have installed, so the executable is not touched then.
+    let image_is_new = fs
         .sha256_file(&paths.exe_path)
         .is_ok_and(|sha| sha.eq_ignore_ascii_case(&pending.binary.sha256));
+    let at_path_is_new = undo.is_some() && image_is_new;
     if at_path_is_new {
         let parked = paths.unused_sibling(paths.bad_exe_path(&pending.target_version));
         match rename(fs, &paths.exe_path, &parked) {
@@ -125,9 +130,17 @@ pub fn rollback_applied_update(
                 ));
             }
         }
+    } else if undo.is_none() {
+        log("rollback: no undo record; the executable at its path is left untouched");
     } else {
         log("rollback: the executable at its path is already the previous version");
     }
+    // Nothing of the update replaced the executable: no undo record, and
+    // either the image in place is not the new one or the update would
+    // have installed the same version (a same-version reinstall whose
+    // transaction never ran).
+    let nothing_landed =
+        undo.is_none() && (!image_is_new || pending.from_version == pending.target_version);
 
     // 2. The previous executable back to its path.
     let parked_old_exists = fs.exists(&old_path).unwrap_or(false);
@@ -142,7 +155,10 @@ pub fn rollback_applied_update(
                 old_path.display()
             )),
         }
-    } else if at_path_is_new || !fs.exists(&paths.exe_path).unwrap_or(false) {
+    } else if nothing_landed {
+        log("rollback: nothing of the update landed; the executable in place is the previous one");
+        outcome.exe_restored = true;
+    } else if image_is_new || !fs.exists(&paths.exe_path).unwrap_or(false) {
         outcome.failures.push(format!(
             "the previous executable {} is missing; reinstall with install.ps1",
             old_path.display()
@@ -478,6 +494,42 @@ mod tests {
             !f.dir.join("prefix/rpi.exe").exists(),
             "the new image was still set aside"
         );
+    }
+
+    /// A pending that was marked applied without its transaction ever
+    /// running (round-2 review: a same-version reinstall taken for a
+    /// landed commit) has no undo record and no parked previous image,
+    /// and the image in place carries the update's own digest. A rollback
+    /// must leave it alone: no `.bad-*` parking, no deletion.
+    #[test]
+    fn a_rollback_without_a_pre_image_never_parks_the_executable() {
+        let f = Fixture::new();
+        f.applied_state();
+        let prefix = f.dir.join("prefix");
+        std::fs::remove_file(f.paths.undo_path()).unwrap();
+        std::fs::remove_file(prefix.join("rpi.exe.old-0.1.9-rc.3")).unwrap();
+        // The "update" would have installed the version already in place.
+        let mut same_version = f.pending.clone();
+        same_version.from_version = same_version.target_version.clone();
+        let outcome = rollback_applied_update(
+            &f.fs,
+            &f.paths,
+            &same_version,
+            RollbackReason::FirstBootCrash,
+            &f.sink(),
+        );
+        assert!(outcome.exe_restored, "{outcome:?}");
+        assert!(outcome.parked_new_exe.is_none(), "{outcome:?}");
+        assert_eq!(std::fs::read(prefix.join("rpi.exe")).unwrap(), b"new exe");
+        let parked: Vec<_> = std::fs::read_dir(&prefix)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("rpi.exe."))
+            .collect();
+        assert!(parked.is_empty(), "{parked:?}");
+        // With no undo record at all the rollback is still reported as
+        // incomplete: the missing record is a finding, not a success.
+        assert!(!outcome.ok(), "{outcome:?}");
     }
 
     #[test]

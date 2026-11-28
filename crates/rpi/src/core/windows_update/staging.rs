@@ -111,6 +111,20 @@ fn installed_version(fs: &dyn UpdateFs, paths: &UpdatePaths, running_version: &s
 /// Stage the update described by `request`. `log` receives one line per
 /// event. On `Err` nothing of this run remains staged (the caller removes
 /// the extension staging directories it created).
+/// Whether everything a pending names is still in place and intact: the
+/// staged executable by its digest and every staged extension tree by its
+/// recorded file list. The one idempotency criterion of staging, shared
+/// with the `already downloaded` fast path of `update --self` (round-2
+/// review: a broken extension staging must not pass as "downloaded").
+pub fn staged_update_is_complete(fs: &dyn UpdateFs, pending: &PendingUpdate) -> bool {
+    fs.sha256_file(&pending.binary.staged_path)
+        .is_ok_and(|sha| sha.eq_ignore_ascii_case(&pending.binary.sha256))
+        && pending.extensions.iter().all(|old| {
+            old.files.is_empty()
+                || super::transaction::verify_staged_tree(fs, &old.staged_path, &old.files).is_ok()
+        })
+}
+
 pub fn stage_update(
     fs: &dyn UpdateFs,
     paths: &UpdatePaths,
@@ -187,15 +201,7 @@ pub fn stage_update(
             && previous.binary.sha256.eq_ignore_ascii_case(&exe_sha256);
         if same_target && same_extensions {
             // Idempotent only when the earlier staging is still complete.
-            let complete = fs
-                .sha256_file(&previous.binary.staged_path)
-                .is_ok_and(|sha| sha.eq_ignore_ascii_case(&previous.binary.sha256))
-                && previous.extensions.iter().all(|old| {
-                    old.files.is_empty()
-                        || super::transaction::verify_staged_tree(fs, &old.staged_path, &old.files)
-                            .is_ok()
-                });
-            if complete {
+            if staged_update_is_complete(fs, &previous) {
                 log("staging: the same update is already staged");
                 return Ok(StageOutcome::AlreadyStaged {
                     version: target.to_owned(),
@@ -411,8 +417,13 @@ mod tests {
         }
 
         fn extension(&self, name: &str, version: &str) -> StagedExtension {
+            self.extension_at(name, version, 7)
+        }
+
+        /// A freshly extracted staging directory owned by `pid`.
+        fn extension_at(&self, name: &str, version: &str, pid: u32) -> StagedExtension {
             let root = self.dir.join("agent/extensions");
-            let staged = UpdatePaths::extension_staging_path(&root, name, version, 7);
+            let staged = UpdatePaths::extension_staging_path(&root, name, version, pid);
             std::fs::create_dir_all(staged.join("lib")).unwrap();
             std::fs::write(
                 staged.join("rpi-extension.json"),
@@ -653,6 +664,46 @@ mod tests {
             std::fs::read(f.paths.binary_staging_dir(TARGET).join("rpi.exe")).unwrap(),
             b"other build"
         );
+    }
+
+    /// The one completeness criterion of staging (round-2 review): a
+    /// staged extension tree that lost a file makes the pending
+    /// incomplete, for the idempotency check of `stage_update` and for
+    /// the `already downloaded` fast path alike — neither may pass a
+    /// broken staging as complete and leave it for the next start to
+    /// discard.
+    #[test]
+    fn an_incomplete_extension_staging_is_not_complete() {
+        let f = Fixture::new();
+        f.install_manifest(RUNNING);
+        let release = f.release();
+        let mut request = f.request(&release, false, false);
+        request.extensions.push(f.extension("rpi-todo", TARGET));
+        f.stage(&request).unwrap();
+        let pending = read_record::<PendingUpdate>(&f.fs, &f.paths.pending_path()).unwrap();
+        assert!(staged_update_is_complete(&f.fs, &pending));
+        // One recorded file of the staged tree goes missing.
+        assert!(!pending.extensions[0].files.is_empty());
+        let missing = pending.extensions[0]
+            .staged_path
+            .join(&pending.extensions[0].files[0].path);
+        std::fs::remove_file(&missing).unwrap();
+        assert!(!staged_update_is_complete(&f.fs, &pending));
+        // The next `update --self` extracts afresh (a staging directory of
+        // its own) and stages again instead of answering "already
+        // downloaded" over the broken tree.
+        let mut again = f.request(&release, false, false);
+        again.extensions.push(f.extension_at("rpi-todo", TARGET, 8));
+        let outcome = f.stage(&again).unwrap();
+        assert!(matches!(
+            outcome,
+            StageOutcome::Staged {
+                replaced_previous: true,
+                ..
+            }
+        ));
+        let pending = read_record::<PendingUpdate>(&f.fs, &f.paths.pending_path()).unwrap();
+        assert!(staged_update_is_complete(&f.fs, &pending));
     }
 
     #[test]
