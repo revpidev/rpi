@@ -180,7 +180,7 @@ function Invoke-Baseline {
 }
 
 function Invoke-Stage {
-    Say "Phase stage: rpi update --self $($script:ChannelFlag -join ' ')"
+    Say "Phase stage: rpi update --self $($script:ChannelFlag -join ' ') (requires an installed rpi of at least 0.1.9-rc.4 and a target newer than it: -ToVersion <version>; an older installed rpi has no staging code - install 0.1.9-rc.4 with install.ps1 first)"
     $before = Get-Sha256 $script:Exe
     $result = Invoke-Rpi (@('update', '--self') + $script:ChannelFlag)
     Write-Host $result.Output
