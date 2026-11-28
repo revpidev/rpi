@@ -121,6 +121,8 @@ rpi update --models     # 刷新远程模型目录
 
 扩展升级计划会把已是最新的插件合并显示一次，只为实际需要升级的插件展示详细流程。下载百分比、字节数和速度仍会实时显示，native（L0）确认保持必需；默认输出不再重复连接 URL、校验阶段或临时路径。
 
+更新通过 Git 安装的插件时，如果无法写入恢复标记，rpi 会在重置工作目录前停止。错误信息会列出标记路径，修复文件系统问题后可重试。
+
 交互模式启动时会异步检查已安装的插件。正式版主体只比较最新正式版插件，RC 主体只比较最新 RC 插件；发现更新时会列出插件，并提示对应的 `rpi update --extensions` 或 `rpi update --extensions --rc` 命令。
 
 **Windows：更新在下次启动时生效。** Windows 不能替换运行中的程序，所以 `rpi update --self`（以及 `rpi update --all` 的本体部分）只把新版本下载并校验到 `rpi.exe` 旁的 `.update\` 目录，输出「Downloaded rpi <version>. It takes effect the next time rpi starts.」。下次启动时重新校验暂存文件，用一个带 journal 的事务把本体与同批扩展一并换入，随后旧进程用原始命令行启动新的 `rpi.exe` 并等待它：shell 提示符在 rpi 退出后才返回，Ctrl+C 只交给新实例。扩展以分代目录安装（`~/.rpi/agent/extensions/<name>/<version>/` 加 `current.json` 指针；旧版本写入的扁平布局照常加载），其他正在运行的 rpi 实例继续使用已加载的库，重启后切换。每次启动都会清理不再被任何实例使用的旧版本文件，并在交互模式的启动通知里说明：旧版本已清理；或旧文件仍被运行中的实例占用、或无法删除时给出警告（`rpi update --cleanup` 可重试）。新版本在首次启动确认之前崩溃时自动回滚——恢复旧的可执行文件、扩展指针与安装清单，禁用该版本并明确提示——之后用 `rpi update --self --version <版本> --force` 才能再次暂存该版本（不带 `--version` 的 `rpi update --self --force` 跟随通道最新版）。`%LOCALAPPDATA%\rpi\logs\update.log` 记录每一步。唯一的例外是从更旧版本升到 `0.1.9-rc.4`：旧版本的 `rpi update --self` 仍以手动步骤结束，请先运行一次 `install.ps1`（或手动替换可执行文件）。更新期间仍在运行的、低于 `0.1.9-rc.4` 的 rpi 实例不受 pin 登记保护——执行 `rpi update --all` 前请先关闭它们。已知限制：新版本确认首启之前关机视同首启崩溃；确认之后的崩溃不自动回滚（旧映像以 `rpi.exe.old-<version>` 保留到下一次正常退出，可手动改回或重跑 `install.ps1`，它也会修复缺失的 `rpi.exe`）；低于 `0.1.9-rc.4` 的目标版本切换时没有首启检查；更新前已运行的实例派生的子代理子进程运行的是新版本。
