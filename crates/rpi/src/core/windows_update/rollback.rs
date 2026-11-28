@@ -138,9 +138,12 @@ pub fn rollback_applied_update(
     // Nothing of the update replaced the executable: no undo record, and
     // either the image in place is not the new one or the update would
     // have installed the same version (a same-version reinstall whose
-    // transaction never ran).
-    let nothing_landed =
-        undo.is_none() && (!image_is_new || pending.from_version == pending.target_version);
+    // transaction never ran). A missing executable at its path is never
+    // "nothing landed": that is a broken installation to report, not a
+    // restored one.
+    let nothing_landed = undo.is_none()
+        && fs.exists(&paths.exe_path).unwrap_or(false)
+        && (!image_is_new || pending.from_version == pending.target_version);
 
     // 2. The previous executable back to its path.
     let parked_old_exists = fs.exists(&old_path).unwrap_or(false);
@@ -530,6 +533,29 @@ mod tests {
         // With no undo record at all the rollback is still reported as
         // incomplete: the missing record is a finding, not a success.
         assert!(!outcome.ok(), "{outcome:?}");
+        // A missing executable at its path is never "nothing landed": a
+        // broken installation is reported, not restored (round-3 review).
+        let f = Fixture::new();
+        f.applied_state();
+        let prefix = f.dir.join("prefix");
+        std::fs::remove_file(f.paths.undo_path()).unwrap();
+        std::fs::remove_file(prefix.join("rpi.exe.old-0.1.9-rc.3")).unwrap();
+        std::fs::remove_file(prefix.join("rpi.exe")).unwrap();
+        let outcome = rollback_applied_update(
+            &f.fs,
+            &f.paths,
+            &same_version,
+            RollbackReason::FirstBootCrash,
+            &f.sink(),
+        );
+        assert!(!outcome.exe_restored, "{outcome:?}");
+        assert!(
+            outcome
+                .failures
+                .iter()
+                .any(|failure| failure.contains("reinstall")),
+            "{outcome:?}"
+        );
     }
 
     #[test]
