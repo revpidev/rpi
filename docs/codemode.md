@@ -24,7 +24,7 @@ The result starts with `Script completed` or `Script failed`, the wall time, and
 | `tools.<name>(args)` | Call a tool. See [Call tools](#call-tools). |
 | `text(value)` | Add a text item to the output. Strings are added as is, other values as JSON. |
 | `image(value)` | Add an image to the output: a base64 `data:` URL, an `{ image_url }` object, or an image block `{ type: "image", data, mimeType }` such as those returned by MCP tools and `models.generateImages()`. Remote URLs are not supported. PNG, JPEG, GIF, and WebP are accepted. Each image is also saved to a temp file, and the result names the path before the image. |
-| `console.log(...)` | Add a line to the `<console_output>` block after the other output. Arguments are joined with spaces; `info`, `warn`, `error`, and `debug` do the same. |
+| `console.log(...)` | Add a line to the `<console_output>` block after the other output. Arguments are joined with spaces; `info`, `warn`, `error`, and `debug` do the same. Top-level numbers print as numbers, including `NaN` and `Infinity`; numbers nested inside JSON objects still follow JSON's `null` rule. |
 | `return value` | A top-level `return` adds the value like `text()`. |
 | `exit()` | End the script successfully. |
 | `store(key, value)` / `load(key)` | Keep small JSON values across `codemode` calls. See [Store values](#store-values). |
@@ -33,6 +33,8 @@ The result starts with `Script completed` or `Script failed`, the wall time, and
 | `describeTool(name)` | Resolves to a tool's description and TypeScript declaration, or `undefined`. |
 | `describeNamespace(name)` | Resolves to `{ name, description?, instructions?, tools }` for a namespace such as an MCP server, or `undefined`. Accepts a canonical namespace name or one of its `aliases`. |
 | `models` | List and run non-LLM models. See [Models](#models). |
+
+`searchTools` ranks name and full-name matches above namespace instructions, uses NFC-aware Unicode tokenization, and does not penalize long descriptions. Local `$ref` resolution expands only referenced definitions and stops on cycles; malformed percent escapes and unresolved references return `unknown`. These are not claims of every `Intl.Segmenter` dictionary behavior.
 
 ## Call tools
 

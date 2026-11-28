@@ -4,7 +4,7 @@
 //! (`isToolModifier` / `getToolListError` / `applyToolModifiers`) and
 //! `packages/coding-agent/src/core/mcp-servers.ts`
 //! (`toolPatternRegExp` / `createToolNameMatcher` / `isMcpToolName`) @
-//! `4a080252f` (v1.4.0, `04b97ef00`).
+//! `b4afdddf` (v1.5.2, `04b97ef00`).
 
 use std::collections::HashSet;
 

@@ -1,5 +1,5 @@
 //! Public types of the codemode sandbox (port of
-//! `packages/codemode/src/types.ts` @ 4a080252f).
+//! `packages/codemode/src/types.ts` @ b4afdddf).
 
 use std::sync::Arc;
 
@@ -87,7 +87,7 @@ pub struct CodemodeToolInfo {
 /// One item of the script's output, in the order the script produced it:
 /// `text()` and `console.*` produce text items (`console` true for
 /// `console.*`), `image()` produces image items. Image `data` is base64
-/// (types.ts:43-50 @ 4a080252f).
+/// (types.ts:43-50 @ b4afdddf).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum CodemodeOutputItem {
@@ -95,7 +95,7 @@ pub enum CodemodeOutputItem {
     Text {
         text: String,
         /// `console.*` items are marked so the caller can group them
-        /// (`console: true`, types.ts:45-50 @ 4a080252f).
+        /// (`console: true`, types.ts:45-50 @ b4afdddf).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         console: bool,
     },

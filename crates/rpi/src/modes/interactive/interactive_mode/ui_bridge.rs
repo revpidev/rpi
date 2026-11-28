@@ -50,6 +50,10 @@ use crate::modes::interactive::components::extension_selector::{
 use crate::modes::interactive::program_status::BlockedStatus;
 use rpi_tui::program_status::ProgramStatusKind;
 
+fn sanitized_terminal_title(title: &str) -> String {
+    rpi_tui::terminal::replace_control_characters(title)
+}
+
 /// TUI entry wrapper forwarding component calls and focus (the
 /// startup_ui.rs `SelectorRegion` pattern).
 struct DialogRegion<C: Component>(Arc<Mutex<C>>);
@@ -720,7 +724,8 @@ impl UiBridge for InteractiveUiBridge {
     /// `setTitle` — terminal window/tab title.
     fn set_title(&self, title: &str) {
         if let Some(ui) = self.ui() {
-            ui.ui.with_terminal(|terminal| terminal.set_title(title));
+            let title = sanitized_terminal_title(title);
+            ui.ui.with_terminal(|terminal| terminal.set_title(&title));
         }
     }
 
@@ -729,8 +734,29 @@ impl UiBridge for InteractiveUiBridge {
     /// `props.done` interaction form (V17-11 FR-B R1). A tree without
     /// selectable rows stays mounted until Escape; the caller's `done` value
     /// is the JSON carried by the selected row's `done` prop.
-    async fn custom(&self, component: ComponentTree, _options: Option<Value>) -> Option<Value> {
+    async fn custom(&self, component: ComponentTree, options: Option<Value>) -> Option<Value> {
         let ui = self.ui()?;
+        let options = options.unwrap_or(Value::Null);
+        let overlay = options
+            .get("overlay")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let blocked = options.get("blocked").map(|blocked| BlockedStatus {
+            kind: match blocked
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("question")
+            {
+                "permission" => ProgramStatusKind::Permission,
+                "auth" => ProgramStatusKind::Auth,
+                _ => ProgramStatusKind::Question,
+            },
+            message: blocked
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        });
         let (tx, rx) = oneshot::channel();
         let dialog = Arc::new(Mutex::new(ExtensionCustomComponent::new(
             Arc::clone(&lock(&ui.theme)),
@@ -738,18 +764,22 @@ impl UiBridge for InteractiveUiBridge {
             tx,
         )));
         let entry = super::shared_component_from_boxed(Box::new(DialogRegion(dialog)));
-        ui.show_dialog(
-            entry.clone(),
-            BlockedStatus {
-                kind: ProgramStatusKind::Question,
-                message: "extension custom UI".to_owned(),
-            },
-        );
+        let overlay_id = if overlay {
+            let handle = ui.ui.show_overlay(entry.clone(), None);
+            Some(ui.register_extension_overlay(handle, blocked))
+        } else {
+            ui.show_dialog_with_blocked(entry.clone(), blocked);
+            None
+        };
         let result = rx.await.ok().flatten();
-        // ADR-0041: `done()`/dispose closes only this frame; a superseded
-        // dialog drops its frame without closing the visible replacement.
         if let Some(ui) = self.ui() {
-            ui.hide_selector_if_current(&entry);
+            if let Some(id) = overlay_id {
+                ui.close_extension_overlay(id);
+            } else {
+                // `done()`/dispose closes only this frame; a superseded
+                // dialog drops its frame without closing the replacement.
+                ui.hide_selector_if_current(&entry);
+            }
         }
         result
     }
@@ -822,7 +852,11 @@ impl UiBridge for InteractiveUiBridge {
         if let Some(tree) = component {
             let built = component_from_tree(&tree, &Arc::clone(&lock(&ui.theme)));
             let entry = super::shared_component_from_boxed(built);
-            ui.show_inline_selector(entry.clone());
+            if ui.has_open_extension_dialog() {
+                ui.defer_inline_selector(entry.clone());
+            } else {
+                ui.show_inline_selector(entry.clone());
+            }
             *lock(&self.editor_component_entry) = Some(entry);
         }
     }
@@ -1028,5 +1062,22 @@ impl UiBridge for InteractiveUiBridge {
         // that never block the TUI (R-U11.2).
         let ui = self.detached()?;
         ui.edit_text_external(text, language).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_title_cannot_inject_control_sequences() {
+        assert_eq!(sanitized_terminal_title("plain"), "plain");
+        assert_eq!(sanitized_terminal_title("bad\nname\u{7}"), "bad name ");
+        assert_eq!(
+            sanitized_terminal_title("\u{1b}]0;other\u{7}"),
+            " ]0;other "
+        );
+        assert_eq!(sanitized_terminal_title("\u{1b}[<0;31mred"), " [<0;31mred");
+        assert_eq!(sanitized_terminal_title("a\n\u{7}\u{85}b"), "a b");
     }
 }

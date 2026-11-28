@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use crate::api::openai_completions::OpenAiCompletions;
 use crate::auth::{ProviderAuth, env_api_key_auth};
-use crate::generated::get_builtin_models;
 use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `xiaomiTokenPlanAmsProvider()`.
@@ -27,7 +26,9 @@ pub fn xiaomi_token_plan_ams_provider() -> Arc<dyn Provider> {
             ))),
             oauth: None,
         },
-        models: get_builtin_models("xiaomi-token-plan-ams").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared(
+            "xiaomi-token-plan-ams",
+        )),
         api: ProviderApi::Single(Arc::new(OpenAiCompletions)),
         ..Default::default()
     })

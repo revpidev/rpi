@@ -18,7 +18,7 @@ use rpi_durable::storage::{
     NodeSqliteStorageOptions, SqliteDatabaseOptions, SqliteValue, apply_sqlite_migrations,
     open_node_sqlite_database, open_node_sqlite_storage, sqlite_migrations,
 };
-use rpi_durable::types::{ConversationRecord, EntryRecord, Storage, StorageWrite};
+use rpi_durable::types::{ConversationRecord, EntryRecord, Storage, StorageExt, StorageWrite};
 use rpi_durable::{EntryId, ROOT_CONVERSATION_ID, id_from_number};
 
 #[tokio::main]
@@ -39,7 +39,7 @@ async fn main() {
         .await
         .expect("open storage");
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: ROOT_CONVERSATION_ID,
@@ -53,7 +53,7 @@ async fn main() {
         .expect("root commit");
     let entry_id: EntryId = id_from_number(storage.mint_id().await.expect("mint"));
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Entry {
                 value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "crash-entry"),
             }],
@@ -158,7 +158,7 @@ async fn harness_then_sleep(path: &str, marker: &str) {
         set_timer: None,
         on_wake: None,
         on_report: None,
-        on_report_info: None,
+        read_only: false,
     };
     let harness = open_harness(
         std::sync::Arc::clone(&storage),

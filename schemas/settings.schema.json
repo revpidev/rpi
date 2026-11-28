@@ -15,6 +15,16 @@
       ],
       "default": null
     },
+    "extensionChangelogVersions": {
+      "description": "Last seen changelog version per extension package.",
+      "type": [
+        "object"
+      ],
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": null
+    },
     "defaultProvider": {
       "type": [
         "string"
@@ -1030,7 +1040,7 @@
       ]
     },
     "CacheWarmingMode": {
-      "description": "`CacheWarmingMode = \"off\" | \"streaming\" | \"idle\"` (#9668,\nc596d09d9; settings-manager.ts:77-78) — default `\"streaming\"`. Global\nsetting only because each refresh costs money (settings-manager.ts:955).",
+      "description": "`CacheWarmingMode = \"off\" | \"streaming\" | \"idle\"` (#9668,\nc596d09d9; settings-manager.ts:77-78) — default `\"idle\"` (v1.5.2). Global\nsetting only because each refresh costs money (settings-manager.ts:955).",
       "type": "string",
       "enum": [
         "off",
@@ -1309,8 +1319,25 @@
           "format": "uint64",
           "minimum": 0,
           "default": null
+        },
+        "calculation": {
+          "description": "Missing = `auto`; `estimate` shows the lightweight heuristic with `~` while streaming.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StatusLineLiveCalculation"
+            }
+          ],
+          "default": null
         }
       }
+    },
+    "StatusLineLiveCalculation": {
+      "description": "`statusLine.liveTokens.calculation` (ADR-0049 decision 6 / V19-07): the\nstreaming calculation policy. The host schema is a strict enum: an\nillegal value is a `statusLine` scope validation error (startup: empty\nsettings plus the error; reload: the previous in-memory settings stay),\nwhile the statusline plugin's own raw parser only falls its own policy\nback to `auto`. The two channels are deliberately not the same guarantee.",
+      "type": "string",
+      "enum": [
+        "auto",
+        "estimate"
+      ]
     },
     "StatusLineNumberFormat": {
       "type": "string",

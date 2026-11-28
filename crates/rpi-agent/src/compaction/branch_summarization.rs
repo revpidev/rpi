@@ -13,7 +13,7 @@
 //! parent-id walk from the old leaf visits exactly the `old_path` suffix
 //! after the common ancestor.
 
-use rpi_ai::types::{AssistantContent, Model, StopReason, StreamOptions, Usage};
+use rpi_ai::types::{AssistantContent, Model, StopReason, Usage};
 use rpi_ai::utils::retry::RetryCallbacks;
 use rpi_ai::utils::text::content_text_assistant;
 
@@ -22,12 +22,13 @@ use super::utils::{
     extract_file_ops_from_message, format_file_operations, serialize_conversation,
 };
 use super::{
-    SummarizationArgs, complete_summarization, estimate_tokens, get_summarization_failure,
+    SummarizationArgs, complete_summarization, create_summarization_options, estimate_tokens,
+    get_summarization_failure,
 };
 use crate::messages::{AgentMessage, convert_to_llm};
 use crate::session::{
-    SessionEntry, create_branch_summary_message, create_compaction_summary_message,
-    create_custom_message,
+    ContextEditEntry, SessionEntry, create_branch_summary_message,
+    create_compaction_summary_message, create_custom_message,
 };
 use crate::stream_fn::StreamFn;
 
@@ -188,29 +189,30 @@ pub fn collect_entries_for_branch_summary(
 /// branch-summarization.ts:156-180). Similar to the compaction variant but
 /// also handles `compaction` entries, and skips tool results (context is in
 /// the assistant's tool call).
-fn get_message_from_entry(entry: &SessionEntry) -> Option<AgentMessage> {
-    match entry {
+fn get_message_from_entry(
+    entry: &SessionEntry,
+    edit: Option<&ContextEditEntry>,
+) -> Option<AgentMessage> {
+    let message = match entry {
         SessionEntry::Message(m) => {
             if matches!(m.message, AgentMessage::ToolResult(_)) {
                 return None;
             }
-            Some(m.message.clone())
+            m.message.clone()
         }
-        SessionEntry::CustomMessage(c) => Some(AgentMessage::Custom(create_custom_message(
+        SessionEntry::CustomMessage(c) => AgentMessage::Custom(create_custom_message(
             &c.custom_type,
             c.content.clone(),
             c.display,
             c.details.clone(),
             &c.timestamp,
-        ))),
-        SessionEntry::BranchSummary(b) => Some(AgentMessage::BranchSummary(
+        )),
+        SessionEntry::BranchSummary(b) => AgentMessage::BranchSummary(
             create_branch_summary_message(&b.summary, &b.from_id, &b.timestamp),
-        )),
-        SessionEntry::Compaction(c) => Some(AgentMessage::CompactionSummary(
+        ),
+        SessionEntry::Compaction(c) => AgentMessage::CompactionSummary(
             create_compaction_summary_message(&c.summary, c.tokens_before, &c.timestamp),
-        )),
-        // `context_edit` is applied when the projection runs, not when
-        // entries are converted for summarization.
+        ),
         SessionEntry::ThinkingLevelChange(_)
         | SessionEntry::ModelChange(_)
         | SessionEntry::ActiveToolsChange(_)
@@ -219,7 +221,17 @@ fn get_message_from_entry(entry: &SessionEntry) -> Option<AgentMessage> {
         | SessionEntry::ContextEdit(_)
         | SessionEntry::Label(_)
         | SessionEntry::SessionInfo(_)
-        | SessionEntry::Leaf(_) => None,
+        | SessionEntry::Leaf(_) => return None,
+    };
+    if matches!(&message, AgentMessage::Assistant(assistant) if assistant.stop_reason == StopReason::Error)
+    {
+        return None;
+    }
+    match edit {
+        Some(edit) => crate::session::project_context_entry(entry, Some(edit))
+            .into_iter()
+            .next(),
+        None => Some(message),
     }
 }
 
@@ -258,10 +270,17 @@ pub fn prepare_branch_entries(entries: &[SessionEntry], token_budget: u64) -> Br
         }
     }
 
+    let mut edits = std::collections::HashMap::new();
+    for entry in entries {
+        if let SessionEntry::ContextEdit(edit) = entry {
+            edits.insert(edit.target_id.as_str(), edit);
+        }
+    }
+
     // Second pass: walk from newest to oldest, adding messages until the
     // token budget.
     for entry in entries.iter().rev() {
-        let Some(message) = get_message_from_entry(entry) else {
+        let Some(message) = get_message_from_entry(entry, edits.get(entry.id()).copied()) else {
             continue;
         };
 
@@ -404,20 +423,7 @@ pub async fn generate_branch_summary(
         messages: summarization_messages,
         tools: None,
     };
-    let request_options = StreamOptions {
-        // Summaries use the provider's normal output sizing (#11036): the
-        // former min(4096, model.maxTokens) cap made reasoning-heavy models
-        // hit the token cap before the summary was complete.
-        max_tokens: None,
-        request: rpi_ai::ProviderRequestOptions {
-            signal: args.signal.clone(),
-            api_key: args.api_key.clone(),
-            headers: args.headers.clone(),
-            env: args.env.clone(),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let request_options = create_summarization_options(model, args);
     let response = complete_summarization(
         model,
         &context,

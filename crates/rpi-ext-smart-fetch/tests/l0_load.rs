@@ -168,13 +168,19 @@ async fn l0_load_capability_denied_and_full_surface() {
     let details = result.details.clone();
     assert_eq!(details.get("status"), Some(&serde_json::json!("done")));
     assert_eq!(details.get("progress"), Some(&serde_json::json!(1)));
+    // agent-smart-fetch v0.3.23 (V19-03, R19-F03): successful results persist
+    // the compact `fetchSummary` details (no full body) instead of `fetchResult`.
     assert!(
-        details
-            .get("fetchResult")
-            .and_then(|r| r.get("wordCount"))
-            .is_some(),
-        "fetchResult shape: {details}"
+        details.get("fetchResult").is_none(),
+        "no full fetchResult body is persisted: {details}"
     );
+    let summary = details
+        .get("fetchSummary")
+        .unwrap_or_else(|| panic!("fetchSummary shape: {details}"));
+    assert_eq!(summary.get("kind"), Some(&serde_json::json!("content")));
+    assert_eq!(summary.get("charCount"), Some(&serde_json::json!(20)));
+    assert_eq!(summary.get("wordCount"), Some(&serde_json::json!(4)));
+    assert_eq!(summary.get("truncated"), Some(&serde_json::json!(false)));
 
     // 4. Error passthrough: invalid URL → the upstream error text, no panic.
     let request = rpi_ext_host::types::ToolExecuteRequest {
@@ -320,10 +326,20 @@ async fn l0_load_capability_denied_and_full_surface() {
             .and_then(|p| p.get("batchConcurrency")),
         Some(&serde_json::json!(3))
     );
-    assert_eq!(
-        details.get("batchResult").and_then(|r| r.get("succeeded")),
-        Some(&serde_json::json!(2))
+    // agent-smart-fetch v0.3.23 (V19-03, R19-F06): batch results persist the
+    // compact `batchSummary` (total/succeeded/failed/batchConcurrency/items)
+    // instead of the full `batchResult` bodies.
+    assert!(
+        details.get("batchResult").is_none(),
+        "no full batchResult body is persisted: {details}"
     );
+    let summary = details
+        .get("batchSummary")
+        .unwrap_or_else(|| panic!("batchSummary shape: {details}"));
+    assert_eq!(summary.get("total"), Some(&serde_json::json!(3)));
+    assert_eq!(summary.get("succeeded"), Some(&serde_json::json!(2)));
+    assert_eq!(summary.get("failed"), Some(&serde_json::json!(1)));
+    assert_eq!(summary.get("batchConcurrency"), Some(&serde_json::json!(3)));
 
     // 7. global settings apply to web_fetch defaults too (maxChars 333).
     let request = rpi_ext_host::types::ToolExecuteRequest {
@@ -503,6 +519,7 @@ async fn l0_load_capability_denied_and_full_surface() {
         duration_ms: None,
         output_pad: 1,
         terminal_width: None,
+        keybinding_hints: Default::default(),
     };
     let call_tree = render_call(context).expect("renderCall returns a tree");
     assert_eq!(call_tree["type"], serde_json::json!("text"));
@@ -545,6 +562,7 @@ async fn l0_load_capability_denied_and_full_surface() {
             duration_ms: None,
             output_pad: 1,
             terminal_width: None,
+            keybinding_hints: Default::default(),
         },
     )
     .expect("partial renderResult returns a tree");
@@ -557,11 +575,23 @@ async fn l0_load_capability_denied_and_full_surface() {
     let final_tree = render_result(
         rpi_agent::types::AgentToolResult {
             content: vec![],
+            // A legacy `fetchResult` (pre-v0.3.23 session) still renders its
+            // metadata/stats; agent-smart-fetch v0.3.23 (V19-03, R19-F05) never
+            // renders the body preview or the collapse hint any more.
             details: serde_json::json!({
                 "fetchResult": {
                     "kind": "content",
+                    "url": "https://ex.com/a",
+                    "finalUrl": "https://ex.com/a",
                     "title": "T",
+                    "author": "",
+                    "published": "",
+                    "site": "",
+                    "language": "",
                     "content": "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9",
+                    "wordCount": 9,
+                    "browser": "chrome_145",
+                    "os": "windows",
                 }
             }),
             usage: None,
@@ -587,6 +617,7 @@ async fn l0_load_capability_denied_and_full_surface() {
             duration_ms: None,
             output_pad: 1,
             terminal_width: None,
+            keybinding_hints: Default::default(),
         },
     )
     .expect("final renderResult returns a tree");
@@ -594,8 +625,16 @@ async fn l0_load_capability_denied_and_full_surface() {
     let joined = serde_json::to_string(&final_tree).unwrap_or_default();
     assert!(joined.contains("Title: T"), "metadata line: {joined}");
     assert!(
-        joined.contains("(2 more lines, Ctrl+O to expand)"),
-        "collapse hint: {joined}"
+        joined.contains("26 chars · 9 words"),
+        "stats line: {joined}"
+    );
+    assert!(
+        joined.contains("Full content was delivered to the agent."),
+        "delivery note: {joined}"
+    );
+    assert!(
+        !joined.contains("l1\\nl2") && !joined.contains("Ctrl+O to expand"),
+        "no body preview or collapse hint: {joined}"
     );
 
     let batch_render_result = batch_definition
@@ -639,6 +678,7 @@ async fn l0_load_capability_denied_and_full_surface() {
             duration_ms: None,
             output_pad: 1,
             terminal_width: None,
+        keybinding_hints: Default::default(),
         },
     )
     .expect("batch renderResult returns a tree");

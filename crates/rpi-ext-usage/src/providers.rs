@@ -195,7 +195,7 @@ fn register_path(dir: &Path, script: &BuiltinScript) -> Result<PathBuf, String> 
                 shim.display()
             )
         })?;
-        return Ok(shim);
+        Ok(shim)
     }
     #[cfg(not(windows))]
     Ok(dir.join(script.file))

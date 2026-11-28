@@ -219,6 +219,7 @@ fn models_with_classifier(base_url: &str) -> Models {
         },
         models: Vec::new(),
         all_models: Vec::new(),
+        shared_all_models: None,
         classifiers: std::collections::HashMap::from([(
             "typesafe-system-one".to_owned(),
             typesafe_system_one_api(),
@@ -363,6 +364,7 @@ async fn openrouter_classifier_sends_state_image_urls_without_assets() {
         )]),
         models: Vec::new(),
         all_models: Vec::new(),
+        shared_all_models: None,
         images: std::collections::HashMap::new(),
         base_url: None,
         headers: None,
@@ -432,6 +434,7 @@ async fn cloudflare_clef_direct_output_supports_all_models_and_prices() {
             )]),
             models: Vec::new(),
             all_models: Vec::new(),
+            shared_all_models: None,
             images: std::collections::HashMap::new(),
             base_url: None,
             headers: None,
@@ -491,6 +494,7 @@ async fn cloudflare_clef_classifier_sends_images_list() {
         )]),
         models: Vec::new(),
         all_models: Vec::new(),
+        shared_all_models: None,
         images: std::collections::HashMap::new(),
         base_url: None,
         headers: None,
@@ -580,6 +584,7 @@ async fn classify_without_a_key_or_provider_is_an_error_result() {
         )]),
         models: Vec::new(),
         all_models: Vec::new(),
+        shared_all_models: None,
         images: std::collections::HashMap::new(),
         base_url: None,
         headers: None,
@@ -618,6 +623,7 @@ async fn classify_without_a_key_or_provider_is_an_error_result() {
         classifiers: std::collections::HashMap::new(),
         models: Vec::new(),
         all_models: Vec::new(),
+        shared_all_models: None,
         images: std::collections::HashMap::new(),
         base_url: None,
         headers: None,
@@ -693,6 +699,7 @@ async fn cloudflare_transport_unwraps_the_rest_envelope() {
         )]),
         models: Vec::new(),
         all_models: Vec::new(),
+        shared_all_models: None,
         images: std::collections::HashMap::new(),
         base_url: None,
         headers: None,
@@ -770,6 +777,7 @@ async fn generate_images_resolves_auth_and_never_rejects() {
         )]),
         models: Vec::new(),
         all_models: Vec::new(),
+        shared_all_models: None,
         classifiers: std::collections::HashMap::new(),
         base_url: None,
         headers: None,
@@ -921,6 +929,7 @@ fn models_with_capture_classifier(
         },
         models: Vec::new(),
         all_models: Vec::new(),
+        shared_all_models: None,
         classifiers: std::collections::HashMap::from([("capture-classify".to_owned(), classifier)]),
         images: std::collections::HashMap::new(),
         base_url: Some("http://127.0.0.1:1".to_owned()),
@@ -1008,4 +1017,69 @@ async fn classifier_without_images_still_succeeds() {
     assert_eq!(result.stop_reason, ClassifierStopReason::Stop, "{result:?}");
     let contexts = classifier.contexts.lock().expect("contexts");
     assert!(contexts[0].images.is_none());
+}
+
+#[tokio::test]
+async fn copilot_microsoft_decision_uses_v1_systemone_and_rejects_images() {
+    let (base_url, mut requests) =
+        serve(vec![ScriptResponse::json(200, system_one_success())]).await;
+    let models = Models::new(None);
+    let provider = rpi_ai::providers::github_copilot::github_copilot_provider();
+    let mut model = provider
+        .get_all_models()
+        .into_iter()
+        .find_map(|model| match model {
+            AnyModel::Classifier(model) if model.id == "microsoft-decision-1" => Some(model),
+            _ => None,
+        })
+        .expect("Microsoft-Decision-1 classifier");
+    model.base_url = base_url;
+    models.set_provider(provider);
+    let options = ClassifierOptions {
+        api_key: Some("sk-test".to_owned()),
+        ..Default::default()
+    };
+    let result = models
+        .classify(&model, &classifier_context(), Some(&options))
+        .await;
+    assert_eq!(result.stop_reason, ClassifierStopReason::Stop);
+    match result.answers.get("q1") {
+        Some(ClassifierAnswer::Choice(answer)) => {
+            assert_eq!(answer.choice, "a");
+            assert_eq!(answer.probabilities.get("a"), Some(&0.7));
+            assert_eq!(answer.confidence, 0.7);
+        }
+        other => panic!("typed choice answer: {other:?}"),
+    }
+    match result.answers.get("q3") {
+        Some(ClassifierAnswer::Bool(answer)) => assert_eq!(answer.probability, 0.9),
+        other => panic!("typed bool answer: {other:?}"),
+    }
+    let request = requests.recv().await.expect("request");
+    assert_eq!(request.path, "/v1/systemone");
+    assert_eq!(request.header("authorization"), Some("Bearer sk-test"));
+    assert_eq!(
+        request.header("copilot-integration-id"),
+        Some("vscode-chat")
+    );
+    assert_eq!(
+        request.header("user-agent"),
+        Some("GitHubCopilotChat/0.35.0")
+    );
+    let body: Value = serde_json::from_str(&request.body).expect("json");
+    assert_eq!(body["model"], "microsoft-decision-1");
+    assert_eq!(body["questions"]["q3"]["type"], "noul");
+
+    let rejected = models
+        .classify(&model, &classifier_context_with_image(), Some(&options))
+        .await;
+    assert_eq!(rejected.stop_reason, ClassifierStopReason::Error);
+    assert!(
+        rejected
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("image")),
+        "{:?}",
+        rejected.error_message
+    );
 }

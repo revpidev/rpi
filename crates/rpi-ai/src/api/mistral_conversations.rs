@@ -76,11 +76,11 @@ use crate::utils::headers::{
     provider_headers_to_header_map,
 };
 use crate::utils::json_parse::StreamingArgsPreview;
-use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_retry::{
     ProviderErrorInfo, ProviderRetryOptions, RetryError, retry_provider_request,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
+use crate::utils::streaming_json::ToolCallArgumentsStream;
 use crate::utils::transform_messages::transform_messages;
 
 // ---------------------------------------------------------------------------
@@ -851,8 +851,9 @@ struct StreamProcessor<'a> {
     tool_blocks_by_key: HashMap<ToolKey, usize>,
     /// Tool-block content indices in creation order (JS `Map` iteration).
     tool_block_order: Vec<usize>,
-    /// `partialArgs` scratch buffer per tool-block content index.
-    partial_args: HashMap<usize, String>,
+    /// #9265: the raw argument text and the incremental parser per tool-block
+    /// content index, never on the content block.
+    arguments: HashMap<usize, ToolCallArgumentsStream>,
     /// rpi#78 A3: preview-parse throttle per tool-block content index.
     args_preview: HashMap<usize, StreamingArgsPreview>,
 }
@@ -865,7 +866,7 @@ impl<'a> StreamProcessor<'a> {
             current_block: None,
             tool_blocks_by_key: HashMap::new(),
             tool_block_order: Vec::new(),
-            partial_args: HashMap::new(),
+            arguments: HashMap::new(),
             args_preview: HashMap::new(),
         }
     }
@@ -1174,16 +1175,22 @@ impl<'a> StreamProcessor<'a> {
             Value::Null => "{}".to_owned(),
             other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_owned()),
         };
-        let partial = self.partial_args.entry(content_index).or_default();
-        partial.push_str(&args_delta);
+        let args_len = {
+            let stream = self.arguments.entry(content_index).or_default();
+            stream.append(&args_delta);
+            stream.text().len()
+        };
         // rpi#78 A3: authoritative arguments are parsed in `finish`.
         let refresh = self
             .args_preview
             .entry(content_index)
             .or_default()
-            .should_parse(partial.len());
-        if refresh && let AssistantContent::ToolCall(call) = &mut output.content[content_index] {
-            call.arguments = parse_streaming_json(Some(partial));
+            .should_refresh(args_len);
+        if refresh && let Some(stream) = self.arguments.get_mut(&content_index) {
+            let parsed = stream.arguments().clone();
+            if let AssistantContent::ToolCall(call) = &mut output.content[content_index] {
+                call.arguments = parsed;
+            }
         }
         events.push(StreamEvent::ToolCallDelta {
             content_index,
@@ -1198,11 +1205,11 @@ impl<'a> StreamProcessor<'a> {
         self.output.with_mut(|output| {
             self.finish_current_block_locked(output, events);
             for index in std::mem::take(&mut self.tool_block_order) {
-                let Some(partial) = self.partial_args.remove(&index) else {
+                let Some(stream) = self.arguments.remove(&index) else {
                     continue;
                 };
                 self.args_preview.remove(&index);
-                let parsed = crate::utils::json_parse::parse_tool_call_arguments(Some(&partial));
+                let parsed = stream.finish();
                 let AssistantContent::ToolCall(call) = &mut output.content[index] else {
                     continue;
                 };

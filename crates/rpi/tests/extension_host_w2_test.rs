@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use rpi::core::extension_host_adapter::ExtensionHostAdapter;
 use rpi::core::extensions::{
     ExtensionRunner, UserBashDecision, extension_on_response_callback, new_extension_runner_ref,
+    read_runner,
 };
 use rpi_agent::messages::AgentMessage;
 use rpi_agent::types::{AgentTool, AgentToolResult, AgentToolUpdateCallback};
@@ -581,8 +582,13 @@ impl CompactionFixture {
 #[tokio::test]
 async fn w2_session_before_compact_cancel_aborts_manual_compaction() {
     // agent-session.ts:1819-1821：cancel → "Compaction cancelled" →
-    // compaction_end{aborted:true, errorMessage:undefined}。
-    let host = host_with(vec![inline_ext(|api| {
+    // compaction_end{aborted:true, errorMessage:undefined}.
+    // Upstream still emits `session_compact_failed` from the catch block
+    // (v1.5.2 agent-session.ts:3044-3064 @ b4afdddf): `aborted:true`,
+    // `errorMessage` undefined.
+    let failed = Arc::new(Mutex::new(Vec::new()));
+    let sink = failed.clone();
+    let host = host_with(vec![inline_ext(move |api| {
         on_json(api, ext::EVENT_SESSION_BEFORE_COMPACT, |event| {
             // Payload-completeness check: preparation/branchEntries/reason/willRetry.
             assert!(event["preparation"].is_object());
@@ -595,30 +601,71 @@ async fn w2_session_before_compact_cancel_aborts_manual_compaction() {
             assert_eq!(event["willRetry"], false);
             Ok(json!({"cancel": true}))
         });
+        let sink = sink.clone();
+        on_json(api, ext::EVENT_SESSION_COMPACT_FAILED, move |event| {
+            sink.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+            Ok(Value::Null)
+        });
     })])
     .await;
     let runner_ref = new_extension_runner_ref(
         Arc::new(ExtensionHostAdapter::new(Arc::new(host))) as Arc<dyn ExtensionRunner>
     );
 
-    let mut fixture = compaction_fixture(Vec::new(), Some(runner_ref));
+    let mut fixture = compaction_fixture(Vec::new(), Some(runner_ref.clone()));
     fixture.seed_three_turns();
 
     let error = fixture.runner.compact(None).await.expect_err("cancelled");
     assert_eq!(error.to_string(), "session error: Compaction cancelled");
-    let events = fixture.events.lock().expect("events");
-    let end = events
+    {
+        let events = fixture.events.lock().expect("events");
+        let end = events
+            .iter()
+            .find_map(|event| match event {
+                rpi::core::compaction_runner::CompactionEvent::CompactionEnd {
+                    aborted,
+                    error_message,
+                    ..
+                } => Some((*aborted, error_message.clone())),
+                _ => None,
+            })
+            .expect("compaction_end");
+        assert_eq!(end, (true, None));
+    }
+
+    // S45: cancellation is a failure event (`aborted:true`) deferred until
+    // the compaction lock is released, exactly like a summarization failure.
+    let pending = fixture
+        .runner
+        .take_pending_session_compact_failed()
+        .expect("deferred session_compact_failed on cancellation");
+    assert_eq!(pending.reason.as_str(), "manual");
+    assert!(pending.aborted);
+    assert_eq!(pending.error_message, None);
+    assert!(!pending.will_retry);
+    assert!(!pending.from_extension);
+    read_runner(&runner_ref)
+        .emit_session_compact_failed(
+            pending.reason.as_str(),
+            pending.error_message.as_deref(),
+            pending.aborted,
+            pending.will_retry,
+            pending.from_extension,
+        )
+        .await;
+    let failed = failed.lock().unwrap_or_else(|e| e.into_inner());
+    let payload = failed
         .iter()
-        .find_map(|event| match event {
-            rpi::core::compaction_runner::CompactionEvent::CompactionEnd {
-                aborted,
-                error_message,
-                ..
-            } => Some((*aborted, error_message.clone())),
-            _ => None,
-        })
-        .expect("compaction_end");
-    assert_eq!(end, (true, None));
+        .find(|payload| payload["type"] == "session_compact_failed")
+        .expect("session_compact_failed delivered");
+    assert_eq!(payload["reason"], "manual");
+    assert_eq!(payload["aborted"], true);
+    assert_eq!(payload["willRetry"], false);
+    assert_eq!(payload["fromExtension"], false);
+    assert!(
+        payload.get("errorMessage").is_none(),
+        "cancellation omits errorMessage: {payload}"
+    );
 }
 
 #[tokio::test]
@@ -654,13 +701,28 @@ async fn w2_session_before_compact_replacement_sets_from_extension_and_emits_ses
         Arc::new(ExtensionHostAdapter::new(Arc::new(host))) as Arc<dyn ExtensionRunner>
     );
 
-    let mut fixture = compaction_fixture(Vec::new(), Some(runner_ref));
+    let mut fixture = compaction_fixture(Vec::new(), Some(runner_ref.clone()));
     fixture.seed_three_turns();
 
     let result = fixture.runner.compact(None).await.expect("compact");
     assert_eq!(result.summary, "ext-summary");
     assert_eq!(result.tokens_before, 42);
     assert!(result.estimated_tokens_after.is_some());
+
+    // V19-03 S45: the runner defers the event until its caller drops the
+    // compaction lock; this runner-level test emits it explicitly.
+    let pending = fixture
+        .runner
+        .take_pending_session_compact()
+        .expect("deferred session_compact");
+    read_runner(&runner_ref)
+        .emit_session_compact(
+            pending.compaction_entry,
+            pending.from_extension,
+            pending.reason.as_str(),
+            pending.will_retry,
+        )
+        .await;
 
     let event = captured.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(event["type"], "session_compact");
@@ -1596,4 +1658,60 @@ async fn w2_before_agent_start_starting_state_queues_and_aborts() {
         "the run's provider request carries the cancelled signal"
     );
     assert!(fixture.session.is_abort_requested());
+}
+
+/// V19-03 S13/S46: the additive `approveToolCall` surface aggregates the
+/// `tool_call` handler chain for a synthetic call without dispatching a tool
+/// (the native host-call envelope is exercised by the subagents crate; this
+/// pins the runner semantics: block/reason + handler input rewrite).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w2_approve_tool_call_aggregates_block_and_rewrite() {
+    let host = host_with(vec![inline_ext(|api| {
+        on_json(api, ext::EVENT_TOOL_CALL, |event| {
+            assert_eq!(event["toolName"], "subagent_launch");
+            Ok(json!({
+                "input": {
+                    "key": event["input"]["key"],
+                    "task": "rewritten by handler"
+                }
+            }))
+        });
+    })])
+    .await;
+    let fixture = session_fixture(vec![text_step("done")], Arc::new(host), vec![]).await;
+    let outcome = fixture
+        .session
+        .extension_runner()
+        .emit_tool_call(
+            "synthetic-1",
+            "subagent_launch",
+            json!({"key": "task-1", "task": "original"}),
+            None,
+        )
+        .await
+        .expect("handlers ran");
+    assert_eq!(outcome.block, None);
+    assert_eq!(
+        outcome
+            .input
+            .as_ref()
+            .and_then(|input| input["task"].as_str()),
+        Some("rewritten by handler")
+    );
+
+    let deny_host = host_with(vec![inline_ext(|api| {
+        on_json(api, ext::EVENT_TOOL_CALL, |_| {
+            Ok(json!({"block": true, "reason": "not allowed"}))
+        });
+    })])
+    .await;
+    let deny_fixture = session_fixture(vec![text_step("done")], Arc::new(deny_host), vec![]).await;
+    let outcome = deny_fixture
+        .session
+        .extension_runner()
+        .emit_tool_call("synthetic-2", "subagent_launch", json!({}), None)
+        .await
+        .expect("handlers ran");
+    assert_eq!(outcome.block, Some(true));
+    assert_eq!(outcome.reason.as_deref(), Some("not allowed"));
 }

@@ -15,6 +15,12 @@
 //! - within one session identity, a reply whose `entryCount` is lower than
 //!   the applied value is dropped (no stale overwrite);
 //! - a changed session id/path is a new identity and resets the entry guard.
+//!
+//! V19-07 (ADR-0049 decision 8 / R5.2.8): every read records which trigger
+//! issued it ([`StatsTrigger`]) and [`SessionStatsCache::apply`] hands the
+//! applied request back, so the live-total overlay can clear its pending
+//! exact totals by the snapshot's `assistant_messages` watermark and tell
+//! "issued after the message_end" boundary reads from earlier ones.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -67,12 +73,60 @@ impl SessionStats {
     }
 }
 
+/// Which host event issued a `ctx.sessionStats` read (V19-07): the live-total
+/// overlay only trusts a BOUNDARY read — one issued by an event that fires
+/// after the host persisted the finished message — to clear a pending entry
+/// whose watermark is unknown (terminal probe failed). The terminal counts-only
+/// probe is not a snapshot read and never appears here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsTrigger {
+    SessionStart,
+    SessionCompact,
+    TurnEnd,
+    AgentSettled,
+    Interval,
+    ConfigSaved,
+}
+
+impl StatsTrigger {
+    /// Whether the read was issued by an event that necessarily follows the
+    /// host's persistence of the finished assistant message.
+    pub fn is_boundary(self) -> bool {
+        matches!(
+            self,
+            Self::TurnEnd | Self::AgentSettled | Self::SessionCompact
+        )
+    }
+
+    /// Map a refresh trigger name to its read trigger.
+    pub fn for_reason(reason: &str) -> Option<Self> {
+        match reason {
+            "session_start" => Some(Self::SessionStart),
+            "session_compact" => Some(Self::SessionCompact),
+            "turn_end" => Some(Self::TurnEnd),
+            "agent_settled" => Some(Self::AgentSettled),
+            "interval" => Some(Self::Interval),
+            "config_saved" => Some(Self::ConfigSaved),
+            _ => None,
+        }
+    }
+}
+
 /// One read's identity: only a reply carrying both generations may replace
 /// the snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestToken {
     pub session_generation: u64,
     pub request_generation: u64,
+    pub trigger: StatsTrigger,
+}
+
+/// The request an applied snapshot answered (V19-07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedRequest {
+    pub session_generation: u64,
+    pub request_generation: u64,
+    pub trigger: StatsTrigger,
 }
 
 /// The absolute snapshot cache + generation guards.
@@ -105,26 +159,35 @@ impl SessionStatsCache {
         self.session_generation
     }
 
-    /// Start one read of `ctx.sessionStats`.
-    pub fn begin_request(&mut self) -> RequestToken {
+    /// The request generation current RIGHT NOW: a pending entry created
+    /// after this value was issued is only covered by later reads.
+    pub fn current_request_generation(&self) -> u64 {
+        self.request_generation
+    }
+
+    /// Start one read of `ctx.sessionStats` issued by `trigger`.
+    pub fn begin_request(&mut self, trigger: StatsTrigger) -> RequestToken {
         self.request_generation = self.request_generation.wrapping_add(1);
         RequestToken {
             session_generation: self.session_generation,
             request_generation: self.request_generation,
+            trigger,
         }
     }
 
-    /// Apply a reply. Returns whether the snapshot was replaced.
-    pub fn apply(&mut self, token: RequestToken, stats: SessionStats) -> bool {
+    /// Apply a reply. Returns the applied request when the snapshot was
+    /// replaced (so the caller can advance the live-total watermark), `None`
+    /// for a stale/failed/unapplied reply — which must clear nothing.
+    pub fn apply(&mut self, token: RequestToken, stats: SessionStats) -> Option<AppliedRequest> {
         if token.session_generation != self.session_generation {
-            return false;
+            return None;
         }
         // Only the latest issued read may win; an already-applied generation
         // is a duplicate and is ignored.
         if token.request_generation != self.request_generation
             || token.request_generation <= self.applied_request_generation
         {
-            return false;
+            return None;
         }
         let identity = (stats.session_id.clone(), stats.session_file.clone());
         if self.identity.as_ref() != Some(&identity) {
@@ -134,12 +197,16 @@ impl SessionStatsCache {
             self.identity = Some(identity);
         }
         if stats.entry_count < self.applied_entry_count {
-            return false;
+            return None;
         }
         self.applied_entry_count = stats.entry_count;
         self.applied_request_generation = token.request_generation;
         self.snapshot = Some(stats);
-        true
+        Some(AppliedRequest {
+            session_generation: token.session_generation,
+            request_generation: token.request_generation,
+            trigger: token.trigger,
+        })
     }
 
     pub fn snapshot(&self) -> Option<&SessionStats> {
@@ -192,61 +259,68 @@ mod tests {
     #[test]
     fn applies_the_latest_reply_and_rejects_a_late_older_one() {
         let mut cache = SessionStatsCache::default();
-        let first = cache.begin_request();
-        let second = cache.begin_request();
+        let first = cache.begin_request(StatsTrigger::Interval);
+        let second = cache.begin_request(StatsTrigger::Interval);
         // B (entryCount=11) returns first.
-        assert!(cache.apply(second, stats(11)));
+        assert!(cache.apply(second, stats(11)).is_some());
         assert_eq!(cache.snapshot().map(|s| s.entry_count), Some(11));
         // A (entryCount=10) arrives late with an older request generation.
-        assert!(!cache.apply(first, stats(10)));
+        assert!(cache.apply(first, stats(10)).is_none());
         assert_eq!(cache.snapshot().map(|s| s.entry_count), Some(11));
     }
 
     #[test]
     fn drops_a_lower_entry_count_within_the_same_identity() {
         let mut cache = SessionStatsCache::default();
-        let first = cache.begin_request();
-        assert!(cache.apply(first, stats(11)));
+        let first = cache.begin_request(StatsTrigger::Interval);
+        assert!(cache.apply(first, stats(11)).is_some());
         // Even a newer request carrying an older count is dropped.
-        let second = cache.begin_request();
-        assert!(!cache.apply(second, stats(10)));
+        let second = cache.begin_request(StatsTrigger::Interval);
+        assert!(cache.apply(second, stats(10)).is_none());
         assert_eq!(cache.snapshot().map(|s| s.entry_count), Some(11));
         // Equal count is a valid absolute replacement.
-        let third = cache.begin_request();
+        let third = cache.begin_request(StatsTrigger::TurnEnd);
         let mut same = stats(11);
         same.cost = 0.75;
-        assert!(cache.apply(third, same));
+        assert_eq!(
+            cache.apply(third, same),
+            Some(AppliedRequest {
+                session_generation: 0,
+                request_generation: 3,
+                trigger: StatsTrigger::TurnEnd,
+            })
+        );
         assert_eq!(cache.snapshot().map(|s| s.cost), Some(0.75));
     }
 
     #[test]
     fn session_lifecycle_invalidates_previous_replies() {
         let mut cache = SessionStatsCache::default();
-        let old = cache.begin_request();
+        let old = cache.begin_request(StatsTrigger::TurnEnd);
         cache.begin_session(Some("new"));
-        assert!(!cache.apply(old, stats(3)));
+        assert!(cache.apply(old, stats(3)).is_none());
         assert_eq!(cache.snapshot(), None);
-        let fresh = cache.begin_request();
+        let fresh = cache.begin_request(StatsTrigger::SessionStart);
         let mut next = stats(0);
         next.session_id = "s2".into();
         next.session_file = None;
-        assert!(cache.apply(fresh, next));
+        assert!(cache.apply(fresh, next).is_some());
         assert_eq!(cache.snapshot().map(|s| s.session_id.as_str()), Some("s2"));
         // A changed identity resets the entry guard (an in-memory session can
         // restart at a lower count after resume).
-        let third = cache.begin_request();
+        let third = cache.begin_request(StatsTrigger::TurnEnd);
         let mut other = stats(2);
         other.session_id = "s3".into();
-        assert!(cache.apply(third, other));
+        assert!(cache.apply(third, other).is_some());
         assert_eq!(cache.snapshot().map(|s| s.entry_count), Some(2));
     }
 
     #[test]
     fn duplicate_apply_of_the_same_token_is_rejected() {
         let mut cache = SessionStatsCache::default();
-        let token = cache.begin_request();
-        assert!(cache.apply(token, stats(1)));
-        assert!(!cache.apply(token, stats(2)));
+        let token = cache.begin_request(StatsTrigger::Interval);
+        assert!(cache.apply(token, stats(1)).is_some());
+        assert!(cache.apply(token, stats(2)).is_none());
         assert_eq!(cache.snapshot().map(|s| s.entry_count), Some(1));
     }
 

@@ -35,6 +35,16 @@ pub async fn run_auth(args: &[String]) -> Option<i32> {
         print!("{}", print_auth_command_help());
         return Some(0);
     }
+    if args.first().is_some_and(|arg| arg == "auth")
+        && args.get(1).is_some_and(|arg| arg == "login")
+    {
+        return Some(run_login(args).await);
+    }
+    if args.first().is_some_and(|arg| arg == "auth")
+        && args.get(1).is_some_and(|arg| arg == "logout")
+    {
+        return Some(run_logout(args).await);
+    }
 
     // Step 2: parse (main.ts:145-153).
     let command: AuthCommand = match parse_auth_command(args) {
@@ -88,6 +98,95 @@ pub async fn run_auth(args: &[String]) -> Option<i32> {
         }
         AuthCommandKind::Check => run_check(&parsed, &command).await,
     }
+}
+
+async fn run_login(args: &[String]) -> i32 {
+    use crate::core::model_runtime::CreateModelRuntimeOptions;
+    use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let agent_dir = crate::config::get_agent_dir();
+    let settings = Arc::new(std::sync::Mutex::new(SettingsManager::create(
+        &cwd,
+        Some(&agent_dir),
+        SettingsManagerCreateOptions {
+            project_trusted: false,
+        },
+    )));
+    let model_runtime =
+        crate::core::model_runtime::ModelRuntime::create(CreateModelRuntimeOptions {
+            allow_model_network: false,
+            ..Default::default()
+        })
+        .await;
+    let signal = tokio_util::sync::CancellationToken::new();
+    let interrupt = signal.clone();
+    let interrupt_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            interrupt.cancel();
+        }
+    });
+    let get_device_id = {
+        let settings = Arc::clone(&settings);
+        Arc::new(move || {
+            settings
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_or_create_device_id()
+        })
+    };
+    let command_args = args[2..]
+        .iter()
+        .filter(|arg| arg.as_str() != "--offline")
+        .cloned()
+        .collect::<Vec<_>>();
+    let code = crate::cli::auth_login::run_auth_login(
+        &command_args,
+        crate::cli::auth_login::AuthLoginOptions {
+            model_runtime,
+            terminal: Arc::new(crate::cli::auth_terminal::ProcessLoginTerminal),
+            agent_dir,
+            cwd,
+            get_device_id,
+            signal,
+        },
+    )
+    .await;
+    interrupt_task.abort();
+    code
+}
+
+async fn run_logout(args: &[String]) -> i32 {
+    use crate::core::model_runtime::CreateModelRuntimeOptions;
+
+    let model_runtime =
+        crate::core::model_runtime::ModelRuntime::create(CreateModelRuntimeOptions {
+            allow_model_network: false,
+            ..Default::default()
+        })
+        .await;
+    let signal = tokio_util::sync::CancellationToken::new();
+    let timeout = signal.clone();
+    let timeout_task = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        timeout.cancel();
+    });
+    let command_args = args[2..]
+        .iter()
+        .filter(|arg| arg.as_str() != "--offline")
+        .cloned()
+        .collect::<Vec<_>>();
+    let code = crate::cli::auth_logout::run_auth_logout(
+        &command_args,
+        crate::cli::auth_logout::AuthLogoutOptions {
+            model_runtime,
+            terminal: Arc::new(crate::cli::auth_terminal::ProcessLoginTerminal),
+            signal,
+        },
+    )
+    .await;
+    timeout_task.abort();
+    code
 }
 
 /// Credential print path (main.ts:168-179).

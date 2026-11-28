@@ -89,6 +89,14 @@
       RPI_INSTALL_PROMPT_TIMEOUT  interactive prompt timeout seconds (default 60)
       RPI_CODING_AGENT_DIR   agent dir (settings/extensions root)
 
+    Update layout (ADR-0050, V19-09): plugins are placed as versioned
+    generations (<extensions>\<name>\<version>\) with an atomic current.json
+    pointer, so running rpi instances keep the libraries they loaded. The
+    legacy flat layout (<name>\rpi-extension.json) stays readable. Before
+    installing, a startup update that died between its two renames is
+    repaired: when rpi.exe is missing but a parked rpi.exe.old-* exists, the
+    newest parked image is restored to rpi.exe first.
+
     Download fallback order (ADR-0011 revision, for networks where GitHub is
     unreachable): 1) the browser_download_url pair returned by the GitHub API,
     2) the URL constructed by naming rule from RPI_RELEASE_BASE_URL, 3) the
@@ -1813,6 +1821,109 @@ function Seed-DefaultSettings {
     }
 }
 
+# V19-09 (ADR-0050): recover from a startup update transaction that died
+# between its two renames - rpi.exe is missing while a parked previous image
+# rpi.exe.old-<version> exists. The newest parked image goes back to rpi.exe
+# before the installer replaces it. Returns the restored path, or $null when
+# nothing needed restoring.
+function Restore-ParkedExecutable {
+    param([string]$InstallPath)
+    if (Test-Path -LiteralPath $InstallPath -PathType Leaf) { return $null }
+    $dir = Split-Path -Parent $InstallPath
+    $name = Split-Path -Leaf $InstallPath
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return $null }
+    $candidates = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name.StartsWith("$name.old-") } |
+        Sort-Object LastWriteTime -Descending)
+    if ($candidates.Count -eq 0) { return $null }
+    $parked = $candidates[0].FullName
+    Move-Item -LiteralPath $parked -Destination $InstallPath -Force
+    return $parked
+}
+
+# V19-09 (ADR-0050): the first rpi version that reads the generational
+# plugin layout (a current.json pointer). The installer only writes that
+# layout for versions that can read it: the installer served at
+# revpi.dev also installs older stable builds, which know only the flat
+# layout, so for them it keeps the in-place replacement.
+function Test-GenerationLayout {
+    param([string]$PluginVersion)
+    $firstGenerational = '0.1.9-rc.4'
+    $comparison = Compare-SemverVersion -Left $PluginVersion -Right $firstGenerational
+    return ($comparison -eq 'eq' -or $comparison -eq 'gt')
+}
+
+# V19-09 (ADR-0050): place one verified plugin extraction as a generation
+# <extensions>/<name>/<version>/ and flip the atomic current.json pointer to
+# it. A same-version generation is reused only when it is the same build
+# (manifest sha256); otherwise it is replaced. The pointer is written to a
+# same-directory temporary file and moved over the old one. The legacy flat
+# files of an earlier install stay in the container root: rpi reads the
+# pointer first and its startup cleanup removes them once nobody uses them.
+function Install-PluginGeneration {
+    param(
+        [string]$PluginDir,
+        [string]$Plugin,
+        [string]$Version,
+        [string]$Staged,
+        [string]$ManifestSha
+    )
+    $container = Join-Path $PluginDir $Plugin
+    $generation = Join-Path $container $Version
+    $pointerPath = Join-Path $container 'current.json'
+    New-Item -ItemType Directory -Force -Path $container | Out-Null
+    $retired = Join-Path $container '.retired'
+    if (Test-Path -LiteralPath $retired) {
+        Remove-Item -LiteralPath $retired -Force -ErrorAction Stop
+    }
+    $previous = $null
+    if (Test-Path -LiteralPath $pointerPath -PathType Leaf) {
+        try {
+            $previous = [string](Get-Content -LiteralPath $pointerPath -Raw | ConvertFrom-Json).version
+        } catch {
+            $previous = $null
+        }
+    }
+    if (Test-Path -LiteralPath $generation) {
+        $existingManifest = Join-Path $generation 'rpi-extension.json'
+        $existingSha = ''
+        if (Test-Path -LiteralPath $existingManifest -PathType Leaf) {
+            $existingSha = Get-FileSha256 $existingManifest
+        }
+        if ($existingSha -eq $ManifestSha) {
+            Remove-Item -Recurse -Force -Path $Staged -ErrorAction SilentlyContinue
+            return
+        }
+        # A different build of the same version: move it aside first (same
+        # volume) and delete the copy. A loaded library would otherwise be
+        # left half-deleted; when the move itself fails (a running rpi still
+        # has it loaded) the plugin is reported as failed, not half-installed.
+        $aside = Join-Path (Join-Path $PluginDir '.staging') ("$Plugin-$Version-$PID.replaced")
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $aside) | Out-Null
+        Remove-Item -Recurse -Force -Path $aside -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $generation -Destination $aside -ErrorAction Stop
+        Remove-Item -Recurse -Force -Path $aside -ErrorAction SilentlyContinue
+    }
+    Move-Item -LiteralPath $Staged -Destination $generation -ErrorAction Stop
+    $pointer = [ordered]@{
+        schemaVersion  = 1
+        version        = $Version
+        path           = $Version
+        manifestSha256 = $ManifestSha
+        rpiAbi         = 1
+        previous       = $previous
+    }
+    $stagePointer = "$pointerPath.stage-$PID"
+    [IO.File]::WriteAllText($stagePointer, ($pointer | ConvertTo-Json), (New-Object System.Text.UTF8Encoding $false))
+    try {
+        Move-Item -LiteralPath $stagePointer -Destination $pointerPath -Force -ErrorAction Stop
+    } finally {
+        if (Test-Path -LiteralPath $stagePointer) {
+            Remove-Item -LiteralPath $stagePointer -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Install-ProfilePlugins {
     param(
         [string]$BundleDir,
@@ -1823,6 +1934,11 @@ function Install-ProfilePlugins {
     )
     $pluginDir = Join-Path $AgentDir 'extensions'
     New-Item -ItemType Directory -Force -Path $pluginDir | Out-Null
+    $generational = Test-GenerationLayout -PluginVersion $Version
+    $stagingRoot = Join-Path $pluginDir '.staging'
+    if ($generational) {
+        New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null
+    }
     $installed = 0
     $failed = 0
     $failedNames = @()
@@ -1851,9 +1967,8 @@ function Install-ProfilePlugins {
             $failedNames += $plugin
             continue
         }
-        $tmp = Join-Path $pluginDir "$plugin.tmp-$PID"
-        $old = Join-Path $pluginDir "$plugin.old-$PID"
-        Remove-Item -Recurse -Force $tmp, $old -ErrorAction SilentlyContinue
+        $tmp = if ($generational) { Join-Path $stagingRoot "$plugin-$Version-$PID" } else { Join-Path $pluginDir "$plugin.tmp-$PID" }
+        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Force -Path $tmp | Out-Null
         $ok = $true
         try {
@@ -1885,20 +2000,36 @@ function Install-ProfilePlugins {
             $failedNames += $plugin
             continue
         }
-        $final = Join-Path $pluginDir $plugin
         try {
-            if (Test-Path -LiteralPath $final) { Move-Item -LiteralPath $final -Destination $old -Force }
-            Move-Item -LiteralPath $tmp -Destination $final -Force
-            Remove-Item -Recurse -Force $old -ErrorAction SilentlyContinue
-            $installed++
+            if ($generational) {
+                $manifestSha = Get-FileSha256 (Join-Path $tmp 'rpi-extension.json')
+                Install-PluginGeneration -PluginDir $pluginDir -Plugin $plugin -Version $Version `
+                    -Staged $tmp -ManifestSha $manifestSha
+                $installed++
+            } else {
+                # Legacy flat layout for versions that predate the pointer.
+                $final = Join-Path $pluginDir $plugin
+                $old = Join-Path $pluginDir "$plugin.old-$PID"
+                Remove-Item -Recurse -Force $old -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $final) { Move-Item -LiteralPath $final -Destination $old -Force }
+                Move-Item -LiteralPath $tmp -Destination $final -Force
+                Remove-Item -Recurse -Force $old -ErrorAction SilentlyContinue
+                $installed++
+            }
         } catch {
-            Write-Warning "$plugin`: atomic replace failed: $($_.Exception.Message)"
-            if (Test-Path -LiteralPath $old) {
-                Move-Item -LiteralPath $old -Destination $final -Force -ErrorAction SilentlyContinue
+            Write-Warning "$plugin`: placement failed: $($_.Exception.Message)"
+            if (-not $generational -and (Test-Path -LiteralPath (Join-Path $pluginDir "$plugin.old-$PID"))) {
+                Move-Item -LiteralPath (Join-Path $pluginDir "$plugin.old-$PID") -Destination (Join-Path $pluginDir $plugin) -Force -ErrorAction SilentlyContinue
             }
             Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
             $failed++
             $failedNames += $plugin
+        }
+    }
+    if ($generational) {
+        $stagingLeft = @(Get-ChildItem -LiteralPath $stagingRoot -Force -ErrorAction SilentlyContinue)
+        if ($stagingLeft.Count -eq 0) {
+            Remove-Item -LiteralPath $stagingRoot -Force -ErrorAction SilentlyContinue
         }
     }
     return [pscustomobject]@{
@@ -2224,9 +2355,16 @@ try {
         Fail "install directory $Prefix is not writable - re-run from an elevated PowerShell (Run as administrator)"
     }
 
-    $InstallPath = Join-Path $Prefix 'rpi.exe'
     $PrefixAbs = (Resolve-Path $Prefix).Path
     $InstallPath = Join-Path $PrefixAbs 'rpi.exe'
+    # V19-09 preflight: a startup update that died between its two renames
+    # leaves rpi.exe missing next to a parked rpi.exe.old-*. Restore the
+    # previous image first so the replace below has a target and a rollback.
+    $parked = Restore-ParkedExecutable -InstallPath $InstallPath
+    if ($parked) {
+        Write-Host ''
+        Write-Host "restored the parked executable $(Split-Path -Leaf $parked) to rpi.exe before installing"
+    }
     $existingManifestPath = Join-Path $PrefixAbs 'rpi.install.json'
     foreach ($installTarget in @($InstallPath, $existingManifestPath)) {
         $item = Get-Item -LiteralPath $installTarget -Force -ErrorAction SilentlyContinue

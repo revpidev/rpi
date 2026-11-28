@@ -2,6 +2,20 @@
 //! (`rpc-entry.ts` @ pi 0.82.1).
 
 fn main() {
+    rpi::core::early_init::initialize();
+
+    // V19-09 hook #1 (ADR-0050, Windows only): the startup self-update;
+    // a trampoline wait never returns into this process.
+    #[cfg(windows)]
+    match rpi::core::windows_update::startup::before_run(
+        &std::env::args_os().skip(1).collect::<Vec<_>>(),
+    ) {
+        rpi::core::windows_update::startup::Startup::Run => {}
+        rpi::core::windows_update::startup::Startup::Trampoline(trampoline) => {
+            trampoline.wait_and_exit()
+        }
+    }
+
     // Marker env for child processes/extensions (rpc-entry.ts:7-8).
     // SAFETY: process start; the tokio runtime and its worker threads do
     // not exist yet, so no concurrent env readers can race this write.
@@ -18,9 +32,13 @@ fn main() {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("Error: failed to start runtime: {error}");
-            std::process::exit(1);
+            rpi::process_exit::exit_fatal(1);
         }
     };
     let exit_code = runtime.block_on(rpi::app::run_app(args));
+    // V19-09 hook #2: the unified exit outlet (Windows).
+    #[cfg(windows)]
+    rpi::process_exit::exit(exit_code);
+    #[cfg(not(windows))]
     std::process::exit(exit_code);
 }

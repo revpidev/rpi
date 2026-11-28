@@ -257,6 +257,10 @@ pub struct SessionBeforeCompactEvent {
     pub custom_instructions: Option<String>,
     pub reason: CompactionReason,
     pub will_retry: bool,
+    /// Additive (V19-03 S45): the manual compaction interrupted a streaming
+    /// parent run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
 }
 
 /// `session_before_compact` result (`compaction` = upstream
@@ -454,7 +458,7 @@ pub struct ProviderStreamEvent {
 /// `before_agent_start` payload (`systemPromptOptions` as JSON): a tagged
 /// union on `messageType`. `user` runs carry the prompt/images; `custom`
 /// runs (idle `sendMessage(..., {triggerTurn:true})`) carry the starting
-/// message (types.ts:929-961 @ 4a080252f).
+/// message (types.ts:929-961 @ b4afdddf).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "messageType", rename_all = "lowercase")]
 pub enum BeforeAgentStartEvent {
@@ -513,7 +517,7 @@ pub struct AgentEndEvent {
     pub messages: Value,
 }
 
-/// `agent_settled` payload (types.ts:1005-1009 @ 4a080252f, #10607):
+/// `agent_settled` payload (types.ts:1005-1009 @ b4afdddf, #10607):
 /// `aborted` distinguishes a cancelled run (for example Escape) from a
 /// finished one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -531,7 +535,7 @@ pub struct TurnStartEvent {
 }
 
 /// `turn_end` payload (`message`/`toolResults` as JSON) plus the boundary
-/// state added at dispatch time (V16-03; types.ts:1015-1022 @ 4a080252f).
+/// state added at dispatch time (V16-03; types.ts:1015-1022 @ b4afdddf).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnEndEvent {
@@ -547,7 +551,7 @@ pub struct TurnEndEvent {
     pub context: Value,
 }
 
-/// `agent_before_settle` payload (V16-03; types.ts:980-983 @ 4a080252f).
+/// `agent_before_settle` payload (V16-03; types.ts:980-983 @ b4afdddf).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentBeforeSettleEvent {
@@ -558,7 +562,7 @@ pub struct AgentBeforeSettleEvent {
     pub context: Value,
 }
 
-/// `AgentActivityOutcome` (types.ts:922 @ 4a080252f).
+/// `AgentActivityOutcome` (types.ts:922 @ b4afdddf).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentActivityOutcome {
@@ -567,7 +571,7 @@ pub enum AgentActivityOutcome {
     Error,
 }
 
-/// `BoundaryResult` (types.ts:975-978 @ 4a080252f): what a boundary handler
+/// `BoundaryResult` (types.ts:975-978 @ b4afdddf): what a boundary handler
 /// may return. Entries stay raw JSON until the host applies them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -637,7 +641,7 @@ pub struct ToolExecutionEndEvent {
     pub result: Value,
     pub is_error: bool,
     /// Milliseconds `execute()` took, measured with a monotonic clock;
-    /// absent when the tool did not run (types.ts:1087-1094 @ 4a080252f).
+    /// absent when the tool did not run (types.ts:1087-1094 @ b4afdddf).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

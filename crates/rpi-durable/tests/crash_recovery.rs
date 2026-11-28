@@ -128,7 +128,7 @@ async fn a_sigkill_mid_phase_recovers_with_one_restart() {
         set_timer: None,
         on_wake: None,
         on_report: None,
-        on_report_info: None,
+        read_only: false,
     };
     let harness = open_harness(Arc::clone(&storage), options, &BACKGROUND_CONTEXT)
         .await

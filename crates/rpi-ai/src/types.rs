@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/types.ts` @ pi 1.4.0 (4a080252f).
+//! Port of `packages/ai/src/types.ts` @ pi 1.5.2 (b4afdddf).
 //!
 //! Core wire types: messages, content blocks, usage, tools, models (with
 //! compat matrices), stream options and the assistant stream event protocol.
@@ -177,11 +177,11 @@ pub enum ModelThinkingLevel {
 /// level unsupported, `Some(value)` = provider/model-specific mapped value.
 pub type ThinkingLevelMap = std::collections::BTreeMap<ModelThinkingLevel, Option<String>>;
 
-/// `SamplingParams` (types.ts:92 @ 4a080252f): arbitrary sampling parameters
+/// `SamplingParams` (types.ts:92 @ b4afdddf): arbitrary sampling parameters
 /// merged into the request body as-is.
 pub type SamplingParams = serde_json::Map<String, Value>;
 
-/// `SamplingParamsByThinkingLevel` (types.ts:93 @ 4a080252f; R2.3.1):
+/// `SamplingParamsByThinkingLevel` (types.ts:93 @ b4afdddf; R2.3.1):
 /// per-thinking-level sampling parameter overrides. Applies to the
 /// `openai-completions` / `openai-responses` / `azure-openai-responses` APIs.
 pub type SamplingParamsByThinkingLevel =
@@ -501,6 +501,9 @@ pub struct StreamOptions {
     pub websocket_connect_timeout_ms: Option<u64>,
     /// Optional metadata; providers extract the fields they understand.
     pub metadata: Option<serde_json::Map<String, Value>>,
+    /// Disable provider continuation state, including Anthropic message
+    /// threads. Cache warming always sets this to keep replay prefixes stable.
+    pub disable_continuation: Option<bool>,
 }
 
 impl std::ops::Deref for StreamOptions {
@@ -846,10 +849,14 @@ pub struct UsageCost {
     pub cache_read: f64,
     pub cache_write: f64,
     pub total: f64,
+    /// Whether every monetary component came from the provider rather than
+    /// the catalog's estimated rates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_from_provider: Option<bool>,
 }
 
 impl Usage {
-    /// `combineUsage` (usage-totals.ts:31 @ 4a080252f): field-wise sum;
+    /// `combineUsage` (usage-totals.ts:31 @ b4afdddf): field-wise sum;
     /// optional splits stay `None` when both sides are `None`.
     pub fn combined(&self, other: &Usage) -> Usage {
         Usage {
@@ -872,6 +879,10 @@ impl Usage {
                 cache_read: self.cost.cache_read + other.cost.cache_read,
                 cache_write: self.cost.cache_write + other.cost.cache_write,
                 total: self.cost.total + other.cost.total,
+                total_from_provider: Some(
+                    self.cost.total_from_provider == Some(true)
+                        && other.cost.total_from_provider == Some(true),
+                ),
             },
         }
     }
@@ -1077,7 +1088,7 @@ impl fmt::Debug for ImagesOptions {
 // `api/system-one-shared.ts`; V16-07 FR-F)
 // ---------------------------------------------------------------------------
 
-/// `ClassifierChoiceQuestion` (types.ts:633-637 @ 4a080252f).
+/// `ClassifierChoiceQuestion` (types.ts:633-637 @ b4afdddf).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassifierChoiceQuestion {
@@ -1119,7 +1130,7 @@ pub enum ClassifierQuestion {
     Bool(ClassifierBoolQuestion),
 }
 
-/// `ClassifierContext` (types.ts:668-676 @ 4a080252f).
+/// `ClassifierContext` (types.ts:668-676 @ b4afdddf).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassifierContext {
@@ -1267,7 +1278,7 @@ pub trait ProviderClassifier: Send + Sync {
 }
 
 /// `Provider.generateImages` for the unified schema-v6 `ImageModel`
-/// (models.ts:221-226 @ 4a080252f). The older image subsystem's
+/// (models.ts:221-226 @ b4afdddf). The older image subsystem's
 /// `images_models::ProviderImages` stays as is; this trait is the unified
 /// runtime's contract.
 pub trait ProviderImageGenerator: Send + Sync {
@@ -1447,7 +1458,7 @@ pub struct AssistantMessage {
     pub provider_thinking_level: Option<String>,
     /// Pi thinking level the agent loop requested for this response. Absent
     /// outside the agent loop and for legacy responses (R2.7.1,
-    /// types.ts:553-554 @ 4a080252f). The agent loop records it on every
+    /// types.ts:553-554 @ b4afdddf). The agent loop records it on every
     /// finalized assistant message (agent-loop.ts:409).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<ModelThinkingLevel>,
@@ -1480,7 +1491,7 @@ pub struct AssistantMessage {
     /// a monotonic clock. Set by the assistant message event stream on the
     /// final message of a response it saw start; absent for legacy messages
     /// and for deferred results fetched later (R2.7.1, types.ts:571-575
-    /// @ 4a080252f).
+    /// @ b4afdddf).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
 }
@@ -1549,7 +1560,7 @@ impl<'de> Deserialize<'de> for SharedAssistantMessage {
 }
 
 /// A tool call that another tool made while it ran, for example from a
-/// codemode script (types.ts:570-581 @ 4a080252f).
+/// codemode script (types.ts:570-581 @ b4afdddf).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NestedToolCallRecord {
@@ -1571,7 +1582,7 @@ pub struct NestedToolCallRecord {
 }
 
 /// Bounded record of the nested calls a tool made. Results are not recorded
-/// (types.ts:583-588 @ 4a080252f).
+/// (types.ts:583-588 @ b4afdddf).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NestedToolCalls {
@@ -1605,7 +1616,7 @@ pub struct ToolResultMessage {
     /// Unix timestamp in milliseconds.
     pub timestamp: i64,
     /// Milliseconds the tool's execution took, measured with a monotonic
-    /// clock. Absent for legacy results (R2.7.1, types.ts:595 @ 4a080252f).
+    /// clock. Absent for legacy results (R2.7.1, types.ts:595 @ b4afdddf).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
 }
@@ -2078,11 +2089,12 @@ pub struct Model {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Compatibility overrides; which fields apply is governed by `api`
     /// (upstream types this conditionally per API; see file header note).
+    /// Boxing keeps catalog entries compact without changing their JSON shape.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub compat: Option<ModelCompat>,
+    pub compat: Option<Box<ModelCompat>>,
 }
 
-/// `ModelType` (types.ts:1158-1165 @ 4a080252f, schema v6): what a catalog
+/// `ModelType` (types.ts:1158-1165 @ b4afdddf, schema v6): what a catalog
 /// entry is for. Chat is the default and omits `type` in catalog data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -2106,7 +2118,7 @@ impl ModelType {
     }
 }
 
-/// `ImageModel` (types.ts:1143-1156 @ 4a080252f): image-generation catalog
+/// `ImageModel` (types.ts:1143-1156 @ b4afdddf): image-generation catalog
 /// entry. Parsed through [`AnyModel`]; `AnyModel` dispatch tries this shape
 /// before the classifier and chat shapes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2131,7 +2143,7 @@ pub struct ImageModel {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
-/// `ClassifierModel` (types.ts:1150-1155 @ 4a080252f): structured classifier
+/// `ClassifierModel` (types.ts:1150-1155 @ b4afdddf): structured classifier
 /// catalog entry. Parsed through [`AnyModel`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2156,15 +2168,13 @@ pub struct ClassifierModel {
     pub compat: Option<ModelCompat>,
 }
 
-/// `AnyModel` (types.ts:1167-1168 @ 4a080252f): anything a provider can
+/// `AnyModel` (types.ts:1167-1168 @ b4afdddf): anything a provider can
 /// list. Deserialization dispatches on the raw `type` field (missing =
 /// chat), so each variant is unambiguous; unknown types are rejected and
 /// skipped by callers (catalog/remote parse).
 ///
-/// The chat variant is intentionally much larger than the image/classifier
-/// variants (upstream `AnyModel` is a plain TS union); boxing would force
-/// allocations through the hot chat path, so the size difference is
-/// accepted here.
+/// Variants retain owned values so the public serde and Provider surfaces stay
+/// unchanged; compact representations are applied within each model type.
 fn image_model_type() -> ModelType {
     ModelType::Image
 }
@@ -2206,7 +2216,7 @@ impl<'de> Deserialize<'de> for AnyModel {
 }
 
 impl AnyModel {
-    /// `getModelType` (utils/model-operations.ts @ 4a080252f).
+    /// `getModelType` (utils/model-operations.ts @ b4afdddf).
     pub fn model_type(&self) -> ModelType {
         match self {
             AnyModel::Image(_) => ModelType::Image,
@@ -2247,7 +2257,7 @@ impl AnyModel {
         }
     }
 
-    /// Merge key `type\0id` (remote-catalog-provider.ts:26-30 @ 4a080252f):
+    /// Merge key `type\0id` (remote-catalog-provider.ts:26-30 @ b4afdddf):
     /// the same upstream id may appear once per type.
     pub fn merge_key(&self) -> String {
         format!("{}\0{}", self.model_type().as_str(), self.id())
@@ -2283,7 +2293,7 @@ impl From<Model> for AnyModel {
     }
 }
 
-/// `isModelType` (utils/model-operations.ts @ 4a080252f).
+/// `isModelType` (utils/model-operations.ts @ b4afdddf).
 pub fn is_model_type(model: &AnyModel, model_type: ModelType) -> bool {
     model.model_type() == model_type
 }
@@ -2383,6 +2393,18 @@ pub enum SystemOneImageInput {
     Images,
     #[serde(rename = "state-image-urls")]
     StateImageUrls,
+}
+
+/// `OpenAIResponsesCompat.promptCacheKeyMode`.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptCacheKeyMode {
+    #[default]
+    Auto,
+    Enabled,
+    Disabled,
 }
 
 /// Merged compat settings for OpenAI-completions / OpenAI-responses /
@@ -2497,6 +2519,18 @@ pub struct ModelCompat {
     /// OpenAIResponsesCompat and AnthropicMessagesCompat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_long_cache_retention: Option<bool>,
+    /// Restore legacy proxies that require an empty tools array when the
+    /// conversation already contains tool calls or results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires_tools_with_tool_history: Option<bool>,
+    /// Whether assistant messages without text must use an empty string
+    /// instead of JSON null content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires_non_null_assistant_content: Option<bool>,
+    /// Prompt-cache key emission policy. `auto` keeps endpoint/retention
+    /// detection; `enabled` and `disabled` are explicit overrides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key_mode: Option<PromptCacheKeyMode>,
 
     // --- OpenAIResponsesCompat only ---
     /// Whether the model supports message-anchored `additional_tools` input
@@ -2561,6 +2595,10 @@ pub struct ModelCompat {
     /// (first-party Anthropic only; proxies reject them).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_mid_convo_tool_changes: Option<bool>,
+    /// Whether the endpoint supports Anthropic message threads. Official
+    /// Anthropic origins default to true; proxies default to false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_message_threads: Option<bool>,
 
     // --- SystemOneCompat ---
     /// How a System One service accepts classifier images.
@@ -2716,7 +2754,7 @@ pub struct VercelGatewayRouting {
 
 // ---------------------------------------------------------------------------
 // Model type guards and error results (`utils/model-operations.ts` @
-// 4a080252f; V16-06/V16-07 R2.5.2/R2.5.3)
+// b4afdddf; V16-06/V16-07 R2.5.2/R2.5.3)
 // ---------------------------------------------------------------------------
 fn assert_model_type(
     model: &AnyModel,
@@ -3765,5 +3803,57 @@ mod tests {
         );
         let back: Model = serde_json::from_value(wire).expect("model");
         assert_eq!(back.input_limits, model.input_limits);
+    }
+
+    #[test]
+    fn test_usage_total_from_provider_merge_and_serde() {
+        let with_source = |total_from_provider| Usage {
+            cost: UsageCost {
+                input: 0.25,
+                output: 0.5,
+                cache_read: 0.125,
+                cache_write: 0.125,
+                total: 1.0,
+                total_from_provider,
+            },
+            ..Usage::default()
+        };
+        assert_eq!(
+            with_source(Some(true))
+                .combined(&with_source(Some(true)))
+                .cost
+                .total_from_provider,
+            Some(true)
+        );
+        for combined in [
+            with_source(Some(true)).combined(&with_source(Some(false))),
+            with_source(Some(false)).combined(&with_source(Some(true))),
+            with_source(Some(false)).combined(&with_source(Some(false))),
+            with_source(Some(true)).combined(&with_source(None)),
+        ] {
+            assert_eq!(combined.cost.total_from_provider, Some(false));
+            assert_eq!(combined.cost.total, 2.0);
+        }
+        assert_eq!(
+            serde_json::to_value(with_source(Some(true))).expect("serialize")["cost"]["totalFromProvider"],
+            true
+        );
+        assert_eq!(
+            serde_json::to_value(with_source(Some(false))).expect("serialize")["cost"]["totalFromProvider"],
+            false
+        );
+        assert!(
+            serde_json::to_value(with_source(None)).expect("serialize")["cost"]
+                .get("totalFromProvider")
+                .is_none()
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_model_compat_boxing_compacts_model_types() {
+        assert_eq!(std::mem::size_of::<ModelCompat>(), 592);
+        assert_eq!(std::mem::size_of::<Model>(), 480);
+        assert_eq!(std::mem::size_of::<AnyModel>(), 904);
     }
 }

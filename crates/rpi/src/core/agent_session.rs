@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine;
@@ -61,7 +61,9 @@ use tokio_util::sync::CancellationToken;
 use crate::core::auth_guidance::{
     format_no_api_key_found_message, format_no_model_selected_message,
 };
-use crate::core::compaction_runner::{CompactionEvent, CompactionRunner};
+use crate::core::compaction_runner::{
+    CompactionEvent, CompactionRunner, PendingSessionCompact, PendingSessionCompactFailed,
+};
 use crate::core::extensions::{
     BeforeAgentStartTrigger, ExtensionErrorInfo, ExtensionMode, ExtensionRunner,
     ExtensionRunnerRef, InputEventResult, InputSource, SessionStartEvent, SessionStartReason,
@@ -136,7 +138,7 @@ pub struct AgentEndEvent {
 )]
 pub enum SessionEvent {
     /// `{type: "agent_settled", aborted}` (agent-session.ts:203 @
-    /// 4a080252f, #10607): `aborted` distinguishes a cancelled run from a
+    /// b4afdddf, #10607): `aborted` distinguishes a cancelled run from a
     /// finished one.
     AgentSettled {
         aborted: bool,
@@ -460,7 +462,7 @@ fn builtin_tool_guidelines(name: &str) -> &'static [&'static str] {
 // AgentSession
 // ============================================================================
 
-/// `_deferredSettledActions` entries (agent-session.ts:418 @ 4a080252f):
+/// `_deferredSettledActions` entries (agent-session.ts:418 @ b4afdddf):
 /// work requested from `agent_settled` handlers, run after every settled
 /// handler finished.
 type DeferredSettledAction = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
@@ -491,6 +493,7 @@ struct AgentSessionInner {
     /// `abort_branch_summary` cancels it, `is_compacting` consults it
     /// (#8920 / FR-F R2).
     branch_summary_abort: crate::core::compaction_runner::AbortTokenCell,
+    navigation_generation: AtomicU64,
 
     listeners: Mutex<Vec<(u64, AgentSessionEventListener)>>,
     next_listener_id: AtomicU64,
@@ -505,13 +508,16 @@ struct AgentSessionInner {
 
     steering_messages: Mutex<Vec<String>>,
     follow_up_messages: Mutex<Vec<String>>,
+    queued_message_generations: Mutex<HashSet<i64>>,
+    last_queued_timestamp: AtomicI64,
+    image_resize_queue: tokio::sync::Mutex<()>,
     pending_next_turn_messages: Mutex<Vec<AgentMessage>>,
     /// `_pendingCustomMessages` (agent-session.ts:331): custom messages sent
     /// with `triggerTurn: false` while streaming, appended once the current
     /// turn's tool results are in state and session (240eb29c4, #8537).
     pending_custom_messages: Mutex<Vec<AgentMessage>>,
     last_assistant_message: Mutex<Option<AssistantMessage>>,
-    /// `_failedResponse` (agent-session.ts:401 @ 4a080252f): the failed
+    /// `_failedResponse` (agent-session.ts:401 @ b4afdddf): the failed
     /// response handed to the next request preparation as the route
     /// `failed` payload (`retry` reason). Set by the auto-retry and overflow
     /// recovery paths; consumed/cleared by `prepareRequest` and the agent
@@ -524,7 +530,7 @@ struct AgentSessionInner {
     /// rpi-statusline 03-realtime-token-count §1.3).
     turn_index: AtomicU32,
 
-    /// `_boundaryDispatchedMessages` (agent-session.ts:413 @ 4a080252f):
+    /// `_boundaryDispatchedMessages` (agent-session.ts:413 @ b4afdddf):
     /// assistant messages whose `turn_end` boundary already ran inside
     /// `finishTurn`; the event-time fallback skips them.
     boundary_dispatched_messages: Mutex<Vec<AssistantMessage>>,
@@ -561,7 +567,7 @@ struct AgentSessionInner {
     suppressed_tool_names: Mutex<HashSet<String>>,
     /// `ToolDefinitionEntry` registry (agent-session.ts:2460 `_toolDefinitions`).
     tool_definitions: Mutex<OrderedMap<ToolDefinitionEntry>>,
-    /// `_hiddenDeclarations` (agent-session.ts:452-453 @ 4a080252f): declared
+    /// `_hiddenDeclarations` (agent-session.ts:452-453 @ b4afdddf): declared
     /// tools whose declarations requests leave out, from `prepareLoadout`
     /// hooks. They stay active and callable, and the transcript still
     /// declares them, so the active set survives `/tree` and resume.
@@ -570,7 +576,7 @@ struct AgentSessionInner {
     /// re-applied after every registry rebuild so `setToolExposures`
     /// survives register/unregister/reload. Cleared with the session.
     tool_exposure_overrides: Mutex<HashMap<String, ext::ToolExposure>>,
-    /// `_nestedToolCalls` (agent-session.ts:450-451 @ 4a080252f): created on
+    /// `_nestedToolCalls` (agent-session.ts:450-451 @ b4afdddf): created on
     /// the first `ctx.executeTool()` call (V16-06 FR-E).
     nested_tool_calls: Mutex<Option<Arc<NestedCallRunner>>>,
     /// `_customTools` (agent-session.ts:345) — SDK-provided tools.
@@ -613,7 +619,7 @@ struct AgentSessionInner {
     http_dispatcher: Arc<crate::core::http_dispatcher::HttpDispatcher>,
 }
 
-/// `routedModel` (agent-session.ts:1422-1427 @ 4a080252f): the physical
+/// `routedModel` (agent-session.ts:1422-1427 @ b4afdddf): the physical
 /// model (and requested thinking level) of the latest successful response,
 /// returned only while the current selection is a virtual model.
 #[derive(Debug, Clone)]
@@ -774,7 +780,7 @@ impl NestedToolCallHost for SessionNestedHost {
             return;
         };
         // `await this._extensionRunner.emit(event); this._emit(event)`
-        // (agent-session.ts:729-732 @ 4a080252f).
+        // (agent-session.ts:729-732 @ b4afdddf).
         let (event_name, payload, agent_event) = match event {
             NestedToolExecutionEvent::Start {
                 tool_call_id,
@@ -997,6 +1003,7 @@ impl AgentSession {
             compaction_abort,
             auto_compaction_abort,
             branch_summary_abort: crate::core::compaction_runner::AbortTokenCell::default(),
+            navigation_generation: AtomicU64::new(0),
             listeners: Mutex::new(Vec::new()),
             next_listener_id: AtomicU64::new(0),
             unsubscribe_agent: Mutex::new(None),
@@ -1005,6 +1012,9 @@ impl AgentSession {
             idle_notify: Notify::new(),
             steering_messages: Mutex::new(Vec::new()),
             follow_up_messages: Mutex::new(Vec::new()),
+            queued_message_generations: Mutex::new(HashSet::new()),
+            last_queued_timestamp: AtomicI64::new(0),
+            image_resize_queue: tokio::sync::Mutex::new(()),
             pending_next_turn_messages: Mutex::new(Vec::new()),
             pending_custom_messages: Mutex::new(Vec::new()),
             last_assistant_message: Mutex::new(None),
@@ -1123,7 +1133,7 @@ impl AgentSession {
         }
         // V16-03 FR-A R5: the compaction runner persists restorative context
         // omissions for discarded recovery attempts
-        // (`_omitRecoveryAttempt`, agent-session.ts:1208-1222 @ 4a080252f).
+        // (`_omitRecoveryAttempt`, agent-session.ts:1208-1222 @ b4afdddf).
         {
             let weak = Arc::downgrade(&session.inner);
             if let Ok(mut runner) = session.inner.compaction.try_lock() {
@@ -1173,18 +1183,19 @@ impl AgentSession {
         // compaction + state refresh (V14-01 FR-D).
         session.install_agent_next_turn_refresh();
         // `_installAgentRequestProjection()` (agent-session.ts:398,
-        // 760-786 @ 4a080252f): a SessionManager projection becomes the
+        // 760-786 @ b4afdddf): a SessionManager projection becomes the
         // provider-context authority before every conversational request.
         session.install_agent_request_projection();
+        session.install_queued_message_normalization();
         // `_installAgentBoundaryHooks()` (agent-session.ts:398, 858-868):
         // `turn_end` boundary dispatch runs inside `finishTurn`.
         session.install_agent_boundary_hooks();
         // `_installHiddenDeclarationsProjection()` (agent-session.ts:490,
-        // 1720-1738 @ 4a080252f): `prepareLoadout` hidden declarations are
+        // 1720-1738 @ b4afdddf): `prepareLoadout` hidden declarations are
         // removed from the declarations every request carries.
         session.install_hidden_declarations_projection();
         // `_nestedToolCalls` lookup (agent-session.ts:1074-1086 @
-        // 4a080252f): finished model-issued calls take their bounded
+        // b4afdddf): finished model-issued calls take their bounded
         // nested-call record onto the result message (V16-06 FR-E).
         session.install_nested_call_summary();
         // `_installAgentForcedPromptProjection()` (agent-session.ts:417 @
@@ -1245,13 +1256,16 @@ impl AgentSession {
                         // `_compactBeforeNextAssistantResponse`,
                         // agent-session.ts:563).
                         session.sync_compaction_model().await;
-                        session
-                            .inner
-                            .compaction
-                            .lock()
-                            .await
+                        let mut runner = session.inner.compaction.lock().await;
+                        let messages = runner
                             .compact_before_next_assistant_response(&turn.context.messages)
-                            .await
+                            .await;
+                        let pending = runner.take_pending_session_compact();
+                        let failed = runner.take_pending_session_compact_failed();
+                        drop(runner);
+                        session.emit_pending_session_compact(pending).await;
+                        session.emit_pending_session_compact_failed(failed).await;
+                        messages
                     };
                     let mut context = AgentContext {
                         messages,
@@ -1340,13 +1354,13 @@ impl AgentSession {
     }
 
     /// `_installAgentRequestProjection` (agent-session.ts:760-853 @
-    /// 4a080252f; virtual-model routing slice deferred to V16-12): installs
+    /// b4afdddf; virtual-model routing slice deferred to V16-12): installs
     /// the canonical session projection as the provider context for every
     /// conversational request. Direct `agent.state.messages` assignments are
     /// superseded here (R3.1.2); recovery goes through the session append
     /// APIs + [`Self::refresh_context`].
     /// `_consumeFailedResponse` slice of `prepareRequest`
-    /// (agent-session.ts:762-763 @ 4a080252f): the auto-retry/overflow path
+    /// (agent-session.ts:762-763 @ b4afdddf): the auto-retry/overflow path
     /// stores the failed response; request preparation takes and clears it.
     fn take_failed_response(&self) -> Option<AssistantMessage> {
         lock(&self.inner.failed_response).take()
@@ -1462,7 +1476,7 @@ impl AgentSession {
         Ok((Some(route.model), route.thinking_level))
     }
 
-    /// `_recordSelection` (agent-session.ts:594-603 @ 4a080252f): record the
+    /// `_recordSelection` (agent-session.ts:594-603 @ b4afdddf): record the
     /// selection on the current branch when the branch implies another one,
     /// so a resume restores it. Tree navigation can leave the latest
     /// `model_change` on another branch; responses cannot record a virtual
@@ -1481,25 +1495,43 @@ impl AgentSession {
         let recorded = crate::core::virtual_models::get_branch_selection(&typed, |provider, id| {
             runtime.get_model(provider, id)
         });
-        let Some((recorded_provider, recorded_model_id)) = recorded else {
+        if let Some((recorded_provider, recorded_model_id)) = recorded
+            && (recorded_provider != model.provider || recorded_model_id != model.id)
+        {
+            let recorded_model = self
+                .inner
+                .model_runtime
+                .get_model(&recorded_provider, &recorded_model_id);
+            let current_virtual = crate::core::virtual_models::is_virtual_model(&model);
+            let recorded_virtual = recorded_model
+                .as_ref()
+                .is_some_and(crate::core::virtual_models::is_virtual_model);
+            if (current_virtual || recorded_virtual)
+                && let Err(error) = lock(&self.inner.session_manager)
+                    .append_model_change(&model.provider, &model.id)
+            {
+                tracing::warn!("session append failed: {error}");
+            }
+        }
+
+        let recorded_level = branch.iter().rev().find_map(|entry| match entry.known() {
+            Some(SessionEntry::ThinkingLevelChange(change)) => {
+                crate::cli::args::parse_thinking_level(&change.thinking_level)
+            }
+            _ => None,
+        });
+        let Some(recorded_level) = recorded_level else {
             return;
         };
-        if recorded_provider == model.provider && recorded_model_id == model.id {
-            return;
-        }
-        let recorded_model = self
-            .inner
-            .model_runtime
-            .get_model(&recorded_provider, &recorded_model_id);
-        let current_virtual = crate::core::virtual_models::is_virtual_model(&model);
-        let recorded_virtual = recorded_model
-            .as_ref()
-            .is_some_and(crate::core::virtual_models::is_virtual_model);
-        if !current_virtual && !recorded_virtual {
-            return;
-        }
-        if let Err(error) =
-            lock(&self.inner.session_manager).append_model_change(&model.provider, &model.id)
+        let available = self.get_available_thinking_levels();
+        let effective = if available.contains(&recorded_level) {
+            recorded_level
+        } else {
+            clamp_thinking_level(&model, recorded_level)
+        };
+        if effective != self.thinking_level()
+            && let Err(error) = lock(&self.inner.session_manager)
+                .append_thinking_level_change(thinking_level_str(self.thinking_level()))
         {
             tracing::warn!("session append failed: {error}");
         }
@@ -1518,7 +1550,7 @@ impl AgentSession {
                     let session = AgentSession { inner };
 
                     // `const failed = this._failedResponse; this._failedResponse = undefined;`
-                    // (agent-session.ts:762-763 @ 4a080252f).
+                    // (agent-session.ts:762-763 @ b4afdddf).
                     let failed = session.take_failed_response();
 
                     // `prepare()` (agent-session.ts:764-776): canonical
@@ -1674,7 +1706,7 @@ impl AgentSession {
         )));
     }
 
-    /// `refreshContext` (agent-session.ts:1391-1393 @ 4a080252f): rebuild the
+    /// `refreshContext` (agent-session.ts:1391-1393 @ b4afdddf): rebuild the
     /// finalized agent transcript from the canonical session projection.
     pub fn refresh_context(&self) {
         let projection = lock(&self.inner.session_manager).build_session_projection();
@@ -1682,7 +1714,7 @@ impl AgentSession {
     }
 
     /// `_findPersistedMessageEntryId` (agent-session.ts:1189-1207 @
-    /// 4a080252f): value-equality scan over the branch, then the
+    /// b4afdddf): value-equality scan over the branch, then the
     /// projected-index fallback.
     fn find_persisted_message_entry_id(&self, message: &AgentMessage) -> Option<String> {
         let session = lock(&self.inner.session_manager);
@@ -1710,7 +1742,7 @@ impl AgentSession {
         None
     }
 
-    /// `_omitRecoveryAttempt` (agent-session.ts:1208-1222 @ 4a080252f):
+    /// `_omitRecoveryAttempt` (agent-session.ts:1208-1222 @ b4afdddf):
     /// durably omit a discarded retry/recovery attempt (and the immediate
     /// tool results of its turn) from the model projection while keeping the
     /// raw transcript intact. Fail-soft: append failures are logged and do
@@ -1761,7 +1793,7 @@ impl AgentSession {
     }
 
     // ==================================================================
-    // Boundary cluster (agent-session.ts:858-1016 @ 4a080252f)
+    // Boundary cluster (agent-session.ts:858-1016 @ b4afdddf)
     // ==================================================================
 
     /// `_installAgentBoundaryHooks` (agent-session.ts:852-862):
@@ -1878,7 +1910,7 @@ impl AgentSession {
         boundary.continue_
     }
 
-    /// `_runBeforeSettleBoundary` (agent-session.ts:1846-1869 @ 4a080252f).
+    /// `_runBeforeSettleBoundary` (agent-session.ts:1846-1869 @ b4afdddf).
     async fn run_before_settle_boundary(&self) -> bool {
         let runner = self.runner();
         if !runner.has_handlers("agent_before_settle") {
@@ -2172,14 +2204,14 @@ impl AgentSession {
             cache_warmer.on_agent_settled();
         }
         // `_isEmittingAgentSettled = true` before the dispatch
-        // (agent-session.ts:1053 @ 4a080252f); `finally` clears it. Work
+        // (agent-session.ts:1053 @ b4afdddf); `finally` clears it. Work
         // requested from settled handlers is queued and drained after every
         // handler finished.
         self.inner
             .is_emitting_agent_settled
             .store(true, Ordering::SeqCst);
         // `const aborted = this._agentRunAbortRequested` read once at
-        // emission time (agent-session.ts:1083 @ 4a080252f): extension
+        // emission time (agent-session.ts:1083 @ b4afdddf): extension
         // handlers and session listeners must observe the same value even
         // if a handler requests a new run while settling.
         let aborted = self.inner.agent_run_abort_requested.load(Ordering::SeqCst);
@@ -2195,7 +2227,7 @@ impl AgentSession {
         self.inner
             .is_emitting_agent_settled
             .store(false, Ordering::SeqCst);
-        // `_deferredSettledActions` (agent-session.ts:1052-1068 @ 4a080252f):
+        // `_deferredSettledActions` (agent-session.ts:1052-1068 @ b4afdddf):
         // runs requested from settled handlers execute after every handler
         // finished, then the idle wait resolves.
         let deferred: Vec<_> = std::mem::take(&mut *lock(&self.inner.deferred_settled_actions));
@@ -2210,10 +2242,10 @@ impl AgentSession {
     }
 
     /// `_handleAgentEvent` (agent-session.ts:1074-1086).
-    async fn handle_agent_event(&self, event: AgentEvent) {
+    async fn handle_agent_event(&self, mut event: AgentEvent) {
         // An abort requested while the run was starting (e.g. during
         // before_agent_start) stops it when the loop starts
-        // (agent-session.ts:1104-1107 @ 4a080252f). `agent_start` is awaited
+        // (agent-session.ts:1104-1107 @ b4afdddf). `agent_start` is awaited
         // before the first request.
         if matches!(event, AgentEvent::AgentStart)
             && self.inner.agent_run_abort_requested.load(Ordering::SeqCst)
@@ -2228,29 +2260,49 @@ impl AgentSession {
         // BEFORE emitting (agent-session.ts:598-616).
         if let AgentEvent::MessageStart {
             message: AgentMessage::User(user),
-        } = &event
+        } = &mut event
         {
             self.inner.compaction.lock().await.reset_overflow_recovery();
             let message_text = content_text_user(&user.content, "");
-            if !message_text.is_empty() {
-                let mut steering = lock(&self.inner.steering_messages);
-                if let Some(index) = steering.iter().position(|m| *m == message_text) {
-                    steering.remove(index);
-                    drop(steering);
-                    self.emit_queue_update();
+            let is_queued_delivery =
+                lock(&self.inner.queued_message_generations).remove(&user.timestamp);
+            let mut steering = lock(&self.inner.steering_messages);
+            let steering_index = if is_queued_delivery && !steering.is_empty() {
+                Some(0)
+            } else {
+                steering.iter().position(|m| *m == message_text)
+            };
+            if let Some(index) = steering_index {
+                steering.remove(index);
+                drop(steering);
+                self.emit_queue_update();
+            } else {
+                drop(steering);
+                let mut follow_up = lock(&self.inner.follow_up_messages);
+                let index = if is_queued_delivery && !follow_up.is_empty() {
+                    Some(0)
                 } else {
-                    drop(steering);
-                    let mut follow_up = lock(&self.inner.follow_up_messages);
-                    if let Some(index) = follow_up.iter().position(|m| *m == message_text) {
-                        follow_up.remove(index);
-                        drop(follow_up);
-                        self.emit_queue_update();
-                    }
+                    follow_up.iter().position(|m| *m == message_text)
+                };
+                if let Some(index) = index {
+                    follow_up.remove(index);
+                    drop(follow_up);
+                    self.emit_queue_update();
                 }
             }
         }
 
         // Emit to extensions first (agent-session.ts:619) — no-op seam.
+        //
+        // ORDER CONTRACT (ADR-0049 decision 8 / V19-07 R5.2.8): the assistant
+        // `message_end` extension handlers are AWAITED here, BEFORE the
+        // session persistence below appends the message. rpi-statusline
+        // reads the counts-only `ctx.sessionStats({countsOnly:true})`
+        // watermark inside that handler, so the value it sees must not yet
+        // include the message it is about to account for. Keep persistence
+        // after this point; `extension_host_agent_event_payload_test::
+        // message_end_handlers_run_before_the_message_is_persisted` guards
+        // the order.
         let replaced = self.emit_extension_event(&event).await;
         let event = match replaced {
             Some(message) => AgentEvent::MessageEnd { message },
@@ -2414,7 +2466,7 @@ impl AgentSession {
                 // The boundary normally already ran inside `finishTurn`
                 // (`_boundaryDispatchedMessages`); the event-time fallback
                 // covers messages that bypassed the hook
-                // (agent-session.ts:1267-1271 @ 4a080252f).
+                // (agent-session.ts:1267-1271 @ b4afdddf).
                 if let AgentMessage::Assistant(assistant) = message {
                     let already_dispatched = {
                         let mut dispatched = lock(&self.inner.boundary_dispatched_messages);
@@ -2618,6 +2670,11 @@ impl AgentSession {
             "This extension ctx is stale after session replacement or reload. Do not use a captured rpi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
         );
         lock(&self.inner.listeners).clear();
+        if let Err(error) =
+            rpi_ai::session_resources::cleanup_session_resources(Some(&self.session_id()))
+        {
+            tracing::warn!(error = %error, "Failed to clean up session resources");
+        }
     }
 
     // ==================================================================
@@ -2906,6 +2963,7 @@ impl AgentSession {
             scope: crate::core::skills::SourceScope::Temporary,
             origin: crate::core::skills::SourceOrigin::TopLevel,
             base_dir: None,
+            changelog_path: None,
         }
     }
 
@@ -3156,7 +3214,7 @@ impl AgentSession {
             )
     }
 
-    /// `_getCallableTools` (agent-session.ts:1515-1524 @ 4a080252f): the
+    /// `_getCallableTools` (agent-session.ts:1515-1524 @ b4afdddf): the
     /// active `direct` tools plus every registered `codemode`/`deferred`
     /// tool. `hidden` and `model-only` tools are not callable through
     /// `ctx.executeTool()`.
@@ -3190,7 +3248,7 @@ impl AgentSession {
 
     /// Install the nested-call summary lookup on the shared agent
     /// (`_handleAgentEvent`'s `takeRecord`, agent-session.ts:1074-1086 @
-    /// 4a080252f; V16-06 FR-E). The loop calls it for each finished
+    /// b4afdddf; V16-06 FR-E). The loop calls it for each finished
     /// model-issued tool call.
     fn install_nested_call_summary(&self) {
         let weak = Arc::downgrade(&self.inner);
@@ -3218,7 +3276,7 @@ impl AgentSession {
         runner
     }
 
-    /// `_executeNestedToolCall` (agent-session.ts:702-735 @ 4a080252f): run
+    /// `_executeNestedToolCall` (agent-session.ts:702-735 @ b4afdddf): run
     /// a call a tool made through `ctx.executeTool()` against the callable
     /// tools, through the same pipeline and hooks as model-issued calls.
     pub async fn execute_nested_tool_call(
@@ -3328,7 +3386,7 @@ impl AgentSession {
             .collect()
     }
 
-    /// `getToolDefinition` (agent-session.ts:1478 @ 4a080252f): the
+    /// `getToolDefinition` (agent-session.ts:1478 @ b4afdddf): the
     /// `ToolInfo` JSON for one registered tool, or `None`.
     pub fn get_tool_definition(&self, name: &str) -> Option<serde_json::Value> {
         let definitions = lock(&self.inner.tool_definitions);
@@ -3337,7 +3395,7 @@ impl AgentSession {
             .map(|entry| Self::tool_info_json(name, entry))
     }
 
-    /// `ToolInfo` shape (agent-session.ts:1465-1476 @ 4a080252f; `ToolInfo` =
+    /// `ToolInfo` shape (agent-session.ts:1465-1476 @ b4afdddf; `ToolInfo` =
     /// core/extensions/types.ts:2067): name,
     /// description, parameters, promptGuidelines, exposure, namespace,
     /// annotations, sourceInfo.
@@ -3419,7 +3477,7 @@ impl AgentSession {
             .map(|reaches| reaches(&input))
     }
 
-    /// `setActiveToolsByName` (agent-session.ts:1488-1496 @ 4a080252f).
+    /// `setActiveToolsByName` (agent-session.ts:1488-1496 @ b4afdddf).
     /// A user/API call replaces the restored loadout, so any pending/suppressed
     /// state from the transcript restore no longer applies.
     pub fn set_active_tools_by_name(&self, tool_names: Vec<String>) {
@@ -3447,18 +3505,30 @@ impl AgentSession {
         self.rebuild_system_prompt(&valid_names);
     }
 
-    /// `_applyToolLoadout` (agent-session.ts:1528-1569 @ 4a080252f): the
+    /// `_applyToolLoadout` (agent-session.ts:1528-1569 @ b4afdddf): the
     /// active tools are the registered, non-hidden ones; active tools with a
     /// `prepareLoadout` hook can replace declared descriptions and hide
     /// declarations from requests (the hidden projection lives on the agent
     /// transform chain).
     fn apply_tool_loadout(&self, tool_names: Vec<String>) -> Vec<Arc<dyn AgentTool>> {
+        let requested: HashSet<String> = tool_names.iter().cloned().collect();
+        let mut ordered_names = self
+            .get_active_tool_names()
+            .into_iter()
+            .filter(|name| requested.contains(name))
+            .collect::<Vec<_>>();
+        let mut seen: HashSet<String> = ordered_names.iter().cloned().collect();
+        ordered_names.extend(
+            tool_names
+                .into_iter()
+                .filter(|name| seen.insert(name.clone())),
+        );
         let (tools, loadout, hooks) = {
             let definitions = lock(&self.inner.tool_definitions);
             let registry = lock(&self.inner.tool_registry);
             let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
-            for name in tool_names {
+            for name in ordered_names {
                 if !seen.insert(name.clone()) {
                     continue;
                 }
@@ -3636,7 +3706,7 @@ impl AgentSession {
             // `build_rules` re-derives lines for the CURRENT selected set on
             // every build (#9548 `toolGuidelines`). Hidden declarations are
             // filtered by the builder through `hiddenTools`, not here
-            // (agent-session.ts:1658 @ 4a080252f).
+            // (agent-session.ts:1658 @ b4afdddf).
             let mut tool_snippets: HashMap<String, String> = HashMap::new();
             let mut tool_guidelines: HashMap<String, Vec<String>> = HashMap::new();
             for (name, entry) in definitions.iter() {
@@ -3709,7 +3779,7 @@ impl AgentSession {
         messages: Option<&[AgentMessage]>,
     ) -> Option<rpi_ai::types::SystemMessage> {
         // `options.selectedTools = this._applyToolLoadout(options.selectedTools)
-        // .map(t => t.name)` (agent-session.ts:1693 @ 4a080252f): the
+        // .map(t => t.name)` (agent-session.ts:1693 @ b4afdddf): the
         // prompt's selected tools are executable through the loadout hooks
         // (description replacements + hidden declarations), and the agent
         // tools are set from the same declared list.
@@ -3720,7 +3790,7 @@ impl AgentSession {
         options.selected_tools = Some(valid_tool_names);
         // `options.toolSnippets = Object.fromEntries(Object.entries(...)
         // .filter(([name]) => !this._hiddenDeclarations.has(name)))`
-        // (agent-session.ts:1694-1697 @ 4a080252f) became
+        // (agent-session.ts:1694-1697 @ b4afdddf) became
         // `options.hiddenTools = [...this._hiddenDeclarations]` in v1.1.0
         // (#10343): the builder filters the tool list and rules itself.
         let hidden = lock(&self.inner.hidden_declarations).clone();
@@ -3762,7 +3832,7 @@ impl AgentSession {
     }
 
     /// `_installHiddenDeclarationsProjection` (agent-session.ts:1720-1738 @
-    /// 4a080252f): remove the declarations that `prepareLoadout` hooks hide
+    /// b4afdddf): remove the declarations that `prepareLoadout` hooks hide
     /// from every request. The whole transcript is filtered with the
     /// current set, so the projected declarations stay consistent across
     /// requests and only change when the loadout does. Chained after the
@@ -3890,7 +3960,7 @@ impl AgentSession {
     }
 
     /// `_restoreToolsFromTranscript` (agent-session.ts:1817-1848 @
-    /// 4a080252f + bd3c9b823): restore the loadout the branch records, add
+    /// b4afdddf + bd3c9b823): restore the loadout the branch records, add
     /// extension tools registered after it recorded (unless
     /// `defaultActive:false`), apply `+name`/`-name` modifiers, and keep
     /// recorded tools that have not registered yet pending. Tools the branch
@@ -4005,7 +4075,7 @@ impl AgentSession {
     async fn run_agent_prompt_inner(&self, messages: Vec<AgentMessage>) -> Result<(), RpiError> {
         // Requests made from `agent_settled` handlers wait until every
         // settled handler finished (agent-session.ts:1922 / :2268 @
-        // 4a080252f; rpi adapts the two upstream deferral points to the
+        // b4afdddf; rpi adapts the two upstream deferral points to the
         // single run entry point).
         if self.inner.is_emitting_agent_settled.load(Ordering::SeqCst) {
             let weak = Arc::downgrade(&self.inner);
@@ -4026,7 +4096,7 @@ impl AgentSession {
         // Busy/abort state was armed by `try_mark_run_starting` before
         // preparation; do not clear an abort requested during setup.
         // `this._failedResponse = undefined; this._recordSelection();`
-        // (agent-session.ts:1778-1779 @ 4a080252f).
+        // (agent-session.ts:1778-1779 @ b4afdddf).
         *lock(&self.inner.failed_response) = None;
         self.record_selection();
         let result = async {
@@ -4155,16 +4225,44 @@ impl AgentSession {
             && self.inner.agent.has_queued_messages()
     }
 
+    fn install_queued_message_normalization(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        self.inner
+            .agent
+            .set_prepare_queued_messages(Some(Arc::new(move |messages| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    let Some(inner) = weak.upgrade() else {
+                        return messages;
+                    };
+                    let session = AgentSession { inner };
+                    let mut normalized = Vec::with_capacity(messages.len());
+                    for mut message in messages {
+                        if let AgentMessage::User(user) = &mut message {
+                            let is_queued_image = lock(&session.inner.queued_message_generations)
+                                .contains(&user.timestamp);
+                            if is_queued_image {
+                                session.normalize_queued_message_images(user).await;
+                            }
+                        }
+                        normalized.push(message);
+                    }
+                    normalized
+                })
+            })));
+    }
+
     /// `_normalizePromptImages` (agent-session.ts:1890-1911 @ f5c946480):
     /// run prompt images through the shared `process_image` seam with the
     /// current model's resize profile before they enter the request and
     /// history. Cache-safe: resampling happens before base64 encoding, and a
     /// missing profile keeps the historical global defaults (zero-regression
     /// red line, #9631).
-    fn normalize_prompt_images(
+    async fn normalize_prompt_images(
         &self,
         images: Option<Vec<ImageContent>>,
     ) -> (Vec<ImageContent>, Vec<String>) {
+        let _queue = self.inner.image_resize_queue.lock().await;
         let Some(images) = images else {
             return (Vec::new(), Vec::new());
         };
@@ -4215,8 +4313,38 @@ impl AgentSession {
         (normalized_images, hints)
     }
 
+    async fn normalize_queued_message_images(&self, message: &mut UserMessage) {
+        let UserContent::Blocks(blocks) = &mut message.content else {
+            return;
+        };
+        let Some(UserContentBlock::Text(mut first)) = blocks.first().cloned() else {
+            return;
+        };
+        let images = blocks
+            .iter()
+            .filter_map(|block| match block {
+                UserContentBlock::Image(image) => Some(image.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let (normalized, hints) = self.normalize_prompt_images(Some(images)).await;
+        if !hints.is_empty() {
+            first.text = format!("{}\n\n{}", first.text, hints.join("\n"));
+        }
+        let mut content = vec![UserContentBlock::Text(first.clone())];
+        content.extend(
+            blocks
+                .iter()
+                .filter(|block| !matches!(block, UserContentBlock::Image(_)))
+                .skip(1)
+                .cloned(),
+        );
+        content.extend(normalized.into_iter().map(UserContentBlock::Image));
+        *blocks = content;
+    }
+
     /// Try to mark a run as starting (`_startRun` entry, agent-session.ts:
-    /// 1823-1855 @ 4a080252f): busy before before_agent_start runs, with the
+    /// 1823-1855 @ b4afdddf): busy before before_agent_start runs, with the
     /// previous run's abort request cleared. The compare-exchange is the
     /// single claim point, so two concurrent prompts cannot both observe an
     /// idle session and start a second run. A request during setup persists
@@ -4248,7 +4376,7 @@ impl AgentSession {
     }
 
     /// Prepare a run and return its starting messages (`_prepareRun`,
-    /// agent-session.ts:1879-1934 @ 4a080252f): compaction first, then
+    /// agent-session.ts:1879-1934 @ b4afdddf): compaction first, then
     /// before_agent_start (user or custom trigger), the prompt option/tool
     /// loadout union, followed by the starting message, pending nextTurn
     /// messages and handler-injected custom messages, with the system patch
@@ -4265,7 +4393,7 @@ impl AgentSession {
         }
 
         // before_agent_start extension event (agent-session.ts:1891-1934
-        // @ 4a080252f). Handlers may edit `systemPromptOptions` (collections
+        // @ b4afdddf). Handlers may edit `systemPromptOptions` (collections
         // mutable) or return `systemPrompt` — the runner chains the latter
         // as `forceSystemPrompt` on the options and threads the mutated
         // options back in the combined result.
@@ -4320,7 +4448,8 @@ impl AgentSession {
                 // @ f5c946480): after the hook so extension-driven model
                 // selection determines the resize profile used for the
                 // request and history (#9631).
-                let (normalized_images, image_hints) = self.normalize_prompt_images(images.clone());
+                let (normalized_images, image_hints) =
+                    self.normalize_prompt_images(images.clone()).await;
                 let user_text = if image_hints.is_empty() {
                     prompt.clone()
                 } else {
@@ -4522,7 +4651,7 @@ impl AgentSession {
                 }
 
                 // The session counts as busy from the start of setup
-                // (agent-session.ts:1823-1855 @ 4a080252f): messages sent
+                // (agent-session.ts:1823-1855 @ b4afdddf): messages sent
                 // while before_agent_start handlers run join this run
                 // instead of starting a second one, and an abort requested
                 // meanwhile stops it once the run exists.
@@ -4744,18 +4873,37 @@ impl AgentSession {
             .await
     }
 
+    fn queued_user_message(&self, text: &str, images: Option<Vec<ImageContent>>) -> AgentMessage {
+        let has_images = images.as_ref().is_some_and(|images| !images.is_empty());
+        let mut message = user_message(text, images);
+        let timestamp = self
+            .inner
+            .last_queued_timestamp
+            .fetch_max(now_millis(), Ordering::SeqCst)
+            + 1;
+        if let AgentMessage::User(user) = &mut message {
+            user.timestamp = timestamp;
+        }
+        if has_images {
+            lock(&self.inner.queued_message_generations).insert(timestamp);
+        }
+        message
+    }
+
     /// `_queueSteer` (agent-session.ts:1371-1383).
     async fn queue_steer(&self, text: &str, images: Option<Vec<ImageContent>>) {
         lock(&self.inner.steering_messages).push(text.to_owned());
         self.emit_queue_update();
-        self.inner.agent.steer(user_message(text, images));
+        let message = self.queued_user_message(text, images);
+        self.inner.agent.steer(message);
     }
 
     /// `_queueFollowUp` (agent-session.ts:1388-1400).
     async fn queue_follow_up(&self, text: &str, images: Option<Vec<ImageContent>>) {
         lock(&self.inner.follow_up_messages).push(text.to_owned());
         self.emit_queue_update();
-        self.inner.agent.follow_up(user_message(text, images));
+        let message = self.queued_user_message(text, images);
+        self.inner.agent.follow_up(message);
     }
 
     /// `_throwIfExtensionCommand` (agent-session.ts:1405-1415).
@@ -4812,7 +4960,7 @@ impl AgentSession {
         } else if trigger_turn == Some(true) {
             if self.inner.is_emitting_agent_settled.load(Ordering::SeqCst) {
                 // Defer until every settled handler finished
-                // (agent-session.ts:2335-2343 @ 4a080252f). Re-evaluate the
+                // (agent-session.ts:2335-2343 @ b4afdddf). Re-evaluate the
                 // state at that point by starting the prepared custom run.
                 let session = AgentSession {
                     inner: self.inner.clone(),
@@ -4841,7 +4989,7 @@ impl AgentSession {
     }
 
     /// Start a run from an idle `sendMessage(..., { triggerTurn: true })`
-    /// custom message (`_startRun({messageType:"custom"})` @ 4a080252f): the
+    /// custom message (`_startRun({messageType:"custom"})` @ b4afdddf): the
     /// session is busy from the start of setup, before_agent_start receives
     /// the custom trigger, and the usual pending/nextTurn/system-patch
     /// plumbing builds the starting batch.
@@ -5005,7 +5153,7 @@ impl AgentSession {
                 .store(true, Ordering::SeqCst);
         }
         // `if (this._isBeforeSettle) this._abortDuringBeforeSettle = true`
-        // (agent-session.ts:2394 @ 4a080252f).
+        // (agent-session.ts:2394 @ b4afdddf).
         if self.inner.is_before_settle.load(Ordering::SeqCst) {
             self.inner
                 .abort_during_before_settle
@@ -5639,11 +5787,24 @@ impl AgentSession {
         &self,
         custom_instructions: Option<&str>,
     ) -> Result<CompactionResult, RpiError> {
+        // S45: capture before abort() emits agent_end and clears the
+        // extension's active-parent bit. An already-requested user abort is
+        // Esc, not a compaction interruption.
+        let interrupted = self.is_streaming() && !self.is_abort_requested();
         self.abort().await;
         self.sync_compaction_model().await;
         let result = {
             let mut runner = self.inner.compaction.lock().await;
-            runner.compact(custom_instructions).await
+            runner.set_manual_interrupted(interrupted);
+            let result = runner.compact(custom_instructions).await;
+            // V19-03 S45: emit after the lock is released so `ctx.isIdle`
+            // already reflects the completed compaction.
+            let pending = runner.take_pending_session_compact();
+            let failed = runner.take_pending_session_compact_failed();
+            drop(runner);
+            self.emit_pending_session_compact(pending).await;
+            self.emit_pending_session_compact_failed(failed).await;
+            result
         };
         // `_clearManualCompactionState` (agent-session.ts:1926-1929
         // @ 9841914): resolve a pending `waitForIdle` when the manual
@@ -5667,7 +5828,11 @@ impl AgentSession {
         let outcome = runner
             .check_compaction(assistant_message, skip_aborted_check)
             .await;
+        let pending = runner.take_pending_session_compact();
+        let failed = runner.take_pending_session_compact_failed();
         drop(runner);
+        self.emit_pending_session_compact(pending).await;
+        self.emit_pending_session_compact_failed(failed).await;
         self.resolve_idle_wait_if_idle();
         outcome
     }
@@ -5688,6 +5853,9 @@ impl AgentSession {
     /// `abortBranchSummary` (agent-session.ts:2107-2108, bea67d90d/#8920):
     /// cancel an in-flight branch summary generation.
     pub fn abort_branch_summary(&self) {
+        self.inner
+            .navigation_generation
+            .fetch_add(1, Ordering::SeqCst);
         if let Some(token) = lock(&self.inner.branch_summary_abort).as_ref() {
             token.cancel();
         }
@@ -5766,7 +5934,7 @@ impl AgentSession {
 
         // Keep the failed attempt in raw history while durably omitting it
         // from model projection (`_omitRecoveryAttempt`, agent-session.ts:3738
-        // @ 4a080252f).
+        // @ b4afdddf).
         self.omit_recovery_attempt(message);
 
         let token = CancellationToken::new();
@@ -6023,6 +6191,11 @@ impl AgentSession {
             ));
         }
 
+        let navigation_generation = self
+            .inner
+            .navigation_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
         let old_leaf_id = lock(&self.inner.session_manager)
             .get_leaf_id()
             .map(str::to_owned);
@@ -6109,9 +6282,32 @@ impl AgentSession {
             // V16-12 FR-B R6: route the summary model first under a virtual
             // selection (`_getSummarizationRequestAuth`, agent-session.ts:549-568).
             let (summary_model, summary_thinking_level) = self.summarization_model().await?;
-            let model = summary_model.ok_or_else(|| {
+            let mut model = summary_model.ok_or_else(|| {
                 RpiError::Session("No model available for summarization".to_owned())
             })?;
+            let summary_auth = match self.inner.model_runtime.get_auth(&model, None).await {
+                Ok(auth) => auth,
+                Err(error) if token.is_cancelled() => return Err(RpiError::Session(error.message)),
+                Err(_) => None,
+            };
+            let (api_key, headers, env) = match summary_auth {
+                Some(result) => {
+                    if let Some(base_url) = result.auth.base_url {
+                        model.base_url = base_url;
+                    }
+                    (
+                        result.auth.api_key,
+                        result.auth.headers.map(|headers| {
+                            headers
+                                .into_iter()
+                                .filter(|(_, value)| value.is_some())
+                                .collect()
+                        }),
+                        result.env,
+                    )
+                }
+                None => (None, None, None),
+            };
             let reserve_tokens = lock(&self.inner.resource_loader)
                 .settings_manager_mut()
                 .get_branch_summary_settings()
@@ -6129,13 +6325,15 @@ impl AgentSession {
                     args: &SummarizationArgs {
                         signal: Some(token.clone()),
                         thinking_level: Some(summary_thinking_level),
+                        api_key,
+                        headers,
+                        env,
                         retry: {
                             let mut loader = lock(&self.inner.resource_loader);
                             retry_config_to_policy(
                                 loader.settings_manager_mut().get_retry_settings(),
                             )
                         },
-                        ..Default::default()
                     },
                     custom_instructions: custom_instructions.as_deref(),
                     replace_instructions,
@@ -6164,6 +6362,14 @@ impl AgentSession {
             summary_text = Some(extension_summary.summary);
             summary_details = extension_summary.details;
             summary_usage = extension_summary.usage;
+        }
+
+        if self.inner.navigation_generation.load(Ordering::SeqCst) != navigation_generation {
+            return Ok(NavigateTreeResult {
+                cancelled: true,
+                aborted: true,
+                ..Default::default()
+            });
         }
 
         // Determine the new leaf position (agent-session.ts:3013-3028).
@@ -6743,6 +6949,42 @@ impl AgentSession {
         self.runner()
     }
 
+    /// Emit a `session_compact` deferred by the compaction runner until the
+    /// compaction lock was released (V19-03 S45).
+    async fn emit_pending_session_compact(&self, pending: Option<PendingSessionCompact>) {
+        let Some(pending) = pending else {
+            return;
+        };
+        self.runner()
+            .emit_session_compact(
+                pending.compaction_entry,
+                pending.from_extension,
+                pending.reason.as_str(),
+                pending.will_retry,
+            )
+            .await;
+    }
+
+    /// Emit a deferred `session_compact_failed` after the compaction lock was
+    /// released (V19-03 S45 failure path).
+    async fn emit_pending_session_compact_failed(
+        &self,
+        pending: Option<PendingSessionCompactFailed>,
+    ) {
+        let Some(pending) = pending else {
+            return;
+        };
+        self.runner()
+            .emit_session_compact_failed(
+                pending.reason.as_str(),
+                pending.error_message.as_deref(),
+                pending.aborted,
+                pending.will_retry,
+                pending.from_extension,
+            )
+            .await;
+    }
+
     pub fn extension_mode(&self) -> ExtensionMode {
         *lock(&self.inner.extension_mode)
     }
@@ -7054,5 +7296,22 @@ mod recovery_omission_tests {
                 .any(|message| matches!(message, AgentMessage::ToolResult(result) if result.tool_call_id == "call-truncated")),
             "orphaned result omitted"
         );
+    }
+}
+
+#[cfg(test)]
+mod disposal_tests {
+    #[tokio::test]
+    async fn dispose_cleans_session_provider_resources() {
+        let fixture = crate::modes::interactive::test_support::build_test_session().await;
+        let session_id = fixture.session.session_id();
+        rpi_ai::api::strict_tool_limits::anthropic_mark_exceeded(&session_id);
+        assert!(rpi_ai::api::strict_tool_limits::anthropic_has_exceeded(
+            Some(&session_id)
+        ));
+        fixture.session.dispose();
+        assert!(!rpi_ai::api::strict_tool_limits::anthropic_has_exceeded(
+            Some(&session_id)
+        ));
     }
 }

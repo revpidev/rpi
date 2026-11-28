@@ -160,6 +160,8 @@ pub struct PathMetadata {
     pub scope: SourceScope,
     pub origin: SourceOrigin,
     pub base_dir: Option<PathBuf>,
+    /// Resolved package changelog path (upstream `PathMetadata.changelogPath`).
+    pub changelog_path: Option<PathBuf>,
 }
 
 /// `resourcePrecedenceRank` (package-manager.ts:184-188). Lower rank =
@@ -192,6 +194,8 @@ pub struct SourceInfo {
     pub origin: SourceOrigin,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog_path: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +250,7 @@ fn create_skill_source_info(
         scope,
         origin: SourceOrigin::TopLevel,
         base_dir: Some(base_dir.to_path_buf()),
+        changelog_path: None,
     }
 }
 
@@ -1076,6 +1081,7 @@ pub fn discover_skill_paths(options: &DiscoverSkillsOptions) -> Vec<ResolvedSkil
         scope: SourceScope::Project,
         origin: SourceOrigin::TopLevel,
         base_dir: None,
+        changelog_path: None,
     };
     for entry in resolve_local_skill_entries(
         &options.project_settings_skills,
@@ -1089,6 +1095,7 @@ pub fn discover_skill_paths(options: &DiscoverSkillsOptions) -> Vec<ResolvedSkil
         scope: SourceScope::User,
         origin: SourceOrigin::TopLevel,
         base_dir: None,
+        changelog_path: None,
     };
     for entry in resolve_local_skill_entries(
         &options.global_settings_skills,
@@ -1105,6 +1112,7 @@ pub fn discover_skill_paths(options: &DiscoverSkillsOptions) -> Vec<ResolvedSkil
             scope: SourceScope::Project,
             origin: SourceOrigin::TopLevel,
             base_dir: Some(project_base_dir.clone()),
+            changelog_path: None,
         };
         for path in collect_skill_entries(
             &config::get_project_skills_dir(&cwd),
@@ -1141,6 +1149,7 @@ pub fn discover_skill_paths(options: &DiscoverSkillsOptions) -> Vec<ResolvedSkil
                 scope: SourceScope::Project,
                 origin: SourceOrigin::TopLevel,
                 base_dir: Some(agents_base_dir.clone()),
+                changelog_path: None,
             };
             for path in collect_skill_entries(&agents_skills_dir, SkillDiscoveryMode::Agents) {
                 let enabled = is_enabled_by_overrides(
@@ -1163,6 +1172,7 @@ pub fn discover_skill_paths(options: &DiscoverSkillsOptions) -> Vec<ResolvedSkil
         scope: SourceScope::User,
         origin: SourceOrigin::TopLevel,
         base_dir: Some(global_base_dir.clone()),
+        changelog_path: None,
     };
     for path in collect_skill_entries(&agent_dir.join("skills"), SkillDiscoveryMode::Rpi) {
         let enabled =
@@ -1182,6 +1192,7 @@ pub fn discover_skill_paths(options: &DiscoverSkillsOptions) -> Vec<ResolvedSkil
             scope: SourceScope::User,
             origin: SourceOrigin::TopLevel,
             base_dir: Some(user_agents_base_dir.clone()),
+            changelog_path: None,
         };
         for path in collect_skill_entries(
             &user_agents_base_dir.join("skills"),
@@ -1220,6 +1231,7 @@ pub fn discover_skill_paths(options: &DiscoverSkillsOptions) -> Vec<ResolvedSkil
         scope: SourceScope::User,
         origin: SourceOrigin::TopLevel,
         base_dir: None,
+        changelog_path: None,
     };
     for raw in &options.cli_skill_paths {
         let path = resolve_path(raw.trim(), &cwd);
@@ -1424,7 +1436,7 @@ pub enum SkillFileReadTool {
 }
 
 /// The skill-file reader for a selected/hidden tool set
-/// (system-prompt.ts:160-167 @ 4a080252f): the first DECLARED reader wins; a
+/// (system-prompt.ts:160-167 @ b4afdddf): the first DECLARED reader wins; a
 /// hidden reader is still reachable through another tool, so skills stay and
 /// the hint names no tool (`"indirect"`, #10343).
 pub fn skill_file_read_tool(

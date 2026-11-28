@@ -17,11 +17,15 @@
 //! additive `ctx.sessionFile`, ADR-0022), `ui.setFooter`, `ui.setStatus`,
 //! `ui.setWidget`.
 
+pub mod compact;
 pub mod config;
 pub mod editor;
 pub mod fields;
 pub mod git;
+pub mod incremental;
 pub mod items;
+pub mod live_ticker;
+pub mod live_total;
 pub mod paths;
 pub mod payload;
 pub mod refresh;
@@ -41,6 +45,7 @@ use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls, RpiNativeModule, RpiNativeModule_Ref};
 use serde_json::{Value, json};
 
+use crate::live_total::Settlement;
 use crate::refresh::Trigger;
 use crate::runtime::PluginRuntime;
 use crate::state::EngineState;
@@ -95,6 +100,10 @@ pub struct AsyncHostCalls {
     pub call: extern "C" fn(PluginCookie, RVec<u8>) -> RVec<u8>,
     pub cookie: usize,
 }
+
+/// Streaming-counter counters (CountReset / CountFallback / finalize
+/// mismatches) for diagnostics and the V19-07 fixtures.
+pub use crate::refresh::{reset_ticker_for_test, ticker_stats};
 
 /// Fire one host call from a background context; returns the raw envelope.
 pub fn host_call_static(channel: &AsyncHostCalls, method: &str, args: Value) -> Value {
@@ -228,13 +237,69 @@ pub(crate) fn reconcile_subscriptions(
     // unchanged).
     match settings.status_line.as_ref() {
         Some(config::StatusLine::Items(items)) => {
-            with_engine(|engine| engine.set_live_measure(items.live_enabled()));
+            // V19-07 R5.2.8: the `message_end` callback decides whether to
+            // probe from THIS cache (updated here on every reconcile), never
+            // from the raw settings file.
+            let live_total_selected =
+                items.live_enabled() && items.has_field(crate::fields::FieldId::LiveTotalTokens);
+            with_engine(|engine| {
+                engine.set_live_measure(items.live_enabled());
+                engine.set_live_total_selected(live_total_selected);
+            });
         }
         Some(config::StatusLine::Command(config)) => {
-            with_engine(|engine| engine.set_live_measure(config.live_tokens.enabled));
+            with_engine(|engine| {
+                engine.set_live_measure(config.live_tokens.enabled);
+                // Command mode never creates pending entries or probes.
+                engine.set_live_total_selected(false);
+            });
         }
-        None => with_engine(|engine| engine.set_live_measure(false)),
+        None => with_engine(|engine| {
+            engine.set_live_measure(false);
+            engine.set_live_total_selected(false);
+        }),
     }
+}
+
+/// The ONE counts-only watermark probe of an assistant terminal (V19-07
+/// R5.2.8): `ctx.sessionStats({countsOnly:true})` answers the O(1) counts
+/// shape (`assistantMessages` = `pre_persist_assistant_messages`); an older
+/// host answers the full snapshot instead (same key) — either way only the
+/// count is read and the cached baseline is NOT replaced. A failed call
+/// leaves the watermark unknown (the engine hides the field until a boundary
+/// snapshot recovers it); nothing is ever guessed.
+fn terminal_counts_probe() {
+    // Runtime leg of the R5.2.8 budget: a slow probe (a host answering the
+    // full snapshot, or a regression) sends this terminal to the
+    // lower-bound path — never to the full stats.
+    if !with_engine(|engine| engine.terminal_probe_wanted()) {
+        with_engine(|engine| engine.record_lower_bound_watermark());
+        return;
+    }
+    // Invariant: `CHANNEL` is installed by the first `install` before any
+    // dispatch can reach this point (the dispatch table is registered there).
+    let calls = *CHANNEL
+        .get()
+        .expect("channel cell installed before dispatch")
+        .read()
+        .unwrap_or_else(|error| error.into_inner());
+    let started = std::time::Instant::now();
+    let response = crate::host_call_static(&calls, "ctx.sessionStats", json!({"countsOnly": true}));
+    let elapsed = started.elapsed().as_nanos() as u64;
+    let pre_persist = response
+        .get("ok")
+        .and_then(|ok| ok.get("assistantMessages"))
+        .and_then(Value::as_u64);
+    if pre_persist.is_none() {
+        tracing::debug!(
+            ?response,
+            "rpi-statusline: counts-only sessionStats probe returned no assistantMessages"
+        );
+    }
+    with_engine(|engine| {
+        engine.note_terminal_probe_duration(elapsed);
+        engine.record_terminal_probe(pre_persist);
+    });
 }
 
 /// Event dispatch: light state updates + a channel send, nothing more.
@@ -261,12 +326,20 @@ fn handle_dispatch(message: &Value) -> Value {
     let trigger = match event {
         "message_end" => {
             let message = payload.get("message").cloned().unwrap_or(Value::Null);
-            with_engine(|engine| {
+            let settlement = with_engine(|engine| {
                 engine.accumulate_usage(&message);
                 // FR-C/FR-D: exact output tokens + streaming=false; also
-                // accumulates the live session-total contribution.
-                engine.on_message_end(&message);
+                // settles the live session-total contribution (V19-07).
+                engine.on_message_end(&message)
             });
+            // V19-07 R5.2.8: a provider-exact total needs its persistence
+            // watermark BEFORE this callback returns (the host persists the
+            // message right after it): one synchronous counts-only probe per
+            // assistant terminal, only for items `live-total-tokens`, never a
+            // full `sessionStats` and never on refresh/interval/config_saved.
+            if settlement == Settlement::ProviderExact {
+                terminal_counts_probe();
+            }
             Trigger::Event("message_end")
         }
         "message_start" => {
@@ -278,9 +351,7 @@ fn handle_dispatch(message: &Value) -> Value {
             // first deltas of that window).
             with_engine(|engine| {
                 engine.arm_live_measure();
-                if let Some(live) = engine.live.as_mut() {
-                    live.on_message_start(payload.pointer("/message/role").and_then(Value::as_str));
-                }
+                engine.on_message_start(payload.pointer("/message/role").and_then(Value::as_str));
             });
             Trigger::Live
         }
@@ -308,9 +379,7 @@ fn handle_dispatch(message: &Value) -> Value {
                     return;
                 }
                 engine.arm_live_measure();
-                if let Some(live) = engine.live.as_mut() {
-                    live.on_message_update(&payload);
-                }
+                engine.on_message_update(&payload);
             });
             Trigger::Live
         }

@@ -602,6 +602,8 @@ impl OpenAiCodexOAuth {
         interaction.notify(AuthEvent::DeviceCode {
             user_code: device.user_code.clone(),
             verification_uri: DEVICE_VERIFICATION_URI.to_owned(),
+            open_browser_on_confirm: None,
+            copy_code_on_confirm: None,
             interval_seconds: Some(device.interval_seconds as u64),
             expires_in_seconds: Some(DEVICE_CODE_TIMEOUT_SECONDS as u64),
         });
@@ -1441,6 +1443,8 @@ mod tests {
             Some(AuthEvent::DeviceCode {
                 user_code: "ABCD-1234".to_owned(),
                 verification_uri: DEVICE_VERIFICATION_URI.to_owned(),
+                open_browser_on_confirm: None,
+                copy_code_on_confirm: None,
                 interval_seconds: Some(1),
                 expires_in_seconds: Some(900),
             })
@@ -1539,6 +1543,8 @@ mod tests {
             Some(AuthEvent::DeviceCode {
                 user_code: "WXYZ-7890".to_owned(),
                 verification_uri: DEVICE_VERIFICATION_URI.to_owned(),
+                open_browser_on_confirm: None,
+                copy_code_on_confirm: None,
                 interval_seconds: Some(5),
                 expires_in_seconds: Some(900),
             })

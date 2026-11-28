@@ -1,6 +1,6 @@
 //! The built-in `mcp` extension: `mcp.json` configuration, server
 //! connections, tools/resources, `/mcp` and `rpi mcp` (port of
-//! `packages/coding-agent/src/extensions/mcp/` @ 4a080252f).
+//! `packages/coding-agent/src/extensions/mcp/` @ b4afdddf).
 
 pub mod cli;
 pub mod config;

@@ -1,0 +1,7 @@
+[38;2;95;168;204m────────────────────────────────────────────────────────────────────────────────[39m
+
+ Updated rpi 0.1.9-rc.3 → 0.1.9-rc.4. The previous version is removed           
+ automatically the next time rpi starts after you exit this session. 1 other    
+ running rpi instance is still on rpi 0.1.9-rc.3; they switch over after they   
+ restart.                                                                       
+[38;2;95;168;204m────────────────────────────────────────────────────────────────────────────────[39m

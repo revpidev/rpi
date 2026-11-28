@@ -128,7 +128,11 @@ impl TaskDefinition for ReportExtensionErrorTask {
     ) -> SessionResult<()> {
         runtime.report_info(
             ReportInfo::new(ReportKind::ExtensionError)
-                .with_task(runtime.task_id(), TOOL)
+                .with_task(rpi_durable::harness::ReportTask::new(
+                    runtime.task_id(),
+                    TOOL,
+                    runtime.conversation_id(),
+                ))
                 .with_extension("test"),
         );
         runtime
@@ -747,7 +751,7 @@ pub async fn open_with_storage_settings_and_report(
     storage: Arc<dyn Storage>,
     tasks: Vec<AnyTask>,
     settings: Option<rpi_durable::harness::HarnessSettings>,
-    report_info: Option<rpi_durable::harness::ReportInfoFn>,
+    report_info: Option<rpi_durable::harness::ReportFn>,
 ) -> Opened {
     let registry = Arc::new(RegistryImpl::with_builtins(builtins()));
     if !tasks.is_empty() {
@@ -769,8 +773,8 @@ pub async fn open_with_storage_settings_and_report(
         now: None,
         set_timer: None,
         on_wake: None,
-        on_report: None,
-        on_report_info: report_info,
+        on_report: report_info,
+        read_only: false,
     };
     let harness = open_harness(Arc::clone(&storage), options, &context())
         .await
@@ -797,7 +801,7 @@ pub async fn open_with_telemetry_and_report(
     storage: Arc<dyn Storage>,
     tasks: Vec<AnyTask>,
     telemetry: rpi_durable::harness::TelemetryContext,
-    report_info: Option<rpi_durable::harness::ReportInfoFn>,
+    report_info: Option<rpi_durable::harness::ReportFn>,
 ) -> Opened {
     open_with_telemetry_and_extensions(storage, tasks, telemetry, report_info, Vec::new()).await
 }
@@ -808,7 +812,7 @@ pub async fn open_with_telemetry_and_extensions(
     storage: Arc<dyn Storage>,
     tasks: Vec<AnyTask>,
     telemetry: rpi_durable::harness::TelemetryContext,
-    report_info: Option<rpi_durable::harness::ReportInfoFn>,
+    report_info: Option<rpi_durable::harness::ReportFn>,
     extensions: Vec<Extension>,
 ) -> Opened {
     let registry = Arc::new(RegistryImpl::with_builtins(builtins()));
@@ -834,8 +838,8 @@ pub async fn open_with_telemetry_and_extensions(
         now: None,
         set_timer: None,
         on_wake: None,
-        on_report: None,
-        on_report_info: report_info,
+        on_report: report_info,
+        read_only: false,
     };
     let harness = open_harness(Arc::clone(&storage), options, &context())
         .await

@@ -48,8 +48,8 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         // V16-14 additions: setToolExposures/clearToolExposures write the
         // session exposure override layer (the same surface setActiveTools
         // already exposes through the tools capability).
-        "registerTool" | "unregisterTool" | "toolUpdate" | "executeTool" | "setToolExposures"
-        | "clearToolExposures" => Requires(Capability::Tools),
+        "registerTool" | "unregisterTool" | "toolUpdate" | "executeTool" | "approveToolCall"
+        | "setToolExposures" | "clearToolExposures" => Requires(Capability::Tools),
         // V16-08 FR-E: MCP server registration is tools-capability surface.
         "registerMcpServer" | "unregisterMcpServer" | "getMcpServers" => {
             Requires(Capability::Tools)
@@ -637,6 +637,33 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             serde_json::to_value(&outcome).map_err(|e| ("internal", format!("executeTool: {e}")))
         }
 
+        // V19-03 S13 (additive): run the session's `tool_call` handler chain
+        // for a synthetic call without executing a tool. Native plugins use it
+        // to offer workflow child launches (`subagent_launch`) to permission
+        // extensions. No current-tool binding is required.
+        "approveToolCall" => {
+            let name = str_arg(&args, "name")
+                .ok_or_else(|| ("invalidRequest", "approveToolCall: missing name".to_owned()))?
+                .to_owned();
+            let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
+            let actions = state
+                .api
+                .runtime()
+                .require_actions()
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            let handle = state.async_handle.clone();
+            // Reentrancy guard: this host call synchronously waits on the
+            // handler chain, so a dispatch back into this extension would
+            // deadlock (same rule as executeTool).
+            let _guard = state.api.extension().host_call_guard().clone().enter();
+            let approval = block_on(&handle, async move {
+                actions.approve_tool_call(&name, input).await
+            })?
+            .map_err(|e| (error_kind(&e), e.to_string()))?;
+            serde_json::to_value(approval)
+                .map_err(|e| ("internal", format!("approveToolCall: {e}")))
+        }
+
         // ADR-0015: `toolUpdate(toolCallId, update)` — guest/plugin reports a
         // partial `AgentToolResult` for its in-flight toolExecute. The sink
         // lives in the per-extension pending table for the dispatch duration;
@@ -884,31 +911,41 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
         // for `render` kind "markdownTransform" is handled by the forward
         // path (same as message/entry renderers).
         "registerMarkdownTransformer" => {
+            let options = args
+                .get("options")
+                .cloned()
+                .map(serde_json::from_value::<crate::types::MarkdownTransformerOptions>)
+                .transpose()
+                .map_err(|error| ("invalidRequest", error.to_string()))?
+                .unwrap_or_default();
             let forward = state.forward.clone();
             state
                 .api
-                .register_markdown_transformer(Arc::new(move |markdown, context| {
-                    let forward = forward.clone();
-                    // On error, return the input unchanged (upstream
-                    // applyMarkdownTransformers catches and continues).
-                    match forward.dispatch_blocking(
-                        json!({
-                            "kind": "render",
-                            "what": "markdownTransform",
-                            "markdown": markdown,
-                            "context": context,
-                        }),
-                        false,
-                    ) {
-                        // markdown-transform.ts:19-23: non-string Ok return
-                        // preserves the current markdown (do not assign).
-                        Ok(result) => result
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| markdown.to_owned()),
-                        Err(_) => markdown,
-                    }
-                }))
+                .register_markdown_transformer_with_options(
+                    Arc::new(move |markdown, context| {
+                        let forward = forward.clone();
+                        // On error, return the input unchanged (upstream
+                        // applyMarkdownTransformers catches and continues).
+                        match forward.dispatch_blocking(
+                            json!({
+                                "kind": "render",
+                                "what": "markdownTransform",
+                                "markdown": markdown,
+                                "context": context,
+                            }),
+                            false,
+                        ) {
+                            // markdown-transform.ts:19-23: non-string Ok return
+                            // preserves the current markdown (do not assign).
+                            Ok(result) => result
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| markdown.to_owned()),
+                            Err(_) => markdown,
+                        }
+                    }),
+                    options,
+                )
                 .map_err(|e| ("stale", e.to_string()))?;
             Ok(Value::Null)
         }
@@ -982,7 +1019,9 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             let options = args
                 .get("options")
                 .cloned()
-                .and_then(|v| serde_json::from_value::<crate::api::ExecOptions>(v).ok());
+                .map(serde_json::from_value::<crate::api::ExecOptions>)
+                .transpose()
+                .map_err(|error| ("invalidRequest", error.to_string()))?;
             let api = state.api.clone();
             let handle = state.async_handle.clone();
             block_on(&handle, async move {
@@ -1342,12 +1381,36 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             // rpi additive (ADR-0040 / V18-02): the host's absolute session
             // snapshot. Empty args; unbound hosts answer `null` (feature
             // probe), live hosts answer one consistent object.
-            let stats = state
-                .api
-                .context()
-                .session_stats()
-                .map_err(|e| (error_kind(&e), e.to_string()))?;
-            Ok(serde_json::to_value(stats).unwrap_or(Value::Null))
+            //
+            // V19-07 (ADR-0049 decision 8 / R5.2.8): the OPTIONAL additive
+            // argument `{countsOnly: true}` asks for the O(1) identity +
+            // counts shape instead (no entry clone/iteration, no usage
+            // aggregation). Only the boolean `true` selects it; anything else
+            // keeps the legacy full-snapshot behavior. A host that does not
+            // implement the probe falls back to the full snapshot, so the
+            // guest code is the same on every host (`rpiAbi` stays 1).
+            let counts_only = matches!(args.get("countsOnly"), Some(Value::Bool(true)));
+            let context = state.api.context();
+            let value = if counts_only {
+                let counts = context
+                    .session_counts()
+                    .map_err(|e| (error_kind(&e), e.to_string()))?;
+                match counts {
+                    Some(counts) => serde_json::to_value(counts).unwrap_or(Value::Null),
+                    None => {
+                        let stats = context
+                            .session_stats()
+                            .map_err(|e| (error_kind(&e), e.to_string()))?;
+                        serde_json::to_value(stats).unwrap_or(Value::Null)
+                    }
+                }
+            } else {
+                let stats = context
+                    .session_stats()
+                    .map_err(|e| (error_kind(&e), e.to_string()))?;
+                serde_json::to_value(stats).unwrap_or(Value::Null)
+            };
+            Ok(value)
         }
         "ctx.getSystemPrompt" => Ok(json!(
             state
@@ -2124,11 +2187,15 @@ mod session_stats_tests {
         CompactOptions, ContextActions, ContextUsage, ExtensionApi, ExtensionRuntime,
         LoadedExtension,
     };
-    use crate::types::{SessionStatsSnapshot, SessionTokenStats};
+    use crate::types::{SessionCountsSnapshot, SessionStatsSnapshot, SessionTokenStats};
     use crate::wasm::{Capability, DispatchTarget, HostState, WasmForward};
 
     struct StatsActions {
         stats: Option<SessionStatsSnapshot>,
+        /// `None` models a host that predates the counts-only probe.
+        counts: Option<SessionCountsSnapshot>,
+        /// How many times each probe ran (the budget: ≤ 1 per terminal).
+        probes: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
@@ -2162,6 +2229,11 @@ mod session_stats_tests {
         }
         fn session_stats(&self) -> Option<SessionStatsSnapshot> {
             self.stats.clone()
+        }
+        fn session_counts(&self) -> Option<SessionCountsSnapshot> {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.counts.clone()
         }
     }
 
@@ -2204,6 +2276,8 @@ mod session_stats_tests {
     #[test]
     fn snapshot_serializes_camel_case_and_omits_memory_session_file() {
         let actions = Arc::new(StatsActions {
+            counts: None,
+            probes: std::sync::atomic::AtomicUsize::new(0),
             stats: Some(SessionStatsSnapshot {
                 session_id: "s1".to_owned(),
                 session_file: None,
@@ -2247,9 +2321,112 @@ mod session_stats_tests {
         assert!(value.get("tokens").and_then(|t| t.get("total")).is_none());
     }
 
+    fn full_snapshot() -> SessionStatsSnapshot {
+        SessionStatsSnapshot {
+            session_id: "s1".to_owned(),
+            session_file: Some("/tmp/s1.jsonl".to_owned()),
+            started_at: "2026-10-27T10:00:00Z".to_owned(),
+            entry_count: 9,
+            user_messages: 4,
+            assistant_messages: 5,
+            tokens: SessionTokenStats {
+                input: 10,
+                output: 20,
+                cache_read: 30,
+                cache_write: 40,
+            },
+            cost: 1.5,
+        }
+    }
+
+    /// V19-07 (R5.2.8): `{countsOnly: true}` answers the identity + counts
+    /// shape — no `tokens`, no `cost` — from the O(1) probe, and nothing
+    /// else selects it.
+    #[test]
+    fn counts_only_arg_selects_the_counts_shape() {
+        let actions = Arc::new(StatsActions {
+            stats: Some(full_snapshot()),
+            counts: Some(SessionCountsSnapshot {
+                session_id: "s1".to_owned(),
+                session_file: Some("/tmp/s1.jsonl".to_owned()),
+                started_at: "2026-10-27T10:00:00Z".to_owned(),
+                entry_count: 9,
+                user_messages: 4,
+                assistant_messages: 5,
+            }),
+            probes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        state
+            .api
+            .runtime()
+            .set_context_actions(Some(actions.clone() as Arc<dyn ContextActions>));
+        let value =
+            dispatch(&mut state, "ctx.sessionStats", json!({"countsOnly": true})).expect("probe");
+        assert_eq!(
+            value,
+            json!({
+                "sessionId": "s1",
+                "sessionFile": "/tmp/s1.jsonl",
+                "startedAt": "2026-10-27T10:00:00Z",
+                "entryCount": 9,
+                "userMessages": 4,
+                "assistantMessages": 5,
+            })
+        );
+        assert!(
+            value.get("tokens").is_none(),
+            "the probe never aggregates usage"
+        );
+        assert!(value.get("cost").is_none());
+        assert_eq!(actions.probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Every other argument shape keeps the full snapshot (and never
+        // runs the probe).
+        for args in [
+            json!({}),
+            json!({"countsOnly": false}),
+            json!({"countsOnly": "true"}),
+            json!({"countsOnly": 1}),
+            json!({"countsOnly": null}),
+        ] {
+            let value = dispatch(&mut state, "ctx.sessionStats", args.clone()).expect("full");
+            assert_eq!(value["tokens"]["output"], 20, "{args}");
+            assert!(value.get("cost").is_some(), "{args}");
+        }
+        assert_eq!(actions.probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A host without the O(1) probe answers `{countsOnly:true}` with its
+    /// full snapshot: the argument is additive and `rpiAbi` stays 1.
+    #[test]
+    fn counts_only_falls_back_to_the_full_snapshot_on_an_old_host() {
+        let actions = Arc::new(StatsActions {
+            stats: Some(full_snapshot()),
+            counts: None,
+            probes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        state
+            .api
+            .runtime()
+            .set_context_actions(Some(actions as Arc<dyn ContextActions>));
+        let value = dispatch(&mut state, "ctx.sessionStats", json!({"countsOnly": true}))
+            .expect("fallback");
+        assert_eq!(value["assistantMessages"], 5);
+        assert_eq!(value["tokens"]["cacheWrite"], 40);
+        // Unbound stays `null` for both shapes.
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        assert_eq!(
+            dispatch(&mut state, "ctx.sessionStats", json!({"countsOnly": true})).expect("unbound"),
+            Value::Null
+        );
+    }
+
     #[test]
     fn file_backed_session_keeps_the_path() {
         let actions = Arc::new(StatsActions {
+            counts: None,
+            probes: std::sync::atomic::AtomicUsize::new(0),
             stats: Some(SessionStatsSnapshot {
                 session_id: "s2".to_owned(),
                 session_file: Some("/tmp/s2.jsonl".to_owned()),

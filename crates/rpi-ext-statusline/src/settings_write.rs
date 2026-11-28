@@ -19,6 +19,16 @@
 //!
 //! The host and the subagents writer implement the identical A→B protocol;
 //! this module is the statusline participant, not a third lock.
+//!
+//! Two platform rules shape the Windows paths (the host coordinator in
+//! `crates/rpi/src/core/settings_write.rs` follows the same two). (1) A
+//! `LockFileEx` range is mandatory for every *other* handle, including
+//! handles of the locking process itself, so the re-read under A goes through
+//! the handle that owns the lock ([`read_locked`]); a path read would fail
+//! with `ERROR_LOCK_VIOLATION` (33) on every save. (2) A directory cannot be
+//! renamed while it contains an open handle, so lease directories are moved
+//! aside by [`retire_lease`], which closes the handle first and re-verifies
+//! the token when the held-handle rename is refused.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -110,7 +120,9 @@ pub fn save_status_line(
     let host_lock = acquire_host_lock(&target)?;
     let lease = acquire_lease(&target)?;
     let result = (|| {
-        let raw = match std::fs::read_to_string(&target) {
+        // Read through the A handle: Windows denies a second handle the
+        // locked range (`ERROR_LOCK_VIOLATION`), see `read_locked`.
+        let raw = match read_locked(&host_lock) {
             Ok(raw) => Some(strip_bom(&raw).to_owned()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(WriteError::io("reading settings", error)),
@@ -133,7 +145,7 @@ pub fn save_status_line(
             let _ = fs2::FileExt::unlock(&host_lock);
             drop(host_lock);
             atomic_replace(&target, &body, mode)?;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(windows))]
         {
@@ -270,7 +282,7 @@ fn is_lock_contended(error: &io::Error) -> bool {
     }
     #[cfg(windows)]
     {
-        return error.raw_os_error() == Some(33);
+        error.raw_os_error() == Some(33)
     }
     #[cfg(not(windows))]
     {
@@ -333,14 +345,64 @@ impl Drop for LeaseGuard {
             self.lock_path.display(),
             self.token
         ));
-        let renamed = std::fs::rename(&self.lock_path, &released).is_ok();
-        self.lock_file.take();
+        // Platform rules as in `retire_lease`: Unix renames while the
+        // lease.lock handle is held; Windows closes it first, token-checked.
+        let renamed = retire_lease(
+            &self.lock_path,
+            &released,
+            self.lock_file.take(),
+            Some(self.token.as_str()),
+        );
         if renamed {
             let _ = std::fs::remove_dir_all(&released);
         } else if read_owner(&self.lock_path).is_some_and(|owner| owner.token == self.token) {
             let _ = std::fs::remove_dir_all(&self.lock_path);
         }
     }
+}
+
+/// Bytes of a file held under lock A, read through the handle that owns the
+/// lock (the only handle Windows lets read a locked range; see the module
+/// notes).
+fn read_locked(file: &std::fs::File) -> io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut reader = file;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut text = String::new();
+    reader.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Move a lease directory aside to `retired` and report whether it moved.
+/// On Unix the rename happens while `lock_handle` (the claimed `lease.lock`
+/// handle, `None` for a legacy lease without one) is still held, so no second
+/// reclaimer can race the take-over. Windows cannot rename a directory that
+/// contains an open handle (`ERROR_ACCESS_DENIED`): the first attempt failing
+/// costs nothing, and the retry runs after the handle is closed, only while
+/// the directory still carries the expected token (`None` for an ownerless
+/// directory). A peer that claimed and replaced the lease in between writes
+/// a fresh token, and a replacement lease is never renamed aside by a late
+/// reclaimer — on any platform, so the token gate runs before the first
+/// attempt too.
+fn retire_lease(
+    lock_path: &Path,
+    retired: &Path,
+    lock_handle: Option<std::fs::File>,
+    expected_token: Option<&str>,
+) -> bool {
+    let lease_unchanged =
+        || read_owner(lock_path).map(|owner| owner.token) == expected_token.map(str::to_owned);
+    if !lease_unchanged() {
+        return false;
+    }
+    let Some(lock_handle) = lock_handle else {
+        return std::fs::rename(lock_path, retired).is_ok();
+    };
+    if std::fs::rename(lock_path, retired).is_ok() {
+        return true;
+    }
+    drop(lock_handle);
+    lease_unchanged() && std::fs::rename(lock_path, retired).is_ok()
 }
 
 fn read_owner(lock_path: &Path) -> Option<LeaseOwner> {
@@ -414,9 +476,12 @@ fn try_lease(lock_path: &Path) -> io::Result<Option<LeaseGuard>> {
                     );
                     let retired =
                         PathBuf::from(format!("{}.retired-{}", lock_path.display(), token));
-                    let renamed = std::fs::rename(lock_path, &retired).is_ok();
-                    drop(dead_lock);
-                    if renamed {
+                    if retire_lease(
+                        lock_path,
+                        &retired,
+                        Some(dead_lock),
+                        previous.as_ref().map(|owner| owner.token.as_str()),
+                    ) {
                         return try_lease(lock_path);
                     }
                     return Ok(None);
@@ -615,6 +680,8 @@ fn new_token() -> String {
 }
 
 fn atomic_replace(target: &Path, body: &str, mode: Option<u32>) -> Result<(), WriteError> {
+    #[cfg(not(unix))]
+    let _ = mode;
     let temp = target.with_file_name(format!(
         ".{}.{}.{}.tmp",
         target
@@ -863,5 +930,83 @@ mod tests {
         // different fingerprint, which is a conservative conflict.
         assert_ne!(fingerprint(Some(&first)), fingerprint(Some(&second)));
         assert_eq!(fingerprint(None), "null");
+    }
+
+    /// The re-read under A goes through the handle that owns the lock. The
+    /// pre-fix path read (`read_to_string(path)`) is a second handle, which
+    /// Windows denies with `ERROR_LOCK_VIOLATION` (33) while the first one
+    /// holds the exclusive `LockFileEx` range — every save failed with
+    /// "reading settings" on Windows.
+    #[test]
+    fn read_locked_reads_through_the_handle_that_owns_lock_a() {
+        let dir = temp_dir("read-locked");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{\n  \"statusLine\": null\n}\n").expect("write");
+        let host_lock = acquire_host_lock(&path).expect("A");
+        #[cfg(windows)]
+        {
+            let error = std::fs::read_to_string(&path)
+                .expect_err("a second handle cannot read the locked range");
+            assert_eq!(error.raw_os_error(), Some(33), "{error}");
+        }
+        let raw = read_locked(&host_lock).expect("read through the lock handle");
+        assert_eq!(raw, "{\n  \"statusLine\": null\n}\n");
+        let _ = fs2::FileExt::unlock(&host_lock);
+        drop(host_lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale lease directory with its `lease.lock` already claimed (the
+    /// `LeaseLockState::Dead` handle) and the owner metadata the test names.
+    fn dead_lease_dir(lock: &Path, token: &str) -> std::fs::File {
+        std::fs::create_dir_all(lock).expect("mkdir");
+        let owner = LeaseOwner {
+            token: token.to_owned(),
+            pid: std::process::id() as u64,
+            hostname: local_hostname(),
+            process_start: None,
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_vec(&owner).unwrap())
+            .expect("owner");
+        std::fs::write(lock.join(LEASE_LOCK_FILE), b"").expect("lease.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock.join(LEASE_LOCK_FILE))
+            .expect("open");
+        file.try_lock_exclusive().expect("claim");
+        file
+    }
+
+    /// A dead lease is retired with its claimed handle open: Unix renames
+    /// around the open handle, Windows retries after closing it. Either way
+    /// the stale directory leaves `settings.json.write-lock`, which used to
+    /// be impossible on Windows (rename refused, 200 ms wait, lock timeout on
+    /// every later save).
+    #[test]
+    fn retire_lease_moves_a_dead_lease_while_its_lock_handle_is_open() {
+        let dir = temp_dir("retire-dead");
+        let lock = dir.join("settings.json.write-lock");
+        let retired = dir.join("settings.json.write-lock.retired-stale");
+        let dead = dead_lease_dir(&lock, "stale");
+        assert!(retire_lease(&lock, &retired, Some(dead), Some("stale")));
+        assert!(!lock.exists(), "stale lease left the live path");
+        assert!(retired.is_dir(), "kept as the protocol fence");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peer that claimed and replaced the lease after the dead owner
+    /// vanished writes a fresh token; the late reclaimer must leave it alone.
+    #[test]
+    fn retire_lease_never_moves_a_replacement_lease() {
+        let dir = temp_dir("retire-fresh");
+        let lock = dir.join("settings.json.write-lock");
+        let retired = dir.join("settings.json.write-lock.retired-stale");
+        let claimed = dead_lease_dir(&lock, "fresh");
+        assert!(!retire_lease(&lock, &retired, None, Some("stale")));
+        assert!(!retire_lease(&lock, &retired, Some(claimed), Some("stale")));
+        assert!(lock.is_dir(), "replacement lease retained");
+        assert!(!retired.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

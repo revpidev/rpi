@@ -68,10 +68,10 @@ fn adaptive_model() -> Model {
     // upstream fixture asserts the opposite via opus's catalog compat, so
     // mirror that by marking adaptive).
     let mut model = test_model("claude-opus-4-6");
-    model.compat = Some(rpi_ai::types::ModelCompat {
+    model.compat = Some(Box::new(rpi_ai::types::ModelCompat {
         force_adaptive_thinking: Some(true),
         ..Default::default()
-    });
+    }));
     model
 }
 

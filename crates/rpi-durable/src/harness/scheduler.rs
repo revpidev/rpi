@@ -1,10 +1,10 @@
 //! Task scheduler of one Harness (port of
-//! `packages/durable/src/harness/scheduler.ts` @ `4a080252f`).
+//! `packages/durable/src/harness/scheduler.ts` @ `b4afdddf`).
 //!
 //! [`TaskScheduler`] mirrors every committed non-terminal task (`pending`,
 //! `running`, `waiting`, `completing`) in memory; the synchronous commit
-//! listener updates that mirror on the Session line, so code running on the line
-//! reads exactly the committed state. Tasks and conversations form one ownership
+//! listener updates that mirror in Writer publication order, so a decision
+//! after its publication barrier reads exactly the committed state. Tasks and conversations form one ownership
 //! tree; walks up it decide cascades, idle scopes, and whether a task's ordinary
 //! owned work is live (which holds its outcome as `completing` and delays its
 //! abort handler).
@@ -40,7 +40,7 @@ use crate::chord::context::{Context, await_with_context, with_abort_signal};
 use crate::chord::json::{JsonObject, JsonValue};
 use crate::chord::telemetry::TelemetrySpan;
 use crate::documents::DocToken;
-use crate::harness::context::{ContextRange, read_context_from};
+use crate::harness::context::{ContextRange, advance_range, read_context_from};
 use crate::harness::live::{LiveRun, LiveState, SchedulerOutcome, settle_scheduler_outcome};
 use crate::harness::registry::{COMPACTION_TASK_NAME, GENERATION_TASK_NAME};
 use crate::harness::submissions::Submissions;
@@ -139,13 +139,10 @@ pub struct InvocationBinding {
 #[async_trait]
 pub trait SchedulerService: Send + Sync {
     /// Enable scheduling (idempotent); upstream `TaskScheduler.resume()`.
-    fn resume(&self);
+    fn resume(&self) -> SessionResult<()>;
 
     /// When the Session next needs a running process.
     fn wake(&self) -> Wake;
-
-    /// Run a task parked by the restart limit again.
-    async fn retry_task(&self, id: TaskId, context: &Context) -> SessionResult<()>;
 
     /// Load live tasks and rewind surviving `running` tasks to `pending`
     /// (upstream `open()`); part of `Harness.open`.
@@ -162,6 +159,7 @@ pub trait SchedulerService: Send + Sync {
         conversation_id: ConversationId,
         live: &DocDraft,
         inputs: Vec<SubmissionId>,
+        first: Option<EntryId>,
     ) -> SessionResult<()>;
 
     /// Create a manual compaction task and return its ID.
@@ -241,11 +239,8 @@ pub struct SchedulerDeps {
     pub settings: SettingsSource,
     /// Environment factory.
     pub env: Option<EnvFactory>,
-    /// Receives extension failures.
+    /// Receives extension failures through the single report channel.
     pub report: ReportFn,
-    /// Fixed-field report callback for the host. The scheduler emits the
-    /// report's telemetry itself before calling it.
-    pub report_info: Option<crate::harness::types::ReportInfoFn>,
     /// Wall clock.
     pub now: NowFn,
     /// Host timers.
@@ -277,6 +272,7 @@ enum InvocationMode {
 /// One in-memory execution of a task (upstream `Invocation`).
 struct Invocation {
     task_id: TaskId,
+    kind: String,
     conversation_id: ConversationId,
     mode: InvocationMode,
     /// Adapter-owned parent carrier stored on the task record.
@@ -434,6 +430,26 @@ enum Decider {
 struct KeptContext {
     range: ContextRange,
     idle_since: Option<f64>,
+    expires_at: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct IdleDeadline(f64, ConversationId);
+
+impl Eq for IdleDeadline {}
+
+impl Ord for IdleDeadline {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .total_cmp(&other.0)
+            .then_with(|| self.1.cmp(&other.1))
+    }
+}
+
+impl PartialOrd for IdleDeadline {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Outcome of `abort` staged inside its commit (upstream inline return).
@@ -443,6 +459,44 @@ struct AbortCommit {
 }
 
 /// Shared scheduler state. Methods take `self: &Arc<Self>` so they can spawn.
+struct FaultedTask {
+    record: TaskRecord,
+    message: String,
+    durable: bool,
+    reserve_id: u64,
+}
+
+/// Unsubscribes a temporary commit listener and drops that reserve's pending
+/// faults even if `reserve` is dropped before it can report them.
+struct ListenerGuard {
+    subscription: Option<Subscription>,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl ListenerGuard {
+    fn new(subscription: Subscription, cleanup: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            subscription: Some(subscription),
+            cleanup: Some(Box::new(cleanup)),
+        }
+    }
+
+    fn unsubscribe(&mut self) {
+        if let Some(subscription) = self.subscription.take() {
+            subscription.unsubscribe();
+        }
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+impl Drop for ListenerGuard {
+    fn drop(&mut self) {
+        self.unsubscribe();
+    }
+}
+
 struct SchedulerInner {
     session: Arc<SessionImpl>,
     storage: Arc<dyn Storage>,
@@ -451,7 +505,6 @@ struct SchedulerInner {
     settings: SettingsSource,
     env: Option<EnvFactory>,
     report: ReportFn,
-    report_info: Option<crate::harness::types::ReportInfoFn>,
     now: NowFn,
     timers: Arc<Timers>,
     on_wake: Option<WakeFn>,
@@ -466,7 +519,19 @@ struct SchedulerInner {
     submissions: std::sync::OnceLock<Arc<Submissions>>,
     live: Mutex<BTreeMap<TaskId, TaskRecord>>,
     contexts: Mutex<BTreeMap<ConversationId, KeptContext>>,
+    idle_order: Mutex<BTreeSet<IdleDeadline>>,
+    runnable: Mutex<BTreeSet<TaskId>>,
+    finalize_checks: Mutex<BTreeSet<TaskId>>,
+    sleeping: Mutex<BTreeSet<TaskId>>,
+    waiters: Mutex<BTreeMap<TaskId, BTreeSet<TaskId>>>,
+    unloaded: Mutex<BTreeSet<TaskId>>,
+    owned_by: Mutex<BTreeMap<TaskId, BTreeSet<TaskId>>>,
+    record_owners: Mutex<BTreeMap<TaskId, BTreeSet<TaskId>>>,
+    full_idle_checks: AtomicU64,
+    candidate_visits: AtomicU64,
     invocations: Mutex<BTreeMap<TaskId, Arc<Invocation>>>,
+    faulted: Mutex<Vec<FaultedTask>>,
+    next_fault_reserve: AtomicU64,
     task_waiters: Waiters<TaskId, SettledTask<JsonValue>>,
     idle_waiters: Waiters<Option<ConversationId>, ()>,
     /// Definition whose migration failed per task; retried only for another definition.
@@ -510,7 +575,6 @@ impl SchedulerInner {
             settings: deps.settings,
             env: deps.env,
             report: Arc::clone(&deps.report),
-            report_info: deps.report_info,
             now: deps.now,
             timers: Timers::new(deps.set_timer, Arc::clone(&deps.report)),
             on_wake: deps.on_wake,
@@ -524,7 +588,19 @@ impl SchedulerInner {
             submissions: std::sync::OnceLock::new(),
             live: Mutex::new(BTreeMap::new()),
             contexts: Mutex::new(BTreeMap::new()),
+            idle_order: Mutex::new(BTreeSet::new()),
+            runnable: Mutex::new(BTreeSet::new()),
+            finalize_checks: Mutex::new(BTreeSet::new()),
+            sleeping: Mutex::new(BTreeSet::new()),
+            waiters: Mutex::new(BTreeMap::new()),
+            unloaded: Mutex::new(BTreeSet::new()),
+            owned_by: Mutex::new(BTreeMap::new()),
+            record_owners: Mutex::new(BTreeMap::new()),
+            full_idle_checks: AtomicU64::new(0),
+            candidate_visits: AtomicU64::new(0),
             invocations: Mutex::new(BTreeMap::new()),
+            faulted: Mutex::new(Vec::new()),
+            next_fault_reserve: AtomicU64::new(1),
             task_waiters: Waiters::new(),
             idle_waiters: Waiters::new(),
             failed_migrations: Mutex::new(BTreeMap::new()),
@@ -566,19 +642,16 @@ impl SchedulerInner {
             ),
             None => None,
         };
-        // Wrapper renames report `extension_error`; route them through the
-        // scheduler's telemetry path like every other scheduler report.
-        let report_info: crate::harness::types::ReportInfoFn = {
-            let inner = Arc::clone(self);
-            let context = context.clone();
-            Arc::new(move |info| inner.report_fixed_with(info, Some(&context)))
-        };
+        let report_context = context.clone();
+        let this = Arc::clone(self);
+        let report: ReportFn = Arc::new(move |report| {
+            this.report_error(report.error, report.info, Some(&report_context));
+        });
         Ok(resolve_agent(
             state.as_ref(),
             snapshot.as_ref(),
             &self.settings(),
-            &self.report,
-            Some(&report_info),
+            &report,
         ))
     }
 
@@ -628,27 +701,77 @@ impl SchedulerInner {
             .subscribe_close(Arc::new(move || sealer.seal()));
         let kicker = Arc::clone(self);
         let subscription = self.registry.subscribe(Arc::new(move || {
+            let ids: Vec<TaskId> = kicker
+                .live
+                .lock()
+                .map(|live| live.keys().copied().collect())
+                .unwrap_or_default();
+            if let Ok(mut runnable) = kicker.runnable.lock() {
+                runnable.extend(ids);
+            }
             kicker.notify_blocked();
             kicker.kick();
         }));
         if let Ok(mut slot) = self.unsubscribe_registry.lock() {
             *slot = Some(subscription);
         }
-        let this = Arc::clone(self);
-        self.session
-            .commit_with(
-                commit_fn(move |tx| {
-                    let this = Arc::clone(&this);
-                    Box::pin(async move { this.open_tasks(tx).await })
-                }),
-                context,
-                None,
-            )
-            .await?;
+        if self.session.is_read_only() {
+            self.open_read_only_tasks(context).await?;
+        } else {
+            let this = Arc::clone(self);
+            self.session
+                .commit_with(
+                    commit_fn(move |tx| {
+                        let this = Arc::clone(&this);
+                        Box::pin(async move { this.open_tasks(tx).await })
+                    }),
+                    context,
+                    None,
+                )
+                .await?;
+        }
         // Derive abort marks a crash left unapplied below cancelled owners, and
-        // finalize held outcomes.
-        self.cascade_pending.store(true, Ordering::SeqCst);
-        self.schedule_reconcile();
+        // finalize held outcomes. Read-only sessions only load the committed mirror.
+        if !self.session.is_read_only() {
+            self.cascade_pending.store(true, Ordering::SeqCst);
+            self.schedule_reconcile();
+        }
+        Ok(())
+    }
+
+    async fn open_read_only_tasks(self: &Arc<Self>, context: &Context) -> SessionResult<()> {
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::Waiting,
+            TaskStatus::Sleeping,
+            TaskStatus::Completing,
+        ] {
+            let mut cursor = None;
+            loop {
+                let page = self
+                    .storage
+                    .scan_tasks(
+                        TaskQuery {
+                            status: Some(status),
+                            ..TaskQuery::default()
+                        },
+                        SCAN_PAGE_SIZE,
+                        cursor,
+                        context,
+                    )
+                    .await?;
+                for record in page.items {
+                    if let Ok(mut live) = self.live.lock() {
+                        live.insert(record.id, record);
+                    }
+                }
+                match page.next {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+        }
         Ok(())
     }
 
@@ -684,19 +807,24 @@ impl SchedulerInner {
             }
             scans.push(records);
         }
-        let mut parked: Vec<TaskRecord> = Vec::new();
         for records in scans {
             for record in records {
                 let mut record = record;
-                if let Ok(mut resumed) = self.resumed.lock() {
+                if !self.session.is_read_only()
+                    && let Ok(mut resumed) = self.resumed.lock()
+                {
                     resumed.insert(record.id);
                 }
                 // A task its creator awaited only in memory is abandoned after a
                 // restart: it is marked below, after the crash count, so that the
                 // mark's fresh count is the one the record ends with (upstream
                 // counts first and marks in the first reservation pass).
-                let abandoned = record.abandon_on_restart && !record.abort_requested;
-                if let TaskState::Running { checkpoint } = &record.state {
+                let abandoned = !self.session.is_read_only()
+                    && record.abandon_on_restart
+                    && !record.abort_requested;
+                if !self.session.is_read_only()
+                    && let TaskState::Running { checkpoint } = &record.state
+                {
                     // A crash, eviction, or reset cut the phase off: count it and
                     // write the task back as pending. A normal close writes the
                     // same state in `join` without counting.
@@ -708,12 +836,6 @@ impl SchedulerInner {
                         },
                     );
                     pending.restarts = record.restarts;
-                    if let Some(limit) = self.restart_limit().limit()
-                        && record.restarts.unwrap_or(0) as u64 >= limit
-                        && !record.abort_requested
-                    {
-                        parked.push(record.clone());
-                    }
                     tx.set_task(pending.clone())?;
                     record = pending;
                 }
@@ -728,6 +850,7 @@ impl SchedulerInner {
                 if let Ok(mut live) = self.live.lock() {
                     live.insert(record.id, record.clone());
                 }
+                self.track_transition(None, &record);
                 self.telemetry.record_metric(
                     "pi.durable.tasks.active",
                     1.0,
@@ -746,19 +869,6 @@ impl SchedulerInner {
                 }
             }
         }
-        for record in parked {
-            let restarts = record.restarts.unwrap_or(0);
-            (self.report)(format!(
-                "Task {} ({}) was cut off {restarts} times without progress; it is parked until retryTask()",
-                record.id, record.kind
-            ));
-            self.report_fixed(
-                crate::harness::types::ReportInfo::new(
-                    crate::harness::types::ReportKind::TaskParked,
-                )
-                .with_task(record.id, record.kind.clone()),
-            );
-        }
         Ok(())
     }
 
@@ -776,14 +886,8 @@ impl SchedulerInner {
         self.settings().restart_limit
     }
 
-    /// Whether a subject was parked by the restart limit.
-    fn parked_subject(&self, record: &BlockedSubject) -> bool {
-        !record.abort_requested
-            && self
-                .restart_limit()
-                .limit()
-                .map(|limit| record.restarts.unwrap_or(0) as u64 >= limit)
-                .unwrap_or(false)
+    fn limits_restarts(kind: &str) -> bool {
+        matches!(kind, "pi.generation" | "pi.tool" | "pi.compaction")
     }
 
     /// Why a live task cannot run here, if it cannot (upstream `blockedReason`).
@@ -797,21 +901,19 @@ impl SchedulerInner {
         if record.abort_requested && record.abort_reason.is_none() {
             return None;
         }
-        if self.parked_subject(record) {
-            return Some(BlockedReason::RestartLimit);
-        }
         let snapshot = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.registry.snapshot()
         })) {
             Ok(snapshot) => snapshot,
             Err(_) => {
                 if !self.registry_snapshot_reported.swap(true, Ordering::SeqCst) {
-                    (self.report)("The task registry snapshot failed".to_string());
-                    self.report_fixed(
+                    self.report_error(
+                        "The task registry snapshot failed".to_string(),
                         crate::harness::types::ReportInfo::new(
                             crate::harness::types::ReportKind::HostError,
                         )
                         .with_callback("registry"),
+                        None,
                     );
                 }
                 return None;
@@ -842,16 +944,15 @@ impl SchedulerInner {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener()))
             {
                 let message = crate::session::session::panic_message(payload);
-                (self.report)(format!("A blocked listener failed: {message}"));
-                self.report_fixed(crate::harness::types::ReportInfo::new(
-                    crate::harness::types::ReportKind::ListenerError,
-                ));
+                self.report_error(
+                    format!("A blocked listener failed: {message}"),
+                    crate::harness::types::ReportInfo::new(
+                        crate::harness::types::ReportKind::ListenerError,
+                    ),
+                    None,
+                );
             }
         }
-    }
-
-    fn report_fixed(&self, info: crate::harness::types::ReportInfo) {
-        self.report_fixed_with(info, None);
     }
 
     fn report_fixed_with(
@@ -859,26 +960,38 @@ impl SchedulerInner {
         info: crate::harness::types::ReportInfo,
         context: Option<&Context>,
     ) {
+        self.report_error(format!("{:?}", info.kind), info, context);
+    }
+
+    fn report_error(
+        &self,
+        message: String,
+        info: crate::harness::types::ReportInfo,
+        context: Option<&Context>,
+    ) {
         emit_report_telemetry(&self.telemetry, &info, context);
-        if let Some(report) = &self.report_info {
-            // A host callback that throws is contained (upstream `contained`).
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(info)));
+        let report = crate::harness::types::Report::new(info, message);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.report)(report)));
+    }
+
+    fn resume(self: &Arc<Self>) -> SessionResult<()> {
+        if self.session.is_read_only() {
+            return Err(SessionError::ReadOnlySession);
         }
-    }
-
-    /// Whether a record is parked by the restart limit.
-    fn parked(&self, record: &TaskRecord) -> bool {
-        self.parked_subject(&BlockedSubject::of(record))
-    }
-
-    fn resume(self: &Arc<Self>) {
         self.enabled.store(true, Ordering::SeqCst);
         self.schedule_wake();
         self.kick();
+        Ok(())
     }
 
     /// When this Session next needs a running process.
     fn wake_snapshot(self: &Arc<Self>) -> Wake {
+        if self.session.is_read_only() {
+            return Wake {
+                active: false,
+                at: None,
+            };
+        }
         let now = (self.now)();
         // A reconcile pass with work to do is work as well: it finalizes held
         // outcomes and marks cascades. Counting the scheduled/running pass
@@ -893,6 +1006,11 @@ impl SchedulerInner {
             || self.reconciling.load(Ordering::SeqCst)
             || self.cascade_pending.load(Ordering::SeqCst)
             || self
+                .finalize_checks
+                .lock()
+                .map(|checks| !checks.is_empty())
+                .unwrap_or(false)
+            || self
                 .fail_fast_checks
                 .lock()
                 .map(|checks| !checks.is_empty())
@@ -900,11 +1018,23 @@ impl SchedulerInner {
         let mut at: Option<f64> = None;
         let mut snapshot: Option<Arc<dyn RegistrySnapshot>> = None;
         let mut snapshot_failed = false;
-        let records: Vec<TaskRecord> = self
-            .live
+        let mut ids: BTreeSet<TaskId> = self
+            .runnable
             .lock()
-            .map(|live| live.values().cloned().collect())
+            .map(|runnable| runnable.iter().copied().collect())
             .unwrap_or_default();
+        if let Ok(sleeping) = self.sleeping.lock() {
+            ids.extend(sleeping.iter().copied());
+        }
+        let records: Vec<TaskRecord> = ids
+            .into_iter()
+            .filter_map(|id| {
+                self.live
+                    .lock()
+                    .ok()
+                    .and_then(|live| live.get(&id).cloned())
+            })
+            .collect();
         for record in records {
             if matches!(record.state, TaskState::Completing { .. }) {
                 continue;
@@ -930,13 +1060,7 @@ impl SchedulerInner {
             if active {
                 continue;
             }
-            // A parked task waits for `retryTask()`, not for a process.
-            if self.parked(&record) {
-                continue;
-            }
-            if record.abort_requested
-                && !self.waiting_on(&record, &self.owned_live(None)).is_empty()
-            {
+            if record.abort_requested && !self.waiting_on(&record).is_empty() {
                 continue;
             }
             if !record.abort_requested || record.abort_reason.is_some() {
@@ -948,12 +1072,13 @@ impl SchedulerInner {
                         Err(_) => {
                             snapshot_failed = true;
                             if !self.registry_snapshot_reported.swap(true, Ordering::SeqCst) {
-                                (self.report)("The task registry snapshot failed".to_string());
-                                self.report_fixed(
+                                self.report_error(
+                                    "The task registry snapshot failed".to_string(),
                                     crate::harness::types::ReportInfo::new(
                                         crate::harness::types::ReportKind::HostError,
                                     )
                                     .with_callback("registry"),
+                                    None,
                                 );
                             }
                         }
@@ -1029,7 +1154,14 @@ impl SchedulerInner {
                 *last = Some(wake);
             }
         } else {
-            (self.report)("HarnessOptions.onWake threw".to_string());
+            self.report_error(
+                "HarnessOptions.onWake threw".to_string(),
+                crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::HostError,
+                )
+                .with_callback("onWake"),
+                None,
+            );
         }
     }
 
@@ -1065,37 +1197,6 @@ impl SchedulerInner {
         *slot = Some((at, disarm));
     }
 
-    async fn retry_task(self: &Arc<Self>, id: TaskId, context: &Context) -> SessionResult<()> {
-        let this = Arc::clone(self);
-        self.session
-            .commit_with(
-                commit_fn(move |tx| {
-                    let this = Arc::clone(&this);
-                    Box::pin(async move {
-                        let Some(current) = tx.task(id).await? else {
-                            return Err(SessionError::message(format!("Task {id} does not exist")));
-                        };
-                        if matches!(
-                            current.state,
-                            TaskState::Terminal { .. } | TaskState::Completing { .. }
-                        ) || !this.parked(&current)
-                        {
-                            return Ok(());
-                        }
-                        let mut next = current.clone();
-                        next.restarts = None;
-                        tx.set_task(next)?;
-                        Ok(())
-                    })
-                }),
-                context,
-                None,
-            )
-            .await?;
-        self.resume();
-        Ok(())
-    }
-
     async fn join(self: &Arc<Self>) -> SessionResult<()> {
         // A close is not a crash: mark the scheduler closing before cancelling
         // invocations, so a phase ended by the close is `aborted`, not faulted.
@@ -1127,6 +1228,7 @@ impl SchedulerInner {
                     let this = Arc::clone(&this);
                     let ids = ids.clone();
                     Box::pin(async move {
+                        this.session.wait_for_all_writers().await?;
                         for id in ids {
                             let record = this
                                 .live
@@ -1200,6 +1302,7 @@ impl SchedulerInner {
         id: TaskId,
         keep_restart: bool,
     ) -> SessionResult<AbortCommit> {
+        self.session.wait_for_all_writers().await?;
         let Some(current) = tx.task(id).await? else {
             return Err(SessionError::message(format!("Task {id} does not exist")));
         };
@@ -1224,7 +1327,7 @@ impl SchedulerInner {
         }
         if invocation.is_none() && !matches!(current.state, TaskState::Completing { .. }) {
             self.load_scopes(false).await?;
-            if !self.owned_live(None).contains_key(&id) {
+            if self.owned_children(id, None).is_empty() {
                 let snapshot = self.registry.snapshot();
                 if let Resolution::Blocked { reason, .. } = self.resolve(&current, &snapshot) {
                     self.terminate(
@@ -1284,13 +1387,21 @@ impl SchedulerInner {
                     let record = this.storage.task(id, &read_context).await?;
                     match record {
                         None => Err(SessionError::message(format!("Task {id} does not exist"))),
-                        Some(record) => Ok(Box::pin(async move { Ok(settled_task(record)) })
-                            as WaitFuture<SettledTask<JsonValue>>),
+                        Some(record) => {
+                            Ok(Box::pin(async move { Ok(settled_task((*record).clone())) })
+                                as WaitFuture<SettledTask<JsonValue>>)
+                        }
                     }
                 })
             })
             .await;
-        found?.await.map_err(Into::into)
+        let found = found?;
+        // A waiter settles on the task's terminal publication; a fault
+        // recorded by a later, still-unpublished reserve commit is not
+        // reported before it is durable.
+        let settled = found.await.map_err(Into::into);
+        self.report_faulted();
+        settled
     }
 
     async fn wait_for_idle(
@@ -1327,6 +1438,7 @@ impl SchedulerInner {
                 commit_fn(move |tx| {
                     let this = Arc::clone(&this);
                     Box::pin(async move {
+                        this.session.wait_for_all_writers().await?;
                         let queued = this.load_scopes(true).await?;
                         let scope = Scope::Conversation(conversation_id);
                         let mut reached: Vec<TaskId> = Vec::new();
@@ -1409,6 +1521,18 @@ impl SchedulerInner {
         if let Ok(mut contexts) = self.contexts.lock() {
             contexts.clear();
         }
+        if let Ok(mut order) = self.idle_order.lock() {
+            order.clear();
+        }
+        if let Ok(mut runnable) = self.runnable.lock() {
+            runnable.clear();
+        }
+        if let Ok(mut sleeping) = self.sleeping.lock() {
+            sleeping.clear();
+        }
+        if let Ok(mut checks) = self.finalize_checks.lock() {
+            checks.clear();
+        }
         if let Ok(mut resumed) = self.resumed.lock() {
             resumed.clear();
         }
@@ -1424,7 +1548,208 @@ impl SchedulerInner {
 
     // ─── Observation ────────────────────────────────────────────────────────
 
+    fn advance_contexts(self: &Arc<Self>, publication: &CommitPublication) {
+        if self
+            .contexts
+            .lock()
+            .map(|contexts| contexts.is_empty())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let mut appended: BTreeMap<ConversationId, Vec<crate::types::EntryRecord>> =
+            BTreeMap::new();
+        for change in &publication.changes {
+            let CommitChange::Table(StorageWrite::Entry { value }) = change else {
+                continue;
+            };
+            if self
+                .contexts
+                .lock()
+                .map(|contexts| contexts.contains_key(&value.conversation_id))
+                .unwrap_or(false)
+            {
+                appended
+                    .entry(value.conversation_id)
+                    .or_default()
+                    .push(value.clone());
+            }
+        }
+        if appended.is_empty() {
+            return;
+        }
+        let now = (self.now)();
+        for (id, entries) in appended {
+            let expired = self
+                .contexts
+                .lock()
+                .ok()
+                .and_then(|contexts| contexts.get(&id).and_then(|kept| kept.expires_at))
+                .is_some_and(|expires| expires <= now);
+            if expired {
+                self.drop_context(id);
+                continue;
+            }
+            let advanced = self
+                .contexts
+                .lock()
+                .ok()
+                .and_then(|contexts| contexts.get(&id).map(|kept| kept.range.clone()))
+                .and_then(|range| advance_range(range, &entries));
+            match advanced {
+                Some(range) => {
+                    if let Ok(mut contexts) = self.contexts.lock()
+                        && let Some(kept) = contexts.get_mut(&id)
+                    {
+                        kept.range = range;
+                    }
+                }
+                None => self.drop_context(id),
+            }
+        }
+    }
+
+    fn track_transition(self: &Arc<Self>, previous: Option<&TaskRecord>, record: &TaskRecord) {
+        if previous.is_none()
+            && let Ok(mut unloaded) = self.unloaded.lock()
+        {
+            unloaded.insert(record.id);
+        }
+        if let Ok(mut waiters) = self.waiters.lock() {
+            if let Some(TaskState::Waiting { on, .. }) = previous.map(|previous| &previous.state) {
+                let mut empty = Vec::new();
+                for dependency in on {
+                    if let Some(parents) = waiters.get_mut(dependency) {
+                        parents.remove(&record.id);
+                        if parents.is_empty() {
+                            empty.push(*dependency);
+                        }
+                    }
+                }
+                for dependency in empty {
+                    waiters.remove(&dependency);
+                }
+            }
+            if let TaskState::Waiting { on, .. } = &record.state {
+                for dependency in on {
+                    waiters.entry(*dependency).or_default().insert(record.id);
+                }
+            }
+        }
+        if matches!(record.state, TaskState::Terminal { .. }) {
+            if let Ok(mut runnable) = self.runnable.lock() {
+                runnable.remove(&record.id);
+            }
+            if let Ok(mut sleeping) = self.sleeping.lock() {
+                sleeping.remove(&record.id);
+            }
+            if let Ok(mut checks) = self.finalize_checks.lock() {
+                checks.remove(&record.id);
+            }
+            let waiters = self
+                .waiters
+                .lock()
+                .map(|mut waiters| waiters.remove(&record.id).unwrap_or_default())
+                .unwrap_or_default();
+            if let Ok(mut runnable) = self.runnable.lock() {
+                runnable.extend(waiters);
+            }
+            let holders = self
+                .record_owners
+                .lock()
+                .ok()
+                .and_then(|owners| owners.get(&record.id).cloned())
+                .unwrap_or_default();
+            if let Ok(mut runnable) = self.runnable.lock() {
+                runnable.extend(holders.iter().copied());
+            }
+            if let Ok(mut checks) = self.finalize_checks.lock() {
+                checks.extend(holders.iter().copied());
+            }
+            if let Ok(mut owners) = self.record_owners.lock() {
+                owners.remove(&record.id);
+            }
+            if let Ok(mut owned) = self.owned_by.lock() {
+                for holder in holders {
+                    if let Some(children) = owned.get_mut(&holder) {
+                        children.remove(&record.id);
+                        if children.is_empty() {
+                            owned.remove(&holder);
+                        }
+                    }
+                }
+                owned.remove(&record.id);
+            }
+            return;
+        }
+        self.reindex_owned(record);
+        if let Ok(mut sleeping) = self.sleeping.lock() {
+            if matches!(record.state, TaskState::Sleeping { .. }) {
+                sleeping.insert(record.id);
+            } else {
+                sleeping.remove(&record.id);
+            }
+        }
+        if let Ok(mut checks) = self.finalize_checks.lock() {
+            if matches!(record.state, TaskState::Completing { .. }) {
+                checks.insert(record.id);
+            } else {
+                checks.remove(&record.id);
+            }
+        }
+        let ready = match &record.state {
+            TaskState::Pending { .. } | TaskState::Running { .. } => true,
+            TaskState::Waiting { .. } => self.waiting_on(record).is_empty(),
+            _ => false,
+        };
+        if let Ok(mut runnable) = self.runnable.lock() {
+            if ready {
+                runnable.insert(record.id);
+            } else {
+                runnable.remove(&record.id);
+            }
+        }
+    }
+
+    fn reindex_owned(self: &Arc<Self>, record: &TaskRecord) {
+        let previous = self
+            .record_owners
+            .lock()
+            .map(|mut owners| owners.remove(&record.id).unwrap_or_default())
+            .unwrap_or_default();
+        if let Ok(mut owned) = self.owned_by.lock() {
+            for ancestor in previous {
+                if let Some(children) = owned.get_mut(&ancestor) {
+                    children.remove(&record.id);
+                }
+            }
+            if record.background {
+                return;
+            }
+            let mut ancestors = BTreeSet::new();
+            for step in self.above(parent_of(record), None) {
+                match step {
+                    Step::Unknown => break,
+                    Step::Conversation(_) => {}
+                    Step::Task(id, node) => {
+                        owned.entry(id).or_default().insert(record.id);
+                        ancestors.insert(id);
+                        if node.background {
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Ok(mut owners) = self.record_owners.lock()
+                && !ancestors.is_empty()
+            {
+                owners.insert(record.id, ancestors);
+            }
+        }
+    }
+
     fn observe(self: &Arc<Self>, publication: &CommitPublication, context: &Context) {
+        self.advance_contexts(publication);
         let telemetry = context.telemetry();
         let mut updated: Vec<TaskRecord> = Vec::new();
         let mut failed: Vec<TaskId> = Vec::new();
@@ -1481,6 +1806,7 @@ impl SchedulerInner {
                 failed.push(record.id);
             }
             if matches!(record.state, TaskState::Terminal { .. }) {
+                self.track_transition(previous.as_ref(), record);
                 if previous.is_some() {
                     telemetry.record_metric(
                         "pi.durable.tasks.active",
@@ -1580,6 +1906,7 @@ impl SchedulerInner {
                         .unwrap_or_default(),
                 );
             }
+            self.track_transition(previous.as_ref(), record);
             updated.push(record.clone());
         }
         for id in failed {
@@ -1644,24 +1971,24 @@ impl SchedulerInner {
             return;
         }
         self.prune_ownership_indexes();
-        self.settle_idle();
+        self.settle_idle_scopes(Some(
+            updated
+                .iter()
+                .map(|record| record.conversation_id)
+                .collect(),
+        ));
         self.kick();
     }
 
     /// Keep only the terminal ownership nodes a live task's walk still reaches.
     fn prune_ownership_indexes(self: &Arc<Self>) {
-        let records: Vec<TaskRecord> = self
-            .live
+        let mut needed: BTreeSet<TaskId> = self
+            .owned_by
             .lock()
-            .map(|live| live.values().cloned().collect())
+            .map(|owned| owned.keys().copied().collect())
             .unwrap_or_default();
-        let mut needed: BTreeSet<TaskId> = BTreeSet::new();
-        for record in &records {
-            for step in self.above(parent_of(record), None) {
-                if let Step::Task(id, _) = step {
-                    needed.insert(id);
-                }
-            }
+        if let Ok(owners) = self.record_owners.lock() {
+            needed.extend(owners.values().flatten().copied());
         }
         if let Ok(mut settled) = self.settled.lock() {
             settled.retain(|id, _| needed.contains(id));
@@ -1672,49 +1999,133 @@ impl SchedulerInner {
     }
 
     fn settle_idle(self: &Arc<Self>) {
+        self.settle_idle_scopes(None);
+    }
+
+    fn settle_idle_scopes(self: &Arc<Self>, scopes: Option<BTreeSet<ConversationId>>) {
+        if scopes.is_none() {
+            self.full_idle_checks.fetch_add(1, Ordering::SeqCst);
+        }
         for conversation_id in self.idle_waiters.keys() {
+            if conversation_id.is_some()
+                && scopes
+                    .as_ref()
+                    .is_some_and(|scopes| !scopes.contains(&conversation_id.expect("conversation")))
+            {
+                continue;
+            }
             if self.idle(conversation_id) {
                 self.idle_waiters.resolve(conversation_id, ());
             }
         }
         let now = (self.now)();
         let retention = self.settings().context_retention_ms as f64;
-        let Ok(mut contexts) = self.contexts.lock() else {
-            return;
-        };
-        let keys: Vec<ConversationId> = contexts.keys().copied().collect();
+        self.expire_contexts(now, retention);
+        let keys: Vec<ConversationId> = self
+            .contexts
+            .lock()
+            .map(|contexts| {
+                contexts
+                    .keys()
+                    .filter(|id| scopes.as_ref().is_none_or(|scopes| scopes.contains(*id)))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
         for id in keys {
-            let expired = contexts
-                .get(&id)
-                .and_then(|kept| kept.idle_since)
-                .map(|since| now - since >= retention)
-                .unwrap_or(false);
-            if expired {
-                contexts.remove(&id);
-                continue;
-            }
             if !self.idle(Some(id)) {
-                if let Some(kept) = contexts.get_mut(&id) {
-                    kept.idle_since = None;
-                }
-            } else if retention > 0.0 {
-                if let Some(kept) = contexts.get_mut(&id)
-                    && kept.idle_since.is_none()
-                {
-                    kept.idle_since = Some(now);
-                }
+                self.mark_context_busy(id);
+            } else if retention <= 0.0 {
+                self.drop_context(id);
             } else {
-                contexts.remove(&id);
+                let mark = self
+                    .contexts
+                    .lock()
+                    .ok()
+                    .and_then(|mut contexts| {
+                        contexts.get_mut(&id).and_then(|kept| {
+                            if kept.idle_since.is_some() {
+                                None
+                            } else {
+                                kept.idle_since = Some(now);
+                                kept.expires_at = Some(now + retention);
+                                Some(())
+                            }
+                        })
+                    })
+                    .is_some();
+                if mark && let Ok(mut order) = self.idle_order.lock() {
+                    order.insert(IdleDeadline(now, id));
+                }
             }
         }
-        drop(contexts);
         self.schedule_expiry();
+    }
+
+    fn mark_context_busy(&self, id: ConversationId) {
+        let since = self.contexts.lock().ok().and_then(|mut contexts| {
+            contexts.get_mut(&id).and_then(|kept| {
+                let since = kept.idle_since.take();
+                kept.expires_at = None;
+                since
+            })
+        });
+        if let Some(since) = since
+            && let Ok(mut order) = self.idle_order.lock()
+        {
+            order.remove(&IdleDeadline(since, id));
+        }
+    }
+
+    fn drop_context(&self, id: ConversationId) {
+        let since = self
+            .contexts
+            .lock()
+            .ok()
+            .and_then(|mut contexts| contexts.remove(&id).and_then(|kept| kept.idle_since));
+        if let Some(since) = since
+            && let Ok(mut order) = self.idle_order.lock()
+        {
+            order.remove(&IdleDeadline(since, id));
+        }
+    }
+
+    fn expire_contexts(&self, now: f64, retention: f64) {
+        loop {
+            let next = self
+                .idle_order
+                .lock()
+                .ok()
+                .and_then(|order| order.first().copied());
+            let Some(next) = next else {
+                return;
+            };
+            if retention > 0.0 && next.0 + retention > now {
+                return;
+            }
+            if let Ok(mut order) = self.idle_order.lock() {
+                order.remove(&next);
+            }
+            let current = self
+                .contexts
+                .lock()
+                .ok()
+                .and_then(|contexts| contexts.get(&next.1).and_then(|kept| kept.idle_since));
+            if current == Some(next.0)
+                && let Ok(mut contexts) = self.contexts.lock()
+            {
+                contexts.remove(&next.1);
+            }
+        }
     }
 
     // ─── Ownership ──────────────────────────────────────────────────────────
 
     fn schedule_reconcile(self: &Arc<Self>) {
-        if self.reconcile_scheduled.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) {
+        if self.reconcile_scheduled.load(Ordering::SeqCst)
+            || self.closing.load(Ordering::SeqCst)
+            || self.session.is_read_only()
+        {
             return;
         }
         self.reconcile_scheduled.store(true, Ordering::SeqCst);
@@ -1767,6 +2178,7 @@ impl SchedulerInner {
         cascade: bool,
         checks: Vec<TaskId>,
     ) -> SessionResult<()> {
+        self.session.wait_for_all_writers().await?;
         if self.closing.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -1776,11 +2188,14 @@ impl SchedulerInner {
         // Staged first, so a request wins over a `restart` mark of the same pass
         // (upstream `#reconcile` `mark()`).
         let mut marks: BTreeMap<TaskId, (TaskRecord, Option<String>)> = BTreeMap::new();
-        let records: Vec<TaskRecord> = self
-            .live
-            .lock()
-            .map(|live| live.values().cloned().collect())
-            .unwrap_or_default();
+        let records: Vec<TaskRecord> = if cascade {
+            self.live
+                .lock()
+                .map(|live| live.values().cloned().collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         for record in records {
             if record.background {
                 continue;
@@ -1841,7 +2256,11 @@ impl SchedulerInner {
             let record = self.live.lock().ok().and_then(|live| live.get(id).cloned());
             let record = match record {
                 Some(record) => Some(record),
-                None => self.storage.task(*id, &self.context).await?,
+                None => self
+                    .storage
+                    .task(*id, &self.context)
+                    .await?
+                    .map(|record| (*record).clone()),
             };
             if record
                 .map(|record| failed_outcome(&record))
@@ -1854,49 +2273,73 @@ impl SchedulerInner {
     }
 
     async fn finalize(self: &Arc<Self>, tx: &mut Transaction) -> SessionResult<()> {
+        let mut candidates: BTreeSet<TaskId> = self
+            .finalize_checks
+            .lock()
+            .map(|mut checks| std::mem::take(&mut *checks))
+            .unwrap_or_default();
         loop {
-            let overlay = overlay_of(tx);
-            let owned = self.owned_live(Some(&overlay));
-            let done: Vec<TaskRecord> = self
-                .live_records(Some(&overlay))
-                .into_iter()
-                .filter(|record| {
-                    matches!(record.state, TaskState::Completing { .. })
-                        && !owned.contains_key(&record.id)
-                })
-                .collect();
-            if done.is_empty() {
+            if candidates.is_empty() {
                 return Ok(());
             }
-            for record in done {
+            let overlay = overlay_of(tx);
+            let mut next = BTreeSet::new();
+            for id in candidates {
+                let record = overlay.tasks.get(&id).cloned().or_else(|| {
+                    self.live
+                        .lock()
+                        .ok()
+                        .and_then(|live| live.get(&id).cloned())
+                });
+                let Some(record) = record else {
+                    continue;
+                };
                 let TaskState::Completing { outcome } = &record.state else {
                     continue;
                 };
+                if !self.owned_children(id, Some(&overlay)).is_empty() {
+                    continue;
+                }
                 tx.set_task(with_state(
                     &record,
                     TaskState::Terminal {
                         outcome: outcome.clone(),
                     },
                 ))?;
-                // Only the scheduler writes `faulted` and `orphaned`; their
-                // Harness cleanup waits for this commit.
                 if let Some(scheduler_outcome) = scheduler_outcome(outcome) {
                     settle_scheduler_outcome(tx, &record, &scheduler_outcome).await?;
                 }
+                let holders = self
+                    .record_owners
+                    .lock()
+                    .ok()
+                    .and_then(|owners| owners.get(&id).cloned())
+                    .unwrap_or_default();
+                next.extend(holders);
             }
+            candidates = next;
         }
     }
 
     async fn load_scopes(self: &Arc<Self>, queued: bool) -> SessionResult<Vec<ConversationId>> {
-        let live: Vec<TaskRecord> = self
-            .live
+        let pending: Vec<TaskId> = self
+            .unloaded
             .lock()
-            .map(|live| live.values().cloned().collect())
+            .map(|mut unloaded| std::mem::take(&mut *unloaded).into_iter().collect())
             .unwrap_or_default();
-        for record in live {
+        for id in pending {
+            let record = self
+                .live
+                .lock()
+                .ok()
+                .and_then(|live| live.get(&id).cloned());
+            let Some(record) = record else {
+                continue;
+            };
             if !self.chain_known(parent_of(&record), None) {
                 self.load_chain(parent_of(&record), None).await?;
             }
+            self.reindex_owned(&record);
         }
         if !queued {
             return Ok(Vec::new());
@@ -1962,8 +2405,9 @@ impl SchedulerInner {
                         Some(edge) => edge,
                         None => {
                             let record = self.storage.conversation(id, &self.context).await?;
-                            let owner =
-                                record.and_then(|record| record.owner.map(|owner| owner.task_id));
+                            let owner = record.and_then(|record| {
+                                record.owner.as_ref().map(|owner| owner.task_id)
+                            });
                             self.set_edge(id, owner);
                             owner
                         }
@@ -2089,6 +2533,42 @@ impl SchedulerInner {
         records
     }
 
+    fn owned_children(self: &Arc<Self>, id: TaskId, overlay: Option<&Overlay>) -> Vec<TaskId> {
+        let mut children = self
+            .owned_by
+            .lock()
+            .ok()
+            .and_then(|owned| owned.get(&id).cloned())
+            .unwrap_or_default();
+        if let Some(overlay) = overlay {
+            for (task, staged) in &overlay.tasks {
+                if matches!(staged.state, TaskState::Terminal { .. }) {
+                    children.remove(task);
+                }
+            }
+            for record in overlay.tasks.values() {
+                if record.background || matches!(record.state, TaskState::Terminal { .. }) {
+                    continue;
+                }
+                for step in self.above(parent_of(record), Some(overlay)) {
+                    match step {
+                        Step::Unknown => break,
+                        Step::Conversation(_) => {}
+                        Step::Task(ancestor, node) => {
+                            if ancestor == id {
+                                children.insert(record.id);
+                            }
+                            if node.background {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        children.into_iter().collect()
+    }
+
     fn owned_live(self: &Arc<Self>, overlay: Option<&Overlay>) -> BTreeMap<TaskId, Vec<TaskId>> {
         let mut owned: BTreeMap<TaskId, Vec<TaskId>> = BTreeMap::new();
         for record in self.live_records(overlay) {
@@ -2192,12 +2672,11 @@ impl SchedulerInner {
             return;
         }
         let retention = self.settings().context_retention_ms as f64;
-        let at = self.contexts.lock().ok().and_then(|contexts| {
-            contexts
-                .values()
-                .filter_map(|kept| kept.idle_since.map(|since| since + retention))
-                .reduce(f64::min)
-        });
+        let at = self
+            .idle_order
+            .lock()
+            .ok()
+            .and_then(|order| order.first().map(|deadline| deadline.0 + retention));
         let mut slot = match self.expiry_timer.lock() {
             Ok(slot) => slot,
             Err(_) => return,
@@ -2220,7 +2699,8 @@ impl SchedulerInner {
             if let Ok(mut slot) = this.expiry_timer.lock() {
                 slot.take();
             }
-            this.settle_idle();
+            let retention = this.settings().context_retention_ms as f64;
+            this.expire_contexts((this.now)(), retention);
             this.schedule_expiry();
         });
         let delay = (at - (self.now)()).max(0.0);
@@ -2273,49 +2753,109 @@ impl SchedulerInner {
         }
     }
 
+    fn report_faulted(&self) {
+        let faulted = self
+            .faulted
+            .lock()
+            .ok()
+            .map(|mut values| {
+                let all = std::mem::take(&mut *values);
+                let (ready, pending): (Vec<_>, Vec<_>) =
+                    all.into_iter().partition(|fault| fault.durable);
+                *values = pending;
+                ready
+            })
+            .unwrap_or_default();
+        for FaultedTask {
+            record, message, ..
+        } in faulted
+        {
+            self.report_error(
+                message,
+                crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::TaskFaulted,
+                )
+                .with_task(crate::harness::types::ReportTask::new(
+                    record.id,
+                    record.kind,
+                    record.conversation_id,
+                ))
+                .with_reason("restart_limit"),
+                None,
+            );
+        }
+    }
+
     async fn reserve(self: &Arc<Self>) -> SessionResult<Vec<Reservation>> {
         let out: Arc<Mutex<Vec<Reservation>>> = Arc::new(Mutex::new(Vec::new()));
-        let faulted: Arc<Mutex<Vec<(TaskRecord, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let this = Arc::clone(self);
         let out_commit = Arc::clone(&out);
-        let faulted_commit = Arc::clone(&faulted);
+        let reserve_id = self.next_fault_reserve.fetch_add(1, Ordering::SeqCst);
+        let cleanup = Arc::clone(self);
+        // A restart-limit fault is recorded in the commit callback, before
+        // storage. Mark it durable from the publication of the terminal task;
+        // the actual report stays after the commit (reserve) or after the
+        // waiter's terminal publication, as upstream `#reserve` does.
+        let listener = Arc::clone(self);
+        let mut subscription = ListenerGuard::new(
+            self.session
+                .subscribe_commits(Arc::new(move |publication, _| {
+                    if let Ok(mut values) = listener.faulted.lock() {
+                        for fault in values.iter_mut() {
+                            if !fault.durable
+                                && publication.changes.iter().any(|change| {
+                                    matches!(
+                                        change,
+                                        CommitChange::Table(StorageWrite::Task { value })
+                                            if value.id == fault.record.id
+                                                && matches!(
+                                                    value.state,
+                                                    TaskState::Terminal {
+                                                        outcome: TaskOutcome::Faulted { .. }
+                                                    } | TaskState::Completing {
+                                                        outcome: TaskOutcome::Faulted { .. }
+                                                    }
+                                                )
+                                    )
+                                })
+                            {
+                                fault.durable = true;
+                            }
+                        }
+                    }
+                })),
+            move || {
+                if let Ok(mut values) = cleanup.faulted.lock() {
+                    values.retain(|fault| fault.durable || fault.reserve_id != reserve_id);
+                }
+            },
+        );
         let result = self
             .session
             .commit_with(
                 commit_fn(move |tx| {
                     let this = Arc::clone(&this);
                     let out = Arc::clone(&out_commit);
-                    let faulted = Arc::clone(&faulted_commit);
-                    Box::pin(async move { this.reserve_in(tx, &out, &faulted).await })
+                    Box::pin(async move { this.reserve_in(tx, &out, reserve_id).await })
                 }),
                 &self.context,
                 None,
             )
             .await;
+        subscription.unsubscribe();
         let reservations = out
             .lock()
             .map(|mut values| std::mem::take(&mut *values))
             .unwrap_or_default();
         match result {
             Ok(()) => {
-                // Only after the fault is durable.
-                let faulted = faulted
-                    .lock()
-                    .map(|mut values| std::mem::take(&mut *values))
-                    .unwrap_or_default();
-                for (record, message) in faulted {
-                    (self.report)(message);
-                    self.report_fixed(
-                        crate::harness::types::ReportInfo::new(
-                            crate::harness::types::ReportKind::TaskFaulted,
-                        )
-                        .with_task(record.id, record.kind)
-                        .with_reason("restart_limit"),
-                    );
-                }
+                self.report_faulted();
                 Ok(reservations)
             }
             Err(error) => {
+                if let Ok(mut faulted) = self.faulted.lock() {
+                    faulted.clear();
+                }
                 for reservation in reservations {
                     if let Ok(mut map) = self.invocations.lock() {
                         map.remove(&reservation.invocation.task_id);
@@ -2331,26 +2871,36 @@ impl SchedulerInner {
         self: &Arc<Self>,
         tx: &mut Transaction,
         out: &Arc<Mutex<Vec<Reservation>>>,
-        faulted: &Arc<Mutex<Vec<(TaskRecord, String)>>>,
+        reserve_id: u64,
     ) -> SessionResult<()> {
+        self.session.wait_for_all_writers().await?;
         if !self.enabled.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) {
             return Ok(());
         }
         self.load_scopes(false).await?;
-        let owned = self.owned_live(None);
-        let records: Vec<TaskRecord> = self
-            .live
+        self.wake_due();
+        let candidates: Vec<TaskId> = self
+            .runnable
             .lock()
-            .map(|live| live.values().cloned().collect())
+            .map(|mut runnable| std::mem::take(&mut *runnable).into_iter().collect())
             .unwrap_or_default();
         let mut snapshot: Option<Arc<dyn RegistrySnapshot>> = None;
-        for record in records {
+        for id in candidates {
+            self.candidate_visits.fetch_add(1, Ordering::SeqCst);
+            let Some(record) = self
+                .live
+                .lock()
+                .ok()
+                .and_then(|live| live.get(&id).cloned())
+            else {
+                continue;
+            };
             let has_invocation = self
                 .invocations
                 .lock()
                 .map(|map| map.contains_key(&record.id))
                 .unwrap_or(false);
-            if has_invocation || !self.waiting_on(&record, &owned).is_empty() {
+            if has_invocation || !self.waiting_on(&record).is_empty() {
                 continue;
             }
             if matches!(record.state, TaskState::Completing { .. }) {
@@ -2360,9 +2910,6 @@ impl SchedulerInner {
                 && !record.abort_requested
                 && *until > (self.now)()
             {
-                continue;
-            }
-            if self.parked(&record) {
                 continue;
             }
             if !record.abort_requested
@@ -2378,16 +2925,25 @@ impl SchedulerInner {
             } else {
                 InvocationMode::Run
             };
-            if mode == InvocationMode::Abort
-                && let Some(limit) = self.restart_limit().limit()
-                && record.restarts.unwrap_or(0) as u64 >= limit
-            {
-                let message = format!(
-                    "Abort handler of task {} ({}) was cut off {} times",
-                    record.id,
-                    record.kind,
-                    record.restarts.unwrap_or(0)
-                );
+            if self.restart_limit().limit().is_some_and(|limit| {
+                record.restarts.unwrap_or(0) as u64 >= limit
+                    && (mode == InvocationMode::Abort || !Self::limits_restarts(&record.kind))
+            }) {
+                let message = if mode == InvocationMode::Abort {
+                    format!(
+                        "Abort handler of task {} ({}) was cut off {} times",
+                        record.id,
+                        record.kind,
+                        record.restarts.unwrap_or(0)
+                    )
+                } else {
+                    format!(
+                        "Task {} ({}) was cut off {} times without progress",
+                        record.id,
+                        record.kind,
+                        record.restarts.unwrap_or(0)
+                    )
+                };
                 self.terminate(
                     tx,
                     &record,
@@ -2399,8 +2955,13 @@ impl SchedulerInner {
                     },
                 )
                 .await?;
-                if let Ok(mut values) = faulted.lock() {
-                    values.push((record, message));
+                if let Ok(mut values) = self.faulted.lock() {
+                    values.push(FaultedTask {
+                        record,
+                        message,
+                        durable: false,
+                        reserve_id,
+                    });
                 }
                 continue;
             }
@@ -2451,13 +3012,9 @@ impl SchedulerInner {
         Ok(())
     }
 
-    fn waiting_on(
-        self: &Arc<Self>,
-        record: &TaskRecord,
-        owned: &BTreeMap<TaskId, Vec<TaskId>>,
-    ) -> Vec<TaskId> {
+    fn waiting_on(self: &Arc<Self>, record: &TaskRecord) -> Vec<TaskId> {
         if record.abort_requested {
-            return owned.get(&record.id).cloned().unwrap_or_default();
+            return self.owned_children(record.id, None);
         }
         match &record.state {
             TaskState::Waiting { on, .. } => on
@@ -2471,6 +3028,34 @@ impl SchedulerInner {
                 .copied()
                 .collect(),
             _ => Vec::new(),
+        }
+    }
+
+    fn wake_due(self: &Arc<Self>) {
+        let now = (self.now)();
+        let sleeping: Vec<TaskId> = self
+            .sleeping
+            .lock()
+            .map(|sleeping| sleeping.iter().copied().collect())
+            .unwrap_or_default();
+        for id in sleeping {
+            let due = self
+                .live
+                .lock()
+                .ok()
+                .and_then(|live| live.get(&id).cloned())
+                .is_some_and(|record| {
+                    record.abort_requested
+                        || matches!(record.state, TaskState::Sleeping { until, .. } if until <= now)
+                });
+            if due {
+                if let Ok(mut sleeping) = self.sleeping.lock() {
+                    sleeping.remove(&id);
+                }
+                if let Ok(mut runnable) = self.runnable.lock() {
+                    runnable.insert(id);
+                }
+            }
         }
     }
 
@@ -2511,12 +3096,19 @@ impl SchedulerInner {
                         if let Ok(mut map) = self.failed_migrations.lock() {
                             map.insert(record.id, (Arc::clone(&task), message.clone()));
                         }
-                        (self.report)(message.clone());
-                        self.report_fixed(
+                        self.report_error(
+                            message.clone(),
                             crate::harness::types::ReportInfo::new(
                                 crate::harness::types::ReportKind::MigrationFailed,
                             )
-                            .with_task(record.id, record.kind.clone()),
+                            .with_task(
+                                crate::harness::types::ReportTask::new(
+                                    record.id,
+                                    record.kind.clone(),
+                                    record.conversation_id,
+                                ),
+                            ),
+                            None,
                         );
                         // Blocked now without a commit: the graph and the host's
                         // wake must hear it after this line releases.
@@ -2595,6 +3187,7 @@ impl SchedulerInner {
         };
         let invocation = Arc::new(Invocation {
             task_id: record.id,
+            kind: record.kind.clone(),
             conversation_id: record.conversation_id,
             mode,
             trace: record.trace.clone(),
@@ -2613,6 +3206,9 @@ impl SchedulerInner {
         if let Ok(mut map) = self.invocations.lock() {
             map.insert(record.id, Arc::clone(&invocation));
         }
+        if let Ok(mut runnable) = self.runnable.lock() {
+            runnable.remove(&record.id);
+        }
         invocation
     }
 
@@ -2627,7 +3223,13 @@ impl SchedulerInner {
                 this.run_abort(&reservation).await
             };
             if let Err(error) = outcome {
-                (this.report)(error.to_string());
+                this.report_error(
+                    error.to_string(),
+                    crate::harness::types::ReportInfo::new(
+                        crate::harness::types::ReportKind::TaskError,
+                    ),
+                    None,
+                );
             }
             this.end(&invocation);
             invocation.finish();
@@ -2996,18 +3598,22 @@ impl SchedulerInner {
                         let cause = if next.is_none() {
                             "missing_task"
                         } else {
-                            "incompatible_task"
+                            "task_too_old"
                         };
-                        (self.report)(format!(
-                            "Task {} keeps running under its old {} definition ({cause})",
-                            current.id(),
-                            current.kind()
-                        ));
-                        self.report_fixed_with(
+                        self.report_error(
+                            format!(
+                                "Task {} keeps running under its old {} definition ({cause})",
+                                current.id(),
+                                current.kind()
+                            ),
                             crate::harness::types::ReportInfo::new(
                                 crate::harness::types::ReportKind::TaskOutdated,
                             )
-                            .with_task(current.id(), current.kind().to_string())
+                            .with_task(crate::harness::types::ReportTask::new(
+                                current.id(),
+                                current.kind().to_string(),
+                                current.record.conversation_id,
+                            ))
                             .with_reason(cause),
                             Some(context),
                         );
@@ -3036,6 +3642,7 @@ impl SchedulerInner {
                     let decider = decider.clone();
                     let telemetry_context = telemetry_context.clone();
                     Box::pin(async move {
+                        this.session.wait_for_all_writers().await?;
                         let found = this
                             .live
                             .lock()
@@ -3057,11 +3664,16 @@ impl SchedulerInner {
                         if let Decision::Fault(message) = decision
                             && let Some(current) = &current
                         {
-                            this.report_fixed_with(
+                            this.report_error(
+                                message.clone(),
                                 crate::harness::types::ReportInfo::new(
                                     crate::harness::types::ReportKind::TaskFaulted,
                                 )
-                                .with_task(current.id(), current.kind().to_string())
+                                .with_task(crate::harness::types::ReportTask::new(
+                                    current.id(),
+                                    current.kind().to_string(),
+                                    current.record.conversation_id,
+                                ))
                                 .with_reason("threw"),
                                 Some(&telemetry_context),
                             );
@@ -3104,7 +3716,7 @@ impl SchedulerInner {
     ) -> SessionResult<()> {
         self.load_scopes(false).await?;
         let overlay = overlay_of(tx);
-        if self.owned_live(Some(&overlay)).contains_key(&record.id) {
+        if !self.owned_children(record.id, Some(&overlay)).is_empty() {
             tx.set_task(with_state(
                 record,
                 TaskState::Completing {
@@ -3165,7 +3777,7 @@ impl SchedulerInner {
             for record in candidates {
                 self.load_chain(parent_of(&record), Some(&overlay)).await?;
             }
-            if self.owned_live(Some(&overlay)).contains_key(&current.id()) {
+            if !self.owned_children(current.id(), Some(&overlay)).is_empty() {
                 tx.set_task(with_state(
                     &progressed(&current.record),
                     TaskState::Completing {
@@ -3243,7 +3855,11 @@ impl SchedulerInner {
                 .or_else(|| self.live.lock().ok().and_then(|live| live.get(id).cloned()));
             let member = match member {
                 Some(member) => Some(member),
-                None => self.storage.task(*id, &self.context).await?,
+                None => self
+                    .storage
+                    .task(*id, &self.context)
+                    .await?
+                    .map(|record| (*record).clone()),
             };
             let Some(member) = member else {
                 return Err(SessionError::message(format!("Task {id} does not exist")));
@@ -3286,6 +3902,14 @@ impl SchedulerInner {
             disarm();
         }
         invocation.controller.cancel();
+        let ready = self
+            .live
+            .lock()
+            .ok()
+            .is_some_and(|live| live.contains_key(&invocation.task_id));
+        if ready && let Ok(mut runnable) = self.runnable.lock() {
+            runnable.insert(invocation.task_id);
+        }
     }
 
     // ─── Inspection ─────────────────────────────────────────────────────────
@@ -3320,7 +3944,7 @@ impl SchedulerInner {
         self: &Arc<Self>,
         record: &TaskRecord,
         snapshot: &Arc<dyn RegistrySnapshot>,
-        owned: &BTreeMap<TaskId, Vec<TaskId>>,
+        _owned: &BTreeMap<TaskId, Vec<TaskId>>,
     ) -> TaskInspectionState {
         let running = self
             .invocations
@@ -3333,18 +3957,12 @@ impl SchedulerInner {
         if matches!(record.state, TaskState::Completing { .. }) {
             return TaskInspectionState::Completing;
         }
-        let on = self.waiting_on(record, owned);
+        let on = self.waiting_on(record);
         if !on.is_empty() {
             return TaskInspectionState::Waiting { on };
         }
         if let Some(until) = not_due(record, (self.now)()) {
             return TaskInspectionState::Sleeping { until };
-        }
-        if self.parked(record) {
-            return TaskInspectionState::Blocked {
-                reason: BlockedReason::RestartLimit,
-                error: None,
-            };
         }
         match self.fit(record, snapshot.task(&record.kind)) {
             Fit::Blocked { reason, error } => TaskInspectionState::Blocked { reason, error },
@@ -3360,7 +3978,7 @@ impl SchedulerInner {
                         )),
                     }
                 } else {
-                    TaskInspectionState::Ready { migrates }
+                    TaskInspectionState::Pending { migrates }
                 }
             }
         }
@@ -3374,6 +3992,7 @@ impl SchedulerInner {
         conversation_id: ConversationId,
         live: &DocDraft,
         inputs: Vec<SubmissionId>,
+        first: Option<EntryId>,
     ) -> SessionResult<()> {
         let snapshot = self.registry.snapshot();
         let (version, checkpoint) = match snapshot.task(GENERATION_TASK_NAME) {
@@ -3396,7 +4015,13 @@ impl SchedulerInner {
             })
             .await?;
         let mut state: LiveState = read_state(live)?;
-        state.run = Some(LiveRun { task_id, inputs });
+        state.run = Some(LiveRun {
+            task_id,
+            inputs,
+            first,
+            ..Default::default()
+        });
+        state.run_failure = None;
         write_state(live, &state)
     }
 
@@ -3499,6 +4124,16 @@ impl InvocationRuntime {
         change: Arc<GatedFn<T>>,
         context: &Context,
     ) -> SessionResult<T> {
+        self.gated_with_options(change, context, crate::session::CommitOptions::default())
+            .await
+    }
+
+    async fn gated_with_options<T: Send + 'static>(
+        &self,
+        change: Arc<GatedFn<T>>,
+        context: &Context,
+        options: crate::session::CommitOptions,
+    ) -> SessionResult<T> {
         self.ensure_open()?;
         let inner = Arc::clone(&self.inner);
         let invocation = Arc::clone(&self.invocation);
@@ -3506,12 +4141,13 @@ impl InvocationRuntime {
         let task_id = invocation.task_id;
         let session = Arc::clone(&inner.session);
         session
-            .commit_with(
+            .commit_with_options(
                 commit_fn(move |tx| {
                     let inner = Arc::clone(&inner);
                     let invocation = Arc::clone(&invocation);
                     let change = Arc::clone(&change);
                     Box::pin(async move {
+                        inner.session.wait_for_all_writers().await?;
                         if invocation.ended.load(Ordering::SeqCst) {
                             return Err(ended_error(invocation.task_id));
                         }
@@ -3551,6 +4187,7 @@ impl InvocationRuntime {
                     conversation_id: Some(conversation_id),
                     task_id: Some(task_id),
                 }),
+                options,
             )
             .await
     }
@@ -3610,6 +4247,16 @@ impl TaskRuntime for InvocationRuntime {
     }
 
     async fn commit(&self, change: TaskCommitFn, context: &Context) -> SessionResult<()> {
+        self.commit_with_options(change, context, crate::session::CommitOptions::default())
+            .await
+    }
+
+    async fn commit_with_options(
+        &self,
+        change: TaskCommitFn,
+        context: &Context,
+        options: crate::session::CommitOptions,
+    ) -> SessionResult<()> {
         let inner = Arc::clone(&self.inner);
         let invocation = Arc::clone(&self.invocation);
         let telemetry = context.telemetry();
@@ -3636,7 +4283,7 @@ impl TaskRuntime for InvocationRuntime {
                 Ok(())
             })
         });
-        let result = self.gated(wrapper, context).await;
+        let result = self.gated_with_options(wrapper, context, options).await;
         if result.is_ok()
             && let Some(checkpoint) = changed.lock().ok().and_then(|mut slot| slot.take())
         {
@@ -3743,7 +4390,12 @@ impl TaskRuntime for InvocationRuntime {
         self.inner
             .session
             .read_on_line(move || {
-                Box::pin(async move { Ok(storage.task(id, &read_context).await?) })
+                Box::pin(async move {
+                    Ok(storage
+                        .task(id, &read_context)
+                        .await?
+                        .map(|record| (*record).clone()))
+                })
             })
             .await
     }
@@ -3810,7 +4462,12 @@ impl TaskRuntime for InvocationRuntime {
             .inner
             .session
             .read_on_line(move || {
-                Box::pin(async move { Ok(storage.task(id, &read_context).await?) })
+                Box::pin(async move {
+                    Ok(storage
+                        .task(id, &read_context)
+                        .await?
+                        .map(|record| (*record).clone()))
+                })
             })
             .await?;
         let Some(record) = record else {
@@ -3852,7 +4509,7 @@ impl TaskRuntime for InvocationRuntime {
                         let state = storage
                             .task(id, &read_context)
                             .await?
-                            .map(|record| record.state);
+                            .map(|record| record.state.clone());
                         match state {
                             Some(TaskState::Terminal { outcome }) => outcomes.push(outcome),
                             _ => {
@@ -3933,6 +4590,38 @@ impl TaskRuntime for InvocationRuntime {
             .await
     }
 
+    async fn entries(
+        &self,
+        query: crate::types::EntryQuery,
+        limit: usize,
+        cursor: Option<crate::types::Cursor>,
+        context: &Context,
+    ) -> SessionResult<crate::types::Page<crate::types::EntryRecord>> {
+        self.ensure_open()?;
+        let storage = Arc::clone(&self.inner.storage);
+        let conversation_id = self.invocation.conversation_id;
+        let read_context = context.clone();
+        self.inner
+            .session
+            .read_on_line(move || {
+                Box::pin(async move {
+                    storage
+                        .scan_entries(
+                            crate::types::EntryQuery {
+                                conversation_id,
+                                ..query
+                            },
+                            limit,
+                            cursor,
+                            &read_context,
+                        )
+                        .await
+                        .map_err(Into::into)
+                })
+            })
+            .await
+    }
+
     async fn context(
         &self,
         conversation_id: ConversationId,
@@ -3981,6 +4670,7 @@ impl TaskRuntime for InvocationRuntime {
                             KeptContext {
                                 range,
                                 idle_since: None,
+                                expires_at: None,
                             },
                         );
                     }
@@ -3992,8 +4682,15 @@ impl TaskRuntime for InvocationRuntime {
                             KeptContext {
                                 range,
                                 idle_since: Some(now),
+                                expires_at: Some(
+                                    now + inner.settings().context_retention_ms as f64,
+                                ),
                             },
                         );
+                        if let Ok(mut order) = inner.idle_order.lock() {
+                            order.insert(IdleDeadline(now, conversation_id));
+                        }
+                        inner.schedule_expiry();
                     }
                 }
             }
@@ -4045,7 +4742,16 @@ impl TaskRuntime for InvocationRuntime {
 
     fn report(&self, message: String) -> SessionResult<()> {
         self.ensure_open()?;
-        (self.inner.report)(message);
+        self.inner.report_error(
+            message,
+            crate::harness::types::ReportInfo::new(crate::harness::types::ReportKind::TaskError)
+                .with_task(crate::harness::types::ReportTask::new(
+                    self.invocation.task_id,
+                    self.invocation.kind.clone(),
+                    self.invocation.conversation_id,
+                )),
+            Some(&self.context),
+        );
         Ok(())
     }
 
@@ -4142,16 +4848,12 @@ impl TaskScheduler {
 
 #[async_trait]
 impl SchedulerService for TaskScheduler {
-    fn resume(&self) {
-        self.inner.resume();
+    fn resume(&self) -> SessionResult<()> {
+        self.inner.resume()
     }
 
     fn wake(&self) -> Wake {
         self.inner.wake_snapshot()
-    }
-
-    async fn retry_task(&self, id: TaskId, context: &Context) -> SessionResult<()> {
-        self.inner.retry_task(id, context).await
     }
 
     async fn open(&self, context: &Context) -> SessionResult<()> {
@@ -4168,9 +4870,10 @@ impl SchedulerService for TaskScheduler {
         conversation_id: ConversationId,
         live: &DocDraft,
         inputs: Vec<SubmissionId>,
+        first: Option<EntryId>,
     ) -> SessionResult<()> {
         self.inner
-            .start_run(tx, conversation_id, live, inputs)
+            .start_run(tx, conversation_id, live, inputs, first)
             .await
     }
 
@@ -4269,14 +4972,12 @@ impl Default for UnavailableScheduler {
 
 #[async_trait]
 impl SchedulerService for UnavailableScheduler {
-    fn resume(&self) {}
+    fn resume(&self) -> SessionResult<()> {
+        Ok(())
+    }
 
     fn wake(&self) -> Wake {
         Wake::default()
-    }
-
-    async fn retry_task(&self, _id: TaskId, _context: &Context) -> SessionResult<()> {
-        unavailable()
     }
 
     async fn open(&self, _context: &Context) -> SessionResult<()> {
@@ -4293,6 +4994,7 @@ impl SchedulerService for UnavailableScheduler {
         _conversation_id: ConversationId,
         _live: &DocDraft,
         _inputs: Vec<SubmissionId>,
+        _first: Option<EntryId>,
     ) -> SessionResult<()> {
         unavailable()
     }
@@ -4444,7 +5146,6 @@ fn blocked_reason_str(reason: BlockedReason) -> &'static str {
         BlockedReason::MissingTask => "missing_task",
         BlockedReason::TaskTooOld => "task_too_old",
         BlockedReason::MigrationFailed => "migration_failed",
-        BlockedReason::RestartLimit => "restart_limit",
     }
 }
 
@@ -4513,27 +5214,40 @@ pub(crate) fn emit_report_telemetry(
             if let Some(extension) = &info.extension {
                 attributes.insert("extension".to_string(), JsonValue::from(extension.clone()));
             }
-            if let Some(task) = info.task_id {
+            if let Some(task) = info.task.as_ref().map(|task| task.id) {
                 attributes.insert("task.id".to_string(), JsonValue::from(task.get()));
             }
         }
-        crate::harness::types::ReportKind::TaskParked
-        | crate::harness::types::ReportKind::MigrationFailed
+        crate::harness::types::ReportKind::TaskInterrupted => {
+            if let Some(reason) = &info.reason {
+                attributes.insert("reason".to_string(), JsonValue::from(reason.clone()));
+            }
+            if let Some(restarts) = info.restarts {
+                attributes.insert("restarts".to_string(), JsonValue::from(restarts));
+            }
+            if let Some(extension) = &info.extension {
+                attributes.insert("extension".to_string(), JsonValue::from(extension.clone()));
+            }
+            if let Some(task) = info.task.as_ref().map(|task| task.id) {
+                attributes.insert("task.id".to_string(), JsonValue::from(task.get()));
+            }
+        }
+        crate::harness::types::ReportKind::MigrationFailed
         | crate::harness::types::ReportKind::TaskError
         | crate::harness::types::ReportKind::ExtensionError => {
             if let Some(extension) = &info.extension {
                 attributes.insert("extension".to_string(), JsonValue::from(extension.clone()));
             }
-            if let Some(task) = info.task_id {
+            if let Some(task) = info.task.as_ref().map(|task| task.id) {
                 attributes.insert("task.id".to_string(), JsonValue::from(task.get()));
             }
         }
         crate::harness::types::ReportKind::HostError => {
-            if let Some(task) = info.task_id {
+            if let Some(task) = info.task.as_ref().map(|task| task.id) {
                 attributes.insert("task.id".to_string(), JsonValue::from(task.get()));
             }
         }
-        crate::harness::types::ReportKind::SessionFailed
+        crate::harness::types::ReportKind::StorageFailed
         | crate::harness::types::ReportKind::ListenerError => {}
     }
     if let Some(context) = context {
@@ -4633,6 +5347,23 @@ fn json_equal(left: &JsonValue, right: &JsonValue) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn listener_guard_unsubscribes_on_drop() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&called);
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_flag = Arc::clone(&cleaned);
+        let guard = ListenerGuard::new(
+            Subscription::new(move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+            move || cleanup_flag.store(true, std::sync::atomic::Ordering::SeqCst),
+        );
+        drop(guard);
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn owned_tasks_rechecks_the_invocation_on_the_mutation_line() {
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
@@ -4649,7 +5380,6 @@ mod tests {
             ),
             env: None,
             report: Arc::new(|_| {}),
-            report_info: None,
             now: Arc::new(|| 0.0),
             set_timer: None,
             on_wake: None,

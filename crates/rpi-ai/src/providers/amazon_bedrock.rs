@@ -10,7 +10,6 @@ use crate::auth::{
     ApiKeyAuth, ApiKeyCredential, AuthContext, AuthEvent, AuthInfoLink, AuthInteraction,
     AuthPrompt, AuthResult, ModelAuth, ModelsError, ModelsErrorCode, ProviderAuth, SelectOption,
 };
-use crate::generated::get_builtin_models;
 use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 use crate::types::ProviderEnv;
 
@@ -221,7 +220,9 @@ pub fn amazon_bedrock_provider() -> Arc<dyn Provider> {
             api_key: Some(Arc::new(BedrockAuth)),
             oauth: None,
         },
-        models: get_builtin_models("amazon-bedrock").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared(
+            "amazon-bedrock",
+        )),
         api: ProviderApi::Single(Arc::new(BedrockConverseStream)),
         ..Default::default()
     })

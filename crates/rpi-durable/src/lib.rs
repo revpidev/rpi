@@ -1,5 +1,5 @@
 //! Durable storage stack: port of `packages/durable` (`@earendil-works/pi-durable`
-//! @ 4a080252f / v1.4.0) — the M4 storage foundation.
+//! @ b4afdddf / v1.5.2) — the M4 storage foundation.
 //!
 //! **Experimental.** The API changes without notice between releases.
 //!
@@ -68,16 +68,17 @@ pub use documents::{
     materialize_document, materialize_document_value, resolve_address,
 };
 pub use session::{
-    CloseListener, CommitChange, CommitFn, CommitListener, CommitPublication, CommittedStateSource,
-    CommittedWatch, ConversationCreatedHook, ConversationDocumentView, ConversationOwnership,
-    DocDraft, DocOwner, DocumentChange, DocumentCopyChange, EntryDraft, EntryHead,
-    ForkDocumentCopy, LoadedDocument, NowFn, ObservedDocumentValue, SessionError, SessionFuture,
-    SessionImpl, SessionResult, Subscription, TaskCreate, TaskOwnership, Transaction,
-    TransactionScope, WatchEnd, WatchListener, commit_fn, create_session,
-    prepare_fork_document_copies, watch_listener,
+    CloseListener, CommitChange, CommitFn, CommitListener, CommitObservation, CommitObserver,
+    CommitOptions, CommitPersistence, CommitPublication, CommittedStateSource, CommittedWatch,
+    ConversationCreatedHook, ConversationDocumentView, ConversationOwnership, DocDraft, DocOwner,
+    DocumentChange, DocumentCopyChange, EntryDraft, EntryHead, ForkDocumentCopy, LoadedDocument,
+    NowFn, Observation, ObservedDocumentValue, Observer, SessionError, SessionFuture, SessionImpl,
+    SessionResult, Subscription, TaskCreate, TaskOwnership, Transaction, TransactionScope,
+    WatchCall, WatchEnd, WatchListener, commit_fn, create_session, prepare_fork_document_copies,
+    watch_listener,
 };
 
-// Code mode (port of `packages/durable/src/codemode` @ `4a080252f`).
+// Code mode (port of `packages/durable/src/codemode` @ `b4afdddf`).
 pub use codemode::{
     CATALOG_GLOBALS, CLASSIFY_TOOL, CODEMODE_INTERNAL_PREFIX, CODEMODE_JOURNAL_DOC,
     CODEMODE_MODULE_VERSION, CODEMODE_RUN_DOC, CODEMODE_STORE_DOC, CODEMODE_TOOL_NAME,

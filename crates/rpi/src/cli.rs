@@ -3,6 +3,9 @@
 pub mod args;
 pub mod auth_check;
 pub mod auth_command;
+pub mod auth_login;
+pub mod auth_logout;
+pub mod auth_terminal;
 pub mod config_command;
 pub mod credential_print;
 pub mod diagnostics;

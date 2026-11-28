@@ -9,7 +9,7 @@ use rpi_durable::chord::context::BACKGROUND_CONTEXT;
 use rpi_durable::ids::{EntryId, ROOT_CONVERSATION_ID, id_from_number, seq_from_number};
 use rpi_durable::storage::MemoryStorage;
 use rpi_durable::testing::run_storage_conformance;
-use rpi_durable::types::{ConversationRecord, EntryRecord, Storage, StorageWrite};
+use rpi_durable::types::{ConversationRecord, EntryRecord, Storage, StorageExt, StorageWrite};
 
 #[tokio::test]
 async fn memory_storage_conformance() {
@@ -28,7 +28,7 @@ async fn memory_storage_conformance() {
 async fn memory_prepared_commit_is_detached_and_idempotent() {
     let storage = MemoryStorage::new();
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: ROOT_CONVERSATION_ID,
@@ -72,7 +72,12 @@ async fn memory_prepared_commit_is_detached_and_idempotent() {
 async fn memory_rejects_commit_after_close() {
     let storage = MemoryStorage::new();
     storage.close(&BACKGROUND_CONTEXT).await.expect("close");
-    assert!(storage.commit(&[], &BACKGROUND_CONTEXT).await.is_err());
+    assert!(
+        storage
+            .commit(&[], &mut |_, _| {}, &BACKGROUND_CONTEXT)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

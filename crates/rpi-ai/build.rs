@@ -2,9 +2,9 @@
 //!
 //! Reads the vendored provider catalog data in `src/providers/data/` — a
 //! byte-for-byte copy of the output of the pinned upstream generator
-//! (`external/pi/packages/ai/scripts/generate-models.ts` @ pi 1.4.0
-//! (4a080252f); the initial vendoring at pin 0.82.1 @ 2efa728 has been
-//! refreshed repeatedly, most recently the 2026-11-07 run — see the manifest
+//! (`external/pi/packages/ai/scripts/generate-models.ts` @ pi 1.5.2
+//! (b4afdddf); the initial vendoring at pin 0.82.1 @ 2efa728 has been
+//! refreshed repeatedly, most recently the 2026-11-28 run — see the manifest
 //! `generatedAt`; read-only generated data — never edit by hand,
 //! coding-standards
 //! §3.2) and emits `models_generated.rs` into `OUT_DIR` with:

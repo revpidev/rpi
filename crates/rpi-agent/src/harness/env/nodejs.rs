@@ -314,6 +314,8 @@ fn to_file_error(error: io::Error, path: Option<&str>) -> FileError {
         }
         #[cfg(windows)]
         {
+            // Windows reports failures through `ErrorKind`, not errno.
+            let _ = errno;
             kind_to_file_error_code(&error)
         }
     } else {
@@ -1186,7 +1188,6 @@ impl Shell for NodeExecutionEnv {
         cmd.process_group(0);
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }

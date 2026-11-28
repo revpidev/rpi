@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::components::input::Input;
 use crate::fuzzy::fuzzy_filter;
-use crate::keybindings::{Keybinding, get_keybindings};
+use crate::keybindings::{Keybinding, get_keybindings, get_select_page_index};
 use crate::tui::{
     Component, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
     TuiMouseHandlerResult,
@@ -428,6 +428,10 @@ impl SettingsList {
 }
 
 impl Component for SettingsList {
+    fn captures_viewport_input(&self) -> bool {
+        true
+    }
+
     fn render(&self, width: usize) -> Vec<String> {
         // If a submenu is active, render it instead.
         if let Some(submenu_component) = &self.submenu_component {
@@ -558,6 +562,16 @@ impl Component for SettingsList {
             self.items.len()
         };
 
+        if let Some(index) = get_select_page_index(
+            &kb,
+            data,
+            self.selected_index,
+            display_items_len,
+            self.max_visible,
+        ) {
+            self.selected_index = index;
+            return;
+        }
         if kb.matches(data, Keybinding::SelectUp) {
             if display_items_len == 0 {
                 return;

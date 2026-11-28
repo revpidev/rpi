@@ -157,7 +157,7 @@ pub fn reaches_all_tools() -> rpi_ext_host::types::ReachesToolsFn {
 }
 
 /// The message that starts an agent run, without the system-prompt fields
-/// (runner.ts `BeforeAgentStartTrigger` @ 4a080252f). User runs carry the
+/// (runner.ts `BeforeAgentStartTrigger` @ b4afdddf). User runs carry the
 /// expanded prompt and images; custom runs carry the starting message from
 /// `sendMessage(..., { triggerTurn: true })` while idle.
 #[derive(Debug, Clone)]
@@ -220,6 +220,10 @@ pub struct SessionBeforeCompactEvent {
     /// `"manual" | "threshold" | "overflow"`.
     pub reason: String,
     pub will_retry: bool,
+    /// Additive (V19-03 S45): the manual compaction aborted a streaming
+    /// parent run. `agent_end` may already have cleared the extension's own
+    /// active flag, so the host records this at `compact()` entry.
+    pub interrupted: bool,
 }
 
 /// `ToolCallEventResult` (extensions/types.ts:1065-1069) plus the threaded
@@ -251,7 +255,7 @@ pub struct ToolResultPatch {
     /// Machine-readable result for tools that declare an `outputSchema`
     /// (V16-06 FR-C). `None` with `content: Some(..)` means the handler
     /// replaced the content without restating it, so the structured content
-    /// is dropped (runner.ts:1185-1193 @ 4a080252f).
+    /// is dropped (runner.ts:1185-1193 @ b4afdddf).
     pub structured_content: Option<serde_json::Value>,
     pub is_error: Option<bool>,
     pub usage: Option<rpi_ai::types::Usage>,
@@ -333,7 +337,7 @@ pub struct ProjectTrustEventResult {
 #[derive(Debug, Clone)]
 pub struct ExtensionCommand {
     /// The name the extension registered (`ResolvedCommand.name`,
-    /// runner.ts:807-841 @ 4a080252f): duplicates across extensions keep the
+    /// runner.ts:807-841 @ b4afdddf): duplicates across extensions keep the
     /// base name while [`Self::invocation_name`] gets a `:occurrence`
     /// suffix. The built-in conflict diagnostics and the autocomplete
     /// filter both key on this field (interactive-mode.ts:710-723,
@@ -560,7 +564,7 @@ pub trait ExtensionRunner: Send + Sync {
         messages
     }
 
-    /// `emitBoundary` (runner.ts:1020-1078 @ 4a080252f): the chained
+    /// `emitBoundary` (runner.ts:1020-1078 @ b4afdddf): the chained
     /// `{entries, continue, context}` dispatch used for `turn_end` and
     /// `agent_before_settle`. Default = no handlers, no dispatch.
     fn emit_boundary(

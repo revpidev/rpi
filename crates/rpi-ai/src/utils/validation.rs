@@ -1,21 +1,22 @@
-//! Port of `packages/ai/src/utils/validation.ts` @ pi 0.84.1+ (4181f66).
+//! Tool-call argument validation and coercion against JSON Schema, ported
+//! from `packages/ai/src/utils/validation.ts` and
+//! `packages/schema/src/coerce.ts` @ b4afdddf.
 //!
-//! Tool-call argument validation against JSON Schema with lenient type
-//! coercion (null→0, "123"→123, …), recursion through allOf/anyOf/oneOf,
-//! type arrays, object properties/additionalProperties and array items
-//! (tuple positional).
+//! Optional-null cleanup precedes TypeBox-style structural conversion and
+//! Ajv-style primitive coercion. Validators are compiled once per schema
+//! content generation with local unresolved-reference handling.
 //!
-//! Intentional differences:
-//! - Upstream distinguishes TypeBox schemas (symbol-marked, `Value.Convert`
-//!   prelude) from plain JSON Schema. In rpi every tool parameter schema is
-//!   plain JSON, so all schemas take the recursive-coercion path and the
-//!   TypeBox `Value.Convert` prelude has no equivalent.
-//! - Validation wording comes from the `jsonschema` crate, not TypeBox; the
-//!   surrounding message format (`Validation failed for tool "…"` +
-//!   `- path: message` lines + `Received arguments:` pretty JSON) is ported
-//!   exactly. Registered as deviation D-006.
+//! Validation wording comes from the `jsonschema` crate, not TypeBox; the
+//! surrounding message format (`Validation failed for tool "…"` +
+//! `- path: message` lines + `Received arguments:` pretty JSON) is ported
+//! exactly. Registered as deviation D-006.
 
-use serde_json::{Map, Value};
+mod coercion;
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex};
+
+use serde_json::Value;
 
 use crate::types::{Tool, ToolCall};
 
@@ -47,268 +48,300 @@ fn matches_json_type(value: &Value, kind: &str) -> bool {
         "null" => value.is_null(),
         "array" => value.is_array(),
         "object" => value.is_object(),
+        // JSON has no JS BigInt/undefined values. These TypeBox arms accept
+        // and preserve the incoming JSON value instead of fabricating one.
+        "bigint" | "undefined" => true,
+        "void" => false,
         _ => false,
     }
 }
 
-fn get_sub_schema_validator(schema: &Value) -> Option<jsonschema::Validator> {
-    // Draft 7 matches TypeBox semantics (tuple `items` arrays, etc.); the
-    // crate default (2020-12) rejects tuple `items` schemas that TypeBox
-    // accepts.
-    jsonschema::draft7::new(schema).ok()
-}
-
-/// JS `String(number)`: integral floats render without a trailing `.0`.
-fn js_number_to_string(number: &serde_json::Number) -> String {
-    if let Some(f) = number.as_f64()
-        && f.fract() == 0.0
-        && f.is_finite()
-        && f.abs() < 1e15
-    {
-        return format!("{f:.0}");
-    }
-    number.to_string()
-}
-
-/// Coerced numbers that are integral become integer JSON numbers (JS numbers
-/// are all doubles but serialize integral values without a fraction).
-fn f64_to_value(parsed: f64) -> Value {
-    if parsed.fract() == 0.0 && parsed.is_finite() && parsed.abs() < 9.0e15 {
-        return Value::from(parsed as i64);
-    }
-    serde_json::Number::from_f64(parsed)
-        .map(Value::Number)
-        .unwrap_or(Value::Null)
-}
-
-fn coerce_primitive_by_type(value: &Value, kind: &str) -> Value {
-    match kind {
-        "number" => {
-            if value.is_null() {
-                return Value::from(0);
-            }
-            if let Value::String(text) = value
-                && !text.trim().is_empty()
-                && let Ok(parsed) = text.trim().parse::<f64>()
-                && parsed.is_finite()
-            {
-                return f64_to_value(parsed);
-            }
-            if let Value::Bool(b) = value {
-                return Value::from(if *b { 1 } else { 0 });
-            }
-            value.clone()
-        }
-        "integer" => {
-            if value.is_null() {
-                return Value::from(0);
-            }
-            if let Value::String(text) = value
-                && !text.trim().is_empty()
-                && let Ok(parsed) = text.trim().parse::<f64>()
-                && parsed.fract() == 0.0
-                && parsed.is_finite()
-            {
-                return f64_to_value(parsed);
-            }
-            if let Value::Bool(b) = value {
-                return Value::from(if *b { 1 } else { 0 });
-            }
-            value.clone()
-        }
-        "boolean" => {
-            if value.is_null() {
-                return Value::from(false);
-            }
-            if let Value::String(text) = value {
-                if text == "true" {
-                    return Value::from(true);
-                }
-                if text == "false" {
-                    return Value::from(false);
+fn collect_schema_identifiers(schema: &Value, identifiers: &mut Vec<String>) {
+    match schema {
+        Value::Object(map) => {
+            for key in ["$id", "$anchor"] {
+                if let Some(identifier) = map.get(key).and_then(Value::as_str) {
+                    identifiers.push(identifier.to_owned());
                 }
             }
-            if let Some(number) = value.as_f64() {
-                if number == 1.0 {
-                    return Value::from(true);
-                }
-                if number == 0.0 {
-                    return Value::from(false);
-                }
-            }
-            value.clone()
-        }
-        "string" => {
-            if value.is_null() {
-                return Value::from(String::new());
-            }
-            match value {
-                Value::Number(number) => Value::from(js_number_to_string(number)),
-                Value::Bool(b) => Value::from(b.to_string()),
-                _ => value.clone(),
-            }
-        }
-        "null" => match value {
-            Value::String(text) if text.is_empty() => Value::Null,
-            Value::Number(number) if number.as_f64() == Some(0.0) => Value::Null,
-            Value::Bool(false) => Value::Null,
-            _ => value.clone(),
-        },
-        _ => value.clone(),
-    }
-}
-
-fn apply_schema_object_coercion(value: &mut Map<String, Value>, schema: &Value) {
-    let properties = schema.get("properties").and_then(Value::as_object);
-    if let Some(properties) = properties {
-        for (key, property_schema) in properties {
-            if let Some(entry) = value.get_mut(key) {
-                let coerced = coerce_with_json_schema(entry.clone(), property_schema);
-                *entry = coerced;
-            }
-        }
-    }
-
-    if let Some(additional) = schema.get("additionalProperties")
-        && additional.is_object()
-    {
-        let defined_keys: Vec<String> = properties
-            .map(|p| p.keys().cloned().collect())
-            .unwrap_or_default();
-        let keys: Vec<String> = value.keys().cloned().collect();
-        for key in keys {
-            if defined_keys.contains(&key) {
-                continue;
-            }
-            if let Some(entry) = value.get_mut(&key) {
-                let coerced = coerce_with_json_schema(entry.clone(), additional);
-                *entry = coerced;
-            }
-        }
-    }
-}
-
-fn apply_schema_array_coercion(value: &mut [Value], schema: &Value) {
-    match schema.get("items") {
-        Some(Value::Array(item_schemas)) => {
-            for (index, item) in value.iter_mut().enumerate() {
-                let Some(item_schema) = item_schemas.get(index) else {
+            for (key, child) in map {
+                if matches!(
+                    key.as_str(),
+                    "const" | "enum" | "default" | "example" | "examples"
+                ) {
                     continue;
-                };
-                let coerced = coerce_with_json_schema(item.clone(), item_schema);
-                *item = coerced;
+                }
+                collect_schema_identifiers(child, identifiers);
             }
         }
-        Some(items @ Value::Object(_)) => {
-            for item in value.iter_mut() {
-                let coerced = coerce_with_json_schema(item.clone(), items);
-                *item = coerced;
+        Value::Array(items) => {
+            for item in items {
+                collect_schema_identifiers(item, identifiers);
             }
         }
         _ => {}
     }
 }
 
-fn coerce_with_union_schema(value: &Value, schemas: &[Value]) -> Value {
-    // 2e95584da: a value that already matches a union arm is preserved as-is
-    // before any coercion is attempted (nullable unions must not convert
-    // `null` into another primitive).
-    for schema in schemas {
-        if let Some(validator) = get_sub_schema_validator(schema)
-            && validator.is_valid(value)
-        {
-            return value.clone();
-        }
+fn reference_resolves(reference: &str, root: &Value, identifiers: &[String]) -> bool {
+    if reference.is_empty() || reference == "#" {
+        return true;
     }
-
-    for schema in schemas {
-        let candidate = value.clone();
-        let coerced = coerce_with_json_schema(candidate, schema);
-        if let Some(validator) = get_sub_schema_validator(schema)
-            && validator.is_valid(&coerced)
-        {
-            return coerced;
-        }
+    if let Some(pointer) = reference.strip_prefix('#')
+        && pointer.starts_with('/')
+    {
+        return root.pointer(pointer).is_some();
     }
-    value.clone()
+    identifiers.iter().any(|identifier| {
+        identifier == reference
+            || identifier.ends_with(&format!("/{reference}"))
+            || identifier.ends_with(&format!("#{reference}"))
+    })
 }
 
-fn coerce_with_json_schema(value: Value, schema: &Value) -> Value {
-    let mut next_value = value;
+fn find_named_schema<'a>(schema: &'a Value, reference: &str) -> Option<&'a Value> {
+    if reference.is_empty() || reference.starts_with('#') {
+        return None;
+    }
+    match schema {
+        Value::Object(map) => {
+            for key in ["$id", "$anchor"] {
+                if map
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|identifier| {
+                        identifier == reference
+                            || identifier.ends_with(&format!("/{reference}"))
+                            || identifier.ends_with(&format!("#{reference}"))
+                    })
+                {
+                    return Some(schema);
+                }
+            }
+            for (key, child) in map {
+                if matches!(
+                    key.as_str(),
+                    "const" | "enum" | "default" | "example" | "examples"
+                ) {
+                    continue;
+                }
+                if let Some(found) = find_named_schema(child, reference) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| find_named_schema(item, reference)),
+        _ => None,
+    }
+}
 
-    if let Some(Value::Array(all_of)) = schema.get("allOf") {
-        for nested in all_of {
-            next_value = coerce_with_json_schema(next_value, nested);
+fn schema_contains_reference(schema: &Value) -> bool {
+    match schema {
+        Value::Object(map) => {
+            if map.contains_key("$ref") {
+                return true;
+            }
+            map.iter().any(|(key, child)| {
+                !matches!(
+                    key.as_str(),
+                    "const" | "enum" | "default" | "example" | "examples"
+                ) && schema_contains_reference(child)
+            })
+        }
+        Value::Array(items) => items.iter().any(schema_contains_reference),
+        _ => false,
+    }
+}
+
+fn normalize_schema_node(schema: &mut Value, root: &Value, identifiers: &[String]) {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        if !reference_resolves(reference, root, identifiers) {
+            *schema = serde_json::json!({"not": {}});
+            return;
+        }
+        if let Some(target) = find_named_schema(root, reference)
+            && !schema_contains_reference(target)
+        {
+            *schema = target.clone();
         }
     }
-
-    if let Some(Value::Array(any_of)) = schema.get("anyOf") {
-        next_value = coerce_with_union_schema(&next_value, any_of);
-    }
-
-    if let Some(Value::Array(one_of)) = schema.get("oneOf") {
-        next_value = coerce_with_union_schema(&next_value, one_of);
-    }
-
-    let schema_types = get_schema_types(schema);
-    let matches_union_member = schema_types.len() > 1
-        && schema_types
+    let Some(map) = schema.as_object_mut() else {
+        return;
+    };
+    if let Some(kind) = map.get("type").and_then(Value::as_str) {
+        match kind {
+            "bigint" | "undefined" => {
+                map.remove("type");
+            }
+            "void" => {
+                *schema = serde_json::json!({"not": {}});
+                return;
+            }
+            _ => {}
+        }
+    } else if let Some(Value::Array(kinds)) = map.get_mut("type") {
+        if kinds
             .iter()
-            .any(|kind| matches_json_type(&next_value, kind));
-    if !schema_types.is_empty() && !matches_union_member {
-        for kind in &schema_types {
-            let candidate = coerce_primitive_by_type(&next_value, kind);
-            if candidate != next_value {
-                next_value = candidate;
-                break;
+            .any(|kind| matches!(kind.as_str(), Some("bigint") | Some("undefined")))
+        {
+            map.remove("type");
+        } else {
+            kinds.retain(|kind| kind.as_str() != Some("void"));
+            if kinds.is_empty() {
+                *schema = serde_json::json!({"not": {}});
+                return;
             }
         }
     }
-
-    if schema_types.contains(&"object")
-        && let Value::Object(map) = &mut next_value
-    {
-        apply_schema_object_coercion(map, schema);
+    for (key, child) in map {
+        if matches!(
+            key.as_str(),
+            "const" | "enum" | "default" | "example" | "examples"
+        ) {
+            continue;
+        }
+        normalize_schema_node(child, root, identifiers);
     }
-
-    if schema_types.contains(&"array")
-        && let Value::Array(items) = &mut next_value
-    {
-        apply_schema_array_coercion(items, schema);
-    }
-
-    next_value
 }
 
-fn get_validator(schema: &Value) -> Result<jsonschema::Validator, String> {
-    jsonschema::draft7::new(schema).map_err(|error| error.to_string())
+fn normalized_schema(schema: &Value) -> Value {
+    let mut normalized = schema.clone();
+    let mut identifiers = Vec::new();
+    collect_schema_identifiers(schema, &mut identifiers);
+    normalize_schema_node(&mut normalized, schema, &identifiers);
+    normalized
+}
+
+fn contains_prefix_items(schema: &Value) -> bool {
+    match schema {
+        Value::Object(map) => {
+            if map.contains_key("prefixItems") {
+                return true;
+            }
+            map.iter().any(|(key, child)| {
+                !matches!(
+                    key.as_str(),
+                    "const" | "enum" | "default" | "example" | "examples"
+                ) && contains_prefix_items(child)
+            })
+        }
+        Value::Array(items) => items.iter().any(contains_prefix_items),
+        _ => false,
+    }
+}
+
+fn validation_options(schema: &Value) -> jsonschema::ValidationOptions<'static> {
+    let options = jsonschema::options();
+    if schema.get("$schema").is_some() {
+        options
+    } else {
+        options.with_draft(if contains_prefix_items(schema) {
+            jsonschema::Draft::Draft202012
+        } else {
+            jsonschema::Draft::Draft7
+        })
+    }
+}
+
+/// Compile the shared validator after applying pi-schema's extended type and
+/// unresolved-reference rules. Draft 7 preserves tuple `items` arrays;
+/// `prefixItems` selects 2020-12 unless the schema declares its own dialect.
+pub fn compile_schema_validator(schema: &Value) -> Result<jsonschema::Validator, String> {
+    validation_options(schema)
+        .build(&normalized_schema(schema))
+        .map_err(|error| error.to_string())
+}
+
+struct CompiledSchema {
+    schema: Value,
+    validators: jsonschema::ValidatorMap,
+}
+
+impl CompiledSchema {
+    fn new(schema: &Value) -> Result<Self, String> {
+        let validators = validation_options(schema)
+            .build_map(&normalized_schema(schema))
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            schema: schema.clone(),
+            validators,
+        })
+    }
+
+    fn root(&self) -> &jsonschema::Validator {
+        &self.validators["#"]
+    }
+}
+
+const SCHEMA_CACHE_CAPACITY: usize = 64;
+
+#[derive(Default)]
+struct CompiledSchemaCache {
+    entries: HashMap<String, Arc<CompiledSchema>>,
+    insertion_order: VecDeque<String>,
+}
+
+static COMPILED_SCHEMAS: LazyLock<Mutex<CompiledSchemaCache>> =
+    LazyLock::new(|| Mutex::new(CompiledSchemaCache::default()));
+
+fn get_compiled_schema(schema: &Value) -> Result<Arc<CompiledSchema>, String> {
+    let key = serde_json::to_string(schema).unwrap_or_default();
+    if let Some(compiled) = lock_cache().entries.get(&key).map(Arc::clone) {
+        return Ok(compiled);
+    }
+    let compiled = Arc::new(CompiledSchema::new(schema)?);
+    let mut cache = lock_cache();
+    if let Some(existing) = cache.entries.get(&key) {
+        return Ok(Arc::clone(existing));
+    }
+    if cache.entries.len() >= SCHEMA_CACHE_CAPACITY
+        && let Some(oldest) = cache.insertion_order.pop_front()
+    {
+        cache.entries.remove(&oldest);
+    }
+    cache.insertion_order.push_back(key.clone());
+    cache.entries.insert(key, Arc::clone(&compiled));
+    Ok(compiled)
+}
+
+fn lock_cache() -> std::sync::MutexGuard<'static, CompiledSchemaCache> {
+    COMPILED_SCHEMAS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn format_json_pointer(pointer: &str) -> String {
+    if pointer.is_empty() {
+        return "root".to_owned();
+    }
+    pointer
+        .strip_prefix('/')
+        .unwrap_or(pointer)
+        .split('/')
+        .map(|segment| segment.replace("~1", "/").replace("~0", "~"))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn format_validation_path(error: &jsonschema::ValidationError) -> String {
-    let instance_path = error.instance_path.to_string();
-    let base_path = instance_path
-        .strip_prefix('/')
-        .unwrap_or(&instance_path)
-        .replace('/', ".");
-    if let jsonschema::error::ValidationErrorKind::Required { property } = &error.kind {
-        // `property` is a JSON value like `"/name"` (pointer-escaped).
+    let base_path = format_json_pointer(&error.instance_path().to_string());
+    if let jsonschema::error::ValidationErrorKind::Required { property } = &error.kind() {
         let property = property
             .as_str()
-            .map(|p| p.strip_prefix('/').unwrap_or(p).to_owned())
+            .map(format_json_pointer)
             .unwrap_or_default();
         if !property.is_empty() {
-            return if base_path.is_empty() {
+            return if base_path == "root" {
                 property
             } else {
                 format!("{base_path}.{property}")
             };
         }
     }
-    if base_path.is_empty() {
-        "root".to_owned()
-    } else {
-        base_path
-    }
+    base_path
 }
 
 /// `validateToolCall`: finds a tool by name and validates the call arguments.
@@ -319,78 +352,7 @@ pub fn validate_tool_call(tools: &[Tool], tool_call: &ToolCall) -> Result<Value,
     validate_tool_arguments(tool, tool_call)
 }
 
-/// `validateToolArguments`: validates (and coerces) tool-call arguments
-/// against the tool's JSON schema. Returns the validated arguments.
-/// `getSubSchemaValidator(propertySchema)?.Check(null)` — does the property
-/// schema accept `null`? A schema that fails to compile keeps the key
-/// (upstream `undefined?.Check(null) === false` → false).
-fn schema_accepts_null(schema: &Value) -> bool {
-    jsonschema::draft7::new(schema)
-        .map(|validator| validator.is_valid(&Value::Null))
-        .unwrap_or(true)
-}
-
-/// `normalizeOptionalNulls` (validation.ts:240-268, `7915cdac6`): drop
-/// `null` values for optional, non-nullable, non-`$ref` properties
-/// (recursively through arrays and nested objects) before coercion —
-/// providers reject explicit nulls on optional fields.
-fn normalize_optional_nulls(value: &mut Value, schema: &Value) {
-    let Some(schema_object) = schema.as_object() else {
-        return;
-    };
-    if let Value::Array(items) = value {
-        match schema_object.get("items") {
-            Some(Value::Array(item_schemas)) => {
-                for (item, item_schema) in items.iter_mut().zip(item_schemas.iter()) {
-                    normalize_optional_nulls(item, item_schema);
-                }
-            }
-            Some(single) => {
-                for item in items.iter_mut() {
-                    normalize_optional_nulls(item, single);
-                }
-            }
-            None => {}
-        }
-        return;
-    }
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    let Some(properties) = schema_object.get("properties").and_then(Value::as_object) else {
-        return;
-    };
-    let required: std::collections::HashSet<&str> = schema_object
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<std::collections::HashSet<_>>()
-        })
-        .unwrap_or_default();
-    for (key, property_schema) in properties {
-        if !object.contains_key(key) {
-            continue;
-        }
-        let is_null = object.get(key) == Some(&Value::Null);
-        let ref_exempt = property_schema.get("$ref").is_some_and(Value::is_string);
-        if is_null
-            && !required.contains(key.as_str())
-            && !ref_exempt
-            && !schema_accepts_null(property_schema)
-        {
-            object.remove(key);
-        } else {
-            let Some(child) = object.get_mut(key) else {
-                continue;
-            };
-            normalize_optional_nulls(child, property_schema);
-        }
-    }
-}
-
+/// Validates and coerces tool-call arguments against the tool's JSON schema.
 pub fn validate_tool_arguments(tool: &Tool, tool_call: &ToolCall) -> Result<Value, String> {
     if let Some(error) = &tool_call.arguments_error {
         return Err(format!(
@@ -398,28 +360,14 @@ pub fn validate_tool_arguments(tool: &Tool, tool_call: &ToolCall) -> Result<Valu
             tool_call.name
         ));
     }
-    let mut args = Value::Object(tool_call.arguments.clone());
-    normalize_optional_nulls(&mut args, &tool.parameters);
-    let validator = get_validator(&tool.parameters)?;
-
-    let coerced = coerce_with_json_schema(args.clone(), &tool.parameters);
-    if coerced != args {
-        if args.is_object() && coerced.is_object() {
-            args = coerced;
-        } else {
-            return Ok(if validator.is_valid(&coerced) {
-                coerced
-            } else {
-                args
-            });
-        }
-    }
-
-    if validator.is_valid(&args) {
+    let compiled = get_compiled_schema(&tool.parameters)?;
+    let args = coercion::coerce(&compiled, Value::Object(tool_call.arguments.clone()));
+    if compiled.root().is_valid(&args) {
         return Ok(args);
     }
 
-    let errors = validator
+    let errors = compiled
+        .root()
         .iter_errors(&args)
         .map(|error| format!("  - {}: {}", format_validation_path(&error), error))
         .collect::<Vec<_>>()
@@ -462,6 +410,27 @@ mod tests {
             namespace: None,
             arguments_error: None,
         }
+    }
+
+    fn coerced(schema: Value, input: Value) -> Value {
+        let compiled = get_compiled_schema(&schema).expect("schema compiles");
+        coercion::coerce(&compiled, input)
+    }
+
+    fn assert_coerces(schema: Value, input: Value, expected: Value) {
+        let compiled = get_compiled_schema(&schema).expect("schema compiles");
+        let output = coercion::coerce(&compiled, input);
+        assert_eq!(output, expected);
+        assert!(
+            compiled.root().is_valid(&output),
+            "coerced output must validate: {}",
+            compiled
+                .root()
+                .iter_errors(&output)
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
     }
 
     #[test]
@@ -557,6 +526,25 @@ mod tests {
     }
 
     #[test]
+    fn relative_root_id_applies_once_for_local_references() {
+        let schema = json!({
+            "$id": "schemas/tool.json",
+            "type": "object",
+            "properties": { "count": { "$ref": "#/$defs/count" } },
+            "required": ["count"],
+            "$defs": { "count": { "type": "integer" } }
+        });
+        let validator = compile_schema_validator(&schema).expect("validator");
+        assert!(validator.is_valid(&json!({"count": 2})));
+        let invalid = json!({"count": "a"});
+        let error = validator
+            .iter_errors(&invalid)
+            .next()
+            .expect("string is not an integer");
+        assert_eq!(error.instance_path().to_string(), "/count");
+    }
+
+    #[test]
     fn test_validate_tool_call_not_found() {
         let err = validate_tool_call(&[], &call(json!({}))).unwrap_err();
         assert_eq!(err, "Tool \"bash\" not found");
@@ -587,12 +575,32 @@ mod tests {
         let out =
             validate_tool_arguments(&tool, &call(json!({"n": "123", "i": "42"}))).expect("valid");
         assert_eq!(out, json!({"n": 123, "i": 42}));
-        // Non-integer string into integer field: not coerced, fails validation.
-        let result = validate_tool_arguments(&tool, &call(json!({"n": 1, "i": "4.5"})));
-        assert!(result.is_err());
-        // Empty string is not coerced (JS Number("") guard).
-        let result = validate_tool_arguments(&tool, &call(json!({"n": "", "i": 1})));
-        assert!(result.is_err());
+        let out = validate_tool_arguments(&tool, &call(json!({"n": 1, "i": "4.5"})))
+            .expect("integer conversion truncates toward zero");
+        assert_eq!(out, json!({"n": 1, "i": 4}));
+        let out = validate_tool_arguments(&tool, &call(json!({"n": 1, "i": -4.5})))
+            .expect("numeric input follows the same integer conversion");
+        assert_eq!(out, json!({"n": 1, "i": -4}));
+        let out = validate_tool_arguments(&tool, &call(json!({"n": "", "i": 1})))
+            .expect("pass 2 follows JS Number for an empty string");
+        assert_eq!(out, json!({"n": 0, "i": 1}));
+    }
+
+    #[test]
+    fn coercion_preserves_a_valid_union_member_without_array_wrapping() {
+        let tool = tool(json!({
+            "type": "object",
+            "properties": {
+                "payload": {"type": ["array", "string"], "items": {"type": "integer"}}
+            },
+            "required": ["payload"]
+        }));
+        let out = validate_tool_arguments(&tool, &call(json!({"payload": "x"})))
+            .expect("the string union arm already accepts this value");
+        assert_eq!(out, json!({"payload": "x"}));
+        let out = validate_tool_arguments(&tool, &call(json!({"payload": ["1", 2]})))
+            .expect("the array union arm accepts converted items");
+        assert_eq!(out, json!({"payload": [1, 2]}));
     }
 
     #[test]
@@ -622,7 +630,7 @@ mod tests {
             validate_tool_arguments(&tool, &call(json!({"s": 12, "x": false}))).expect("valid");
         assert_eq!(out, json!({"s": "12", "x": null}));
         let out = validate_tool_arguments(&tool, &call(json!({"s": null, "x": 0}))).expect("valid");
-        assert_eq!(out, json!({"s": "", "x": null}));
+        assert_eq!(out, json!({"s": "null", "x": null}));
     }
 
     #[test]
@@ -742,6 +750,62 @@ mod tests {
     }
 
     #[test]
+    fn test_extended_bigint_undefined_and_void_rules() {
+        let tool = tool(json!({
+            "type": "object",
+            "properties": {
+                "big": {"type": "bigint"},
+                "maybe": {"type": "undefined"},
+                "never": {"type": "void"},
+                "numbers": {"type": "array", "items": {"type": "integer"}}
+            }
+        }));
+        let input = json!({"big": "12n", "maybe": null, "numbers": "7"});
+        let out = validate_tool_arguments(&tool, &call(input.clone())).expect("valid");
+        assert_eq!(out["big"], "12n");
+        assert_eq!(out["maybe"], Value::Null);
+        assert_eq!(out["numbers"], json!([7]));
+        assert!(out.get("never").is_none());
+        let error = validate_tool_arguments(
+            &tool,
+            &call(json!({"big": 12, "maybe": null, "never": false, "numbers": [1]})),
+        )
+        .expect_err("Void always rejects");
+        assert!(error.contains("never"), "{error}");
+        let validator = compile_schema_validator(&json!({"type": "void"})).expect("Void compiles");
+        assert!(!validator.is_valid(&Value::Null));
+    }
+
+    #[test]
+    fn test_unresolved_refs_fail_only_at_their_instance_location() {
+        let tool = tool(json!({
+            "$id": "https://example.com/root.json",
+            "type": "object",
+            "properties": {
+                "good": {"$ref": "#/$defs/string"},
+                "recursive": {"$ref": "#"},
+                "missing": {"$ref": "#/$defs/missing"},
+                "external": {"$ref": "https://example.com/missing.json"},
+                "named": {"$ref": "A"}
+            },
+            "$defs": {
+                "string": {"type": "string"},
+                "A": {"$id": "A", "type": "integer"}
+            }
+        }));
+        let valid = json!({"good": "ok", "recursive": {"good": "nested"}, "named": 3});
+        validate_tool_arguments(&tool, &call(valid)).expect("valid and cyclic refs survive");
+        let missing =
+            json!({"good": "ok", "recursive": {"good": "nested"}, "missing": 1, "named": 3});
+        let error = validate_tool_arguments(&tool, &call(missing)).expect_err("missing ref");
+        assert!(error.contains("missing"), "{error}");
+        let external =
+            json!({"good": "ok", "recursive": {"good": "nested"}, "external": 1, "named": 3});
+        let error = validate_tool_arguments(&tool, &call(external)).expect_err("external ref");
+        assert!(error.contains("external"), "{error}");
+    }
+
+    #[test]
     fn test_validation_failure_message_format() {
         let tool = tool(json!({
             "type": "object",
@@ -755,5 +819,258 @@ mod tests {
         );
         assert!(err.contains("  - cmd: "), "{err}");
         assert!(err.contains("\n\nReceived arguments:\n{}"), "{err}");
+    }
+
+    #[test]
+    fn upstream_primitives_const_enum_and_arrays() {
+        for (schema, input, expected) in [
+            (json!({"type": "number"}), json!(""), json!(0)),
+            (json!({"type": "number"}), json!("true"), json!(1)),
+            (json!({"type": "integer"}), json!("3.5"), json!(3)),
+            (json!({"type": "boolean"}), json!("1"), json!(true)),
+            (json!({"type": "boolean"}), json!("FALSE"), json!(false)),
+            (json!({"type": "null"}), json!("null"), Value::Null),
+            (json!({"type": "string"}), Value::Null, json!("null")),
+            (json!({"const": 1}), json!("1"), json!(1)),
+            (json!({"enum": [1, 2, "hello"]}), json!("2"), json!(2)),
+            (
+                json!({"type": "array", "items": {"type": "string"}}),
+                Value::Null,
+                json!(["null"]),
+            ),
+        ] {
+            assert_coerces(schema, input, expected);
+        }
+        assert_eq!(coerced(json!({"const": 1}), json!("2")), json!("2"));
+        assert_eq!(
+            coerced(json!({"enum": [1, 2, "hello"]}), json!("world")),
+            json!("world")
+        );
+        assert_eq!(
+            coerced(json!({"type": ["integer", "null"]}), json!("1.5")),
+            json!("1.5")
+        );
+        for input in [json!("true"), json!("12n")] {
+            assert_eq!(
+                coerced(json!({"type": ["number", "null"]}), input.clone()),
+                input,
+                "pass 3 must not apply TypeBox-only number conversions"
+            );
+        }
+        assert_coerces(json!({"type": "number"}), json!("12n"), json!(12));
+    }
+
+    #[test]
+    fn bigint_string_number_fallback_matches_upstream_grammar() {
+        let schema = json!({"type": "number"});
+        assert_coerces(schema.clone(), json!("-12n"), json!(-12));
+        assert_coerces(schema.clone(), json!("01"), json!(1));
+        assert_coerces(schema.clone(), json!("1e3"), json!(1000));
+        assert_coerces(schema.clone(), json!("0x10"), json!(16));
+        assert_coerces(schema.clone(), json!("12.9"), json!(12.9));
+        for input in ["01n", "1e3n", "12.9n", "12N", "9007199254740992n"] {
+            assert_eq!(coerced(schema.clone(), json!(input)), json!(input));
+        }
+    }
+
+    #[test]
+    fn follows_refs_and_converts_pattern_and_implicit_containers() {
+        assert_coerces(
+            json!({
+                "type": "object",
+                "properties": {"item": {"$ref": "#/$defs/item"}},
+                "$defs": {"item": {"type": "object", "properties": {"id": {"type": "integer"}}}}
+            }),
+            json!({"item": {"id": "7"}}),
+            json!({"item": {"id": 7}}),
+        );
+        assert_coerces(
+            json!({
+                "type": "object",
+                "properties": {"a": {"type": "number"}},
+                "patternProperties": {"^n_": {"type": "number"}},
+                "additionalProperties": {"type": "boolean"}
+            }),
+            json!({"a": "1", "n_x": "2", "other": "true"}),
+            json!({"a": 1, "n_x": 2, "other": true}),
+        );
+        assert_coerces(
+            json!({"properties": {"n": {"type": "integer"}}}),
+            json!({"n": "5"}),
+            json!({"n": 5}),
+        );
+        assert_coerces(
+            json!({"items": {"type": "integer"}}),
+            json!(["5"]),
+            json!([5]),
+        );
+        assert_coerces(
+            json!({"properties": {"a~1b": {"type": "integer"}}}),
+            json!({"a~1b": "3"}),
+            json!({"a~1b": 3}),
+        );
+    }
+
+    #[test]
+    fn converts_prefix_items_without_wrapping_tuples() {
+        let tuple = json!({
+            "type": "array",
+            "prefixItems": [{"type": "number"}, {"type": "boolean"}],
+            "items": false
+        });
+        assert_coerces(tuple.clone(), json!(["1", "true"]), json!([1, true]));
+        assert_eq!(coerced(tuple, json!("1")), json!("1"));
+    }
+
+    #[test]
+    fn upstream_all_of_one_of_and_union_member_fixtures() {
+        assert_coerces(
+            json!({"allOf": [
+                {"type": "object", "properties": {"a": {"type": "number"}}},
+                {"type": "object", "properties": {"b": {"type": "boolean"}}}
+            ]}),
+            json!({"a": "1", "b": "true"}),
+            json!({"a": 1, "b": true}),
+        );
+        assert_coerces(
+            json!({"oneOf": [{"type": "boolean"}, {"type": "number"}]}),
+            json!("1"),
+            json!(true),
+        );
+        for keyword in ["anyOf", "oneOf"] {
+            assert_coerces(
+                json!({
+                    "type": "object",
+                    keyword: [
+                        {"type": "object", "properties": {"a": {"type": "array", "items": {"type": "integer"}}}, "required": ["a"]},
+                        {"type": "object", "properties": {"b": {"type": "boolean"}}, "required": ["b"]}
+                    ],
+                    "properties": {"c": {"type": "integer"}},
+                    "required": ["c"]
+                }),
+                json!({"a": "3", "c": "2"}),
+                json!({"a": [3], "c": 2}),
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_json_union_converts_nested_nulls_and_arrays() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"data": {"$ref": "#/$defs/Json"}},
+            "required": ["data"],
+            "$defs": {
+                "Json": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "number"},
+                        {"type": "boolean"},
+                        {"type": "array", "items": {"$ref": "#/$defs/Json"}},
+                        {"type": "object", "additionalProperties": {"$ref": "#/$defs/Json"}}
+                    ]
+                }
+            }
+        });
+        assert_coerces(
+            schema,
+            json!({"data": {"a": [1, null]}}),
+            json!({"data": {"a": [1, "null"]}}),
+        );
+    }
+
+    #[test]
+    fn recursive_unions_convert_once_and_reject_without_expanding_forever() {
+        let tree = json!({
+            "type": "object",
+            "properties": {"t": {"$ref": "#/$defs/Tree"}},
+            "$defs": {"Tree": {"anyOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"$ref": "#/$defs/Tree"}}
+            ]}}
+        });
+        assert_coerces(tree.clone(), json!({"t": [5]}), json!({"t": ["5"]}));
+        assert_coerces(tree, json!({"t": ["a", ["b"]]}), json!({"t": ["a", ["b"]]}));
+
+        let schema = json!({
+            "type": "object",
+            "properties": {"value": {"anyOf": [
+                {"type": "number"},
+                {"type": "array", "items": {"$ref": "#/properties/value"}}
+            ]}},
+            "required": ["value"]
+        });
+        assert_coerces(
+            schema,
+            json!({"value": ["1", ["2"]]}),
+            json!({"value": [1, [2]]}),
+        );
+
+        let deep_schema = json!({
+            "type": "object",
+            "properties": {"s": {"$ref": "#/$defs/S"}},
+            "$defs": {"S": {"anyOf": [
+                {"type": "object", "additionalProperties": {"$ref": "#/$defs/S"}, "required": ["a"]},
+                {"type": "object", "additionalProperties": {"$ref": "#/$defs/S"}, "required": ["b"]}
+            ]}}
+        });
+        let mut nested = json!({"x": 1});
+        for _ in 0..40 {
+            nested = json!({"c": nested});
+        }
+        let input = json!({"s": nested});
+        let compiled = get_compiled_schema(&deep_schema).expect("recursive schema compiles");
+        let output = coercion::coerce(&compiled, input.clone());
+        assert_eq!(output, input);
+        assert!(!compiled.root().is_valid(&output));
+    }
+
+    #[test]
+    fn union_members_and_optional_nulls_follow_all_property_keywords() {
+        assert_coerces(
+            json!({
+                "type": "object",
+                "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+                "anyOf": [{"required": ["a"]}, {"required": ["b"]}]
+            }),
+            json!({"a": "3.5"}),
+            json!({"a": 3}),
+        );
+        let item =
+            json!({"type": "object", "properties": {"n": {"type": "integer", "minimum": 1}}});
+        for schema in [
+            json!({"type": "object", "additionalProperties": item.clone()}),
+            json!({"type": "object", "patternProperties": {"^entry$": item.clone()}, "additionalProperties": false}),
+        ] {
+            assert_coerces(schema, json!({"entry": {"n": null}}), json!({"entry": {}}));
+        }
+    }
+
+    #[test]
+    fn validation_paths_unescape_json_pointer_segments() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"a/b": {"type": "integer"}, "c~d": {"type": "integer"}}
+        });
+        let error = validate_tool_arguments(
+            &tool(schema.clone()),
+            &call(json!({"a/b": "bad", "c~d": 1})),
+        )
+        .expect_err("invalid property");
+        assert!(error.contains("- a/b:"), "{error}");
+        let error = validate_tool_arguments(&tool(schema), &call(json!({"a/b": 1, "c~d": "bad"})))
+            .expect_err("invalid property");
+        assert!(error.contains("- c~d:"), "{error}");
+    }
+
+    #[test]
+    fn compiled_schemas_are_cached_by_content() {
+        let schema = json!({"$id": "schema-cache-regression", "type": "object", "properties": {"n": {"type": "integer"}}});
+        let first = get_compiled_schema(&schema).expect("first compile");
+        let second = get_compiled_schema(&schema).expect("cache hit");
+        assert!(Arc::ptr_eq(&first, &second));
+        let changed = json!({"$id": "schema-cache-regression", "type": "object", "properties": {"n": {"type": "string"}}});
+        let third = get_compiled_schema(&changed).expect("changed schema compile");
+        assert!(!Arc::ptr_eq(&first, &third));
     }
 }

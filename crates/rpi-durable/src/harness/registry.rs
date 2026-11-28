@@ -1,5 +1,5 @@
 //! Extension registry (port of `packages/durable/src/harness/registry.ts`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 //!
 //! A registry publishes immutable [`RegistryState`] snapshots. Installation
 //! replaces an extension with the same name in place; removal of a later install

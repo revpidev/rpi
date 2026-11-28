@@ -1,5 +1,5 @@
 //! TypeScript declaration rendering for the script-visible API (port of
-//! `packages/codemode/src/declarations.ts` @ 4a080252f).
+//! `packages/codemode/src/declarations.ts` @ b4afdddf).
 //!
 //! Tools become members of `declare const tools`, globals become
 //! `declare function` statements, and `ns.member` globals members of
@@ -266,8 +266,8 @@ fn is_object(value: &Value) -> bool {
 }
 
 /// `decodeURIComponent` for one JSON pointer segment: percent-escapes are
-/// decoded as UTF-8; malformed escapes stay literal instead of throwing.
-fn decode_uri_component(segment: &str) -> String {
+/// decoded as UTF-8; malformed escapes and invalid UTF-8 name nothing.
+fn decode_uri_component(segment: &str) -> Option<String> {
     fn hex(byte: u8) -> Option<u8> {
         match byte {
             b'0'..=b'9' => Some(byte - b'0'),
@@ -280,10 +280,13 @@ fn decode_uri_component(segment: &str) -> String {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2]))
-        {
+        if bytes[index] == b'%' {
+            let (Some(high), Some(low)) = (
+                bytes.get(index + 1).copied().and_then(hex),
+                bytes.get(index + 2).copied().and_then(hex),
+            ) else {
+                return None;
+            };
             decoded.push(high * 16 + low);
             index += 3;
         } else {
@@ -291,24 +294,21 @@ fn decode_uri_component(segment: &str) -> String {
             index += 1;
         }
     }
-    String::from_utf8(decoded).unwrap_or_else(|_| segment.to_owned())
+    String::from_utf8(decoded).ok()
 }
 
-fn resolve_ref(reference: &str, root: &Value) -> Option<Value> {
-    if reference == "#" {
-        // Upstream's `ref.slice(2)` over `"#"` is empty, so the loop is
-        // skipped and the root schema is returned.
-        return Some(root.clone());
-    }
-    if !reference.starts_with("#/") {
+pub fn resolve_schema_ref(reference: &str, root: &Value) -> Option<Value> {
+    if reference != "#" && !reference.starts_with("#/") {
         return None;
     }
     let mut current = root;
-    for segment in reference[2..].split('/').filter(|part| !part.is_empty()) {
-        let key = decode_uri_component(segment)
-            .replace("~1", "/")
-            .replace("~0", "~");
-        current = current.as_object()?.get(&key)?;
+    if reference != "#" {
+        for segment in reference[2..].split('/').filter(|part| !part.is_empty()) {
+            let key = decode_uri_component(segment)?
+                .replace("~1", "/")
+                .replace("~0", "~");
+            current = current.as_object()?.get(&key)?;
+        }
     }
     if current.is_boolean() || current.is_object() {
         Some(current.clone())
@@ -334,7 +334,7 @@ fn to_type(schema: &Value, context: &mut SchemaContext<'_>) -> String {
         {
             return "unknown".to_owned();
         }
-        let Some(target) = resolve_ref(reference, context.root) else {
+        let Some(target) = resolve_schema_ref(reference, context.root) else {
             return "unknown".to_owned();
         };
         context.expansions += 1;
@@ -731,7 +731,7 @@ pub fn is_plain_object(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    //! Ports `packages/codemode/test/declarations.test.ts` @ 4a080252f.
+    //! Ports `packages/codemode/test/declarations.test.ts` @ b4afdddf.
 
     use super::*;
     use serde_json::json;
@@ -1043,6 +1043,41 @@ mod tests {
             "$defs": { "a b": { "type": "string" } }
         });
         assert_eq!(schema_to_type(&schema, None), "{ item?: string; }");
+    }
+
+    #[test]
+    fn malformed_remote_and_missing_refs_resolve_to_nothing() {
+        let root = json!({
+            "$id": "schemas/tool.json",
+            "$defs": {
+                "ok": {"type": "string"},
+                "a/b~c": {"const": "value"}
+            }
+        });
+        assert_eq!(
+            resolve_schema_ref("#/$defs/ok", &root),
+            Some(json!({"type": "string"}))
+        );
+        assert_eq!(
+            resolve_schema_ref("#/$defs/a~1b~0c", &root),
+            Some(json!({"const": "value"}))
+        );
+        for reference in [
+            "#/$defs/missing",
+            "#/$defs/bad%",
+            "#/$defs/bad%GG",
+            "#/$defs/bad%FF",
+            "https://example.com/schema.json",
+        ] {
+            assert_eq!(resolve_schema_ref(reference, &root), None, "{reference}");
+        }
+        assert_eq!(resolve_schema_ref("#", &root), Some(root));
+        for invalid_root in [Value::Null, json!([]), json!("schema"), json!(1)] {
+            assert_eq!(resolve_schema_ref("#", &invalid_root), None);
+        }
+        for boolean_root in [json!(true), json!(false)] {
+            assert_eq!(resolve_schema_ref("#", &boolean_root), Some(boolean_root));
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Consumed subset of `@earendil-works/chord` (port of `packages/chord` @
-//! 4a080252f).
+//! b4afdddf).
 //!
 //! Only the surfaces durable consumes are carried (V17-13 FR-B): the cancellation
 //! context family, `copyJson`/`JsonValue` helpers, the `Op` delta applier, the

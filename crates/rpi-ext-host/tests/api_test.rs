@@ -83,6 +83,7 @@ impl HostActions for MockActions {
             stderr: String::new(),
             code: 0,
             killed: false,
+            truncated: false,
         })
     }
 

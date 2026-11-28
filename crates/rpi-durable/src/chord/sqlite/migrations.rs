@@ -1,5 +1,5 @@
 //! Generic SQLite migration runner (port of `src/sqlite/migrations.ts` @
-//! `4a080252f`).
+//! `b4afdddf`).
 //!
 //! The runner validates a prefix-safe metadata table, checks contiguous
 //! versions and applies every pending migration in one transaction. Durable

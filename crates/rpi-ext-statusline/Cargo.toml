@@ -45,6 +45,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 rpi-test-env.workspace = true
+# V19-07 FR-F memory report example: `malloc_trim(0)` so the RssAnon deltas
+# reflect the tables a tokenizer retains, not the allocator's free lists.
+libc.workspace = true
 # TE52 joint frames use the host's exact status-line wrap helper (the same
 # function the built-in footer uses). TE53 replaces the usage-side literal
 # with the real typed footer (linking both abi_stable root modules into one

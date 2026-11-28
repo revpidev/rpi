@@ -1,4 +1,4 @@
-//! Port of `packages/tui/src/native-modifiers.ts` @ pi 1.4.0 (`4a080252f`),
+//! Port of `packages/tui/src/native-modifiers.ts` @ pi 1.5.2 (`b4afdddf`),
 //! with the platform gating tracking the `4181f66` revision (`73dd066ee`
 //! added the win32 helper path).
 //!
@@ -8,10 +8,8 @@
 //! since `73dd066ee`). This port implements the macOS arm with a
 //! CoreGraphics FFI query (V17-10 #69, ADR-0004's reserved helper seam):
 //! Apple Terminal's Shift+Enter normalization needs the physical modifier
-//! state. Windows keeps the fallback used when a native helper is
-//! unavailable (`native_helper_supported` is macOS-only — the win32
-//! addon's modifier query is not ported); the VT-input half of the win32
-//! helper is implemented in `terminal.rs`.
+//! state. macOS uses CoreGraphics and Windows uses `GetAsyncKeyState`; other
+//! platforms keep the helper-unavailable fallback.
 //! - `ModifierKey` is an enum instead of a string-literal union;
 //!   `ModifierKey::name()` returns the upstream byte values
 //!   ("shift" | "command" | "control" | "option").
@@ -52,10 +50,10 @@ impl ModifierKey {
 /// Whether a native helper exists for this platform/build
 /// (`loadNativeModifiersHelper`, native-modifiers.ts:21-53 @ 4181f66):
 /// upstream resolves an addon on darwin and win32 for x64/arm64. The Rust
-/// port ships the macOS CoreGraphics arm; Windows stays on the upstream
-/// fallback (no console-mode modifier query).
+/// port uses the macOS CoreGraphics and Windows User32 query arms.
 fn native_helper_supported() -> bool {
-    cfg!(target_os = "macos") && matches!(std::env::consts::ARCH, "x86_64" | "aarch64")
+    cfg!(any(target_os = "macos", target_os = "windows"))
+        && matches!(std::env::consts::ARCH, "x86_64" | "aarch64")
 }
 
 /// `isNativeModifierPressed` (native-modifiers.ts:51-58).
@@ -91,7 +89,11 @@ fn native_modifier_query(key: ModifierKey) -> Option<bool> {
     {
         Some(macos::is_modifier_pressed(key))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        Some(windows::is_modifier_pressed(key))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = key;
         None
@@ -135,6 +137,26 @@ mod macos {
             ModifierKey::Option => FLAG_OPTION,
         };
         flags & mask != 0
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::ModifierKey;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAsyncKeyState(virtual_key: i32) -> i16;
+    }
+
+    pub(super) fn is_modifier_pressed(key: ModifierKey) -> bool {
+        let virtual_key = match key {
+            ModifierKey::Shift => 0x10,
+            ModifierKey::Control => 0x11,
+            ModifierKey::Option => 0x12,
+            ModifierKey::Command => 0x5b,
+        };
+        (unsafe { GetAsyncKeyState(virtual_key) }) < 0
     }
 }
 

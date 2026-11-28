@@ -1,7 +1,7 @@
 //! renderCall/renderResult component trees (FR-P2-E) — port of the
-//! renderer half of upstream `pi-smart-fetch/src/index.ts` @ b0111612
-//! (:77-468 helpers, :628-664 web_fetch renderers, :773-789 batch
-//! renderers), mapped onto ComponentTree v1
+//! renderer half of upstream `pi-smart-fetch/src/index.ts` @ feb6da00
+//! (smart-fetch-core v0.3.23; :77-468 helpers, :628-664 web_fetch renderers,
+//! :773-789 batch renderers), mapped onto ComponentTree v1
 //! (`rpi.component-tree.v1`).
 //!
 //! Protocol-driven degradations (v1 has no `row`, one `fg` per text node —
@@ -9,7 +9,8 @@
 //! pixel-level parity are non-goals):
 //! - every horizontal multi-color composition collapses to a single text
 //!   node (the glyph/URL/`█░` bar line carries one foreground color);
-//! - the Markdown preview renders as plain text;
+//! - the Markdown preview renders as plain text (F07 removed the Markdown
+//!   renderer dependency);
 //! - `getOptimisticProgress` time extrapolation is dropped (Out: depends on
 //!   `Date.now`) — bar fill uses the event's static progress value.
 //!
@@ -42,14 +43,7 @@ fn context_render_width(context: &Value) -> usize {
         .unwrap_or(DEFAULT_RENDER_WIDTH)
 }
 
-/// `maxPreviewLines` (index.ts:292).
-const MAX_PREVIEW_LINES: usize = 7;
-
 // ===== ComponentTree v1 node helpers =====
-
-fn text_node(text: &str) -> Value {
-    json!({ "type": "text", "props": { "text": text } })
-}
 
 fn text_node_styled(text: &str, fg: &str, bold: bool) -> Value {
     let mut props = serde_json::Map::new();
@@ -118,19 +112,6 @@ fn status_glyph(status: &str, spinner_index: usize) -> (&'static str, &'static s
     }
 }
 
-/// `${value}` rendering for the file-info lines: JSON scalars without the
-/// serde quoting (numbers bare, strings bare, null → "undefined" — a file
-/// result always carries these fields, the fallback mirrors JS).
-fn plain_template_value(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Null => "undefined".to_string(),
-        Value::Bool(flag) => flag.to_string(),
-        Value::Number(number) => number.to_string(),
-        other => format!("{other}"),
-    }
-}
-
 /// The character progress bar (`renderProgressBar`, index.ts:107-150,
 /// re-based from bg blocks to `█`/`░` fills — Out: pixel-level parity).
 /// Fill is the static event progress (`getOptimisticProgress` dropped).
@@ -190,9 +171,11 @@ fn render_web_fetch_partial(details: &Value, context: &Value) -> Value {
     let url = details
         .get("url")
         .or_else(|| {
+            // F07 (index.ts:487-491 @ feb6da00): pending URL reads the compact
+            // summary; the legacy fetchResult is not a pending fallback.
             details
-                .get("fetchResult")
-                .and_then(|result| result.get("finalUrl").or_else(|| result.get("url")))
+                .get("fetchSummary")
+                .and_then(|summary| summary.get("finalUrl").or_else(|| summary.get("url")))
         })
         .and_then(Value::as_str)
         .unwrap_or("");
@@ -213,110 +196,86 @@ fn render_web_fetch_partial(details: &Value, context: &Value) -> Value {
     )
 }
 
-/// `buildWebFetchMetadataLines` (index.ts:238-261): Title/Published when
-/// non-empty. Upstream colors each half (syntaxKeyword/syntaxString); v1
-/// renders the muted pair.
-fn web_fetch_metadata_lines(details: &Value) -> Vec<String> {
-    let Some(result) = details.get("fetchResult") else {
+/// `buildWebFetchMetadataLines` (index.ts:445-467 @ feb6da00): Title and
+/// Published from the compact summary, empty values omitted.
+fn web_fetch_metadata_lines(summary: &crate::types::WebFetchResultSummary) -> Vec<String> {
+    let crate::types::WebFetchResultSummary::Content {
+        title, published, ..
+    } = summary
+    else {
         return Vec::new();
     };
     let mut lines = Vec::new();
-    for (label, key) in [("Title", "title"), ("Published", "published")] {
-        let value = result.get(key).and_then(Value::as_str);
-        if let Some(value) = value.filter(|value| !value.is_empty()) {
+    for (label, value) in [("Title", title), ("Published", published)] {
+        if !value.is_empty() {
             lines.push(format!("{label}: {value}"));
         }
     }
     lines
 }
 
-/// `buildWebFetchCollapsedPreview` (index.ts:282-299): drop the trailing
-/// empty lines, keep the first 7.
-fn web_fetch_collapsed_preview(content: &str) -> (String, usize) {
-    let lines: Vec<&str> = content.split('\n').collect();
-    let content_lines: Vec<&str> = lines
-        .iter()
-        .enumerate()
-        .filter(|(index, line)| !line.is_empty() || *index == 0 || *index + 1 < lines.len())
-        .map(|(_, line)| *line)
-        .collect();
-    let preview: Vec<&str> = content_lines
-        .iter()
-        .take(MAX_PREVIEW_LINES)
-        .copied()
-        .collect();
-    let remaining = content_lines.len().saturating_sub(preview.len());
-    (preview.join("\n"), remaining)
-}
-
-/// `createWebFetchResultComponent` (index.ts:301-377) as a column:
-/// metadata lines → (file info | preview/full content) → the expand hint.
-/// Markdown rendering degrades to plain text (Out).
-fn render_web_fetch_final(details: &Value, expanded: bool) -> Value {
-    let Some(fetch_result) = details.get("fetchResult") else {
+/// `createWebFetchResultComponent` (index.ts:469-537 @ feb6da00): metadata +
+/// stats only. The extracted page text stays in the agent `content` payload;
+/// collapsed and expanded views never render a body preview.
+fn render_web_fetch_final(details: &Value) -> Value {
+    let Some(summary) =
+        crate::types::resolve_web_fetch_summary(details, crate::constants::DEFAULT_MAX_CHARS)
+    else {
         return text_node_styled("No fetch result available.", "muted", false);
     };
 
     let mut children: Vec<Value> = Vec::new();
-    let metadata = web_fetch_metadata_lines(details);
+    let metadata = web_fetch_metadata_lines(&summary);
     if !metadata.is_empty() {
         children.push(text_node_styled(&metadata.join("\n"), "muted", false));
     }
 
-    let is_file = fetch_result.get("kind").and_then(Value::as_str) == Some("file");
-    if is_file {
-        if !metadata.is_empty() {
-            children.push(spacer_node(1));
+    match summary {
+        crate::types::WebFetchResultSummary::File {
+            file_size,
+            mime_type,
+            file_path,
+            ..
+        } => {
+            let mut file_lines = vec![format!("File size: {file_size}")];
+            if let Some(mime_type) = mime_type.filter(|mime| !mime.is_empty()) {
+                file_lines.push(format!("Mime type: {mime_type}"));
+            }
+            file_lines.push(format!("File path: {file_path}"));
+            if !metadata.is_empty() {
+                children.push(spacer_node(1));
+            }
+            children.push(text_node_styled(&file_lines.join("\n"), "muted", false));
         }
-        let mut file_lines = Vec::new();
-        // JS template values: numbers render bare, missing fields render
-        // "undefined" — `Value`'s Display would quote strings.
-        file_lines.push(format!(
-            "File size: {}",
-            fetch_result
-                .get("fileSize")
-                .map(plain_template_value)
-                .unwrap_or_else(|| "undefined".to_string())
-        ));
-        if let Some(mime_type) = fetch_result
-            .get("mimeType")
-            .and_then(Value::as_str)
-            .filter(|mime| !mime.is_empty())
-        {
-            file_lines.push(format!("Mime type: {mime_type}"));
+        crate::types::WebFetchResultSummary::Content {
+            char_count,
+            word_count,
+            truncated,
+            ..
+        } => {
+            // Raw responses carry a placeholder word count of 0; omit it
+            // instead of claiming the page has no words (index.ts:520-524).
+            let format = details.get("format").and_then(Value::as_str);
+            let count_text = if format == Some("raw") {
+                format!("{char_count} chars")
+            } else {
+                format!("{char_count} chars · {word_count} words")
+            };
+            let stats = format!(
+                "{count_text}{}",
+                if truncated { " · truncated" } else { "" }
+            );
+            let hint = if truncated {
+                "Content was truncated to maxChars before delivery to the agent."
+            } else {
+                "Full content was delivered to the agent."
+            };
+            if !metadata.is_empty() {
+                children.push(spacer_node(1));
+            }
+            children.push(text_node_styled(&stats, "muted", false));
+            children.push(text_node_styled(hint, "dim", false));
         }
-        file_lines.push(format!(
-            "File path: {}",
-            fetch_result
-                .get("filePath")
-                .map(plain_template_value)
-                .unwrap_or_else(|| "undefined".to_string())
-        ));
-        children.push(text_node_styled(&file_lines.join("\n"), "muted", false));
-        return column_node(children);
-    }
-
-    let content = fetch_result
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let (preview, remaining) = web_fetch_collapsed_preview(content);
-    let shown = if expanded { content } else { &preview };
-    if !metadata.is_empty() && !shown.is_empty() {
-        children.push(spacer_node(1));
-    }
-    if !shown.is_empty() {
-        children.push(text_node(shown));
-    }
-    if !expanded && remaining > 0 {
-        if !shown.is_empty() {
-            children.push(spacer_node(1));
-        }
-        children.push(text_node_styled(
-            &format!("... ({remaining} more lines, Ctrl+O to expand)"),
-            "muted",
-            false,
-        ));
     }
     column_node(children)
 }
@@ -361,7 +320,8 @@ pub fn render_web_fetch_result(result: &Value, options: &Value, context: &Value)
             .unwrap_or("Error");
         return text_node_styled(message, "error", false);
     }
-    render_web_fetch_final(&details, expanded)
+    let _ = expanded;
+    render_web_fetch_final(&details)
 }
 
 // ===== renderResult: batch (index.ts:177-223, 439-468, 783-789) =====
@@ -575,17 +535,25 @@ mod tests {
     }
 
     #[test]
-    fn final_result_metadata_preview_and_hint() {
-        let content = "para one\npara two\npara three\npara four\npara five\npara six\npara seven\npara eight\npara nine";
+    fn final_result_metadata_stats_and_no_body() {
+        let content = "para one\npara two\npara three\npara four\npara five";
         let tree = render_web_fetch_result(
             &json!({
                 "content": [{ "type": "text", "text": "agent text" }],
                 "details": {
                     "fetchResult": {
                         "kind": "content",
+                        "url": "https://ex.com/a",
+                        "finalUrl": "https://ex.com/a",
                         "title": "T",
+                        "author": "",
                         "published": "2026-01-01",
+                        "site": "",
+                        "language": "",
                         "content": content,
+                        "wordCount": 10,
+                        "browser": "chrome_145",
+                        "os": "windows",
                     }
                 }
             }),
@@ -599,22 +567,37 @@ mod tests {
             json!("Title: T\nPublished: 2026-01-01")
         );
         assert_eq!(children[1]["type"], json!("spacer"));
-        let preview = children[2]["props"]["text"].as_str().unwrap();
-        assert_eq!(preview.matches('\n').count(), 6, "7 preview lines");
-        assert!(preview.starts_with("para one"));
+        assert_eq!(children[2]["props"]["text"], json!("48 chars · 10 words"));
         assert_eq!(
-            children[4]["props"]["text"],
-            json!("... (2 more lines, Ctrl+O to expand)")
+            children[3]["props"]["text"],
+            json!("Full content was delivered to the agent.")
+        );
+        assert!(
+            !tree.to_string().contains("para one"),
+            "the body never renders in details"
         );
     }
 
     #[test]
-    fn final_result_expanded_shows_everything() {
+    fn final_result_expanded_still_hides_body() {
         let content = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10";
         let tree = render_web_fetch_result(
             &json!({
                 "content": [],
-                "details": { "fetchResult": { "kind": "content", "content": content } }
+                "details": { "fetchResult": {
+                    "kind": "content",
+                    "url": "https://ex.com/a",
+                    "finalUrl": "https://ex.com/a",
+                    "title": "",
+                    "author": "",
+                    "published": "",
+                    "site": "",
+                    "language": "",
+                    "content": content,
+                    "wordCount": 10,
+                    "browser": "chrome_145",
+                    "os": "windows",
+                } }
             }),
             &json!({ "isPartial": false, "expanded": true }),
             &json!({}),
@@ -626,35 +609,76 @@ mod tests {
             .filter(|node| node["type"] == json!("text"))
             .map(|node| node["props"]["text"].as_str().unwrap())
             .collect();
-        assert_eq!(texts, vec!["l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10"]);
+        assert_eq!(
+            texts,
+            vec![
+                "30 chars · 10 words",
+                "Full content was delivered to the agent."
+            ]
+        );
     }
 
     #[test]
-    fn file_result_lines() {
+    fn fetch_summary_renders_truncation_and_raw_omits_words() {
+        let details = json!({
+            "format": "raw",
+            "fetchSummary": {
+                "kind": "content",
+                "url": "https://ex.com/a",
+                "finalUrl": "https://ex.com/a",
+                "ok": true,
+                "charCount": 50001,
+                "wordCount": 0,
+                "truncated": true,
+                "title": "",
+                "published": ""
+            }
+        });
         let tree = render_web_fetch_result(
-            &json!({
-                "content": [],
-                "details": {
-                    "fetchResult": {
-                        "kind": "file",
-                        "fileSize": 12345,
-                        "mimeType": "application/pdf",
-                        "filePath": "/tmp/smart-fetch-rpi/report.pdf",
-                        "content": ""
-                    }
-                }
-            }),
+            &json!({ "content": [], "details": details }),
             &json!({ "isPartial": false, "expanded": false }),
             &json!({}),
         );
         let children = tree["children"].as_array().unwrap();
         assert_eq!(
             children[0]["props"]["text"],
-            json!(
-                "File size: 12345\nMime type: application/pdf\nFile path: /tmp/smart-fetch-rpi/report.pdf"
-            )
+            json!("50001 chars · truncated")
         );
-        assert_eq!(children[0]["props"]["fg"], json!("muted"));
+        assert_eq!(
+            children[1]["props"]["text"],
+            json!("Content was truncated to maxChars before delivery to the agent.")
+        );
+    }
+
+    #[test]
+    fn pending_url_prefers_summary() {
+        let tree = render_web_fetch_result(
+            &json!({
+                "content": [],
+                "details": {
+                    "status": "loading",
+                    "fetchSummary": { "kind": "content", "url": "https://ex.com/final", "finalUrl": "https://ex.com/final" }
+                }
+            }),
+            &json!({ "isPartial": true }),
+            &json!({}),
+        );
+        assert!(
+            tree["props"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("https://ex.com/final")
+        );
+    }
+
+    #[test]
+    fn malformed_details_degrade_to_no_result() {
+        let tree = render_web_fetch_result(
+            &json!({ "content": [], "details": { "fetchSummary": { "kind": "content" } } }),
+            &json!({ "isPartial": false, "expanded": false }),
+            &json!({}),
+        );
+        assert_eq!(tree["props"]["text"], json!("No fetch result available."));
     }
 
     #[test]

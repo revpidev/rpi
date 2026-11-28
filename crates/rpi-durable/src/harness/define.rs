@@ -1,5 +1,5 @@
 //! Identity/typed constructors of the extension surface
-//! (port of `packages/durable/src/harness/define.ts` @ `4a080252f`).
+//! (port of `packages/durable/src/harness/define.ts` @ `b4afdddf`).
 //!
 //! Upstream these are generic identity functions that only influence TypeScript
 //! inference. The Rust port keeps them as thin, typed constructors so extension

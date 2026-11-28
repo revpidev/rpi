@@ -389,6 +389,7 @@ async fn runner_renderer_first_registration_wins_silently() {
         ext::MessageRenderOptions {
             expanded: false,
             output_pad: 0,
+            keybinding_hints: Default::default(),
         },
     )
     .unwrap()
@@ -423,16 +424,22 @@ async fn runner_entry_renderer_first_registration_wins_silently() {
     .await;
 
     let renderer = host.get_entry_renderer("card").unwrap();
-    let tree = renderer(json!({}), ext::EntryRenderOptions { expanded: false })
-        .unwrap()
-        .unwrap();
+    let tree = renderer(
+        json!({}),
+        ext::EntryRenderOptions {
+            expanded: false,
+            keybinding_hints: Default::default(),
+        },
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(tree["props"]["text"], "a");
     assert!(host.get_command_diagnostics().is_empty());
     assert!(host.get_entry_renderer("other").is_none());
 }
 
 // ---------------------------------------------------------------------------
-// Tool renderer resolvers (runner.ts:790-796 @ 4a080252f, #10285)
+// Tool renderer resolvers (runner.ts:790-796 @ b4afdddf, #10285)
 // ---------------------------------------------------------------------------
 
 fn caller_text(text: &str) -> ext::RenderCallFn {
@@ -454,11 +461,12 @@ fn render_context() -> ext::ToolRenderContext {
         duration_ms: None,
         output_pad: 1,
         terminal_width: None,
+        keybinding_hints: Default::default(),
     }
 }
 
 /// Port of `extensions-runner.test.ts` "resolves tool renderers in extension
-/// load order, each able to defer to the next" (:894-913 @ 4a080252f).
+/// load order, each able to defer to the next" (:894-913 @ b4afdddf).
 #[tokio::test]
 async fn runner_resolves_tool_renderers_in_load_order() {
     let host = host_with(vec![
@@ -578,7 +586,7 @@ async fn runner_tool_renderer_resolver_matches_unregistered_tools() {
     );
 }
 
-/// `ToolRenderContext` additive fields (types.ts:494-498 @ 4a080252f):
+/// `ToolRenderContext` additive fields (types.ts:494-498 @ b4afdddf):
 /// camelCase, `durationMs` omitted when absent, `outputPad` defaulted.
 #[test]
 fn tool_render_context_duration_and_output_pad_wire_shape() {
@@ -595,6 +603,7 @@ fn tool_render_context_duration_and_output_pad_wire_shape() {
         duration_ms: Some(1_500),
         output_pad: 2,
         terminal_width: Some(120),
+        keybinding_hints: Default::default(),
     };
     let value = serde_json::to_value(&with_fields).expect("serialize");
     assert_eq!(value["durationMs"], json!(1500));
@@ -673,6 +682,7 @@ async fn runner_markdown_transformers_chain_in_load_order() {
         message_type: "assistant".to_owned(),
         is_streaming: true,
         available_width: 76,
+        ..Default::default()
     };
     let step_a = transformers[0]("hello".to_owned(), context.clone());
     let step_b = transformers[1](step_a, context.clone());
@@ -681,6 +691,43 @@ async fn runner_markdown_transformers_chain_in_load_order() {
         *calls.lock().unwrap_or_else(|e| e.into_inner()),
         ["a:assistant:true:76", "b:assistant:true:76"]
     );
+}
+
+#[tokio::test]
+async fn runner_markdown_transformers_filter_new_surfaces() {
+    let host = host_with(vec![
+        inline_ext("ext-default", |api| {
+            api.register_markdown_transformer(Arc::new(|md, _| format!("default({md})")))
+                .unwrap();
+        }),
+        inline_ext("ext-changelog", |api| {
+            api.register_markdown_transformer_with_options(
+                Arc::new(|md, _| format!("changelog({md})")),
+                ext::MarkdownTransformerOptions {
+                    message_types: Some(vec![ext::MarkdownMessageType::Changelog]),
+                },
+            )
+            .unwrap();
+        }),
+    ])
+    .await;
+    let transformers = host.get_markdown_transformers();
+    let apply = |message_type: &str| {
+        transformers
+            .iter()
+            .fold("body".to_owned(), |markdown, transform| {
+                transform(
+                    markdown,
+                    ext::MarkdownTransformContext {
+                        message_type: message_type.to_owned(),
+                        ..Default::default()
+                    },
+                )
+            })
+    };
+    assert_eq!(apply("assistant"), "default(body)");
+    assert_eq!(apply("changelog"), "changelog(body)");
+    assert_eq!(apply("summary"), "body");
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,7 +1443,7 @@ fn user_message_json(content: &str, timestamp: i64) -> Value {
 
 /// V16-03 FR-C R1: `context` handlers never see system messages; when they
 /// change the conversation the replayed prompt/tool checkpoint is re-attached
-/// as one leading system message (runner.ts:1187-1317 @ 4a080252f).
+/// as one leading system message (runner.ts:1187-1317 @ b4afdddf).
 #[tokio::test]
 async fn runner_context_hides_system_messages_and_restores_prompt() {
     let host = host_with(vec![inline_ext("ext-a", |api| {
@@ -1490,7 +1537,7 @@ async fn runner_context_keeps_system_messages_added_by_a_handler() {
 
 /// V16-03 FR-B R2: `context_with_system` runs after every `context` handler
 /// on the restored transcript and its output is sent verbatim
-/// (runner.ts:1320-1354 @ 4a080252f).
+/// (runner.ts:1320-1354 @ b4afdddf).
 #[tokio::test]
 async fn runner_context_with_system_runs_after_context_verbatim() {
     let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -2717,7 +2764,7 @@ fn all_events_is_additive_43_in_order() {
     assert_eq!(index("input"), events.len() - 2);
     // V16-06: `mcp_servers_change` after `session_shutdown`,
     // `provider_stream_event` after `after_provider_response` (upstream
-    // `on()` overload order, types.ts:1545-1625 @ 4a080252f).
+    // `on()` overload order, types.ts:1545-1625 @ b4afdddf).
     assert_eq!(index("mcp_servers_change"), index("session_shutdown") + 1);
     assert_eq!(
         index("session_before_tree"),
@@ -2865,7 +2912,7 @@ fn tool_event_payloads_carry_parent_and_structured_fields() {
 #[tokio::test]
 async fn runner_tool_result_drops_structured_content_on_content_replace() {
     // A handler that replaces `content` without restating `structuredContent`
-    // drops it (runner.ts:1185-1196 @ 4a080252f).
+    // drops it (runner.ts:1185-1196 @ b4afdddf).
     let host = host_with(vec![inline_ext("ext-a", |api| {
         api.on(
             ext::EVENT_TOOL_RESULT,

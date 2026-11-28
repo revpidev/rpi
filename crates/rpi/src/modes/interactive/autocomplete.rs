@@ -2,10 +2,10 @@
 //! `packages/coding-agent/src/modes/interactive/interactive-mode.ts` @ pi
 //! 0.82.1 (2efa728):
 //! - `getAutocompleteSourceTag` / `prefixAutocompleteDescription`
-//!   (interactive-mode.ts:676-708 @ 4a080252f)
-//! - `getBuiltInCommandConflictDiagnostics` (interactive-mode.ts:710-723 @ 4a080252f)
-//! - `createBaseAutocompleteProvider` (interactive-mode.ts:725-823 @ 4a080252f)
-//! - `setupAutocompleteProvider` (interactive-mode.ts:825-841 @ 4a080252f)
+//!   (interactive-mode.ts:676-708 @ b4afdddf)
+//! - `getBuiltInCommandConflictDiagnostics` (interactive-mode.ts:710-723 @ b4afdddf)
+//! - `createBaseAutocompleteProvider` (interactive-mode.ts:725-823 @ b4afdddf)
+//! - `setupAutocompleteProvider` (interactive-mode.ts:825-841 @ b4afdddf)
 //!
 //! The provider combines four command sources: the built-in slash commands
 //! (`core::slash_commands::BUILTIN_SLASH_COMMANDS`), prompt templates
@@ -199,7 +199,7 @@ fn auth_type_order(auth_type: AuthType) -> u8 {
 
 /// `getLoginProviderCompletionOptions` (interactive-mode.ts:386-407): merge
 /// the per-method selector rows into one entry per provider id (auth types
-/// deduped and ordered), sorted by display name.
+/// deduped and ordered), preferred partners first and then display name.
 pub(crate) fn get_login_provider_completion_options(
     provider_options: &[AuthSelectorProvider],
 ) -> Vec<LoginProviderCompletionOption> {
@@ -221,7 +221,9 @@ pub(crate) fn get_login_provider_completion_options(
             subscription: provider.subscription,
         });
     }
-    options.sort_by(|a, b| a.name.cmp(&b.name));
+    options.sort_by(|a, b| {
+        crate::core::preferred_providers::compare_providers(&a.id, &a.name, &b.id, &b.name)
+    });
     options
 }
 
@@ -266,7 +268,7 @@ pub(crate) fn format_login_provider_completion_description(
 // Base provider (interactive-mode.ts:545-629)
 // ---------------------------------------------------------------------------
 
-/// `createBaseAutocompleteProvider` (interactive-mode.ts:725-823 @ 4a080252f): the
+/// `createBaseAutocompleteProvider` (interactive-mode.ts:725-823 @ b4afdddf): the
 /// combined slash-command provider — built-ins (+ `/model` and `/login`
 /// argument completions), prompt templates, extension commands and skills.
 pub(crate) fn create_base_autocomplete_provider(
@@ -673,10 +675,10 @@ impl AutocompleteProvider for ExtensionAutocompleteProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Setup (interactive-mode.ts:825-841 @ 4a080252f)
+// Setup (interactive-mode.ts:825-841 @ b4afdddf)
 // ---------------------------------------------------------------------------
 
-/// `setupAutocompleteProvider` (interactive-mode.ts:825-841 @ 4a080252f):
+/// `setupAutocompleteProvider` (interactive-mode.ts:825-841 @ b4afdddf):
 /// build the base provider and install it on the editor. Upstream also sets
 /// it on a secondary editor when one is active; the mode has a single
 /// editor.
@@ -752,6 +754,7 @@ mod tests {
             scope,
             origin: SourceOrigin::TopLevel,
             base_dir: None,
+            changelog_path: None,
         }
     }
 

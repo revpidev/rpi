@@ -7,7 +7,7 @@
 //! - `--min-expiry` duration parsing and enforcement
 //! - Error path with no credential leakage (G4 red line)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +18,9 @@ use rpi::cli::auth_check::{
     get_provider_credential,
 };
 use rpi::cli::auth_command::{AuthCommandKind, parse_auth_command, validate_auth_command_args};
+use rpi::cli::auth_login::{AuthLoginOptions, configure_radius_mcp_server, run_auth_login};
+use rpi::cli::auth_logout::{AuthLogoutOptions, run_auth_logout};
+use rpi::cli::auth_terminal::{AuthOutput, LoginTerminal};
 use rpi::cli::credential_print::{
     DEFAULT_BEARER_TOKEN_MIN_EXPIRY_MS, resolve_credential_for_print,
 };
@@ -71,6 +74,65 @@ fn api_key_store(provider: &str, key: &str) -> Arc<dyn CredentialStore> {
         }),
     );
     Arc::new(FileCredentialStore::in_memory(map))
+}
+
+struct ScriptedTerminal {
+    answers: std::sync::Mutex<VecDeque<String>>,
+    writes: std::sync::Mutex<Vec<String>>,
+    errors: std::sync::Mutex<Vec<String>>,
+    opened: std::sync::Mutex<Vec<String>>,
+    interactive: bool,
+}
+
+impl ScriptedTerminal {
+    fn new(answers: &[&str]) -> Self {
+        Self {
+            answers: std::sync::Mutex::new(
+                answers.iter().map(|answer| (*answer).to_owned()).collect(),
+            ),
+            writes: std::sync::Mutex::new(Vec::new()),
+            errors: std::sync::Mutex::new(Vec::new()),
+            opened: std::sync::Mutex::new(Vec::new()),
+            interactive: true,
+        }
+    }
+
+    fn answer(&self) -> Result<String, ModelsError> {
+        self.answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| ModelsError::new(ModelsErrorCode::Auth, "missing scripted answer"))
+    }
+}
+
+impl AuthOutput for ScriptedTerminal {
+    fn write(&self, line: &str) {
+        self.writes.lock().unwrap().push(line.to_owned());
+    }
+
+    fn error(&self, line: &str) {
+        self.errors.lock().unwrap().push(line.to_owned());
+    }
+}
+
+#[async_trait::async_trait]
+impl LoginTerminal for ScriptedTerminal {
+    fn interactive(&self) -> bool {
+        self.interactive
+    }
+
+    async fn question(&self, _message: &str) -> Result<String, ModelsError> {
+        self.answer()
+    }
+
+    async fn secret(&self, _message: &str) -> Result<String, ModelsError> {
+        self.answer()
+    }
+
+    fn open_url(&self, url: &str) {
+        self.opened.lock().unwrap().push(url.to_owned());
+    }
 }
 
 // ===========================================================================
@@ -813,5 +875,149 @@ async fn test_run_auth_print_diagnostics_exit_1() {
         result,
         Some(1),
         "print subcommand diagnostics must exit 1, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn auth_login_api_key_persists_without_session_files() {
+    let temp = TempDir::new();
+    let store = Arc::new(FileCredentialStore::in_memory(HashMap::new()));
+    let runtime = create_auth_check_model_runtime(store.clone()).await;
+    let terminal = Arc::new(ScriptedTerminal::new(&["sk-cli-login-test"]));
+    let code = run_auth_login(
+        &owned(&["openai", "--api-key"]),
+        AuthLoginOptions {
+            model_runtime: runtime,
+            terminal: terminal.clone(),
+            agent_dir: temp.root.clone(),
+            cwd: temp.root.clone(),
+            get_device_id: Arc::new(|| "test-device".to_owned()),
+            signal: tokio_util::sync::CancellationToken::new(),
+        },
+    )
+    .await;
+    assert_eq!(code, 0, "{:?}", terminal.errors.lock().unwrap());
+    let saved = store
+        .read("openai", None)
+        .await
+        .expect("read saved credential")
+        .expect("credential exists");
+    assert_eq!(
+        saved,
+        Credential::ApiKey(ApiKeyCredential {
+            key: Some("sk-cli-login-test".to_owned()),
+            env: None,
+        })
+    );
+    assert!(terminal.opened.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read_dir(&temp.root).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn auth_logout_removes_only_stored_credentials() {
+    let temp = TempDir::new();
+    let store = api_key_store("openai", "sk-cli-logout-test");
+    let runtime = create_auth_check_model_runtime(store.clone()).await;
+    let terminal = Arc::new(ScriptedTerminal::new(&[]));
+    let code = run_auth_logout(
+        &owned(&["OpenAI"]),
+        AuthLogoutOptions {
+            model_runtime: runtime,
+            terminal: terminal.clone(),
+            signal: tokio_util::sync::CancellationToken::new(),
+        },
+    )
+    .await;
+    assert_eq!(code, 0, "{:?}", terminal.errors.lock().unwrap());
+    assert!(
+        store
+            .read("openai", None)
+            .await
+            .expect("read after logout")
+            .is_none()
+    );
+    assert!(
+        terminal
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("Removed stored API key"))
+    );
+
+    let second = run_auth_logout(
+        &owned(&["openai"]),
+        AuthLogoutOptions {
+            model_runtime: create_auth_check_model_runtime(store).await,
+            terminal: terminal.clone(),
+            signal: tokio_util::sync::CancellationToken::new(),
+        },
+    )
+    .await;
+    assert_eq!(second, 0);
+    assert_eq!(std::fs::read_dir(&temp.root).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn auth_login_rejects_non_interactive_terminal_before_prompt() {
+    let temp = TempDir::new();
+    let store = Arc::new(FileCredentialStore::in_memory(HashMap::new()));
+    let runtime = create_auth_check_model_runtime(store).await;
+    let mut terminal = ScriptedTerminal::new(&[]);
+    terminal.interactive = false;
+    let terminal = Arc::new(terminal);
+    let code = run_auth_login(
+        &owned(&["openai", "--api-key"]),
+        AuthLoginOptions {
+            model_runtime: runtime,
+            terminal: terminal.clone(),
+            agent_dir: temp.root.clone(),
+            cwd: temp.root.clone(),
+            get_device_id: Arc::new(|| "test-device".to_owned()),
+            signal: tokio_util::sync::CancellationToken::new(),
+        },
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(
+        terminal
+            .errors
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("requires an interactive terminal"))
+    );
+}
+
+#[tokio::test]
+async fn radius_login_success_uses_shared_mcp_writer() {
+    let temp = TempDir::new();
+    let store = Arc::new(FileCredentialStore::in_memory(HashMap::new()));
+    let runtime = create_auth_check_model_runtime(store).await;
+    let provider = runtime.get_provider("radius").expect("Radius provider");
+    let terminal = Arc::new(ScriptedTerminal::new(&[]));
+    let options = AuthLoginOptions {
+        model_runtime: runtime,
+        terminal: terminal.clone(),
+        agent_dir: temp.root.clone(),
+        cwd: temp.root.clone(),
+        get_device_id: Arc::new(|| "test-device".to_owned()),
+        signal: tokio_util::sync::CancellationToken::new(),
+    };
+    configure_radius_mcp_server(&provider, &options);
+    let config = std::fs::read_to_string(temp.root.join("mcp.json")).expect("mcp.json");
+    let value: serde_json::Value = serde_json::from_str(&config).expect("valid mcp.json");
+    assert_eq!(
+        value["mcpServers"]["radius"]["auth"]["provider"],
+        serde_json::json!("radius")
+    );
+    assert!(value["mcpServers"]["radius"].get("oauth").is_none());
+    assert!(
+        terminal
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("Added MCP server"))
     );
 }

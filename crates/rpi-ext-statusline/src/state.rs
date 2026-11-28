@@ -8,17 +8,20 @@
 //! run their own process with their own extension host, so no sidechain
 //! filtering is needed — TE12 verification §1).
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::config::Placement;
+use crate::config::{LiveCalculation, Placement};
 use crate::fields::{FieldId, FieldValue, LiveView};
 use crate::git::GitCache;
+use crate::live_total::{AwaitingLocal, LiveTotalState, LiveTotalView, Settlement};
 use crate::paths::{find_latest_session_file, resolve_session_dir, session_id_from_path};
 use crate::session_stats::SessionStatsCache;
+use crate::tokens::TokenSource;
 
 /// Live streaming measurements for the CURRENT assistant message
 /// (03-realtime-token-count §1.4/§2.3): native measures, python computes.
@@ -97,7 +100,31 @@ pub struct LiveMeasure {
     /// Numerator source of the last PUBLISHED streaming rate frame (rpi#78 B):
     /// a switch between frames means the ratio's numerator changed meaning, so
     /// that frame must not publish a rate.
-    last_rate_source: Option<crate::tokens::TokenSource>,
+    last_rate_source: Option<TokenSource>,
+    /// How the finished message was settled at `message_end` (V19-07): the
+    /// authoritative breakdown the frozen frame shows once the refresh loop
+    /// has run the official full tokenizer (or kept the final heuristic).
+    /// `None` while the settlement is still pending.
+    settled_tokens: Option<crate::tokens::TokenBreakdown>,
+    /// `stopReason` of the finished message (`aborted`/`error` drop the final
+    /// heuristic, R5.2.7) and whether an `errorMessage` was present.
+    stopped_normally: bool,
+}
+
+/// Cheap live status for the items live tick (V19-07 FR-G R1): timing,
+/// provider usage and generations WITHOUT the full text. The refresh loop
+/// feeds its incremental counter from [`LiveMeasure::unprocessed_text`] (only
+/// the bytes that arrived since the last tick) and never deep-copies the
+/// message per refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LiveStatus {
+    pub streaming: bool,
+    pub output_tokens: Option<u64>,
+    pub output_tokens_exact: Option<u64>,
+    pub decode_ms: u128,
+    pub message_seq: u64,
+    /// Byte length of each cumulative buffer (text, thinking, toolcall).
+    pub text_lens: [usize; 3],
 }
 
 /// Read-side projection of [`LiveMeasure`] at one payload assembly
@@ -155,9 +182,17 @@ pub struct LivePeek {
 
 impl LivePeek {
     /// Project the peek plus a token breakdown into the fields' `LiveView`.
-    pub fn into_view(self, model_id: Option<&str>) -> LiveView {
-        let tokens =
-            crate::tokens::count_breakdown(model_id, &self.text, &self.thinking, &self.toolcall);
+    /// Full-text accounting (command mode, editor preview) — the items live
+    /// tick feeds its incremental counter instead (V19-07 FR-G R1).
+    pub fn into_view(self, model_id: Option<&str>, policy: LiveCalculation) -> LiveView {
+        let tokens = match policy {
+            LiveCalculation::Auto => {
+                crate::tokens::count_breakdown(model_id, &self.text, &self.thinking, &self.toolcall)
+            }
+            LiveCalculation::Estimate => {
+                crate::tokens::heuristic_breakdown(&self.text, &self.thinking, &self.toolcall)
+            }
+        };
         LiveView {
             streaming: self.streaming,
             output_tokens: self.output_tokens,
@@ -165,6 +200,8 @@ impl LivePeek {
             decode_ms: self.decode_ms,
             tokens: Some(tokens),
             rate_source_switched: false,
+            policy,
+            settled: false,
         }
     }
 }
@@ -204,6 +241,8 @@ impl LiveMeasure {
         self.message_ended_decode_ms = None;
         self.output_tokens_exact = None;
         self.last_rate_source = None;
+        self.settled_tokens = None;
+        self.stopped_normally = true;
     }
 
     /// FR-A: per-delta bookkeeping — only `assistantMessageEvent.{type,
@@ -269,12 +308,24 @@ impl LiveMeasure {
         }
     }
 
+    /// Whether a finished message completed normally: `stopReason` is neither
+    /// `aborted` nor `error` and no `errorMessage` is set (R5.2.7 — only a
+    /// normal completion may keep its final heuristic as `settled_estimated`).
+    fn completed_normally(message: &Value) -> bool {
+        let stop = message.get("stopReason").and_then(Value::as_str);
+        let errored = message
+            .get("errorMessage")
+            .is_some_and(|value| !value.is_null());
+        !matches!(stop, Some("aborted") | Some("error")) && !errored
+    }
+
     /// FR-C/FR-D: assistant `message_end` — capture the exact provider
     /// output tokens (n > 0 guard), stop streaming, freeze elapsed.
     pub fn on_message_end(&mut self, message: &Value) {
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             return;
         }
+        self.stopped_normally = Self::completed_normally(message);
         if let Some(output) = message.pointer("/usage/output").and_then(Value::as_u64)
             && output > 0
         {
@@ -310,6 +361,65 @@ impl LiveMeasure {
             thinking: self.thinking.clone(),
             toolcall: self.toolcall.clone(),
         }
+    }
+
+    /// The settled breakdown of the finished message (V19-07), if the refresh
+    /// loop has settled it yet.
+    pub fn settled_tokens(&self) -> Option<crate::tokens::TokenBreakdown> {
+        self.settled_tokens
+    }
+
+    pub fn set_settled_tokens(&mut self, tokens: Option<crate::tokens::TokenBreakdown>) {
+        self.settled_tokens = tokens;
+    }
+
+    /// Whether the finished message completed normally (aborted/errored
+    /// messages drop their final heuristic).
+    pub fn stopped_normally(&self) -> bool {
+        self.stopped_normally
+    }
+
+    /// Cheap status for the items live tick: no text is copied.
+    pub fn status(&self, now: Instant) -> LiveStatus {
+        LiveStatus {
+            streaming: self.streaming,
+            output_tokens: self.streaming_output_tokens,
+            output_tokens_exact: self.output_tokens_exact,
+            decode_ms: self.decode_ms(now),
+            message_seq: self.message_seq,
+            text_lens: [self.text.len(), self.thinking.len(), self.toolcall.len()],
+        }
+    }
+
+    /// The bytes of each cumulative buffer past `processed` (the delta-only
+    /// feed of the incremental counter): copies only what is new.
+    pub fn unprocessed_text(&self, processed: [usize; 3]) -> [String; 3] {
+        let tail = |text: &str, from: usize| -> String {
+            let from = from.min(text.len());
+            // Snap to a char boundary (the counter tracks byte offsets that
+            // always land on one; a reset message restarts from 0).
+            let mut from = from;
+            while from > 0 && !text.is_char_boundary(from) {
+                from -= 1;
+            }
+            text[from..].to_owned()
+        };
+        [
+            tail(&self.text, processed[0]),
+            tail(&self.thinking, processed[1]),
+            tail(&self.toolcall, processed[2]),
+        ]
+    }
+
+    /// One-time copy of the full text (hot-switch rebuild, `message_end`
+    /// settlement, command-mode payload) — never on the per-refresh path of
+    /// the items live tick.
+    pub fn full_text(&self) -> [String; 3] {
+        [
+            self.text.clone(),
+            self.thinking.clone(),
+            self.toolcall.clone(),
+        ]
     }
 
     /// Whether any measurement was ever taken (drives block omission:
@@ -486,11 +596,25 @@ pub struct EngineState {
     pub mounted: Option<Placement>,
     /// Absolute `ctx.sessionStats` cache (items mode; TE52 R20 §4.2).
     pub session_stats: SessionStatsCache,
-    /// Exact output tokens of assistant messages that ended after the last
-    /// applied snapshot (items `live-total-tokens`; cleared by the next
-    /// applied `ctx.sessionStats` reply, so it never double counts a
-    /// committed message).
-    pending_output: u64,
+    /// Items `live-total-tokens` overlay (V19-07 / ADR-0049 decision 8):
+    /// pending provider-exact totals with their persistence watermarks, the
+    /// local exact/estimated settled sums and the current-message flag.
+    pub live_total: LiveTotalState,
+    /// Whether the items selection currently renders `live-total-tokens`
+    /// (reconciled from the field selection on every poll — the `message_end`
+    /// callback reads THIS cache and never the raw settings file, R5.2.8).
+    /// `false` in command mode: command keeps its full `rpi.live_output`
+    /// payload and never creates pending entries or probes.
+    live_total_selected: bool,
+    /// Recent terminal-probe durations (nanoseconds, most recent last) —
+    /// the runtime leg of the R5.2.8 budget: a host whose counts-only probe
+    /// is slow (an old host answering the FULL snapshot, or a regression)
+    /// must not pay O(entries) per terminal, so the probe is replaced by the
+    /// cached `assistant_messages + pending` lower bound (R5.2.8: never a
+    /// fall back to the full stats).
+    probe_durations_ns: VecDeque<u64>,
+    /// How many terminals took the lower-bound path instead of a probe.
+    probe_fallbacks: u64,
     /// Local Git probe cache for project-name/git-branch (TE52 R20 §4.4).
     pub git: GitCache,
     /// Items-mode last rendered value of every live row. Between two
@@ -505,6 +629,14 @@ pub struct EngineState {
     /// emitted a delta event keeps doing so.
     delta_supported: bool,
 }
+
+/// A terminal counts-only probe slower than this (p95 of the recent probes)
+/// sends the following terminals to the lower-bound path: the probe budget of
+/// R5.2.8 is a few hundred nanoseconds on the current host, so a
+/// millisecond-scale probe means the host answered with the full snapshot.
+pub const PROBE_SLOW_NS: u64 = 2_000_000;
+/// Recent probes kept for the p95 estimate.
+const PROBE_SAMPLES: usize = 16;
 
 /// Mtime tolerance below the session-start wall clock: the host creates
 /// the session file shortly BEFORE emitting `session_start`, so the new
@@ -524,7 +656,10 @@ impl Default for EngineState {
             live: None,
             mounted: None,
             session_stats: SessionStatsCache::default(),
-            pending_output: 0,
+            live_total: LiveTotalState::default(),
+            live_total_selected: false,
+            probe_durations_ns: VecDeque::new(),
+            probe_fallbacks: 0,
             git: GitCache::default(),
             last_live_values: Vec::new(),
             delta_supported: false,
@@ -636,38 +771,195 @@ impl EngineState {
         self.live.as_ref().map(|live| live.peek(now))
     }
 
-    /// Exact output tokens accumulated since the last applied session
-    /// snapshot (`live-total-tokens`).
-    pub fn pending_output(&self) -> u64 {
-        self.pending_output
+    /// The items `live-total-tokens` overlay projection for one frame.
+    pub fn live_total_view(&self) -> LiveTotalView {
+        self.live_total.view()
     }
 
-    /// Drop the pending live total: the next applied snapshot already counts
-    /// these messages, or an old session's numbers must not leak into a new
-    /// one.
-    pub fn clear_pending_output(&mut self) {
-        self.pending_output = 0;
+    /// Items mode: record whether `live-total-tokens` is selected (updated by
+    /// the reconciliation on every poll; read by the `message_end` callback).
+    pub fn set_live_total_selected(&mut self, selected: bool) {
+        self.live_total_selected = selected;
     }
 
-    /// `message_end`: freeze the live measurement and accumulate the
-    /// assistant's exact output for the live session total. An aborted or
-    /// usage-less message contributes nothing here; its local estimate is
-    /// dropped when the stream settles instead of inflating the committed
-    /// total.
-    pub fn on_message_end(&mut self, message: &Value) {
+    pub fn live_total_selected(&self) -> bool {
+        self.live_total_selected
+    }
+
+    /// `message_start`: a new assistant message generation (the baseline,
+    /// earlier pending entries and the local settled sums are untouched).
+    pub fn on_message_start(&mut self, role: Option<&str>) {
+        if role == Some("assistant") {
+            self.live_total.begin_message();
+        }
+        if let Some(live) = self.live.as_mut() {
+            live.on_message_start(role);
+        }
+    }
+
+    /// `message_update`: per-delta bookkeeping; a stream that starts without
+    /// a `message_start` (mid-stream enable, dropped start) opens the message
+    /// generation on its first delta.
+    pub fn on_message_update(&mut self, payload: &Value) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let was_streaming = live.is_streaming();
+        live.on_message_update(payload);
+        if !was_streaming && live.is_streaming() {
+            self.live_total.begin_message();
+        }
+    }
+
+    /// `message_end`: freeze the live measurement and settle the finished
+    /// assistant message exactly once for the live session total (V19-07
+    /// R5.2.7). Returns what the dispatch path must do next: run the one
+    /// terminal counts-only probe (provider exact), hand the message to the
+    /// refresh loop (local settlement), or nothing. Aborted/usage-less
+    /// messages never inflate the committed total: their final heuristic is
+    /// dropped unless they completed normally.
+    pub fn on_message_end(&mut self, message: &Value) -> Settlement {
         if let Some(live) = self.live.as_mut() {
             live.on_message_end(message);
         }
         // Only assistant output feeds the live session total; other message
         // kinds may carry usage-shaped fields but are not model output.
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
-            return;
+            return Settlement::None;
         }
-        if let Some(output) = message.pointer("/usage/output").and_then(Value::as_u64)
-            && output > 0
+        // Command mode / field not selected: no pending entries, no probe,
+        // no local settlement — the overlay belongs to items only.
+        if !self.live_total_selected {
+            return Settlement::None;
+        }
+        let [text, thinking, toolcall] = match self.live.as_ref() {
+            Some(live) => live.full_text(),
+            None => [String::new(), String::new(), String::new()],
+        };
+        let awaiting = AwaitingLocal {
+            text,
+            thinking,
+            toolcall,
+            normal_completion: self
+                .live
+                .as_ref()
+                .is_none_or(|live| live.stopped_normally()),
+            message_generation: self.live_total.message_generation(),
+            diagnostic_only: false,
+        };
+        let provider_output = message
+            .pointer("/usage/output")
+            .and_then(Value::as_u64)
+            .filter(|output| *output > 0);
+        self.live_total.on_message_end(
+            provider_output,
+            awaiting,
+            self.session_stats.current_request_generation(),
+        )
+    }
+
+    /// Whether the terminal probe should run: it is skipped once the recent
+    /// probes' p95 exceeds [`PROBE_SLOW_NS`] (with at least half the samples
+    /// in). The caller then records the lower-bound watermark through
+    /// [`Self::record_lower_bound_watermark`].
+    pub fn terminal_probe_wanted(&mut self) -> bool {
+        let mut samples: Vec<u64> = self.probe_durations_ns.iter().copied().collect();
+        samples.sort_unstable();
+        if samples.len() < PROBE_SAMPLES / 2 {
+            return true;
+        }
+        let p95 = samples[samples.len() * 95 / 100];
+        p95 <= PROBE_SLOW_NS
+    }
+
+    /// Record the duration of a terminal probe (nanoseconds).
+    pub fn note_terminal_probe_duration(&mut self, elapsed_ns: u64) {
+        self.probe_durations_ns.push_back(elapsed_ns);
+        while self.probe_durations_ns.len() > PROBE_SAMPLES {
+            self.probe_durations_ns.pop_front();
+        }
+    }
+
+    /// The lower-bound path of the budget: the watermark is the cached
+    /// snapshot's `assistant_messages` plus every queued pending entry
+    /// (each is one message the host is about to persist). It is cleared
+    /// later than a probed watermark at worst — never earlier than the
+    /// persistence, never through the full `sessionStats`.
+    pub fn record_lower_bound_watermark(&mut self) {
+        self.probe_fallbacks += 1;
+        let base = self
+            .session_stats
+            .snapshot()
+            .map_or(0, |stats| stats.assistant_messages);
+        let pending = self.live_total.pending_len() as u64;
+        self.live_total
+            .record_probe(Some(base.saturating_add(pending.max(1) - 1)));
+    }
+
+    /// How many terminals took the lower-bound path (diagnostics).
+    pub fn probe_fallbacks(&self) -> u64 {
+        self.probe_fallbacks
+    }
+
+    /// Record the ONE terminal counts-only probe for the pending entry that
+    /// [`Self::on_message_end`] just queued (`pre_persist_assistant_messages`
+    /// or `None` when the probe failed → unknown watermark, field hidden).
+    pub fn record_terminal_probe(&mut self, pre_persist_assistant: Option<u64>) {
+        self.live_total.record_probe(pre_persist_assistant);
+    }
+
+    /// Take the finished message awaiting its local settlement (refresh loop;
+    /// the official tokenizer run happens outside the engine lock).
+    pub fn take_awaiting_local(&mut self) -> Option<AwaitingLocal> {
+        self.live_total.take_awaiting_local()
+    }
+
+    /// Apply a local settlement of `generation`'s message and remember the
+    /// settled breakdown for its frozen frame. The breakdown is only written
+    /// when that message is still the current one (a `message_start` that
+    /// landed meanwhile owns the measurement now).
+    pub fn settle_local(
+        &mut self,
+        settlement: crate::live_total::LocalSettlement,
+        tokens: Option<crate::tokens::TokenBreakdown>,
+        generation: u64,
+    ) {
+        self.live_total.settle_local(settlement, generation);
+        if generation == self.live_total.message_generation()
+            && let Some(live) = self.live.as_mut()
         {
-            self.pending_output = self.pending_output.saturating_add(output);
+            live.set_settled_tokens(tokens);
         }
+    }
+
+    /// Command mode: the official local breakdown of the FINISHED message,
+    /// computed once at the first settled run and cached on the frozen
+    /// measurement (V19-07: both policies publish the official full pass once
+    /// the message settled; idle re-runs do not repeat the BPE).
+    pub fn cached_settled_local(
+        &mut self,
+        model_id: Option<&str>,
+    ) -> crate::tokens::TokenBreakdown {
+        let Some(live) = self.live.as_mut() else {
+            return crate::tokens::TokenBreakdown::default();
+        };
+        if let Some(tokens) = live.settled_tokens() {
+            return tokens;
+        }
+        let [text, thinking, toolcall] = live.full_text();
+        let tokens = crate::tokens::count_breakdown(model_id, &text, &thinking, &toolcall);
+        live.set_settled_tokens(Some(tokens));
+        tokens
+    }
+
+    /// Apply an applied snapshot's watermark to the pending entries.
+    pub fn on_snapshot_applied(
+        &mut self,
+        assistant_messages: u64,
+        applied: &crate::session_stats::AppliedRequest,
+    ) {
+        self.live_total
+            .on_snapshot_applied(assistant_messages, applied);
     }
 
     /// `message_end`: accumulate `message.usage` when present (assistant
@@ -696,7 +988,10 @@ impl EngineState {
         // every case (reload included: identity is re-checked on the next
         // reply; the snapshot is never re-added).
         self.session_stats.begin_session(reason);
-        self.pending_output = 0;
+        // Every overlay generation belongs to the previous session (reload
+        // included): pending watermarks, local settled sums and the current
+        // message all start over.
+        self.live_total.begin_session();
         // The held live footer belongs to the previous session's messages.
         self.last_live_values.clear();
         match reason {
@@ -1202,22 +1497,172 @@ mod tests {
         assert!(!state.accumulate_usage(&json!({"role": "user"})));
     }
 
+    /// V19-07 FR-C R6: command mode (field not selected) never creates a
+    /// pending entry; items mode queues the provider-exact total and asks
+    /// for the one terminal probe; usage-less messages go to local
+    /// settlement; a new session drops the overlay.
     #[test]
-    fn message_end_accumulates_and_clears_the_pending_live_total() {
+    fn message_end_settles_the_live_total_overlay() {
         let mut state = EngineState::default();
-        state.on_message_end(&json!({"role": "assistant", "usage": {"output": 42}}));
-        assert_eq!(state.pending_output(), 42);
-        // Aborted/usage-less messages add nothing: the local estimate is not
-        // promoted into the committed total.
-        state.on_message_end(&json!({"role": "assistant", "usage": {"output": 0}}));
-        state.on_message_end(&json!({"role": "assistant"}));
-        assert_eq!(state.pending_output(), 42);
-        state.clear_pending_output();
-        assert_eq!(state.pending_output(), 0);
-        // A new session drops the previous session's pending part.
-        state.on_message_end(&json!({"role": "assistant", "usage": {"output": 7}}));
+        state.arm_live_measure();
+        // Command mode: nothing is queued, nothing to probe.
+        assert_eq!(
+            state.on_message_end(&json!({"role": "assistant", "usage": {"output": 42}})),
+            Settlement::None
+        );
+        assert_eq!(state.live_total_view(), LiveTotalView::default());
+        // Items mode with `live-total-tokens` selected.
+        state.set_live_total_selected(true);
+        state.on_message_start(Some("assistant"));
+        assert!(state.live_total_view().current_open);
+        assert_eq!(
+            state.on_message_end(&json!({"role": "assistant", "usage": {"output": 42}})),
+            Settlement::ProviderExact
+        );
+        let view = state.live_total_view();
+        assert_eq!(view.pending_output, 42);
+        assert!(view.hidden, "unknown watermark until the probe answers");
+        assert!(
+            !view.current_open,
+            "the finished message is not current any more"
+        );
+        state.record_terminal_probe(Some(3));
+        let view = state.live_total_view();
+        assert!(!view.hidden);
+        assert_eq!(
+            state.live_total.pending()[0].persist_after_assistant,
+            Some(4)
+        );
+        // A failed probe keeps the watermark unknown.
+        state.on_message_start(Some("assistant"));
+        state.on_message_end(&json!({"role": "assistant", "usage": {"output": 5}}));
+        state.record_terminal_probe(None);
+        assert!(state.live_total_view().hidden);
+        // Usage-less normal message: local settlement pending — the message
+        // stays CURRENT until the official tokenizer ran, so the total does
+        // not dip between message_end and the settlement.
+        state.on_message_start(Some("assistant"));
+        state.on_message_update(&delta("text_delta", "hello world"));
+        assert_eq!(
+            state.on_message_end(&json!({"role": "assistant", "usage": {"output": 0}})),
+            Settlement::AwaitingLocal
+        );
+        assert!(state.live_total_view().current_open);
+        // The two provider-exact messages queued diagnostic-only entries
+        // (the official comparison of their incremental counters).
+        for _ in 0..2 {
+            let diagnostic = state.take_awaiting_local().expect("diagnostic");
+            assert!(diagnostic.diagnostic_only);
+            assert_eq!(diagnostic.text, "", "those messages had no text");
+        }
+        let awaiting = state.take_awaiting_local().expect("awaiting");
+        assert!(!awaiting.diagnostic_only);
+        assert_eq!(awaiting.text, "hello world");
+        assert!(awaiting.normal_completion);
+        assert!(
+            state.live_total_view().current_open,
+            "still current until settled"
+        );
+        state.settle_local(
+            crate::live_total::LocalSettlement::Exact(2),
+            None,
+            awaiting.message_generation,
+        );
+        assert_eq!(state.live_total_view().settled_local_exact, 2);
+        assert!(!state.live_total_view().current_open);
+        // Aborted message: the final heuristic is dropped.
+        state.on_message_start(Some("assistant"));
+        state.on_message_update(&delta("text_delta", "partial"));
+        state.on_message_end(&json!({"role": "assistant", "stopReason": "aborted"}));
+        let awaiting = state.take_awaiting_local().expect("awaiting");
+        assert!(!awaiting.normal_completion);
+        state.settle_local(
+            crate::live_total::LocalSettlement::Dropped,
+            None,
+            awaiting.message_generation,
+        );
+        assert_eq!(state.live_total_view().settled_estimated, 0);
+        // Non-assistant ends settle nothing.
+        assert_eq!(
+            state.on_message_end(&json!({"role": "user"})),
+            Settlement::None
+        );
+        // A new session drops the previous session's overlay.
         state.on_session_start(Some("new"));
-        assert_eq!(state.pending_output(), 0);
+        assert_eq!(state.live_total_view(), LiveTotalView::default());
+    }
+
+    /// R5.2.8 runtime budget: a slow terminal probe (a host answering the
+    /// full snapshot) switches the following terminals to the cached
+    /// `assistant_messages + pending` lower bound — never the full stats —
+    /// and counts the fallbacks; fast probes keep probing.
+    #[test]
+    fn slow_probes_fall_back_to_the_cached_lower_bound_watermark() {
+        let mut state = EngineState::default();
+        state.arm_live_measure();
+        state.set_live_total_selected(true);
+        assert!(state.terminal_probe_wanted(), "no samples yet: probe");
+        for _ in 0..8 {
+            state.note_terminal_probe_duration(500);
+        }
+        assert!(
+            state.terminal_probe_wanted(),
+            "sub-microsecond probes stay on the probe path"
+        );
+        // Baseline snapshot at 3 assistant messages.
+        let token = state
+            .session_stats
+            .begin_request(crate::session_stats::StatsTrigger::TurnEnd);
+        let mut stats = crate::session_stats::SessionStats {
+            session_id: "s1".into(),
+            session_file: None,
+            started_at: "2026-10-27T10:00:00Z".into(),
+            entry_count: 3,
+            user_messages: 1,
+            assistant_messages: 3,
+            tokens: Default::default(),
+            cost: 0.0,
+        };
+        assert!(state.session_stats.apply(token, stats.clone()).is_some());
+        for _ in 0..8 {
+            state.note_terminal_probe_duration(PROBE_SLOW_NS + 1);
+        }
+        assert!(
+            !state.terminal_probe_wanted(),
+            "p95 above the budget: lower bound"
+        );
+        state.on_message_start(Some("assistant"));
+        state.on_message_end(&json!({"role": "assistant", "usage": {"output": 10}}));
+        state.record_lower_bound_watermark();
+        assert_eq!(state.probe_fallbacks(), 1);
+        // Watermark = cached assistant_messages + pending (the snapshot
+        // that counts this message).
+        assert_eq!(
+            state.live_total.pending()[0].persist_after_assistant,
+            Some(4)
+        );
+        assert!(!state.live_total_view().hidden);
+        // A second pending entry moves the bound up by one.
+        stats.assistant_messages = 3;
+        state.on_message_start(Some("assistant"));
+        state.on_message_end(&json!({"role": "assistant", "usage": {"output": 11}}));
+        state.record_lower_bound_watermark();
+        assert_eq!(
+            state.live_total.pending()[1].persist_after_assistant,
+            Some(5)
+        );
+        assert_eq!(state.probe_fallbacks(), 2);
+    }
+
+    /// A stream that starts without `message_start` opens the message
+    /// generation on its first delta (mid-stream enable / dropped start).
+    #[test]
+    fn first_delta_opens_the_message_generation_without_a_start() {
+        let mut state = EngineState::default();
+        state.arm_live_measure();
+        state.on_message_update(&delta("text_delta", "x"));
+        assert!(state.live_total_view().current_open);
+        assert_eq!(state.live_total.message_generation(), 1);
     }
 
     #[test]
@@ -1338,6 +1783,8 @@ mod tests {
                 TokenSource::Estimated,
             )),
             rate_source_switched: false,
+            policy: LiveCalculation::Auto,
+            settled: true,
         }));
         let held = state.live_held_values();
         let held_output = held
@@ -1378,6 +1825,8 @@ mod tests {
             decode_ms: 300,
             tokens: Some(TokenBreakdown::from_tiers(7, 0, 0, TokenSource::Estimated)),
             rate_source_switched: false,
+            policy: LiveCalculation::Auto,
+            settled: false,
         }));
         let refreshed = state.live_held_values();
         assert!(
@@ -1406,6 +1855,8 @@ mod tests {
             decode_ms: 1_000,
             tokens: Some(TokenBreakdown::from_tiers(9, 0, 0, TokenSource::Estimated)),
             rate_source_switched: false,
+            policy: LiveCalculation::Auto,
+            settled: true,
         }));
         assert!(!state.live_held_values().is_empty());
         state.on_session_start(Some("new"));
@@ -1483,6 +1934,8 @@ mod tests {
                 TokenSource::Estimated,
             )),
             rate_source_switched: false,
+            policy: LiveCalculation::Auto,
+            settled: true,
         }));
         assert!(
             state
@@ -1500,6 +1953,8 @@ mod tests {
             decode_ms: 0,
             tokens: Some(TokenBreakdown::from_tiers(1, 0, 0, TokenSource::Estimated)),
             rate_source_switched: false,
+            policy: LiveCalculation::Auto,
+            settled: true,
         }));
         let held = state.live_held_values();
         assert!(

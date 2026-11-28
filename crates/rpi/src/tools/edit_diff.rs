@@ -185,15 +185,17 @@ pub struct AppliedEditsResult {
     pub base_content: String,
     /// The content after edits have been applied.
     pub new_content: String,
+    /// Sorted replacements that turn `base_content` into `new_content`.
+    pub replacements: Vec<TextReplacement>,
 }
 
 /// A matched edit with its position in the content.
 #[derive(Clone, Debug)]
-struct MatchedEdit {
+pub struct TextReplacement {
     edit_index: usize,
-    match_index: usize,
-    match_length: usize,
-    new_text: String,
+    pub match_index: usize,
+    pub match_length: usize,
+    pub new_text: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +242,7 @@ fn get_replacement_line_range(
 ///
 /// Port of `applyReplacements` (edit-diff.ts:110-119). `offset` is subtracted
 /// from each `match_index` because the content may be a slice of a larger string.
-fn apply_replacements(content: &str, replacements: &[MatchedEdit], offset: usize) -> String {
+fn apply_replacements(content: &str, replacements: &[TextReplacement], offset: usize) -> String {
     let mut result = content.to_string();
     // Process in reverse order so earlier offsets stay valid.
     for replacement in replacements.iter().rev() {
@@ -260,31 +262,27 @@ fn apply_replacements(content: &str, replacements: &[MatchedEdit], offset: usize
 /// rewritten from the normalized base, all other lines are copied verbatim
 /// from the original. This prevents duplicate normalized lines from being
 /// aligned to the wrong occurrence.
-fn apply_replacements_preserving_unchanged_lines(
+fn widen_replacements_to_lines(
     original_content: &str,
     base_content: &str,
-    matched_edits: &[MatchedEdit],
-) -> String {
-    let original_lines = split_lines_with_endings(original_content);
+    matched_edits: &[TextReplacement],
+) -> Vec<TextReplacement> {
+    let original_lines = get_line_spans(original_content);
     let base_lines = get_line_spans(base_content);
-    // The number of lines must match because base_content is a normalized view
-    // of original_content (same line structure, different character content).
-    // If they differ we fall back to a simple string concatenation of the base.
     debug_assert_eq!(
         original_lines.len(),
         base_lines.len(),
-        "line count mismatch in preserve-unchanged-lines"
+        "line count mismatch in widen-replacements-to-lines"
     );
 
-    // Build groups of adjacent/overlapping replacements.
-    let mut sorted: Vec<&MatchedEdit> = matched_edits.iter().collect();
+    let mut sorted: Vec<&TextReplacement> = matched_edits.iter().collect();
     sorted.sort_by_key(|e| e.match_index);
 
     #[derive(Clone)]
     struct Group {
         start_line: usize,
         end_line: usize,
-        replacements: Vec<MatchedEdit>,
+        replacements: Vec<TextReplacement>,
     }
 
     let mut groups: Vec<Group> = Vec::new();
@@ -311,34 +309,100 @@ fn apply_replacements_preserving_unchanged_lines(
         });
     }
 
-    let mut original_line_index = 0usize;
-    let mut result = String::new();
+    groups
+        .into_iter()
+        .map(|group| {
+            let group_start_offset = base_lines[group.start_line].start;
+            let group_end_offset = base_lines[group.end_line - 1].end;
+            let original_start = original_lines[group.start_line].start;
+            let original_end = original_lines[group.end_line - 1].end;
+            let edit_index = group
+                .replacements
+                .first()
+                .map_or(0, |replacement| replacement.edit_index);
+            TextReplacement {
+                edit_index,
+                match_index: original_start,
+                match_length: original_end - original_start,
+                new_text: apply_replacements(
+                    &base_content[group_start_offset..group_end_offset],
+                    &group.replacements,
+                    group_start_offset,
+                ),
+            }
+        })
+        .collect()
+}
 
-    for group in &groups {
-        // Copy original lines before this group.
-        for &line in &original_lines[original_line_index..group.start_line] {
-            result.push_str(line);
+fn line_ending_at(content: &str, offset: usize) -> &'static str {
+    let next = content[offset..]
+        .find('\n')
+        .map(|index| offset + index)
+        .or_else(|| content[..offset].rfind('\n'));
+    match next {
+        Some(index) if index > 0 && content.as_bytes()[index - 1] == b'\r' => "\r\n",
+        Some(_) => "\n",
+        None if content.contains('\r') => "\r",
+        None => "\n",
+    }
+}
+
+fn push_original_part(parts: &mut Vec<String>, ends_with_cr: &mut bool, part: &str) {
+    if part.is_empty() {
+        return;
+    }
+    if *ends_with_cr && part.starts_with('\n') {
+        parts.push("\n".to_owned());
+    }
+    *ends_with_cr = part.ends_with('\r');
+    parts.push(part.to_owned());
+}
+
+/// Apply normalized replacements to the original bytes. Unchanged ranges keep
+/// their exact line endings; inserted lines inherit the ending at the edit.
+pub fn apply_replacements_to_original(
+    original_content: &str,
+    replacements: &[TextReplacement],
+) -> String {
+    let mut crlf_before = 0usize;
+    let mut next_crlf = original_content.find("\r\n");
+    let to_original = |offset: usize, crlf_before: &mut usize, next_crlf: &mut Option<usize>| {
+        while next_crlf.is_some_and(|position| position - *crlf_before < offset) {
+            *crlf_before += 1;
+            *next_crlf = next_crlf.and_then(|position| {
+                original_content[position + 2..]
+                    .find("\r\n")
+                    .map(|index| position + 2 + index)
+            });
         }
+        offset + *crlf_before
+    };
 
-        // Apply replacements within the group slice of base_content.
-        let group_start_offset = base_lines[group.start_line].start;
-        let group_end_offset = base_lines[group.end_line - 1].end;
-        let slice = &base_content[group_start_offset..group_end_offset];
-        result.push_str(&apply_replacements(
-            slice,
-            &group.replacements,
-            group_start_offset,
-        ));
-
-        original_line_index = group.end_line;
+    let mut parts = Vec::new();
+    let mut ends_with_cr = false;
+    let mut position = 0usize;
+    for replacement in replacements {
+        let start = to_original(replacement.match_index, &mut crlf_before, &mut next_crlf);
+        push_original_part(
+            &mut parts,
+            &mut ends_with_cr,
+            &original_content[position..start],
+        );
+        let ending = line_ending_at(original_content, start);
+        let new_text = if ending == "\n" {
+            replacement.new_text.clone()
+        } else {
+            replacement.new_text.replace('\n', ending)
+        };
+        push_original_part(&mut parts, &mut ends_with_cr, &new_text);
+        position = to_original(
+            replacement.match_index + replacement.match_length,
+            &mut crlf_before,
+            &mut next_crlf,
+        );
     }
-
-    // Copy remaining original lines.
-    for &line in &original_lines[original_line_index..] {
-        result.push_str(line);
-    }
-
-    result
+    push_original_part(&mut parts, &mut ends_with_cr, &original_content[position..]);
+    parts.concat()
 }
 
 // ---------------------------------------------------------------------------
@@ -503,7 +567,7 @@ pub fn apply_edits_to_normalized_content(
     };
 
     // Per-edit matching and validation.
-    let mut matched_edits: Vec<MatchedEdit> = Vec::new();
+    let mut matched_edits: Vec<TextReplacement> = Vec::new();
     for (i, (old_text, new_text, _)) in normalized_edits.iter().enumerate() {
         let match_result = fuzzy_find_text(&replacement_base_content, old_text);
         if !match_result.found {
@@ -520,7 +584,7 @@ pub fn apply_edits_to_normalized_content(
             ));
         }
 
-        matched_edits.push(MatchedEdit {
+        matched_edits.push(TextReplacement {
             edit_index: i,
             match_index: match_result.index,
             match_length: match_result.match_length,
@@ -542,15 +606,16 @@ pub fn apply_edits_to_normalized_content(
     }
 
     let base_content = normalized_content.to_string();
-    let new_content = if used_fuzzy_match {
-        apply_replacements_preserving_unchanged_lines(
+    let replacements = if used_fuzzy_match {
+        widen_replacements_to_lines(
             normalized_content,
             &replacement_base_content,
             &matched_edits,
         )
     } else {
-        apply_replacements(&replacement_base_content, &matched_edits, 0)
+        matched_edits
     };
+    let new_content = apply_replacements(&base_content, &replacements, 0);
 
     if base_content == new_content {
         return Err(get_no_change_error(path, normalized_edits.len()));
@@ -559,6 +624,7 @@ pub fn apply_edits_to_normalized_content(
     Ok(AppliedEditsResult {
         base_content,
         new_content,
+        replacements,
     })
 }
 
@@ -1131,5 +1197,253 @@ pub fn compute_edits_diff(
     })() {
         Ok(result) => result,
         Err(result) => result,
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EditDiff {
+    pub diff: String,
+    pub patch: String,
+    pub first_changed_line: Option<usize>,
+}
+
+const DIFF_WINDOW_MARGIN_LINES: usize = 32;
+
+#[derive(Clone, Copy, Debug)]
+struct DiffWindow {
+    old_start: usize,
+    old_end: usize,
+    old_line: usize,
+    new_start: usize,
+    new_end: usize,
+    new_line: usize,
+}
+
+/// Start of the line that owns the byte at `offset - 1`, where a `\n` byte is
+/// owned by the line it terminates. Returns 0 for `offset == 0`.
+///
+/// `offset` only has to satisfy `offset <= content.len()`. When a match starts
+/// or ends right next to a multi-byte character (U+3002, U+884C, an emoji,
+/// ...) the byte before it is a continuation byte, and slicing the `str` at
+/// `offset - 1` panics with "not a char boundary". `\n` is ASCII and never
+/// part of a multi-byte sequence, so a plain byte search gives the same
+/// answer regardless.
+fn line_start_before(content: &str, offset: usize) -> usize {
+    if offset == 0 {
+        return 0;
+    }
+    content.as_bytes()[..offset - 1]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |index| index + 1)
+}
+
+/// Number of `\n` bytes in `content[start..end]`. Byte-based for the same
+/// reason as [`line_start_before`]: the range need not start or end on a char
+/// boundary.
+fn count_line_feeds(content: &str, start: usize, end: usize) -> usize {
+    content.as_bytes()[start..end]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count()
+}
+
+fn diff_windows(base_content: &str, replacements: &[TextReplacement]) -> Vec<DiffWindow> {
+    let mut windows: Vec<DiffWindow> = Vec::new();
+    let mut offset_delta = 0isize;
+    let mut line_delta = 0isize;
+    let mut cursor_offset = 0usize;
+    let mut cursor_line = 0usize;
+    for replacement in replacements {
+        let match_end = replacement.match_index + replacement.match_length;
+        let mut start = line_start_before(base_content, replacement.match_index);
+        for _ in 0..DIFF_WINDOW_MARGIN_LINES {
+            if start == 0 {
+                break;
+            }
+            start = line_start_before(base_content, start - 1);
+        }
+        // End of the last line touched by the match, then the margin. `search`
+        // may sit inside a multi-byte character (the last one of the match),
+        // so the line feed is looked up by byte rather than with a `str`
+        // slice, which would panic on such an index.
+        let mut end = match_end;
+        for index in 0..=DIFF_WINDOW_MARGIN_LINES {
+            if end >= base_content.len() {
+                break;
+            }
+            let search = if index == 0 {
+                match_end.saturating_sub(1).max(replacement.match_index)
+            } else {
+                end
+            };
+            end = base_content.as_bytes()[search..]
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(base_content.len(), |line_feed| search + line_feed + 1);
+        }
+        let replacement_offset_delta =
+            replacement.new_text.len() as isize - replacement.match_length as isize;
+        let replacement_line_delta =
+            count_line_feeds(&replacement.new_text, 0, replacement.new_text.len()) as isize
+                - count_line_feeds(base_content, replacement.match_index, match_end) as isize;
+        if let Some(previous) = windows.last_mut() {
+            if start <= previous.old_end {
+                previous.old_end = previous.old_end.max(end);
+                previous.new_end =
+                    (previous.old_end as isize + offset_delta + replacement_offset_delta) as usize;
+            } else {
+                cursor_line += count_line_feeds(base_content, cursor_offset, start);
+                cursor_offset = start;
+                windows.push(DiffWindow {
+                    old_start: start,
+                    old_end: end,
+                    old_line: cursor_line,
+                    new_start: (start as isize + offset_delta) as usize,
+                    new_end: (end as isize + offset_delta + replacement_offset_delta) as usize,
+                    new_line: (cursor_line as isize + line_delta) as usize,
+                });
+            }
+        } else {
+            cursor_line += count_line_feeds(base_content, cursor_offset, start);
+            cursor_offset = start;
+            windows.push(DiffWindow {
+                old_start: start,
+                old_end: end,
+                old_line: cursor_line,
+                new_start: (start as isize + offset_delta) as usize,
+                new_end: (end as isize + offset_delta + replacement_offset_delta) as usize,
+                new_line: (cursor_line as isize + line_delta) as usize,
+            });
+        }
+        offset_delta += replacement_offset_delta;
+        line_delta += replacement_line_delta;
+    }
+    windows
+}
+
+fn shift_display_line(line: &str, old_line: usize, new_line: usize, width: usize) -> String {
+    let Some(prefix) = line.chars().next() else {
+        return line.to_owned();
+    };
+    if !matches!(prefix, '+' | '-' | ' ') {
+        return line.to_owned();
+    }
+    let rest = &line[prefix.len_utf8()..];
+    let trimmed = rest.trim_start();
+    let digits = trimmed
+        .split(|character: char| !character.is_ascii_digit())
+        .next()
+        .unwrap_or_default();
+    let Ok(number) = digits.parse::<usize>() else {
+        // The fold marker (` ...`) is laid out with the window's line-number
+        // width, which is narrower than the whole file's whenever the window
+        // does not reach the higher line numbers. Re-layout it with the
+        // whole-file width so it matches a whole-file diff and so adjacent
+        // windows' markers compare equal and collapse into one.
+        if prefix == ' ' && trimmed == "..." {
+            return format!(" {:>width$} ...", "", width = width);
+        }
+        return line.to_owned();
+    };
+    let shifted = if prefix == '+' {
+        number + new_line
+    } else {
+        number + old_line
+    };
+    format!(
+        "{prefix}{shifted:>width$}{}",
+        &trimmed[digits.len()..],
+        width = width
+    )
+}
+
+fn parse_patch_range(range: &str) -> Option<(usize, &str)> {
+    let (start, count) = range.split_once(',')?;
+    Some((start.parse::<usize>().ok()?, count))
+}
+
+fn shift_patch_hunk_header(line: &str, old_line: usize, new_line: usize) -> String {
+    let Some(numbers) = line
+        .strip_prefix("@@ -")
+        .and_then(|line| line.strip_suffix(" @@"))
+    else {
+        return line.to_owned();
+    };
+    let Some((old, new)) = numbers.split_once(" +") else {
+        return line.to_owned();
+    };
+    let parse = parse_patch_range;
+    let Some((old_start, old_count)) = parse(old) else {
+        return line.to_owned();
+    };
+    let Some((new_start, new_count)) = parse(new) else {
+        return line.to_owned();
+    };
+    format!(
+        "@@ -{},{} +{},{} @@",
+        old_start + old_line,
+        old_count,
+        new_start + new_line,
+        new_count
+    )
+}
+
+/// Generate display and unified patches only around the replacements.
+pub fn generate_edit_diff(
+    path: &str,
+    base_content: &str,
+    new_content: &str,
+    replacements: &[TextReplacement],
+    context_lines: usize,
+) -> EditDiff {
+    let line_num_width = base_content
+        .split('\n')
+        .count()
+        .max(new_content.split('\n').count())
+        .to_string()
+        .len();
+    let skip_marker = format!(" {:>width$} ...", "", width = line_num_width);
+    let mut output = Vec::new();
+    let mut hunks = Vec::new();
+    let mut first_changed_line = None;
+    for window in diff_windows(base_content, replacements) {
+        let old_text = &base_content[window.old_start..window.old_end];
+        let new_text = &new_content[window.new_start..window.new_end];
+        let shown = generate_diff_string(old_text, new_text, context_lines);
+        if first_changed_line.is_none() {
+            first_changed_line = shown.first_changed_line.map(|line| line + window.new_line);
+        }
+        for line in shown.diff.lines() {
+            let shifted =
+                shift_display_line(line, window.old_line, window.new_line, line_num_width);
+            // Two windows that do not overlap end and start with a fold
+            // marker right next to each other. A whole-file diff folds the
+            // gap between them once, so keep a single marker. This has to be
+            // decided on the re-layouted line: the raw one still carries the
+            // window's (narrower) line-number width.
+            if shifted == skip_marker && output.last() == Some(&skip_marker) {
+                continue;
+            }
+            output.push(shifted);
+        }
+        let patch = generate_unified_patch(path, old_text, new_text, context_lines);
+        for line in patch.lines().skip(2) {
+            hunks.push(shift_patch_hunk_header(
+                line,
+                window.old_line,
+                window.new_line,
+            ));
+        }
+    }
+    let patch = if hunks.is_empty() {
+        format!("--- {path}\n+++ {path}\n")
+    } else {
+        format!("--- {path}\n+++ {path}\n{}\n", hunks.join("\n"))
+    };
+    EditDiff {
+        diff: output.join("\n"),
+        patch,
+        first_changed_line,
     }
 }

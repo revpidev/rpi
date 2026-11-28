@@ -136,6 +136,8 @@ pub fn write_file(path: &Path, content: &str) -> std::io::Result<usize> {
 /// already flushed); a failure here cannot corrupt the plan, so it is
 /// ignored. Windows cannot open a directory as a file, so it is unix-only.
 fn sync_parent_dir(path: &Path) {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     if let Some(parent) = path.parent()
         && let Ok(dir) = std::fs::File::open(parent)

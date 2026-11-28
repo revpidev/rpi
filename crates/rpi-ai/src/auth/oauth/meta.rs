@@ -81,12 +81,7 @@ fn now_ms() -> i64 {
 /// only http(s) URLs are trusted. Returns the parsed-and-serialized form
 /// (JS `url.href`).
 fn trusted_http_url(value: Option<&Value>) -> Option<String> {
-    let raw = value?.as_str().filter(|value| !value.is_empty())?;
-    let url = url::Url::parse(raw).ok()?;
-    match url.scheme() {
-        "https" | "http" => Some(url.to_string()),
-        _ => None,
-    }
+    super::trusted_url::trusted_http_url(value?.as_str()?)
 }
 
 /// `readJson` — parse JSON, or `null` for unparseable bodies. JS
@@ -453,6 +448,8 @@ impl MetaOAuth {
         interaction.notify(AuthEvent::DeviceCode {
             user_code: device.user_code.clone(),
             verification_uri: device.verification_uri.clone(),
+            open_browser_on_confirm: None,
+            copy_code_on_confirm: None,
             interval_seconds: device.interval_seconds.map(|seconds| seconds as u64),
             expires_in_seconds: device.expires_in_seconds.map(|seconds| seconds as u64),
         });
@@ -751,6 +748,8 @@ mod tests {
             AuthEvent::DeviceCode {
                 user_code: "ABCD-1234".to_owned(),
                 verification_uri: "https://auth.meta.com/oauth/device/?code=ABCD-1234".to_owned(),
+                open_browser_on_confirm: None,
+                copy_code_on_confirm: None,
                 interval_seconds: Some(1),
                 expires_in_seconds: Some(600),
             }

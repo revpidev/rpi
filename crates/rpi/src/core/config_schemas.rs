@@ -65,10 +65,25 @@ pub enum StatusLineNumberFormat {
     Exact,
 }
 
+/// `statusLine.liveTokens.calculation` (ADR-0049 decision 6 / V19-07): the
+/// streaming calculation policy. The host schema is a strict enum: an
+/// illegal value is a `statusLine` scope validation error (startup: empty
+/// settings plus the error; reload: the previous in-memory settings stay),
+/// while the statusline plugin's own raw parser only falls its own policy
+/// back to `auto`. The two channels are deliberately not the same guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum StatusLineLiveCalculation {
+    Auto,
+    Estimate,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StatusLineLiveTokensOptions {
     pub refresh_ms: Option<u64>,
+    /// Missing = `auto`; `estimate` shows the lightweight heuristic with `~` while streaming.
+    pub calculation: Option<StatusLineLiveCalculation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -103,6 +118,8 @@ pub struct SettingsDocument {
     #[serde(rename = "$schema")]
     pub schema: Option<String>,
     pub last_changelog_version: Option<String>,
+    /// Last seen changelog version per extension package.
+    pub extension_changelog_versions: Option<BTreeMap<String, String>>,
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
     pub default_thinking_level: Option<ModelThinkingLevel>,
@@ -446,6 +463,66 @@ mod tests {
         assert!(schema["properties"]["usage"].is_object());
         assert!(schema["properties"]["statusLine"].is_object());
         assert!(schema["properties"]["versionCheckUrl"].is_object());
+    }
+
+    /// V19-07 FR-A R2: the host typed schema is a strict `auto|estimate`
+    /// enum. A missing `calculation` (and the legacy bool / `refreshMs`-only
+    /// object) stays valid; an illegal value fails the `statusLine` scope.
+    #[test]
+    fn live_tokens_calculation_is_a_strict_enum() {
+        let schema = settings_schema();
+        assert_eq!(
+            schema["$defs"]["StatusLineLiveCalculation"]["enum"],
+            serde_json::json!(["auto", "estimate"])
+        );
+        assert_eq!(
+            schema["$defs"]["StatusLineLiveTokensOptions"]["properties"]["calculation"]["anyOf"][0]
+                ["$ref"],
+            "#/$defs/StatusLineLiveCalculation"
+        );
+        for valid in [
+            serde_json::json!({"type": "items"}),
+            serde_json::json!({"type": "items", "liveTokens": true}),
+            serde_json::json!({"type": "items", "liveTokens": {"refreshMs": 500}}),
+            serde_json::json!({"type": "items", "liveTokens": {"calculation": "auto"}}),
+            serde_json::json!({"type": "items", "liveTokens": {"refreshMs": 300, "calculation": "estimate"}}),
+            serde_json::json!({"type": "command", "command": "echo x", "liveTokens": {"calculation": "estimate"}}),
+        ] {
+            let document =
+                validate_runtime_settings_document(&serde_json::json!({"statusLine": valid}))
+                    .unwrap_or_else(|error| panic!("{valid}: {error}"));
+            let live = document
+                .status_line
+                .expect("statusLine")
+                .live_tokens
+                .unwrap_or(StatusLineLiveTokens::Enabled(false));
+            match (&valid["liveTokens"], live) {
+                (serde_json::Value::Object(object), StatusLineLiveTokens::Options(options)) => {
+                    let expected = object
+                        .get("calculation")
+                        .and_then(|value| value.as_str())
+                        .map(|value| match value {
+                            "estimate" => StatusLineLiveCalculation::Estimate,
+                            _ => StatusLineLiveCalculation::Auto,
+                        });
+                    assert_eq!(options.calculation, expected, "{valid}");
+                }
+                (serde_json::Value::Bool(_), StatusLineLiveTokens::Enabled(_)) => {}
+                (serde_json::Value::Null, StatusLineLiveTokens::Enabled(false)) => {}
+                (value, parsed) => panic!("{value} parsed as {parsed:?}"),
+            }
+        }
+        for invalid in [
+            serde_json::json!({"type": "items", "liveTokens": {"calculation": "fast"}}),
+            serde_json::json!({"type": "items", "liveTokens": {"calculation": "AUTO"}}),
+            serde_json::json!({"type": "items", "liveTokens": {"calculation": true}}),
+            serde_json::json!({"type": "items", "liveTokens": {"calculation": null, "refreshMs": 400}}),
+        ] {
+            let error =
+                validate_runtime_settings_document(&serde_json::json!({"statusLine": invalid}))
+                    .expect_err("illegal calculation must fail the scope");
+            assert!(error.starts_with("statusLine:"), "{invalid}: {error}");
+        }
     }
 
     #[test]

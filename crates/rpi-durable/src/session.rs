@@ -1,10 +1,10 @@
 //! Session kernel of the durable runtime (port of the session domain of
-//! `packages/durable/src/session/*` @ `4a080252f`: `session.ts`, `transaction.ts`,
+//! `packages/durable/src/session/*` @ `b4afdddf`: `session.ts`, `transaction.ts`,
 //! `observation.ts`, `forks.ts`).
 //!
-//! The kernel owns one **mutation line**: every commit callback, storage
-//! settlement, adoption and publication runs serialized while the line is held;
-//! only committed state is observable. This module root carries the shared error
+//! The kernel owns one **mutation line**: commit callbacks and settlement are
+//! serialized, then the Writer stores admitted batches off the line and
+//! publishes them in admission order; only committed state is observable. This module root carries the shared error
 //! surface and the public value types; [`session`] carries the single-line
 //! [`session::SessionImpl`], [`transaction`] the staging [`transaction::Transaction`],
 //! [`observation`] the async watch/state bridge, and [`forks`] the conversation
@@ -27,19 +27,24 @@ use crate::errors::StorageError;
 use crate::ids::{ConversationId, Seq, TaskId};
 use crate::types::{DocumentCopySource, DocumentRecord, StorageWrite};
 
+pub mod cached_storage;
 pub mod forks;
+mod gated;
 pub mod guarded;
+mod keys;
 pub mod observation;
 // The design keeps the kernel in `session/session.rs` (frozen layout); Clippy's
 // `module_inception` is a style lint for the resulting `session::session` path.
 #[allow(clippy::module_inception)]
 pub mod session;
 pub mod transaction;
+mod writer;
 
+pub use cached_storage::{CachedStorage, CachedStorageSizes};
 pub use forks::{ForkDocumentCopy, prepare_fork_document_copies};
 pub use observation::{
-    CommittedStateSource, CommittedWatch, MAX_PENDING_WATCH_FRAMES, ObservedDocumentValue,
-    RETIREMENT_OPERATIONS, WatchEnd, WatchFuture, WatchListener,
+    CommittedStateSource, CommittedWatch, ObservedDocumentValue, RETIREMENT_OPERATIONS, WatchCall,
+    WatchEnd, WatchFuture, WatchListener,
 };
 pub use session::{
     CloseListener, CommitFn, CommitListener, ConversationCreatedHook, ConversationDocumentView,
@@ -88,6 +93,9 @@ pub enum SessionError {
     /// `"Session is closed"`).
     #[error("Session is closed")]
     Closed,
+    /// A read-only Session rejected a write before reaching Storage.
+    #[error("Read-only session")]
+    ReadOnlySession,
     /// The Session failed after a storage error; nothing runs or commits any
     /// more. Reopen the Session to recover from what was committed.
     #[error("Session failed after a storage error; close and reopen it")]
@@ -185,10 +193,20 @@ pub enum CommitChange {
     DocumentCopy(DocumentCopyChange),
 }
 
+/// A committed document value change or incarnation retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentChangeKind {
+    Change,
+    Retire,
+}
+
 /// One committed document content change or retirement (upstream
 /// `DocumentCommitChange` with `type: "document"`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocumentChange {
+    /// Whether this is a value change or an incarnation retirement.
+    pub kind: DocumentChangeKind,
     /// Incarnation record after the commit; `retired_at` is stamped on retirement.
     pub record: DocumentRecord,
     /// Publication conversation; absent for session-scoped documents.
@@ -205,7 +223,7 @@ pub struct DocumentChange {
 impl DocumentChange {
     /// Whether this frame retires the incarnation.
     pub fn is_retirement(&self) -> bool {
-        self.version.is_none()
+        self.kind == DocumentChangeKind::Retire
     }
 
     /// The frame value as strict JSON (`null` for a retirement).
@@ -238,6 +256,73 @@ pub struct CommitPublication {
     pub changes: Vec<CommitChange>,
 }
 
+/// When one commit reaches Storage.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommitPersistence {
+    Immediate,
+    Deferred {
+        /// `None` uses the Session default; infinity waits for a read/write or close.
+        within_ms: Option<f64>,
+    },
+}
+
+/// Options of one Session commit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CommitOptions {
+    pub persistence: Option<CommitPersistence>,
+}
+
+pub(crate) struct DeferredCommit {
+    pub id: u64,
+    pub deadline: Option<f64>,
+    pub deadlines: std::collections::HashMap<crate::ids::DocumentId, Option<f64>>,
+    pub writes: Vec<StorageWrite>,
+    pub changes: Vec<CommitChange>,
+    pub keys: Vec<String>,
+    /// Documents held by this deferred commit; never evicted until flushed.
+    pub pinned: Vec<crate::ids::DocumentId>,
+    /// Documents whose held operations overflowed into a replacement: the
+    /// stored change is a base and later held operations are not folded into
+    /// it (upstream `Hold.pending`'s `replace` state).
+    pub replaces: std::collections::HashSet<crate::ids::DocumentId>,
+}
+
+pub(crate) fn earliest_deferred_deadline(
+    deadlines: &std::collections::HashMap<crate::ids::DocumentId, Option<f64>>,
+) -> Option<f64> {
+    deadlines
+        .values()
+        .copied()
+        .fold(None, |earliest, deadline| match (earliest, deadline) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        })
+}
+
+/// Synchronous observer of value calls and one terminal end.
+pub trait Observer<T>: Send + Sync {
+    fn advance(&self, call: WatchCall<T>, context: &crate::chord::context::Context);
+    fn end(&self, end: WatchEnd);
+}
+
+/// Atomic observation attachment and its initial value.
+pub struct Observation<T> {
+    pub value: T,
+    pub detach: Subscription,
+}
+
+/// Synchronous observer of stored commit publications.
+pub trait CommitObserver: Send + Sync {
+    fn advance(&self, publication: &CommitPublication, context: &crate::chord::context::Context);
+    fn end(&self, end: WatchEnd);
+}
+
+/// Commit observation has no state value: commits are events, not a snapshot.
+pub struct CommitObservation {
+    pub detach: Subscription,
+}
+
 /// Operations an observer applies for one committed change (upstream
 /// `observedOperations`, `session.ts:557`).
 ///
@@ -258,6 +343,28 @@ pub fn observed_operations(
     }
     observed_version.store(version, Ordering::SeqCst);
     vec![Op::Replace(change.frame_value())]
+}
+
+/// Like [`observed_operations`], but also treats a new document incarnation
+/// as a root replacement. A watch follows the address, so a retire/recreate
+/// must not deliver the new value with the old incarnation's (empty) ops.
+pub fn observed_operations_for(
+    observed_id: &std::sync::atomic::AtomicU64,
+    observed_version: &std::sync::atomic::AtomicU64,
+    change: &DocumentChange,
+) -> Vec<Op> {
+    use std::sync::atomic::Ordering;
+    if change.is_retirement() {
+        return RETIREMENT_OPERATIONS.to_vec();
+    }
+    let id = change.record.id.get();
+    let version = change.version.unwrap_or(0);
+    if id != observed_id.load(Ordering::SeqCst) {
+        observed_id.store(id, Ordering::SeqCst);
+        observed_version.store(version, Ordering::SeqCst);
+        return vec![Op::Replace(change.frame_value())];
+    }
+    observed_operations(observed_version, change)
 }
 
 /// Default wall clock (upstream `Date.now`).

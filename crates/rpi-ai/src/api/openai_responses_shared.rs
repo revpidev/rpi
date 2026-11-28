@@ -21,9 +21,9 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value, json};
 
 use crate::api::constrained_sampling::{
-    GrammarToolInputJsonBuffer, append_grammar_tool_input_json_delta, get_grammar_tool_input,
-    get_json_schema_tool_parameters, resolve_grammar_constrained_sampling,
-    resolve_json_schema_strict_sampling,
+    GrammarToolInputJsonBuffer, append_grammar_tool_input_json_delta,
+    close_grammar_tool_input_json, get_grammar_tool_input, get_json_schema_tool_parameters,
+    resolve_grammar_constrained_sampling, resolve_json_schema_strict_sampling,
 };
 use crate::types::StreamEvent;
 use crate::types::{
@@ -35,8 +35,8 @@ use crate::utils::cost::calculate_cost;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
 use crate::utils::json_parse::StreamingArgsPreview;
-use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::sanitize_unicode::sanitize_surrogates;
+use crate::utils::streaming_json::ToolCallArgumentsStream;
 use crate::utils::transform_messages::transform_messages;
 
 // =============================================================================
@@ -730,21 +730,61 @@ pub struct ResponsesStreamOptions<'a> {
     pub resolve_service_tier: Option<ResolveServiceTier>,
 }
 
-/// Custom (grammar) tool streaming state.
-#[derive(Debug, Default)]
-struct CustomInputState {
-    property: String,
-    json_buffer: GrammarToolInputJsonBuffer,
+/// Stream state of a tool call, kept in its scratch entry and never on the
+/// content block, so it never reaches partials: the JSON arguments of a
+/// function call, or the input of a custom (grammar) tool call.
+#[derive(Debug)]
+enum ToolCallInput {
+    /// Boxed: the parser state is much larger than the custom-input variant,
+    /// and every tool-call scratch entry holds one.
+    Json(Box<ToolCallArgumentsStream>),
+    Custom {
+        property: String,
+        buffer: GrammarToolInputJsonBuffer,
+        /// JSON text of the item's initial input, sent with the first delta.
+        unsent: String,
+    },
 }
 
-/// Per-tool-call streaming scratch state (upstream stores `partialJson` and
-/// `customInput` on the streaming block; here keyed by content index).
-#[derive(Debug, Default)]
+/// Per-tool-call streaming scratch state.
+#[derive(Debug)]
 struct ToolScratch {
-    partial_json: Option<String>,
-    custom_input: Option<CustomInputState>,
-    /// rpi#78 A3: refresh `block.arguments` at display cadence, not per delta.
+    input: ToolCallInput,
+    /// rpi#78 A3: materialize `block.arguments` at display cadence, not per
+    /// delta.
     args_preview: StreamingArgsPreview,
+}
+
+/// Stream state of a custom tool call that starts with `initial_input`.
+fn custom_input(property: String, initial_input: &str) -> ToolCallInput {
+    let mut buffer = GrammarToolInputJsonBuffer::default();
+    // A fresh buffer cannot be closed; an error is unreachable here.
+    let unsent = append_grammar_tool_input_json_delta(&mut buffer, &property, initial_input)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    ToolCallInput::Custom {
+        property,
+        buffer,
+        unsent,
+    }
+}
+
+/// The `{ property: input }` arguments object of a custom tool call.
+fn custom_arguments(property: &str, input: &str) -> Map<String, Value> {
+    let mut arguments = Map::new();
+    arguments.insert(property.to_owned(), json!(input));
+    arguments
+}
+
+/// Emit the initial custom input (if not sent yet) together with `json_delta`.
+fn send_custom_input(unsent: &mut String, json_delta: Option<String>) -> Option<String> {
+    if unsent.is_empty() {
+        return json_delta;
+    }
+    let sent = format!("{unsent}{}", json_delta.unwrap_or_default());
+    unsent.clear();
+    Some(sent)
 }
 
 /// `ResponsesOutputSlot`: which content block an output index maps to.
@@ -763,40 +803,6 @@ impl Slot {
             | Slot::ToolCall { content_index } => content_index,
         }
     }
-}
-
-/// `getCustomToolCallInput`: the current raw grammar input text.
-fn custom_tool_call_input(block: &ToolCall, scratch: &ToolScratch) -> String {
-    let Some(custom_input) = &scratch.custom_input else {
-        return String::new();
-    };
-    match block.arguments.get(&custom_input.property) {
-        Some(Value::String(input)) => input.clone(),
-        _ => String::new(),
-    }
-}
-
-/// `appendCustomToolCallInput`: advance the grammar JSON buffer and replace
-/// `block.arguments` with `{ property: nextInput }`.
-fn append_custom_tool_call_input(
-    block: &mut ToolCall,
-    scratch: &mut ToolScratch,
-    next_input: &str,
-    close: bool,
-) -> Result<Option<String>, String> {
-    let Some(custom_input) = &mut scratch.custom_input else {
-        return Ok(None);
-    };
-    let delta = append_grammar_tool_input_json_delta(
-        &mut custom_input.json_buffer,
-        &custom_input.property,
-        next_input,
-        close,
-    )?;
-    let mut arguments = Map::new();
-    arguments.insert(custom_input.property.clone(), json!(next_input));
-    block.arguments = arguments;
-    Ok(delta)
 }
 
 /// `mapStopReason` (response status); unknown statuses are an error (the API
@@ -901,7 +907,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
         output_index: usize,
         item: &Value,
         events: &AssistantMessageEventStream,
-    ) -> Option<Slot> {
+    ) -> Result<Option<Slot>, String> {
         match item.get("type").and_then(Value::as_str) {
             Some("reasoning") => {
                 output
@@ -919,7 +925,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     content_index: slot.content_index(),
                     partial: self.output.clone(),
                 });
-                Some(slot)
+                Ok(Some(slot))
             }
             Some("message") => {
                 self.apply_message_phase_stop_reason(output, item);
@@ -937,7 +943,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     content_index: slot.content_index(),
                     partial: self.output.clone(),
                 });
-                Some(slot)
+                Ok(Some(slot))
             }
             Some("function_call") => {
                 let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
@@ -947,11 +953,12 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     .get("id")
                     .and_then(Value::as_str)
                     .unwrap_or("undefined");
-                let partial_json = item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
+                let partial_json = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                let mut arguments = ToolCallArgumentsStream::default();
+                if !partial_json.is_empty() {
+                    arguments.append(partial_json);
+                }
+                let partial_arguments = arguments.arguments().clone();
                 output.content.push(AssistantContent::ToolCall(ToolCall {
                     id: format!("{call_id}|{item_id}"),
                     name: item
@@ -959,7 +966,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_owned(),
-                    arguments: Map::new(),
+                    arguments: partial_arguments,
                     thought_signature: None,
                     // 02bd2d1c6 (#7709): preserve the Responses namespace.
                     namespace: item
@@ -974,8 +981,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 self.scratch.insert(
                     slot.content_index(),
                     ToolScratch {
-                        partial_json: Some(partial_json),
-                        custom_input: None,
+                        input: ToolCallInput::Json(Box::new(arguments)),
                         args_preview: StreamingArgsPreview::default(),
                     },
                 );
@@ -984,7 +990,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     content_index: slot.content_index(),
                     partial: self.output.clone(),
                 });
-                Some(slot)
+                Ok(Some(slot))
             }
             Some("custom_tool_call") => {
                 let name = item.get("name").and_then(Value::as_str).unwrap_or("");
@@ -999,13 +1005,9 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     .get(name)
                     .cloned()
                     .unwrap_or_else(|| "input".to_owned());
-                let input = item
-                    .get("input")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let mut arguments = Map::new();
-                arguments.insert(input_property.clone(), json!(input));
+                let input = item.get("input").and_then(Value::as_str).unwrap_or("");
+                let arguments = custom_arguments(&input_property, input);
+                let input_state = custom_input(input_property.clone(), input);
                 output.content.push(AssistantContent::ToolCall(ToolCall {
                     id: format!("{call_id}|{item_id}"),
                     name: name.to_owned(),
@@ -1024,11 +1026,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 self.scratch.insert(
                     slot.content_index(),
                     ToolScratch {
-                        partial_json: None,
-                        custom_input: Some(CustomInputState {
-                            property: input_property,
-                            json_buffer: GrammarToolInputJsonBuffer::default(),
-                        }),
+                        input: input_state,
                         args_preview: StreamingArgsPreview::default(),
                     },
                 );
@@ -1037,9 +1035,9 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     content_index: slot.content_index(),
                     partial: self.output.clone(),
                 });
-                Some(slot)
+                Ok(Some(slot))
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 
@@ -1049,9 +1047,9 @@ impl<'a> ResponsesStreamProcessor<'a> {
         output_index: usize,
         item: &Value,
         events: &AssistantMessageEventStream,
-    ) -> Option<Slot> {
+    ) -> Result<Option<Slot>, String> {
         match self.slots.get(&output_index).copied() {
-            Some(slot) => Some(slot),
+            Some(slot) => Ok(Some(slot)),
             None => self.create_slot(output, output_index, item, events),
         }
     }
@@ -1201,7 +1199,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 }
                 Some("response.output_item.added") => {
                     if let Some(item) = event.get("item") {
-                        self.create_slot(output, output_index, item, events);
+                        self.create_slot(output, output_index, item, events)?;
                     }
                 }
                 Some("response.reasoning_summary_text.delta")
@@ -1264,22 +1262,32 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     else {
                         return Ok(());
                     };
-                    let delta = event.get("delta").and_then(Value::as_str);
-                    let Some(scratch) = self.scratch.get_mut(&content_index) else {
+                    let Some(delta) = event.get("delta").and_then(Value::as_str) else {
                         return Ok(());
                     };
-                    let Some(partial_json) = scratch.partial_json.as_mut() else {
-                        return Ok(());
+                    // #9265: feed only the new delta to the shared parser; the
+                    // authoritative arguments land at
+                    // `response.function_call_arguments.done`.
+                    let refresh = {
+                        let Some(scratch) = self.scratch.get_mut(&content_index) else {
+                            return Ok(());
+                        };
+                        let ToolCallInput::Json(stream) = &mut scratch.input else {
+                            return Ok(());
+                        };
+                        stream.append(delta);
+                        scratch.args_preview.should_refresh(stream.text().len())
                     };
-                    let Some(delta) = delta else { return Ok(()) };
-                    partial_json.push_str(delta);
-                    // rpi#78 A3: no O(args) clone per delta; the authoritative
-                    // arguments land at `response.function_call_arguments.done`.
-                    let refresh = scratch.args_preview.should_parse(partial_json.len());
                     if refresh {
-                        let parsed = parse_streaming_json(Some(partial_json));
-                        if let Some(AssistantContent::ToolCall(block)) =
-                            output.content.get_mut(content_index)
+                        let parsed = self.scratch.get_mut(&content_index).and_then(|scratch| {
+                            match &mut scratch.input {
+                                ToolCallInput::Json(stream) => Some(stream.arguments().clone()),
+                                ToolCallInput::Custom { .. } => None,
+                            }
+                        });
+                        if let Some(parsed) = parsed
+                            && let Some(AssistantContent::ToolCall(block)) =
+                                output.content.get_mut(content_index)
                         {
                             block.arguments = parsed;
                         }
@@ -1295,29 +1303,19 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     let Some(scratch) = self.scratch.get_mut(&content_index) else {
                         return Ok(());
                     };
-                    if scratch.partial_json.is_none() {
+                    let ToolCallInput::Json(stream) = &mut scratch.input else {
                         return Ok(());
-                    }
-                    let previous_partial_json = scratch.partial_json.clone().unwrap_or_default();
-                    let arguments = event
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned();
-                    scratch.partial_json = Some(arguments.clone());
+                    };
+                    let arguments = event.get("arguments").and_then(Value::as_str).unwrap_or("");
+                    let (delta, _) = stream.replace(arguments);
+                    let parsed = stream.finish();
                     if let Some(AssistantContent::ToolCall(block)) =
                         output.content.get_mut(content_index)
                     {
-                        let parsed =
-                            crate::utils::json_parse::parse_tool_call_arguments(Some(&arguments));
                         block.arguments = parsed.arguments;
                         block.arguments_error = parsed.arguments_error;
                     }
-                    if let Some(delta) = arguments.strip_prefix(&previous_partial_json)
-                        && !delta.is_empty()
-                    {
-                        self.push_tool_call_delta(content_index, Some(delta.to_owned()), events);
-                    }
+                    self.push_tool_call_delta(content_index, delta, events);
                 }
                 Some("response.custom_tool_call_input.delta") => {
                     let Some(Slot::ToolCall { content_index }) =
@@ -1326,21 +1324,29 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         return Ok(());
                     };
                     let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
-                    let Some(scratch) = self.scratch.get_mut(&content_index) else {
-                        return Ok(());
+                    let json_delta = {
+                        let Some(scratch) = self.scratch.get_mut(&content_index) else {
+                            return Ok(());
+                        };
+                        let ToolCallInput::Custom {
+                            property,
+                            buffer,
+                            unsent,
+                        } = &mut scratch.input
+                        else {
+                            return Ok(());
+                        };
+                        let json_delta =
+                            append_grammar_tool_input_json_delta(buffer, property, delta)?;
+                        let input = buffer.input.clone();
+                        if let Some(AssistantContent::ToolCall(block)) =
+                            output.content.get_mut(content_index)
+                        {
+                            block.arguments = custom_arguments(property, &input);
+                        }
+                        send_custom_input(unsent, json_delta)
                     };
-                    if scratch.custom_input.is_none() {
-                        return Ok(());
-                    }
-                    if let Some(AssistantContent::ToolCall(block)) =
-                        output.content.get_mut(content_index)
-                    {
-                        let next_input =
-                            format!("{}{delta}", custom_tool_call_input(block, scratch));
-                        let delta =
-                            append_custom_tool_call_input(block, scratch, &next_input, false)?;
-                        self.push_tool_call_delta(content_index, delta, events);
-                    }
+                    self.push_tool_call_delta(content_index, json_delta, events);
                 }
                 Some("response.custom_tool_call_input.done") => {
                     let Some(Slot::ToolCall { content_index }) =
@@ -1348,26 +1354,37 @@ impl<'a> ResponsesStreamProcessor<'a> {
                     else {
                         return Ok(());
                     };
-                    let input = event.get("input").and_then(Value::as_str).unwrap_or("");
-                    let Some(scratch) = self.scratch.get_mut(&content_index) else {
-                        return Ok(());
+                    let final_input = event.get("input").and_then(Value::as_str);
+                    let json_delta = {
+                        let Some(scratch) = self.scratch.get_mut(&content_index) else {
+                            return Ok(());
+                        };
+                        let ToolCallInput::Custom {
+                            property,
+                            buffer,
+                            unsent,
+                        } = &mut scratch.input
+                        else {
+                            return Ok(());
+                        };
+                        let json_delta =
+                            close_grammar_tool_input_json(buffer, property, final_input)?;
+                        let input = buffer.input.clone();
+                        if let Some(AssistantContent::ToolCall(block)) =
+                            output.content.get_mut(content_index)
+                        {
+                            block.arguments = custom_arguments(property, &input);
+                        }
+                        send_custom_input(unsent, json_delta)
                     };
-                    if scratch.custom_input.is_none() {
-                        return Ok(());
-                    }
-                    if let Some(AssistantContent::ToolCall(block)) =
-                        output.content.get_mut(content_index)
-                    {
-                        let delta = append_custom_tool_call_input(block, scratch, input, true)?;
-                        self.push_tool_call_delta(content_index, delta, events);
-                    }
+                    self.push_tool_call_delta(content_index, json_delta, events);
                 }
                 Some("response.output_item.done") => {
                     let Some(item) = event.get("item") else {
                         return Ok(());
                     };
                     self.apply_message_phase_stop_reason(output, item);
-                    let Some(slot) = self.get_or_create_slot(output, output_index, item, events)
+                    let Some(slot) = self.get_or_create_slot(output, output_index, item, events)?
                     else {
                         return Ok(());
                     };
@@ -1448,43 +1465,23 @@ impl<'a> ResponsesStreamProcessor<'a> {
                             self.slots.remove(&output_index);
                         }
                         (Some("function_call"), Slot::ToolCall { .. }) => {
-                            let has_partial_json = self
-                                .scratch
-                                .get(&content_index)
-                                .is_some_and(|scratch| scratch.partial_json.is_some());
-                            if !has_partial_json {
+                            let Some(scratch) = self.scratch.get_mut(&content_index) else {
                                 return Ok(());
-                            }
-                            let partial = self
-                                .scratch
-                                .get(&content_index)
-                                .and_then(|scratch| scratch.partial_json.clone())
-                                .unwrap_or_default();
-                            let arguments = item
+                            };
+                            let ToolCallInput::Json(stream) = &mut scratch.input else {
+                                return Ok(());
+                            };
+                            if let Some(arguments) = item
                                 .get("arguments")
                                 .and_then(Value::as_str)
                                 .filter(|arguments| !arguments.is_empty())
-                                .map(str::to_owned)
-                                .or(if partial.is_empty() {
-                                    Some("{}".to_owned())
-                                } else {
-                                    Some(partial)
-                                });
+                            {
+                                stream.replace(arguments);
+                            }
+                            let parsed = stream.finish();
                             if let Some(AssistantContent::ToolCall(block)) =
                                 output.content.get_mut(content_index)
                             {
-                                // `item.arguments || partialJson || "{}"`.
-                                let fallback;
-                                let source = match &arguments {
-                                    Some(source) => source,
-                                    None => {
-                                        fallback = "{}".to_owned();
-                                        &fallback
-                                    }
-                                };
-                                let parsed = crate::utils::json_parse::parse_tool_call_arguments(
-                                    Some(source),
-                                );
                                 block.arguments = parsed.arguments;
                                 block.arguments_error = parsed.arguments_error;
                                 // 02bd2d1c6: a namespace on the done item wins.
@@ -1503,28 +1500,28 @@ impl<'a> ResponsesStreamProcessor<'a> {
                             self.slots.remove(&output_index);
                         }
                         (Some("custom_tool_call"), Slot::ToolCall { .. }) => {
-                            let has_custom_input = self
-                                .scratch
-                                .get(&content_index)
-                                .is_some_and(|scratch| scratch.custom_input.is_some());
-                            if !has_custom_input {
-                                return Ok(());
-                            }
+                            let final_input = item.get("input").and_then(Value::as_str);
                             let close_delta = {
                                 let Some(scratch) = self.scratch.get_mut(&content_index) else {
                                     return Ok(());
                                 };
-                                let input =
-                                    item.get("input").and_then(Value::as_str).map(str::to_owned);
+                                let ToolCallInput::Custom {
+                                    property,
+                                    buffer,
+                                    unsent,
+                                } = &mut scratch.input
+                                else {
+                                    return Ok(());
+                                };
+                                let json_delta =
+                                    close_grammar_tool_input_json(buffer, property, final_input)?;
+                                let input = buffer.input.clone();
                                 if let Some(AssistantContent::ToolCall(block)) =
                                     output.content.get_mut(content_index)
                                 {
-                                    let input = input
-                                        .unwrap_or_else(|| custom_tool_call_input(block, scratch));
-                                    append_custom_tool_call_input(block, scratch, &input, true)?
-                                } else {
-                                    None
+                                    block.arguments = custom_arguments(property, &input);
                                 }
+                                send_custom_input(unsent, json_delta)
                             };
                             self.push_tool_call_delta(content_index, close_delta, events);
                             if let Some(AssistantContent::ToolCall(block)) =
@@ -1619,9 +1616,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                 let AssistantContent::ToolCall(call) = block else {
                     continue;
                 };
-                let unfinished = self.scratch.get(&index).is_some_and(|scratch| {
-                    scratch.partial_json.is_some() || scratch.custom_input.is_some()
-                });
+                let unfinished = self.scratch.contains_key(&index);
                 if unfinished {
                     return Err(format!(
                         "OpenAI Responses stream completed with an unfinished tool call: {} ({})",

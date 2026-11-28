@@ -1,17 +1,22 @@
-//! OAuth 2.1 for MCP (port of `packages/mcp/src/oauth/` @ 4a080252f),
+//! OAuth 2.1 for MCP (port of `packages/mcp/src/oauth/` @ b4afdddf),
 //! including the v1.0.0 hardening: `authServerMetadataUrl`, RFC 9207 `iss`,
 //! step-up scope merging, credential-key migration support and null/empty
 //! optional-field tolerance.
 
 pub mod callback;
+pub mod client_settings;
 pub mod discovery;
 pub mod errors;
 pub mod flow;
 pub mod provider;
+pub mod sign_in;
 pub mod types;
 
 pub use callback::{
     OAuthCallback, OAuthCallbackPage, OAuthCallbackServer, OAuthCallbackServerOptions,
+};
+pub use client_settings::{
+    McpOAuthClientOptions, McpOAuthSettings, create_oauth_client_provider, registered_redirect_urls,
 };
 pub use discovery::{
     AuthorizationServerMetadataOptions, OAuthServerInfoOptions, ProtectedResourceMetadataOptions,
@@ -29,7 +34,11 @@ pub use flow::{
 };
 pub use provider::{
     ClientMetadataDocumentFn, McpOAuthProvider, McpOAuthProviderOptions, McpOAuthState,
-    McpOAuthStateStore, MemoryOAuthStateStore,
+    McpOAuthStateStore, McpRefreshLockGuard, MemoryOAuthStateStore,
+};
+pub use sign_in::{
+    McpSignInOptions, McpSignInRedirect, McpSignInStart, complete_mcp_sign_in,
+    refresh_stored_tokens, start_mcp_sign_in,
 };
 pub use types::{
     AuthorizationServerMetadata, OAuthChallenge, OAuthClientInformation, OAuthClientMetadata,

@@ -1,6 +1,6 @@
 //! `rpi mcp`: add, remove, and check MCP servers and sign in to them outside
 //! a session (port of `packages/coding-agent/src/extensions/mcp/cli.ts` @
-//! 4a080252f). Agents run it through bash to configure servers, verify an
+//! b4afdddf). Agents run it through bash to configure servers, verify an
 //! `mcp.json` they wrote, and start an OAuth sign-in; the user only approves
 //! access in the browser. Running sessions pick up new credentials on their
 //! next turn.
@@ -921,22 +921,7 @@ async fn read_line(signal: CancellationToken) -> Option<String> {
 
 /// Best-effort platform browser opener (upstream `openBrowser`).
 fn open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let command = "open";
-    #[cfg(target_os = "windows")]
-    let command = "cmd";
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let command = "xdg-open";
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new(command)
-            .args(["/c", "start", "", url])
-            .spawn();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::process::Command::new(command).arg(url).spawn();
-    }
+    crate::utils::open_browser::open_browser(url);
 }
 
 /// Helper for tests and hosts: the default command options with console

@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
@@ -162,6 +162,16 @@ impl From<DeferredFetchOptions> for ModelsDeferredFetchOptions {
 /// Options for deferred cancellation, including header transformation.
 pub type ModelsDeferredCancelOptions = ModelsStreamOptions;
 
+/// Authentication required by the network phase of a catalog refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshModelsAuth {
+    /// Only check existing configuration; never refresh OAuth and pass no
+    /// credential to the catalog source.
+    Configured,
+    /// Resolve the effective credential, refreshing expired OAuth first.
+    Credential,
+}
+
 /// `Provider` — the concrete runtime unit (T03 subset, see module docs).
 pub trait Provider: Send + Sync {
     fn id(&self) -> &str;
@@ -181,13 +191,23 @@ pub trait Provider: Send + Sync {
     /// implementation as having no models.
     fn get_models(&self) -> Vec<Model>;
 
-    /// `getAllModels?` (models.ts:174 @ 4a080252f / schema v6): every model
+    /// `getAllModels?` (models.ts:174 @ b4afdddf / schema v6): every model
     /// type known to the provider (chat + image + classifier). Defaults to
     /// the chat-only [`Provider::get_models`] wrapped as [`AnyModel::Chat`],
     /// so existing providers need no change and chat reads keep their
     /// current behavior (red line).
     fn get_all_models(&self) -> Vec<AnyModel> {
         self.get_models().into_iter().map(AnyModel::Chat).collect()
+    }
+
+    /// Shared catalog generation for internal composition and snapshots.
+    fn get_models_shared(&self) -> Arc<[Model]> {
+        self.get_models().into()
+    }
+
+    /// Shared all-type generation; owned getters preserve the public boundary.
+    fn get_all_models_shared(&self) -> Arc<[AnyModel]> {
+        self.get_all_models().into()
     }
 
     /// `filterModels` — optional provider policy for credential-specific
@@ -239,6 +259,10 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    fn refresh_models_auth(&self) -> RefreshModelsAuth {
+        RefreshModelsAuth::Credential
+    }
+
     fn stream(
         &self,
         model: &Model,
@@ -271,7 +295,7 @@ pub trait Provider: Send + Sync {
         None
     }
 
-    /// `generateImages?` (models.ts:221-226 @ 4a080252f): present when the
+    /// `generateImages?` (models.ts:221-226 @ b4afdddf): present when the
     /// provider supports dedicated image models. Never rejects: the
     /// implementation returns an error `AssistantImages` itself; a `None`
     /// here is wrapped by [`Models::generate_images`] as a provider error.
@@ -484,6 +508,8 @@ pub struct ModelsRefreshResult {
     pub aborted: bool,
     /// Provider id → error message, in provider iteration order.
     pub errors: Vec<(String, String)>,
+    /// Authentication failures that were downgraded so other providers could continue.
+    pub warnings: Vec<(String, String)>,
 }
 
 /// In-flight refresh future shared by concurrent callers.
@@ -573,7 +599,7 @@ pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
 }
 
 /// `mergeModels` for schema v6 (`remote-catalog-provider.ts:31-35 @
-/// 4a080252f`): the merge key is `type\0id`, so the same upstream id may
+/// b4afdddf`): the merge key is `type\0id`, so the same upstream id may
 /// appear once per type. Same-key models replace the baseline entry in
 /// place; new keys append. A map index keeps the merge linear (@ c34f2d6ad).
 pub fn merge_any_models(baseline: &[AnyModel], dynamic: &[AnyModel]) -> Vec<AnyModel> {
@@ -594,6 +620,86 @@ pub fn merge_any_models(baseline: &[AnyModel], dynamic: &[AnyModel]) -> Vec<AnyM
         }
     }
     merged
+}
+
+#[doc(hidden)]
+pub struct SharedMerge<T> {
+    baseline: Arc<[T]>,
+    dynamic: Arc<[T]>,
+    merged: Arc<[T]>,
+}
+
+#[doc(hidden)]
+pub struct SharedAllModelProjection {
+    dynamic: Arc<[Model]>,
+    projected: Arc<[AnyModel]>,
+}
+
+#[doc(hidden)]
+pub fn project_dynamic_all_models(
+    cache: &Mutex<Option<SharedAllModelProjection>>,
+    dynamic: &Arc<[Model]>,
+) -> Arc<[AnyModel]> {
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(cached) = cache.as_ref()
+        && Arc::ptr_eq(&cached.dynamic, dynamic)
+    {
+        return Arc::clone(&cached.projected);
+    }
+    let projected: Arc<[AnyModel]> = dynamic.iter().cloned().map(AnyModel::Chat).collect();
+    *cache = Some(SharedAllModelProjection {
+        dynamic: Arc::clone(dynamic),
+        projected: Arc::clone(&projected),
+    });
+    projected
+}
+
+#[doc(hidden)]
+pub fn merge_shared<T: Clone>(
+    cache: &Mutex<Option<SharedMerge<T>>>,
+    baseline: &Arc<[T]>,
+    dynamic: &Arc<[T]>,
+    merge: impl FnOnce(&[T], &[T]) -> Vec<T>,
+) -> Arc<[T]> {
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(cached) = cache.as_ref()
+        && Arc::ptr_eq(&cached.baseline, baseline)
+        && Arc::ptr_eq(&cached.dynamic, dynamic)
+    {
+        return Arc::clone(&cached.merged);
+    }
+    let merged: Arc<[T]> = merge(baseline, dynamic).into();
+    *cache = Some(SharedMerge {
+        baseline: Arc::clone(baseline),
+        dynamic: Arc::clone(dynamic),
+        merged: Arc::clone(&merged),
+    });
+    merged
+}
+
+#[doc(hidden)]
+pub struct SharedChatProjection {
+    all: Arc<[AnyModel]>,
+    chat: Arc<[Model]>,
+}
+
+#[doc(hidden)]
+pub fn project_shared_chat_models(
+    cache: &Mutex<Option<SharedChatProjection>>,
+    all: &Arc<[AnyModel]>,
+) -> Arc<[Model]> {
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(cached) = cache.as_ref()
+        && Arc::ptr_eq(&cached.all, all)
+    {
+        return Arc::clone(&cached.chat);
+    }
+    let chat: Arc<[Model]> = all.iter().filter_map(AnyModel::as_chat).cloned().collect();
+    *cache = Some(SharedChatProjection {
+        all: Arc::clone(all),
+        chat: Arc::clone(&chat),
+    });
+    chat
 }
 
 /// Unix epoch milliseconds (`Date.now()`).
@@ -659,6 +765,9 @@ pub struct CreateProviderOptions {
     /// order. Empty means "chat only" (the schema-v6 default for providers
     /// without image/classifier entries).
     pub all_models: Vec<AnyModel>,
+    /// Shared built-in generation. When present it replaces `all_models` and
+    /// lets the catalog, provider and runtime composition share one allocation.
+    pub shared_all_models: Option<Arc<[AnyModel]>>,
     /// Classifier API implementations by api id (`classifiers`,
     /// models.ts:1023).
     pub classifiers: std::collections::HashMap<String, Arc<dyn ProviderClassifier>>,
@@ -683,9 +792,14 @@ struct CreatedProvider {
     base_url: Option<String>,
     headers: Option<ProviderHeaders>,
     auth: ProviderAuth,
-    models: Vec<Model>,
+    models: Arc<[Model]>,
     /// Schema-v6 all-type baseline (empty = derive from `models`).
-    all_models: Vec<AnyModel>,
+    all_models: Arc<[AnyModel]>,
+    derived_models: OnceLock<Arc<[Model]>>,
+    derived_all_models: OnceLock<Arc<[AnyModel]>>,
+    dynamic_all_models: Mutex<Option<SharedAllModelProjection>>,
+    merged_models: Mutex<Option<SharedMerge<Model>>>,
+    merged_all_models: Mutex<Option<SharedMerge<AnyModel>>>,
     /// Classifier API implementations by api id.
     classifiers: std::collections::HashMap<String, Arc<dyn ProviderClassifier>>,
     /// Image-generation API implementations by api id.
@@ -693,7 +807,7 @@ struct CreatedProvider {
     api: ProviderApi,
     /// Dynamic overlay (models.ts:764-774): merged over `models` in
     /// `get_models`. Updated atomically by `refresh_models`.
-    dynamic_models: Arc<Mutex<Vec<Model>>>,
+    dynamic_models: Arc<Mutex<Arc<[Model]>>>,
     /// Optional `fetchModels` closure — when `Some`, the provider implements
     /// `refresh_models` (models.ts:801-826).
     fetch_models: Option<FetchModelsFn>,
@@ -730,6 +844,27 @@ impl CreatedProvider {
             }
         }
     }
+
+    fn baseline_models(&self) -> Arc<[Model]> {
+        if !self.models.is_empty() || self.all_models.is_empty() {
+            return Arc::clone(&self.models);
+        }
+        self.derived_models
+            .get_or_init(|| {
+                self.all_models
+                    .iter()
+                    .filter_map(|model| model.as_chat().cloned())
+                    .collect()
+            })
+            .clone()
+    }
+
+    fn dynamic_models(&self) -> Arc<[Model]> {
+        self.dynamic_models
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
 }
 
 impl Provider for CreatedProvider {
@@ -754,30 +889,51 @@ impl Provider for CreatedProvider {
     }
 
     fn get_models(&self) -> Vec<Model> {
-        let dynamic = self
-            .dynamic_models
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        merge_models(&self.models, &dynamic)
+        self.get_models_shared().to_vec()
     }
 
-    /// Schema-v6 all-type read (`getAllModels?`, models.ts:174 @ 4a080252f):
+    fn get_models_shared(&self) -> Arc<[Model]> {
+        let baseline = self.baseline_models();
+        let dynamic = self.dynamic_models();
+        if dynamic.is_empty() {
+            return baseline;
+        }
+        merge_shared(&self.merged_models, &baseline, &dynamic, merge_models)
+    }
+
+    /// Schema-v6 all-type read (`getAllModels?`, models.ts:174 @ b4afdddf):
     /// the static all-type baseline when the provider declared one, with the
     /// dynamic chat overlay merged on top; chat-only providers keep the
     /// legacy default.
     fn get_all_models(&self) -> Vec<AnyModel> {
-        if self.all_models.is_empty() {
-            return self.get_models().into_iter().map(AnyModel::Chat).collect();
+        self.get_all_models_shared().to_vec()
+    }
+
+    fn get_all_models_shared(&self) -> Arc<[AnyModel]> {
+        let baseline = if self.all_models.is_empty() {
+            self.derived_all_models
+                .get_or_init(|| {
+                    self.baseline_models()
+                        .iter()
+                        .cloned()
+                        .map(AnyModel::Chat)
+                        .collect()
+                })
+                .clone()
+        } else {
+            Arc::clone(&self.all_models)
+        };
+        let dynamic = self.dynamic_models();
+        if dynamic.is_empty() {
+            return baseline;
         }
-        let dynamic: Vec<AnyModel> = self
-            .dynamic_models
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .cloned()
-            .map(AnyModel::Chat)
-            .collect();
-        merge_any_models(&self.all_models, &dynamic)
+        let dynamic = project_dynamic_all_models(&self.dynamic_all_models, &dynamic);
+        merge_shared(
+            &self.merged_all_models,
+            &baseline,
+            &dynamic,
+            merge_any_models,
+        )
     }
 
     fn generate_images(
@@ -876,14 +1032,13 @@ impl Provider for CreatedProvider {
                     .filter(|model| model.provider == id)
                     .cloned()
                     .collect();
-                let restored_clone = restored.clone();
+                let restored: Arc<[Model]> = restored.into();
                 let published = context
                     .publish
                     .publish(ModelsPublication {
                         persist: None,
                         update: Some(Box::new(move || {
-                            *dynamic_models.lock().unwrap_or_else(|e| e.into_inner()) =
-                                restored_clone;
+                            *dynamic_models.lock().unwrap_or_else(|e| e.into_inner()) = restored;
                         })),
                     })
                     .await?;
@@ -906,19 +1061,21 @@ impl Provider for CreatedProvider {
                 return Ok(());
             }
             let dynamic_models = dynamic_models.clone();
-            let refreshed_clone = refreshed.clone();
+            let refreshed: Arc<[Model]> = refreshed.into();
+            let persisted: Vec<AnyModel> = refreshed.iter().cloned().map(AnyModel::Chat).collect();
+            let updated = Arc::clone(&refreshed);
             context
                 .publish
                 .publish(ModelsPublication {
                     persist: Some(Some(ModelsStoreEntry {
-                        models: refreshed.into_iter().map(AnyModel::Chat).collect(),
+                        models: persisted,
                         last_modified: None,
                         checked_at: Some(now_millis()),
                         etag: None,
                         credential_fingerprint: None,
                     })),
                     update: Some(Box::new(move || {
-                        *dynamic_models.lock().unwrap_or_else(|e| e.into_inner()) = refreshed_clone;
+                        *dynamic_models.lock().unwrap_or_else(|e| e.into_inner()) = updated;
                     })),
                 })
                 .await?;
@@ -986,18 +1143,26 @@ impl Provider for CreatedProvider {
 /// models; an api map dispatches on `model.api`, and a model whose api has no
 /// entry produces a stream error.
 pub fn create_provider(input: CreateProviderOptions) -> Arc<dyn Provider> {
+    let all_models = input
+        .shared_all_models
+        .unwrap_or_else(|| Arc::from(input.all_models));
     Arc::new(CreatedProvider {
         name: input.name.unwrap_or_else(|| input.id.clone()),
         id: input.id,
         base_url: input.base_url,
         headers: input.headers,
         auth: input.auth,
-        models: input.models,
-        all_models: input.all_models,
+        models: Arc::from(input.models),
+        all_models,
+        derived_models: OnceLock::new(),
+        derived_all_models: OnceLock::new(),
+        dynamic_all_models: Mutex::new(None),
+        merged_models: Mutex::new(None),
+        merged_all_models: Mutex::new(None),
         classifiers: input.classifiers,
         images: input.images,
         api: input.api,
-        dynamic_models: Arc::new(Mutex::new(Vec::new())),
+        dynamic_models: Arc::new(Mutex::new(Arc::from(Vec::new()))),
         fetch_models: input.fetch_models,
         filter_models_fn: input.filter_models_fn,
         filter_all_models_fn: input.filter_all_models_fn,
@@ -1040,11 +1205,23 @@ struct NonChatRequest<'a> {
 /// `Models` — runtime collection of providers plus auth application and
 /// stream convenience (T03 subset, see module docs). T21a added generation
 /// guards and per-provider publication chains (models.ts:259-261 @ 4181f66).
+struct SharedChatModels {
+    generations: Vec<Arc<[Model]>>,
+    models: Arc<[Model]>,
+}
+
+struct SharedAllModels {
+    generations: Vec<Arc<[AnyModel]>>,
+    models: Arc<[AnyModel]>,
+}
+
 #[derive(Clone)]
 pub struct Models {
     /// Insertion-ordered like the upstream JS `Map`: `getModels()` order is
     /// observable (initial-model fallback, available-model listings).
     providers: Arc<RwLock<OrderedMap<Arc<dyn Provider>>>>,
+    chat_models: Arc<RwLock<Option<SharedChatModels>>>,
+    all_models: Arc<RwLock<Option<SharedAllModels>>>,
     credentials: Arc<dyn CredentialStore>,
     auth_context: Arc<dyn AuthContext>,
     models_store: Arc<dyn ModelsStore>,
@@ -1098,6 +1275,8 @@ impl Models {
         });
         Self {
             providers: Arc::new(RwLock::new(OrderedMap::default())),
+            chat_models: Arc::new(RwLock::new(None)),
+            all_models: Arc::new(RwLock::new(None)),
             credentials: options
                 .credentials
                 .unwrap_or_else(|| Arc::new(InMemoryCredentialStore::new())),
@@ -1255,7 +1434,55 @@ impl Models {
         }
     }
 
-    /// `getAllModels` (models.ts:446 @ 4a080252f / schema v6) — every model
+    pub fn get_models_shared(&self, provider: Option<&str>) -> Arc<[Model]> {
+        let providers = self.providers.read().unwrap_or_else(|e| e.into_inner());
+        match provider {
+            Some(id) => providers
+                .get(id)
+                .map(|provider| provider.get_models_shared())
+                .unwrap_or_else(|| Arc::from(Vec::new())),
+            None => {
+                let generations: Vec<Arc<[Model]>> = providers
+                    .values()
+                    .map(|provider| provider.get_models_shared())
+                    .collect();
+                if let Some(cached) = self
+                    .chat_models
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                    .filter(|cached| {
+                        cached.generations.len() == generations.len()
+                            && cached
+                                .generations
+                                .iter()
+                                .zip(&generations)
+                                .all(|(left, right)| Arc::ptr_eq(left, right))
+                    })
+                {
+                    return Arc::clone(&cached.models);
+                }
+                let models: Arc<[Model]> = if generations.len() == 1 {
+                    Arc::clone(&generations[0])
+                } else {
+                    generations
+                        .iter()
+                        .flat_map(|models| models.iter().cloned())
+                        .collect()
+                };
+                *self
+                    .chat_models
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(SharedChatModels {
+                    generations,
+                    models: Arc::clone(&models),
+                });
+                models
+            }
+        }
+    }
+
+    /// `getAllModels` (models.ts:446 @ b4afdddf / schema v6) — every model
     /// type from one provider or all. `get_models` stays chat-only (red
     /// line).
     pub fn get_all_models(&self, provider: Option<&str>) -> Vec<AnyModel> {
@@ -1272,7 +1499,55 @@ impl Models {
         }
     }
 
-    /// `getModelsOfType` (models.ts:446-477 @ 4a080252f): every model of
+    pub fn get_all_models_shared(&self, provider: Option<&str>) -> Arc<[AnyModel]> {
+        let providers = self.providers.read().unwrap_or_else(|e| e.into_inner());
+        match provider {
+            Some(id) => providers
+                .get(id)
+                .map(|provider| provider.get_all_models_shared())
+                .unwrap_or_else(|| Arc::from(Vec::new())),
+            None => {
+                let generations: Vec<Arc<[AnyModel]>> = providers
+                    .values()
+                    .map(|provider| provider.get_all_models_shared())
+                    .collect();
+                if let Some(cached) = self
+                    .all_models
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                    .filter(|cached| {
+                        cached.generations.len() == generations.len()
+                            && cached
+                                .generations
+                                .iter()
+                                .zip(&generations)
+                                .all(|(left, right)| Arc::ptr_eq(left, right))
+                    })
+                {
+                    return Arc::clone(&cached.models);
+                }
+                let models: Arc<[AnyModel]> = if generations.len() == 1 {
+                    Arc::clone(&generations[0])
+                } else {
+                    generations
+                        .iter()
+                        .flat_map(|models| models.iter().cloned())
+                        .collect()
+                };
+                *self
+                    .all_models
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(SharedAllModels {
+                    generations,
+                    models: Arc::clone(&models),
+                });
+                models
+            }
+        }
+    }
+
+    /// `getModelsOfType` (models.ts:446-477 @ b4afdddf): every model of
     /// one type from one provider or all.
     pub fn get_models_of_type(
         &self,
@@ -1285,7 +1560,7 @@ impl Models {
             .collect()
     }
 
-    /// `getModelOfType` (models.ts:446-477 @ 4a080252f): sync runtime
+    /// `getModelOfType` (models.ts:446-477 @ b4afdddf): sync runtime
     /// lookup of one model of one type against last-known lists.
     pub fn get_model_of_type(
         &self,
@@ -1300,12 +1575,13 @@ impl Models {
 
     /// `getModel` — sync runtime model lookup.
     pub fn get_model(&self, provider: &str, id: &str) -> Option<Model> {
-        self.get_models(Some(provider))
-            .into_iter()
+        self.get_models_shared(Some(provider))
+            .iter()
             .find(|model| model.id == id)
+            .cloned()
     }
 
-    /// `getAuthenticatedProviders` (models.ts:678-691 @ 4a080252f): the
+    /// `getAuthenticatedProviders` (models.ts:678-691 @ b4afdddf): the
     /// providers with complete auth configuration, plus the credential the
     /// availability filter needs.
     async fn get_authenticated_providers(
@@ -1336,7 +1612,7 @@ impl Models {
         Ok(authenticated)
     }
 
-    /// `getAvailableOfType` (models.ts:708-717 @ 4a080252f): models of one
+    /// `getAvailableOfType` (models.ts:708-717 @ b4afdddf): models of one
     /// type whose providers have complete auth configuration.
     pub async fn get_available_of_type(
         &self,
@@ -1351,7 +1627,7 @@ impl Models {
             .collect())
     }
 
-    /// `getAllAvailable` (models.ts:719-735 @ 4a080252f): models of every
+    /// `getAllAvailable` (models.ts:719-735 @ b4afdddf): models of every
     /// type whose providers have complete auth configuration. Providers
     /// without a `filterAllModels` hook apply `filterModels` to their chat
     /// models and pass the other types through (upstream fallback).
@@ -1373,7 +1649,7 @@ impl Models {
     /// the resulting credential through the store's serialized `modify` path.
     ///
     /// `options` is the upstream `LoginOptions` slot (auth/types.ts:202-208
-    /// @ 4a080252f): app-supplied context such as the stable installation ID
+    /// @ b4afdddf): app-supplied context such as the stable installation ID
     /// for Sign in with ChatGPT.
     ///
     /// **Write race** (models.ts:576-608): the credential write is queued in
@@ -1554,6 +1830,7 @@ impl Models {
             return ModelsRefreshResult {
                 aborted: true,
                 errors: Vec::new(),
+                warnings: Vec::new(),
             };
         }
 
@@ -1580,6 +1857,7 @@ impl Models {
             .collect();
 
         let errors = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let warnings = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
         let caller_signal_clone = caller_signal.clone();
 
         let refresh = async {
@@ -1589,6 +1867,7 @@ impl Models {
                     let this = self.clone();
                     let force = options.force;
                     let errors = errors.clone();
+                    let warnings = warnings.clone();
                     let caller_signal = caller_signal_clone.clone();
                     async move {
                         let provider_id = provider.id().to_owned();
@@ -1643,16 +1922,60 @@ impl Models {
                             }
 
                             // Phase 2: resolve credential + fetch.
-                            let credential = this
-                                .resolve_refresh_credential(&provider, stored_credential, &combined)
-                                .await?;
-                            if credential.is_none() {
-                                return Ok(());
+                            match provider.refresh_models_auth() {
+                                RefreshModelsAuth::Configured => {
+                                    let configured = match &stored_credential {
+                                        Some(Credential::OAuth(_)) => {
+                                            provider.auth().oauth.is_some()
+                                        }
+                                        _ => this
+                                            .get_provider_auth(&provider_id, None)
+                                            .await?
+                                            .is_some(),
+                                    };
+                                    if configured {
+                                        this.run_provider_refresh_phase(
+                                            &provider, None, true, force, generation, &combined,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                                RefreshModelsAuth::Credential => {
+                                    let credential = this
+                                        .resolve_refresh_credential(
+                                            &provider,
+                                            stored_credential,
+                                            &combined,
+                                        )
+                                        .await;
+                                    match credential {
+                                        Ok(Some(credential)) => {
+                                            this.run_provider_refresh_phase(
+                                                &provider,
+                                                Some(credential),
+                                                true,
+                                                force,
+                                                generation,
+                                                &combined,
+                                            )
+                                            .await?;
+                                        }
+                                        Ok(None) => {}
+                                        Err(error)
+                                            if matches!(
+                                                error.code,
+                                                ModelsErrorCode::Auth | ModelsErrorCode::Oauth
+                                            ) =>
+                                        {
+                                            warnings
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .push((provider_id.clone(), error.message));
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
+                                }
                             }
-                            this.run_provider_refresh_phase(
-                                &provider, credential, true, force, generation, &combined,
-                            )
-                            .await?;
                             Ok(())
                         };
 
@@ -1695,9 +2018,11 @@ impl Models {
         }
 
         let errors = errors.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let warnings = warnings.lock().unwrap_or_else(|e| e.into_inner()).clone();
         ModelsRefreshResult {
             aborted: caller_signal.is_cancelled(),
             errors,
+            warnings,
         }
     }
 
@@ -2141,7 +2466,7 @@ impl Models {
         })
     }
 
-    /// `generateImages` (models.ts:948-965 @ 4a080252f): resolve the model
+    /// `generateImages` (models.ts:948-965 @ b4afdddf): resolve the model
     /// through its owning provider with request-time authentication. Never
     /// rejects: unknown providers, unconfigured auth, and providers without
     /// an image implementation return an error `AssistantImages`.
@@ -2209,7 +2534,7 @@ impl Models {
             .await)
     }
 
-    /// `classify` (models.ts:966-983 @ 4a080252f): resolve the classifier
+    /// `classify` (models.ts:966-983 @ b4afdddf): resolve the classifier
     /// through its owning provider with request-time authentication. Never
     /// rejects.
     pub async fn classify(
@@ -2444,7 +2769,7 @@ impl Models {
     }
 }
 
-/// `assertChatModel` (utils/model-operations.ts:26-30 @ 4a080252f): reject
+/// `assertChatModel` (utils/model-operations.ts:26-30 @ b4afdddf): reject
 /// non-chat models at the chat stream entry with a `ModelsError`.
 pub fn assert_chat_model(model: &AnyModel) -> Result<&Model, ModelsError> {
     match model {
@@ -2831,6 +3156,72 @@ mod tests {
             api,
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn shared_chat_catalog_reuses_unchanged_provider_generations() {
+        let models = Models::new(None);
+        models.set_provider(test_provider("first", ProviderApi::Map(HashMap::new())));
+        models.set_provider(test_provider("second", ProviderApi::Map(HashMap::new())));
+        let first = models.get_models_shared(None);
+        let second = models.get_models_shared(None);
+        assert!(Arc::ptr_eq(&first, &second));
+        let all_first = models
+            .get_provider("first")
+            .expect("provider")
+            .get_all_models_shared();
+        let all_second = models
+            .get_provider("first")
+            .expect("provider")
+            .get_all_models_shared();
+        assert!(Arc::ptr_eq(&all_first, &all_second));
+        let aggregate_first = models.get_all_models_shared(None);
+        let aggregate_second = models.get_all_models_shared(None);
+        assert!(Arc::ptr_eq(&aggregate_first, &aggregate_second));
+        models.set_provider(test_provider("second", ProviderApi::Map(HashMap::new())));
+        let changed = models.get_models_shared(None);
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(first.len(), changed.len());
+        let aggregate_changed = models.get_all_models_shared(None);
+        assert!(!Arc::ptr_eq(&aggregate_first, &aggregate_changed));
+        assert!(Arc::ptr_eq(
+            &aggregate_changed,
+            &models.get_all_models_shared(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dynamic_all_type_merge_reuses_projection_until_refresh() {
+        let provider = create_provider(CreateProviderOptions {
+            id: "dynamic".to_owned(),
+            auth: ProviderAuth {
+                api_key: Some(Arc::new(StaticKeyAuth)),
+                oauth: None,
+            },
+            models: vec![model("dynamic", ApiKind::ANTHROPIC_MESSAGES)],
+            api: ProviderApi::Single(Arc::new(EchoStreams)),
+            fetch_models: Some(Arc::new(|_ctx| {
+                Box::pin(async { Ok(vec![model_with_id("dynamic", "new")]) })
+            })),
+            ..Default::default()
+        });
+        let models = Models::new(None);
+        models.set_provider(provider.clone());
+        let options = ModelsRefreshOptions {
+            force: Some(true),
+            ..Default::default()
+        };
+        let result = models.refresh(Some(options.clone())).await;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let first = provider.get_all_models_shared();
+        let second = provider.get_all_models_shared();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.iter().any(|model| model.id() == "new"));
+        let result = models.refresh(Some(options)).await;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let refreshed = provider.get_all_models_shared();
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert!(Arc::ptr_eq(&refreshed, &provider.get_all_models_shared()));
     }
 
     #[tokio::test]
@@ -3992,6 +4383,7 @@ mod tests {
         id: String,
         models_val: Arc<Mutex<Vec<Model>>>,
         auth_val: ProviderAuth,
+        refresh_auth: RefreshModelsAuth,
         callback: Arc<
             dyn Fn(RefreshModelsContext) -> BoxFuture<'static, Result<(), ModelsError>>
                 + Send
@@ -4027,6 +4419,9 @@ mod tests {
         ) -> Option<BoxFuture<'_, Result<(), ModelsError>>> {
             Some((self.callback)(context))
         }
+        fn refresh_models_auth(&self) -> RefreshModelsAuth {
+            self.refresh_auth
+        }
         fn stream(
             &self,
             _: &Model,
@@ -4058,6 +4453,25 @@ mod tests {
             id: id.to_owned(),
             models_val: Arc::new(Mutex::new(models)),
             auth_val: auth,
+            refresh_auth: RefreshModelsAuth::Credential,
+            callback: Arc::new(callback),
+        })
+    }
+
+    fn configured_callback_provider(
+        id: &str,
+        auth: ProviderAuth,
+        models: Vec<Model>,
+        callback: impl Fn(RefreshModelsContext) -> BoxFuture<'static, Result<(), ModelsError>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Arc<dyn Provider> {
+        Arc::new(CallbackProvider {
+            id: id.to_owned(),
+            models_val: Arc::new(Mutex::new(models)),
+            auth_val: auth,
+            refresh_auth: RefreshModelsAuth::Configured,
             callback: Arc::new(callback),
         })
     }
@@ -4087,6 +4501,42 @@ mod tests {
                 expires: now_millis() + 60_000,
                 extra: Map::new(),
             })
+        }
+        async fn to_auth(
+            &self,
+            credential: &crate::auth::OAuthCredential,
+        ) -> Result<ModelAuth, ModelsError> {
+            Ok(ModelAuth {
+                api_key: Some(credential.access.clone()),
+                headers: None,
+                base_url: None,
+            })
+        }
+    }
+
+    struct FailingOAuth {
+        code: ModelsErrorCode,
+        message: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::auth::OAuthAuth for FailingOAuth {
+        fn name(&self) -> &str {
+            "Failing OAuth"
+        }
+        async fn login(
+            &self,
+            _: &dyn AuthInteraction,
+            _options: Option<&LoginOptions>,
+        ) -> Result<crate::auth::OAuthCredential, ModelsError> {
+            unreachable!("not used")
+        }
+        async fn refresh(
+            &self,
+            _: &crate::auth::OAuthCredential,
+            _: Option<&CancellationToken>,
+        ) -> Result<crate::auth::OAuthCredential, ModelsError> {
+            Err(ModelsError::new(self.code, self.message.clone()))
         }
         async fn to_auth(
             &self,
@@ -4181,6 +4631,7 @@ mod tests {
                 api_key: Some(Arc::new(StaticKeyAuth)),
                 oauth: None,
             },
+            refresh_auth: RefreshModelsAuth::Credential,
             callback: Arc::new(move |context| {
                 let dyn_models = dyn_models_for_cb.clone();
                 let refreshes = refreshes_clone.clone();
@@ -6518,6 +6969,151 @@ mod tests {
                 .expect("empty")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn configured_refresh_never_refreshes_oauth_and_passes_no_credential() {
+        let store = Arc::new(InMemoryCredentialStore::new());
+        store
+            .modify(
+                "configured",
+                Arc::new(|_| {
+                    Box::pin(async {
+                        Ok(Some(Credential::OAuth(crate::auth::OAuthCredential {
+                            refresh: "stale".to_owned(),
+                            access: "expired".to_owned(),
+                            expires: 0,
+                            extra: Map::new(),
+                        })))
+                    })
+                }),
+                None,
+            )
+            .await
+            .expect("seed expired OAuth");
+        let auth = ProviderAuth {
+            api_key: None,
+            oauth: Some(Arc::new(FailingOAuth {
+                code: ModelsErrorCode::Oauth,
+                message: "invalid_grant".to_owned(),
+            })),
+        };
+        let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
+            credentials: Some(store),
+            auth_context: None,
+            models_store: None,
+        }));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_callback = seen.clone();
+        models.set_provider(configured_callback_provider(
+            "configured",
+            auth,
+            Vec::new(),
+            move |context| {
+                seen_callback
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(context.credential.is_none());
+                Box::pin(async { Ok(()) })
+            },
+        ));
+        let result = models.refresh(None).await;
+        assert!(result.errors.is_empty());
+        assert!(result.warnings.is_empty());
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).last(),
+            Some(&true)
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_refresh_failures_warn_and_other_providers_continue() {
+        let store = Arc::new(InMemoryCredentialStore::new());
+        store
+            .modify(
+                "stale",
+                Arc::new(|_| {
+                    Box::pin(async {
+                        Ok(Some(Credential::OAuth(crate::auth::OAuthCredential {
+                            refresh: "stale".to_owned(),
+                            access: "expired".to_owned(),
+                            expires: 0,
+                            extra: Map::new(),
+                        })))
+                    })
+                }),
+                None,
+            )
+            .await
+            .expect("seed expired OAuth");
+        let models = Models::new(Some(CreateModelsOptions {
+            identity: None,
+            credentials: Some(store),
+            auth_context: None,
+            models_store: None,
+        }));
+        models.set_provider(callback_provider(
+            "stale",
+            ProviderAuth {
+                api_key: None,
+                oauth: Some(Arc::new(FailingOAuth {
+                    code: ModelsErrorCode::Oauth,
+                    message: "invalid_grant".to_owned(),
+                })),
+            },
+            Vec::new(),
+            |_| Box::pin(async { Ok(()) }),
+        ));
+        let good_calls = Arc::new(Mutex::new(0usize));
+        let good_calls_callback = good_calls.clone();
+        models.set_provider(callback_provider(
+            "good",
+            ProviderAuth {
+                api_key: Some(env_key_auth(Some("good-key"))),
+                oauth: None,
+            },
+            Vec::new(),
+            move |_| {
+                *good_calls_callback
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) += 1;
+                Box::pin(async { Ok(()) })
+            },
+        ));
+        let result = models.refresh(None).await;
+        assert!(result.errors.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].0, "stale");
+        assert!(result.warnings[0].1.contains("invalid_grant"));
+        assert!(*good_calls.lock().unwrap_or_else(|e| e.into_inner()) >= 1);
+
+        let fatal_models = Models::new(Some(CreateModelsOptions {
+            identity: None,
+            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
+            auth_context: None,
+            models_store: None,
+        }));
+        fatal_models.set_provider(callback_provider(
+            "fatal",
+            ProviderAuth {
+                api_key: Some(env_key_auth(Some("fatal-key"))),
+                oauth: None,
+            },
+            Vec::new(),
+            |_| {
+                Box::pin(async {
+                    Err(ModelsError::new(
+                        ModelsErrorCode::ModelSource,
+                        "network failed",
+                    ))
+                })
+            },
+        ));
+        let fatal = fatal_models.refresh(None).await;
+        assert!(fatal.warnings.is_empty());
+        assert_eq!(fatal.errors.len(), 1);
+        assert_eq!(fatal.errors[0].0, "fatal");
     }
 
     #[test]

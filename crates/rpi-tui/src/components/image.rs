@@ -9,13 +9,13 @@
 //! - The render cache and the kitty image id use interior mutability
 //!   (`RefCell`) because `Component::render` takes `&self`.
 
-use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex};
 
 use crate::terminal_image::{
-    ImageDimensions, ImageProtocol, ImageRenderOptions, allocate_image_id, get_capabilities,
-    get_cell_dimensions, get_image_dimensions, get_png_dimensions, image_fallback, render_image,
+    ImageDimensions, ImageProtocol, ImageRenderOptions, allocate_image_id, capabilities_generation,
+    get_capabilities, get_cell_dimensions, get_image_dimensions, get_png_dimensions,
+    image_fallback, render_image,
 };
 use crate::tui::Component;
 
@@ -30,17 +30,137 @@ pub type ImageTranscoder = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Syn
 /// `imageTranscoder` (image.ts:20): the registered converter.
 static IMAGE_TRANSCODER: Mutex<Option<ImageTranscoder>> = Mutex::new(None);
 
-/// `pngCache` (image.ts:22): backstop for callers that recreate `Image`
-/// instances. Keyed by source data, least recently used first, capped at 32.
-struct PngCache {
-    map: HashMap<String, Option<String>>,
-    order: VecDeque<String>,
+/// Monotonic generation of the registered transcoder (V19-04 FR-E): an Image
+/// rendered before a transcoder was registered must not reuse its fallback
+/// lines after one becomes available.
+static PNG_TRANSCODER_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn transcoder_generation() -> u64 {
+    PNG_TRANSCODER_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// 256-bit content digest of the base64 source (V19-04 R1.4.7.1). Four
+/// independent 64-bit lanes over one pass; the cache verifies length and a
+/// short prefix/suffix on every hit, so a collision cannot serve the wrong
+/// image. The digest is computed once in `Image::new`, never in the render
+/// lock.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct ContentDigest([u64; 4]);
+
+fn content_digest(data: &[u8]) -> ContentDigest {
+    const P1: u64 = 0x9e37_79b9_7f4a_7c15;
+    const P2: u64 = 0xc2b2_ae3d_27d4_eb4f;
+    const P3: u64 = 0x1656_67b1_9e37_79f9;
+    const P4: u64 = 0x27d4_eb2f_1656_67c5;
+    let mut lanes = [
+        0xcbf2_9ce4_8422_2325,
+        0x9e37_79b9_7f4a_7c15,
+        0xff51_afd7_ed55_8ccd,
+        0xc4ce_b9fe_1a85_ec53,
+    ];
+    for (index, byte) in data.iter().enumerate() {
+        let byte = u64::from(*byte);
+        let index = index as u64;
+        lanes[0] = (lanes[0] ^ byte.wrapping_add(index)).wrapping_mul(P1);
+        lanes[1] = (lanes[1].wrapping_add(byte << 1))
+            .wrapping_mul(P2)
+            .rotate_left(17);
+        lanes[2] = (lanes[2] ^ byte.wrapping_mul(P3)).wrapping_add(index);
+        lanes[3] = (lanes[3].wrapping_add(byte << 2) ^ index).wrapping_mul(P4);
+    }
+    ContentDigest(lanes)
+}
+
+/// Digest key plus the short content checks that make a collision harmless.
+struct PngKey {
+    digest: ContentDigest,
+    len: usize,
+    prefix: String,
+    suffix: String,
+    mime_type: String,
+}
+
+impl PngKey {
+    fn new(base64_data: &str, mime_type: &str) -> Self {
+        const CHECK_CHARS: usize = 32;
+        let prefix = base64_data
+            .get(..CHECK_CHARS.min(base64_data.len()))
+            .unwrap_or(base64_data)
+            .to_string();
+        let suffix = base64_data
+            .get(base64_data.len().saturating_sub(CHECK_CHARS)..)
+            .unwrap_or(base64_data)
+            .to_string();
+        Self {
+            digest: content_digest(base64_data.as_bytes()),
+            len: base64_data.len(),
+            prefix,
+            suffix,
+            mime_type: mime_type.to_string(),
+        }
+    }
+
+    fn matches(&self, entry: &PngCacheEntry) -> bool {
+        entry.digest == self.digest
+            && entry.len == self.len
+            && entry.mime_type == self.mime_type
+            && entry.prefix == self.prefix
+            && entry.suffix == self.suffix
+    }
+}
+
+/// `pngCache` (image.ts:22): backstop for callers that recreate `Image`
+/// instances. V19-04 R1.4.7.2: the full base64 source is no longer a map and
+/// order key; entries are keyed by digest with prefix/suffix verification and
+/// bounded by both the 32-entry count and a total-byte budget (LRU).
+struct PngCacheEntry {
+    digest: ContentDigest,
+    len: usize,
+    prefix: String,
+    suffix: String,
+    mime_type: String,
+    value: Option<Arc<str>>,
+    bytes: usize,
+}
+
+impl PngCacheEntry {
+    fn new(key: PngKey, value: Option<Arc<str>>) -> Self {
+        let mut entry = Self {
+            digest: key.digest,
+            len: key.len,
+            prefix: key.prefix,
+            suffix: key.suffix,
+            mime_type: key.mime_type,
+            value,
+            bytes: 0,
+        };
+        entry.bytes = entry.retained_bytes();
+        entry
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.prefix.len()
+            + self.suffix.len()
+            + self.mime_type.len()
+            + self.value.as_ref().map_or(0, |value| value.len())
+    }
+}
+
+struct PngCache {
+    /// Least recently used first.
+    entries: Vec<PngCacheEntry>,
+    total_bytes: usize,
+}
+
+const PNG_CACHE_MAX_ENTRIES: usize = 32;
+const PNG_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 static PNG_CACHE: std::sync::LazyLock<Mutex<PngCache>> = std::sync::LazyLock::new(|| {
     Mutex::new(PngCache {
-        map: HashMap::new(),
-        order: VecDeque::new(),
+        entries: Vec::new(),
+        total_bytes: 0,
     })
 });
 
@@ -51,43 +171,76 @@ pub fn set_image_transcoder(transcoder: Option<ImageTranscoder>) {
     *IMAGE_TRANSCODER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = transcoder;
+    PNG_TRANSCODER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut cache = PNG_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.map.clear();
-    cache.order.clear();
+    cache.entries.clear();
+    cache.total_bytes = 0;
+}
+
+impl PngCache {
+    /// Look up a verified entry and mark it most recently used.
+    fn get(&mut self, key: &PngKey) -> Option<Option<Arc<str>>> {
+        let position = self.entries.iter().position(|entry| key.matches(entry))?;
+        let entry = self.entries.remove(position);
+        let value = entry.value.clone();
+        self.entries.push(entry);
+        Some(value)
+    }
+
+    /// Insert an entry and evict least recently used entries until both the
+    /// count and the total-byte budget hold.
+    fn insert(&mut self, key: PngKey, value: Option<Arc<str>>) {
+        let entry = PngCacheEntry::new(key, value);
+        // A single entry larger than the whole budget cannot satisfy it;
+        // leave it uncached (the caller keeps its own `png_data`).
+        if entry.bytes > PNG_CACHE_MAX_BYTES {
+            return;
+        }
+        self.total_bytes = self.total_bytes.saturating_add(entry.bytes);
+        self.entries.push(entry);
+        while self.entries.len() > PNG_CACHE_MAX_ENTRIES
+            || (self.total_bytes > PNG_CACHE_MAX_BYTES && self.entries.len() > 1)
+        {
+            let evicted = self.entries.remove(0);
+            self.total_bytes = self.total_bytes.saturating_sub(evicted.bytes);
+        }
+    }
 }
 
 /// `toPng` (image.ts:33-41): consult the LRU cache, then the transcoder.
-fn to_png(base64_data: &str, mime_type: &str) -> Option<String> {
+fn to_png(key: &PngKey, base64_data: &str, mime_type: &str) -> Option<Arc<str>> {
     let transcoder = IMAGE_TRANSCODER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()?;
+
+    {
+        let mut cache = PNG_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(value) = cache.get(key) {
+            return value;
+        }
+    }
+
+    let value: Option<Arc<str>> = transcoder(base64_data, mime_type).map(Arc::from);
+
     let mut cache = PNG_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let png = match cache.map.get(base64_data) {
-        Some(cached) => cached.clone(),
-        None => {
-            let png = transcoder(base64_data, mime_type);
-            cache.map.insert(base64_data.to_owned(), png.clone());
-            cache.order.push_back(base64_data.to_owned());
-            while cache.order.len() > 32 {
-                if let Some(oldest) = cache.order.pop_front() {
-                    cache.map.remove(&oldest);
-                }
-            }
-            png
-        }
-    };
-    // Touch the entry so it survives the next eviction.
-    if let Some(position) = cache.order.iter().position(|key| key == base64_data)
-        && let Some(key) = cache.order.remove(position)
-    {
-        cache.order.push_back(key);
-    }
-    png
+    cache.insert(
+        PngKey {
+            digest: key.digest,
+            len: key.len,
+            prefix: key.prefix.clone(),
+            suffix: key.suffix.clone(),
+            mime_type: key.mime_type.clone(),
+        },
+        value.clone(),
+    );
+    value
 }
 
 /// `ImageTheme` (image.ts:12-14).
@@ -113,16 +266,26 @@ struct ImageCache {
 
 /// Image component (upstream `Image`, image.ts:24).
 pub struct Image {
-    base64_data: String,
+    base64_data: Arc<str>,
     mime_type: String,
+    /// Content digest + collision checks, computed once in `new`
+    /// (V19-04 R1.4.7.1) so the render path never hashes the source.
+    png_key: PngKey,
     dimensions: ImageDimensions,
     theme: ImageTheme,
     options: ImageOptions,
     image_id: RefCell<Option<u32>>,
     /// Converted PNG data for Kitty. Failures are not stored so a later
-    /// transcoder can retry (`pngData`, image.ts:63).
-    png_data: RefCell<Option<String>>,
+    /// transcoder can retry (`pngData`, image.ts:63). Shared with the cache.
+    png_data: RefCell<Option<Arc<str>>>,
     cache: RefCell<Option<ImageCache>>,
+    /// Monotonic revision for [`Component::cache_revision`] (V19-04 FR-E).
+    revision: Cell<u64>,
+    /// Process-unique instance id (V19-06).
+    instance_id: u64,
+    /// Last observed capabilities/transcoder generations; a change bumps
+    /// `revision`.
+    last_capability_generation: Cell<(u64, u64)>,
 }
 
 impl Image {
@@ -134,8 +297,9 @@ impl Image {
         dimensions: Option<ImageDimensions>,
     ) -> Self {
         let options = options.unwrap_or_default();
-        let base64_data = base64_data.into();
+        let base64_data: Arc<str> = Arc::from(base64_data.into().as_str());
         let mime_type = mime_type.into();
+        let png_key = PngKey::new(&base64_data, &mime_type);
         // `getImageDimensions(...) || { widthPx: 800, heightPx: 600 }`
         // (image.ts:46).
         let dimensions = dimensions
@@ -147,12 +311,16 @@ impl Image {
         Self {
             base64_data,
             mime_type,
+            png_key,
             dimensions,
             theme,
             image_id: RefCell::new(options.image_id),
             options,
             png_data: RefCell::new(None),
             cache: RefCell::new(None),
+            revision: Cell::new(0),
+            instance_id: crate::tui::next_cache_instance_id(),
+            last_capability_generation: Cell::new((0, 0)),
         }
     }
 
@@ -191,11 +359,12 @@ impl Component for Image {
         // through the registered transcoder and prefer the PNG's own
         // dimensions (conversion may apply EXIF rotation, image.ts:105-110 @
         // a276dabe5, #10292).
-        let mut data = Some(self.base64_data.clone());
+        let mut data = Some(Arc::clone(&self.base64_data));
         let mut dimensions = self.dimensions;
         if caps.images == Some(ImageProtocol::Kitty) && self.mime_type != "image/png" {
             if self.png_data.borrow().is_none() {
-                *self.png_data.borrow_mut() = to_png(&self.base64_data, &self.mime_type);
+                *self.png_data.borrow_mut() =
+                    to_png(&self.png_key, &self.base64_data, &self.mime_type);
             }
             data = self.png_data.borrow().clone();
             if let Some(png) = &data
@@ -283,6 +452,23 @@ impl Component for Image {
 
     fn invalidate(&mut self) {
         *self.cache.borrow_mut() = None;
+        self.revision.set(self.revision.get().wrapping_add(1));
+    }
+
+    fn cache_revision(&self) -> Option<u64> {
+        // The rendered image depends on the terminal capabilities (protocol)
+        // as well as the component's own state. Keep the returned value
+        // monotonic: a generation change bumps the local revision.
+        let generations = (capabilities_generation(), transcoder_generation());
+        if self.last_capability_generation.get() != generations {
+            self.last_capability_generation.set(generations);
+            self.revision.set(self.revision.get().wrapping_add(1));
+        }
+        Some(self.revision.get())
+    }
+
+    fn cache_instance_id(&self) -> Option<u64> {
+        Some(self.instance_id)
     }
 }
 
@@ -298,8 +484,9 @@ mod tests {
         set_cell_dimensions,
     };
 
-    /// Serializes tests that mutate the global capabilities cache.
-    static TEST_CAPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes tests that mutate the global capabilities cache. Shared
+    /// with the markdown/alt-screen/main-screen suites.
+    use crate::terminal_image::TEST_CAPS_LOCK;
 
     fn kitty_caps() -> TerminalCapabilities {
         TerminalCapabilities {
@@ -650,5 +837,141 @@ mod tests {
             calls.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
             "no conversion for PNG data or iTerm2 output"
         );
+    }
+
+    // ── V19-04 FR-F: digest identity and byte-budget LRU ──────────────────
+
+    #[test]
+    fn content_digest_is_stable_and_content_sensitive() {
+        let first = content_digest(b"same bytes");
+        assert_eq!(first, content_digest(b"same bytes"));
+        assert_ne!(first, content_digest(b"same byteS"));
+        assert_ne!(content_digest(b"a"), content_digest(b"b"));
+        // 256-bit output: all four lanes participate.
+        assert_ne!(
+            content_digest(b"0123456789abcdef"),
+            content_digest(b"fedcba9876543210")
+        );
+    }
+
+    #[test]
+    fn image_computes_the_digest_at_construction() {
+        let image = Image::new(
+            JPEG,
+            "image/jpeg",
+            ImageTheme {
+                fallback_color: Box::new(|value: &str| value.to_string()),
+            },
+            None,
+            None,
+        );
+        assert_eq!(image.png_key.digest, content_digest(JPEG.as_bytes()));
+        assert_eq!(image.png_key.len, JPEG.len());
+        assert_eq!(image.png_key.mime_type, "image/jpeg");
+    }
+
+    #[test]
+    fn png_key_collision_check_rejects_different_content() {
+        let mut entry = PngCacheEntry::new(PngKey::new("AAAA", "image/jpeg"), None);
+        // Same digest/len but a different prefix/suffix must not match.
+        entry.prefix = "BBBB".to_string();
+        let key = PngKey {
+            digest: entry.digest,
+            len: entry.len,
+            prefix: "AAAA".to_string(),
+            suffix: entry.suffix.clone(),
+            mime_type: entry.mime_type.clone(),
+        };
+        assert!(!key.matches(&entry));
+        entry.prefix = "AAAA".to_string();
+        assert!(key.matches(&entry));
+        // A different mime type is also a different conversion input.
+        let other_mime = PngKey {
+            digest: entry.digest,
+            len: entry.len,
+            prefix: entry.prefix.clone(),
+            suffix: entry.suffix.clone(),
+            mime_type: "image/png".to_string(),
+        };
+        assert!(!other_mime.matches(&entry));
+    }
+
+    #[test]
+    fn png_cache_enforces_count_and_byte_budget() {
+        let mut cache = PngCache {
+            entries: Vec::new(),
+            total_bytes: 0,
+        };
+        for index in 0..(PNG_CACHE_MAX_ENTRIES * 2) {
+            let source = format!("image-{index}");
+            cache.insert(PngKey::new(&source, "image/jpeg"), None);
+        }
+        assert_eq!(cache.entries.len(), PNG_CACHE_MAX_ENTRIES);
+
+        // A single value larger than the whole budget is not cached, so the
+        // total never exceeds the limit.
+        let large: Arc<str> = Arc::from("x".repeat(PNG_CACHE_MAX_BYTES + 1024).as_str());
+        cache.insert(PngKey::new("large", "image/jpeg"), Some(Arc::clone(&large)));
+        assert_eq!(cache.entries.len(), PNG_CACHE_MAX_ENTRIES);
+        assert!(cache.total_bytes <= PNG_CACHE_MAX_BYTES);
+
+        // An entry that fits is admitted and evicts older entries until both
+        // limits hold.
+        let fits: Arc<str> = Arc::from("y".repeat(PNG_CACHE_MAX_BYTES / 2).as_str());
+        cache.insert(PngKey::new("fits", "image/jpeg"), Some(Arc::clone(&fits)));
+        assert!(!cache.entries.is_empty());
+        assert!(cache.total_bytes <= PNG_CACHE_MAX_BYTES);
+    }
+
+    #[test]
+    fn png_cache_hit_moves_the_entry_to_the_back() {
+        let mut cache = PngCache {
+            entries: Vec::new(),
+            total_bytes: 0,
+        };
+        for index in 0..PNG_CACHE_MAX_ENTRIES {
+            let source = format!("image-{index}");
+            cache.insert(PngKey::new(&source, "image/jpeg"), None);
+        }
+        let first_key = PngKey::new("image-0", "image/jpeg");
+        assert!(cache.get(&first_key).is_some());
+        // Fill one more: the oldest untouched entry (image-1) is evicted,
+        // not the refreshed image-0.
+        cache.insert(PngKey::new("new", "image/jpeg"), None);
+        assert!(cache.get(&first_key).is_some());
+        assert!(cache.get(&PngKey::new("image-1", "image/jpeg")).is_none());
+    }
+
+    #[test]
+    fn cache_revision_is_monotonic_and_tracks_capabilities() {
+        let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let original = crate::terminal_image::get_capabilities();
+        let image = Image::new(
+            JPEG,
+            "image/jpeg",
+            ImageTheme {
+                fallback_color: Box::new(|value: &str| value.to_string()),
+            },
+            None,
+            None,
+        );
+        let first = image.cache_revision().expect("Image is trusted");
+        assert!(image.cache_revision().expect("revision") >= first);
+
+        crate::terminal_image::set_capabilities(no_image_caps());
+        let second = image.cache_revision().expect("revision");
+        assert!(
+            second > first,
+            "a capabilities-generation change must bump the revision"
+        );
+
+        crate::terminal_image::set_capabilities(original);
+
+        // Registering a transcoder after the first render must also bump.
+        let third = image.cache_revision().expect("revision");
+        set_image_transcoder(Some(Arc::new(|_data: &str, _mime: &str| None)));
+        let fourth = image.cache_revision().expect("revision");
+        assert!(fourth > third);
+        set_image_transcoder(None);
     }
 }

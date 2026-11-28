@@ -1,4 +1,4 @@
-//! Scan order/cursor resolution (port of `src/storage/scan.ts` @ `4a080252f`).
+//! Scan order/cursor resolution (port of `src/storage/scan.ts` @ `b4afdddf`).
 
 use crate::errors::{StorageError, StorageResult};
 use crate::types::{Cursor, ScanOrder};

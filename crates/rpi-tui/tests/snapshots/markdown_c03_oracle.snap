@@ -1,0 +1,45 @@
+case: html-comment-closed width=80
+before                                                                          
+                                                                                
+after                                                                           
+---
+case: html-comment-unclosed width=80
+
+---
+case: html-comment-inline width=80
+a b                                                                             
+---
+case: bare-url-cjk width=120
+]8;;https://example.com/path\[34m[4mhttps://example.com/path[24m[0m]8;;\，next                                                                                          
+---
+case: display-math-wide width=80
+a │ b                                                                           
+c │ d                                                                           
+---
+case: display-math-narrow width=3
+$$\
+beg
+in{
+mat
+rix
+}a&
+b\\
+c&d
+\en
+d{m
+atr
+ix}
+$$ 
+---
+case: narrow-blockquote-2 width=2
+xy
+---
+case: narrow-blockquote-3 width=3
+[2m│ [22m[3m[3mx
+[2m│ [22m[3my[23m[23m
+---
+case: sgr-wrap width=10
+[1mbold words
+[1m[22m and [33mcode[0m 
+wrap      
+---

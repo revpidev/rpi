@@ -1,5 +1,5 @@
 //! Harness type surface (port of `packages/durable/src/harness/types.ts`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 //!
 //! This module mirrors the upstream harness type surface as Rust data types and
 //! seam traits. Upstream expresses most of it as TypeScript interfaces; the Rust
@@ -47,11 +47,8 @@ use crate::types::{
 /// A boxed future returned by the harness seam traits.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Receives extension failures that do not fail the calling operation
-/// (`HarnessOptions.onReport`). Upstream passes an arbitrary thrown value; the
-/// Rust port carries its rendered message.
-// FORM: upstream `onReport(error: unknown)`; Rust reports a rendered `String`.
-pub type ReportFn = Arc<dyn Fn(String) + Send + Sync>;
+/// Receives one failure and its fixed report information.
+pub type ReportFn = Arc<dyn Fn(Report) + Send + Sync>;
 
 /// Options of one host timer (`SetTimer` options).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -71,98 +68,157 @@ pub type SetTimer = Arc<
     dyn Fn(Arc<dyn Fn() + Send + Sync>, u64, TimerOptions) -> Option<TimerDisarm> + Send + Sync,
 >;
 
-/// Fixed report kinds (`ReportInfo.type`).
+/// Fixed report kinds (`ReportInfo.kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReportKind {
-    /// The Session failed after a storage error.
-    SessionFailed,
-    /// A task faulted.
+    StorageFailed,
     TaskFaulted,
-    /// The restart limit parked a task.
-    TaskParked,
-    /// A definition migration failed.
+    TaskInterrupted,
     MigrationFailed,
-    /// A stored task is newer than its definition.
     TaskOutdated,
-    /// A task's own code failed.
     TaskError,
-    /// Extension code failed.
     ExtensionError,
-    /// A host callback failed.
     HostError,
-    /// A listener failed.
     ListenerError,
 }
 
-/// What happened, for `onReport` (`ReportInfo`). Fixed fields only; never
-/// content, prompts, or credentials.
+/// The task a report is about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportTask {
+    pub id: TaskId,
+    pub kind: String,
+    pub conversation_id: ConversationId,
+}
+
+impl ReportTask {
+    pub fn new(id: TaskId, kind: impl Into<String>, conversation_id: ConversationId) -> Self {
+        Self {
+            id,
+            kind: kind.into(),
+            conversation_id,
+        }
+    }
+}
+
+/// Fixed report information; never prompt, token, or credential content.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReportInfo {
-    /// Fixed report kind.
-    #[serde(rename = "type")]
     pub kind: ReportKind,
-    /// Fixed reason, when present: `threw`/`restart_limit` for a faulted task,
-    /// `missing_task`/`incompatible_task` for an outdated one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Host callback that failed (`setTimer`/`now`/`registry`/`settings`/
-    /// `onWake`/`env`/`models`), for a `host_error` report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callback: Option<String>,
-    /// Task the report is about.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<TaskId>,
-    /// Registered task name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_kind: Option<String>,
-    /// Extension whose code ran.
+    pub task: Option<ReportTask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<ConversationId>,
 }
 
 impl ReportInfo {
-    /// A report of `kind` without task fields.
     pub fn new(kind: ReportKind) -> Self {
         Self {
             kind,
             reason: None,
             callback: None,
-            task_id: None,
-            task_kind: None,
+            task: None,
             extension: None,
+            restarts: None,
+            conversation_id: None,
         }
     }
 
-    /// Attach a fixed reason.
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
         self
     }
 
-    /// Attach the host callback that failed.
     pub fn with_callback(mut self, callback: impl Into<String>) -> Self {
         self.callback = Some(callback.into());
         self
     }
 
-    /// Attach the task the report is about.
-    pub fn with_task(mut self, id: TaskId, kind: impl Into<String>) -> Self {
-        self.task_id = Some(id);
-        self.task_kind = Some(kind.into());
+    pub fn with_task(mut self, task: ReportTask) -> Self {
+        self.task = Some(task);
         self
     }
 
-    /// Attach the extension whose code failed.
+    pub fn with_restarts(mut self, restarts: u32) -> Self {
+        self.restarts = Some(restarts);
+        self
+    }
+
+    pub fn with_conversation(mut self, conversation_id: ConversationId) -> Self {
+        self.conversation_id = Some(conversation_id);
+        self
+    }
+
     pub fn with_extension(mut self, extension: impl Into<String>) -> Self {
         self.extension = Some(extension.into());
         self
     }
 }
 
-/// Receives fixed-field reports (`HarnessOptions.onReport`'s `info`).
-pub type ReportInfoFn = Arc<dyn Fn(ReportInfo) + Send + Sync>;
+/// One report: its error and fixed information.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Report {
+    #[serde(flatten)]
+    pub info: ReportInfo,
+    pub error: String,
+}
+
+impl Report {
+    pub fn new(info: ReportInfo, error: impl Into<String>) -> Self {
+        Self {
+            info,
+            error: error.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Report {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.error)
+    }
+}
+
+/// Whose code a task's report is about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ReportFrom {
+    Extension {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension: Option<String>,
+    },
+    Host {
+        callback: HostCallback,
+    },
+}
+
+/// Host callbacks a report can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostCallback {
+    Now,
+    Settings,
+    Registry,
+    Env,
+    Models,
+    SetTimer,
+    OnWake,
+    Telemetry,
+}
 
 /// When a Harness next needs a running process (`Harness.wake()`).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -205,6 +261,13 @@ pub enum WhenBusy {
     Reject,
 }
 
+/// Admission behavior when no run is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WhenIdle {
+    Reject,
+}
+
 /// The entry an input is placed as, instead of `pi.user`: an application kind,
 /// and data the transcript shows, such as its author.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -226,8 +289,18 @@ pub struct InputSubmissionDraft {
     pub content: UserInput,
     /// Busy-queue behaviour.
     pub when_busy: Option<WhenBusy>,
+    /// Idle-admission behaviour.
+    pub when_idle: Option<WhenIdle>,
     /// Entry to place the input as; default `pi.user` without data.
     pub entry: Option<InputEntry>,
+}
+
+/// Continue the last failed or completed run without appending an input entry.
+#[derive(Debug, Clone)]
+pub struct ContinueSubmissionDraft {
+    pub request_id: Option<String>,
+    pub when_busy: Option<WhenBusy>,
+    pub when_idle: Option<WhenIdle>,
 }
 
 /// Host write submission: a passive entry write.
@@ -245,6 +318,8 @@ pub struct WriteSubmissionDraft {
 pub enum SubmissionDraft {
     /// User input that may start a run.
     Input(InputSubmissionDraft),
+    /// Continue the last run without appending an entry.
+    Continue(ContinueSubmissionDraft),
     /// Passive entry write.
     Write(WriteSubmissionDraft),
 }
@@ -468,6 +543,15 @@ pub trait TaskRuntime: Send + Sync {
     async fn env(&self, context: &Context) -> SessionResult<Option<Arc<dyn ExecutionEnv>>>;
     /// Commit on the Session line after rereading the task.
     async fn commit(&self, change: TaskCommitFn, context: &Context) -> SessionResult<()>;
+    /// Commit with an explicit persistence policy; default remains immediate.
+    async fn commit_with_options(
+        &self,
+        change: TaskCommitFn,
+        context: &Context,
+        _options: crate::session::CommitOptions,
+    ) -> SessionResult<()> {
+        self.commit(change, context).await
+    }
     /// Read a durable memo of this task.
     async fn memo(&self, name: &str, context: &Context) -> SessionResult<Option<JsonValue>>;
     /// Store a memo unless one already exists; return the durable winner.
@@ -519,6 +603,18 @@ pub trait TaskRuntime: Send + Sync {
     ) -> SessionResult<Option<Arc<dyn ConversationHandle>>>;
     /// Committed entry visible from the task's conversation.
     async fn entry(&self, id: EntryId, context: &Context) -> SessionResult<Option<EntryRecord>>;
+    /// Read raw fork-aware history; external runtimes must opt in explicitly.
+    async fn entries(
+        &self,
+        _query: EntryQuery,
+        _limit: usize,
+        _cursor: Option<Cursor>,
+        _context: &Context,
+    ) -> SessionResult<Page<EntryRecord>> {
+        Err(SessionError::message(
+            "Raw entry history is unsupported by this task runtime",
+        ))
+    }
     /// Committed raw active transcript and model context.
     async fn context(
         &self,
@@ -1199,6 +1295,12 @@ pub struct AgentState {
     /// Environment working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Maximum tool rounds of one run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u64>,
+    /// Conversation-specific compaction settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionSettings>,
 }
 
 /// Edit of a stored extension selection.
@@ -1262,6 +1364,10 @@ pub struct AgentChange {
     pub instructions: Option<Option<String>>,
     /// Working-directory change.
     pub cwd: Option<Option<String>>,
+    /// Maximum-turn change; inner `None` clears the limit.
+    pub max_turns: Option<Option<u64>>,
+    /// Whole compaction-settings replacement; inner `None` clears it.
+    pub compaction: Option<Option<CompactionSettings>>,
 }
 
 /// A conversation's agent resolved against a registry snapshot and the settings.
@@ -1287,6 +1393,10 @@ pub struct Agent {
     pub instructions: Option<String>,
     /// Environment working directory.
     pub cwd: Option<String>,
+    /// Maximum tool rounds of one run.
+    pub max_turns: Option<u64>,
+    /// Conversation-specific compaction settings.
+    pub compaction: Option<CompactionSettings>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1394,7 +1504,8 @@ pub struct CompactionPolicy {
 }
 
 /// Partial compaction policy (upstream `Partial<CompactionPolicy>`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct CompactionPolicyPatch {
     /// Whether compaction is enabled.
     pub enabled: Option<bool>,
@@ -1408,6 +1519,9 @@ pub struct CompactionPolicyPatch {
     pub model_overrides: std::collections::BTreeMap<String, CompactionPolicyPatch>,
 }
 
+/// Conversation-specific compaction settings and per-model overrides.
+pub type CompactionSettings = CompactionPolicyPatch;
+
 /// How often running progress is committed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1416,15 +1530,25 @@ pub struct ProgressPolicy {
     pub partial_interval_ms: u64,
     /// Minimum pause between running tool-output commits.
     pub output_interval_ms: u64,
+    /// Deferred progress persistence deadline; `None` waits for a read/write or close.
+    #[serde(default = "default_persist_within_ms")]
+    pub persist_within_ms: Option<u64>,
+}
+
+fn default_persist_within_ms() -> Option<u64> {
+    Some(1000)
 }
 
 /// Partial progress policy (upstream `Partial<ProgressPolicy>`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct ProgressPolicyPatch {
     /// Answer commit interval.
     pub partial_interval_ms: Option<u64>,
     /// Tool-output commit interval.
     pub output_interval_ms: Option<u64>,
+    /// Outer `None` leaves the default; inner `None` disables the deadline.
+    pub persist_within_ms: Option<Option<u64>>,
 }
 
 /// Why a compaction runs.
@@ -1451,10 +1575,10 @@ pub struct CompactionResult {
     pub submission_id: Option<SubmissionId>,
 }
 
-/// How many restarts a task may survive before it is parked (`restartLimit`).
+/// How many restarts a task may survive before its terminal failure (`restartLimit`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartLimit {
-    /// Park a task after this many consecutive restarts.
+    /// End a task after this many consecutive restarts.
     Limited(u64),
     /// Never park (upstream `Infinity`).
     Infinite,
@@ -1645,10 +1769,10 @@ pub struct HarnessOptions {
     pub set_timer: Option<SetTimer>,
     /// Wake the process for sleeping tasks instead of arming a timer.
     pub on_wake: Option<WakeFn>,
-    /// Receives extension failures.
+    /// Receives extension failures through one report channel.
     pub on_report: Option<ReportFn>,
-    /// Receives fixed-field reports; the `info` half of `onReport`.
-    pub on_report_info: Option<ReportInfoFn>,
+    /// Load live state without recovery writes or any later commits.
+    pub read_only: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1676,8 +1800,6 @@ pub enum BlockedReason {
     TaskTooOld,
     /// The registered definition's migration failed.
     MigrationFailed,
-    /// The restart limit parked the task; `retryTask()` runs it again.
-    RestartLimit,
 }
 
 /// What the scheduler would do with one live task.
@@ -1686,7 +1808,7 @@ pub enum TaskInspectionState {
     /// An invocation is active.
     Running,
     /// The next pass reserves it.
-    Ready {
+    Pending {
         /// Whether its definition is newer and has a migration.
         migrates: bool,
     },
@@ -1873,7 +1995,6 @@ pub trait Harness: Send + Sync {
     /// When this Session next needs a running process.
     fn wake(&self) -> Wake;
     /// Run a task parked by the restart limit again.
-    async fn retry_task(&self, id: TaskId, context: &Context) -> Result<(), SessionError>;
     /// Return the reserved root conversation, creating it when absent.
     async fn root(
         &self,
@@ -1955,6 +2076,28 @@ pub trait HookApi: Send + Sync {
         value: JsonValue,
         context: &Context,
     ) -> Result<JsonValue, SessionError>;
+    /// Read one entry visible in the asking conversation.
+    async fn entry(
+        &self,
+        _id: EntryId,
+        _context: &Context,
+    ) -> Result<Option<EntryRecord>, SessionError> {
+        Err(SessionError::message(
+            "Raw entry history is unsupported by this hook API",
+        ))
+    }
+    /// Read raw fork-aware history shared with the task runtime.
+    async fn entries(
+        &self,
+        _query: EntryQuery,
+        _limit: usize,
+        _cursor: Option<Cursor>,
+        _context: &Context,
+    ) -> Result<Page<EntryRecord>, SessionError> {
+        Err(SessionError::message(
+            "Raw entry history is unsupported by this hook API",
+        ))
+    }
 }
 
 /// [`HookApi`] backed by one task invocation.
@@ -1990,6 +2133,52 @@ impl HookApi for RuntimeHookApi<'_> {
     ) -> Result<JsonValue, SessionError> {
         self.runtime.memo_set(name, value, context).await
     }
+
+    async fn entry(
+        &self,
+        id: EntryId,
+        context: &Context,
+    ) -> Result<Option<EntryRecord>, SessionError> {
+        self.runtime.entry(id, context).await
+    }
+
+    async fn entries(
+        &self,
+        query: EntryQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+        context: &Context,
+    ) -> Result<Page<EntryRecord>, SessionError> {
+        self.runtime.entries(query, limit, cursor, context).await
+    }
+}
+
+pub(crate) async fn contain_hook<T, F>(
+    future: F,
+    runtime: &dyn TaskRuntime,
+    hook: &'static str,
+    task_kind: &'static str,
+) -> Option<T>
+where
+    F: Future<Output = T> + Send,
+{
+    match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(future)).await {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            let message = crate::session::session::panic_message(payload);
+            let _ = runtime.report(message);
+            runtime.report_info(
+                ReportInfo::new(ReportKind::ExtensionError)
+                    .with_task(ReportTask::new(
+                        runtime.task_id(),
+                        task_kind,
+                        runtime.conversation_id(),
+                    ))
+                    .with_callback(hook),
+            );
+            None
+        }
+    }
 }
 
 /// `beforeRequest` replacement payload.
@@ -2015,9 +2204,67 @@ pub struct BeforeToolResult {
     pub block: Option<String>,
 }
 
+/// How a completed run is presented to after-run hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunEndReason {
+    Answer,
+    Terminate,
+}
+
+/// The entry range and outcome of one run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSummary {
+    pub reason: RunEndReason,
+    pub first: Option<EntryId>,
+    pub answer: EntryId,
+    pub last: EntryId,
+}
+
+/// A child task requested by an after-run hook.
+#[derive(Clone)]
+pub struct RunEndTask {
+    pub task: AnyTask,
+    pub input: JsonValue,
+}
+
+/// Tasks requested by one after-run hook.
+#[derive(Clone, Default)]
+pub struct RunEndTasks {
+    pub tasks: Vec<RunEndTask>,
+}
+
+/// Provider-specific payload before one generation request is sent.
+#[derive(Clone)]
+pub struct ProviderRequest {
+    pub model: rpi_ai::types::Model,
+    pub payload: JsonValue,
+}
+
 /// Hooks of the built-in generation task.
 #[async_trait]
 pub trait GenerationHooks: Send + Sync {
+    /// Replace only this generation request's provider payload.
+    async fn before_provider_request(
+        &self,
+        _request: ProviderRequest,
+        _api: &dyn HookApi,
+        _context: &Context,
+    ) -> Option<ProviderRequest> {
+        None
+    }
+
+    /// Create children after the answer is durable and before the run settles.
+    async fn after_run(
+        &self,
+        _run: RunSummary,
+        _api: &dyn HookApi,
+        _context: &Context,
+    ) -> Option<RunEndTasks> {
+        None
+    }
+
     /// Before every request attempt.
     async fn before_request(
         &self,

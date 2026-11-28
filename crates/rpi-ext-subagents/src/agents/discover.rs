@@ -19,6 +19,19 @@ use std::path::{Path, PathBuf};
 
 use crate::paths;
 
+/// S20 (#3117): agent discovery is bound to a session generation. A reload
+/// or session switch bumps it; a scan that observes a change before it
+/// returns is stale and must not rebuild the old session's agents.
+static DISCOVERY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn discovery_generation() -> u64 {
+    DISCOVERY_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub fn bump_discovery_generation() -> u64 {
+    DISCOVERY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
 /// Frontmatter `thinking`: unset | explicitly disabled (`false`) | a level.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThinkingSpec {
@@ -79,7 +92,15 @@ pub struct AgentConfig {
     pub thinking: ThinkingSpec,
     pub system_prompt_mode: &'static str,
     pub inherit_project_context: bool,
+    /// `inheritGlobalContext` (#3206): inherit the global agent-dir
+    /// AGENTS.md. Default false; `subagents.defaultInheritGlobalContext:true`
+    /// fills it for agents that did not write the key, and an explicit
+    /// `false` opts out.
+    pub inherit_global_context: bool,
     pub inherit_skills: bool,
+    /// `launcher` frontmatter (#3163): a `runnerLaunchers` name that wraps
+    /// the local child process. `None` = unwrapped.
+    pub launcher: Option<String>,
     pub default_context: Option<ContextMode>,
     pub default_async: Option<bool>,
     pub default_timeout_ms: Option<u64>,
@@ -487,6 +508,15 @@ fn default_system_prompt_mode(local_name: &str) -> &'static str {
     }
 }
 
+/// `runnerLaunchers` name pattern (shared/types.ts @ feb6da00).
+fn valid_launcher_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic() && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 fn default_inherit_project_context(local_name: &str) -> bool {
     // agents.ts:52-54.
     local_name == "delegate"
@@ -697,6 +727,16 @@ pub fn agent_from_content(
         Some("false") => false,
         _ => default_inherit_project_context(local_name),
     };
+    let inherit_global_context = fm.get("inheritGlobalContext").map(String::as_str) == Some("true");
+    let launcher = match fm.get("launcher").map(String::as_str) {
+        None => None,
+        Some(name) if valid_launcher_name(name) => Some(name.to_string()),
+        Some(name) => {
+            return Err(format!(
+                "Agent '{local_name}' frontmatter 'launcher' \"{name}\" is invalid; launcher names start with a letter and contain only letters, digits, underscores and dashes."
+            ));
+        }
+    };
     let inherit_skills = match fm.get("inheritSkills").map(String::as_str) {
         Some("true") => true,
         Some("false") => false,
@@ -752,7 +792,9 @@ pub fn agent_from_content(
         thinking,
         system_prompt_mode,
         inherit_project_context,
+        inherit_global_context,
         inherit_skills,
+        launcher,
         default_context,
         default_async,
         default_timeout_ms,
@@ -1310,6 +1352,7 @@ pub fn discover_agents_with_user_dirs_with_diagnostics_trusted(
     mut user_dirs: Vec<PathBuf>,
     project_trusted: bool,
 ) -> (Vec<AgentConfig>, Vec<DiscoverDiagnostic>) {
+    let generation = discovery_generation();
     // #1801: user-scope `agentScanDirs` append after the (explicit or
     // default) fixed user dirs — fixed definitions win on same-name because
     // scan dirs load last (agents.ts discovery order + the upstream test
@@ -1341,6 +1384,7 @@ pub fn discover_agents_with_user_dirs_with_diagnostics_trusted(
         &settings.default_subagent_only_extensions,
     );
     apply_default_provider(&mut builtin, &settings.default_provider);
+    apply_default_inherit_global_context(&mut builtin, settings.default_inherit_global_context);
     apply_builtin_overrides(&mut builtin, settings);
 
     let mut user: Vec<AgentConfig> = if scope == "project" {
@@ -1366,6 +1410,7 @@ pub fn discover_agents_with_user_dirs_with_diagnostics_trusted(
     apply_default_extensions(&mut user, &default_extensions);
     apply_default_subagent_only_extensions(&mut user, &settings.default_subagent_only_extensions);
     apply_default_provider(&mut user, &settings.default_provider);
+    apply_default_inherit_global_context(&mut user, settings.default_inherit_global_context);
     apply_custom_overrides(
         &mut user,
         &settings.project.overrides,
@@ -1396,6 +1441,7 @@ pub fn discover_agents_with_user_dirs_with_diagnostics_trusted(
         &settings.default_subagent_only_extensions,
     );
     apply_default_provider(&mut project, &settings.default_provider);
+    apply_default_inherit_global_context(&mut project, settings.default_inherit_global_context);
     apply_custom_overrides(
         &mut project,
         &settings.project.overrides,
@@ -1419,6 +1465,17 @@ pub fn discover_agents_with_user_dirs_with_diagnostics_trusted(
             merged.insert(agent.name.clone(), agent);
         }
     }
+    // S20: a reload/session switch during the scan invalidates its result.
+    if generation != discovery_generation() {
+        return (
+            Vec::new(),
+            vec![DiscoverDiagnostic {
+                path: cwd.to_path_buf(),
+                scope: AgentSource::Project,
+                error: "agent discovery was cancelled by a session generation change".to_string(),
+            }],
+        );
+    }
     (
         merged
             .into_values()
@@ -1438,6 +1495,22 @@ fn dedupe_by_name(agents: Vec<AgentConfig>) -> Vec<AgentConfig> {
 
 /// `applySubagentDefaults` model fill (agents.ts:955-993): only agents
 /// without an explicit model inherit `subagents.defaultModel`.
+/// `applySubagentDefaultInheritGlobalContext` (agents.ts:1501-1511 @
+/// feb6da00): when the settings default is true, agents that did not write
+/// the key inherit the global context; an explicit false opts out.
+fn apply_default_inherit_global_context(agents: &mut [AgentConfig], default: Option<bool>) {
+    if default != Some(true) {
+        return;
+    }
+    for agent in agents.iter_mut() {
+        if !agent.inherit_global_context
+            && !agent.frontmatter_fields.contains("inheritGlobalContext")
+        {
+            agent.inherit_global_context = true;
+        }
+    }
+}
+
 fn apply_default_model(agents: &mut [AgentConfig], default_model: &Option<String>) {
     if let Some(default_model) = default_model {
         for agent in agents.iter_mut() {
@@ -1520,17 +1593,9 @@ fn apply_builtin_overrides(agents: &mut [AgentConfig], settings: &crate::config:
         }
     };
     for agent in agents.iter_mut() {
-        if let Some(project_override) = settings.project.overrides.get(&agent.name) {
-            let explicit = project_override.thinking.is_some();
-            apply_override_entry(agent, project_override);
-            clear_thinking(agent, explicit);
-            continue;
-        }
-        if settings.project_bulk_disabled {
-            agent.disabled = Some(true);
-            clear_thinking(agent, false);
-            continue;
-        }
+        // #3124 (agents.ts:1210-1228 @ feb6da00): project fields merge on
+        // top of the user entry instead of replacing it; project wins where
+        // both set the same field.
         if let Some(user_override) = settings.user.overrides.get(&agent.name) {
             // agents.ts:1085: an explicit user-override thinking protects from
             // clearing only when the project file does not configure
@@ -1539,12 +1604,19 @@ fn apply_builtin_overrides(agents: &mut [AgentConfig], settings: &crate::config:
                 !settings.project_thinking_configured && user_override.thinking.is_some();
             apply_override_entry(agent, user_override);
             clear_thinking(agent, explicit);
-            continue;
-        }
-        if settings.user_bulk_disabled {
+        } else if settings.user_bulk_disabled {
             agent.disabled = Some(true);
         }
-        clear_thinking(agent, false);
+        if let Some(project_override) = settings.project.overrides.get(&agent.name) {
+            let explicit = project_override.thinking.is_some();
+            apply_override_entry(agent, project_override);
+            clear_thinking(agent, explicit);
+        } else if settings.project_bulk_disabled {
+            agent.disabled = Some(true);
+            clear_thinking(agent, false);
+        } else if !settings.user.overrides.contains_key(&agent.name) {
+            clear_thinking(agent, false);
+        }
     }
 }
 
@@ -1558,12 +1630,12 @@ fn apply_custom_overrides(
     user_overrides: &BTreeMap<String, crate::config::AgentOverride>,
 ) {
     for agent in agents.iter_mut() {
-        if let Some(project_override) = project_overrides.get(&agent.name) {
-            apply_custom_override_entry(agent, project_override);
-            continue;
-        }
+        // #3124: deep-merge user then project (project fields win).
         if let Some(user_override) = user_overrides.get(&agent.name) {
             apply_custom_override_entry(agent, user_override);
+        }
+        if let Some(project_override) = project_overrides.get(&agent.name) {
+            apply_custom_override_entry(agent, project_override);
         }
     }
 }
@@ -2230,6 +2302,39 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_discovery_does_not_probe_ancestor_agent_dirs() {
+        let root = temp_root("untrusted-ancestor");
+        let cwd = root.join("nested").join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let ancestor_agents = root.join(".rpi").join("agents");
+        std::fs::create_dir_all(&ancestor_agents).unwrap();
+        // A corrupt definition would produce a diagnostic if scanned.
+        std::fs::write(ancestor_agents.join("bad.md"), "not frontmatter").unwrap();
+        let settings = crate::config::SettingsPair::default();
+        let (agents, diagnostics) = discover_agents_with_user_dirs_with_diagnostics_trusted(
+            &cwd,
+            "both",
+            &settings,
+            None,
+            vec![],
+            false,
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.path.ends_with("bad.md")),
+            "untrusted discovery must not probe ancestor .rpi: {diagnostics:?}"
+        );
+        assert!(
+            agents
+                .iter()
+                .all(|agent| agent.source == AgentSource::Builtin),
+            "untrusted discovery must not load project agents"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn discovery_override_and_scope() {
         let root = temp_root("ovr");
         let project = root.join("proj");
@@ -2517,6 +2622,7 @@ mod tests {
 #[cfg(test)]
 mod discovery_robustness_tests {
     use super::*;
+    #[cfg(unix)]
     use std::time::Duration;
 
     const HIDDEN_RPI_AGENT: &str = "---\nname: hidden-rpi-agent\ndescription: pruned\n---\nbody\n";
@@ -3393,5 +3499,163 @@ mod te18_tools_tests {
             "frontmatter excludeTools wins over fill-only override"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod inherit_global_context_tests {
+    use super::*;
+
+    fn agent(frontmatter: &str) -> AgentConfig {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-igc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.md");
+        std::fs::write(
+            &path,
+            format!("---\nname: a\ndescription: d\n{frontmatter}\n---\nbody\n"),
+        )
+        .unwrap();
+        let (agents, _) = load_agents_from_dir_with_diagnostics(&dir, "user");
+        let _ = std::fs::remove_dir_all(&dir);
+        agents.into_iter().next().expect("agent parsed")
+    }
+
+    #[test]
+    fn frontmatter_opt_in_and_launcher_parse() {
+        let plain = agent("");
+        assert!(!plain.inherit_global_context);
+        assert!(plain.launcher.is_none());
+
+        let opted = agent("inheritGlobalContext: true\nlauncher: sandbox");
+        assert!(opted.inherit_global_context);
+        assert_eq!(opted.launcher.as_deref(), Some("sandbox"));
+
+        let opted_out = agent("inheritGlobalContext: false");
+        assert!(!opted_out.inherit_global_context);
+
+        // Invalid launcher names are a definition error (the agent is dropped
+        // with a diagnostic, like other fatal frontmatter values).
+        let dir = std::env::temp_dir().join(format!("rpi-igc-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.md"),
+            "---\nname: a\ndescription: d\nlauncher: 1bad\n---\nbody\n",
+        )
+        .unwrap();
+        let (agents, diagnostics) = load_agents_from_dir_with_diagnostics(&dir, "user");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(agents.is_empty());
+        assert!(diagnostics.iter().any(|d| d.error.contains("launcher")));
+    }
+
+    #[test]
+    fn settings_default_fills_only_agents_without_the_key() {
+        let mut agents = vec![agent(""), agent("inheritGlobalContext: false")];
+        apply_default_inherit_global_context(&mut agents, Some(true));
+        assert!(agents[0].inherit_global_context, "default fills unset");
+        assert!(!agents[1].inherit_global_context, "explicit false opts out");
+
+        let mut agents = vec![agent("")];
+        apply_default_inherit_global_context(&mut agents, Some(false));
+        assert!(!agents[0].inherit_global_context);
+    }
+}
+
+#[cfg(test)]
+mod override_merge_tests {
+    use super::*;
+    use crate::config::AgentOverride;
+
+    fn base() -> AgentConfig {
+        let mut agent = AgentConfig {
+            name: "scout".into(),
+            local_name: "scout".into(),
+            package_name: None,
+            description: "builtin".into(),
+            aliases: None,
+            tools: None,
+            exclude_tools: Vec::new(),
+            mcp_direct_tools: Vec::new(),
+            mutation_tools: Vec::new(),
+            model: None,
+            allowed_agents: None,
+            thinking: ThinkingSpec::Unset,
+            system_prompt_mode: "replace",
+            inherit_project_context: false,
+            inherit_global_context: false,
+            inherit_skills: false,
+            launcher: None,
+            default_context: None,
+            default_async: None,
+            default_timeout_ms: None,
+            system_prompt: String::new(),
+            source: AgentSource::Builtin,
+            file_path: PathBuf::new(),
+            skills: Vec::new(),
+            extensions: None,
+            subagent_only_extensions: None,
+            output: None,
+            output_mode: None,
+            advertise: None,
+            allow_nested_subagents: None,
+            model_provider: None,
+            default_reads: Vec::new(),
+            default_progress: false,
+            max_subagent_depth: None,
+            disabled: None,
+            acceptance_role: None,
+            memory: None,
+            frontmatter_fields: Default::default(),
+        };
+        agent.frontmatter_fields.insert("name".into());
+        agent
+    }
+
+    #[test]
+    fn project_override_merges_on_top_of_user_instead_of_replacing() {
+        let mut agents = vec![base()];
+        let mut user = BTreeMap::new();
+        user.insert(
+            "scout".to_string(),
+            AgentOverride {
+                model: Some(Some("user/model".into())),
+                ..Default::default()
+            },
+        );
+        let mut project = BTreeMap::new();
+        project.insert(
+            "scout".to_string(),
+            AgentOverride {
+                thinking: Some(Some("high".into())),
+                ..Default::default()
+            },
+        );
+        apply_custom_overrides(&mut agents, &project, &user);
+        assert_eq!(agents[0].model.as_deref(), Some("user/model"));
+        assert_eq!(
+            agents[0].thinking,
+            ThinkingSpec::Level("high".into()),
+            "project field applied on top of the user entry"
+        );
+
+        // Same-field conflict: project wins.
+        let mut agents = vec![base()];
+        let mut project = BTreeMap::new();
+        project.insert(
+            "scout".to_string(),
+            AgentOverride {
+                model: Some(Some("project/model".into())),
+                ..Default::default()
+            },
+        );
+        apply_custom_overrides(&mut agents, &project, &user);
+        assert_eq!(agents[0].model.as_deref(), Some("project/model"));
     }
 }

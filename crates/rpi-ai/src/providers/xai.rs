@@ -19,7 +19,6 @@ use std::sync::Arc;
 use crate::api::openai_responses::OpenAiResponses;
 use crate::auth::oauth::xai_oauth;
 use crate::auth::{ProviderAuth, env_api_key_auth};
-use crate::generated::get_builtin_models;
 use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `xaiProvider()`.
@@ -33,7 +32,7 @@ pub fn xai_provider() -> Arc<dyn Provider> {
             api_key: Some(Arc::new(env_api_key_auth("xAI API key", &["XAI_API_KEY"]))),
             oauth: Some(xai_oauth()),
         },
-        models: get_builtin_models("xai").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared("xai")),
         api: xai_provider_api(),
         ..Default::default()
     })

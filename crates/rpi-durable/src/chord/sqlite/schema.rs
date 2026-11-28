@@ -1,5 +1,5 @@
 //! SQLite schema-prefix validation (port of `src/sqlite/schema.ts` @
-//! `4a080252f`).
+//! `b4afdddf`).
 
 use crate::errors::{StorageError, StorageResult};
 

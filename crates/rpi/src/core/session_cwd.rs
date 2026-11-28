@@ -49,10 +49,42 @@ pub fn format_missing_session_cwd_error(issue: &SessionCwdIssue) -> String {
 
 /// `formatMissingSessionCwdPrompt` (session-cwd.ts:40-42).
 pub fn format_missing_session_cwd_prompt(issue: &SessionCwdIssue) -> String {
-    format!(
-        "cwd from session file does not exist\n{}\n\ncontinue in current cwd\n{}",
-        issue.session_cwd, issue.fallback_cwd
-    )
+    format!("Session cwd does not exist: {}", issue.session_cwd)
+}
+
+/// The recovery action shared by startup, resume, import, and extension-driven
+/// session switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingCwdDecision {
+    Continue,
+    Fork,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingCwdOption {
+    pub label: String,
+    pub decision: Option<MissingCwdDecision>,
+}
+
+/// `getMissingSessionCwdOptions` (session-cwd.ts:44-55).
+pub fn get_missing_session_cwd_options(issue: &SessionCwdIssue) -> Vec<MissingCwdOption> {
+    vec![
+        MissingCwdOption {
+            label: format!("Continue in {} (asks again next time)", issue.fallback_cwd),
+            decision: Some(MissingCwdDecision::Continue),
+        },
+        MissingCwdOption {
+            label: format!(
+                "Fork into {} (new session ID, original kept)",
+                issue.fallback_cwd
+            ),
+            decision: Some(MissingCwdDecision::Fork),
+        },
+        MissingCwdOption {
+            label: "Cancel".to_owned(),
+            decision: None,
+        },
+    ]
 }
 
 /// `MissingSessionCwdError` (session-cwd.ts:44-52).

@@ -1,5 +1,5 @@
 //! Async host side of the sandbox (port of `CodemodeSandbox` / `Execution`
-//! in `packages/codemode/src/runtime/host.ts` @ 4a080252f).
+//! in `packages/codemode/src/runtime/host.ts` @ b4afdddf).
 //!
 //! One script run gets its own worker thread, fresh wasmtime `Store`, and
 //! fresh QuickJS VM. A runaway script, including one that only spins the
@@ -285,7 +285,7 @@ impl CodemodeSandbox {
         let calls = Arc::new(Mutex::new(CallTable::default()));
         let mut output: Vec<CodemodeOutputItem> = Vec::new();
         // Reserve the shared worker slot immediately before the worker
-        // starts (`acquireWorker`, host.ts:20-46 @ 4a080252f). A denied
+        // starts (`acquireWorker`, host.ts:20-46 @ b4afdddf). A denied
         // reservation fails the execution without starting a worker.
         let release = match self.acquire_worker.as_ref() {
             None => None,
@@ -1044,6 +1044,52 @@ mod tests {
         .await
         .expect("both close callers must return");
         let _ = running.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn non_finite_numbers_print_in_console_and_thrown_values() {
+        let sandbox = CodemodeSandbox::new(CodemodeSandboxOptions {
+            timeout_ms: CodemodeTimeout::Milliseconds(60_000),
+            ..Default::default()
+        })
+        .expect("sandbox");
+        let result = sandbox
+            .execute(
+                "console.log('avg', 0/0, 1/0, -1/0, -0, { nested: 0/0 }); text(0/0);",
+                CodemodeExecuteOptions::default(),
+            )
+            .await
+            .expect("execution");
+        let CodemodeResult::Ok { output, .. } = result else {
+            panic!("expected ok, got {result:?}")
+        };
+        assert!(output.iter().any(|item| matches!(
+            item,
+            CodemodeOutputItem::Text { text, console: true }
+                if text == "avg NaN Infinity -Infinity 0 {\"nested\":null}"
+        )));
+        assert!(output.iter().any(|item| matches!(
+            item,
+            CodemodeOutputItem::Text { text, console: false } if text == "NaN"
+        )));
+        for value in ["NaN", "Infinity", "-Infinity"] {
+            let result = sandbox
+                .execute(
+                    &format!("throw {value};"),
+                    CodemodeExecuteOptions::default(),
+                )
+                .await
+                .expect("execution");
+            let CodemodeResult::Err { error, .. } = result else {
+                panic!("expected thrown {value}, got {result:?}")
+            };
+            assert!(error.message.contains(value), "{}: {value}", error.message);
+            assert!(
+                !error.message.contains("null"),
+                "{}: {value}",
+                error.message
+            );
+        }
     }
 
     /// Round-2: the depth-disabled deserializer still requires one complete

@@ -29,6 +29,52 @@ pub fn async_runs_dir() -> PathBuf {
 pub fn async_results_dir() -> PathBuf {
     crate::paths::temp_root_dir().join("async-subagent-results")
 }
+/// Current parent session id for completion delivery (S24 leave/take): the
+/// run's recorded owner must match this before `sendMessage` fires. `None`
+/// keeps the single-window fallback.
+static CURRENT_SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
+
+/// Tests mutate the process-global binding; production binds on
+/// `session_start`. Test builds serialize every write through this lock so a
+/// concurrent `session_start` test cannot change the owner observed by a
+/// completion-delivery test. Tests that need to bind and then assert across
+/// an await hold the guard and use [`set_current_session_for_test`].
+#[cfg(test)]
+pub(crate) static CURRENT_SESSION_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn set_current_session(session_id: Option<&str>) {
+    *CURRENT_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) =
+        session_id.filter(|id| !id.is_empty()).map(str::to_string);
+}
+
+pub fn bind_current_session(session_id: Option<&str>) {
+    #[cfg(test)]
+    let _guard = CURRENT_SESSION_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    set_current_session(session_id);
+}
+
+/// Test seam: write the binding while the caller holds
+/// [`CURRENT_SESSION_TEST_MUTEX`].
+#[cfg(test)]
+pub(crate) fn set_current_session_for_test(session_id: Option<&str>) {
+    set_current_session(session_id);
+}
+
+/// Test seam: clear the process-global binding.
+#[cfg(test)]
+pub(crate) fn reset_current_session_for_test() {
+    set_current_session(None);
+}
+
+fn current_session_id() -> Option<String> {
+    CURRENT_SESSION_ID
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 pub fn spawn_budgets_dir() -> PathBuf {
     crate::paths::temp_root_dir().join("spawn-budgets")
 }
@@ -41,6 +87,7 @@ pub const STATE_FAILED: &str = "failed";
 pub const STATE_PAUSED: &str = "paused";
 pub const STATE_STOPPED: &str = "stopped";
 pub const STATE_REJECTED: &str = "rejected";
+pub const STATE_PARTIAL: &str = "partial";
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -80,6 +127,8 @@ pub struct AsyncRunHandle {
 pub struct AsyncControl {
     pub stop_requested: Mutex<bool>,
     pub interrupt_requested: Mutex<bool>,
+    /// S29 (#3202): stop admitting new children; started children finish.
+    pub drain_requested: Mutex<bool>,
 }
 
 impl AsyncControl {
@@ -104,6 +153,18 @@ impl AsyncControl {
     pub fn interrupt_requested(&self) -> bool {
         *self
             .interrupt_requested
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+    pub fn request_drain(&self) {
+        *self
+            .drain_requested
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
+    }
+    pub fn drain_requested(&self) -> bool {
+        *self
+            .drain_requested
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
@@ -185,7 +246,12 @@ fn remove_status_gate(run_id: &str) {
 fn is_terminal_state(state: &str) -> bool {
     matches!(
         state,
-        STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
+        STATE_COMPLETE
+            | STATE_FAILED
+            | STATE_STOPPED
+            | STATE_PAUSED
+            | STATE_REJECTED
+            | STATE_PARTIAL
     )
 }
 
@@ -207,6 +273,7 @@ fn prune_terminal_runs() {
         STATE_STOPPED,
         STATE_PAUSED,
         STATE_REJECTED,
+        STATE_PARTIAL,
     ];
     let is_terminal = |handle: &Arc<AsyncRunHandle>| {
         let status = handle.status.read().unwrap_or_else(|e| e.into_inner());
@@ -254,7 +321,12 @@ pub fn find_active_run(query: &str) -> Option<Arc<AsyncRunHandle>> {
         let status = handle.status.read().unwrap_or_else(|e| e.into_inner());
         matches!(
             status["state"].as_str().unwrap_or(""),
-            STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
+            STATE_COMPLETE
+                | STATE_FAILED
+                | STATE_STOPPED
+                | STATE_PAUSED
+                | STATE_REJECTED
+                | STATE_PARTIAL
         )
     };
     if terminal { None } else { Some(handle) }
@@ -669,6 +741,57 @@ pub fn process_boot_id(pid: u64) -> Option<u64> {
     }
 }
 
+/// Parent pid of `pid` (`/proc/<pid>/stat` field 4).
+fn process_parent_pid(pid: u64) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = raw.rsplit_once(')')?.1;
+        after_comm
+            .split_whitespace()
+            .nth(1)
+            .and_then(|token| token.parse().ok())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Refuse to signal the host itself, init, one of the host's ancestors, or a
+/// pid that is not a subagent process-group leader. The ledger lives in the
+/// parent-owned launch folder, but the reconciler still validates every
+/// target before sending a signal (R19-S11: never trust a reported pid).
+fn is_safe_reap_target(pid: u64) -> bool {
+    if pid == 0 || pid == 1 || pid == u64::from(std::process::id()) {
+        return false;
+    }
+    let mut current = u64::from(std::process::id());
+    for _ in 0..64 {
+        let Some(parent) = process_parent_pid(current) else {
+            break;
+        };
+        if parent == 0 {
+            break;
+        }
+        if parent == pid {
+            return false;
+        }
+        current = parent;
+    }
+    #[cfg(unix)]
+    {
+        // Subagent children are spawned with `process_group(0)`, so a real
+        // recorded child is its own group leader. A forged unrelated pid
+        // almost never satisfies this.
+        if unsafe { libc::getpgid(pid as i32) } != pid as i32 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether `pid` is alive AND started at `boot_id` (pid-reuse guard). A
 /// recorded `boot_id` of `None` (non-unix) degrades to a liveness check.
 pub(crate) fn pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
@@ -684,25 +807,35 @@ pub(crate) fn pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
 /// Crate-visible liveness probe for other run-history surfaces
 /// (`foreground_history`); the boot-id guard is the same one the stale-run
 /// reconciler uses.
+#[cfg(unix)]
 pub(crate) fn recorded_pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
     pid_matches(pid, boot_id)
 }
 
 /// Persist a spawned child pid for `run_id` (ADR-0019 crash branch): the
 /// stale-run reconciler reads these to signal orphaned children whose owner
-/// host died. Append-only, so parallel children never clobber each other.
+/// host died. The ledger is parent-owned (launch folder, beside
+/// `recovery.json`) so a child cannot seed arbitrary pids through its
+/// writable run folder. Append-only, so parallel children never clobber each
+/// other. A same-uid malicious child is outside this ledger's threat model;
+/// signal targets are still validated (self/init/ancestors/process-group
+/// leader) before any kill.
 pub fn record_child_pid(run_id: &str, pid: u32) {
     if pid == 0 {
         return;
     }
     let run_dir = async_runs_dir().join(run_id);
-    // Only async runs keep a run directory; foreground runs have no
+    // Only async/detached runs keep a run directory; foreground runs have no
     // reconciler surface (their dispatch dies with the host).
     if !run_dir.is_dir() {
         return;
     }
+    let launch_dir = crate::recovery::launch_dir(run_id);
+    if crate::paths::create_private_dir_all(&launch_dir).is_err() {
+        return;
+    }
     crate::artifacts::append_jsonl(
-        &run_dir.join("children.jsonl"),
+        &crate::recovery::child_pid_ledger_path(run_id),
         &json!({
             "pid": pid,
             "bootId": process_boot_id(pid as u64),
@@ -712,9 +845,9 @@ pub fn record_child_pid(run_id: &str, pid: u32) {
     );
 }
 
-/// Read the recorded child pids for a run directory (empty when absent).
-fn recorded_child_pids(run_dir: &Path) -> Vec<(u64, Option<u64>)> {
-    std::fs::read_to_string(run_dir.join("children.jsonl"))
+/// Read the recorded child pids for a run id (empty when absent).
+fn recorded_child_pids(run_id: &str) -> Vec<(u64, Option<u64>)> {
+    std::fs::read_to_string(crate::recovery::child_pid_ledger_path(run_id))
         .ok()
         .map(|raw| {
             raw.lines()
@@ -866,6 +999,18 @@ pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Ar
     update_status(&handle, |_| {});
     append_event(&run_dir, "run.started", json!({ "runId": run_id }));
     register_run(handle.clone());
+    // V19-03 S11: the parent-owned trusted record exists before any child.
+    if let Err(error) = crate::recovery::start_record(
+        run_id,
+        match body {
+            AsyncBody::Single { .. } => "single",
+            AsyncBody::Tasks { .. } => "parallel",
+            AsyncBody::Steps { .. } => "chain",
+        },
+        session_id,
+    ) {
+        tracing::warn!(run_id, error = %error, "failed to persist trusted recovery record");
+    }
     handle
 }
 
@@ -1252,6 +1397,7 @@ pub async fn drive_run(
                 std::sync::Arc::new(move || crate::p1::parallel::RunControlFlags {
                     stop_requested: control_handle.control.stop_requested(),
                     interrupt_requested: control_handle.control.interrupt_requested(),
+                    drain_requested: control_handle.control.drain_requested(),
                 });
             let outcome = crate::p1::parallel::run_parallel_async(
                 &entries,
@@ -1278,7 +1424,9 @@ pub async fn drive_run(
                     let any_failed = outcomes.iter().any(|o| o.exit_code != 0);
                     finish_with_handoff(
                         &handle,
-                        if any_failed {
+                        if handle.control.drain_requested() {
+                            STATE_STOPPED
+                        } else if any_failed {
                             STATE_FAILED
                         } else {
                             STATE_COMPLETE
@@ -1323,6 +1471,7 @@ pub async fn drive_run(
                 std::sync::Arc::new(move || crate::p1::parallel::RunControlFlags {
                     stop_requested: control_handle.control.stop_requested(),
                     interrupt_requested: control_handle.control.interrupt_requested(),
+                    drain_requested: control_handle.control.drain_requested(),
                 });
             match crate::p1::chain::run_chain_async_with_step_sink(
                 &steps,
@@ -1347,17 +1496,20 @@ pub async fn drive_run(
                     match failed {
                         Some(failure) => {
                             let error = failure.error.as_deref().unwrap_or("chain step failed");
-                            if handle.control.stop_requested() {
+                            if handle.control.stop_requested() || handle.control.drain_requested() {
                                 finish(&handle, STATE_STOPPED, error, &notify).await
                             } else {
                                 finish_failed(&handle, error, &notify).await
                             }
                         }
+                        None if handle.control.drain_requested() => {
+                            finish(&handle, STATE_STOPPED, &last_output, &notify).await
+                        }
                         None => finish(&handle, STATE_COMPLETE, &last_output, &notify).await,
                     }
                 }
                 Err(error) => {
-                    if handle.control.stop_requested() {
+                    if handle.control.stop_requested() || handle.control.drain_requested() {
                         finish(&handle, STATE_STOPPED, &error, &notify).await
                     } else {
                         finish_failed(&handle, &error, &notify).await
@@ -1611,10 +1763,21 @@ fn record_step_result(
         if result.output_partial {
             step["outputPartial"] = json!(true);
         }
+        // S40 (#3227): a terminal acceptance report closes guidance until an
+        // explicit resume; steer/follow-up must not open a new turn.
+        if result.acceptance_final {
+            step["acceptanceFinal"] = json!(true);
+        }
         // Terminal steps drop the live-activity fields (upstream shows
         // currentTool only for pending/running steps).
         clear_step_live_fields(step);
     });
+    crate::recovery::update_child_session(
+        &handle.run_id,
+        index as u32,
+        result.session_file.as_deref(),
+        terminal.as_status(),
+    );
 }
 
 /// Persist one settled chain step: terminal classification plus the
@@ -1653,6 +1816,7 @@ fn run_control_flags(handle: &Arc<AsyncRunHandle>) -> crate::p1::parallel::RunCo
     crate::p1::parallel::RunControlFlags {
         stop_requested: handle.control.stop_requested(),
         interrupt_requested: handle.control.interrupt_requested(),
+        drain_requested: handle.control.drain_requested(),
     }
 }
 
@@ -1719,6 +1883,8 @@ pub async fn drive_run_and_release(
 #[derive(Clone)]
 pub struct AsyncNotify {
     pub calls: Option<crate::AsyncHostCalls>,
+    /// S45: the owning session, used to defer a wake during manual compaction.
+    pub session_id: Option<String>,
 }
 
 impl AsyncNotify {
@@ -1777,24 +1943,57 @@ impl AsyncNotify {
             handoff_path,
         });
         if let Some(calls) = &self.calls {
-            // sendMessage is synchronous through the ABI envelope; acceptance
-            // is any non-error response. A failed delivery keeps the result
-            // file for `resend_pending_results` on the next session start
-            // (#3032/#2968) and records one diagnostic event.
-            match send_completion_message(calls, &details) {
-                Ok(()) => {
-                    let _ = std::fs::remove_file(&result_path);
-                }
-                Err(error) => {
-                    append_event(
-                        handle.run_dir.as_path(),
-                        "run.result_delivery_failed",
-                        json!({
-                            "runId": run_id,
-                            "error": error,
-                            "resultPath": result_path.to_string_lossy(),
-                        }),
-                    );
+            // S24 leave/take: only deliver into the run's owner session. The
+            // host-call channel belongs to the session that launched the run;
+            // after a take the status owner changes but the channel does not,
+            // so the owner must match BOTH the channel and the active session.
+            // A mismatch keeps the result file for `resend_pending_results`
+            // when the owner becomes active again.
+            let owner = status["sessionId"].as_str();
+            let channel_session = self.session_id.as_deref();
+            let current = current_session_id();
+            let owned = match (owner, channel_session, current.as_deref()) {
+                (Some(owner), Some(channel), Some(current)) => owner == channel && owner == current,
+                (Some(owner), Some(channel), None) => owner == channel,
+                (Some(owner), None, Some(current)) => owner == current,
+                _ => true,
+            };
+            if !owned {
+                append_event(
+                    handle.run_dir.as_path(),
+                    "run.completion_deferred",
+                    json!({
+                        "runId": run_id,
+                        "reason": "owner-session-mismatch",
+                        "owner": owner,
+                        "channel": channel_session,
+                        "current": current,
+                    }),
+                );
+            } else {
+                // sendMessage is synchronous through the ABI envelope; acceptance
+                // is any non-error response. A failed delivery keeps the result
+                // file for `resend_pending_results` on the next session start
+                // (#3032/#2968) and records one diagnostic event.
+                // The owner may have changed via take; defer against the
+                // current owner, not the launch-time binding.
+                let notice_session = status["sessionId"].as_str().or(self.session_id.as_deref());
+                let trigger_turn = !crate::compaction_wake::defer_wake(notice_session);
+                match send_completion_message(calls, &details, trigger_turn) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&result_path);
+                    }
+                    Err(error) => {
+                        append_event(
+                            handle.run_dir.as_path(),
+                            "run.result_delivery_failed",
+                            json!({
+                                "runId": run_id,
+                                "error": error,
+                                "resultPath": result_path.to_string_lossy(),
+                            }),
+                        );
+                    }
                 }
             }
             // Bus event (subagent:async-complete) is observation-only.
@@ -1869,6 +2068,7 @@ fn completion_details(notice: &CompletionNotice<'_>) -> crate::messages::Subagen
 fn send_completion_message(
     calls: &crate::AsyncHostCalls,
     details: &crate::messages::SubagentNotifyDetails,
+    trigger_turn: bool,
 ) -> Result<(), String> {
     let content = crate::messages::format_single_completion(details);
     let display = details.status != "completed";
@@ -1882,7 +2082,7 @@ fn send_completion_message(
     let response = crate::host_call_static(
         calls,
         "sendMessage",
-        json!({ "message": message, "options": { "triggerTurn": true } }),
+        json!({ "message": message, "options": { "triggerTurn": trigger_turn } }),
     );
     match response.get("error") {
         None => Ok(()),
@@ -1938,7 +2138,12 @@ pub fn resend_pending_results(calls: &crate::AsyncHostCalls, session_id: Option<
         }
         if !matches!(
             status["state"].as_str().unwrap_or(""),
-            STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
+            STATE_COMPLETE
+                | STATE_FAILED
+                | STATE_STOPPED
+                | STATE_PAUSED
+                | STATE_REJECTED
+                | STATE_PARTIAL
         ) {
             continue;
         }
@@ -1957,7 +2162,7 @@ pub fn resend_pending_results(calls: &crate::AsyncHostCalls, session_id: Option<
             duration_ms,
             handoff_path: handoff.as_deref(),
         });
-        if send_completion_message(calls, &details).is_ok() {
+        if send_completion_message(calls, &details, true).is_ok() {
             let _ = std::fs::remove_file(&path);
             let _ = crate::host_call_static(
                 calls,
@@ -2034,7 +2239,8 @@ async fn finish_with_handoff(
     handoff_path: Option<&Path>,
     notify: &AsyncNotify,
 ) {
-    let stopped = handle.control.stop_requested();
+    let drained = handle.control.drain_requested();
+    let stopped = handle.control.stop_requested() || drained;
     let state = if stopped { STATE_STOPPED } else { state };
     update_status(handle, |status| {
         status["state"] = json!(state);
@@ -2044,7 +2250,11 @@ async fn finish_with_handoff(
         });
         if stopped {
             status["stopped"] = json!(true);
-            status["stoppedReason"] = json!("stop-request");
+            status["stoppedReason"] = json!(if drained {
+                "drain-request"
+            } else {
+                "stop-request"
+            });
         }
         if let Some(object) = status.as_object_mut() {
             object.remove("activityState");
@@ -2060,6 +2270,8 @@ async fn finish_with_handoff(
         settle_unfinished_steps(status, unfinished_state, unfinished_error);
         clear_steps_terminal(status);
     });
+    crate::recovery::finish_record(&handle.run_id, state);
+    crate::p1::supervisor::clear_progress_for_run(&handle.run_id);
     append_event(
         handle.run_dir.as_path(),
         "run.finished",
@@ -2070,7 +2282,14 @@ async fn finish_with_handoff(
     flush_pending_status_write_failure(handle);
     // A terminal child cannot consume a supervisor reply; close its asks so
     // they do not keep a later wait/drain yielding on a dead run.
-    crate::p1::supervisor::close_requests_for_run(&handle.run_id);
+    crate::p1::supervisor::close_requests_for_run_with_kind(
+        &handle.run_id,
+        if state == STATE_STOPPED {
+            "stopped"
+        } else {
+            "closed"
+        },
+    );
     notify.send(handle, state, output, handoff_path).await;
     // Terminal handle stays registered (see prune_terminal_runs): wait/stop
     // poll this table for the terminal transition.
@@ -2078,27 +2297,19 @@ async fn finish_with_handoff(
 }
 
 async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &AsyncNotify) {
-    // A stop request wins over a child/launch failure, exactly like
-    // `finish_with_handoff`: the single/tasks Err paths must not record
-    // `failed` after the caller already stopped the run (upstream
-    // `stopRunner` outranks any child failure).
-    let stopped = handle.control.stop_requested();
-    let state = if stopped { STATE_STOPPED } else { STATE_FAILED };
-    let output = if stopped {
-        "Stopped before completion."
-    } else {
-        error
-    };
+    if handle.control.stop_requested() || handle.control.drain_requested() {
+        finish(handle, STATE_STOPPED, error, notify).await;
+        return;
+    }
+    // A stop/drain request already routed to `finish` above; this path is
+    // only a genuine failure (upstream `stopRunner` outranks child failures).
+    let state = STATE_FAILED;
     update_status(handle, |status| {
         status["state"] = json!(state);
         status["processTerminal"] = json!({
             "kind": "runner-exit",
             "at": iso8601(now_millis()),
         });
-        if stopped {
-            status["stopped"] = json!(true);
-            status["stoppedReason"] = json!("stop-request");
-        }
         status["error"] = json!(error);
         if let Some(object) = status.as_object_mut() {
             object.remove("activityState");
@@ -2107,29 +2318,18 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
         // A failed chain leaves its last step with live activity fields
         // (currentTool/activityState); terminal steps must not keep them, or
         // `subagent_wait` can report attention for a dead run.
-        if stopped {
-            settle_unfinished_steps(status, "stopped", output);
-        } else {
-            settle_unfinished_steps(status, "failed", error);
-        }
+        settle_unfinished_steps(status, "failed", error);
         clear_steps_terminal(status);
     });
-    if stopped {
-        append_event(
-            handle.run_dir.as_path(),
-            "run.finished",
-            json!({ "runId": handle.run_id, "state": STATE_STOPPED }),
-        );
-    } else {
-        append_event(
-            handle.run_dir.as_path(),
-            "run.failed",
-            json!({ "runId": handle.run_id, "error": error }),
-        );
-    }
+    append_event(
+        handle.run_dir.as_path(),
+        "run.failed",
+        json!({ "runId": handle.run_id, "error": error }),
+    );
     flush_pending_status_write_failure(handle);
-    crate::p1::supervisor::close_requests_for_run(&handle.run_id);
-    notify.send(handle, state, output, None).await;
+    crate::recovery::finish_record(&handle.run_id, state);
+    crate::p1::supervisor::close_requests_for_run_with_kind(&handle.run_id, "closed");
+    notify.send(handle, state, error, None).await;
     prune_terminal_runs();
 }
 
@@ -2171,9 +2371,13 @@ pub fn deliver_steer(
     message: &str,
     mode: &str,
     target_index: Option<usize>,
+    current_session: Option<&str>,
 ) -> Result<Value, String> {
     let handle =
         find_run(run_id).ok_or_else(|| format!("No active background run matches '{run_id}'."))?;
+    if !run_owned_by(&handle, current_session) {
+        return Err(format!("No active background run matches '{run_id}'."));
+    }
     let status = status_snapshot(&handle);
     let state = status["state"].as_str().unwrap_or("").to_string();
     if is_terminal_state(&state) {
@@ -2186,6 +2390,25 @@ pub fn deliver_steer(
         ));
     }
     let steps: Vec<Value> = status["steps"].as_array().cloned().unwrap_or_default();
+    if steps
+        .iter()
+        .any(|step| step["acceptanceFinal"].as_bool() == Some(true))
+    {
+        return Err(
+            "Child completed its acceptance report; resume it for further guidance.".to_string(),
+        );
+    }
+    // S40: the child writes this marker as soon as its final assistant
+    // message is an acceptance report, before the run records the terminal
+    // step. Steer must be rejected during that finishing window too.
+    if steer_inbox_dir(&handle.run_dir, target_index.unwrap_or(0))
+        .join("steer-inbox-closed.json")
+        .exists()
+    {
+        return Err(
+            "Child completed its acceptance report; resume it for further guidance.".to_string(),
+        );
+    }
     let step_live = |step: &Value| {
         matches!(
             step["status"].as_str(),
@@ -2301,20 +2524,49 @@ pub fn read_run_status(run_id: &str) -> Result<Option<Value>, String> {
             ));
         }
     };
-    serde_json::from_str(&raw).map(Some).map_err(|error| {
+    let status: Value = serde_json::from_str(&raw).map_err(|error| {
         format!(
             "Corrupt status for run '{run_id}' at {}: {error}",
             path.display()
         )
-    })
+    })?;
+    // V19-03 S11 (#3116): the status file must name the run whose folder it
+    // sits in; a mismatch is refused with both names instead of resuming the
+    // id the child-controlled file claims.
+    if let Some(named) = status["runId"].as_str()
+        && named != run_id
+    {
+        return Err(format!(
+            "Status file '{}' names run '{}', but the run directory is '{}'; resume is refused.",
+            path.display(),
+            named,
+            run_id
+        ));
+    }
+    Ok(Some(status))
 }
 
 /// `requestAsyncInterrupt`: pause marker; the run becomes `paused` between
 /// children and can be `resume`d.
+#[allow(dead_code)]
 pub fn interrupt_run(query: &str) -> Result<Value, String> {
+    interrupt_run_for_session(query, None)
+}
+
+/// V19-03 S24: owner-scoped interrupt — a run owned by another session is
+/// invisible to this one (local ownership; no cross-window routing).
+pub fn interrupt_run_for_session(
+    query: &str,
+    current_session: Option<&str>,
+) -> Result<Value, String> {
     let handle =
         find_active_run(query).ok_or_else(|| format!("No active async run matches '{query}'."))?;
+    if !run_owned_by(&handle, current_session) {
+        return Err(format!("No active async run matches '{query}'."));
+    }
     handle.control.request_interrupt();
+    // V19-03 S11: a paused run is resumable; the trusted record must say so.
+    crate::recovery::set_record_state(&handle.run_id, STATE_PAUSED);
     let control_dir = handle.run_dir.join("control");
     let _ = std::fs::create_dir_all(&control_dir);
     let _ = std::fs::write(
@@ -2330,10 +2582,123 @@ pub fn interrupt_run(query: &str) -> Result<Value, String> {
     Ok(status_snapshot(&handle))
 }
 
+/// V19-03 S24: run ownership is the parent session id recorded at launch
+/// (a fork gets a new id). `None` on either side keeps the local default
+/// (single-window hosts).
+pub fn run_owned_by(handle: &AsyncRunHandle, current_session: Option<&str>) -> bool {
+    let status = handle
+        .status
+        .read()
+        .unwrap_or_else(|error| error.into_inner());
+    status_owned_by(&status, current_session)
+}
+
+/// Ownership check for a status snapshot (list/fleet/wait surfaces).
+pub fn status_owned_by(status: &Value, current_session: Option<&str>) -> bool {
+    let Some(current) = current_session else {
+        return true;
+    };
+    match status["sessionId"].as_str() {
+        Some(owner) => owner == current,
+        None => true,
+    }
+}
+
 /// All live runs for the status listing.
 pub fn list_runs() -> Vec<Value> {
     let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
     runs.values().map(|h| status_snapshot(h)).collect()
+}
+
+/// Live runs owned by `current_session` (S24: list/status must not expose
+/// another session's runs). `None` keeps the single-window default.
+pub fn list_runs_for_session(current_session: Option<&str>) -> Vec<Value> {
+    let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    runs.values()
+        .filter(|handle| run_owned_by(handle, current_session))
+        .map(|h| status_snapshot(h))
+        .collect()
+}
+
+/// S12: result files whose completion notice has not reached this session
+/// yet. A result file is removed after a successful `sendMessage`.
+pub fn pending_result_count(session_id: Option<&str>) -> usize {
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(async_results_dir()) else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(result) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(run_id) = result["runId"].as_str() else {
+            continue;
+        };
+        let status = async_runs_dir().join(run_id).join("status.json");
+        let Ok(raw) = std::fs::read_to_string(status) else {
+            continue;
+        };
+        let Ok(status) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if status["sessionId"].as_str() == Some(session_id) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// S12: move this process's live run ownership to the successor session.
+pub fn reassign_owner(old_session: &str, new_session: &str) {
+    if old_session.is_empty() || new_session.is_empty() || old_session == new_session {
+        return;
+    }
+    let handles: Vec<Arc<AsyncRunHandle>> = ASYNC_RUNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    for handle in handles {
+        let owned = {
+            let status = handle.status.read().unwrap_or_else(|e| e.into_inner());
+            status["sessionId"].as_str() == Some(old_session)
+        };
+        if owned {
+            update_status(&handle, |status| {
+                status["sessionId"] = json!(new_session);
+            });
+        }
+    }
+    // Runs retained on disk but not in this process's registry.
+    let Ok(entries) = std::fs::read_dir(async_runs_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("status.json");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut status) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if status["sessionId"].as_str() != Some(old_session) {
+            continue;
+        }
+        status["sessionId"] = json!(new_session);
+        status["updatedAt"] = json!(iso8601(now_millis()));
+        let _ = crate::artifacts::write_metadata(&path, &status);
+    }
 }
 
 /// Has any run in the non-terminal states? (auto-drain probe)
@@ -2415,7 +2780,8 @@ pub async fn harvest_for_shutdown() {
         // The host-shutdown stop is terminal too: surface a deferred
         // status-write failure after the terminal event (TE17 R7.1.7.1).
         flush_pending_status_write_failure(handle);
-        crate::p1::supervisor::close_requests_for_run(&handle.run_id);
+        crate::p1::supervisor::close_requests_for_run_with_kind(&handle.run_id, "stopped");
+        crate::recovery::finish_record(&handle.run_id, STATE_STOPPED);
         unregister_run(&handle.run_id);
     }
 }
@@ -2424,6 +2790,126 @@ pub async fn harvest_for_shutdown() {
 /// stuck in queued/running whose owner host pid is dead get their recorded
 /// children signalled (SIGTERM → bounded poll → SIGKILL, bootId-guarded
 /// against pid reuse) and are then marked failed(stale).
+/// S49 (#3261): result files are written before the final status; when the
+/// owner died in that window the result is better evidence than a generic
+/// "stale" failure. Mirrors upstream `readResultRepairData` /
+/// `terminalStatusFromResult` (stale-run-reconciler.ts:120-208).
+struct ResultRepairData {
+    state: &'static str,
+    error: Option<String>,
+    results: Vec<Value>,
+}
+
+fn read_result_repair_data(run_id: &str) -> Option<ResultRepairData> {
+    let path = async_results_dir().join(format!("{run_id}.json"));
+    let raw = std::fs::read_to_string(path).ok()?;
+    let data: Value = serde_json::from_str(&raw).ok()?;
+    let state = if data["success"].as_bool() == Some(true) {
+        STATE_COMPLETE
+    } else {
+        match data["state"].as_str() {
+            Some("stopped") => STATE_STOPPED,
+            Some("rejected") => STATE_REJECTED,
+            Some("partial") => STATE_PARTIAL,
+            Some("paused") => STATE_PAUSED,
+            _ if data["exitCode"].as_i64() == Some(0) => STATE_PAUSED,
+            _ => STATE_FAILED,
+        }
+    };
+    let error = data["error"]
+        .as_str()
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            data["results"].as_array().and_then(|results| {
+                results.iter().find_map(|child| {
+                    (child["success"].as_bool() == Some(false))
+                        .then(|| child["error"].as_str().map(str::trim))
+                        .flatten()
+                        .filter(|error| !error.is_empty())
+                        .map(str::to_string)
+                })
+            })
+        });
+    Some(ResultRepairData {
+        state,
+        error,
+        results: data["results"].as_array().cloned().unwrap_or_default(),
+    })
+}
+
+fn apply_result_repair(status: &mut Value, repair: &ResultRepairData, now: u64) {
+    let now_iso = iso8601(now);
+    status["state"] = json!(repair.state);
+    if let Some(error) = &repair.error
+        && matches!(repair.state, STATE_FAILED | STATE_PARTIAL)
+    {
+        status["error"] = json!(error);
+    }
+    status["updatedAt"] = json!(now_iso);
+    status["endedAt"] = status
+        .get("endedAt")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| json!(now_iso));
+    if repair.state == STATE_STOPPED {
+        status["stopped"] = json!(true);
+    }
+    if let Some(object) = status.as_object_mut() {
+        object.remove("activityState");
+        object.remove("lastActivityAt");
+    }
+    if let Some(steps) = status["steps"].as_array_mut() {
+        for (index, step) in steps.iter_mut().enumerate() {
+            let live = matches!(
+                step["status"].as_str(),
+                Some("running") | Some("pending") | Some("queued")
+            );
+            if !live {
+                continue;
+            }
+            let child = repair.results.get(index);
+            let child_state = match child.and_then(|child| child["success"].as_bool()) {
+                Some(true) => STATE_COMPLETE,
+                Some(false) => STATE_FAILED,
+                None => repair.state,
+            };
+            step["status"] = json!(child_state);
+            step["endedAt"] = json!(now_iso);
+            if let Some(started) = step["startedAt"].as_u64()
+                && step["durationMs"].is_null()
+            {
+                step["durationMs"] = json!(now.saturating_sub(started));
+            }
+            step["exitCode"] = json!(if matches!(child_state, STATE_COMPLETE | STATE_PAUSED) {
+                0
+            } else {
+                1
+            });
+            if let Some(error) = child
+                .and_then(|child| child["error"].as_str())
+                .filter(|error| !error.trim().is_empty())
+                && matches!(child_state, STATE_FAILED | STATE_PARTIAL | STATE_STOPPED)
+            {
+                step["error"] = json!(error);
+            }
+            if child_state == STATE_STOPPED {
+                step["stopped"] = json!(true);
+            }
+            if let Some(child) = child {
+                for key in ["sessionFile", "sessionName", "model", "thinking"] {
+                    if step.get(key).is_none_or(Value::is_null)
+                        && let Some(value) = child.get(key).cloned()
+                    {
+                        step[key] = value;
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn reconcile_stale_runs() {
     let Ok(entries) = std::fs::read_dir(async_runs_dir()) else {
         return;
@@ -2460,36 +2946,56 @@ pub fn reconcile_stale_runs() {
         // recorded pids survive the host crash in an independent process
         // group and would otherwise hang forever on the full stdout pipe.
         let mut reaped = Vec::new();
-        for (pid, boot_id) in recorded_child_pids(&run_dir) {
+        let run_id = status["runId"].as_str().unwrap_or_default();
+        for (pid, boot_id) in recorded_child_pids(run_id) {
             if !pid_matches(pid, boot_id) {
+                continue;
+            }
+            if !is_safe_reap_target(pid) {
+                append_event(
+                    &run_dir,
+                    "run.reconcile_skipped_pid",
+                    json!({ "reason": "unsafe-target", "pid": pid }),
+                );
                 continue;
             }
             reap_orphan_pid(pid);
             reaped.push(pid);
         }
-        status["state"] = json!(STATE_FAILED);
-        status["error"] = json!("stale: owning host process exited before the run finished");
-        status["updatedAt"] = json!(iso8601(now_millis()));
-        if let Some(object) = status.as_object_mut() {
-            object.remove("activityState");
-            object.remove("lastActivityAt");
+        // S49: a result file written before the owner died carries the real
+        // outcome; only runs without one get the generic stale failure.
+        let repaired = read_result_repair_data(run_id);
+        if let Some(repair) = &repaired {
+            apply_result_repair(&mut status, repair, now_millis());
+        } else {
+            status["state"] = json!(STATE_FAILED);
+            status["error"] = json!("stale: owning host process exited before the run finished");
+            status["updatedAt"] = json!(iso8601(now_millis()));
+            if let Some(object) = status.as_object_mut() {
+                object.remove("activityState");
+                object.remove("lastActivityAt");
+            }
+            settle_unfinished_steps(
+                &mut status,
+                "failed",
+                "stale: owning host process exited before the run finished",
+            );
+            clear_steps_terminal(&mut status);
         }
-        settle_unfinished_steps(
-            &mut status,
-            "failed",
-            "stale: owning host process exited before the run finished",
-        );
-        clear_steps_terminal(&mut status);
         let write_result = crate::artifacts::write_metadata(&status_path, &status);
         append_event(
             &run_dir,
             "run.reconciled",
-            json!({ "reason": "owner-dead", "reapedChildPids": reaped }),
+            json!({
+                "reason": "owner-dead",
+                "repairedState": status["state"],
+                "reapedChildPids": reaped,
+            }),
         );
         // The run is terminal now; close its pending supervisor asks so a
         // later wait/drain does not keep yielding on a dead owner.
         if let Some(run_id) = status["runId"].as_str() {
-            crate::p1::supervisor::close_requests_for_run(run_id);
+            crate::p1::supervisor::close_requests_for_run_with_kind(run_id, "interrupted");
         }
         // The reconciled write is terminal: a failure surfaces after
         // run.reconciled (TE17 R7.1.7.1 — no run handle exists here, so the
@@ -2501,6 +3007,103 @@ pub fn reconcile_stale_runs() {
                 "run.status_write_failed",
                 write_failure_payload(run_id, &status_path, &error),
             );
+        }
+    }
+}
+
+/// V19-03 S09 (#3098): remove finished run folders on disk. A run whose
+/// child session file still exists is kept for 90 days (resumable), any
+/// other finished run for 30; active runs are never touched. The trusted
+/// launch folder is removed with its run. Best-effort: a failed removal is a
+/// warning, not a host exit.
+pub fn cleanup_expired_runs() {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(async_runs_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let run_dir = entry.path();
+        if !run_dir.is_dir() {
+            continue;
+        }
+        let status_path = run_dir.join("status.json");
+        let Ok(raw) = std::fs::read_to_string(&status_path) else {
+            // A run folder without status is not a finished run this sweep
+            // owns; stale reconciliation handles the crash branch.
+            continue;
+        };
+        let Ok(status) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if matches!(
+            status["state"].as_str().unwrap_or(""),
+            STATE_QUEUED | STATE_RUNNING | STATE_PAUSED
+        ) {
+            continue;
+        }
+        let run_id = status["runId"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| entry.file_name().to_str().map(str::to_string));
+        let Some(run_id) = run_id else {
+            continue;
+        };
+        let age = status_path
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let session_exists = status["sessionFile"]
+            .as_str()
+            .map(|file| Path::new(file).is_file())
+            .unwrap_or(false)
+            || status["steps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|step| step["sessionFile"].as_str())
+                .any(|file| Path::new(file).is_file());
+        let max_age = if session_exists {
+            90 * DAY_MS
+        } else {
+            30 * DAY_MS
+        };
+        if age <= max_age {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&run_dir) {
+            tracing::warn!(run_id = %run_id, error = %error, "failed to remove expired async run");
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+        crate::p1::supervisor::close_requests_for_run_with_kind(&run_id, "expired");
+    }
+    // Orphaned launch folders (run folder already gone): 30 days.
+    let launches = crate::paths::temp_root_dir().join("async-subagent-launches");
+    if let Ok(entries) = std::fs::read_dir(&launches) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let age = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            if age > 30 * DAY_MS {
+                // A launch folder belongs to a run folder; the run sweep owns
+                // its retention (30/90 days, paused kept). Only remove truly
+                // orphaned folders, otherwise a 31-day-old launch folder
+                // would delete the trusted record of a 90-day resumable run.
+                let run_id = entry.file_name().to_string_lossy().to_string();
+                if async_runs_dir().join(&run_id).exists() {
+                    continue;
+                }
+                let _ = std::fs::remove_dir_all(&path);
+            }
         }
     }
 }
@@ -2560,7 +3163,12 @@ pub async fn wait_for_runs_with_session_asks(
     let is_terminal = |state: &str| {
         matches!(
             state,
-            STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
+            STATE_COMPLETE
+                | STATE_FAILED
+                | STATE_STOPPED
+                | STATE_PAUSED
+                | STATE_REJECTED
+                | STATE_PARTIAL
         )
     };
     // subagent-wait.ts:552-566: the wait tracks the runs ACTIVE WHEN IT
@@ -2588,6 +3196,7 @@ pub async fn wait_for_runs_with_session_asks(
                         .filter(|h| {
                             let status = h.status.read().unwrap_or_else(|e| e.into_inner());
                             !is_terminal(status["state"].as_str().unwrap_or(""))
+                                && status_owned_by(&status, orchestrator_session_id)
                         })
                         .map(|h| h.run_id.clone())
                 };
@@ -2606,6 +3215,7 @@ pub async fn wait_for_runs_with_session_asks(
                 .filter(|h| {
                     let status = h.status.read().unwrap_or_else(|e| e.into_inner());
                     !is_terminal(status["state"].as_str().unwrap_or(""))
+                        && status_owned_by(&status, orchestrator_session_id)
                 })
                 .map(|h| h.run_id.clone())
                 .collect(),
@@ -3174,7 +3784,15 @@ pub(crate) mod tests {
             status["activityState"] = json!("needs_attention");
             status["lastActivityAt"] = json!(2);
         });
-        finish_failed(&handle, "chain step failed", &AsyncNotify { calls: None }).await;
+        finish_failed(
+            &handle,
+            "chain step failed",
+            &AsyncNotify {
+                calls: None,
+                session_id: None,
+            },
+        )
+        .await;
         let status = status_snapshot(&handle);
         assert_eq!(status["state"], json!(STATE_FAILED));
         assert!(status.get("activityState").is_none(), "{status}");
@@ -3221,7 +3839,15 @@ pub(crate) mod tests {
             status["steps"][0]["currentTool"] = json!("bash");
         });
         handle.control.request_stop();
-        finish_failed(&handle, "spawn failed", &AsyncNotify { calls: None }).await;
+        finish_failed(
+            &handle,
+            "spawn failed",
+            &AsyncNotify {
+                calls: None,
+                session_id: None,
+            },
+        )
+        .await;
         let status = status_snapshot(&handle);
         assert_eq!(status["state"], json!(STATE_STOPPED));
         assert_eq!(status["stopped"], json!(true));
@@ -3847,7 +4473,15 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn failed_completion_notice_is_kept_and_resent_on_session_start() {
+        let _registry = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _session = CURRENT_SESSION_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_current_session_for_test();
         let run_id = format!(
             "resend-{}-{}",
             std::process::id(),
@@ -3878,7 +4512,10 @@ pub(crate) mod tests {
             cookie: 0,
         };
         FAKE_SEND_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
-        let notify = AsyncNotify { calls: Some(calls) };
+        let notify = AsyncNotify {
+            calls: Some(calls),
+            session_id: None,
+        };
         notify
             .send(&handle, STATE_COMPLETE, "report body", None)
             .await;
@@ -3909,6 +4546,151 @@ pub(crate) mod tests {
             FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst) > before,
             "resend issued a sendMessage"
         );
+        reset_current_session_for_test();
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn completion_is_not_delivered_to_a_non_owner_session() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _session = CURRENT_SESSION_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_current_session_for_test();
+        let run_id = format!("notify-owner-{}", std::process::id());
+        let run_dir = async_runs_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let status = json!({
+            "runId": run_id,
+            "sessionId": "session-old",
+            "mode": "single",
+            "state": STATE_COMPLETE,
+            "steps": [{ "agent": "scout", "status": "complete" }],
+        });
+        crate::artifacts::write_metadata(&run_dir.join("status.json"), &status).unwrap();
+        let handle = Arc::new(AsyncRunHandle {
+            run_id: run_id.clone(),
+            status: Arc::new(RwLock::new(status)),
+            control: Arc::new(AsyncControl::default()),
+            run_dir: run_dir.clone(),
+            started_ms: 0,
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
+        });
+        let calls = crate::AsyncHostCalls {
+            call: fake_notify_host_call,
+            cookie: 0,
+        };
+        let notify = AsyncNotify {
+            calls: Some(calls),
+            session_id: Some("session-old".to_string()),
+        };
+        let result_path = async_results_dir().join(format!("{run_id}.json"));
+        let _ = std::fs::remove_file(&result_path);
+
+        FAKE_SEND_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        let before = FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        set_current_session_for_test(Some("session-new"));
+        notify.send(&handle, STATE_COMPLETE, "done", None).await;
+        assert_eq!(
+            FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "non-owner session must not receive the completion"
+        );
+        assert!(result_path.exists(), "result stays pending for the owner");
+        let events = std::fs::read_to_string(run_dir.join("events.jsonl")).unwrap_or_default();
+        assert!(events.contains("run.completion_deferred"), "{events}");
+
+        set_current_session_for_test(Some("session-old"));
+        notify.send(&handle, STATE_COMPLETE, "done", None).await;
+        assert!(
+            FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "owner session receives the completion"
+        );
+        assert!(!result_path.exists());
+        reset_current_session_for_test();
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    /// S24 take: the run's status owner is the new session, but the host-call
+    /// channel still belongs to the launch session. The completion must be
+    /// deferred (result kept) so the new owner's `resend_pending_results`
+    /// delivers it, not sent through the old channel.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn completion_take_is_deferred_to_the_new_owner() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _session = CURRENT_SESSION_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_current_session_for_test();
+        let run_id = format!("notify-take-{}", std::process::id());
+        let run_dir = async_runs_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let status = json!({
+            "runId": run_id,
+            "sessionId": "session-new",
+            "mode": "single",
+            "state": STATE_COMPLETE,
+            "steps": [{ "agent": "scout", "status": "complete" }],
+        });
+        crate::artifacts::write_metadata(&run_dir.join("status.json"), &status).unwrap();
+        let handle = Arc::new(AsyncRunHandle {
+            run_id: run_id.clone(),
+            status: Arc::new(RwLock::new(status)),
+            control: Arc::new(AsyncControl::default()),
+            run_dir: run_dir.clone(),
+            started_ms: 0,
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
+        });
+        let calls = crate::AsyncHostCalls {
+            call: fake_notify_host_call,
+            cookie: 0,
+        };
+        // Launched by session-old, then taken over by session-new.
+        let notify = AsyncNotify {
+            calls: Some(calls),
+            session_id: Some("session-old".to_string()),
+        };
+        let result_path = async_results_dir().join(format!("{run_id}.json"));
+        let _ = std::fs::remove_file(&result_path);
+
+        FAKE_SEND_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        let before = FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        set_current_session_for_test(Some("session-new"));
+        notify.send(&handle, STATE_COMPLETE, "done", None).await;
+        assert_eq!(
+            FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "a taken run must not send through the launch session's host channel"
+        );
+        assert!(
+            result_path.exists(),
+            "result stays pending for the new owner"
+        );
+        let events = std::fs::read_to_string(run_dir.join("events.jsonl")).unwrap_or_default();
+        assert!(events.contains("run.completion_deferred"), "{events}");
+
+        // The new owner's session_start resends the pending result.
+        let calls = crate::AsyncHostCalls {
+            call: fake_notify_host_call,
+            cookie: 0,
+        };
+        resend_pending_results(&calls, Some("session-new"));
+        assert!(
+            FAKE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "new owner receives the pending completion"
+        );
+        assert!(!result_path.exists());
+        reset_current_session_for_test();
         let _ = std::fs::remove_dir_all(&run_dir);
     }
 
@@ -3920,7 +4702,10 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&result_dir);
         let _ = std::fs::remove_file(&result_dir);
         block_target(&result_dir);
-        let notify = AsyncNotify { calls: None };
+        let notify = AsyncNotify {
+            calls: None,
+            session_id: None,
+        };
         notify.send(&handle, STATE_COMPLETE, "done", None).await;
         let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
         let failure_line = events
@@ -4012,9 +4797,158 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&channel);
     }
 
+    #[test]
+    fn stale_reconciler_repairs_from_a_result_file() {
+        let cases = [
+            (
+                "complete",
+                json!({ "success": true, "results": [{ "success": true }] }),
+                STATE_COMPLETE,
+                "complete",
+            ),
+            (
+                "partial",
+                json!({ "state": "partial", "results": [{ "success": true }, { "success": false, "error": "boom" }] }),
+                STATE_PARTIAL,
+                "complete",
+            ),
+            (
+                "stopped",
+                json!({ "state": "stopped" }),
+                STATE_STOPPED,
+                "stopped",
+            ),
+        ];
+        for (tag, result, expected_state, expected_step) in cases {
+            let run_id = format!("recon-result-{tag}-{}", std::process::id());
+            let dir = async_runs_dir().join(&run_id);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            crate::artifacts::write_metadata(
+                &dir.join("status.json"),
+                &json!({
+                    "runId": run_id,
+                    "state": STATE_RUNNING,
+                    "ownerPid": 4000000,
+                    "steps": [
+                        { "agent": "a", "status": "running" },
+                        { "agent": "b", "status": "running" },
+                    ],
+                }),
+            )
+            .unwrap();
+            std::fs::create_dir_all(async_results_dir()).unwrap();
+            let result_path = async_results_dir().join(format!("{run_id}.json"));
+            crate::artifacts::write_metadata(&result_path, &result).unwrap();
+            reconcile_stale_runs();
+            let status: Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("status.json")).unwrap())
+                    .unwrap();
+            assert_eq!(status["state"], json!(expected_state), "{tag}: {status}");
+            assert_eq!(
+                status["steps"][0]["status"],
+                json!(expected_step),
+                "{tag}: {status}"
+            );
+            if tag == "partial" {
+                assert_eq!(status["steps"][1]["status"], json!("failed"));
+                assert_eq!(status["steps"][1]["error"], json!("boom"));
+            }
+            let _ = std::fs::remove_file(result_path);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn drained_failure_routes_to_stopped() {
+        let run_id = format!("drain-failed-{}", std::process::id());
+        let body = AsyncBody::Single {
+            spec: Box::new(crate::p1::launch_child::ChildSpec::default()),
+        };
+        let handle = start_run(&run_id, Some("s"), &body);
+        handle.control.request_drain();
+        let notify = AsyncNotify {
+            calls: None,
+            session_id: Some("s".to_string()),
+        };
+        finish_failed(&handle, "launch failed", &notify).await;
+        let status = status_snapshot(&handle);
+        assert_eq!(status["state"], json!(STATE_STOPPED));
+        assert_eq!(status["stoppedReason"], json!("drain-request"));
+        ASYNC_RUNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id);
+        let _ = std::fs::remove_dir_all(async_runs_dir().join(&run_id));
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+    }
+
+    #[tokio::test]
+    async fn drained_finish_marks_queued_steps_stopped() {
+        let run_id = format!("drain-finish-{}", std::process::id());
+        let body = AsyncBody::Single {
+            spec: Box::new(crate::p1::launch_child::ChildSpec::default()),
+        };
+        let handle = start_run(&run_id, Some("s"), &body);
+        handle.control.request_drain();
+        let notify = AsyncNotify {
+            calls: None,
+            session_id: Some("s".to_string()),
+        };
+        finish_with_handoff(&handle, STATE_FAILED, "child failed", None, &notify).await;
+        let status = status_snapshot(&handle);
+        assert_eq!(status["state"], json!(STATE_STOPPED));
+        assert_eq!(status["stoppedReason"], json!("drain-request"));
+        assert_eq!(status["steps"][0]["status"], json!("stopped"));
+        ASYNC_RUNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id);
+        let _ = std::fs::remove_dir_all(async_runs_dir().join(&run_id));
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+    }
+
+    #[test]
+    fn live_runner_between_result_and_final_status_is_not_repaired() {
+        // S49 (#3261): a result file written just before the final status
+        // must not make reconciliation replace a live runner's status with a
+        // placeholder terminal state.
+        let run_id = format!("result-window-{}", std::process::id());
+        let dir = async_runs_dir().join(&run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::artifacts::write_metadata(
+            &dir.join("status.json"),
+            &json!({
+                "runId": run_id,
+                "state": STATE_RUNNING,
+                "sessionId": "s",
+                "ownerPid": std::process::id(),
+                "ownerBootId": process_boot_id(std::process::id() as u64),
+                "mode": "single",
+            }),
+        )
+        .unwrap();
+        let result_path = async_results_dir().join(format!("{run_id}.json"));
+        std::fs::create_dir_all(async_results_dir()).unwrap();
+        crate::artifacts::write_metadata(
+            &result_path,
+            &json!({ "runId": run_id, "state": "complete", "output": "done" }),
+        )
+        .unwrap();
+        reconcile_stale_runs();
+        let status: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["state"], json!(STATE_RUNNING));
+        assert_ne!(status["state"], json!("unknown(observer-unavailable)"));
+        let _ = std::fs::remove_file(result_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn stale_reconciler_reaps_orphaned_child_processes() {
+        use std::os::unix::process::CommandExt;
         use std::process::Command;
         // A stand-in for a subagent child that outlived its crashed host:
         // independent process group, still running.
@@ -4022,22 +4956,23 @@ pub(crate) mod tests {
             .arg("30")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()
             .expect("spawn sleep");
         let pid = orphan.id() as u64;
-        let dir = async_runs_dir().join(format!("recon-orphan-{}", std::process::id()));
+        let run_id = format!("recon-orphan-{}", std::process::id());
+        let dir = async_runs_dir().join(&run_id);
         std::fs::create_dir_all(&dir).unwrap();
-        // children.jsonl first: status.json is the reconciler's entry
-        // condition, and a concurrent test's reconcile sweep must not mark
-        // the run terminal before the pid record exists.
+        // The ledger is parent-owned (launch folder); status.json is the
+        // reconciler's entry condition, so write the pid first.
         crate::artifacts::append_jsonl(
-            &dir.join("children.jsonl"),
+            &crate::recovery::child_pid_ledger_path(&run_id),
             &json!({ "pid": pid, "bootId": process_boot_id(pid) }).to_string(),
         );
         crate::artifacts::write_metadata(
             &dir.join("status.json"),
             &json!({
-                "runId": "orphans",
+                "runId": run_id,
                 "state": STATE_RUNNING,
                 "ownerPid": 4000000, // not a live pid on this system
             }),
@@ -4061,31 +4996,35 @@ pub(crate) mod tests {
         assert!(events.contains("run.reconciled"));
         assert!(events.contains(&format!("{pid}")));
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
     }
 
     #[cfg(unix)]
     #[test]
     fn stale_reconciler_skips_reused_pids() {
+        use std::os::unix::process::CommandExt;
         use std::process::Command;
         let mut child = Command::new("sleep")
             .arg("30")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()
             .expect("spawn sleep");
         let pid = child.id() as u64;
-        let dir = async_runs_dir().join(format!("recon-reuse-{}", std::process::id()));
+        let run_id = format!("recon-reuse-{}", std::process::id());
+        let dir = async_runs_dir().join(&run_id);
         std::fs::create_dir_all(&dir).unwrap();
         // bootId deliberately wrong → the live pid must not be signalled.
         // Written before status.json for the same race reason as above.
         crate::artifacts::append_jsonl(
-            &dir.join("children.jsonl"),
+            &crate::recovery::child_pid_ledger_path(&run_id),
             &json!({ "pid": pid, "bootId": 1 }).to_string(),
         );
         crate::artifacts::write_metadata(
             &dir.join("status.json"),
             &json!({
-                "runId": "reuse",
+                "runId": run_id,
                 "state": STATE_RUNNING,
                 "ownerPid": 4000000,
             }),
@@ -4096,6 +5035,100 @@ pub(crate) mod tests {
         assert!(pid_alive(pid), "mismatched bootId must be left alone");
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciler_never_targets_self_init_or_ancestors() {
+        assert!(!is_safe_reap_target(0));
+        assert!(!is_safe_reap_target(1));
+        assert!(!is_safe_reap_target(u64::from(std::process::id())));
+        let parent = process_parent_pid(u64::from(std::process::id())).unwrap_or(0);
+        if parent > 1 {
+            assert!(
+                !is_safe_reap_target(parent),
+                "parent must never be signalled"
+            );
+        }
+    }
+
+    /// The ledger is advisory: even a forged entry must pass the process
+    /// group-leader check before any signal. A child sharing the host's
+    /// process group is not a subagent child and must be left alone.
+    #[cfg(unix)]
+    #[test]
+    fn reconciler_skips_a_pid_that_is_not_a_process_group_leader() {
+        use std::process::Command;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as u64;
+        let run_id = format!("recon-nonleader-{}", std::process::id());
+        let dir = async_runs_dir().join(&run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::artifacts::append_jsonl(
+            &crate::recovery::child_pid_ledger_path(&run_id),
+            &json!({ "pid": pid, "bootId": process_boot_id(pid) }).to_string(),
+        );
+        crate::artifacts::write_metadata(
+            &dir.join("status.json"),
+            &json!({
+                "runId": run_id,
+                "state": STATE_RUNNING,
+                "ownerPid": 4000000,
+            }),
+        )
+        .unwrap();
+        reconcile_stale_runs();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            pid_alive(pid),
+            "a non-leader pid must not be signalled even when the ledger names it"
+        );
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+        assert!(events.contains("run.reconcile_skipped_pid"), "{events}");
+        assert!(events.contains("unsafe-target"), "{events}");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciler_ignores_a_forged_run_dir_ledger() {
+        // The child-writable run folder must not be able to seed pids; only
+        // the parent-owned launch ledger is read.
+        let run_id = format!("recon-forged-{}", std::process::id());
+        let dir = async_runs_dir().join(&run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid = u64::from(std::process::id());
+        crate::artifacts::append_jsonl(
+            &dir.join("children.jsonl"),
+            &json!({ "pid": pid, "bootId": process_boot_id(pid) }).to_string(),
+        );
+        crate::artifacts::write_metadata(
+            &dir.join("status.json"),
+            &json!({
+                "runId": run_id,
+                "state": STATE_RUNNING,
+                "ownerPid": 4000000,
+            }),
+        )
+        .unwrap();
+        reconcile_stale_runs();
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+        let reconciled: Value = events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["type"] == json!("run.reconciled"))
+            .expect("run.reconciled event");
+        assert_eq!(reconciled["reapedChildPids"], json!([]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4178,12 +5211,7 @@ pub(crate) mod tests {
     fn record_child_pid_writes_only_for_async_runs() {
         // The async-runs root holds no directory for this id → no file.
         record_child_pid("no-such-run-id-xyz", 4242);
-        assert!(
-            !async_runs_dir()
-                .join("no-such-run-id-xyz")
-                .join("children.jsonl")
-                .exists()
-        );
+        assert!(!crate::recovery::child_pid_ledger_path("no-such-run-id-xyz").exists());
     }
 
     // ---- V13-01 FR-C: status write coalescing + terminal flush ---------
@@ -4232,6 +5260,7 @@ pub(crate) mod tests {
             timed_out: false,
             process_signal: None,
             output_partial: false,
+            acceptance_final: false,
             tool_count: 0,
             turns: 1,
             activity_state: None,
@@ -4372,7 +5401,10 @@ pub(crate) mod tests {
             &handle,
             STATE_COMPLETE,
             "stopped after step 1",
-            &AsyncNotify { calls: None },
+            &AsyncNotify {
+                calls: None,
+                session_id: None,
+            },
         )
         .await;
         let status = status_snapshot(&handle);
@@ -4398,7 +5430,10 @@ pub(crate) mod tests {
         finish_detached_with_result(
             &handle,
             &result,
-            &AsyncNotify { calls: None },
+            &AsyncNotify {
+                calls: None,
+                session_id: None,
+            },
             Path::new("/tmp/detached-cwd"),
         )
         .await;
@@ -4474,12 +5509,14 @@ pub(crate) mod tests {
                     Value::Bool(false) => crate::p1::launch_child::OutputOverride::Disabled,
                     _ => crate::p1::launch_child::OutputOverride::Inherit,
                 },
+                inherited_output: None,
                 timeout_ms: None,
                 child_index: index,
                 skills: None,
                 gate: None,
                 turn_budget: None,
                 tool_budget: None,
+                output_schema: None,
                 session_file: None,
                 steer_inbox: None,
                 context_profile: false,
@@ -4768,7 +5805,7 @@ pub(crate) mod tests {
         let _handle = steer_test_run(&run_id, &run_dir);
         write_pending_ask(&run_id, "req-1");
 
-        let error = deliver_steer(&run_id, "change of plans", "steer", None)
+        let error = deliver_steer(&run_id, "change of plans", "steer", None, None)
             .expect_err("pending ask must block the steer");
         // The rejection carries the guidance + the request id (FR-A).
         assert!(error.contains("need_decision"), "{error}");
@@ -4785,7 +5822,7 @@ pub(crate) mod tests {
 
         // Answering (consuming the ask) unblocks the normal path.
         remove_ask(&run_id, "req-1");
-        let request = deliver_steer(&run_id, "change of plans", "steer", None)
+        let request = deliver_steer(&run_id, "change of plans", "steer", None, None)
             .expect("steer delivers once the ask is answered");
         assert_eq!(request["targetIndex"], json!(0));
         assert!(steer_inbox_dir(&run_dir, 0).is_dir());
@@ -4835,7 +5872,7 @@ pub(crate) mod tests {
             status["state"] = json!(STATE_COMPLETE);
             status["steps"][0]["status"] = json!("complete");
         }
-        let error = deliver_steer(&run_id, "hello?", "steer", None)
+        let error = deliver_steer(&run_id, "hello?", "steer", None, None)
             .expect_err("terminal runs cannot be steered");
         assert!(
             error.contains("is complete and cannot be steered"),
@@ -4865,18 +5902,18 @@ pub(crate) mod tests {
         }
         // Out of range: names the available range.
         let error =
-            deliver_steer(&run_id, "m", "steer", Some(5)).expect_err("index 5 out of range");
+            deliver_steer(&run_id, "m", "steer", Some(5), None).expect_err("index 5 out of range");
         assert!(error.contains("has 2 children"), "{error}");
         assert!(error.contains("Index 5 is out of range"), "{error}");
         // Terminal child: refuses to steer it.
-        let error = deliver_steer(&run_id, "m", "steer", Some(1))
+        let error = deliver_steer(&run_id, "m", "steer", Some(1), None)
             .expect_err("terminal child cannot be steered");
         assert!(
             error.contains("child 1 is complete and cannot be steered"),
             "{error}"
         );
         // Live child at an explicit index delivers to THAT inbox.
-        let request = deliver_steer(&run_id, "m", "steer", Some(0)).expect("index 0 steers");
+        let request = deliver_steer(&run_id, "m", "steer", Some(0), None).expect("index 0 steers");
         assert_eq!(request["targetIndex"], json!(0));
         assert!(steer_inbox_dir(&run_dir, 0).is_dir());
         unregister_run(&run_id);
@@ -4979,14 +6016,270 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn steer_is_rejected_during_the_acceptance_finishing_window() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("steer-finishing-{}", std::process::id());
+        let run_dir = std::env::temp_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let _handle = steer_test_run(&run_id, &run_dir);
+        let inbox = steer_inbox_dir(&run_dir, 0);
+        std::fs::create_dir_all(&inbox).unwrap();
+        // The child writes this as soon as its terminal acceptance report is
+        // seen; the run's step is still `running` at this point.
+        std::fs::write(inbox.join("steer-inbox-closed.json"), "{}").unwrap();
+        let error = deliver_steer(&run_id, "one more thing", "steer", None, None)
+            .expect_err("acceptance finishing window must reject steer");
+        assert!(error.contains("completed its acceptance report"), "{error}");
+        unregister_run(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
     fn steer_unknown_run_is_not_found() {
         let _guard = REGISTRY_TEST_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let error = deliver_steer("no-such-run-xyz", "m", "steer", None).unwrap_err();
+        let error = deliver_steer("no-such-run-xyz", "m", "steer", None, None).unwrap_err();
         assert!(
             error.contains("No active background run matches"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn owner_scope_covers_list_steer_and_wait() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("owner-scope-{}", std::process::id());
+        let run_dir = std::env::temp_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let _handle = steer_test_run(&run_id, &run_dir);
+        {
+            let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            let handle = runs.get(run_id.as_str()).expect("registered run");
+            let mut status = handle.status.write().unwrap_or_else(|e| e.into_inner());
+            status["sessionId"] = json!("session-a");
+        }
+        assert!(
+            list_runs_for_session(Some("session-a"))
+                .iter()
+                .any(|run| run["runId"] == json!(run_id))
+        );
+        assert!(
+            !list_runs_for_session(Some("session-b"))
+                .iter()
+                .any(|run| run["runId"] == json!(run_id))
+        );
+        assert!(
+            deliver_steer(&run_id, "m", "steer", None, Some("session-b")).is_err(),
+            "another session must not steer"
+        );
+        assert!(
+            deliver_steer(&run_id, "m", "steer", None, Some("session-a")).is_ok(),
+            "the owner may steer"
+        );
+        let error = wait_for_runs_with_session_asks(
+            Some(&run_id),
+            false,
+            10,
+            None,
+            None,
+            Some("session-b"),
+            true,
+        )
+        .await
+        .expect_err("another session must not wait on the run");
+        assert!(error.contains("No active run matched"), "{error}");
+        unregister_run(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+}
+
+#[cfg(test)]
+mod recovery_integration_tests {
+    use super::*;
+
+    #[test]
+    fn status_file_naming_another_run_is_refused() {
+        let run_id = format!("recovery-mismatch-{}", std::process::id());
+        let run_dir = async_runs_dir().join(&run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("status.json"),
+            serde_json::to_string(&json!({
+                "runId": "some-other-run",
+                "state": "complete",
+                "steps": [],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = read_run_status(&run_id).expect_err("mismatch refused");
+        assert!(error.contains("some-other-run"), "{error}");
+        assert!(error.contains(&run_id), "{error}");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+    }
+
+    #[tokio::test]
+    async fn start_run_writes_the_trusted_record() {
+        let run_id = format!("recovery-start-{}", std::process::id());
+        let body = AsyncBody::Single {
+            spec: Box::new(crate::p1::launch_child::ChildSpec {
+                agent_name: "scout".into(),
+                task: "t".into(),
+                ..Default::default()
+            }),
+        };
+        let handle = start_run(&run_id, Some("session-a"), &body);
+        let record = crate::recovery::read_record(&run_id)
+            .expect("read")
+            .expect("record exists before children");
+        assert_eq!(record.mode, "single");
+        assert_eq!(record.parent_session_id.as_deref(), Some("session-a"));
+        assert_eq!(record.state, "running");
+        finish_failed(
+            &handle,
+            "test failure",
+            &AsyncNotify {
+                calls: None,
+                session_id: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            crate::recovery::read_record(&run_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "failed"
+        );
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(&run_id));
+        unregister_run(&run_id);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    fn backdate(path: &Path, days: u64) {
+        let when =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);
+        // A read-only handle can still set times as the owner and also works
+        // for directories (a write handle on a directory is EISDIR).
+        let file = std::fs::File::open(path).expect("open");
+        file.set_modified(when).expect("set mtime");
+    }
+
+    fn fake_run(run_id: &str, session_file: Option<&Path>, age_days: u64) {
+        let run_dir = async_runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let status = json!({
+            "runId": run_id,
+            "state": "complete",
+            "steps": [{
+                "agent": "worker",
+                "status": "complete",
+                "sessionFile": session_file.map(|file| file.to_string_lossy().to_string()),
+            }],
+        });
+        let path = run_dir.join("status.json");
+        std::fs::write(&path, serde_json::to_string(&status).unwrap()).unwrap();
+        backdate(&path, age_days);
+    }
+
+    #[test]
+    fn retention_uses_30_days_or_90_when_the_session_survives() {
+        let base = std::env::temp_dir().join(format!("rpi-retention-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let session = base.join("child.jsonl");
+        std::fs::write(&session, "{}").unwrap();
+
+        let kept_run = format!("retention-keep-{}", std::process::id());
+        fake_run(&kept_run, Some(&session), 40);
+        let old_run = format!("retention-old-{}", std::process::id());
+        fake_run(&old_run, Some(&session), 91);
+        let no_session_run = format!("retention-nosession-{}", std::process::id());
+        fake_run(&no_session_run, None, 31);
+        let fresh_run = format!("retention-fresh-{}", std::process::id());
+        fake_run(&fresh_run, None, 29);
+
+        cleanup_expired_runs();
+
+        assert!(
+            async_runs_dir().join(&kept_run).is_dir(),
+            "40-day run with a live session is kept"
+        );
+        assert!(
+            !async_runs_dir().join(&old_run).is_dir(),
+            "91-day run is removed"
+        );
+        assert!(
+            !async_runs_dir().join(&no_session_run).is_dir(),
+            "31-day run without a session is removed"
+        );
+        assert!(
+            async_runs_dir().join(&fresh_run).is_dir(),
+            "29-day run is kept"
+        );
+
+        // The orphaned-launch-folder sweep must not delete the trusted record
+        // of a run whose run folder is still retained (V19-03 S09/S42).
+        let kept_launch = crate::recovery::launch_dir(&kept_run);
+        std::fs::create_dir_all(&kept_launch).unwrap();
+        let kept_record = kept_launch.join("recovery.json");
+        std::fs::write(&kept_record, "{}").unwrap();
+        backdate(&kept_record, 40);
+        backdate(&kept_launch, 40);
+
+        let paused_run = format!("retention-paused-{}", std::process::id());
+        fake_run(&paused_run, None, 40);
+        let paused_status = async_runs_dir().join(&paused_run).join("status.json");
+        let mut paused: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paused_status).unwrap()).unwrap();
+        paused["state"] = json!("paused");
+        std::fs::write(&paused_status, serde_json::to_string(&paused).unwrap()).unwrap();
+        backdate(&paused_status, 40);
+        let paused_launch = crate::recovery::launch_dir(&paused_run);
+        std::fs::create_dir_all(&paused_launch).unwrap();
+        let paused_record = paused_launch.join("recovery.json");
+        std::fs::write(&paused_record, "{}").unwrap();
+        backdate(&paused_record, 40);
+        backdate(&paused_launch, 40);
+
+        let orphan_launch =
+            crate::recovery::launch_dir(&format!("retention-orphan-{}", std::process::id()));
+        std::fs::create_dir_all(&orphan_launch).unwrap();
+        let orphan_record = orphan_launch.join("recovery.json");
+        std::fs::write(&orphan_record, "{}").unwrap();
+        backdate(&orphan_record, 31);
+        backdate(&orphan_launch, 31);
+
+        cleanup_expired_runs();
+
+        assert!(
+            kept_record.is_file(),
+            "a 40-day launch folder whose 90-day run still exists is kept"
+        );
+        assert!(
+            paused_record.is_file(),
+            "a paused run's trusted record survives the orphan sweep"
+        );
+        assert!(
+            !orphan_launch.exists(),
+            "a 31-day launch folder without a run folder is removed"
+        );
+
+        for run in [&kept_run, &fresh_run, &paused_run] {
+            let _ = std::fs::remove_dir_all(async_runs_dir().join(run));
+            let _ = std::fs::remove_dir_all(crate::recovery::launch_dir(run));
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

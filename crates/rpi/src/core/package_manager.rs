@@ -80,6 +80,7 @@ use crate::core::skills::{
     matches_any_exact_pattern, matches_any_pattern, split_patterns,
 };
 use crate::core::version_check::{UpdateChannel, channel_of_version, is_newer_package_version};
+use crate::core::windows_update;
 use crate::tools::path_utils::resolve_path;
 
 /// `NETWORK_TIMEOUT_MS` (package-manager.ts:38).
@@ -486,6 +487,8 @@ pub enum ProgressKind {
     Progress,
     Complete,
     Error,
+    /// A changed package outcome, outside the start/complete pairing.
+    Result,
 }
 
 /// `ProgressEvent["action"]`.
@@ -585,6 +588,26 @@ impl UpdatePlanEntry {
                 self.note.as_deref().unwrap_or("unknown error")
             ),
         }
+    }
+
+    pub fn update_result_message(&self, previous: Option<&str>, next: Option<&str>) -> String {
+        let format = |value: Option<&str>| match value {
+            Some(value) if self.kind == "git" => value.chars().take(7).collect::<String>(),
+            Some(value) => value.to_owned(),
+            None => "(none)".to_owned(),
+        };
+        let scope = if self.scope == SourceScope::Project {
+            " (project)"
+        } else {
+            ""
+        };
+        format!(
+            "{}{} {} -> {}",
+            self.source,
+            scope,
+            format(previous),
+            format(next)
+        )
     }
 
     /// Downgrade warning text, if this row moves backwards (an exact pin).
@@ -884,6 +907,8 @@ pub struct ResolvedPackageResource {
     pub source: String,
     pub scope: SourceScope,
     pub base_dir: Option<PathBuf>,
+    /// Resolved package changelog path (`PathMetadata.changelogPath`).
+    pub changelog_path: Option<PathBuf>,
 }
 
 /// The package slice of `ResolvedPaths` (package-manager.ts:69-74).
@@ -909,6 +934,7 @@ impl ResolvedPackagePaths {
                     enabled: entry.enabled,
                     scope: entry.scope,
                     base_dir: entry.base_dir.clone(),
+                    changelog_path: entry.changelog_path.clone(),
                 })
                 .collect()
         }
@@ -1039,6 +1065,7 @@ pub struct ResourcePathMetadata {
     pub scope: SourceScope,
     pub origin: SourceOrigin,
     pub base_dir: Option<PathBuf>,
+    pub changelog_path: Option<PathBuf>,
 }
 
 /// `ResolvedResource` (package-manager.ts:63-67).
@@ -1133,6 +1160,7 @@ impl FullResourceAccumulator {
                         scope: entry.scope,
                         origin: SourceOrigin::Package,
                         base_dir: entry.base_dir,
+                        changelog_path: entry.changelog_path,
                     },
                     entry.enabled,
                 );
@@ -1251,6 +1279,19 @@ pub struct DefaultPackageManager {
     /// Built-in extension names (`builtin:<name>` resources,
     /// package-manager.ts:825).
     builtin_extensions: Vec<String>,
+    /// V19-09 (ADR-0050): where an extension this process just extracted
+    /// goes — the in-place swap on Unix, a generation directory on
+    /// Windows, or the staging area of an `--all` self-update batch.
+    extension_activation: windows_update::generations::ExtensionActivation,
+    /// V19-09: the load preflight a staged extension must pass before it is
+    /// placed (`None`: the platform default — a child process on Windows,
+    /// nothing to prove on Unix, where nothing is loaded ahead).
+    extension_preflight: Option<windows_update::preflight::Preflight>,
+    /// V19-09: extensions extracted for the self-update batch (activation
+    /// `Stage`), handed to the staging step by
+    /// [`Self::take_staged_extensions`]. Interior-mutable: the install
+    /// paths run behind `&self`.
+    staged_extensions: std::sync::Mutex<Vec<windows_update::records::StagedExtension>>,
 }
 
 /// `getExtensionTempFolder` (package-manager.ts:221-226): create
@@ -1310,7 +1351,148 @@ impl DefaultPackageManager {
             install_confirm: None,
             download_observer: None,
             builtin_extensions: options.builtin_extensions,
+            extension_activation:
+                windows_update::generations::ExtensionActivation::platform_default(),
+            extension_preflight: None,
+            staged_extensions: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// V19-09: choose where the next extension installs go.
+    pub fn set_extension_activation(
+        &mut self,
+        activation: windows_update::generations::ExtensionActivation,
+    ) {
+        self.extension_activation = activation;
+    }
+
+    /// V19-09: inject the load preflight (tests and the platform default).
+    pub fn set_extension_preflight(&mut self, preflight: windows_update::preflight::Preflight) {
+        self.extension_preflight = Some(preflight);
+    }
+
+    /// V19-09: the extensions the `Stage` activation recorded, in plan
+    /// order; the self-update batch stages them with the executable.
+    pub fn take_staged_extensions(&mut self) -> Vec<windows_update::records::StagedExtension> {
+        std::mem::take(
+            &mut self
+                .staged_extensions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+    }
+
+    /// The activation in effect for the next install.
+    pub fn extension_activation(&self) -> windows_update::generations::ExtensionActivation {
+        self.extension_activation
+    }
+
+    /// The preflight to run: the injected one, else a child process on
+    /// Windows and an always-accepting one elsewhere (the Unix in-place
+    /// activation loads nothing in this process).
+    fn preflight(&self) -> windows_update::preflight::Preflight {
+        if let Some(preflight) = &self.extension_preflight {
+            return Arc::clone(preflight);
+        }
+        #[cfg(windows)]
+        {
+            windows_update::preflight::child_process_preflight()
+        }
+        #[cfg(not(windows))]
+        {
+            windows_update::preflight::accept_all()
+        }
+    }
+
+    /// The pins of live rpi processes (the generational placement keeps
+    /// every directory a pin names).
+    fn live_extension_pins(&self) -> Vec<windows_update::records::PinRecord> {
+        let fs = windows_update::fs::RealFs;
+        let pins = self
+            .agent_dir
+            .join("extensions")
+            .join(windows_update::layout::EXTENSION_PINS_DIR);
+        let probe = windows_update::boot::SystemProcessProbe::new();
+        windows_update::pins::live_pins(&fs, &pins, &probe)
+    }
+
+    /// Land a verified extraction by the activation in effect
+    /// (V19-09, design §11.4 step 6 / §11.8).
+    fn land_extracted(
+        &self,
+        extracted: extension_registry::ExtractedRpix,
+        root: &Path,
+        name: &str,
+        marker_source: Option<&str>,
+    ) -> Result<(), String> {
+        use windows_update::generations::ExtensionActivation;
+        use windows_update::preflight::PreflightOutcome;
+        let version = extracted.manifest.version.clone();
+        if self.extension_activation == ExtensionActivation::InPlace {
+            extension_registry::activate_rpix(extracted, root, name, marker_source)?;
+            println!("Installed {name} {version}");
+            return Ok(());
+        }
+        let outcome = (self.preflight())(&extracted.temp_dir);
+        if outcome != PreflightOutcome::Loaded {
+            extracted.cleanup();
+            return Err(format!(
+                "{name} {version} was not installed: {}",
+                match &outcome {
+                    PreflightOutcome::Rejected(reason) =>
+                        format!("the load preflight failed ({reason})"),
+                    PreflightOutcome::TimedOut => format!(
+                        "the load preflight did not finish within {} seconds",
+                        windows_update::VERIFY_EXTENSION_TIMEOUT.as_secs()
+                    ),
+                    PreflightOutcome::NotStarted(reason) =>
+                        format!("the load preflight could not be started ({reason})"),
+                    PreflightOutcome::Loaded => String::new(),
+                }
+            ));
+        }
+        let fs = windows_update::fs::RealFs;
+        let container = root.join(name);
+        if let Some(source) = marker_source {
+            // The `github:` marker stays at the container level (design §11.8).
+            std::fs::create_dir_all(&container).map_err(|error| error.to_string())?;
+            std::fs::write(
+                container.join(extension_registry::GITHUB_INSTALL_MARKER_FILE),
+                format!("{source}\n"),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        match self.extension_activation {
+            ExtensionActivation::Generational => {
+                let pins = self.live_extension_pins();
+                windows_update::generations::place_generation(
+                    &fs,
+                    root,
+                    name,
+                    &version,
+                    &extracted.temp_dir,
+                    &pins,
+                )?;
+                println!("Installed {name} {version}");
+            }
+            ExtensionActivation::Stage => {
+                let staged = windows_update::staging::describe_staged_extension(
+                    &fs,
+                    root,
+                    name,
+                    &version,
+                    &extracted.temp_dir,
+                )
+                .map_err(|error| format!("could not record the staged {name}: {error}"))?;
+                println!("Staged {name} {version} for the next start");
+                self.staged_extensions
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(staged);
+            }
+            ExtensionActivation::InPlace => {}
+        }
+        Ok(())
     }
 
     /// `setProgressCallback` (package-manager.ts:809-811).
@@ -1960,6 +2142,17 @@ impl DefaultPackageManager {
         })
     }
 
+    /// npm writes broken nested package-lock.json paths when `--prefix`
+    /// goes through a symlink (upstream #11358); pass the real path when the
+    /// root already exists.
+    fn real_npm_install_root(root: &Path) -> PathBuf {
+        if root.exists() {
+            std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+        } else {
+            root.to_path_buf()
+        }
+    }
+
     /// `getNpmInstallArgs` (package-manager.ts:1774-1795): peer dependency
     /// resolution is disabled for managed installs (`--legacy-peer-deps`
     /// and the bun/pnpm equivalents).
@@ -1969,7 +2162,9 @@ impl DefaultPackageManager {
         install_root: &Path,
     ) -> Result<Vec<String>, String> {
         let package_manager_name = self.get_package_manager_name()?;
-        let install_root = install_root.to_string_lossy().into_owned();
+        let install_root = Self::real_npm_install_root(install_root)
+            .to_string_lossy()
+            .into_owned();
         let mut args: Vec<String> = vec!["install".to_string()];
         args.extend(specs.iter().cloned());
         match package_manager_name.as_str() {
@@ -1989,6 +2184,10 @@ impl DefaultPackageManager {
                 args.push("--prefix".to_string());
                 args.push(install_root);
                 args.push("--legacy-peer-deps".to_string());
+                // Audit fix would run without --legacy-peer-deps and install
+                // host peers, so skip audit advice (package-manager.ts:2025).
+                args.push("--no-audit".to_string());
+                args.push("--no-fund".to_string());
             }
         }
         Ok(args)
@@ -2100,6 +2299,7 @@ impl DefaultPackageManager {
         if !install_root.exists() {
             return Ok(());
         }
+        let install_root = Self::real_npm_install_root(&install_root);
         let package_manager_name = self.get_package_manager_name()?;
         if package_manager_name == "bun" {
             return self.run_npm_command(
@@ -2120,6 +2320,8 @@ impl DefaultPackageManager {
         ];
         if package_manager_name != "pnpm" {
             args.push("--legacy-peer-deps".to_string());
+            args.push("--no-audit".to_string());
+            args.push("--no-fund".to_string());
         }
         self.run_npm_command(&args, None)
     }
@@ -2254,26 +2456,37 @@ impl DefaultPackageManager {
             .unwrap_or_else(|| PathBuf::from(marker_name))
     }
 
-    /// `cleanAndInstallGitDependencies` (package-manager.ts, b06dc76fd):
-    /// `git clean -fdx`, then npm install. If clean fails, attempt to repair
-    /// missing deps (best-effort, errors swallowed) before rethrowing the
-    /// clean error so the extension isn't left in a broken state.
+    /// `cleanAndInstallGitDependencies` (package-manager.ts:2153-2178):
+    /// a locked file can make clean fail on Windows. Continue installing the
+    /// new commit's dependencies, report a warning, and retain the marker so
+    /// the next update retries the clean.
     fn clean_and_install_git_dependencies(
         &self,
         target_dir: &Path,
         marker_path: &Path,
     ) -> Result<(), String> {
-        let clean_result = self
+        let mut cleaned = true;
+        if let Err(error) = self
             .runner
-            .run(&CommandRequest::new("git", &["clean", "-fdx"]).with_cwd(target_dir));
-        if let Err(error) = clean_result {
-            let _ = self.repair_missing_git_dependencies(target_dir);
-            return Err(error);
+            .run(&CommandRequest::new("git", &["clean", "-fdx"]).with_cwd(target_dir))
+        {
+            cleaned = false;
+            self.emit_progress(&ProgressEvent {
+                kind: ProgressKind::Progress,
+                action: ProgressAction::Update,
+                source: target_dir.to_string_lossy().into_owned(),
+                message: Some(format!(
+                    "Could not remove all untracked files in {} ({error}). Files may be in use by another rpi session; close it and run the update again.",
+                    target_dir.display()
+                )),
+            });
         }
         if target_dir.join("package.json").exists() {
             self.run_npm_command(&self.get_git_dependency_install_args()?, Some(target_dir))?;
         }
-        let _ = std::fs::remove_file(marker_path);
+        if cleaned {
+            let _ = std::fs::remove_file(marker_path);
+        }
         Ok(())
     }
 
@@ -2703,14 +2916,31 @@ impl DefaultPackageManager {
             .on_download_event(&DownloadEvent::Installing {
                 target: root.join(&resolved.info.name),
             });
-        extension_registry::materialize_rpix(
+        let extracted = self.extract_for_activation(
             &bytes,
             &root,
             &resolved.info.name,
             &resolved.info.version,
         )?;
-        println!("Installed {} {}", resolved.info.name, resolved.info.version);
-        Ok(())
+        self.land_extracted(extracted, &root, &resolved.info.name, None)
+    }
+
+    /// Extract and verify a `.rpix` into the directory the activation in
+    /// effect uses (V19-09: `.staging/<name>-<version>-<pid>` on Windows).
+    fn extract_for_activation<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        root: &Path,
+        name: &str,
+        version: &str,
+    ) -> Result<extension_registry::ExtractedRpix, String> {
+        let temp_dir = windows_update::generations::extraction_dir(
+            root,
+            name,
+            version,
+            self.extension_activation,
+        );
+        extension_registry::extract_and_verify_rpix_in(bytes, temp_dir, name, version)
     }
 
     /// `github:` channel install (design §7.1): download → sidecar sha256
@@ -2780,7 +3010,7 @@ impl DefaultPackageManager {
             ));
         }
         let root = self.get_registry_install_root(scope)?;
-        let extracted = extension_registry::extract_and_verify_rpix(
+        let extracted = self.extract_for_activation(
             &bytes,
             &root,
             &resolved.info.name,
@@ -2826,14 +3056,7 @@ impl DefaultPackageManager {
             .on_download_event(&DownloadEvent::Installing {
                 target: root.join(&resolved.info.name),
             });
-        extension_registry::activate_rpix(
-            extracted,
-            &root,
-            &resolved.info.name,
-            Some(source_string),
-        )?;
-        println!("Installed {} {}", resolved.info.name, resolved.info.version);
-        Ok(())
+        self.land_extracted(extracted, &root, &resolved.info.name, Some(source_string))
     }
 
     fn install_registry_source(
@@ -2888,7 +3111,7 @@ impl DefaultPackageManager {
         let entries = std::fs::read_dir(root).ok()?;
         for entry in entries.flatten() {
             let dir = entry.path();
-            if !dir.is_dir() {
+            if !dir.is_dir() || rpi_ext_host::install_layout::is_retired(&dir) {
                 continue;
             }
             let Ok(marker) =
@@ -2909,10 +3132,7 @@ impl DefaultPackageManager {
     fn remove_registry_install(&self, name: &str, scope: SourceScope) -> Result<(), String> {
         let root = self.get_registry_install_root(scope)?;
         let dir = root.join(name);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
-        }
-        Ok(())
+        self.remove_install_container(&dir)
     }
 
     fn remove_github_install(
@@ -2921,7 +3141,28 @@ impl DefaultPackageManager {
         scope: SourceScope,
     ) -> Result<(), String> {
         if let Some(dir) = self.find_github_install_dir(source, scope) {
-            std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+            return self.remove_install_container(&dir);
+        }
+        Ok(())
+    }
+
+    /// Remove an extension install container. Under the generational
+    /// layout (V19-09, R7.4.8 — every Windows install) the container is
+    /// *retired*: pointer dropped, `.retired` written, so running instances
+    /// keep their generation and every reader sees "not installed"; the
+    /// startup cleanup scan removes the files once nobody uses them. The
+    /// in-place layout (Unix) keeps the direct removal.
+    fn remove_install_container(&self, dir: &Path) -> Result<(), String> {
+        use crate::core::windows_update::generations::ExtensionActivation;
+        if self.extension_activation != ExtensionActivation::InPlace {
+            return crate::core::windows_update::generations::retire_container(
+                &crate::core::windows_update::fs::RealFs,
+                dir,
+            )
+            .map_err(|error| error.to_string());
+        }
+        if dir.exists() {
+            std::fs::remove_dir_all(dir).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -3160,7 +3401,11 @@ impl DefaultPackageManager {
             }
             ParsedSource::Registry(registry) => {
                 let root = self.get_registry_install_root(scope).ok()?;
-                let path = root.join(&registry.name);
+                // ADR-0050 (V19-09): the container resolves to its live
+                // generation (or the legacy flat directory); a container
+                // retired by `rpi remove` is not installed.
+                let path =
+                    rpi_ext_host::install_layout::resolve_install_dir(&root.join(&registry.name))?;
                 path.exists().then_some(path)
             }
             ParsedSource::GithubRelease(github) => self.find_github_install_dir(&github, scope),
@@ -3566,6 +3811,38 @@ impl DefaultPackageManager {
         Ok(plan)
     }
 
+    fn git_head(&self, target_dir: &Path) -> Option<String> {
+        if !target_dir.exists() {
+            return None;
+        }
+        self.runner
+            .run_capture(
+                &CommandRequest::new("git", &["rev-parse", "HEAD"])
+                    .with_cwd(target_dir)
+                    .with_timeout(NETWORK_TIMEOUT),
+            )
+            .ok()
+            .map(|head| head.trim().to_owned())
+            .filter(|head| !head.is_empty())
+    }
+
+    fn installed_update_version(&self, entry: &UpdatePlanEntry) -> Option<String> {
+        if let Some(git) = &entry.git {
+            return self
+                .get_git_install_path(&git.parsed, git.scope)
+                .ok()
+                .and_then(|path| self.git_head(&path));
+        }
+        if let Some(npm) = &entry.npm {
+            return self
+                .get_managed_npm_install_path(&npm.parsed, npm.scope)
+                .ok()
+                .and_then(|path| self.get_installed_npm_version(&path));
+        }
+        self.get_installed_path(&entry.source, entry.scope)
+            .and_then(|path| extension_registry::installed_extension_version(&path))
+    }
+
     /// V18-12 FR-D: execute a plan produced by [`Self::plan_updates`].
     /// Registry/`github:` rows reuse the cached resolution; npm/git rows
     /// still go through the command runner. One failing source does not
@@ -3619,6 +3896,11 @@ impl DefaultPackageManager {
                     } else {
                         serde_json::Map::new()
                     };
+                    let previous_git_head = entry.git.as_ref().and_then(|git| {
+                        self.get_git_install_path(&git.parsed, git.scope)
+                            .ok()
+                            .and_then(|path| self.git_head(&path))
+                    });
                     let result = if let Some(npm) = &entry.npm {
                         let spec = match &npm.parsed.version {
                             Some(_) => npm.parsed.spec.clone(),
@@ -3673,7 +3955,58 @@ impl DefaultPackageManager {
                         Err(error) => Err(error),
                     };
                     match result {
-                        Ok(()) => summary.updated += 1,
+                        Ok(()) => {
+                            summary.updated += 1;
+                            let previous = if entry.git.is_some() {
+                                previous_git_head
+                            } else {
+                                entry.current.clone()
+                            };
+                            let next = self.installed_update_version(entry);
+                            if self.extension_activation
+                                == windows_update::generations::ExtensionActivation::Stage
+                            {
+                                // V19-09 `--all` on Windows: the extension
+                                // is staged with the executable.
+                                self.emit_progress(&ProgressEvent {
+                                    kind: ProgressKind::Result,
+                                    action: ProgressAction::Update,
+                                    source: entry.source.clone(),
+                                    message: Some(format!(
+                                        "{} staged {} -> {} (takes effect the next time rpi starts)",
+                                        entry.source,
+                                        previous.as_deref().unwrap_or("(none)"),
+                                        entry.target.as_deref().unwrap_or("(none)")
+                                    )),
+                                });
+                            } else if previous != next {
+                                self.emit_progress(&ProgressEvent {
+                                    kind: ProgressKind::Result,
+                                    action: ProgressAction::Update,
+                                    source: entry.source.clone(),
+                                    message: Some(entry.update_result_message(
+                                        previous.as_deref(),
+                                        next.as_deref(),
+                                    )),
+                                });
+                            } else if entry.npm.is_some()
+                                && previous.is_some()
+                                && next.is_some()
+                                && entry.target != next
+                                && let Some(target) = entry.target.as_deref()
+                            {
+                                self.emit_progress(&ProgressEvent {
+                                    kind: ProgressKind::Progress,
+                                    action: ProgressAction::Update,
+                                    source: entry.source.clone(),
+                                    message: Some(format!(
+                                        "{} is still {} (registry reports {target}); npm registry metadata may be stale, try again in a few minutes",
+                                        entry.source,
+                                        next.as_deref().unwrap_or_default()
+                                    )),
+                                });
+                            }
+                        }
                         Err(error) => {
                             summary.failed += 1;
                             self.emit_progress(&ProgressEvent {
@@ -3717,13 +4050,25 @@ impl DefaultPackageManager {
             };
             for entry in entries.flatten() {
                 let dir = entry.path();
-                if !dir.join("rpi-extension.json").is_file() {
+                if !dir.is_dir() {
                     continue;
                 }
                 let Some(dir_name) = dir.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
-                if dir_name.contains(".tmp-") || dir_name.contains(".old-") {
+                if dir_name.contains(".tmp-")
+                    || dir_name.contains(".old-")
+                    || rpi_ext_host::install_layout::is_reserved_container_entry(dir_name)
+                {
+                    continue;
+                }
+                // ADR-0050 (V19-09): the manifest lives in the generation the
+                // container's pointer names (flat: the container itself); a
+                // retired container is no install.
+                let Some(install) = rpi_ext_host::install_layout::resolve_install_dir(&dir) else {
+                    continue;
+                };
+                if !install.join("rpi-extension.json").is_file() {
                     continue;
                 }
                 let source = match std::fs::read_to_string(
@@ -4266,8 +4611,30 @@ impl DefaultPackageManager {
 
     /// `refreshTemporaryGitSource` (package-manager.ts:1891-1902): keep the
     /// cached temporary checkout when the refresh fails.
-    fn refresh_temporary_git_source(&self, source: &GitSource, source_str: &str) {
+    fn refresh_temporary_git_source(
+        &self,
+        source: &GitSource,
+        source_str: &str,
+        installed_path: &Path,
+    ) {
         if self.offline {
+            return;
+        }
+        if let Some(reference) = source.ref_.as_deref()
+            && (7..=64).contains(&reference.len())
+            && reference
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+            && let Ok(head) = self.runner.run_capture(
+                &CommandRequest::new("git", &["rev-parse", "HEAD"])
+                    .with_cwd(installed_path)
+                    .with_timeout(NETWORK_TIMEOUT),
+            )
+            && head
+                .trim()
+                .to_lowercase()
+                .starts_with(&reference.to_lowercase())
+        {
             return;
         }
         let _ = self.with_progress(
@@ -4319,6 +4686,7 @@ impl DefaultPackageManager {
                     source: "builtin".to_string(),
                     scope,
                     base_dir: None,
+                    changelog_path: None,
                 },
             );
         }
@@ -4385,6 +4753,7 @@ impl DefaultPackageManager {
                     scope: SourceScope::Project,
                     origin: SourceOrigin::TopLevel,
                     base_dir: None,
+                    changelog_path: None,
                 },
                 &project_base_dir,
             );
@@ -4397,6 +4766,7 @@ impl DefaultPackageManager {
                     scope: SourceScope::User,
                     origin: SourceOrigin::TopLevel,
                     base_dir: None,
+                    changelog_path: None,
                 },
                 &global_base_dir,
             );
@@ -4428,6 +4798,7 @@ impl DefaultPackageManager {
                     scope,
                     origin: SourceOrigin::TopLevel,
                     base_dir: None,
+                    changelog_path: None,
                 },
                 enabled,
             );
@@ -4518,12 +4889,14 @@ impl DefaultPackageManager {
             scope: SourceScope::User,
             origin: SourceOrigin::TopLevel,
             base_dir: Some(global_base_dir.to_path_buf()),
+            changelog_path: None,
         };
         let project_metadata = ResourcePathMetadata {
             source: "auto".to_string(),
             scope: SourceScope::Project,
             origin: SourceOrigin::TopLevel,
             base_dir: Some(project_base_dir.to_path_buf()),
+            changelog_path: None,
         };
         let overrides = |settings: &Settings, resource_type: ResourceType| {
             settings_string_array(settings, resource_type.dir_name())
@@ -4695,6 +5068,7 @@ impl DefaultPackageManager {
                 source: source_str.clone(),
                 scope: *scope,
                 base_dir: None,
+                changelog_path: None,
             };
 
             if let ParsedSource::Local(local) = &parsed {
@@ -4756,11 +5130,8 @@ impl DefaultPackageManager {
                         if !install_missing(&mut on_missing)? {
                             continue;
                         }
-                    } else if resolved_scope == SourceScope::Temporary
-                        && !git.pinned
-                        && !self.offline
-                    {
-                        self.refresh_temporary_git_source(git, &resolved_source);
+                    } else if resolved_scope == SourceScope::Temporary && !self.offline {
+                        self.refresh_temporary_git_source(git, &resolved_source, &installed_path);
                     }
                     metadata.base_dir = Some(installed_path.clone());
                     self.collect_package_resources(
@@ -4866,6 +5237,13 @@ impl DefaultPackageManager {
         filter: Option<&PackageSourceFilter>,
         metadata: PackageMetadata,
     ) -> bool {
+        // Record the resolved changelog source with the package metadata
+        // (package-manager.ts:2418-2426).
+        let metadata = PackageMetadata {
+            changelog_path: crate::core::changelog::extension_package_metadata(package_root)
+                .map(|package| package.changelog_path),
+            ..metadata
+        };
         if let Some(filter) = filter {
             for resource_type in RESOURCE_TYPES {
                 let patterns = resource_type.filter_patterns(filter);
@@ -5130,6 +5508,7 @@ struct PackageMetadata {
     source: String,
     scope: SourceScope,
     base_dir: Option<PathBuf>,
+    changelog_path: Option<PathBuf>,
 }
 
 impl PackageMetadata {
@@ -5140,6 +5519,7 @@ impl PackageMetadata {
             source: self.source,
             scope: self.scope,
             base_dir: self.base_dir,
+            changelog_path: self.changelog_path,
         }
     }
 }
@@ -5270,6 +5650,9 @@ fn read_rpi_manifest(package_root: &Path) -> Option<RpiManifest> {
 /// wasm extension packages — `rpi-extension.json` with a `wasm` field, or
 /// `index.wasm` (mirrors the ext-host loader's directory rules).
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
+    // ADR-0050 (V19-09): an extension install container resolves to its live
+    // generation (flat: itself; retired: no extension).
+    let dir = &rpi_ext_host::install_layout::resolve_install_dir(dir)?;
     let package_json_path = dir.join("package.json");
     if package_json_path.exists()
         && let Some(manifest) = read_rpi_manifest(dir)
@@ -6114,6 +6497,8 @@ mod tests {
                 "--prefix",
                 dirs.agent_dir.join("npm").to_string_lossy().as_ref(),
                 "--legacy-peer-deps",
+                "--no-audit",
+                "--no-fund",
             ]
         );
         // `ensureNpmProject` side effects.
@@ -6129,6 +6514,41 @@ mod tests {
             std::fs::read_to_string(dirs.agent_dir.join("npm/.gitignore")).unwrap(),
             "*\n!.gitignore\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_npm_install_args_resolve_a_symlinked_install_root() {
+        let dirs = TestDirs::new();
+        let linked = dirs.root.join("linked-agent");
+        std::os::unix::fs::symlink(&dirs.agent_dir, &linked).unwrap();
+        std::fs::create_dir_all(linked.join("npm")).unwrap();
+        let settings_manager = SettingsManager::create(
+            &dirs.cwd,
+            Some(&linked),
+            crate::core::settings_manager::SettingsManagerCreateOptions {
+                project_trusted: true,
+            },
+        );
+        let manager = DefaultPackageManager::with_options(PackageManagerOptions {
+            cwd: dirs.cwd.clone(),
+            agent_dir: linked.clone(),
+            settings_manager,
+            runner: Some(FakeRunner::ok()),
+            offline: Some(false),
+            registry: None,
+            builtin_extensions: Vec::new(),
+        });
+        let args = manager
+            .get_npm_install_args(&["left-pad".to_owned()], &linked.join("npm"))
+            .unwrap();
+        let expected = std::fs::canonicalize(dirs.agent_dir.join("npm")).unwrap();
+        let prefix = args
+            .windows(2)
+            .find(|pair| pair[0] == "--prefix")
+            .map(|pair| pair[1].as_str())
+            .expect("--prefix");
+        assert_eq!(Path::new(prefix), expected);
     }
 
     #[test]
@@ -6219,6 +6639,8 @@ mod tests {
                 "--prefix",
                 dirs.agent_dir.join("npm").to_string_lossy().as_ref(),
                 "--legacy-peer-deps",
+                "--no-audit",
+                "--no-fund",
             ]
         );
     }
@@ -6403,6 +6825,46 @@ mod tests {
             error.contains("Ambiguous npmCommand package managers: npm, pnpm"),
             "got: {error}"
         );
+    }
+
+    #[test]
+    fn test_temporary_git_skips_checked_out_commit_but_refreshes_branch() {
+        let dirs = TestDirs::new();
+        let head = "a".repeat(40);
+        let runner = FakeRunner::new(move |request| {
+            if request.command == "git"
+                && request.args.first().map(String::as_str) == Some("rev-parse")
+            {
+                Ok(head.clone())
+            } else {
+                Ok(String::new())
+            }
+        });
+        let manager = test_manager(&dirs, runner.clone());
+        let mut source = git_source(
+            "https://github.com/user/repo",
+            "github.com",
+            "user/repo",
+            Some("aaaaaaaa"),
+        );
+        let target = manager
+            .get_git_install_path(&source, SourceScope::Temporary)
+            .expect("temporary install path");
+        std::fs::create_dir_all(&target).expect("checkout");
+        manager.refresh_temporary_git_source(&source, "git:github.com/user/repo@aaaaaaaa", &target);
+        assert!(runner.find_calls("git", "fetch").is_empty());
+
+        source.ref_ = Some("feature/branch".to_owned());
+        let branch_target = manager
+            .get_git_install_path(&source, SourceScope::Temporary)
+            .expect("branch install path");
+        std::fs::create_dir_all(&branch_target).expect("branch checkout");
+        manager.refresh_temporary_git_source(
+            &source,
+            "git:github.com/user/repo@feature/branch",
+            &branch_target,
+        );
+        assert_eq!(runner.find_calls("git", "fetch").len(), 1);
     }
 
     #[test]
@@ -6658,10 +7120,9 @@ mod tests {
     }
 
     #[test]
-    fn test_install_git_clean_failure_triggers_repair_then_rethrows() {
-        // `git clean -fdx` fails during marker-resume → best-effort
-        // repair_missing_git_dependencies runs npm install, then the original
-        // clean error is rethrown (b06dc76fd).
+    fn test_install_git_clean_failure_warns_installs_and_keeps_retry_marker() {
+        // A failed clean must not prevent the new commit's dependencies from
+        // being installed (e3da248ea / #11648).
         let dirs = TestDirs::new();
         let target = dirs.agent_dir.join("git/github.com/user/repo");
         // package.json declares a dependency so has_missing_git_dependencies
@@ -6689,14 +7150,8 @@ mod tests {
         });
         let manager = test_manager(&dirs, runner.clone());
         let result = manager.install("git:github.com/user/repo@v1", false);
-        // Original clean error must be rethrown.
-        assert!(result.is_err(), "install should fail after clean failure");
-        assert!(
-            result.unwrap_err().contains("git clean failed"),
-            "rethrown error should be the clean error"
-        );
-        // repair_missing_git_dependencies should have run npm install
-        // (because has_missing_git_dependencies is true).
+        result.expect("clean failure must not fail dependency installation");
+        assert!(marker.exists(), "failed clean retains the retry marker");
         let npm_calls = runner.find_calls("npm", "install");
         assert!(
             !npm_calls.is_empty(),
@@ -6926,6 +7381,14 @@ mod tests {
         let dirs = TestDirs::new();
         let package_dir = dirs.cwd.join("pkg");
         make_local_package(&package_dir);
+        write_file(
+            &package_dir.join("package.json"),
+            r#"{"name":"pkg","version":"1.2.3"}"#,
+        );
+        write_file(
+            &package_dir.join("CHANGELOG.md"),
+            "## [1.2.3]\n\n- Release\n",
+        );
         let runner = FakeRunner::ok();
         let manager = test_manager(&dirs, runner);
 
@@ -6954,6 +7417,24 @@ mod tests {
         );
         assert!(resolved.extensions[0].enabled);
         assert_eq!(resolved.extensions[0].base_dir, Some(package_dir.clone()));
+        let changelog = package_dir.join("CHANGELOG.md");
+        for resource in resolved
+            .extensions
+            .iter()
+            .chain(&resolved.skills)
+            .chain(&resolved.prompts)
+            .chain(&resolved.themes)
+        {
+            assert_eq!(
+                resource.changelog_path.as_deref(),
+                Some(changelog.as_path())
+            );
+        }
+        let loader_paths = resolved.to_package_resource_paths();
+        assert_eq!(
+            loader_paths.extension_paths[0].changelog_path.as_deref(),
+            Some(changelog.as_path())
+        );
     }
 
     #[test]
@@ -7712,6 +8193,78 @@ mod update_tests {
         // Versioned (range) sources reinstall the configured spec, not
         // `name@latest` (package-manager.ts:1162).
         assert!(installs[0].args.contains(&"foo@^1.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_update_npm_reports_actual_version_change_and_stale_metadata() {
+        let changed_dirs = TestDirs::new();
+        write_installed_npm(&changed_dirs, "foo", "1.0.0");
+        let changed_root = changed_dirs.agent_dir.clone();
+        let changed_runner =
+            FakeRunner::new(
+                move |request| match request.args.first().map(String::as_str) {
+                    Some("view") => Ok(r#""1.2.0""#.to_string()),
+                    Some("install") => {
+                        let dir = changed_root.join("npm/node_modules/foo");
+                        std::fs::create_dir_all(&dir).unwrap();
+                        std::fs::write(
+                            dir.join("package.json"),
+                            r#"{"name":"foo","version":"1.2.0"}"#,
+                        )
+                        .unwrap();
+                        Ok(String::new())
+                    }
+                    _ => Ok(String::new()),
+                },
+            );
+        let mut changed = manager(&changed_dirs, changed_runner);
+        changed
+            .settings_manager
+            .set_packages(vec![PackageSource::Source("npm:foo".to_string())]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        changed.set_progress_callback(Some(Box::new(move |event| {
+            sink.lock().unwrap().push(event.clone());
+        })));
+        changed.update(None).unwrap();
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == ProgressKind::Result
+                && event.message.as_deref() == Some("npm:foo 1.0.0 -> 1.2.0")
+        }));
+        drop(events);
+
+        let stale_dirs = TestDirs::new();
+        write_installed_npm(&stale_dirs, "foo", "1.0.0");
+        let stale_runner = FakeRunner::new(|request| {
+            if request.args.first().map(String::as_str) == Some("view") {
+                return Ok(r#""1.2.0""#.to_string());
+            }
+            Ok(String::new())
+        });
+        let mut stale = manager(&stale_dirs, stale_runner);
+        stale
+            .settings_manager
+            .set_packages(vec![PackageSource::Source("npm:foo".to_string())]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        stale.set_progress_callback(Some(Box::new(move |event| {
+            sink.lock().unwrap().push(event.clone());
+        })));
+        stale.update(None).unwrap();
+        let events = events.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == ProgressKind::Result)
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == ProgressKind::Progress
+                && event
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("registry metadata may be stale"))
+        }));
     }
 
     #[test]
@@ -9292,12 +9845,15 @@ mod registry_tests {
             "{output}"
         );
 
-        let summary = crate::cli::package_command::update_summary_output(&UpdateApplySummary {
-            updated: 1,
-            up_to_date: 6,
-            skipped: 0,
-            failed: 0,
-        });
+        let summary = crate::cli::package_command::update_summary_output(
+            &UpdateApplySummary {
+                updated: 1,
+                up_to_date: 6,
+                skipped: 0,
+                failed: 0,
+            },
+            false,
+        );
         assert_eq!(
             summary,
             "Updated 1 extension · 6 already up to date\nRestart rpi to load the update.\n"
@@ -10037,6 +10593,334 @@ mod registry_tests {
         let discovered = manager.discover_installed_extension_sources();
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].source, "ext-a");
+    }
+
+    /// ADR-0050 (V19-09 FR-W5): a generational container reads through the
+    /// same resolver on every path — tracked resolution, untracked discovery
+    /// and loader auto-discovery all see the generation the pointer names,
+    /// never the legacy flat files left in the container root.
+    #[test]
+    fn test_generational_container_resolves_through_every_read_path() {
+        let dirs = TestDirs::new();
+        place_untracked_extension(&dirs, "ext-gen", "0.1.0");
+        let root = dirs.agent_dir.join("extensions");
+        let container = root.join("ext-gen");
+        let generation = container.join("0.2.0");
+        std::fs::create_dir_all(generation.join("dist")).unwrap();
+        std::fs::write(
+            generation.join("rpi-extension.json"),
+            r#"{"name":"ext-gen","version":"0.2.0","wasm":"dist/ext-gen.wasm","capabilities":[],"rpiAbi":1}"#,
+        )
+        .unwrap();
+        let entry = generation.join("dist/ext-gen.wasm");
+        std::fs::write(&entry, b"wasm").unwrap();
+        // The `.rpi-install-source` marker stays at the container level.
+        std::fs::write(
+            container.join(GITHUB_INSTALL_MARKER_FILE),
+            "github:acme/gen\n",
+        )
+        .unwrap();
+        std::fs::write(
+            container.join("current.json"),
+            r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0"}"#,
+        )
+        .unwrap();
+        let transport = MapTransport::new();
+        let manager = manager_ok(&dirs, transport);
+
+        // Tracked registry resolution and the manifest readers.
+        assert_eq!(
+            manager.get_installed_path("ext-gen", SourceScope::User),
+            Some(generation.clone())
+        );
+        assert_eq!(
+            extension_registry::installed_extension_version(&container).as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            extension_registry::installed_extension_name(&container).as_deref(),
+            Some("ext-gen")
+        );
+        // Untracked discovery (`rpi list`, `update --extensions`) keeps the
+        // github marker as the source.
+        let discovered = manager.discover_installed_extension_sources();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].source, "github:acme/gen");
+        // `github:` marker scan (`remove`, update targeting).
+        assert_eq!(
+            manager.get_installed_path("github:acme/gen", SourceScope::User),
+            Some(container.clone())
+        );
+        // Loader auto-discovery (`add_auto_resources`) loads the generation's
+        // entry, not the stale flat manifest.
+        assert_eq!(collect_auto_extension_entries(&root), vec![entry.clone()]);
+        // The host loader agrees.
+        assert_eq!(
+            rpi_ext_host::loader::discover_extensions_in_dir(&root),
+            vec![entry.clone()]
+        );
+    }
+
+    /// ADR-0050 (V19-09 FR-W5): the generational activation — what every
+    /// `rpi install` / `rpi update --extensions` does on Windows.
+    #[test]
+    fn test_generational_activation_places_generations_and_flips_the_pointer() {
+        use crate::core::windows_update::generations::ExtensionActivation;
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-gen", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.set_extension_activation(ExtensionActivation::Generational);
+        manager.install_and_persist("ext-gen", false).unwrap();
+        let container = dirs.agent_dir.join("extensions/ext-gen");
+        assert!(
+            container.join("0.1.0/rpi-extension.json").is_file(),
+            "a generation, not a flat install"
+        );
+        assert!(!container.join("rpi-extension.json").exists());
+        let pointer = rpi_ext_host::install_layout::read_generation_pointer(&container).unwrap();
+        assert_eq!(pointer.version, "0.1.0");
+        assert!(pointer.previous.is_none());
+        assert_eq!(
+            manager.get_installed_path("ext-gen", SourceScope::User),
+            Some(container.join("0.1.0"))
+        );
+        assert!(
+            !container
+                .join(format!("ext-gen.tmp-{}", std::process::id()))
+                .exists(),
+            "no legacy temp dir"
+        );
+        assert!(
+            !dirs
+                .agent_dir
+                .join("extensions/.staging")
+                .join(format!("ext-gen-0.1.0-{}", std::process::id()))
+                .exists(),
+            "the staging directory moved"
+        );
+
+        // An update places the next generation and records the previous one.
+        serve_registry_extension(&transport, "ext-gen", "0.2.0", true);
+        manager.update(Some("ext-gen")).unwrap();
+        let pointer = rpi_ext_host::install_layout::read_generation_pointer(&container).unwrap();
+        assert_eq!(pointer.version, "0.2.0");
+        assert_eq!(pointer.previous.as_deref(), Some("0.1.0"));
+        assert!(
+            container.join("0.1.0").is_dir(),
+            "the previous generation stays for running instances"
+        );
+        assert_eq!(
+            extension_registry::installed_extension_version(&container).as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            manager.get_installed_path("ext-gen", SourceScope::User),
+            Some(container.join("0.2.0")),
+            "the planner's cached resolution was refreshed after the flip"
+        );
+        assert_eq!(manager.discover_installed_extension_sources().len(), 1);
+    }
+
+    /// ADR-0050 (V19-09 FR-W5): the `Stage` activation of `--all` — the
+    /// extension waits for the startup transaction together with the
+    /// executable, and nothing in place changes.
+    #[test]
+    fn test_staged_activation_records_the_extension_for_the_self_update() {
+        use crate::core::windows_update::generations::ExtensionActivation;
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-stage", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("ext-stage", false).unwrap();
+        serve_registry_extension(&transport, "ext-stage", "0.2.0", true);
+        manager.set_extension_activation(ExtensionActivation::Stage);
+        let plan = manager
+            .plan_updates(Some("ext-stage"), UpdateChannel::Stable, None)
+            .unwrap();
+        let (summary, error) = manager.apply_update_plan(&plan);
+        assert_eq!(error, None);
+        assert_eq!(summary.updated, 1);
+        let staged = manager.take_staged_extensions();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].name, "ext-stage");
+        assert_eq!(staged[0].version, "0.2.0");
+        assert_eq!(staged[0].install_root, dirs.agent_dir.join("extensions"));
+        assert!(staged[0].staged_path.is_dir(), "extracted under .staging");
+        assert_eq!(staged[0].files.len(), 2, "manifest, SHA256SUMS");
+        assert_eq!(
+            staged[0].generation_path(),
+            dirs.agent_dir.join("extensions/ext-stage/0.2.0")
+        );
+        assert!(
+            manager.take_staged_extensions().is_empty(),
+            "handed over once"
+        );
+        // Nothing in place changed: the flat 0.1.0 install still resolves.
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-stage")
+            )
+            .as_deref(),
+            Some("0.1.0")
+        );
+        assert!(
+            !dirs
+                .agent_dir
+                .join("extensions/ext-stage/current.json")
+                .exists()
+        );
+    }
+
+    /// ADR-0050 (V19-09 FR-W1/W5): a package whose preflight fails is
+    /// rejected alone — nothing is placed, the staging directory goes.
+    #[test]
+    fn test_a_failed_preflight_rejects_only_that_extension() {
+        use crate::core::windows_update::generations::ExtensionActivation;
+        use crate::core::windows_update::preflight::PreflightOutcome;
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-pf", "0.1.0", true);
+        serve_registry_extension(&transport, "ext-ok", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.set_extension_activation(ExtensionActivation::Generational);
+        manager.set_extension_preflight(Arc::new(|path: &Path| {
+            if path.to_string_lossy().contains("ext-pf") {
+                PreflightOutcome::Rejected("simulated load failure".to_owned())
+            } else {
+                PreflightOutcome::Loaded
+            }
+        }));
+        let error = manager.install_and_persist("ext-pf", false).unwrap_err();
+        assert!(
+            error.contains("load preflight failed (simulated load failure)"),
+            "{error}"
+        );
+        assert!(
+            !dirs
+                .agent_dir
+                .join("extensions/ext-pf/current.json")
+                .exists()
+        );
+        assert!(!dirs.agent_dir.join("extensions/ext-pf").exists());
+        assert!(
+            !dirs
+                .agent_dir
+                .join("extensions/.staging")
+                .join(format!("ext-pf-0.1.0-{}", std::process::id()))
+                .exists(),
+            "the rejected staging directory is removed"
+        );
+        // The other package is unaffected.
+        manager.install_and_persist("ext-ok", false).unwrap();
+        assert!(
+            dirs.agent_dir
+                .join("extensions/ext-ok/current.json")
+                .exists()
+        );
+    }
+
+    /// ADR-0050 (V19-09, R7.4.8): `rpi remove` retires the whole container;
+    /// a later `rpi install` clears the retirement.
+    #[test]
+    fn test_remove_retires_a_generational_container_and_reinstall_clears_it() {
+        use crate::core::windows_update::generations::ExtensionActivation;
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-ret", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.set_extension_activation(ExtensionActivation::Generational);
+        manager.install_and_persist("ext-ret", false).unwrap();
+        let container = dirs.agent_dir.join("extensions/ext-ret");
+        let removed = manager.remove_and_persist("ext-ret", false).unwrap();
+        assert!(removed);
+        assert!(
+            rpi_ext_host::install_layout::is_retired(&container),
+            "retired, not deleted"
+        );
+        assert!(
+            container.join("0.1.0").is_dir(),
+            "the files wait for the cleanup scan"
+        );
+        assert!(
+            manager
+                .get_installed_path("ext-ret", SourceScope::User)
+                .is_none()
+        );
+        assert!(manager.discover_installed_extension_sources().is_empty());
+        // Reinstall clears the marker.
+        manager.install_and_persist("ext-ret", false).unwrap();
+        assert!(!rpi_ext_host::install_layout::is_retired(&container));
+        assert_eq!(
+            manager.get_installed_path("ext-ret", SourceScope::User),
+            Some(container.join("0.1.0"))
+        );
+        // The in-place layout (Unix default) still removes directly.
+        let mut inplace = manager_ok(&dirs, transport.clone());
+        serve_registry_extension(&transport, "ext-plain", "0.1.0", true);
+        inplace.install_and_persist("ext-plain", false).unwrap();
+        inplace.remove_and_persist("ext-plain", false).unwrap();
+        assert!(!dirs.agent_dir.join("extensions/ext-plain").exists());
+    }
+
+    /// The retirement itself (the Windows removal path) is platform
+    /// independent and exercised directly on every platform.
+    #[test]
+    fn test_retire_container_drops_the_pointer_and_marks_the_container() {
+        use crate::core::windows_update::fs::RealFs;
+        let dirs = TestDirs::new();
+        let container = dirs.agent_dir.join("extensions/ext-r");
+        std::fs::create_dir_all(container.join("0.2.0")).unwrap();
+        std::fs::write(container.join("0.2.0/rpi-extension.json"), "{}").unwrap();
+        std::fs::write(
+            container.join("current.json"),
+            r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0"}"#,
+        )
+        .unwrap();
+        crate::core::windows_update::generations::retire_container(&RealFs, &container).unwrap();
+        assert!(!container.join("current.json").exists());
+        assert!(rpi_ext_host::install_layout::is_retired(&container));
+        // Retiring a missing container is not an error.
+        crate::core::windows_update::generations::retire_container(
+            &RealFs,
+            &dirs.agent_dir.join("extensions/missing"),
+        )
+        .unwrap();
+    }
+
+    /// ADR-0050 (V19-09 FR-W5): `rpi remove` retires the whole container.
+    /// Every read path then reports "not installed" and never falls back to
+    /// the flat files still queued for delayed removal.
+    #[test]
+    fn test_retired_container_is_not_installed_on_any_read_path() {
+        let dirs = TestDirs::new();
+        place_untracked_extension(&dirs, "ext-retired", "0.1.0");
+        let root = dirs.agent_dir.join("extensions");
+        let container = root.join("ext-retired");
+        std::fs::write(
+            container.join(GITHUB_INSTALL_MARKER_FILE),
+            "github:acme/retired\n",
+        )
+        .unwrap();
+        std::fs::write(container.join(".retired"), b"").unwrap();
+        let transport = MapTransport::new();
+        let manager = manager_ok(&dirs, transport);
+
+        assert_eq!(
+            manager.get_installed_path("ext-retired", SourceScope::User),
+            None
+        );
+        assert_eq!(
+            manager.get_installed_path("github:acme/retired", SourceScope::User),
+            None
+        );
+        assert_eq!(
+            extension_registry::installed_extension_name(&container),
+            None
+        );
+        assert!(manager.discover_installed_extension_sources().is_empty());
+        assert!(collect_auto_extension_entries(&root).is_empty());
+        assert!(rpi_ext_host::loader::discover_extensions_in_dir(&root).is_empty());
     }
 
     #[test]

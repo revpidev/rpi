@@ -1,0 +1,3634 @@
+[
+  {
+    "name": "invalid-url",
+    "input": {
+      "opts": {
+        "url": "not a url"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": []
+    },
+    "output": {
+      "result": {
+        "error": "Invalid URL: not a url",
+        "code": "invalid_url",
+        "phase": "validation",
+        "retryable": false,
+        "url": "not a url"
+      },
+      "requestHeadersSeen": null,
+      "requestTimeout": null,
+      "requestProxy": null,
+      "requestRedirect": null,
+      "progressEvents": []
+    }
+  },
+  {
+    "name": "unsupported-protocol",
+    "input": {
+      "opts": {
+        "url": "ftp://example.com/f"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": []
+    },
+    "output": {
+      "result": {
+        "error": "Only http/https URLs supported, got ftp:",
+        "code": "unsupported_protocol",
+        "phase": "validation",
+        "retryable": false,
+        "url": "ftp://example.com/f"
+      },
+      "requestHeadersSeen": null,
+      "requestTimeout": null,
+      "requestProxy": null,
+      "requestRedirect": null,
+      "progressEvents": []
+    }
+  },
+  {
+    "name": "http-404",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/missing"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 404,
+          "statusText": "Not Found",
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "gone"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Server returned HTTP 404 Not Found for https://ex.com/missing.",
+        "code": "http_error",
+        "phase": "loading",
+        "retryable": false,
+        "url": "https://ex.com/missing",
+        "finalUrl": "https://ex.com/missing",
+        "statusCode": 404,
+        "statusText": "Not Found",
+        "timeoutMs": 15000,
+        "mimeType": "text/html"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        }
+      ]
+    }
+  },
+  {
+    "name": "http-500-retryable",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/err"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 500,
+          "statusText": "Internal Server Error",
+          "body": ""
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Server returned HTTP 500 Internal Server Error for https://ex.com/err.",
+        "code": "http_error",
+        "phase": "loading",
+        "retryable": true,
+        "url": "https://ex.com/err",
+        "finalUrl": "https://ex.com/err",
+        "statusCode": 500,
+        "statusText": "Internal Server Error",
+        "timeoutMs": 15000
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        }
+      ]
+    }
+  },
+  {
+    "name": "http-429-retryable",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/limited"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 429,
+          "statusText": "Too Many Requests",
+          "body": ""
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Server returned HTTP 429 Too Many Requests for https://ex.com/limited.",
+        "code": "http_error",
+        "phase": "loading",
+        "retryable": true,
+        "url": "https://ex.com/limited",
+        "finalUrl": "https://ex.com/limited",
+        "statusCode": 429,
+        "statusText": "Too Many Requests",
+        "timeoutMs": 15000
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        }
+      ]
+    }
+  },
+  {
+    "name": "dns-error",
+    "input": {
+      "opts": {
+        "url": "https://no-such-host.example.com/x"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "throw": {
+            "message": "getaddrinfo ENOTFOUND no-such-host.example.com: dns error"
+          }
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "DNS error: failed to lookup address for no-such-host.example.com. Check the URL and try again.",
+        "code": "network_error",
+        "phase": "connecting",
+        "retryable": false,
+        "url": "https://no-such-host.example.com/x"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "status",
+          "status": "error"
+        },
+        {
+          "kind": "progress",
+          "status": "error",
+          "progress": 1,
+          "phase": "error"
+        }
+      ]
+    }
+  },
+  {
+    "name": "connect-error",
+    "input": {
+      "opts": {
+        "url": "https://refused.example.com/x"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "throw": {
+            "message": "connect ECONNREFUSED 127.0.0.1:443: connection refused"
+          }
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Connection failed to refused.example.com. The server may be unreachable or blocking requests.",
+        "code": "network_error",
+        "phase": "connecting",
+        "retryable": true,
+        "url": "https://refused.example.com/x"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "status",
+          "status": "error"
+        },
+        {
+          "kind": "progress",
+          "status": "error",
+          "progress": 1,
+          "phase": "error"
+        }
+      ]
+    }
+  },
+  {
+    "name": "tls-error",
+    "input": {
+      "opts": {
+        "url": "https://self-signed.example.com/x"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "throw": {
+            "message": "unable to verify the first certificate: ssl handshake error"
+          }
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "TLS/SSL error connecting to self-signed.example.com. The server's certificate may be invalid.",
+        "code": "network_error",
+        "phase": "connecting",
+        "retryable": false,
+        "url": "https://self-signed.example.com/x"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "status",
+          "status": "error"
+        },
+        {
+          "kind": "progress",
+          "status": "error",
+          "progress": 1,
+          "phase": "error"
+        }
+      ]
+    }
+  },
+  {
+    "name": "timeout-error",
+    "input": {
+      "opts": {
+        "url": "https://slow.example.com/x",
+        "timeoutMs": 1500
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "throw": {
+            "message": "operation timed out"
+          }
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Timeout of 1500ms exceeded while connecting to https://slow.example.com/x.",
+        "code": "timeout",
+        "phase": "connecting",
+        "retryable": true,
+        "timeoutMs": 1500,
+        "url": "https://slow.example.com/x"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 1500,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "status",
+          "status": "error"
+        },
+        {
+          "kind": "progress",
+          "status": "error",
+          "progress": 1,
+          "phase": "error"
+        }
+      ]
+    }
+  },
+  {
+    "name": "unknown-profile",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/x",
+        "browser": "chrome_99"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "throw": {
+            "message": "Invalid browser profile: chrome_99. Available profiles: chrome_100"
+          }
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Request failed while connecting for https://ex.com/x: Invalid browser profile: chrome_99. Available profiles: chrome_100",
+        "code": "network_error",
+        "phase": "connecting",
+        "retryable": true,
+        "timeoutMs": 15000,
+        "url": "https://ex.com/x"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "status",
+          "status": "error"
+        },
+        {
+          "kind": "progress",
+          "status": "error",
+          "progress": 1,
+          "phase": "error"
+        }
+      ]
+    }
+  },
+  {
+    "name": "json-response-markdown-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/api"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{\"b\":1,\"a\":[1,2]}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/api",
+        "finalUrl": "https://ex.com/api",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 9,
+        "content": "```json\n{\n  \"b\": 1,\n  \"a\": [\n    1,\n    2\n  ]\n}\n```",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "json_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "json-response-json-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/api",
+        "format": "json"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{\"k\":\"v\"}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/api",
+        "finalUrl": "https://ex.com/api",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 4,
+        "content": "{\n  \"k\": \"v\"\n}",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "application/json,text/json,application/ld+json;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "json_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "json-body-text-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/api",
+        "format": "text"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "{\"k\":1}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/api",
+        "finalUrl": "https://ex.com/api",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 4,
+        "content": "{\n  \"k\": 1\n}",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "json_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "json-body-html-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/api",
+        "format": "html"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "{\"k\":1}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/api",
+        "finalUrl": "https://ex.com/api",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 4,
+        "content": "<pre><code class=\"language-json\">{\n  &quot;k&quot;: 1\n}</code></pre>",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "json_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "invalid-json-json-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/api",
+        "format": "json"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{broken"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Invalid JSON response"
+      },
+      "requestHeadersSeen": {
+        "Accept": "application/json,text/json,application/ld+json;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        }
+      ]
+    }
+  },
+  {
+    "name": "non-json-json-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/page",
+        "format": "json"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/xml"
+          },
+          "body": "<x>not json</x>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Not a JSON response (content-type: application/xml)",
+        "code": "unexpected_response",
+        "phase": "loading",
+        "retryable": false,
+        "timeoutMs": 15000,
+        "url": "https://ex.com/page",
+        "finalUrl": "https://ex.com/page",
+        "mimeType": "application/xml"
+      },
+      "requestHeadersSeen": {
+        "Accept": "application/json,text/json,application/ld+json;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        }
+      ]
+    }
+  },
+  {
+    "name": "plain-text-response",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/robots.txt"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "User-agent: *\nDisallow: /"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/robots.txt",
+        "finalUrl": "https://ex.com/robots.txt",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 4,
+        "content": "User-agent: *\nDisallow: /",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "plain-text-html-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/robots.txt",
+        "format": "html"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "a < b & c"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/robots.txt",
+        "finalUrl": "https://ex.com/robots.txt",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 5,
+        "content": "<pre>a &lt; b &amp; c</pre>",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "markdown-content-type",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/readme"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/markdown"
+          },
+          "body": "# Heading\n\ntext"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/readme",
+        "finalUrl": "https://ex.com/readme",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 3,
+        "content": "# Heading\n\ntext",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "extraction-success-markdown",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/article"
+      },
+      "defuddleResult": {
+        "content": "Extracted **article** body.",
+        "wordCount": 4,
+        "title": "Fixture Article",
+        "author": "A. Author",
+        "published": "2026-02-03",
+        "site": "Example",
+        "language": "en"
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>Fixture Article</title></head><body><article><h1>Main Title</h1><p>This article has enough words for readability scoring thresholds so the extractor path is exercised properly across formats.</p></article></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/article",
+        "finalUrl": "https://ex.com/article",
+        "title": "Fixture Article",
+        "author": "A. Author",
+        "published": "2026-02-03",
+        "site": "Example",
+        "language": "en",
+        "wordCount": 4,
+        "content": "Extracted **article** body.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "extraction-success-text-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/article",
+        "format": "text"
+      },
+      "defuddleResult": {
+        "content": "Extracted **article** body.",
+        "wordCount": 4
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>Fixture Article</title></head><body><article><h1>Main Title</h1><p>This article has enough words for readability scoring thresholds so the extractor path is exercised properly across formats.</p></article></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/article",
+        "finalUrl": "https://ex.com/article",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 4,
+        "content": "Extracted article body.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "extraction-success-html-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/article",
+        "format": "html"
+      },
+      "defuddleResult": {
+        "content": "<p>cleaned</p>",
+        "wordCount": 1
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>Fixture Article</title></head><body><article><h1>Main Title</h1><p>This article has enough words for readability scoring thresholds so the extractor path is exercised properly across formats.</p></article></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/article",
+        "finalUrl": "https://ex.com/article",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 1,
+        "content": "<p>cleaned</p>",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "dom-fallback-markdown",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/fallback"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>FB</title></head><body><h1>Head</h1><p>Fallback <b>bold</b> paragraph.</p><ul><li>one</li><li>two</li></ul></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/fallback",
+        "finalUrl": "https://ex.com/fallback",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 3,
+        "content": "# Head\n\nFallback **bold** paragraph.\n\n- one\n- two",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "dom-fallback-text",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/fallback",
+        "format": "text"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>FB</title></head><body><h1>Head</h1><p>Fallback <b>bold</b> paragraph.</p><ul><li>one</li><li>two</li></ul></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/fallback",
+        "finalUrl": "https://ex.com/fallback",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 3,
+        "content": "HeadFallback bold paragraph.onetwo",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "dom-fallback-html-uses-raw-body",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/fallback",
+        "format": "html"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>FB</title></head><body><h1>Head</h1><p>Fallback <b>bold</b> paragraph.</p><ul><li>one</li><li>two</li></ul></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/fallback",
+        "finalUrl": "https://ex.com/fallback",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 3,
+        "content": "<html><head><title>FB</title></head><body><h1>Head</h1><p>Fallback <b>bold</b> paragraph.</p><ul><li>one</li><li>two</li></ul></body></html>",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "no-content",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/empty"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>Empty</title></head><body><script>ignored()</script></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/empty",
+        "finalUrl": "https://ex.com/empty",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 1,
+        "content": "ignored()",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "maxchars-truncation",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/long",
+        "maxChars": 20
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "0123456789012345678901234567890123456789"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/long",
+        "finalUrl": "https://ex.com/long",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 1,
+        "content": "01234567890123456789\n\n[... truncated]",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "maxchars-astral-variant",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/emoji",
+        "maxChars": 7
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "a😀b😀c😀d😀e😀f😀g😀h"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/emoji",
+        "finalUrl": "https://ex.com/emoji",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 1,
+        "content": "a😀b😀c\n\n[... truncated]",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "raw-no-maxchars",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/raw",
+        "format": "raw"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><body>raw body 1234567890</body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/raw",
+        "finalUrl": "https://ex.com/raw",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "<html><body>raw body 1234567890</body></html>",
+        "browser": "chrome_145",
+        "os": "windows",
+        "contentType": "text/html"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/json,application/xml;q=0.9,text/markdown;q=0.8,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "raw_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "raw-explicit-maxchars",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/raw",
+        "format": "raw",
+        "maxChars": 8
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{\"key\":\"value\"}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/raw",
+        "finalUrl": "https://ex.com/raw",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "{\"key\":\"\n\n[... truncated]",
+        "browser": "chrome_145",
+        "os": "windows",
+        "contentType": "application/json"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/json,application/xml;q=0.9,text/markdown;q=0.8,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "raw_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "non-html-content-type",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/binaryish",
+        "tempDir": "/tmp/smart-fetch-parity-downloads"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/octet-stream"
+          },
+          "body": "binary-ish textual body",
+          "stream": true
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "file",
+        "url": "https://ex.com/binaryish",
+        "finalUrl": "https://ex.com/binaryish",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "",
+        "browser": "chrome_145",
+        "os": "windows",
+        "filePath": "/tmp/smart-fetch-parity-downloads/binaryish.bin",
+        "fileSize": 23,
+        "mimeType": "application/octet-stream"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "file_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "custom-headers-merge",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/headers",
+        "headers": {
+          "Accept": "text/custom",
+          "X-Token": "secret"
+        }
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "ok"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/headers",
+        "finalUrl": "https://ex.com/headers",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 1,
+        "content": "ok",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/custom",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Token": "secret"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "format-raw-accept-header",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/accept",
+        "format": "raw"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "ok"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/accept",
+        "finalUrl": "https://ex.com/accept",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "ok",
+        "browser": "chrome_145",
+        "os": "windows",
+        "contentType": "text/plain"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/json,application/xml;q=0.9,text/markdown;q=0.8,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "raw_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "format-json-accept-header",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/accept",
+        "format": "json"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{\"ok\":true}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/accept",
+        "finalUrl": "https://ex.com/accept",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 4,
+        "content": "{\n  \"ok\": true\n}",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "application/json,text/json,application/ld+json;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "json_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "meta-refresh-follow",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/start"
+      },
+      "defuddleResult": {
+        "content": "Final page body.",
+        "wordCount": 3,
+        "title": "Fixture Article"
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/final\"></head><body>redirecting…</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>Fixture Article</title></head><body><article><h1>Main Title</h1><p>This article has enough words for readability scoring thresholds so the extractor path is exercised properly across formats.</p></article></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/final",
+        "finalUrl": "https://ex.com/final",
+        "title": "Fixture Article",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 3,
+        "content": "Final page body.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "meta-refresh-follow-raw-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/start",
+        "format": "raw"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"2;url=https://ex.com/raw-target\"></head><body>redirecting…</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "raw landed body"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/raw-target",
+        "finalUrl": "https://ex.com/raw-target",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "raw landed body",
+        "browser": "chrome_145",
+        "os": "windows",
+        "contentType": "text/plain"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/json,application/xml;q=0.9,text/markdown;q=0.8,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "raw_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "meta-refresh-delay-30-not-followed",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/slowmeta"
+      },
+      "defuddleResult": {
+        "content": "Content stays on page.",
+        "wordCount": 4
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"30;url=/final\"></head><body>still here</body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/slowmeta",
+        "finalUrl": "https://ex.com/slowmeta",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 4,
+        "content": "Content stays on page.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "meta-refresh-limit-exceeded",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/hop-0"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/hop-1\"></head><body>loop</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/hop-2\"></head><body>loop</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/hop-3\"></head><body>loop</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/hop-4\"></head><body>loop</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/hop-5\"></head><body>loop</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/hop-6\"></head><body>loop</body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Client-side redirect limit (5) exceeded while fetching https://ex.com/hop-5.",
+        "code": "too_many_redirects",
+        "phase": "loading",
+        "retryable": false,
+        "timeoutMs": 15000,
+        "url": "https://ex.com/hop-5",
+        "finalUrl": "https://ex.com/hop-5",
+        "mimeType": "text/html"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        }
+      ]
+    }
+  },
+  {
+    "name": "alternate-json-format-fallback",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/page",
+        "format": "json"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><link rel=\"alternate\" type=\"application/json\" href=\"/api.json\"></head><body>not json</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{\"alt\":true}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/api.json",
+        "finalUrl": "https://ex.com/api.json",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 4,
+        "content": "{\n  \"alt\": true\n}",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "application/json,text/json,application/ld+json;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "json_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "alternate-empty-content-fallback",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/emptyish"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><link rel=\"alternate\" type=\"text/markdown\" href=\"/full.md\"></head><body><script>only a script</script></body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/markdown"
+          },
+          "body": "# Alternate Body\n\nPlenty of markdown words on the alternate endpoint."
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/full.md",
+        "finalUrl": "https://ex.com/full.md",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 11,
+        "content": "# Alternate Body\n\nPlenty of markdown words on the alternate endpoint.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "alternate-thin-content-fallback",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/thin"
+      },
+      "defuddleResult": {
+        "content": "too thin",
+        "wordCount": 2
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><link rel=\"alternate\" type=\"text/markdown\" href=\"/full.md\"></head><body><article><p>too thin</p></article></body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/markdown"
+          },
+          "body": "# Full Alternate\n\nThis alternate response carries a comfortable amount of words for the thin-content fallback threshold."
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/full.md",
+        "finalUrl": "https://ex.com/full.md",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 17,
+        "content": "# Full Alternate\n\nThis alternate response carries a comfortable amount of words for the thin-content fallback threshold.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "empty-extraction-alternate-first",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/shell"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><link rel=\"alternate\" type=\"text/markdown\" href=\"/shell.md\"></head><body><article><p>nav shell text that should not win because the declared alternate is the better source here and the fallback article body is deliberately long enough to clear the thin content threshold so the old order keeps this paragraph instead of following the alternate link that the page declares for readers without javascript rendering support at all</p></article></body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/markdown"
+          },
+          "body": "# Full Alternate\n\nThis alternate response carries a comfortable amount of words for the fallback threshold."
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/shell.md",
+        "finalUrl": "https://ex.com/shell.md",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 16,
+        "content": "# Full Alternate\n\nThis alternate response carries a comfortable amount of words for the fallback threshold.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "empty-extraction-alternate-empty",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/shell-empty"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><link rel=\"alternate\" type=\"text/markdown\" href=\"/empty.md\"></head><body>nav shell text</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><body></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "No content extracted from https://ex.com/empty.md. May need JS rendering or is blocked.",
+        "code": "no_content",
+        "phase": "processing",
+        "retryable": false,
+        "timeoutMs": 15000,
+        "url": "https://ex.com/empty.md",
+        "finalUrl": "https://ex.com/empty.md",
+        "mimeType": "text/html"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        }
+      ]
+    }
+  },
+  {
+    "name": "empty-extraction-no-alternate-dom",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/shell-no-alt"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><body>dom fallback text stays</body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/shell-no-alt",
+        "finalUrl": "https://ex.com/shell-no-alt",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 4,
+        "content": "dom fallback text stays",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "alternate-thin-content-unqualified-type-kept",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/thin-alone"
+      },
+      "defuddleResult": {
+        "content": "too thin but no qualified alternate",
+        "wordCount": 6
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><link rel=\"alternate\" type=\"application/rss+xml\" href=\"/feed.xml\"></head><body><article><p>too thin but no qualified alternate</p></article></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/thin-alone",
+        "finalUrl": "https://ex.com/thin-alone",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 6,
+        "content": "too thin but no qualified alternate",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "download-attachment-disposition",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/files/report.pdf",
+        "tempDir": "/tmp/smart-fetch-parity-downloads"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/pdf",
+            "content-disposition": "attachment; filename=\"Mock Report.pdf\""
+          },
+          "body": "PDF-BYTES-0123456789",
+          "stream": true
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "file",
+        "url": "https://ex.com/files/report.pdf",
+        "finalUrl": "https://ex.com/files/report.pdf",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "",
+        "browser": "chrome_145",
+        "os": "windows",
+        "filePath": "/tmp/smart-fetch-parity-downloads/Mock-Report.pdf",
+        "fileSize": 20,
+        "mimeType": "application/pdf"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "file_done"
+        }
+      ]
+    }
+  },
+  {
+    "name": "download-filename-star-disposition",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/dl",
+        "tempDir": "/tmp/smart-fetch-parity-downloads"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain",
+            "content-disposition": "attachment; filename*=UTF-8''na%C3%AFve%20doc.txt"
+          },
+          "body": "plain but forced to download by disposition",
+          "stream": true
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "file",
+        "url": "https://ex.com/dl",
+        "finalUrl": "https://ex.com/dl",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "",
+        "browser": "chrome_145",
+        "os": "windows",
+        "filePath": "/tmp/smart-fetch-parity-downloads/naive-doc.txt",
+        "fileSize": 43,
+        "mimeType": "text/plain"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "file_done"
+        }
+      ]
+    }
+  }
+]

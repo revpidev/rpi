@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use crate::api::anthropic_messages::AnthropicMessages;
 use crate::auth::{ProviderAuth, env_api_key_auth};
-use crate::generated::get_builtin_models;
 use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `minimaxProvider()`.
@@ -24,7 +23,7 @@ pub fn minimax_provider() -> Arc<dyn Provider> {
             ))),
             oauth: None,
         },
-        models: get_builtin_models("minimax").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared("minimax")),
         api: ProviderApi::Single(Arc::new(AnthropicMessages)),
         ..Default::default()
     })

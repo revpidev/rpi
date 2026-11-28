@@ -1,5 +1,5 @@
 //! Nested tool calls (`ctx.executeTool()`), ported from
-//! `packages/coding-agent/test/nested-tool-calls.test.ts` @ 4a080252f
+//! `packages/coding-agent/test/nested-tool-calls.test.ts` @ b4afdddf
 //! (V16-06 FR-E): id assignment, parent-carrying events, bounded record,
 //! usage summation, exclusive serialization.
 
@@ -42,6 +42,7 @@ fn usage(input: u64, cost: f64) -> Usage {
             cache_read: 0.0,
             cache_write: 0.0,
             total: cost,
+            total_from_provider: None,
         },
     }
 }

@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use rpi_ai::types::{ImageContent, UserContent};
 use rpi_ext_host::api::{
     DeliverAs, ExecOptions, ExecResult, ExecuteToolOptions, ExecuteToolOutcome, HostActions,
-    SendMessageOptions, SendUserMessageOptions,
+    SendMessageOptions, SendUserMessageOptions, ToolCallApproval,
 };
 use rpi_ext_host::error::ExtError;
 use serde_json::Value;
@@ -348,8 +348,7 @@ impl HostActions for SessionHostActions {
                     .map(|session| session.cwd().to_owned())
                     .unwrap_or_else(|| "/".to_owned())
             });
-        let timeout_ms = options.as_ref().and_then(|o| o.timeout);
-        Ok(exec_command(command, args, &cwd, timeout_ms).await)
+        exec_command(command, args, &cwd, options).await
     }
 
     /// `getActiveTools` (agent-session.ts:2393).
@@ -607,7 +606,7 @@ impl HostActions for SessionHostActions {
     }
 
     /// `ctx.modelRegistry.findOfType(type, provider, modelId)`
-    /// (model-registry.ts:76-77 @ 4a080252f): non-chat catalog lookup over
+    /// (model-registry.ts:76-77 @ b4afdddf): non-chat catalog lookup over
     /// the runtime's typed accessors (V16-06 R2.5.2).
     fn model_registry_find_of_type(
         &self,
@@ -629,7 +628,7 @@ impl HostActions for SessionHostActions {
     }
 
     /// `ctx.modelRegistry.classify(model, context, options?)`
-    /// (model-registry.ts:173-179 @ 4a080252f): structured classification
+    /// (model-registry.ts:173-179 @ b4afdddf): structured classification
     /// with request-time authentication. Never rejects — parse failures and
     /// an unbound session produce an error `ClassifierResult`. The
     /// callback-bearing option fields (`signal`/`fetch`/`onPayload`/
@@ -803,8 +802,41 @@ impl HostActions for SessionHostActions {
             .map_err(|e| e.to_string())
     }
 
+    /// V19-03 S13 additive (`approveToolCall` host call): run the session's
+    /// `tool_call` handler chain for a synthetic call without dispatching a
+    /// tool. Used by workflow child launches (`subagent_launch`).
+    async fn approve_tool_call(
+        &self,
+        tool_name: &str,
+        input: Value,
+    ) -> Result<ToolCallApproval, ExtError> {
+        let Some(session) = self.session() else {
+            return Err(ExtError::Unbound("session is gone".to_owned()));
+        };
+        let synthetic_id = format!(
+            "subagent-launch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        );
+        let outcome = session
+            .extension_runner()
+            .emit_tool_call(&synthetic_id, tool_name, input, None)
+            .await;
+        Ok(match outcome {
+            Some(outcome) => ToolCallApproval {
+                block: outcome.block.unwrap_or(false),
+                reason: outcome.reason,
+                input: outcome.input,
+            },
+            None => ToolCallApproval::default(),
+        })
+    }
+
     /// Backs `ExtensionToolContext.executeTool()` (types.ts:390-394 @
-    /// 4a080252f; V16-06 FR-E): run a nested tool call through the session's
+    /// b4afdddf; V16-06 FR-E): run a nested tool call through the session's
     /// nested-call runner (same validation, hooks, and permission checks as
     /// model-issued calls). Tool failures come back as `is_error: true`.
     async fn execute_tool(
@@ -869,31 +901,295 @@ fn normalize_user_message_content(content: Value) -> (String, Option<Vec<ImageCo
     (text_parts.join("\n"), images)
 }
 
-/// `execCommand` (exec.ts:34-106): spawn without a shell, capture
-/// stdout/stderr, `killed` marks a timeout kill. Spawn failure resolves
-/// with `code: 1` (exec.ts:98-103 catch branch).
+const DEFAULT_EXEC_MAX_BUFFER: usize = 256 * 1024 * 1024;
+const EXEC_RUNTIME_STRING_LIMIT: usize = isize::MAX as usize;
+const FORCE_KILL_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Default)]
+struct ExecStreamCapture {
+    pending: Vec<u8>,
+    text: String,
+}
+
+impl ExecStreamCapture {
+    fn append(&mut self, data: &[u8]) {
+        self.pending.extend_from_slice(data);
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    self.text.push_str(text);
+                    self.pending.clear();
+                    return;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    if valid > 0 {
+                        self.text
+                            .push_str(std::str::from_utf8(&self.pending[..valid]).unwrap_or(""));
+                    }
+                    match error.error_len() {
+                        None => {
+                            self.pending = self.pending[valid..].to_vec();
+                            return;
+                        }
+                        Some(invalid) => {
+                            self.text.push('\u{fffd}');
+                            self.pending = self.pending[valid + invalid..].to_vec();
+                            if self.pending.is_empty() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.pending.is_empty() {
+            self.text.push_str(&String::from_utf8_lossy(&self.pending));
+            self.pending.clear();
+        }
+    }
+}
+
+struct ExecCapture {
+    stdout: ExecStreamCapture,
+    stderr: ExecStreamCapture,
+    output_bytes: usize,
+    truncated: bool,
+    max_buffer: usize,
+}
+
+impl ExecCapture {
+    fn new(max_buffer: usize) -> Self {
+        Self {
+            stdout: ExecStreamCapture::default(),
+            stderr: ExecStreamCapture::default(),
+            output_bytes: 0,
+            truncated: false,
+            max_buffer,
+        }
+    }
+
+    fn append(&mut self, stdout: bool, data: &[u8]) -> bool {
+        if self.truncated {
+            return false;
+        }
+        let remaining = self.max_buffer.saturating_sub(self.output_bytes);
+        let accepted = remaining.min(data.len());
+        let overflow = data.len() > remaining;
+        if accepted > 0 {
+            let stream = if stdout {
+                &mut self.stdout
+            } else {
+                &mut self.stderr
+            };
+            stream.append(&data[..accepted]);
+            self.output_bytes += accepted;
+        }
+        if overflow {
+            self.truncated = true;
+        }
+        overflow
+    }
+
+    fn finish(mut self) -> (String, String, bool) {
+        if !self.truncated {
+            self.stdout.finish();
+            self.stderr.finish();
+        }
+        (self.stdout.text, self.stderr.text, self.truncated)
+    }
+}
+
+async fn read_exec_stream<R>(
+    reader: R,
+    stdout: bool,
+    capture: Arc<std::sync::Mutex<ExecCapture>>,
+    cancel: tokio_util::sync::CancellationToken,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut reader = reader;
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => {
+                let overflow = {
+                    let mut capture = capture.lock().unwrap_or_else(|error| error.into_inner());
+                    capture.append(stdout, &buffer[..read])
+                };
+                if overflow {
+                    cancel.cancel();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn signal_exec_process(pid: Option<u32>, force: bool) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+        // SAFETY: the child was placed in its own process group. Signalling
+        // the negative pid reaches only that group; the positive-pid fallback
+        // is restricted to the child we still own.
+        unsafe {
+            if libc::kill(-(pid as i32), signal) != 0 {
+                libc::kill(pid as i32, signal);
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Some(pid) = pid {
+        use std::process::{Command, Stdio};
+        let (taskkill, args) = windows_taskkill_invocation(pid);
+        let args = if force {
+            args.to_vec()
+        } else {
+            vec!["/T".to_owned(), "/PID".to_owned(), pid.to_string()]
+        };
+        let _ = Command::new(taskkill)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (pid, force);
+}
+
+/// `execCommand` (exec.ts:47-158 @ b4afdddf): shared stdout/stderr byte cap,
+/// streaming UTF-8 decoding and bounded SIGTERM→SIGKILL escalation.
 async fn exec_command(
     command: &str,
     args: &[String],
     cwd: &str,
-    timeout_ms: Option<u64>,
-) -> ExecResult {
-    let outcome = exec_script(ScriptExecRequest {
-        command,
-        args,
-        cwd,
-        timeout_ms,
-        stdin: None,
-        env: &[],
-        max_stdout_bytes: None,
-    })
-    .await;
-    ExecResult {
-        stdout: outcome.stdout,
-        stderr: outcome.stderr,
-        code: outcome.code,
-        killed: outcome.killed,
+    options: Option<ExecOptions>,
+) -> Result<ExecResult, ExtError> {
+    let options = options.unwrap_or_default();
+    let max_buffer = options
+        .max_buffer
+        .unwrap_or_else(|| DEFAULT_EXEC_MAX_BUFFER.min(EXEC_RUNTIME_STRING_LIMIT));
+    if max_buffer > EXEC_RUNTIME_STRING_LIMIT {
+        return Err(ExtError::Call(format!(
+            "maxBuffer must be an integer between 0 and {EXEC_RUNTIME_STRING_LIMIT} bytes"
+        )));
     }
+
+    let mut process = tokio::process::Command::new(command);
+    process
+        .args(args)
+        .current_dir(cwd)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    process.process_group(0);
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok(ExecResult {
+                stdout: String::new(),
+                stderr: error.to_string(),
+                code: 1,
+                killed: false,
+                truncated: false,
+            });
+        }
+    };
+
+    let pid = child.id();
+    let capture = Arc::new(std::sync::Mutex::new(ExecCapture::new(max_buffer)));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stdout_task = child.stdout.take().map(|stdout| {
+        tokio::spawn(read_exec_stream(
+            stdout,
+            true,
+            Arc::clone(&capture),
+            cancel.clone(),
+        ))
+    });
+    let stderr_task = child.stderr.take().map(|stderr| {
+        tokio::spawn(read_exec_stream(
+            stderr,
+            false,
+            Arc::clone(&capture),
+            cancel.clone(),
+        ))
+    });
+
+    let wait = child.wait();
+    tokio::pin!(wait);
+    let timeout_ms = options.timeout;
+    let signal = options.signal;
+    let cancel_or_timeout = async {
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = async {
+                if let Some(token) = signal {
+                    token.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+            _ = async {
+                if let Some(timeout_ms) = timeout_ms.filter(|timeout| *timeout > 0) {
+                    tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+        }
+    };
+    tokio::pin!(cancel_or_timeout);
+
+    let mut killed = false;
+    let status = tokio::select! {
+        status = &mut wait => status.ok(),
+        _ = &mut cancel_or_timeout => {
+            killed = true;
+            signal_exec_process(pid, false);
+            match tokio::time::timeout(FORCE_KILL_DELAY, &mut wait).await {
+                Ok(status) => status.ok(),
+                Err(_) => {
+                    signal_exec_process(pid, true);
+                    wait.await.ok()
+                }
+            }
+        }
+    };
+    if let Some(task) = stdout_task {
+        let _ = task.await;
+    }
+    if let Some(task) = stderr_task {
+        let _ = task.await;
+    }
+    let capture = Arc::try_unwrap(capture)
+        .map_err(|_| ExtError::Call("exec output capture is still shared".to_owned()))?;
+    let (stdout, stderr, truncated) = capture
+        .into_inner()
+        .unwrap_or_else(|error| error.into_inner())
+        .finish();
+    killed |= truncated;
+    let mut code = status.and_then(|status| status.code()).unwrap_or(0);
+    if truncated && code == 0 {
+        code = 1;
+    }
+    Ok(ExecResult {
+        stdout,
+        stderr,
+        code,
+        killed,
+        truncated,
+    })
 }
 
 /// One request through the shared exec channel ([`exec_script`]).
@@ -918,7 +1214,6 @@ pub(crate) struct ScriptExecRequest<'a> {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ScriptExecOutcome {
     pub stdout: String,
-    pub stderr: String,
     pub code: i32,
     pub killed: bool,
     pub stdout_overflow: bool,
@@ -1026,9 +1321,9 @@ pub(crate) async fn exec_script(request: ScriptExecRequest<'_>) -> ScriptExecOut
         }
     };
 
+    let _ = stderr_text;
     ScriptExecOutcome {
         stdout: stdout_text,
-        stderr: stderr_text,
         code: status.and_then(|status| status.code()).unwrap_or(0),
         killed: timed_out,
         stdout_overflow,
@@ -1134,5 +1429,128 @@ mod tests {
         let rendered = taskkill.to_string_lossy().replace('\\', "/");
         assert!(rendered.ends_with("System32/taskkill.exe"), "{rendered}");
         assert_eq!(args, ["/F", "/T", "/PID", "42"]);
+    }
+
+    fn exec_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_combined_cap_is_exact_and_overflow_is_nonzero() {
+        let exact = exec_command(
+            "/bin/sh",
+            &exec_args(&["-c", "printf ab; printf cd >&2"]),
+            "/",
+            Some(ExecOptions {
+                max_buffer: Some(4),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("exact cap");
+        assert_eq!(exact.stdout, "ab");
+        assert_eq!(exact.stderr, "cd");
+        assert!(!exact.truncated);
+        assert!(!exact.killed);
+        assert_eq!(exact.code, 0);
+
+        let overflow = exec_command(
+            "/bin/sh",
+            &exec_args(&["-c", "printf abc; printf defgh >&2"]),
+            "/",
+            Some(ExecOptions {
+                max_buffer: Some(5),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("overflow result");
+        assert_eq!(overflow.stdout.len() + overflow.stderr.len(), 5);
+        assert!(overflow.truncated);
+        assert!(overflow.killed);
+        assert_ne!(overflow.code, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_decodes_utf8_across_chunks_without_flushing_cut_suffix() {
+        let result = exec_command(
+            "/bin/sh",
+            &exec_args(&["-c", "printf '\\303'; sleep 0.02; printf '\\251'"]),
+            "/",
+            Some(ExecOptions {
+                max_buffer: Some(2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("utf8 output");
+        assert_eq!(result.stdout, "é");
+        assert!(!result.truncated);
+
+        let truncated = exec_command(
+            "/bin/sh",
+            &exec_args(&["-c", "printf '\\303'; sleep 0.02; printf '\\251x'"]),
+            "/",
+            Some(ExecOptions {
+                max_buffer: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("truncated utf8 output");
+        assert!(truncated.truncated);
+        assert!(!truncated.stdout.contains('\u{fffd}'));
+    }
+
+    #[tokio::test]
+    async fn exec_preserves_spawn_errors_and_supports_abort() {
+        let missing = exec_command("/definitely/missing/rpi-exec-command", &[], "/", None)
+            .await
+            .expect("spawn failure is a result");
+        assert_eq!(missing.code, 1);
+        assert!(!missing.stderr.is_empty());
+        assert!(!missing.killed);
+
+        let signal = tokio_util::sync::CancellationToken::new();
+        signal.cancel();
+        let aborted = exec_command(
+            "/bin/sh",
+            &exec_args(&["-c", "sleep 10"]),
+            "/",
+            Some(ExecOptions {
+                signal: Some(signal),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("abort result");
+        assert!(aborted.killed);
+        assert!(!aborted.truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_timeout_escalates_to_force_kill() {
+        let started = std::time::Instant::now();
+        let result = exec_command(
+            "/bin/sh",
+            &exec_args(&["-c", "trap '' TERM; while :; do sleep 1; done"]),
+            "/",
+            Some(ExecOptions {
+                // Leave enough time for the shell to install the TERM trap;
+                // 10 ms is shorter than shell startup under a loaded test
+                // runner, which made the child exit on the first SIGTERM
+                // before the force-kill escalation could run.
+                timeout: Some(1_500),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("timeout result");
+        assert!(result.killed);
+        assert!(started.elapsed() >= FORCE_KILL_DELAY);
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
     }
 }

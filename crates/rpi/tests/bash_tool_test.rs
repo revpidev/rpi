@@ -868,6 +868,28 @@ mod bash_executor_tests {
         assert_eq!(streamed, format!("]{long}"));
         assert_eq!(output, format!("]{long}"));
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_timeout_after_shell_exit_preserves_exit_code() {
+        let tool = create_bash_tool(&test_ctx(), BashToolOptions::default());
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_bash(
+                &tool,
+                "while true; do echo tick; sleep 0.02; done & sleep 0.05; exit 3",
+                Some(0.1),
+            ),
+        )
+        .await
+        .expect("bash execution did not finish")
+        .expect_err("output stream timed out");
+        assert!(error.contains("The shell exited with code 3"), "{error}");
+        assert!(error.contains("background processes"), "{error}");
+        assert!(
+            error.contains("Command timed out after 0.1 seconds"),
+            "{error}"
+        );
+    }
 }
 
 mod process_group_tests {

@@ -1,9 +1,9 @@
-//! The identifier a script uses for a tool (`identifier.ts` @ 4a080252f).
+//! The identifier a script uses for a tool (`identifier.ts` @ b4afdddf).
 //!
 //! Characters that are not valid in a JavaScript identifier become `_`.
 //! `mcp__docs__search` stays as is, `my-tool` becomes `my_tool`.
 
-/// `toCodemodeIdentifier` (packages/codemode/src/identifier.ts @ 4a080252f).
+/// `toCodemodeIdentifier` (packages/codemode/src/identifier.ts @ b4afdddf).
 pub fn to_codemode_identifier(name: &str) -> String {
     let mut identifier = String::with_capacity(name.len());
     for ch in name.chars() {

@@ -1,5 +1,5 @@
 //! Per-conversation agent document and resolution
-//! (port of `packages/durable/src/harness/agent.ts` @ `4a080252f`).
+//! (port of `packages/durable/src/harness/agent.ts` @ `b4afdddf`).
 //!
 //! The `pi.agent` document stores a conversation's *choices*: model, thinking
 //! level, extension selection, tool filter, instructions, and working directory.
@@ -46,6 +46,7 @@ pub const DEFAULT_PROGRESS_POLICY: crate::harness::types::ProgressPolicy =
     crate::harness::types::ProgressPolicy {
         partial_interval_ms: 100,
         output_interval_ms: 100,
+        persist_within_ms: Some(1000),
     };
 
 /// The compaction policy for one model: the harness-wide policy with the
@@ -54,21 +55,51 @@ pub fn compaction_for(
     settings: &Settings,
     model: &crate::harness::types::ModelRef,
 ) -> crate::harness::types::CompactionPolicy {
+    compaction_policy(settings, model, None)
+}
+
+/// Resolve one conversation's compaction settings over the harness policy.
+pub fn compaction_policy(
+    settings: &Settings,
+    model: &crate::harness::types::ModelRef,
+    conversation: Option<&crate::harness::types::CompactionSettings>,
+) -> crate::harness::types::CompactionPolicy {
     let key = format!("{}/{}", model.provider, model.model_id);
-    let Some(patch) = settings.compaction_overrides.get(&key) else {
-        return settings.compaction;
+    let harness_override = settings.compaction_overrides.get(&key);
+    let conversation_model = conversation.and_then(|settings| settings.model_overrides.get(&key));
+    let layers = [conversation_model, harness_override, conversation];
+    let field = |select: fn(&crate::harness::types::CompactionPolicyPatch) -> Option<u64>,
+                 fallback: u64| {
+        layers
+            .iter()
+            .find_map(|layer| layer.and_then(select))
+            .unwrap_or(fallback)
     };
     crate::harness::types::CompactionPolicy {
-        enabled: patch.enabled.unwrap_or(settings.compaction.enabled),
-        reserve_tokens: patch
-            .reserve_tokens
-            .unwrap_or(settings.compaction.reserve_tokens),
-        keep_recent_tokens: patch
-            .keep_recent_tokens
-            .unwrap_or(settings.compaction.keep_recent_tokens),
-        background_tokens: patch
-            .background_tokens
-            .unwrap_or(settings.compaction.background_tokens),
+        enabled: conversation_model
+            .and_then(|layer| layer.enabled)
+            .unwrap_or_else(|| {
+                if conversation.and_then(|settings| settings.enabled) == Some(false) {
+                    false
+                } else {
+                    layers
+                        .iter()
+                        .find_map(|layer| layer.and_then(|patch| patch.enabled))
+                        .unwrap_or(settings.compaction.enabled)
+                }
+            }),
+        reserve_tokens: field(
+            |layer| layer.reserve_tokens,
+            settings.compaction.reserve_tokens,
+        ),
+        keep_recent_tokens: field(
+            |layer| layer.keep_recent_tokens,
+            settings.compaction.keep_recent_tokens,
+        ),
+        background_tokens: field(
+            |layer| layer.background_tokens,
+            settings.compaction.background_tokens,
+        ),
     }
 }
 
@@ -159,6 +190,9 @@ pub fn resolve_settings(settings: Option<&crate::harness::types::HarnessSettings
             output_interval_ms: progress
                 .and_then(|progress| progress.output_interval_ms)
                 .unwrap_or(DEFAULT_PROGRESS_POLICY.output_interval_ms),
+            persist_within_ms: progress
+                .and_then(|progress| progress.persist_within_ms)
+                .unwrap_or(DEFAULT_PROGRESS_POLICY.persist_within_ms),
         },
         tool_execution: settings
             .and_then(|settings| settings.tool_execution)
@@ -201,6 +235,11 @@ pub async fn configure(
     conversation_id: ConversationId,
     change: &AgentChange,
 ) -> SessionResult<()> {
+    if change.max_turns == Some(Some(0)) {
+        return Err(crate::session::SessionError::message(
+            "maxTurns must be an integer 1 or more",
+        ));
+    }
     let draft = tx
         .doc(&AGENT_DOC, DocOwner::Conversation(conversation_id), None)
         .await?;
@@ -271,6 +310,12 @@ pub fn apply_change(state: &mut AgentState, change: &AgentChange) {
     }
     if let Some(cwd) = &change.cwd {
         state.cwd = cwd.clone();
+    }
+    if let Some(max_turns) = change.max_turns {
+        state.max_turns = max_turns;
+    }
+    if let Some(compaction) = &change.compaction {
+        state.compaction = compaction.clone();
     }
 }
 
@@ -405,7 +450,6 @@ pub fn resolve_agent(
     snapshot: &dyn crate::harness::types::RegistrySnapshot,
     settings: &Settings,
     report: &ReportFn,
-    report_info: Option<&crate::harness::types::ReportInfoFn>,
 ) -> Agent {
     let extensions = select_extensions(
         state.and_then(|state| state.extensions.as_ref()),
@@ -428,22 +472,12 @@ pub fn resolve_agent(
     for extension in &extensions {
         for wrap in &extension.wraps {
             match wrap {
-                Wrap::Tool { tool, wrap } => apply_wrap_tool(
-                    &mut composed,
-                    tool,
-                    wrap,
-                    report,
-                    report_info,
-                    &extension.name,
-                ),
-                Wrap::Section { key, wrap } => apply_wrap_section(
-                    &mut sections,
-                    key,
-                    wrap,
-                    report,
-                    report_info,
-                    &extension.name,
-                ),
+                Wrap::Tool { tool, wrap } => {
+                    apply_wrap_tool(&mut composed, tool, wrap, report, &extension.name)
+                }
+                Wrap::Section { key, wrap } => {
+                    apply_wrap_section(&mut sections, key, wrap, report, &extension.name)
+                }
             }
         }
     }
@@ -499,6 +533,8 @@ pub fn resolve_agent(
         sections: agent_sections,
         instructions,
         cwd: state.and_then(|state| state.cwd.clone()),
+        max_turns: state.and_then(|state| state.max_turns),
+        compaction: state.and_then(|state| state.compaction.clone()),
     }
 }
 
@@ -626,7 +662,6 @@ fn apply_wrap_tool(
     target: &str,
     wrap: &Arc<dyn Fn(ToolRegistration) -> ToolRegistration + Send + Sync>,
     report: &ReportFn,
-    report_info: Option<&crate::harness::types::ReportInfoFn>,
     extension: &str,
 ) {
     let Some(index) = items.iter().position(|(name, _)| name == target) else {
@@ -636,15 +671,13 @@ fn apply_wrap_tool(
     if wrapped.name() != target {
         let renamed = wrapped.name().to_string();
         items.remove(index);
-        report(format!("Wrapper renamed {target} to {renamed}"));
-        if let Some(report) = report_info {
-            report(
-                crate::harness::types::ReportInfo::new(
-                    crate::harness::types::ReportKind::ExtensionError,
-                )
-                .with_extension(extension),
-            );
-        }
+        report(crate::harness::types::Report::new(
+            crate::harness::types::ReportInfo::new(
+                crate::harness::types::ReportKind::ExtensionError,
+            )
+            .with_extension(extension),
+            format!("Wrapper renamed {target} to {renamed}"),
+        ));
     } else {
         items[index].1 = wrapped;
     }
@@ -655,7 +688,6 @@ fn apply_wrap_section(
     target: &str,
     wrap: &Arc<dyn Fn(PromptSection) -> PromptSection + Send + Sync>,
     report: &ReportFn,
-    report_info: Option<&crate::harness::types::ReportInfoFn>,
     extension: &str,
 ) {
     let Some(index) = items.iter().position(|(key, _)| key == target) else {
@@ -665,15 +697,13 @@ fn apply_wrap_section(
     if wrapped.key != target {
         let renamed = wrapped.key.clone();
         items.remove(index);
-        report(format!("Wrapper renamed {target} to {renamed}"));
-        if let Some(report) = report_info {
-            report(
-                crate::harness::types::ReportInfo::new(
-                    crate::harness::types::ReportKind::ExtensionError,
-                )
-                .with_extension(extension),
-            );
-        }
+        report(crate::harness::types::Report::new(
+            crate::harness::types::ReportInfo::new(
+                crate::harness::types::ReportKind::ExtensionError,
+            )
+            .with_extension(extension),
+            format!("Wrapper renamed {target} to {renamed}"),
+        ));
     } else {
         items[index].1 = wrapped;
     }
@@ -760,6 +790,7 @@ mod tests {
             progress: Some(crate::harness::types::ProgressPolicyPatch {
                 partial_interval_ms: Some(5),
                 output_interval_ms: None,
+                ..Default::default()
             }),
             tool_execution: Some(crate::harness::types::ToolExecutionMode::Sequential),
             ..Default::default()
@@ -860,7 +891,7 @@ mod tests {
             extensions: Some(ExtensionsSelection::List(vec!["b".to_string()])),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report, None);
+        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report);
         assert_eq!(names(&agent), vec!["b"]);
         assert_eq!(agent.tools.len(), 1);
         assert_eq!(agent.tools[0].tool.description, "from b");
@@ -873,7 +904,7 @@ mod tests {
             }),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report, None);
+        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report);
         assert_eq!(names(&agent), vec!["b"]);
 
         // A tool list offers exactly those tools; an unknown name is skipped.
@@ -885,7 +916,7 @@ mod tests {
             instructions: Some("be brief".to_string()),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report, None);
+        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report);
         assert_eq!(
             agent
                 .tools
@@ -918,13 +949,15 @@ mod tests {
         let reports = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&reports);
         let report: crate::harness::types::ReportFn =
-            Arc::new(move |message| captured.lock().unwrap().push(message));
+            Arc::new(move |report: crate::harness::types::Report| {
+                captured.lock().unwrap().push(report.error)
+            });
 
         let state = AgentState {
             extensions: Some(ExtensionsSelection::List(vec!["a".to_string()])),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report, None);
+        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report);
         assert_eq!(agent.tools[0].tool.description, "plain");
         assert!(agent.sections.iter().any(|s| s.key == "prompt"));
 
@@ -949,7 +982,7 @@ mod tests {
             extensions: Some(ExtensionsSelection::List(vec!["a".to_string()])),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report, None);
+        let agent = resolve_agent(Some(&state), &*snapshot, &settings, &report);
         assert!(agent.tools.is_empty());
         assert_eq!(reports.lock().unwrap().len(), 1);
     }
@@ -1034,7 +1067,7 @@ mod tests {
         let registry = snapshot(vec![extension.clone()]);
         let settings = resolve_settings(None);
 
-        let agent = resolve_agent(None, registry.as_ref(), &settings, &report, None);
+        let agent = resolve_agent(None, registry.as_ref(), &settings, &report);
         assert_eq!(
             agent
                 .tools
@@ -1068,7 +1101,7 @@ mod tests {
             }),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), registry.as_ref(), &settings, &report, None);
+        let agent = resolve_agent(Some(&state), registry.as_ref(), &settings, &report);
         assert_eq!(
             agent
                 .tools
@@ -1087,7 +1120,7 @@ mod tests {
             ])),
             ..AgentState::default()
         };
-        let agent = resolve_agent(Some(&state), registry.as_ref(), &settings, &report, None);
+        let agent = resolve_agent(Some(&state), registry.as_ref(), &settings, &report);
         assert_eq!(
             agent
                 .tools
@@ -1118,6 +1151,7 @@ mod tests {
 #[cfg(test)]
 mod compaction_override_tests {
     use super::*;
+    use crate::chord::json::JsonValue;
     use crate::harness::types::{CompactionPolicyPatch, ModelRef};
 
     #[test]
@@ -1151,5 +1185,160 @@ mod compaction_override_tests {
             model_id: "other".to_string(),
         };
         assert_eq!(compaction_for(&resolved, &other).reserve_tokens, 10);
+    }
+
+    #[test]
+    fn conversation_layers_follow_the_upstream_precedence() {
+        let settings = crate::harness::types::HarnessSettings {
+            compaction: Some(CompactionPolicyPatch {
+                reserve_tokens: Some(10),
+                model_overrides: std::collections::BTreeMap::from([(
+                    "test/model".to_string(),
+                    CompactionPolicyPatch {
+                        reserve_tokens: Some(1),
+                        keep_recent_tokens: Some(2),
+                        enabled: Some(true),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_settings(Some(&settings));
+        let model = ModelRef {
+            provider: "test".to_string(),
+            model_id: "model".to_string(),
+        };
+        let conversation = CompactionPolicyPatch {
+            enabled: Some(false),
+            reserve_tokens: Some(20),
+            model_overrides: std::collections::BTreeMap::from([(
+                "test/model".to_string(),
+                CompactionPolicyPatch {
+                    reserve_tokens: Some(3),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let policy = compaction_policy(&resolved, &model, Some(&conversation));
+        assert_eq!(policy.reserve_tokens, 3);
+        assert_eq!(policy.keep_recent_tokens, 2);
+        assert!(!policy.enabled);
+        let mut model_enabled = conversation.clone();
+        model_enabled
+            .model_overrides
+            .get_mut("test/model")
+            .unwrap()
+            .enabled = Some(true);
+        assert!(compaction_policy(&resolved, &model, Some(&model_enabled)).enabled);
+    }
+
+    #[tokio::test]
+    async fn fork_inherits_turn_limit_and_compaction() {
+        let session =
+            crate::session::create_session(Arc::new(crate::storage::MemoryStorage::new()), None);
+        let context = crate::chord::context::BACKGROUND_CONTEXT.clone();
+        let (parent, entry) = session
+            .commit(
+                crate::session::commit_fn(|tx| {
+                    Box::pin(async move {
+                        let parent = tx
+                            .create_conversation(crate::session::ConversationOwnership::Ownerless)
+                            .await?
+                            .id;
+                        let change = AgentChange {
+                            max_turns: Some(Some(3)),
+                            compaction: Some(Some(CompactionPolicyPatch {
+                                reserve_tokens: Some(123),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        };
+                        configure(tx, parent, &change).await?;
+                        let entry = tx
+                            .append_entry(parent, crate::session::EntryDraft::new("start"))
+                            .await?
+                            .id;
+                        Ok((parent, entry))
+                    })
+                }),
+                &context,
+            )
+            .await
+            .expect("configure parent");
+        let fork = session
+            .commit(
+                crate::session::commit_fn(move |tx| {
+                    Box::pin(async move {
+                        let entry = entry;
+                        Ok(tx
+                            .fork_conversation(
+                                parent,
+                                entry,
+                                crate::session::ConversationOwnership::Ownerless,
+                            )
+                            .await?
+                            .id)
+                    })
+                }),
+                &context,
+            )
+            .await
+            .expect("fork");
+        for conversation in [parent, fork] {
+            let state: AgentState = session
+                .snapshot(&AGENT_DOC, DocOwner::Conversation(conversation), &context)
+                .await
+                .expect("agent")
+                .map(|value| serde_json::from_value(JsonValue::Object(value)).expect("state"))
+                .expect("present");
+            assert_eq!(state.max_turns, Some(3));
+            assert_eq!(
+                state
+                    .compaction
+                    .and_then(|settings| settings.reserve_tokens),
+                Some(123)
+            );
+        }
+        let rejected = session
+            .commit(
+                crate::session::commit_fn(move |tx| {
+                    Box::pin(async move {
+                        configure(
+                            tx,
+                            parent,
+                            &AgentChange {
+                                max_turns: Some(Some(0)),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    })
+                }),
+                &context,
+            )
+            .await;
+        assert!(rejected.is_err(), "maxTurns=0 must be rejected");
+        session
+            .commit(
+                crate::session::commit_fn(move |tx| {
+                    Box::pin(async move {
+                        configure(
+                            tx,
+                            parent,
+                            &AgentChange {
+                                max_turns: Some(None),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    })
+                }),
+                &context,
+            )
+            .await
+            .expect("clear maxTurns");
     }
 }

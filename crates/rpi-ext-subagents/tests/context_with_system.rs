@@ -77,6 +77,12 @@ fn context_with_system_marks_notices_and_keeps_system_positions() {
             .any(|event| event == "context_with_system"),
         "context_with_system registered: {registered:?}"
     );
+    assert!(
+        registered
+            .iter()
+            .any(|event| event == "session_before_compact"),
+        "session_before_compact registered for the S45 wake gate: {registered:?}"
+    );
 
     let result = rpi_ext_subagents::dispatch_event_for_test(
         "context_with_system",

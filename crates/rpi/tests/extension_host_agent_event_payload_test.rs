@@ -129,6 +129,29 @@ fn recording_ext(records: Records, events: &[&'static str]) -> InlineExtension {
     InlineExtension::Anonymous(factory)
 }
 
+/// Records `ctx.is_idle()` from inside a `session_compact` handler: the
+/// host must emit the event only after the compaction lock is released
+/// (V19-03 S45), otherwise the deferred wake can never observe idle.
+fn idle_recording_ext(records: Records, event: &'static str) -> InlineExtension {
+    let factory: ExtensionFactory = Arc::new(move |api| {
+        let records = records.clone();
+        api.on(
+            event,
+            Arc::new(move |payload, ctx| {
+                let idle = ctx.is_idle().unwrap_or(false);
+                records.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    event.to_string(),
+                    json!({ "idle": idle, "payload": payload }),
+                ));
+                Box::pin(async { Ok(Value::Null) })
+            }),
+        )
+        .expect("register handler");
+        Box::pin(async { Ok(()) })
+    });
+    InlineExtension::Anonymous(factory)
+}
+
 const AGENT_EVENTS: [&str; 8] = [
     "agent_end",
     "turn_start",
@@ -151,6 +174,15 @@ struct Fixture {
 /// tool-call turn followed by a plain text turn; inline extension records
 /// the agent-event payloads.
 async fn fixture(responses: Vec<FauxResponseStep>, host: NativeExtensionHost) -> Fixture {
+    fixture_shared(responses, Arc::new(host)).await
+}
+
+/// [`fixture`] for a host shared with the test (binding the session-backed
+/// context actions needs the same `Arc` the session's runner slot holds).
+async fn fixture_shared(
+    responses: Vec<FauxResponseStep>,
+    host: Arc<NativeExtensionHost>,
+) -> Fixture {
     let tmp = TempDir::new();
     let cwd = tmp.path().join("cwd");
     let agent_dir = tmp.path().join("agent");
@@ -211,7 +243,6 @@ async fn fixture(responses: Vec<FauxResponseStep>, host: NativeExtensionHost) ->
         .expect("in-memory session"),
     ));
 
-    let host = Arc::new(host);
     let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
         cwd: Some(cwd),
         agent_dir: Some(agent_dir),
@@ -259,6 +290,95 @@ fn records_of(records: &Records, event: &str) -> Vec<Value> {
         .filter(|(name, _)| name == event)
         .map(|(_, payload)| payload.clone())
         .collect()
+}
+
+/// Records the session counts observed INSIDE each assistant `message_end`
+/// handler: the counts-only probe, the full snapshot's counts and the
+/// session file identity (V19-07 R5.2.8 regression fixture).
+fn watermark_recording_ext(records: Records) -> InlineExtension {
+    let factory: ExtensionFactory = Arc::new(move |api| {
+        let records = records.clone();
+        api.on(
+            "message_end",
+            Arc::new(move |payload, ctx| {
+                let probe = ctx.session_counts().map_err(|error| error.to_string());
+                let full = ctx.session_stats().map_err(|error| error.to_string());
+                let role = payload
+                    .pointer("/message/role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                records.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    "message_end".to_owned(),
+                    json!({
+                        "role": role,
+                        "probe": probe,
+                        "full": full,
+                    }),
+                ));
+                Box::pin(async { Ok(Value::Null) })
+            }),
+        )
+        .expect("register handler");
+        Box::pin(async { Ok(()) })
+    });
+    InlineExtension::Anonymous(factory)
+}
+
+/// V19-07 (R5.2.8 / ADR-0049 decision 8) — host ORDER contract: the host
+/// awaits the assistant `message_end` extension handlers BEFORE persisting
+/// that message. The statusline reads the counts-only watermark inside that
+/// handler; if the order ever flipped, the watermark would already include
+/// the finished message and the pending exact total would be double counted.
+/// This fixture goes red the moment persistence moves ahead of the handlers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn message_end_handlers_run_before_the_message_is_persisted() {
+    let records: Records = Arc::new(Mutex::new(Vec::new()));
+    let host = NativeExtensionHost::new("/payload-cwd");
+    let errors = host
+        .load_inline(&[watermark_recording_ext(records.clone())])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+    let host = Arc::new(host);
+    let fixture = fixture_shared(vec![text_step("done")], host.clone()).await;
+    // The real app binds the session-backed context actions at boot; the
+    // SDK fixture does not, so bind them here (the probe needs the
+    // session-bound `SessionContextActions`).
+    rpi::core::extension_actions::bind_session_actions(&host, &fixture.session).await;
+    run_prompt(&fixture).await;
+
+    let ends = records_of(&records, "message_end");
+    let observed = ends
+        .iter()
+        .find(|payload| payload["role"] == "assistant")
+        .expect("one assistant message_end");
+    let probe = &observed["probe"]["Ok"];
+    let full = &observed["full"]["Ok"];
+    assert!(probe.is_object(), "{observed}");
+    // Inside the handler the finished message is NOT yet persisted: both
+    // the O(1) probe and the full snapshot agree and do not count it.
+    assert_eq!(probe["assistantMessages"], 0, "{probe}");
+    assert_eq!(full["assistantMessages"], 0, "{full}");
+    assert_eq!(
+        probe["entryCount"], full["entryCount"],
+        "probe == snapshot entryCount"
+    );
+    assert_eq!(probe["sessionId"], full["sessionId"]);
+    assert!(probe.get("tokens").is_none(), "the probe carries no usage");
+    // After the run the message IS persisted: the manager counts it, so the
+    // statusline's `pre_persist_assistant_messages + 1` watermark is the
+    // snapshot value that will cover the pending exact total.
+    let persisted = {
+        let manager = fixture.session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        (manager.message_counts().assistant, manager.entry_total())
+    };
+    assert_eq!(persisted.0, 1);
+    assert_eq!(
+        probe["entryCount"].as_u64().expect("entryCount") + 1,
+        persisted.1,
+        "exactly one entry (the assistant message) landed after the handler"
+    );
 }
 
 async fn run_prompt(fixture: &Fixture) {
@@ -402,7 +522,7 @@ async fn agent_event_payloads_match_upstream_shapes() {
 
     // tool_execution_end: {type, toolCallId, toolName, result, isError,
     // durationMs} — the tool ran, so the V17-06 duration is present
-    // (types.ts:1085-1094 @ 4a080252f, #10549).
+    // (types.ts:1085-1094 @ b4afdddf, #10549).
     let tool_ends = records_of(&records, "tool_execution_end");
     assert_eq!(tool_ends.len(), 1);
     assert_eq!(tool_ends[0]["type"], "tool_execution_end");
@@ -435,7 +555,7 @@ async fn agent_event_payloads_match_upstream_shapes() {
     );
 }
 
-/// V17-06 FR-B R3 (types.ts:1092-1094 @ 4a080252f): `durationMs` is absent
+/// V17-06 FR-B R3 (types.ts:1092-1094 @ b4afdddf): `durationMs` is absent
 /// (not zero) when the tool did not run — here an unknown tool name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tool_execution_end_omits_duration_when_the_tool_did_not_run() {
@@ -473,7 +593,7 @@ async fn tool_execution_end_omits_duration_when_the_tool_did_not_run() {
     );
 }
 
-/// V17-06 FR-C (types.ts:1005-1009 @ 4a080252f, #10607): the extension
+/// V17-06 FR-C (types.ts:1005-1009 @ b4afdddf, #10607): the extension
 /// `agent_settled` payload carries `aborted` for both a cancelled run and a
 /// normal completion (the session/JSON faces assert the same value in
 /// `agent_session_test.rs`).
@@ -783,7 +903,6 @@ async fn fixture_with_settings(
         .expect("in-memory session"),
     ));
 
-    let host = Arc::new(host);
     let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
         cwd: Some(cwd),
         agent_dir: Some(agent_dir),
@@ -793,7 +912,7 @@ async fn fixture_with_settings(
         custom_tools: vec![Arc::new(UpdatingTool)],
         services: Some(services),
         session_manager: Some(session_manager),
-        extension_host: Some(host),
+        extension_host: Some(Arc::new(host)),
         ..Default::default()
     })
     .await
@@ -814,8 +933,12 @@ async fn fixture_with_settings(
 async fn session_compact_failed_payload_shape_on_threshold_failure() {
     let records: Records = Arc::new(Mutex::new(Vec::new()));
     let host = NativeExtensionHost::new("/compact-failed-cwd");
+    let idle_records: Records = Arc::new(Mutex::new(Vec::new()));
     let errors = host
-        .load_inline(&[recording_ext(records.clone(), &["session_compact_failed"])])
+        .load_inline(&[
+            recording_ext(records.clone(), &["session_compact_failed"]),
+            idle_recording_ext(idle_records.clone(), "session_compact_failed"),
+        ])
         .await;
     assert!(errors.is_empty(), "{errors:?}");
 
@@ -889,6 +1012,14 @@ async fn session_compact_failed_payload_shape_on_threshold_failure() {
             && error_message.contains("summarizer exploded"),
         "errorMessage: {error_message}"
     );
+    // V19-03 S45 failure path: the handler also observes the post-lock idle
+    // state, so the deferred wake can flush at compaction end.
+    let idle_records = idle_records.lock().unwrap_or_else(|e| e.into_inner());
+    let failed_idle = idle_records
+        .iter()
+        .find(|(event, _)| event == "session_compact_failed")
+        .expect("idle recorder saw session_compact_failed");
+    assert_eq!(failed_idle.1["idle"], json!(true), "{:?}", failed_idle.1);
 }
 
 /// Without a registered handler the failure path is silent (upstream
@@ -959,13 +1090,13 @@ async fn session_compact_failed_emits_only_with_handlers() {
 
 // ---------------------------------------------------------------------------
 // V16-03 FR-B/FR-C: context pipeline and system messages
-// (9789-context-handler-system-messages.test.ts intents @ 4a080252f)
+// (9789-context-handler-system-messages.test.ts intents @ b4afdddf)
 // ---------------------------------------------------------------------------
 
 /// #9789/#9822: a `context` handler that slices the conversation must not
 /// drop the prompt/tool checkpoint — the restored system message leads the
 /// request and the tool declarations survive
-/// (runner.ts:1187-1317 @ 4a080252f).
+/// (runner.ts:1187-1317 @ b4afdddf).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn context_handler_slice_keeps_prompt_and_tools() {
     let seen: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1034,7 +1165,7 @@ async fn context_handler_slice_keeps_prompt_and_tools() {
 
 /// `context_with_system` runs after `context` on the restored transcript and
 /// its output is sent verbatim — stripping a tool from `toolsAdded` removes
-/// it from the provider request (runner.ts:1320-1354 @ 4a080252f).
+/// it from the provider request (runner.ts:1320-1354 @ b4afdddf).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn context_with_system_output_is_sent_verbatim() {
     let seen: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1107,7 +1238,7 @@ async fn context_with_system_output_is_sent_verbatim() {
 
 /// FR-D R3/R4: a `turn_end` handler returning `{entries, continue: true}`
 /// persists the structural entry and forces one next provider request
-/// (agent-session.ts:840-856, runner.ts:1020-1078 @ 4a080252f).
+/// (agent-session.ts:840-856, runner.ts:1020-1078 @ b4afdddf).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn turn_end_boundary_persists_entries_and_continues() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1177,7 +1308,7 @@ async fn turn_end_boundary_persists_entries_and_continues() {
 
 /// FR-D R4: an `agent_before_settle` handler appends a draft and the entry
 /// lands in the session before settlement
-/// (agent-session.ts:1846-1869 @ 4a080252f).
+/// (agent-session.ts:1846-1869 @ b4afdddf).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_before_settle_boundary_persists_entries() {
     let factory: ExtensionFactory = Arc::new(|api| {
@@ -1312,4 +1443,133 @@ async fn message_update_delta_forwards_a_delta_only_payload() {
     // `message_end` still carries the authoritative final message.
     let ends = records_of(&records, "message_end");
     assert!(!ends.is_empty(), "expected message_end");
+}
+
+/// V19-03 S45 regression: `AgentSession::compact` emits `session_compact`
+/// after dropping the compaction lock, so the handler observes idle and the
+/// plugin's deferred wake can flush without polling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compact_handler_observes_idle_after_lock_release() {
+    let records: Records = Arc::new(Mutex::new(Vec::new()));
+    let host = NativeExtensionHost::new("/compact-idle");
+    let errors = host
+        .load_inline(&[idle_recording_ext(records.clone(), "session_compact")])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let fixture = fixture_with_settings(
+        vec![faux_assistant_message("SUMMARY", FauxAssistantOptions::default()).into()],
+        host,
+        8192,
+        r#"{"compaction":{"reserveTokens":1,"keepRecentTokens":1}}"#,
+    )
+    .await;
+    {
+        let manager = fixture.session.session_manager();
+        let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        for (text, role) in [
+            (format!("q1 {}", "x".repeat(2000)), "user"),
+            (format!("a1 {}", "y".repeat(2000)), "assistant"),
+            (format!("q2 {}", "x".repeat(2000)), "user"),
+        ] {
+            let message = if role == "user" {
+                serde_json::from_value(json!({
+                    "role": "user",
+                    "content": text,
+                    "timestamp": 1,
+                }))
+                .expect("user message")
+            } else {
+                rpi_agent::messages::AgentMessage::Assistant(faux_assistant_message(
+                    text,
+                    FauxAssistantOptions::default(),
+                ))
+            };
+            manager.append_message(message).expect("append message");
+        }
+    }
+    fixture.session.compact(None).await.expect("compact");
+    let records = records.lock().unwrap_or_else(|e| e.into_inner());
+    let compact = records
+        .iter()
+        .find(|(event, _)| event == "session_compact")
+        .expect("session_compact recorded");
+    assert_eq!(compact.1["idle"], json!(true), "{:?}", compact.1);
+}
+
+/// V19-03 S45 cancellation: `session_before_compact` returning
+/// `{cancel:true}` is an aborted compaction, but upstream still emits
+/// `session_compact_failed` from the catch block (`aborted:true`, no
+/// `errorMessage`). The deferred event must observe the post-lock idle state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compact_failed_observes_idle_on_cancellation() {
+    let failed: Records = Arc::new(Mutex::new(Vec::new()));
+    let cancel: ExtensionFactory = Arc::new(|api| {
+        api.on(
+            "session_before_compact",
+            Arc::new(move |_payload, _ctx| Box::pin(async { Ok(json!({"cancel": true})) })),
+        )
+        .expect("register cancel handler");
+        Box::pin(async { Ok(()) })
+    });
+    let host = NativeExtensionHost::new("/compact-cancel-idle");
+    let errors = host
+        .load_inline(&[
+            InlineExtension::Anonymous(cancel),
+            idle_recording_ext(failed.clone(), "session_compact_failed"),
+        ])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let fixture = fixture_with_settings(
+        Vec::new(),
+        host,
+        8192,
+        r#"{"compaction":{"reserveTokens":1,"keepRecentTokens":1}}"#,
+    )
+    .await;
+    {
+        let manager = fixture.session.session_manager();
+        let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        for (text, role) in [
+            (format!("q1 {}", "x".repeat(2000)), "user"),
+            (format!("a1 {}", "y".repeat(2000)), "assistant"),
+            (format!("q2 {}", "x".repeat(2000)), "user"),
+        ] {
+            let message = if role == "user" {
+                serde_json::from_value(json!({
+                    "role": "user",
+                    "content": text,
+                    "timestamp": 1,
+                }))
+                .expect("user message")
+            } else {
+                rpi_agent::messages::AgentMessage::Assistant(faux_assistant_message(
+                    text,
+                    FauxAssistantOptions::default(),
+                ))
+            };
+            manager.append_message(message).expect("append message");
+        }
+    }
+    let error = fixture.session.compact(None).await.expect_err("cancelled");
+    assert!(
+        error.to_string().contains("Compaction cancelled"),
+        "{error}"
+    );
+    let records = failed.lock().unwrap_or_else(|e| e.into_inner());
+    let failed_event = records
+        .iter()
+        .find(|(event, _)| event == "session_compact_failed")
+        .expect("session_compact_failed recorded");
+    assert_eq!(failed_event.1["idle"], json!(true), "{:?}", failed_event.1);
+    assert_eq!(failed_event.1["payload"]["reason"], json!("manual"));
+    assert_eq!(failed_event.1["payload"]["aborted"], json!(true));
+    assert_eq!(failed_event.1["payload"]["willRetry"], json!(false));
+    assert_eq!(failed_event.1["payload"]["fromExtension"], json!(false));
+    assert!(
+        failed_event.1["payload"].get("errorMessage").is_none(),
+        "cancellation omits errorMessage: {:?}",
+        failed_event.1
+    );
 }

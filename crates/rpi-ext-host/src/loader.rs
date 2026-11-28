@@ -275,7 +275,13 @@ fn is_extension_file(name: &str) -> bool {
 /// `resolveExtensionEntries` (loader.ts:594-624) adapted: a subdirectory is
 /// an extension when it has a `rpi-extension.json` manifest naming a `wasm`
 /// file that exists, or an `index.wasm`.
+///
+/// Generational installs (ADR-0050, [`crate::install_layout`]): the manifest
+/// and entry points are looked up in the directory the container resolves
+/// to — the generation its `current.json` names, else the directory itself.
+/// A retired container (or an aside directory on its way out) resolves to nothing.
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
+    let dir = crate::install_layout::resolve_install_dir(dir)?;
     let manifest_path = dir.join("rpi-extension.json");
     if manifest_path.is_file()
         && let Ok(content) = std::fs::read_to_string(&manifest_path)

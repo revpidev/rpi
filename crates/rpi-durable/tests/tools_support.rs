@@ -126,6 +126,8 @@ impl ToolExecutionApi for FakeApi {
             sections: Vec::new(),
             instructions: None,
             cwd: None,
+            max_turns: None,
+            compaction: None,
         })
     }
 

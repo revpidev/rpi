@@ -10,6 +10,9 @@
 .pi-subagents/
 .rpi-subagents/
 
+# Local V19 MSRV toolchain cache (RUSTUP_HOME=.v19-cache/rustup)
+.v19-cache/
+
 # Machine-local cargo env (wreq/btls-sys LIBCLANG_PATH etc. — absolute
 # host paths, each machine configures its own; never commit)
 .cargo/

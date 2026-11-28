@@ -107,6 +107,67 @@ async fn test_edit_replace_text() {
 }
 
 #[tokio::test]
+async fn test_edit_multibyte_neighbours_mid_file() {
+    // Regression: the diff window walked back from `match_index - 1` and
+    // forward from `match_end - 1` with `str` slices. Both indices sit inside
+    // a multi-byte character when the old text starts or ends right next to
+    // one (U+3002, U+884C), which panicked the edit tool on the tokio worker
+    // thread ("is not a char boundary") instead of editing the file.
+    let tmp = TempDir::new();
+    let file = tmp.path().join("cjk-notes.md");
+    let original = (1..=60)
+        .map(|line| format!("第 {line} 行。继续修复问题，再运行一段时间 {line} 次。\n"))
+        .collect::<String>();
+    std::fs::write(&file, &original).unwrap();
+
+    let ctx = make_ctx(tmp.path());
+    let tool = create_edit_tool(&ctx, EditToolOptions::default());
+
+    let result = tool
+        .execute(
+            "test-cjk-mid-file",
+            json!({"path": "cjk-notes.md", "edits": [
+                {"oldText": "继续修复问题，再运行一段时间 7 次。", "newText": "问题已经修复。"},
+                {"oldText": "第 40 行。", "newText": "第 40 行（已改）。"},
+                {"oldText": "。继续修复问题，再运行一段时间 59", "newText": "。🙂 再运行一段时间 59"}
+            ]}),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(get_text(&result).contains("Successfully replaced 3 block(s)"));
+    let mut expected: Vec<String> = original.lines().map(str::to_owned).collect();
+    expected[6] = "第 7 行。问题已经修复。".to_owned();
+    expected[39] = "第 40 行（已改）。继续修复问题，再运行一段时间 40 次。".to_owned();
+    expected[58] = "第 59 行。🙂 再运行一段时间 59 次。".to_owned();
+    let expected = expected.join("\n") + "\n";
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+
+    let diff = result.details.get("diff").unwrap().as_str().unwrap();
+    assert!(
+        diff.contains("+ 7 第 7 行。问题已经修复。"),
+        "diff:\n{diff}"
+    );
+    assert!(diff.contains("-40 第 40 行。继续修复问题"), "diff:\n{diff}");
+    assert!(diff.contains("+40 第 40 行（已改）。"), "diff:\n{diff}");
+    assert!(
+        diff.contains(" ..."),
+        "three windows fold in between:\n{diff}"
+    );
+    let patch = result.details.get("patch").unwrap().as_str().unwrap();
+    assert_eq!(patch.matches("@@ -").count(), 3, "patch:\n{patch}");
+    assert!(patch.contains("@@ -3,9 +3,9 @@"), "patch:\n{patch}");
+    assert!(patch.contains("@@ -36,9 +36,9 @@"), "patch:\n{patch}");
+    assert!(patch.contains("@@ -55,6 +55,6 @@"), "patch:\n{patch}");
+    assert_eq!(
+        result.details.get("firstChangedLine").unwrap(),
+        &Value::from(7)
+    );
+}
+
+#[tokio::test]
 async fn test_edit_fail_not_found() {
     let tmp = TempDir::new();
     let file = tmp.path().join("edit-test.txt");

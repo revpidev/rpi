@@ -1,4 +1,4 @@
-//! OAuth errors (port of `packages/mcp/src/oauth/errors.ts` @ 4a080252f).
+//! OAuth errors (port of `packages/mcp/src/oauth/errors.ts` @ b4afdddf).
 
 /// Format an issuer like the upstream error message: a JSON string, or
 /// `none` when it is absent.
@@ -50,6 +50,10 @@ pub enum OAuthFlowError {
     /// Network failures (upstream `TypeError` from fetch).
     #[error("{0}")]
     Network(String),
+    #[error("Another process is refreshing the MCP server's tokens")]
+    RefreshLockBusy,
+    #[error("Sign-in cancelled")]
+    SignInCancelled,
 }
 
 impl OAuthFlowError {

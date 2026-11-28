@@ -1,5 +1,5 @@
 //! Durable sleeping, host timers and wakeups (V18-06 FR-C/FR-D; port of
-//! `packages/durable/test/harness-sleep.test.ts` @ `4a080252f`).
+//! `packages/durable/test/harness-sleep.test.ts` @ `b4afdddf`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -183,7 +183,7 @@ async fn open(
         set_timer: Some(timer.set_timer()),
         on_wake,
         on_report: Some(Arc::new(|message| eprintln!("report: {message}"))),
-        on_report_info: None,
+        read_only: false,
     };
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let harness = open_harness(storage, options, &BACKGROUND_CONTEXT.clone())
@@ -469,7 +469,7 @@ async fn the_earliest_of_several_sleeps_wakes_the_harness() {
         set_timer: Some(timer.set_timer()),
         on_wake: None,
         on_report: None,
-        on_report_info: None,
+        read_only: false,
     };
     let storage: Arc<dyn rpi_durable::types::Storage> = Arc::new(MemoryStorage::new());
     let harness = open_harness(storage, options, &BACKGROUND_CONTEXT.clone())

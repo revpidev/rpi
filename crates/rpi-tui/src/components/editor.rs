@@ -3189,6 +3189,10 @@ impl Editor {
 }
 
 impl Component for Editor {
+    fn captures_viewport_input(&self) -> bool {
+        self.autocomplete_ui.borrow().state.is_some()
+    }
+
     fn invalidate(&mut self) {
         // No cached state to invalidate currently.
     }

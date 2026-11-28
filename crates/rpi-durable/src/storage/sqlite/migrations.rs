@@ -1,5 +1,5 @@
 //! Immutable, ordered durable SQLite schema history
-//! (port of `src/storage/sqlite/migrations.ts` @ `4a080252f`).
+//! (port of `src/storage/sqlite/migrations.ts` @ `b4afdddf`).
 //!
 //! Version 2 adds the `sleeping` task status. SQLite cannot change a `CHECK`
 //! constraint in place, so the task table is rebuilt and its rows and indexes

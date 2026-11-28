@@ -217,19 +217,150 @@ pub(crate) struct CursorPos {
 /// `TUI.MIN_RENDER_INTERVAL_MS` (tui.ts:309).
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 
+/// Adaptive backpressure thresholds (V19-06 FR-D R2, ADR-0049 decision 5).
+/// A frame slower than [`SLOW_FRAME_COST`] drops the schedule to 30 fps, one
+/// slower than [`VERY_SLOW_FRAME_COST`] to 20 fps; [`RECOVERY_FRAMES`]
+/// consecutive frames at or below [`CHEAP_FRAME_COST`] recover one tier.
+/// Internal constants — there is no user configuration for them.
+const SLOW_FRAME_COST: Duration = Duration::from_millis(16);
+const VERY_SLOW_FRAME_COST: Duration = Duration::from_millis(33);
+const CHEAP_FRAME_COST: Duration = Duration::from_millis(8);
+const RECOVERY_FRAMES: u32 = 30;
+
+/// Development/benchmark switch that pins the schedule to the 60 fps tier
+/// (the V19-00 replay harness sets it for the fixed-cadence CPU gate). Not a
+/// user setting: the adaptive tiers are always on in normal operation.
+const ENV_DISABLE_ADAPTIVE_BACKPRESSURE: &str = "RPI_V19_DISABLE_ADAPTIVE_BACKPRESSURE";
+
+/// Minimum render interval tier, fastest to slowest (ordering by `Ord`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RenderTier {
+    Fps60,
+    Fps30,
+    Fps20,
+}
+
+impl RenderTier {
+    fn interval(self) -> Duration {
+        match self {
+            RenderTier::Fps60 => Duration::from_millis(16),
+            RenderTier::Fps30 => Duration::from_millis(33),
+            RenderTier::Fps20 => Duration::from_millis(50),
+        }
+    }
+
+    fn fps(self) -> u8 {
+        match self {
+            RenderTier::Fps60 => 60,
+            RenderTier::Fps30 => 30,
+            RenderTier::Fps20 => 20,
+        }
+    }
+}
+
+/// Snapshot of the render schedule (V19-06 FR-D R5): latest-wins generations,
+/// latency-class promotions and the adaptive tier state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderScheduleStats {
+    /// Current minimum-interval tier.
+    pub tier_fps: u8,
+    /// Generations requested since start (one per `requestRender`).
+    pub requested_generation: u64,
+    /// Generation rendered by the latest frame.
+    pub rendered_generation: u64,
+    /// Requests that arrived while a frame was already pending and were
+    /// folded into it (latest-wins).
+    pub superseded_requests: u64,
+    /// Pending frames promoted to the latency class by input.
+    pub latency_promotions: u64,
+    /// Tier changes driven by measured frame costs.
+    pub tier_changes: u64,
+    /// Cost of the latest rendered frame.
+    pub last_frame_cost: Duration,
+    /// Whether the adaptive tiers are active.
+    pub adaptive: bool,
+}
+
+/// Upstream `renderRequested` / `renderTimer` / `lastRenderAt` (tui.ts:306-308)
+/// as an explicit deadline driven by [`TuiMainScreen::tick`], extended with the
+/// V19-06 latest-wins generations and the adaptive backpressure tier.
+pub(crate) struct RenderSchedule {
+    pub(crate) requested: bool,
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) last_render_at: Option<Instant>,
+    /// Latest requested state generation: bumped by every request, including
+    /// the ones folded into a pending frame.
+    requested_generation: u64,
+    /// Generation the latest rendered frame covered.
+    rendered_generation: u64,
+    superseded_requests: u64,
+    latency_promotions: u64,
+    tier: RenderTier,
+    tier_changes: u64,
+    last_frame_cost: Duration,
+    cheap_streak: u32,
+    /// A pending frame promoted to the latency class (input was dispatched
+    /// in the current tick): it waits at most the baseline 16 ms interval,
+    /// never the 30/20 fps backoff.
+    latency_pending: bool,
+    adaptive: bool,
+}
+
+impl RenderSchedule {
+    pub(crate) fn new(adaptive: bool) -> Self {
+        RenderSchedule {
+            requested: false,
+            deadline: None,
+            last_render_at: None,
+            requested_generation: 0,
+            rendered_generation: 0,
+            superseded_requests: 0,
+            latency_promotions: 0,
+            tier: RenderTier::Fps60,
+            tier_changes: 0,
+            last_frame_cost: Duration::ZERO,
+            cheap_streak: 0,
+            latency_pending: false,
+            adaptive,
+        }
+    }
+
+    /// Time left until the next render may start under `interval`.
+    fn remaining(&self, now: Instant, interval: Duration) -> Duration {
+        match self.last_render_at {
+            None => Duration::ZERO,
+            Some(last) => {
+                if now >= last {
+                    interval.saturating_sub(now.duration_since(last))
+                } else {
+                    // A future `last_render_at` (tests drive `tick` with
+                    // synthetic times) behaves like a negative JS elapsed:
+                    // the delay grows.
+                    interval + last.duration_since(now)
+                }
+            }
+        }
+    }
+
+    fn set_tier(&mut self, tier: RenderTier) {
+        if self.tier != tier {
+            self.tier = tier;
+            self.tier_changes += 1;
+        }
+    }
+}
+
+impl Default for RenderSchedule {
+    fn default() -> Self {
+        RenderSchedule::new(!env_flag_is_1(ENV_DISABLE_ADAPTIVE_BACKPRESSURE))
+    }
+}
+
 /// `RPI_TUI_DEBUG_REDRAW`-style `process.env.X === "1"` checks (the env
 /// names themselves live next to their consumers; the only configuration env
 /// rpi-tui still reads is its own debug face, see `tui_main_screen.rs`).
 pub(crate) fn env_flag_is_1(name: &str) -> bool {
     std::env::var(name).as_deref() == Ok("1")
-}
-
-/// Upstream `renderRequested` / `renderTimer` / `lastRenderAt` (tui.ts:306-308)
-/// as an explicit deadline driven by [`TuiMainScreen::tick`].
-pub(crate) struct RenderSchedule {
-    pub(crate) requested: bool,
-    pub(crate) deadline: Option<Instant>,
-    pub(crate) last_render_at: Option<Instant>,
 }
 
 /// Lock-free terminal size cache shared between `Tui` and `TuiInner`.
@@ -245,8 +376,16 @@ pub(crate) struct TerminalSizeCache {
 /// `requestImmediateRender` (29d9f087c): reset happens in
 /// `TuiMainScreen::request_render`, the immediate arm is the deadline set
 /// here.
+///
+/// V19-06 latest-wins: every request bumps `requested_generation`; a request
+/// that arrives while a frame is pending is counted as superseded — the
+/// pending frame renders the newest state when it fires, so stale
+/// intermediate frames are never queued or executed. The throttled deadline
+/// follows the adaptive tier, except for the latency class (input), which
+/// keeps the baseline 16 ms interval.
 pub(crate) fn schedule_render(schedule: &Arc<Mutex<RenderSchedule>>, force: bool, now: Instant) {
     let mut schedule = lock_shared(schedule);
+    schedule.requested_generation = schedule.requested_generation.wrapping_add(1);
     if force {
         // Upstream `requestImmediateRender` cancels the pending timer and
         // renders on the next tick, bypassing the throttle (tui.ts:776-779).
@@ -255,22 +394,88 @@ pub(crate) fn schedule_render(schedule: &Arc<Mutex<RenderSchedule>>, force: bool
         return;
     }
     if schedule.requested {
+        // Latest-wins: the pending frame already owes this state a render.
+        schedule.superseded_requests += 1;
         return;
     }
     schedule.requested = true;
-    let delay = match schedule.last_render_at {
-        None => Duration::ZERO,
-        Some(last) => {
-            if now >= last {
-                MIN_RENDER_INTERVAL.saturating_sub(now.duration_since(last))
-            } else {
-                // A future `last_render_at` (tests drive `tick` with synthetic
-                // times) behaves like a negative JS elapsed: delay grows.
-                MIN_RENDER_INTERVAL + last.duration_since(now)
+    let interval = if schedule.latency_pending || !schedule.adaptive {
+        MIN_RENDER_INTERVAL
+    } else {
+        schedule.tier.interval()
+    };
+    schedule.deadline = Some(now + schedule.remaining(now, interval));
+}
+
+/// Promotes a pending frame to the latency class (V19-06 FR-D R3): input
+/// events dispatched in this tick must not wait behind the 30/20 fps
+/// backoff, so the pending deadline is re-armed with the baseline interval.
+pub(crate) fn promote_pending_render(schedule: &Mutex<RenderSchedule>, now: Instant) {
+    let mut schedule = lock_shared(schedule);
+    if !schedule.requested || !schedule.adaptive || schedule.latency_pending {
+        return;
+    }
+    schedule.latency_pending = true;
+    schedule.latency_promotions += 1;
+    let deadline = now + schedule.remaining(now, MIN_RENDER_INTERVAL);
+    if schedule.deadline.is_none_or(|current| deadline < current) {
+        schedule.deadline = Some(deadline);
+    }
+}
+
+/// Records the cost of the frame that just rendered (V19-06 FR-D R2) and
+/// adjusts the adaptive tier: a slow frame lowers it, a run of cheap frames
+/// recovers it one step at a time.
+pub(crate) fn record_frame_cost(schedule: &Mutex<RenderSchedule>, cost: Duration) {
+    let mut schedule = lock_shared(schedule);
+    schedule.last_frame_cost = cost;
+    if !schedule.adaptive {
+        return;
+    }
+    if cost > VERY_SLOW_FRAME_COST {
+        schedule.set_tier(RenderTier::Fps20);
+    } else if cost > SLOW_FRAME_COST && schedule.tier < RenderTier::Fps30 {
+        schedule.set_tier(RenderTier::Fps30);
+    }
+    if cost <= CHEAP_FRAME_COST {
+        schedule.cheap_streak = schedule.cheap_streak.saturating_add(1);
+        if schedule.cheap_streak >= RECOVERY_FRAMES {
+            schedule.cheap_streak = 0;
+            match schedule.tier {
+                RenderTier::Fps20 => schedule.set_tier(RenderTier::Fps30),
+                RenderTier::Fps30 => schedule.set_tier(RenderTier::Fps60),
+                RenderTier::Fps60 => {}
             }
         }
-    };
-    schedule.deadline = Some(now + delay);
+    } else {
+        schedule.cheap_streak = 0;
+    }
+}
+
+/// `renderNow` bookkeeping (V19-06): the synchronous frame covers every state
+/// requested so far and ends any pending latency-class promotion.
+pub(crate) fn take_render_synchronous(schedule: &Mutex<RenderSchedule>, now: Instant) {
+    let mut schedule = lock_shared(schedule);
+    schedule.requested = false;
+    schedule.deadline = None;
+    schedule.latency_pending = false;
+    schedule.last_render_at = Some(now);
+    schedule.rendered_generation = schedule.requested_generation;
+}
+
+/// Snapshot of the schedule for tests, the benchmark probe and diagnostics.
+pub(crate) fn render_schedule_stats(schedule: &Mutex<RenderSchedule>) -> RenderScheduleStats {
+    let schedule = lock_shared(schedule);
+    RenderScheduleStats {
+        tier_fps: schedule.tier.fps(),
+        requested_generation: schedule.requested_generation,
+        rendered_generation: schedule.rendered_generation,
+        superseded_requests: schedule.superseded_requests,
+        latency_promotions: schedule.latency_promotions,
+        tier_changes: schedule.tier_changes,
+        last_frame_cost: schedule.last_frame_cost,
+        adaptive: schedule.adaptive,
+    }
 }
 
 /// Shared TUI state and behavior (upstream `TuiBase`, tui.ts:331-1256
@@ -1296,12 +1501,22 @@ impl TuiBase {
             } else {
                 schedule.requested = false;
                 schedule.deadline = None;
+                schedule.latency_pending = false;
                 schedule.last_render_at = Some(now);
+                // The frame covers every state requested so far (V19-06
+                // latest-wins); requests arriving during the render keep
+                // their own generation and stay pending.
+                schedule.rendered_generation = schedule.requested_generation;
                 true
             }
         } else {
             false
         }
+    }
+
+    /// Current schedule snapshot (V19-06).
+    pub(crate) fn schedule_stats(&self) -> RenderScheduleStats {
+        render_schedule_stats(&self.schedule)
     }
 
     /// Fire expired introspection query timeouts and reap settled entries.
@@ -1805,6 +2020,142 @@ impl TuiBase {
         self.pending_terminal_color_queries
             .iter()
             .any(|query| query.deadline.is_some_and(|deadline| now >= deadline))
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    //! V19-06 FR-D: latest-wins generations, latency-class promotion and the
+    //! adaptive 60/30/20 fps tiers of the render schedule.
+
+    use super::*;
+
+    fn schedule(adaptive: bool) -> Arc<Mutex<RenderSchedule>> {
+        Arc::new(Mutex::new(RenderSchedule::new(adaptive)))
+    }
+
+    fn advance_to(schedule: &Arc<Mutex<RenderSchedule>>, instant: Instant) {
+        lock_shared(schedule).last_render_at = Some(instant);
+    }
+
+    #[test]
+    fn requests_arriving_while_a_frame_is_pending_are_folded_into_it() {
+        let schedule = schedule(true);
+        let start = Instant::now();
+        schedule_render(&schedule, false, start);
+        for _ in 0..499 {
+            schedule_render(&schedule, false, start);
+        }
+        let stats = render_schedule_stats(&schedule);
+        assert_eq!(stats.requested_generation, 500);
+        assert_eq!(stats.superseded_requests, 499);
+        assert_eq!(stats.rendered_generation, 0, "nothing rendered yet");
+        // One frame covers the latest state.
+        assert!(lock_shared(&schedule).deadline.is_some());
+        advance_to(&schedule, start);
+        let stats = render_schedule_stats(&schedule);
+        assert_eq!(stats.tier_fps, 60, "starts at the baseline tier");
+    }
+
+    #[test]
+    fn slow_frames_drop_the_tier_and_cheap_frames_recover_it_step_by_step() {
+        let schedule = schedule(true);
+        record_frame_cost(&schedule, Duration::from_millis(5));
+        assert_eq!(render_schedule_stats(&schedule).tier_fps, 60);
+        record_frame_cost(&schedule, Duration::from_millis(20));
+        assert_eq!(render_schedule_stats(&schedule).tier_fps, 30);
+        record_frame_cost(&schedule, Duration::from_millis(40));
+        assert_eq!(render_schedule_stats(&schedule).tier_fps, 20);
+        record_frame_cost(&schedule, Duration::from_millis(20));
+        assert_eq!(
+            render_schedule_stats(&schedule).tier_fps,
+            20,
+            "never jumps back up on a slow frame"
+        );
+        for _ in 0..RECOVERY_FRAMES {
+            record_frame_cost(&schedule, Duration::from_millis(5));
+        }
+        assert_eq!(
+            render_schedule_stats(&schedule).tier_fps,
+            30,
+            "one tier per recovery run"
+        );
+        for _ in 0..RECOVERY_FRAMES {
+            record_frame_cost(&schedule, Duration::from_millis(5));
+        }
+        assert_eq!(render_schedule_stats(&schedule).tier_fps, 60);
+        assert_eq!(render_schedule_stats(&schedule).tier_changes, 4);
+        assert_eq!(
+            render_schedule_stats(&schedule).last_frame_cost,
+            Duration::from_millis(5)
+        );
+    }
+
+    #[test]
+    fn a_moderately_slow_frame_only_drops_to_30_fps() {
+        let schedule = schedule(true);
+        record_frame_cost(&schedule, Duration::from_millis(17));
+        assert_eq!(render_schedule_stats(&schedule).tier_fps, 30);
+        record_frame_cost(&schedule, Duration::from_millis(16));
+        assert_eq!(render_schedule_stats(&schedule).tier_fps, 30);
+    }
+
+    #[test]
+    fn the_disabled_switch_pins_the_baseline_tier() {
+        let schedule = schedule(false);
+        for _ in 0..10 {
+            record_frame_cost(&schedule, Duration::from_millis(40));
+        }
+        let stats = render_schedule_stats(&schedule);
+        assert_eq!(stats.tier_fps, 60);
+        assert!(!stats.adaptive);
+        assert_eq!(stats.tier_changes, 0);
+    }
+
+    #[test]
+    fn input_promotion_re_arms_a_pending_frame_with_the_baseline_interval() {
+        let schedule = schedule(true);
+        record_frame_cost(&schedule, Duration::from_millis(40));
+        let start = Instant::now();
+        advance_to(&schedule, start);
+        schedule_render(&schedule, false, start + Duration::from_millis(1));
+        let throttled = lock_shared(&schedule).deadline;
+        assert_eq!(
+            throttled,
+            Some(start + Duration::from_millis(50)),
+            "a streaming request waits for the 20 fps interval"
+        );
+        promote_pending_render(&schedule, start + Duration::from_millis(2));
+        let promoted = lock_shared(&schedule).deadline;
+        assert_eq!(
+            promoted,
+            Some(start + Duration::from_millis(16)),
+            "an input frame keeps the 16 ms interval"
+        );
+        assert_eq!(render_schedule_stats(&schedule).latency_promotions, 1);
+        // Promotion is idempotent while the frame stays pending.
+        promote_pending_render(&schedule, start + Duration::from_millis(3));
+        assert_eq!(render_schedule_stats(&schedule).latency_promotions, 1);
+        // A later request in the same pending window still gets the baseline.
+        schedule_render(&schedule, false, start + Duration::from_millis(4));
+        assert_eq!(
+            lock_shared(&schedule).deadline,
+            Some(start + Duration::from_millis(16))
+        );
+    }
+
+    #[test]
+    fn forced_requests_are_immediate_in_every_tier() {
+        let schedule = schedule(true);
+        record_frame_cost(&schedule, Duration::from_millis(40));
+        let start = Instant::now();
+        advance_to(&schedule, start);
+        schedule_render(&schedule, true, start + Duration::from_millis(1));
+        assert_eq!(
+            lock_shared(&schedule).deadline,
+            Some(start + Duration::from_millis(1)),
+            "message_end/resize/theme/final renders never wait for a tier"
+        );
     }
 }
 

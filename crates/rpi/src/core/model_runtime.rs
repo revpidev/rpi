@@ -101,13 +101,57 @@ fn write<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 pub struct RuntimeCredentials {
     store: Arc<dyn CredentialStore>,
     overrides: RwLock<HashMap<String, String>>,
+    pending_modifications: Mutex<HashSet<u64>>,
+    pending_tx: tokio::sync::watch::Sender<usize>,
+    next_modification: std::sync::atomic::AtomicU64,
+}
+
+struct PendingCredentialModification<'a> {
+    credentials: &'a RuntimeCredentials,
+    id: u64,
+}
+
+impl<'a> PendingCredentialModification<'a> {
+    fn new(credentials: &'a RuntimeCredentials, id: u64) -> Self {
+        let count = {
+            let mut pending = lock(&credentials.pending_modifications);
+            pending.insert(id);
+            pending.len()
+        };
+        credentials.pending_tx.send_replace(count);
+        Self { credentials, id }
+    }
+}
+
+impl Drop for PendingCredentialModification<'_> {
+    fn drop(&mut self) {
+        let count = {
+            let mut pending = lock(&self.credentials.pending_modifications);
+            pending.remove(&self.id);
+            pending.len()
+        };
+        self.credentials.pending_tx.send_replace(count);
+    }
 }
 
 impl RuntimeCredentials {
     pub fn new(store: Arc<dyn CredentialStore>) -> Self {
+        let (pending_tx, _) = tokio::sync::watch::channel(0);
         RuntimeCredentials {
             store,
             overrides: RwLock::new(HashMap::new()),
+            pending_modifications: Mutex::new(HashSet::new()),
+            pending_tx,
+            next_modification: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub async fn settled(&self) {
+        let mut pending = self.pending_tx.subscribe();
+        while *pending.borrow() > 0 {
+            if pending.changed().await.is_err() {
+                break;
+            }
         }
     }
 
@@ -176,7 +220,13 @@ impl CredentialStore for RuntimeCredentials {
         f: ModifyFn,
         options: Option<&AuthOperationOptions>,
     ) -> Result<Option<Credential>, ModelsError> {
-        self.store.modify(provider_id, f, options).await
+        let id = self
+            .next_modification
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pending = PendingCredentialModification::new(self, id);
+        let result = self.store.modify(provider_id, f, options).await;
+        drop(pending);
+        result
     }
 
     async fn delete(
@@ -245,8 +295,8 @@ pub struct ProviderConfigInput {
 /// `ModelRuntimeSnapshot` (model-runtime.ts:50-56).
 #[derive(Debug, Default)]
 struct ModelRuntimeSnapshot {
-    all: Vec<Model>,
-    available: Vec<Model>,
+    all: Arc<[Model]>,
+    available: Arc<[Model]>,
     configured_providers: HashSet<String>,
     stored_providers: HashSet<String>,
     auth: HashMap<String, AuthCheck>,
@@ -255,8 +305,8 @@ struct ModelRuntimeSnapshot {
 /// Computed snapshot data before publishing (the body of
 /// `runAvailabilityRefresh`, model-runtime.ts:286-313).
 struct ModelRuntimeSnapshotData {
-    all: Vec<Model>,
-    available: Vec<Model>,
+    all: Arc<[Model]>,
+    available: Arc<[Model]>,
     configured_providers: HashSet<String>,
     stored_providers: HashSet<String>,
     auth: HashMap<String, AuthCheck>,
@@ -844,8 +894,16 @@ impl Provider for ModelOverridingProvider {
         self.composed.get_models()
     }
 
+    fn get_models_shared(&self) -> Arc<[Model]> {
+        self.composed.get_models_shared()
+    }
+
     fn get_all_models(&self) -> Vec<AnyModel> {
         self.composed.get_all_models()
+    }
+
+    fn get_all_models_shared(&self) -> Arc<[AnyModel]> {
+        self.composed.get_all_models_shared()
     }
 
     /// `filterModels` forwards to the base (provider-composer.ts:641-643).
@@ -982,8 +1040,16 @@ impl Provider for RefreshDelegatingProvider {
         self.composed.get_models()
     }
 
+    fn get_models_shared(&self) -> Arc<[Model]> {
+        self.composed.get_models_shared()
+    }
+
     fn get_all_models(&self) -> Vec<AnyModel> {
         self.composed.get_all_models()
+    }
+
+    fn get_all_models_shared(&self) -> Arc<[AnyModel]> {
+        self.composed.get_all_models_shared()
     }
 
     /// `filterModels` comes from the native base provider only
@@ -1599,7 +1665,7 @@ fn apply_model_override(mut model: Model, override_: &ModelsJsonModelOverride) -
         model.sampling_params_by_thinking_level = Some(merged);
     }
     if let Some(compat) = &override_.compat {
-        model.compat = Some(merge_compat(model.compat.as_ref(), compat));
+        model.compat = Some(Box::new(merge_compat(model.compat.as_deref(), compat)));
     }
     if let Some(override_headers) = &override_.headers {
         let mut headers: BTreeMap<String, String> = override_headers.clone().into_iter().collect();
@@ -1764,9 +1830,9 @@ fn validate_kimi_coding_base_url(
 /// merge function; model definitions and modelOverrides remain chat-only.
 fn apply_models_json(
     provider_id: &str,
-    base_models: Vec<AnyModel>,
+    base_models: Arc<[AnyModel]>,
     config: Option<&ModelsJsonProvider>,
-) -> Result<Vec<AnyModel>, String> {
+) -> Result<Arc<[AnyModel]>, String> {
     let Some(config) = config else {
         return Ok(base_models);
     };
@@ -1808,7 +1874,8 @@ fn apply_models_json(
     // (provider-composer.ts:328).
     let radius_oauth = config.oauth.as_deref() == Some("radius");
     let mut models: Vec<AnyModel> = base_models
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|mut model| {
             if !radius_oauth
                 && let Some(base_url) = config.base_url.as_ref().filter(|url| !url.is_empty())
@@ -1818,7 +1885,8 @@ fn apply_models_json(
             if let Some(compat) = config.compat.as_ref() {
                 match &mut model {
                     AnyModel::Chat(model) => {
-                        model.compat = Some(merge_compat(model.compat.as_ref(), compat));
+                        model.compat =
+                            Some(Box::new(merge_compat(model.compat.as_deref(), compat)));
                     }
                     AnyModel::Classifier(model) => {
                         model.compat = Some(merge_compat(model.compat.as_ref(), compat));
@@ -1855,16 +1923,16 @@ fn apply_models_json(
             None => models.push(AnyModel::Chat(model)),
         }
     }
-    Ok(models)
+    Ok(models.into())
 }
 
 /// `applyExtension` (provider-composer.ts:346-356): a provided model list
 /// replaces the set; a bare `baseUrl` rewrites every model's baseUrl.
 fn apply_extension_models(
     provider_id: &str,
-    models: Vec<AnyModel>,
+    models: Arc<[AnyModel]>,
     extension: Option<&ProviderConfigInput>,
-) -> Result<Vec<AnyModel>, String> {
+) -> Result<Arc<[AnyModel]>, String> {
     let Some(extension) = extension else {
         return Ok(models);
     };
@@ -1879,7 +1947,8 @@ fn apply_extension_models(
     let Some(definitions) = extension.models.as_ref() else {
         if let Some(base_url) = extension.base_url.as_ref().filter(|url| !url.is_empty()) {
             return Ok(models
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(|mut model| {
                     set_any_base_url(&mut model, base_url.clone());
                     model
@@ -1915,14 +1984,15 @@ fn apply_extension_models(
 /// `modelOverrides` are the topmost user-config layer and apply only to chat
 /// models (provider-composer.ts:576-579).
 fn apply_model_overrides(
-    models: Vec<AnyModel>,
+    models: Arc<[AnyModel]>,
     config: Option<&ModelsJsonProvider>,
-) -> Vec<AnyModel> {
+) -> Arc<[AnyModel]> {
     let Some(overrides) = config.and_then(|config| config.model_overrides.as_ref()) else {
         return models;
     };
     models
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|model| match model {
             AnyModel::Chat(model) => match overrides.get(&model.id) {
                 Some(override_) => AnyModel::Chat(apply_model_override(model, override_)),
@@ -1937,12 +2007,24 @@ fn apply_model_overrides(
 /// applyModelsJson → applyExtension → modelOverrides, recomputed per call so
 /// dynamic base catalogs stay live. `Provider::get_all_models` cannot fail,
 /// so a later recompute error falls back to the last valid list.
+struct CompositionCache {
+    base: Arc<[AnyModel]>,
+    models: Arc<[AnyModel]>,
+}
+
+struct ChatModelsCache {
+    all: Arc<[AnyModel]>,
+    chat: Arc<[Model]>,
+}
+
 struct ComposedModels {
     provider_id: String,
     base: Option<Arc<dyn Provider>>,
     config: Option<ModelsJsonProvider>,
     extension: Option<ProviderConfigInput>,
-    last_valid: std::sync::Mutex<Vec<AnyModel>>,
+    last_valid: std::sync::Mutex<Arc<[AnyModel]>>,
+    composition: std::sync::Mutex<Option<CompositionCache>>,
+    chat_models: std::sync::Mutex<Option<ChatModelsCache>>,
 }
 
 impl ComposedModels {
@@ -1957,29 +2039,48 @@ impl ComposedModels {
             base,
             config,
             extension,
-            last_valid: std::sync::Mutex::new(Vec::new()),
+            last_valid: std::sync::Mutex::new(Arc::from(Vec::new())),
+            composition: std::sync::Mutex::new(None),
+            chat_models: std::sync::Mutex::new(None),
         }
     }
 
-    fn compose(&self) -> Result<Vec<AnyModel>, String> {
-        let base_models = self
-            .base
+    fn base_models(&self) -> Arc<[AnyModel]> {
+        self.base
             .as_ref()
-            .map(|base| base.get_all_models())
-            .unwrap_or_default();
+            .map(|base| base.get_all_models_shared())
+            .unwrap_or_else(|| Arc::from(Vec::new()))
+    }
+
+    fn compose_from(&self, base_models: Arc<[AnyModel]>) -> Result<Arc<[AnyModel]>, String> {
         let models = apply_models_json(&self.provider_id, base_models, self.config.as_ref())?;
         let models = apply_extension_models(&self.provider_id, models, self.extension.as_ref())?;
         Ok(apply_model_overrides(models, self.config.as_ref()))
     }
 
     /// Eager composition (upstream calls `getAllModels()` at composition time).
-    fn compose_eager(&self) -> Result<Vec<AnyModel>, String> {
-        let models = self.compose()?;
-        *lock(&self.last_valid) = models.clone();
+    fn compose_eager(&self) -> Result<Arc<[AnyModel]>, String> {
+        let base = self.base_models();
+        if let Some(cached) = lock(&self.composition)
+            .as_ref()
+            .filter(|cached| Arc::ptr_eq(&cached.base, &base))
+        {
+            return Ok(Arc::clone(&cached.models));
+        }
+        let models = self.compose_from(Arc::clone(&base))?;
+        *lock(&self.last_valid) = Arc::clone(&models);
+        *lock(&self.composition) = Some(CompositionCache {
+            base,
+            models: Arc::clone(&models),
+        });
         Ok(models)
     }
 
     fn get_all_models(&self) -> Vec<AnyModel> {
+        self.get_all_models_shared().to_vec()
+    }
+
+    fn get_all_models_shared(&self) -> Arc<[AnyModel]> {
         match self.compose_eager() {
             Ok(models) => models,
             Err(_) => lock(&self.last_valid).clone(),
@@ -1987,10 +2088,26 @@ impl ComposedModels {
     }
 
     fn get_models(&self) -> Vec<Model> {
-        self.get_all_models()
-            .into_iter()
-            .filter_map(AnyModel::into_chat)
-            .collect()
+        self.get_models_shared().to_vec()
+    }
+
+    fn get_models_shared(&self) -> Arc<[Model]> {
+        let all = self.get_all_models_shared();
+        if let Some(cached) = lock(&self.chat_models)
+            .as_ref()
+            .filter(|cached| Arc::ptr_eq(&cached.all, &all))
+        {
+            return Arc::clone(&cached.chat);
+        }
+        let chat: Arc<[Model]> = all
+            .iter()
+            .filter_map(|model| model.as_chat().cloned())
+            .collect();
+        *lock(&self.chat_models) = Some(ChatModelsCache {
+            all,
+            chat: Arc::clone(&chat),
+        });
+        chat
     }
 }
 
@@ -2330,7 +2447,7 @@ impl ModelRuntime {
             headers,
             auth,
             models: chat_models,
-            all_models: models,
+            all_models: models.to_vec(),
             api: ProviderApi::Single(streams),
             ..Default::default()
         });
@@ -2425,7 +2542,7 @@ impl ModelRuntime {
     }
 
     fn update_model_snapshot(&self) {
-        let all = self.models.get_models(None);
+        let all = self.models.get_models_shared(None);
         let mut snapshot = write(&self.snapshot);
         let configured = std::mem::take(&mut snapshot.configured_providers);
         snapshot.available = all
@@ -2590,7 +2707,7 @@ impl ModelRuntime {
             .map(|entry| entry.provider_id)
             .collect();
         let configured: HashSet<String> = auth.keys().cloned().collect();
-        let all = self.models.get_models(None);
+        let all = self.models.get_models_shared(None);
         // `Models.getAvailable` (models.ts:394-408): configured providers
         // contribute their catalog after the credential-aware
         // `filterModels` policy (e.g. github-copilot subscription
@@ -2615,7 +2732,7 @@ impl ModelRuntime {
         }
         Ok(ModelRuntimeSnapshotData {
             all,
-            available,
+            available: available.into(),
             configured_providers: configured,
             stored_providers: stored,
             auth,
@@ -2645,8 +2762,16 @@ impl ModelRuntime {
         self.credentials.store_clone()
     }
 
+    pub async fn settle_credential_writes(&self) {
+        self.credentials.settled().await;
+    }
+
     pub fn get_models(&self, provider_id: Option<&str>) -> Vec<Model> {
         self.models.get_models(provider_id)
+    }
+
+    pub fn get_models_shared(&self, provider_id: Option<&str>) -> Arc<[Model]> {
+        self.models.get_models_shared(provider_id)
     }
 
     /// `getAllModels` (model-registry.ts / schema v6): every model type from
@@ -2655,7 +2780,7 @@ impl ModelRuntime {
         self.models.get_all_models(provider_id)
     }
 
-    /// `getModelsOfType` (model-registry.ts:150-152 @ 4a080252f).
+    /// `getModelsOfType` (model-registry.ts:150-152 @ b4afdddf).
     pub fn get_models_of_type(
         &self,
         model_type: rpi_ai::types::ModelType,
@@ -2687,7 +2812,7 @@ impl ModelRuntime {
             .await
     }
 
-    /// `classify` (model-registry.ts:173-179 @ 4a080252f): structured
+    /// `classify` (model-registry.ts:173-179 @ b4afdddf): structured
     /// classification with request-time authentication. Never rejects.
     pub async fn classify(
         &self,
@@ -2737,12 +2862,16 @@ impl ModelRuntime {
                 .filter(|model| model.provider == provider_id)
                 .cloned()
                 .collect(),
-            None => snapshot.available.clone(),
+            None => snapshot.available.to_vec(),
         })
     }
 
     /// `getAvailableSnapshot` (model-runtime.ts:330-332).
     pub fn get_available_snapshot(&self) -> Vec<Model> {
+        read(&self.snapshot).available.to_vec()
+    }
+
+    pub fn get_available_shared_snapshot(&self) -> Arc<[Model]> {
         read(&self.snapshot).available.clone()
     }
 
@@ -3345,6 +3474,7 @@ impl ModelRuntime {
             return ModelsRefreshResult {
                 aborted: true,
                 errors: Vec::new(),
+                warnings: Vec::new(),
             };
         }
 
@@ -3394,6 +3524,7 @@ impl ModelRuntime {
                 _ = token.cancelled() => ModelsRefreshResult {
                     aborted: true,
                     errors: Vec::new(),
+                    warnings: Vec::new(),
                 },
                 result = active.shared.clone() => result,
             },
@@ -3823,8 +3954,8 @@ fn json_model_to_model(
             .as_ref()
             .map(|h| h.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         compat: match model.compat.clone() {
-            Some(compat) => Some(merge_compat(provider_compat, &compat)),
-            None => provider_compat.cloned(),
+            Some(compat) => Some(Box::new(merge_compat(provider_compat, &compat))),
+            None => provider_compat.cloned().map(Box::new),
         },
         id: model.id,
     })
@@ -3883,7 +4014,7 @@ fn config_model_to_model(
         sampling_params_by_thinking_level: model.sampling_params_by_thinking_level.clone(),
         headers: model.headers.clone(),
         id: model.id,
-        compat: model.compat.clone(),
+        compat: model.compat.clone().map(Box::new),
     })
 }
 
@@ -4064,6 +4195,89 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct BlockingModifyStore {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Notify,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialStore for BlockingModifyStore {
+        async fn read(
+            &self,
+            _provider_id: &str,
+            _options: Option<&AuthOperationOptions>,
+        ) -> Result<Option<Credential>, ModelsError> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _options: Option<&AuthOperationOptions>,
+        ) -> Result<Vec<CredentialInfo>, ModelsError> {
+            Ok(Vec::new())
+        }
+
+        async fn modify(
+            &self,
+            _provider_id: &str,
+            f: ModifyFn,
+            _options: Option<&AuthOperationOptions>,
+        ) -> Result<Option<Credential>, ModelsError> {
+            if let Some(started) = lock(&self.started).take() {
+                let _ = started.send(());
+            }
+            self.release.notified().await;
+            if self.fail {
+                return Err(ModelsError::new(ModelsErrorCode::Auth, "write failed"));
+            }
+            f(None).await
+        }
+
+        async fn delete(
+            &self,
+            _provider_id: &str,
+            _options: Option<&AuthOperationOptions>,
+        ) -> Result<(), ModelsError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_settled_waits_for_successful_and_failed_modifications() {
+        for fail in [false, true] {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let store = Arc::new(BlockingModifyStore {
+                started: Mutex::new(Some(started_tx)),
+                release: tokio::sync::Notify::new(),
+                fail,
+            });
+            let credentials = Arc::new(RuntimeCredentials::new(store.clone()));
+            let modification = tokio::spawn({
+                let credentials = credentials.clone();
+                async move {
+                    credentials
+                        .modify("provider", Arc::new(|_| Box::pin(async { Ok(None) })), None)
+                        .await
+                }
+            });
+            started_rx.await.expect("modification started");
+            let settled = tokio::spawn({
+                let credentials = credentials.clone();
+                async move { credentials.settled().await }
+            });
+            tokio::task::yield_now().await;
+            assert!(!settled.is_finished(), "settled returned before the write");
+            store.release.notify_one();
+            let result = modification.await.expect("modification task");
+            assert_eq!(result.is_err(), fail);
+            tokio::time::timeout(Duration::from_secs(1), settled)
+                .await
+                .expect("settled did not finish")
+                .expect("settled task");
         }
     }
 
@@ -7228,7 +7442,7 @@ mod virtual_model_tests {
             base_url: Some("https://proxy.example.com/v1".to_owned()),
             ..Default::default()
         };
-        let models = apply_models_json("typesafe", base.get_all_models(), Some(&config))
+        let models = apply_models_json("typesafe", base.get_all_models_shared(), Some(&config))
             .expect("models.json composition");
         let extension = ProviderConfigInput {
             models: Some(vec![ProviderConfigModel {
@@ -7285,7 +7499,7 @@ mod virtual_model_tests {
             };
             let models = apply_models_json(
                 "kimi-coding",
-                rpi_ai::providers::kimi_coding::kimi_coding_provider().get_all_models(),
+                rpi_ai::providers::kimi_coding::kimi_coding_provider().get_all_models_shared(),
                 Some(&config),
             )
             .expect("explicit /v1 URL");
@@ -7298,7 +7512,7 @@ mod virtual_model_tests {
 
     #[test]
     fn kimi_coding_extension_base_urls_require_v1() {
-        let base = rpi_ai::providers::kimi_coding::kimi_coding_provider().get_all_models();
+        let base = rpi_ai::providers::kimi_coding::kimi_coding_provider().get_all_models_shared();
         let extension = ProviderConfigInput {
             base_url: Some("https://proxy.example.com/coding".to_owned()),
             ..Default::default()
@@ -7351,7 +7565,7 @@ mod virtual_model_tests {
             };
             let error = apply_models_json(
                 "kimi-coding",
-                rpi_ai::providers::kimi_coding::kimi_coding_provider().get_all_models(),
+                rpi_ai::providers::kimi_coding::kimi_coding_provider().get_all_models_shared(),
                 Some(&config),
             )
             .expect_err("missing /v1 must fail");
@@ -7372,7 +7586,7 @@ mod virtual_model_tests {
         };
         let error = apply_models_json(
             "kimi-coding",
-            rpi_ai::providers::kimi_coding::kimi_coding_provider().get_all_models(),
+            rpi_ai::providers::kimi_coding::kimi_coding_provider().get_all_models_shared(),
             Some(&config),
         )
         .expect_err("model override missing /v1 must fail");
@@ -7452,5 +7666,68 @@ mod virtual_model_tests {
             Some("caller-key".to_owned()),
             "same-provider routes keep the caller credential"
         );
+    }
+
+    #[test]
+    fn composed_models_reuse_remote_dynamic_generations() {
+        let remote = crate::core::remote_catalog_provider::with_remote_catalog(
+            rpi_ai::providers::kimi_coding::kimi_coding_provider(),
+            Some("http://127.0.0.1:1".to_owned()),
+            None,
+        );
+        remote.set_dynamic_models_for_test(vec![AnyModel::Chat(model("dynamic", "kimi-coding"))]);
+        let composed = ComposedModels::new("kimi-coding", Some(remote.clone()), None, None);
+        let first = composed.compose_eager().expect("dynamic composition");
+        let second = composed.compose_eager().expect("cached composition");
+        assert!(Arc::ptr_eq(&first, &second));
+        remote.set_dynamic_models_for_test(vec![AnyModel::Chat(model("next", "kimi-coding"))]);
+        let refreshed = composed.compose_eager().expect("refreshed composition");
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert!(Arc::ptr_eq(
+            &refreshed,
+            &composed.compose_eager().expect("refreshed cache")
+        ));
+    }
+
+    #[test]
+    fn composed_models_share_unchanged_generations_and_copy_on_override() {
+        let base = rpi_ai::providers::kimi_coding::kimi_coding_provider();
+        let baseline = base.get_all_models_shared();
+        let composed = ComposedModels::new("kimi-coding", Some(base), None, None);
+        let first = composed.compose_eager().expect("baseline composition");
+        assert!(Arc::ptr_eq(&baseline, &first));
+        let second = composed.get_all_models_shared();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&first, &lock(&composed.last_valid)));
+        let first_chat = composed.get_models_shared();
+        let second_chat = composed.get_models_shared();
+        assert!(Arc::ptr_eq(&first_chat, &second_chat));
+
+        let overridden = ComposedModels::new(
+            "kimi-coding",
+            Some(rpi_ai::providers::kimi_coding::kimi_coding_provider()),
+            Some(ModelsJsonProvider {
+                base_url: Some("https://proxy.example.com/v1".to_owned()),
+                ..Default::default()
+            }),
+            None,
+        );
+        let changed = overridden.compose_eager().expect("override composition");
+        assert!(!Arc::ptr_eq(&baseline, &changed));
+        assert!(
+            baseline
+                .iter()
+                .all(|model| any_base_url(model) != "https://proxy.example.com/v1")
+        );
+        assert!(
+            changed
+                .iter()
+                .all(|model| any_base_url(model) == "https://proxy.example.com/v1")
+        );
+        assert!(Arc::ptr_eq(&changed, &lock(&overridden.last_valid)));
+        assert!(Arc::ptr_eq(&changed, &overridden.get_all_models_shared()));
+        let first_chat = overridden.get_models_shared();
+        let second_chat = overridden.get_models_shared();
+        assert!(Arc::ptr_eq(&first_chat, &second_chat));
     }
 }

@@ -1,0 +1,26 @@
+{
+  "//": "Target-track attribution manifest for the v0.1.9 rebase window (V19-03, ADR-0048): expected-source pin = pi-subagents v0.88.1 @ 83cf25f8. The model-miss diagnostics intentionally add the S10 (#3100) provider/extension-load hint when the qualified provider is absent from the child registry; upstream v0.88.1 only prints the plain miss. The args leg is the frozen v0.48 golden on both tracks ([RPI-OWN], ADR-0025 §4).",
+  "cases": [
+    {
+      "mode": "model",
+      "case": "explicit-miss-fails-closed",
+      "section": "rpi-deviation",
+      "r": "R19-S10",
+      "owner": "V19-03"
+    },
+    {
+      "mode": "model",
+      "case": "candidates-explicit-miss-throws",
+      "section": "rpi-deviation",
+      "r": "R19-S10",
+      "owner": "V19-03"
+    },
+    {
+      "mode": "model",
+      "case": "candidates-configured-miss-deferred-throw",
+      "section": "rpi-deviation",
+      "r": "R19-S10",
+      "owner": "V19-03"
+    }
+  ]
+}

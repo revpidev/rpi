@@ -1,24 +1,27 @@
 //! stdio transport: child-process management with LF-delimited JSON-RPC
-//! framing (port of `packages/mcp/src/transports/stdio.ts` @ 4a080252f).
+//! framing (port of `packages/mcp/src/transports/stdio.ts` @ b4afdddf).
 //!
 //! Shutdown follows the spec: close stdin and let the server exit, then
 //! SIGTERM the process group, then SIGKILL after `close_timeout_ms`. The
 //! process group covers wrappers like `npx`/`uvx`, so children do not
 //! outlive the direct child (G4 red line).
 
+#[cfg(unix)]
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::sync::{Once, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use super::{DEFAULT_MAX_MESSAGE_BYTES, McpTransport, McpTransportError, TransportEvents};
-use crate::protocol::parse_json_rpc_message;
 
 /// `DEFAULT_MAX_STDERR_BYTES` (stdio.ts:7).
 const DEFAULT_MAX_STDERR_BYTES: usize = 64 * 1024;
@@ -31,6 +34,46 @@ const STDIN_CLOSE_GRACE_MS: u64 = 500;
 /// can be waited on exactly once, and spawn/close race for it, so both paths
 /// observe the exit through `try_wait`.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+#[cfg(unix)]
+fn live_process_groups() -> &'static Mutex<BTreeSet<i32>> {
+    LIVE_PROCESS_GROUPS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(unix)]
+extern "C" fn terminate_live_process_groups() {
+    let Some(groups) = LIVE_PROCESS_GROUPS.get() else {
+        return;
+    };
+    for pid in lock(groups).iter().copied() {
+        // SAFETY: each tracked id is a process group created by this module.
+        // This is an ordinary exit callback, not a signal handler.
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
+        }
+    }
+}
+
+#[cfg(unix)]
+static LIVE_PROCESS_GROUPS: OnceLock<Mutex<BTreeSet<i32>>> = OnceLock::new();
+
+#[cfg(unix)]
+fn track_process_group(pid: u32) {
+    static EXIT_HOOK: Once = Once::new();
+    EXIT_HOOK.call_once(|| {
+        // SAFETY: the callback remains valid for the life of the process and
+        // only signals groups still owned by a live transport.
+        unsafe {
+            libc::atexit(terminate_live_process_groups);
+        }
+    });
+    lock(live_process_groups()).insert(pid as i32);
+}
+
+#[cfg(unix)]
+fn untrack_process_group(pid: u32) {
+    lock(live_process_groups()).remove(&(pid as i32));
+}
 
 /// stderr line callback (`onStderr`, stdio.ts:61).
 pub type StderrCallback = Arc<dyn Fn(&str) + Send + Sync>;
@@ -81,6 +124,10 @@ impl StdioTransportOptions {
 struct StdioState {
     child: AsyncMutex<Option<Child>>,
     stdin: AsyncMutex<Option<ChildStdin>>,
+    disconnected: AtomicBool,
+    disconnect: Notify,
+    #[cfg(not(unix))]
+    exited: AtomicBool,
 }
 
 /// stdio transport (`StdioTransport`, stdio.ts:67).
@@ -88,27 +135,38 @@ pub struct StdioTransport {
     options: StdioTransportOptions,
     events: Arc<TransportEvents>,
     state: Arc<StdioState>,
-    stderr: Arc<Mutex<Vec<u8>>>,
-    stdout_buffer: Arc<Mutex<Vec<u8>>>,
+    lines: Arc<Mutex<super::lines::JsonRpcLineReader>>,
     started: AtomicBool,
     closed: AtomicBool,
-    pid: Mutex<Option<u32>>,
+    pid: Arc<Mutex<Option<u32>>>,
 }
 
 impl StdioTransport {
     pub fn new(options: StdioTransportOptions) -> Self {
+        let events = Arc::new(TransportEvents::default());
+        let lines = super::lines::JsonRpcLineReader::new(
+            events.clone(),
+            options.on_stderr.clone(),
+            options
+                .max_message_bytes
+                .unwrap_or(DEFAULT_MAX_MESSAGE_BYTES),
+            options.max_stderr_bytes.unwrap_or(DEFAULT_MAX_STDERR_BYTES),
+        );
         Self {
             options,
-            events: Arc::new(TransportEvents::default()),
+            events,
             state: Arc::new(StdioState {
                 child: AsyncMutex::new(None),
                 stdin: AsyncMutex::new(None),
+                disconnected: AtomicBool::new(false),
+                disconnect: Notify::new(),
+                #[cfg(not(unix))]
+                exited: AtomicBool::new(false),
             }),
-            stderr: Arc::new(Mutex::new(Vec::new())),
-            stdout_buffer: Arc::new(Mutex::new(Vec::new())),
+            lines: Arc::new(Mutex::new(lines)),
             started: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            pid: Mutex::new(None),
+            pid: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -119,7 +177,7 @@ impl StdioTransport {
 
     /// `get stderr` (stdio.ts:83): captured tail of the server's stderr.
     pub fn stderr(&self) -> String {
-        String::from_utf8_lossy(&lock(&self.stderr)).into_owned()
+        lock(&self.lines).stderr()
     }
 
     fn spawn(&self) -> Result<Child, McpTransportError> {
@@ -176,18 +234,20 @@ impl StdioTransport {
                 KillSignal::Term => libc::SIGTERM,
                 KillSignal::Kill => libc::SIGKILL,
             };
-            // Negative pid: the whole group, so wrappers like `npx` or `uvx`
-            // do not leave the server behind.
-            // SAFETY: `kill` with a negative pid targets the process group;
-            // failure (group gone) is ignored exactly like upstream.
+            // Negative pid targets the process group. If the group is gone
+            // or was never created, upstream falls back to the direct child.
+            // SAFETY: both forms target only the child or its owned group.
             unsafe {
-                libc::kill(-(pid as i32), signal);
+                if libc::kill(-(pid as i32), signal) != 0 {
+                    libc::kill(pid as i32, signal);
+                }
             }
         }
         #[cfg(windows)]
         {
             // Windows has no graceful signals; `taskkill /T /F` reaps the
             // tree (stdio.ts:31). Best effort.
+            let _ = signal;
             let _ = std::process::Command::new("taskkill")
                 .args(["/pid", &pid.to_string(), "/T", "/F"])
                 .stdout(Stdio::null())
@@ -201,18 +261,11 @@ impl StdioTransport {
         }
     }
 
-    async fn try_wait(&self) -> Option<std::process::ExitStatus> {
-        let mut guard = self.state.child.lock().await;
-        match guard.as_mut() {
-            Some(child) => child.try_wait().ok().flatten(),
-            None => None,
-        }
-    }
-
-    fn start_monitor(&self) {
+    fn start_monitor(&self, readers: [Option<tokio::task::JoinHandle<()>>; 2]) {
         let state = self.state.clone();
         let events = self.events.clone();
-        let stdout_buffer = self.stdout_buffer.clone();
+        let lines = self.lines.clone();
+        let pid_cell = self.pid.clone();
         let pid = *lock(&self.pid);
         tokio::spawn(async move {
             loop {
@@ -229,18 +282,37 @@ impl StdioTransport {
                     Err(_) => break,
                 }
             }
-            StdioTransport::kill_process_tree(pid, KillSignal::Term);
-            if !String::from_utf8_lossy(&lock(&stdout_buffer))
-                .trim()
-                .is_empty()
-            {
-                events.emit_error(&McpTransportError::Other(
-                    "MCP stdio server closed with an incomplete JSON-RPC message".to_owned(),
-                ));
+            #[cfg(not(unix))]
+            state.exited.store(true, Ordering::SeqCst);
+            // A server can exit while its children keep the inherited pipes
+            // open. Keep the group live until those pipes actually close.
+            for reader in readers.into_iter().flatten() {
+                let _ = reader.await;
             }
-            lock(&stdout_buffer).clear();
+            StdioTransport::kill_process_tree(pid, KillSignal::Term);
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                untrack_process_group(pid);
+            }
+            *lock(&pid_cell) = None;
+            *state.child.lock().await = None;
+            state.disconnected.store(true, Ordering::SeqCst);
+            state.disconnect.notify_waiters();
+            lock(&lines).end();
             events.emit_close();
         });
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        let pid = lock(&self.pid).take();
+        if let Some(pid) = pid {
+            // No caller remains to run the graceful close ladder.
+            Self::kill_process_tree(Some(pid), KillSignal::Kill);
+            untrack_process_group(pid);
+        }
     }
 }
 
@@ -263,52 +335,42 @@ impl McpTransport for StdioTransport {
         }
         let mut child = self.spawn()?;
         *lock(&self.pid) = child.id();
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            track_process_group(pid);
+        }
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         *self.state.stdin.lock().await = child.stdin.take();
         *self.state.child.lock().await = Some(child);
 
-        let reader = Arc::new(StdioChildReader {
-            events: self.events.clone(),
-            stdout_buffer: self.stdout_buffer.clone(),
-            stderr: self.stderr.clone(),
-            on_stderr: self.options.on_stderr.clone(),
-            max_message_bytes: self
-                .options
-                .max_message_bytes
-                .unwrap_or(DEFAULT_MAX_MESSAGE_BYTES),
-            max_stderr_bytes: self
-                .options
-                .max_stderr_bytes
-                .unwrap_or(DEFAULT_MAX_STDERR_BYTES),
-        });
-        if let Some(stdout) = stdout {
-            let reader = reader.clone();
+        let lines = self.lines.clone();
+        let stdout = stdout.map(|stdout| {
+            let lines = lines.clone();
             tokio::spawn(async move {
                 let mut stream = BufReader::new(stdout);
                 let mut buffer = [0u8; 8192];
                 loop {
                     match stream.read(&mut buffer).await {
                         Ok(0) | Err(_) => break,
-                        Ok(read) => reader.handle_stdout(&buffer[..read]),
+                        Ok(read) => lock(&lines).read_stdout(&buffer[..read]),
                     }
                 }
-            });
-        }
-        if let Some(stderr) = stderr {
-            let reader = reader.clone();
+            })
+        });
+        let stderr = stderr.map(|stderr| {
             tokio::spawn(async move {
                 let mut stream = BufReader::new(stderr);
                 let mut buffer = [0u8; 4096];
                 loop {
                     match stream.read(&mut buffer).await {
                         Ok(0) | Err(_) => break,
-                        Ok(read) => reader.handle_stderr(&buffer[..read]),
+                        Ok(read) => lock(&lines).read_stderr(&buffer[..read]),
                     }
                 }
-            });
-        }
-        self.start_monitor();
+            })
+        });
+        self.start_monitor([stdout, stderr]);
         Ok(())
     }
 
@@ -338,24 +400,28 @@ impl McpTransport for StdioTransport {
         // Close stdin and let the server exit.
         drop(self.state.stdin.lock().await.take());
         let pid = *lock(&self.pid);
+        if pid.is_none() {
+            self.events.emit_close();
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        if self.state.exited.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let close_timeout = Duration::from_millis(
             self.options
                 .close_timeout_ms
                 .unwrap_or(DEFAULT_CLOSE_TIMEOUT_MS),
         );
         let grace = Duration::from_millis(STDIN_CLOSE_GRACE_MS).min(close_timeout);
-        if !wait_for_exit(self, grace).await {
-            // SIGTERM, then give the server the close timeout to exit.
+        if !wait_for_disconnect(&self.state, grace).await {
             StdioTransport::kill_process_tree(pid, KillSignal::Term);
-            if !wait_for_exit(self, close_timeout).await {
+            if !wait_for_disconnect(&self.state, close_timeout).await {
                 StdioTransport::kill_process_tree(pid, KillSignal::Kill);
-                let _ = wait_for_exit(self, Duration::from_millis(500)).await;
+                wait_until_disconnected(&self.state).await;
             }
         }
-        // Reap anything the server left behind even when it exited on its own.
-        StdioTransport::kill_process_tree(pid, KillSignal::Term);
         *self.state.child.lock().await = None;
-        self.events.emit_close();
         Ok(())
     }
 
@@ -368,103 +434,23 @@ impl McpTransport for StdioTransport {
     }
 }
 
-async fn wait_for_exit(transport: &StdioTransport, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
+async fn wait_until_disconnected(state: &StdioState) {
     loop {
-        if transport.try_wait().await.is_some() {
-            return true;
+        let notified = state.disconnect.notified();
+        tokio::pin!(notified);
+        // Register before re-checking: notify_waiters stores no permit.
+        notified.as_mut().enable();
+        if state.disconnected.load(Ordering::SeqCst) {
+            break;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(EXIT_POLL_INTERVAL).await;
+        notified.await;
     }
 }
 
-/// stdout/stderr reader shared between the two reader tasks.
-struct StdioChildReader {
-    events: Arc<TransportEvents>,
-    stdout_buffer: Arc<Mutex<Vec<u8>>>,
-    stderr: Arc<Mutex<Vec<u8>>>,
-    on_stderr: Option<StderrCallback>,
-    max_message_bytes: usize,
-    max_stderr_bytes: usize,
-}
-
-impl StdioChildReader {
-    fn handle_stdout(&self, chunk: &[u8]) {
-        let mut buffer = lock(&self.stdout_buffer);
-        buffer.extend_from_slice(chunk);
-        loop {
-            let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') else {
-                if buffer.len() > self.max_message_bytes {
-                    buffer.clear();
-                    drop(buffer);
-                    self.events.emit_error(&McpTransportError::Other(format!(
-                        "MCP stdio message exceeds {} bytes",
-                        self.max_message_bytes
-                    )));
-                    return;
-                }
-                return;
-            };
-            let line: Vec<u8> = buffer.drain(..=newline).collect();
-            let line = &line[..line.len() - 1];
-            if line.len() > self.max_message_bytes {
-                drop(buffer);
-                self.events.emit_error(&McpTransportError::Other(format!(
-                    "MCP stdio message exceeds {} bytes",
-                    self.max_message_bytes
-                )));
-                buffer = lock(&self.stdout_buffer);
-                continue;
-            }
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            let text = String::from_utf8_lossy(line);
-            if text.trim().is_empty() {
-                continue;
-            }
-            let parsed = serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(parse_json_rpc_message);
-            match parsed {
-                Some(message) => {
-                    drop(buffer);
-                    self.events.emit_message(&message);
-                    buffer = lock(&self.stdout_buffer);
-                }
-                None => {
-                    drop(buffer);
-                    self.events.emit_error(&McpTransportError::Other(format!(
-                        "MCP stdio server sent an invalid JSON-RPC message: {}",
-                        truncate(&text, 200)
-                    )));
-                    buffer = lock(&self.stdout_buffer);
-                }
-            }
-        }
-    }
-
-    fn handle_stderr(&self, chunk: &[u8]) {
-        {
-            let mut buffer = lock(&self.stderr);
-            buffer.extend_from_slice(chunk);
-            if buffer.len() > self.max_stderr_bytes {
-                let drop = buffer.len() - self.max_stderr_bytes;
-                buffer.drain(..drop);
-            }
-        }
-        if let Some(on_stderr) = &self.on_stderr {
-            on_stderr(&String::from_utf8_lossy(chunk));
-        }
-    }
-}
-
-fn truncate(text: &str, max: usize) -> &str {
-    match text.char_indices().nth(max) {
-        Some((index, _)) => &text[..index],
-        None => text,
-    }
+async fn wait_for_disconnect(state: &StdioState, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, wait_until_disconnected(state))
+        .await
+        .is_ok()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -475,10 +461,52 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
-    fn truncate_keeps_char_boundaries() {
-        assert_eq!(truncate("abcdef", 3), "abc");
-        assert_eq!(truncate("ab", 5), "ab");
-        assert_eq!(truncate("日本語", 2), "日本");
+    fn process_group_failure_falls_back_to_the_direct_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn direct child");
+        StdioTransport::kill_process_tree(Some(child.id()), KillSignal::Term);
+        let mut exited = false;
+        for _ in 0..100 {
+            if child.try_wait().expect("child status").is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("direct child was not signaled after the process-group miss");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disconnect_waiters_observe_the_final_notification() {
+        let state = Arc::new(StdioState {
+            child: AsyncMutex::new(None),
+            stdin: AsyncMutex::new(None),
+            disconnected: AtomicBool::new(false),
+            disconnect: Notify::new(),
+            #[cfg(not(unix))]
+            exited: AtomicBool::new(false),
+        });
+        let waiters: Vec<_> = (0..32)
+            .map(|_| {
+                let state = state.clone();
+                tokio::spawn(async move { wait_until_disconnected(&state).await })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        state.disconnected.store(true, Ordering::SeqCst);
+        state.disconnect.notify_waiters();
+        let results =
+            tokio::time::timeout(Duration::from_secs(1), futures::future::join_all(waiters))
+                .await
+                .expect("all waiters observe disconnect");
+        assert!(results.into_iter().all(|result| result.is_ok()));
     }
 }

@@ -175,6 +175,8 @@ pub struct PackageResource {
     pub scope: SourceScope,
     /// Base directory of the resource inside the package, when known.
     pub base_dir: Option<PathBuf>,
+    /// Resolved package changelog path (`PathMetadata.changelogPath`).
+    pub changelog_path: Option<PathBuf>,
 }
 
 /// Pre-resolved resources from installed packages (`settings.packages`),
@@ -479,6 +481,7 @@ impl DefaultResourceLoader {
                     scope: info.scope,
                     origin: info.origin,
                     base_dir: info.base_dir.clone(),
+                    changelog_path: info.changelog_path.clone(),
                 },
             );
         }
@@ -996,6 +999,7 @@ fn create_source_info(path: &Path, metadata: &PathMetadata) -> SourceInfo {
         scope: metadata.scope,
         origin: metadata.origin,
         base_dir: metadata.base_dir.clone(),
+        changelog_path: metadata.changelog_path.clone(),
     }
 }
 
@@ -1009,6 +1013,7 @@ fn package_source_info(package: &PackageResource) -> SourceInfo {
         scope: package.scope,
         origin: SourceOrigin::Package,
         base_dir: package.base_dir.clone(),
+        changelog_path: package.changelog_path.clone(),
     }
 }
 
@@ -1308,6 +1313,7 @@ fn discover_file_resource_paths(options: &FileResourceDiscovery) -> Vec<Resolved
                 scope: package.scope,
                 origin: SourceOrigin::Package,
                 base_dir: package.base_dir.clone(),
+                changelog_path: package.changelog_path.clone(),
             },
         });
     }
@@ -1318,6 +1324,7 @@ fn discover_file_resource_paths(options: &FileResourceDiscovery) -> Vec<Resolved
         scope: SourceScope::Project,
         origin: SourceOrigin::TopLevel,
         base_dir: None,
+        changelog_path: None,
     };
     for entry in resolve_local_file_entries(
         options.project_settings_entries,
@@ -1332,6 +1339,7 @@ fn discover_file_resource_paths(options: &FileResourceDiscovery) -> Vec<Resolved
         scope: SourceScope::User,
         origin: SourceOrigin::TopLevel,
         base_dir: None,
+        changelog_path: None,
     };
     for entry in resolve_local_file_entries(
         options.global_settings_entries,
@@ -1349,6 +1357,7 @@ fn discover_file_resource_paths(options: &FileResourceDiscovery) -> Vec<Resolved
             scope: SourceScope::Project,
             origin: SourceOrigin::TopLevel,
             base_dir: Some(project_base_dir.clone()),
+            changelog_path: None,
         };
         for path in collect_auto_file_entries(&project_dir, options.kind) {
             let enabled =
@@ -1367,6 +1376,7 @@ fn discover_file_resource_paths(options: &FileResourceDiscovery) -> Vec<Resolved
         scope: SourceScope::User,
         origin: SourceOrigin::TopLevel,
         base_dir: Some(global_base_dir.clone()),
+        changelog_path: None,
     };
     for path in collect_auto_file_entries(&user_dir, options.kind) {
         let enabled =
@@ -1583,7 +1593,9 @@ pub fn migrate_keybindings_config_file_at(path: &Path) -> Result<bool, RpiError>
                 file = Some(opened);
                 break;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            // Contention includes Windows `ERROR_LOCK_VIOLATION` (33), which
+            // `LockFileEx` reports instead of `WouldBlock`.
+            Err(error) if crate::core::settings_write::is_lock_contended(&error) => {
                 if attempt == LOCK_MAX_ATTEMPTS {
                     return Err(RpiError::Resource(format!(
                         "Failed to acquire keybindings lock for {}: {error}",
@@ -1602,14 +1614,25 @@ pub fn migrate_keybindings_config_file_at(path: &Path) -> Result<bool, RpiError>
         )));
     };
 
-    let result = migrate_locked_keybindings(path, &file);
+    let result = migrate_locked_keybindings(&file);
     // Explicit release mirroring upstream's `finally { release() }`.
     let _ = file.unlock();
     result
 }
 
-fn migrate_locked_keybindings(path: &Path, file: &std::fs::File) -> Result<bool, RpiError> {
-    let content = std::fs::read_to_string(path)?;
+fn migrate_locked_keybindings(file: &std::fs::File) -> Result<bool, RpiError> {
+    // Read through the handle that holds the lock: Windows denies a second
+    // handle the locked range with `ERROR_LOCK_VIOLATION` (33), which used to
+    // fail the startup migration of every `keybindings.json` there (the same
+    // rule the settings coordinator documents in `settings_write.rs`).
+    let content = {
+        use std::io::Read;
+        let mut reader = file;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut text = String::new();
+        reader.read_to_string(&mut text)?;
+        text
+    };
     let parsed: serde_json::Value = match serde_json::from_str(&content) {
         Ok(parsed) => parsed,
         // Malformed JSON is ignored, exactly like upstream's catch-all.
@@ -1923,6 +1946,7 @@ mod tests {
             scope: SourceScope::User,
             origin: SourceOrigin::TopLevel,
             base_dir: None,
+            changelog_path: None,
         };
 
         // Plain dir entry + force-exclude pattern.
@@ -2034,6 +2058,7 @@ mod tests {
             enabled: true,
             scope: SourceScope::User,
             base_dir: None,
+            changelog_path: None,
         };
         let discovery = FileResourceDiscovery {
             cwd: &cwd,
@@ -2070,6 +2095,7 @@ mod tests {
             scope: SourceScope::Temporary,
             origin: SourceOrigin::TopLevel,
             base_dir: Some(PathBuf::from("/ext/skills")),
+            changelog_path: None,
         };
         let extra = vec![(PathBuf::from("/ext/skills"), info)];
         let found = find_source_info_for_path(Path::new("/ext/skills/foo/SKILL.md"), &extra, &[])

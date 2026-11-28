@@ -1,5 +1,5 @@
 //! Client identity and provider attribution (port of
-//! `packages/ai/src/utils/identity.ts` @ 4a080252f, adc5fa9f8 / 04a93bad8).
+//! `packages/ai/src/utils/identity.ts` @ b4afdddf, adc5fa9f8 / 04a93bad8).
 
 use serde::{Deserialize, Serialize};
 

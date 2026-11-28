@@ -39,6 +39,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rpi_agent::types::{QueueMode, ThinkingLevel};
 use rpi_ai::types::Transport;
@@ -175,6 +176,20 @@ pub struct ThinkingBudgetsSettings {
     pub high: Option<u64>,
 }
 
+/// Monotonic generation of the `markdown.mermaid` setting (V19-04 FR-E).
+/// Markdown `cache_revision()` reads it cheaply instead of re-reading the
+/// settings document per component per frame.
+static MERMAID_MODE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Current `markdown.mermaid` generation.
+pub fn mermaid_mode_generation() -> u64 {
+    MERMAID_MODE_GENERATION.load(Ordering::Relaxed)
+}
+
+fn bump_mermaid_mode_generation() {
+    MERMAID_MODE_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// `MarkdownSettings` (settings-manager.ts:54-56) — file shape.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
@@ -212,7 +227,7 @@ impl MermaidRenderingMode {
 }
 
 /// `CacheWarmingMode = "off" | "streaming" | "idle"` (#9668,
-/// c596d09d9; settings-manager.ts:77-78) — default `"streaming"`. Global
+/// c596d09d9; settings-manager.ts:77-78) — default `"idle"` (v1.5.2). Global
 /// setting only because each refresh costs money (settings-manager.ts:955).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
@@ -220,9 +235,9 @@ impl MermaidRenderingMode {
 pub enum CacheWarmingMode {
     #[serde(rename = "off")]
     Off,
-    #[default]
     #[serde(rename = "streaming")]
     Streaming,
+    #[default]
     #[serde(rename = "idle")]
     Idle,
 }
@@ -1525,6 +1540,9 @@ impl SettingsManager {
     /// Synchronous — the upstream `await this.writeQueue` is unnecessary
     /// because this port writes inline (see module header).
     pub fn reload(&mut self) {
+        // A reload can change `markdown.mermaid` from outside the setter;
+        // bump the generation so layout revisions observe it (V19-04 FR-E).
+        bump_mermaid_mode_generation();
         let (global_settings, global_error) =
             Self::try_load_from_storage(&mut *self.storage, SettingsScope::Global, true);
         match global_error {
@@ -1821,6 +1839,26 @@ impl SettingsManager {
         self.global_settings
             .set("lastChangelogVersion", Value::String(version.to_string()));
         self.mark_modified("lastChangelogVersion", None);
+        self.save();
+    }
+
+    pub fn get_extension_changelog_version(&self, key: &str) -> Option<String> {
+        self.settings
+            .nested("extensionChangelogVersions", key)
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    }
+
+    pub fn set_extension_changelog_version(&mut self, key: &str, version: &str) {
+        let mut versions = self
+            .global_settings
+            .get("extensionChangelogVersions")
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        versions.insert(key.to_owned(), Value::String(version.to_owned()));
+        self.global_settings
+            .set("extensionChangelogVersions", Value::Object(versions));
+        self.mark_modified("extensionChangelogVersions", Some(key));
         self.save();
     }
 
@@ -2216,7 +2254,7 @@ impl SettingsManager {
     /// `getCacheWarmingMode` (#9668, c596d09d9; settings-manager.ts:955-959):
     /// read from global settings only because warming costs money —
     /// project `cacheWarming` is ignored; invalid values fall back to
-    /// `"streaming"`.
+    /// `"idle"`.
     pub fn get_cache_warming_mode(&self) -> CacheWarmingMode {
         CacheWarmingMode::from_setting(self.global_settings.get("cacheWarming"))
     }
@@ -3025,10 +3063,14 @@ impl SettingsManager {
 
     /// `setMermaidRenderingMode` (settings-manager.ts:1268-1273).
     pub fn set_mermaid_rendering_mode(&mut self, mode: MermaidRenderingMode) {
+        let changed = self.get_mermaid_rendering_mode() != mode;
         self.global_settings
             .set_nested("markdown", "mermaid", json_value(&mode));
         self.mark_modified("markdown", Some("mermaid"));
         self.save();
+        if changed {
+            bump_mermaid_mode_generation();
+        }
     }
 
     /// `getTuiMode` (settings-manager.ts:1370-1372 @ 88ff80b98): default
@@ -4181,33 +4223,32 @@ mod tests {
     // describe("cacheWarming") — #9668 (V15-05 FR-A)
     // =======================================================================
 
-    // Port of "defaults to streaming and ignores project settings"
-    // (settings-manager.test.ts:397-408): global-only because each refresh
-    // costs money.
+    // Port of the v1.5.2 idle default; project settings stay ignored because
+    // each refresh costs money. Explicit streaming/off remain unchanged.
     #[test]
-    fn test_cache_warming_defaults_to_streaming_and_ignores_project() {
+    fn test_cache_warming_defaults_to_idle_and_ignores_project() {
         let dirs = test_dirs();
-        assert_eq!(
-            create(&dirs).get_cache_warming_mode(),
-            CacheWarmingMode::Streaming
-        );
-
-        write_json(&project_path(&dirs), json!({"cacheWarming": "idle"}));
-        assert_eq!(
-            create(&dirs).get_cache_warming_mode(),
-            CacheWarmingMode::Streaming
-        );
-
-        write_json(&global_path(&dirs), json!({"cacheWarming": "idle"}));
         assert_eq!(
             create(&dirs).get_cache_warming_mode(),
             CacheWarmingMode::Idle
         );
 
-        write_json(&global_path(&dirs), json!({"cacheWarming": "bogus"}));
+        write_json(&project_path(&dirs), json!({"cacheWarming": "off"}));
+        assert_eq!(
+            create(&dirs).get_cache_warming_mode(),
+            CacheWarmingMode::Idle
+        );
+
+        write_json(&global_path(&dirs), json!({"cacheWarming": "streaming"}));
         assert_eq!(
             create(&dirs).get_cache_warming_mode(),
             CacheWarmingMode::Streaming
+        );
+
+        write_json(&global_path(&dirs), json!({"cacheWarming": "bogus"}));
+        assert_eq!(
+            create(&dirs).get_cache_warming_mode(),
+            CacheWarmingMode::Idle
         );
     }
 
@@ -4282,6 +4323,76 @@ mod tests {
         assert_eq!(
             manager.get_http_idle_timeout_ms().unwrap(),
             DEFAULT_HTTP_IDLE_TIMEOUT_MS
+        );
+    }
+
+    /// V19-07 FR-A R2 (R5.1.3): the host typed `statusLine` scope rejects an
+    /// illegal `liveTokens.calculation`. At startup the scope is empty and the
+    /// error is recorded; on reload the previous in-memory host settings stay.
+    /// A missing `calculation` (and the legacy bool/object shapes) stay valid.
+    #[test]
+    fn test_status_line_calculation_scope_is_strict() {
+        let dirs = test_dirs();
+        // Legacy shapes and the two legal values load.
+        for live_tokens in [
+            json!(true),
+            json!({"refreshMs": 400}),
+            json!({"calculation": "auto"}),
+            json!({"calculation": "estimate"}),
+        ] {
+            write_json(
+                &global_path(&dirs),
+                json!({"theme": "dark", "statusLine": {"type": "items", "liveTokens": live_tokens}}),
+            );
+            let manager = create(&dirs);
+            assert!(
+                manager.global_settings_load_error.is_none(),
+                "{live_tokens}"
+            );
+            assert_eq!(manager.get_theme().as_deref(), Some("dark"));
+        }
+        // Startup with an illegal value: empty settings plus the error.
+        write_json(
+            &global_path(&dirs),
+            json!({"theme": "dark", "statusLine": {"type": "items", "liveTokens": {"calculation": "fast"}}}),
+        );
+        let mut manager = create(&dirs);
+        let error = manager
+            .global_settings_load_error
+            .as_ref()
+            .expect("illegal calculation fails the scope");
+        assert!(error.to_string().contains("statusLine"), "{error}");
+        assert_eq!(
+            manager.get_theme(),
+            None,
+            "startup failure leaves the scope empty"
+        );
+        assert!(
+            manager.drain_errors().iter().any(|issue| {
+                issue.scope == SettingsScope::Global
+                    && issue.error.to_string().contains("statusLine")
+            }),
+            "the startup error is reported"
+        );
+        // A valid file reloads cleanly, then an illegal value keeps the
+        // previous in-memory host settings.
+        write_json(
+            &global_path(&dirs),
+            json!({"theme": "light", "statusLine": {"type": "items", "liveTokens": {"calculation": "estimate"}}}),
+        );
+        manager.reload();
+        assert!(manager.global_settings_load_error.is_none());
+        assert_eq!(manager.get_theme().as_deref(), Some("light"));
+        write_json(
+            &global_path(&dirs),
+            json!({"theme": "solarized", "statusLine": {"type": "items", "liveTokens": {"calculation": "Auto"}}}),
+        );
+        manager.reload();
+        assert!(manager.global_settings_load_error.is_some());
+        assert_eq!(
+            manager.get_theme().as_deref(),
+            Some("light"),
+            "reload failure keeps the previous host settings"
         );
     }
 

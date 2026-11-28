@@ -1,5 +1,5 @@
 //! Port of `packages/coding-agent/src/modes/interactive/program-status-reporter.ts`
-//! @ pi 1.4.0 (4a080252f).
+//! @ pi 1.5.2 (b4afdddf).
 //!
 //! Reports interactive-mode state to the terminal (OSC 7501): `working`
 //! during agent runs and compaction, `blocked` while a dialog waits for the
@@ -173,6 +173,11 @@ impl ProgramStatusReporter {
     }
 
     /// `currentStatus()` (program-status-reporter.ts:103-110).
+    #[cfg(test)]
+    pub(crate) fn current_status_for_test(&self) -> ProgramStatus {
+        self.current_status(None)
+    }
+
     fn current_status(&self, session_name: Option<&str>) -> ProgramStatus {
         if let Some((_, blocked)) = self.blocked.last() {
             return ProgramStatus::blocked(blocked.kind, blocked.message.clone());

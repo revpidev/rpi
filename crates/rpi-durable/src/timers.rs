@@ -1,5 +1,5 @@
 //! Host timers for the Session and Harness (port of
-//! `packages/durable/src/timers.ts` @ `4a080252f`).
+//! `packages/durable/src/timers.ts` @ `b4afdddf`).
 //!
 //! A foreground timer paces or resumes work and must fire, so one the host
 //! declines or throws on falls back to the runtime's timer, reported once. A
@@ -55,7 +55,13 @@ impl Timers {
 
     fn fall_back(&self, message: &str) {
         if !self.reported_fallback.swap(true, Ordering::SeqCst) {
-            (self.report)(message.to_string());
+            (self.report)(crate::harness::types::Report::new(
+                crate::harness::types::ReportInfo::new(
+                    crate::harness::types::ReportKind::HostError,
+                )
+                .with_callback("setTimer"),
+                message.to_string(),
+            ));
         }
     }
 
@@ -95,7 +101,13 @@ impl Timers {
         })) {
             Ok(disarm) => disarm,
             Err(_) => {
-                (self.report)("HarnessOptions.setTimer threw for a background timer".to_string());
+                (self.report)(crate::harness::types::Report::new(
+                    crate::harness::types::ReportInfo::new(
+                        crate::harness::types::ReportKind::HostError,
+                    )
+                    .with_callback("setTimer"),
+                    "HarnessOptions.setTimer threw for a background timer".to_string(),
+                ));
                 None
             }
         }

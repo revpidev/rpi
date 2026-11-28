@@ -50,6 +50,35 @@ fn schema(name: &str) -> (Value, Validator) {
     (value, validator)
 }
 
+fn assert_valid_meta_schema(value: &Value) {
+    assert!(jsonschema::meta::is_valid(value));
+    jsonschema::meta::validate(value).expect("valid meta-schema");
+    let validator = jsonschema::meta::validator_for(value).expect("built-in meta-validator");
+    assert_eq!(validator.iter_errors(value).count(), 0);
+}
+
+#[test]
+fn generated_schemas_pass_all_native_meta_validation_entry_points() {
+    assert_valid_meta_schema(&rpi::core::config_schemas::settings_schema());
+    assert_valid_meta_schema(&rpi_ai::models_json::ModelsJson::schema_document());
+    for name in [
+        "settings.schema.json",
+        "models.schema.json",
+        "keybindings.schema.json",
+        "theme.schema.json",
+    ] {
+        assert_valid_meta_schema(&schema(name).0);
+    }
+    let invalid = serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": 42
+    });
+    assert!(!jsonschema::meta::is_valid(&invalid));
+    assert!(jsonschema::meta::validate(&invalid).is_err());
+    let validator = jsonschema::meta::validator_for(&invalid).expect("built-in meta-validator");
+    assert!(validator.iter_errors(&invalid).next().is_some());
+}
+
 #[test]
 fn schemas_are_branded_and_complete() {
     for name in [
@@ -272,4 +301,38 @@ fn models_and_keybindings_schemas_enforce_their_typed_shapes() {
     let (_keybindings, keybindings) = schema("keybindings.schema.json");
     assert!(keybindings.is_valid(&serde_json::json!({"tui.editor.cursorUp": ["ctrl+up", "up"]})));
     assert!(!keybindings.is_valid(&serde_json::json!({"tui.editor.cursorUp": 42})));
+}
+
+#[test]
+fn models_schema_includes_anthropic_message_threads_compat() {
+    for value in [
+        rpi::core::config_schemas::models_schema(),
+        schema("models.schema.json").0,
+    ] {
+        let field = &value["$defs"]["ModelCompat"]["properties"]["supportsMessageThreads"];
+        assert!(field.is_object(), "missing supportsMessageThreads");
+        assert_eq!(field["type"], serde_json::json!(["boolean"]));
+    }
+}
+
+#[test]
+fn extension_changelog_versions_are_string_records() {
+    let (_schema, validator) = schema("settings.schema.json");
+    assert!(validator.is_valid(&serde_json::json!({
+        "extensionChangelogVersions": {"[\"npm:demo\",\"user\"]": "1.2.0"}
+    })));
+    assert!(!validator.is_valid(&serde_json::json!({
+        "extensionChangelogVersions": {"npm:demo": 42}
+    })));
+}
+
+#[test]
+fn self_update_command_wrapper_is_not_a_supported_setting() {
+    let (settings, _validator) = schema("settings.schema.json");
+    assert!(settings["properties"].get("selfUpdateCommand").is_none());
+    assert!(
+        settings["properties"]
+            .get("extensionChangelogVersions")
+            .is_some()
+    );
 }

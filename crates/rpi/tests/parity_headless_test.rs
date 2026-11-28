@@ -168,7 +168,9 @@ fn normalize_one_system_message(message: &mut Value) {
         // rpi brand: `pi` → `rpi` in the preamble and the env-var prefix in
         // the rules section.
         if let Some(Value::String(preamble)) = sections.get_mut("preamble") {
-            *preamble = preamble.replace("operating inside pi,", "operating inside rpi,");
+            *preamble = preamble
+                .replace("operating inside pi,", "operating inside rpi,")
+                .replace("running inside pi,", "running inside rpi,");
         }
         if let Some(Value::String(rules)) = sections.get_mut("rules") {
             *rules = rules.replace("PI_*", "RPI_*").replace("RRPI_*", "RPI_*");

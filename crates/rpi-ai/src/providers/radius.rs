@@ -38,7 +38,8 @@ use crate::auth::oauth::radius::RadiusOAuth;
 use crate::auth::{Credential, ModelsError, ProviderAuth, env_api_key_auth};
 use crate::models::{
     CreateProviderOptions, InflightRefresh, ModelsPublication, Provider, ProviderApi,
-    RefreshModelsContext, create_provider, now_millis,
+    RefreshModelsContext, SharedAllModelProjection, create_provider, now_millis,
+    project_dynamic_all_models,
 };
 use crate::models_store::ModelsStoreEntry;
 use crate::types::{
@@ -76,10 +77,14 @@ pub fn radius_provider_with(options: RadiusProviderOptions) -> Arc<RadiusProvide
     // empty. The baseline models keep the catalog's `radius` provider id
     // upstream via `flattenModelCatalog("radius", …)`; our vendored data
     // already carries `provider: "radius"` and `baseUrl: …/v1`.
-    let baseline = if gateway == normalize_radius_gateway_url(DEFAULT_RADIUS_GATEWAY) {
-        crate::generated::get_builtin_models("radius").to_vec()
+    let baseline: Arc<[Model]> = if gateway == normalize_radius_gateway_url(DEFAULT_RADIUS_GATEWAY)
+    {
+        crate::generated::get_builtin_all_models_shared("radius")
+            .iter()
+            .filter_map(|model| model.as_chat().cloned())
+            .collect()
     } else {
-        Vec::new()
+        Arc::from(Vec::new())
     };
     let inner = create_provider(CreateProviderOptions {
         id: id.clone(),
@@ -110,6 +115,7 @@ pub fn radius_provider_with(options: RadiusProviderOptions) -> Arc<RadiusProvide
         // The `dynamicModels` closure cell (radius.ts:25): undefined until a
         // stored, legacy, or fetched catalog exists.
         dynamic_models: Arc::new(Mutex::new(None)),
+        dynamic_all_models: Mutex::new(None),
         id,
         inflight: InflightRefresh::new(),
     })
@@ -125,10 +131,11 @@ pub struct RadiusProvider {
     id: String,
     /// `baselineModels` — read-only after construction (the static public
     /// catalog; empty for custom gateways).
-    baseline: Vec<Model>,
+    baseline: Arc<[Model]>,
     /// `dynamicModels` — written by `refresh_models` (stored restore, legacy
     /// import, gateway fetch); `None` until any catalog exists.
-    dynamic_models: Arc<Mutex<Option<Vec<Model>>>>,
+    dynamic_models: Arc<Mutex<Option<Arc<[Model]>>>>,
+    dynamic_all_models: Mutex<Option<SharedAllModelProjection>>,
     inflight: InflightRefresh,
 }
 
@@ -163,6 +170,10 @@ impl Provider for RadiusProvider {
     }
 
     fn get_models(&self) -> Vec<Model> {
+        self.get_models_shared().to_vec()
+    }
+
+    fn get_models_shared(&self) -> Arc<[Model]> {
         // `getModels()` (radius.ts:38-40 @ 43d376399): the gateway catalog
         // for this account replaces the shipped baseline once known, so
         // organization-disabled models do not reappear. The baseline only
@@ -171,7 +182,16 @@ impl Provider for RadiusProvider {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
-            .unwrap_or_else(|| self.baseline.clone())
+            .unwrap_or_else(|| Arc::clone(&self.baseline))
+    }
+
+    fn get_all_models(&self) -> Vec<AnyModel> {
+        self.get_all_models_shared().to_vec()
+    }
+
+    fn get_all_models_shared(&self) -> Arc<[AnyModel]> {
+        let models = self.get_models_shared();
+        project_dynamic_all_models(&self.dynamic_all_models, &models)
     }
 
     fn filter_models(&self, models: Vec<Model>, credential: Option<&Credential>) -> Vec<Model> {
@@ -220,7 +240,7 @@ impl Provider for RadiusProvider {
                                 persist: None,
                                 update: Some(Box::new(move || {
                                     *models_for_update.lock().unwrap_or_else(|e| e.into_inner()) =
-                                        Some(dynamic);
+                                        Some(dynamic.into());
                                 })),
                             })
                             .await?;
@@ -256,7 +276,7 @@ impl Provider for RadiusProvider {
                                         *models_for_update
                                             .lock()
                                             .unwrap_or_else(|e| e.into_inner()) =
-                                            Some(legacy_clone);
+                                            Some(legacy_clone.into());
                                     })),
                                 })
                                 .await?;
@@ -301,7 +321,7 @@ impl Provider for RadiusProvider {
                             })),
                             update: Some(Box::new(move || {
                                 *models_clone.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(refreshed_clone);
+                                    Some(refreshed_clone.into());
                             })),
                         })
                         .await?;
@@ -549,6 +569,16 @@ mod tests {
     /// "replaces the static public catalog with a cached catalog without
     /// network access" (radius-provider.test.ts @ 43d376399): models an
     /// organization owner disabled must not reappear from the shipped
+    #[test]
+    fn all_type_catalog_reuses_the_chat_generation() {
+        let provider = radius_provider_with(RadiusProviderOptions::default());
+        let first = provider.get_all_models_shared();
+        let second = provider.get_all_models_shared();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!first.is_empty());
+        assert!(first.iter().all(|model| model.as_chat().is_some()));
+    }
+
     /// baseline, so the stored catalog replaces it.
     #[tokio::test]
     async fn replaces_the_static_baseline_with_a_cached_catalog_without_network() {

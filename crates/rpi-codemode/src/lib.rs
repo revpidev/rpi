@@ -1,5 +1,5 @@
 //! Sandboxed JavaScript execution where the only capability is calling
-//! injected tools (port of `packages/codemode` @ 4a080252f).
+//! injected tools (port of `packages/codemode` @ b4afdddf).
 //!
 //! The engine is the vendored `quickjs.wasm` (quickjs-wasi 3.6.2) driven
 //! through wasmtime (ADR-0034 decision 3 / ADR-0035): one OS thread and a
@@ -17,7 +17,8 @@ pub mod wasm;
 
 pub use declarations::{
     DEFAULT_INPUT_SCHEMA_MAX_CHARS, RenderDeclarationsOptions, render_declarations,
-    render_tool_output_type, render_tool_sample, render_tool_signature, schema_to_type,
+    render_tool_output_type, render_tool_sample, render_tool_signature, resolve_schema_ref,
+    schema_to_type,
 };
 pub use identifier::to_codemode_identifier;
 pub use runtime::host::CodemodeSandbox;

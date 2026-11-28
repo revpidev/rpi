@@ -1,5 +1,5 @@
 //! OAuth wire types and their structural validation (port of
-//! `packages/mcp/src/oauth/types.ts` @ 4a080252f).
+//! `packages/mcp/src/oauth/types.ts` @ b4afdddf).
 //!
 //! `null` and `""` optional fields count as absent (v1.0.0 `8ce69e9d2`):
 //! servers send them for values they do not have, like `scope: ""`.

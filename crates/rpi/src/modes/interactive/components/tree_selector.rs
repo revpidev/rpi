@@ -1548,14 +1548,7 @@ fn format_tool_call(name: &str, arguments: &Map<String, Value>) -> String {
         .ok()
         .or_else(|| std::env::var("USERPROFILE").ok());
     let shorten_path = |path: String| -> String {
-        if let Some(home) = &home
-            && !home.is_empty()
-            && path.starts_with(home.as_str())
-        {
-            let suffix: String = path.chars().skip(home.chars().count()).collect();
-            return format!("~{suffix}");
-        }
-        path
+        crate::tools::path_utils::shorten_home_path(&path, home.as_deref().unwrap_or_default())
     };
 
     // `String(args.path || args.file_path || "")` — first non-empty arg.

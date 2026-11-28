@@ -452,6 +452,7 @@ impl HostCall for SessionFakeHost {
                     Ok(json!({ "text": state.editor_texts.pop_front().unwrap_or(Value::Null) }))
                 }
                 "ui.editor" => Ok(state.editor_texts.pop_front().unwrap_or(Value::Null)),
+                "sendMessage" => Ok(Value::Null),
                 "sendUserMessage" => {
                     if let Some(content) = args.get("content").and_then(Value::as_str) {
                         state.user_messages.push(content.to_owned());

@@ -28,6 +28,31 @@ fn host_of(session: &AgentSession) -> Option<Arc<NativeExtensionHost>> {
     host_of_runner(&session.extension_runner())
 }
 
+fn host_keybinding_hints(theme: &Theme) -> ext::KeybindingHints {
+    use super::components::keybinding_hints::{key_hint, key_text};
+
+    let keybindings = crate::core::keybindings::get_keybindings()
+        .read()
+        .map(|manager| {
+            crate::core::keybindings::keybinding_definitions()
+                .iter()
+                .filter_map(|(id, _)| {
+                    let keys = manager.get_keys(id);
+                    (!keys.is_empty()).then(|| (id.clone(), keys.join("/")))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let hint_theme = theme.clone();
+    ext::KeybindingHints {
+        key_text: Some(Arc::new(key_text)),
+        key_hint: Some(Arc::new(move |keybinding, description| {
+            key_hint(&hint_theme, keybinding, description)
+        })),
+        keybindings,
+    }
+}
+
 /// `getMessageRenderer(customType)` → TUI `MessageRenderer`
 /// (interactive-mode.ts message render path).
 pub fn host_message_renderer(session: &AgentSession, custom_type: &str) -> Option<MessageRenderer> {
@@ -39,6 +64,7 @@ pub fn host_message_renderer(session: &AgentSession, custom_type: &str) -> Optio
             ext::MessageRenderOptions {
                 expanded: options.expanded,
                 output_pad: options.output_pad as u32,
+                keybinding_hints: host_keybinding_hints(theme),
             },
         )
         .ok()??;
@@ -55,6 +81,7 @@ pub fn host_entry_renderer(session: &AgentSession, custom_type: &str) -> Option<
             value,
             ext::EntryRenderOptions {
                 expanded: options.expanded,
+                keybinding_hints: host_keybinding_hints(theme),
             },
         )
         .ok()??;
@@ -63,7 +90,7 @@ pub fn host_entry_renderer(session: &AgentSession, custom_type: &str) -> Option<
 }
 
 /// `getRegisteredToolDefinition` (interactive-mode.ts:2223-2232 @
-/// 4a080252f): the render hooks of the (possibly extension-overridden) tool
+/// b4afdddf): the render hooks of the (possibly extension-overridden) tool
 /// definition, resolved through the extension resolver chain in load order
 /// (`resolveToolRenderers(toolName, () => withBuiltInRenderers(...))`,
 /// #10285). Resolvers may render tools that are not registered, such as
@@ -101,6 +128,7 @@ struct HostToolRenderDefinition {
 
 fn to_render_context(
     context: &super::components::tool_execution::ToolRenderContext,
+    theme: &Theme,
 ) -> ext::ToolRenderContext {
     ext::ToolRenderContext {
         args: context.args.clone(),
@@ -113,7 +141,7 @@ fn to_render_context(
         show_images: context.show_images,
         is_error: context.is_error,
         // `durationMs` / `outputPad` (extensions/types.ts:494-498
-        // @ 4a080252f): the TUI component carries both internally since
+        // @ b4afdddf): the TUI component carries both internally since
         // V17-05; this bridge opens them to the extension ABI (V17-06).
         duration_ms: context.duration_ms,
         output_pad: context.output_pad as u32,
@@ -122,6 +150,7 @@ fn to_render_context(
             0 => None,
             width => Some(width as u64),
         },
+        keybinding_hints: host_keybinding_hints(theme),
     }
 }
 
@@ -133,7 +162,7 @@ impl ToolDefinition for HostToolRenderDefinition {
         context: &super::components::tool_execution::ToolRenderContext,
     ) -> Option<Box<dyn Component>> {
         let render = self.render_call.as_ref()?;
-        let mut ext_context = to_render_context(context);
+        let mut ext_context = to_render_context(context, theme);
         ext_context.args = args.clone();
         let tree = render(ext_context).ok()?;
         Some(component_from_tree(&tree, &Arc::new(theme.clone())))
@@ -154,7 +183,7 @@ impl ToolDefinition for HostToolRenderDefinition {
                 expanded: options.expanded,
                 is_partial: options.is_partial,
             },
-            to_render_context(context),
+            to_render_context(context, theme),
         )
         .ok()?;
         Some(component_from_tree(&tree, &Arc::new(theme.clone())))
@@ -228,7 +257,7 @@ mod tests {
         );
     }
 
-    /// V17-06 FR-B (types.ts:494-498 @ 4a080252f): the TUI render context's
+    /// V17-06 FR-B (types.ts:494-498 @ b4afdddf): the TUI render context's
     /// internal `duration_ms`/`output_pad` reach extension renderers through
     /// the bridge — and only then does the extension ABI expose them.
     #[test]
@@ -250,7 +279,8 @@ mod tests {
             output_pad: 3,
             terminal_width: 0,
         };
-        let bridged = to_render_context(&context);
+        let theme = crate::core::themes::load_theme("dark", None).expect("dark theme");
+        let bridged = to_render_context(&context, &theme);
         assert_eq!(bridged.duration_ms, Some(4_200));
         assert_eq!(bridged.output_pad, 3);
         assert_eq!(bridged.terminal_width, None, "0 = never rendered yet");
@@ -259,10 +289,31 @@ mod tests {
             duration_ms: None,
             ..context
         };
-        let bridged = to_render_context(&partial);
+        let bridged = to_render_context(&partial, &theme);
         assert_eq!(
             bridged.duration_ms, None,
             "partial/legacy results carry none"
         );
+    }
+
+    #[test]
+    fn renderer_hints_use_host_keys_and_include_json_key_map() {
+        let theme = crate::core::themes::load_theme("dark", None).expect("dark theme");
+        let hints = host_keybinding_hints(&theme);
+        let key_text = hints.key_text.clone().expect("native keyText");
+        assert_eq!(key_text("app.tools.expand"), "ctrl+o");
+        let key_hint = hints.key_hint.clone().expect("native keyHint");
+        assert!(key_hint("app.tools.expand", "to expand").contains("ctrl+o"));
+        assert_eq!(
+            hints
+                .keybindings
+                .get("app.tools.expand")
+                .map(String::as_str),
+            Some("ctrl+o")
+        );
+        let wire = serde_json::to_value(&hints).expect("serialize hints");
+        assert_eq!(wire["keybindings"]["app.tools.expand"], "ctrl+o");
+        assert!(wire.get("keyText").is_none());
+        assert!(wire.get("keyHint").is_none());
     }
 }

@@ -1,5 +1,5 @@
-//! Port of `packages/ai/src/providers/openrouter.ts` @ pi 1.4.0
-//! (4a080252f), including the per-key `/models/user` catalog from ee409a85f.
+//! Port of `packages/ai/src/providers/openrouter.ts` @ pi 1.5.2
+//! (b4afdddf), including the per-key `/models/user` catalog from ee409a85f.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,7 +12,6 @@ use crate::api::openrouter_images::openrouter_images_v6_api;
 use crate::api::typesafe_system_one::{TYPESAFE_SYSTEM_ONE_API, typesafe_system_one_api};
 use crate::auth::oauth::openrouter_oauth;
 use crate::auth::{Credential, ModelsError, ModelsErrorCode, ProviderAuth, env_api_key_auth};
-use crate::generated::{get_builtin_all_models, get_builtin_models};
 use crate::models::{
     CreateProviderOptions, Provider, ProviderApi, ProviderStreams, RefreshModelsContext,
     create_provider,
@@ -37,8 +36,9 @@ pub fn openrouter_provider() -> Arc<dyn Provider> {
             ))),
             oauth: Some(openrouter_oauth()),
         },
-        models: get_builtin_models("openrouter").to_vec(),
-        all_models: get_builtin_all_models("openrouter").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared(
+            "openrouter",
+        )),
         classifiers: HashMap::from([(
             TYPESAFE_SYSTEM_ONE_API.to_owned(),
             typesafe_system_one_api(),

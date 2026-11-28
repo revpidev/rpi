@@ -963,6 +963,26 @@ pub fn get_keybindings() -> &'static RwLock<KeybindingsManager> {
     instance
 }
 
+/// Resolve a select-list page key without querying the component or its ABI.
+/// Empty lists clamp to index zero; non-page keys return `None`.
+pub fn get_select_page_index(
+    keybindings: &KeybindingsManager,
+    data: &str,
+    selected_index: usize,
+    item_count: usize,
+    page_size: usize,
+) -> Option<usize> {
+    let direction = if keybindings.matches(data, Keybinding::SelectPageUp) {
+        -1isize
+    } else if keybindings.matches(data, Keybinding::SelectPageDown) {
+        1isize
+    } else {
+        return None;
+    };
+    let next = selected_index as isize + direction * page_size as isize;
+    Some(next.clamp(0, item_count.saturating_sub(1) as isize) as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,6 +1011,41 @@ mod tests {
             config.insert((*id).to_string(), value.clone());
         }
         KeybindingsManager::new(tui_keybindings().to_vec(), config)
+    }
+
+    #[test]
+    fn select_page_index_handles_custom_keys_empty_lists_and_clamps() {
+        let manager = manager_with_config(&[
+            (
+                "tui.select.pageUp",
+                KeyBindingValue::Single("f8".to_string()),
+            ),
+            (
+                "tui.select.pageDown",
+                KeyBindingValue::Single("f9".to_string()),
+            ),
+        ]);
+        assert_eq!(
+            get_select_page_index(&manager, "\x1b[19~", 12, 30, 5),
+            Some(7)
+        );
+        assert_eq!(
+            get_select_page_index(&manager, "\x1b[20~", 3, 30, 5),
+            Some(8)
+        );
+        assert_eq!(
+            get_select_page_index(&manager, "\x1b[20~", 29, 30, 5),
+            Some(29)
+        );
+        assert_eq!(
+            get_select_page_index(&manager, "\x1b[19~", 0, 30, 5),
+            Some(0)
+        );
+        assert_eq!(get_select_page_index(&manager, "x", 1, 30, 5), None);
+        assert_eq!(
+            get_select_page_index(&manager, "\x1b[20~", 0, 0, 5),
+            Some(0)
+        );
     }
 
     #[test]

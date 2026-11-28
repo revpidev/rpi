@@ -112,6 +112,28 @@ pub enum CompactionEvent {
 /// stream; tests capture them verbatim for parity comparison.
 pub type CompactionEventSink = Arc<dyn Fn(CompactionEvent) + Send + Sync>;
 
+/// A `session_compact` event whose emit was deferred until the compaction
+/// lock is released (V19-03 S45).
+#[derive(Debug, Clone)]
+pub struct PendingSessionCompact {
+    pub compaction_entry: serde_json::Value,
+    pub from_extension: bool,
+    pub reason: CompactionReason,
+    pub will_retry: bool,
+}
+
+/// A `session_compact_failed` event deferred until the compaction lock is
+/// released (V19-03 S45): the failure path has the same idle-transition
+/// requirement as the success path.
+#[derive(Debug, Clone)]
+pub struct PendingSessionCompactFailed {
+    pub reason: CompactionReason,
+    pub error_message: Option<String>,
+    pub aborted: bool,
+    pub will_retry: bool,
+    pub from_extension: bool,
+}
+
 /// The bare error text upstream puts into `errorMessage` (`error.message`),
 /// without the `RpiError` Display prefix.
 fn raw_error_message(error: &RpiError) -> String {
@@ -138,7 +160,7 @@ fn lock_abort(cell: &AbortTokenCell) -> std::sync::MutexGuard<'_, Option<Cancell
     cell.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// `_omitRecoveryAttempt` callback (agent-session.ts:1208-1222 @ 4a080252f):
+/// `_omitRecoveryAttempt` callback (agent-session.ts:1208-1222 @ b4afdddf):
 /// persists a restorative `context_edit` omission for a discarded recovery
 /// attempt before the post-run compaction.
 pub type OmitRecoveryFn = Arc<dyn Fn(&AssistantMessage) + Send + Sync>;
@@ -158,7 +180,7 @@ pub type SummarizationModelResolver = Arc<
         + Sync,
 >;
 
-/// `_findPersistedMessageEntryId` (agent-session.ts:1189-1207 @ 4a080252f):
+/// `_findPersistedMessageEntryId` (agent-session.ts:1189-1207 @ b4afdddf):
 /// value-equality scan over the branch, then the projected-index fallback.
 fn find_persisted_message_entry_id(
     path: &[SessionEntry],
@@ -198,6 +220,13 @@ pub struct CompactionRunner {
     thinking_level: ThinkingLevel,
     emit: CompactionEventSink,
     overflow_recovery_attempted: bool,
+    /// V19-03 S45: `session_compact` is emitted by the session layer after
+    /// the compaction lock is released. Pi emits it while compaction state
+    /// is still set, so extensions must poll `isIdle`; the plugin host has no
+    /// timer seam, so deferring the emit makes the same transition observable
+    /// without polling.
+    pending_session_compact: Option<PendingSessionCompact>,
+    pending_session_compact_failed: Option<PendingSessionCompactFailed>,
     /// Manual compaction's token — upstream `_compactionAbortController`
     /// (agent-session.ts:327). The prompt rejection reads only this cell
     /// (agent-session.ts:1133).
@@ -224,6 +253,9 @@ pub struct CompactionRunner {
     /// agent-session.ts:549-568): resolves the model + thinking level of a
     /// summary request; a virtual selection routes with reason `direct`.
     summarization_model_resolver: Option<SummarizationModelResolver>,
+    /// Additive (V19-03 S45): `AgentSession::compact` captured whether a
+    /// parent run was streaming before it aborted it.
+    manual_interrupted: bool,
 }
 
 impl CompactionRunner {
@@ -248,13 +280,35 @@ impl CompactionRunner {
             thinking_level,
             emit,
             overflow_recovery_attempted: false,
+            pending_session_compact: None,
+            pending_session_compact_failed: None,
             active_token: AbortTokenCell::default(),
             auto_active_token: AbortTokenCell::default(),
             extension_runner: None,
             omit_recovery: None,
             mark_failed_response: None,
             summarization_model_resolver: None,
+            manual_interrupted: false,
         }
+    }
+
+    /// V19-03 S45: record whether the manual compaction interrupted a
+    /// streaming parent run (captured before `abort()`).
+    pub fn set_manual_interrupted(&mut self, interrupted: bool) {
+        self.manual_interrupted = interrupted;
+    }
+
+    /// Take the deferred `session_compact` payload (if any). The caller must
+    /// drop the compaction lock before emitting it so `ctx.isIdle` observes
+    /// the post-compaction state.
+    pub fn take_pending_session_compact(&mut self) -> Option<PendingSessionCompact> {
+        self.pending_session_compact.take()
+    }
+
+    /// Take the deferred `session_compact_failed` payload (if any). The
+    /// caller must drop the compaction lock before emitting it.
+    pub fn take_pending_session_compact_failed(&mut self) -> Option<PendingSessionCompactFailed> {
+        self.pending_session_compact_failed.take()
     }
 
     /// T15 W2: install the extension runner slot (AgentSession passes its
@@ -267,7 +321,7 @@ impl CompactionRunner {
     }
 
     /// V16-03 FR-A R5: install the recovery-omission callback
-    /// (`_omitRecoveryAttempt`, agent-session.ts:1208-1222 @ 4a080252f).
+    /// (`_omitRecoveryAttempt`, agent-session.ts:1208-1222 @ b4afdddf).
     pub fn set_omit_recovery(&mut self, omit: OmitRecoveryFn) {
         self.omit_recovery = Some(omit);
     }
@@ -386,8 +440,8 @@ impl CompactionRunner {
     /// when handlers are registered for `session_compact_failed` — zero
     /// overhead without extensions, like the upstream `hasHandlers` short
     /// circuit.
-    async fn emit_session_compact_failed(
-        &self,
+    fn emit_session_compact_failed(
+        &mut self,
         reason: CompactionReason,
         error_message: Option<String>,
         aborted: bool,
@@ -400,15 +454,13 @@ impl CompactionRunner {
         if !runner.has_handlers("session_compact_failed") {
             return;
         }
-        runner
-            .emit_session_compact_failed(
-                reason.as_str(),
-                error_message.as_deref(),
-                aborted,
-                will_retry,
-                from_extension,
-            )
-            .await;
+        self.pending_session_compact_failed = Some(PendingSessionCompactFailed {
+            reason,
+            error_message,
+            aborted,
+            will_retry,
+            from_extension,
+        });
     }
 
     fn emit(&self, event: CompactionEvent) {
@@ -490,6 +542,7 @@ impl CompactionRunner {
             }
             Ok(_) => false,
         };
+        self.manual_interrupted = false;
         let (result, error_message) = match &outcome {
             Ok(result) => (Some(Box::new(result.clone())), None),
             Err(error) if aborted => (None, None),
@@ -516,8 +569,7 @@ impl CompactionRunner {
             aborted,
             false,
             from_extension,
-        )
-        .await;
+        );
         outcome
     }
 
@@ -532,6 +584,7 @@ impl CompactionRunner {
         custom_instructions: Option<&str>,
         reason: CompactionReason,
         will_retry: bool,
+        interrupted: bool,
     ) -> Result<Option<CompactionResult>, RpiError> {
         let Some(runner) = self.extension_runner() else {
             return Ok(None);
@@ -547,6 +600,7 @@ impl CompactionRunner {
             custom_instructions: custom_instructions.map(str::to_owned),
             reason: reason.as_str().to_owned(),
             will_retry,
+            interrupted,
         };
         let Some(result) = runner.emit_session_before_compact(&event).await else {
             return Ok(None);
@@ -585,6 +639,7 @@ impl CompactionRunner {
                 custom_instructions,
                 CompactionReason::Manual,
                 false,
+                self.manual_interrupted,
             )
             .await?;
         *from_extension = extension_compaction.is_some();
@@ -646,7 +701,8 @@ impl CompactionRunner {
         let estimated_tokens_after = estimate_messages_tokens(&session_context.messages);
 
         // `session_compact` with the saved entry (found by summary,
-        // agent-session.ts:1876-1891 / :2156-2172).
+        // agent-session.ts:1876-1891 / :2156-2172). The emit itself is
+        // deferred to the session layer (see `pending_session_compact`).
         if let Some(runner) = self.extension_runner()
             && runner.has_handlers("session_compact")
         {
@@ -661,14 +717,12 @@ impl CompactionRunner {
             if let Some(entry) = saved_entry {
                 match serde_json::to_value(&entry) {
                     Ok(value) => {
-                        runner
-                            .emit_session_compact(
-                                value,
-                                from_extension,
-                                reason.as_str(),
-                                will_retry,
-                            )
-                            .await;
+                        self.pending_session_compact = Some(PendingSessionCompact {
+                            compaction_entry: value,
+                            from_extension,
+                            reason,
+                            will_retry,
+                        });
                     }
                     Err(error) => {
                         tracing::warn!("session_compact payload serialize failed: {error}")
@@ -742,7 +796,7 @@ impl CompactionRunner {
             .map(|m| u64::from(m.max_tokens))
             .unwrap_or(0);
         // Canonical projection checks (agent-session.ts:2006-2021 @
-        // 4a080252f): an assistant entry that a later context edit omitted, or
+        // b4afdddf): an assistant entry that a later context edit omitted, or
         // whose usage a later edit/compaction invalidated, must not be
         // trusted to trigger recovery.
         let typed_projection = rpi_agent::session::build_session_projection(&path);
@@ -836,15 +890,14 @@ impl CompactionRunner {
                     false,
                     false,
                     false,
-                )
-                .await;
+                );
                 return false;
             }
 
             self.overflow_recovery_attempted = true;
             // Keep the failed attempt in raw history while durably omitting
             // it from the model projection (agent-session.ts:2992-2997 @
-            // 4a080252f `_omitRecoveryAttempt`). Direct state truncation no
+            // b4afdddf `_omitRecoveryAttempt`). Direct state truncation no
             // longer reaches the provider context under the canonical
             // projection.
             if let Some(omit) = &self.omit_recovery {
@@ -859,7 +912,7 @@ impl CompactionRunner {
             return retry;
         }
 
-        // Case 3: threshold (agent-session.ts:3016-3051 @ 4a080252f). For
+        // Case 3: threshold (agent-session.ts:3016-3051 @ b4afdddf). For
         // error messages or all-zero usage, estimate from the last valid
         // response. Edited context must not trust pre-edit usage.
         let has_context_edits = typed_projection
@@ -936,7 +989,7 @@ impl CompactionRunner {
     /// catch's `aborted = signal.aborted || cancelledByExtension`
     /// classification: clear the idle-blocking cell first (3852cb2b8), then
     /// emit the aborted `compaction_end` pair.
-    async fn abort_auto_outcome(&self, reason: CompactionReason, from_extension: bool) -> bool {
+    async fn abort_auto_outcome(&mut self, reason: CompactionReason, from_extension: bool) -> bool {
         *lock_abort(&self.auto_active_token) = None;
         self.emit(CompactionEvent::CompactionEnd {
             reason,
@@ -945,8 +998,7 @@ impl CompactionRunner {
             will_retry: false,
             error_message: None,
         });
-        self.emit_session_compact_failed(reason, None, true, false, from_extension)
-            .await;
+        self.emit_session_compact_failed(reason, None, true, false, from_extension);
         false
     }
 
@@ -988,6 +1040,7 @@ impl CompactionRunner {
                     None,
                     reason,
                     will_retry,
+                    false,
                 )
                 .await
             {
@@ -1110,8 +1163,7 @@ impl CompactionRunner {
                         aborted,
                         false,
                         from_extension,
-                    )
-                    .await;
+                    );
                 }
                 false
             }

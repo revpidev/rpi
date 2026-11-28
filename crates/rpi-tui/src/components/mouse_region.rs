@@ -47,6 +47,14 @@ impl Component for MouseRegion {
         lock_component(&self.child).render(width)
     }
 
+    fn cache_revision(&self) -> Option<u64> {
+        lock_component(&self.child).cache_revision()
+    }
+
+    fn cache_instance_id(&self) -> Option<u64> {
+        lock_component(&self.child).cache_instance_id()
+    }
+
     fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
         // `const childResult = dispatchMouseEvent(this.child, event);
         //  return childResult ?? this.onMouse(event);` (mouse-region.ts:26-27).

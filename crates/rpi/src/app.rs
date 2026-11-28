@@ -40,7 +40,10 @@ use crate::core::model_resolver::{
     ResolveCliModelOptions, ScopedModel, resolve_cli_model, resolve_model_scope_with_diagnostics,
 };
 use crate::core::model_runtime::ModelRuntime;
-use crate::core::session_cwd::{format_missing_session_cwd_error, get_missing_session_cwd_issue};
+use crate::core::session_cwd::{
+    MissingCwdDecision, format_missing_session_cwd_error, format_missing_session_cwd_prompt,
+    get_missing_session_cwd_issue, get_missing_session_cwd_options,
+};
 use crate::core::session_manager::{NewSessionOptions, SessionManager, assert_valid_session_id};
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::trust_manager::{
@@ -360,7 +363,7 @@ async fn create_session_manager(
                 let _ = writeln!(err, "Session found in different project: {other_cwd}");
                 if !prompt_confirm("Fork this session into current directory?", err) {
                     let _ = writeln!(err, "Aborted.");
-                    std::process::exit(0);
+                    crate::process_exit::exit(0);
                 }
                 SessionManager::fork_from(
                     &path,
@@ -389,7 +392,7 @@ async fn create_session_manager(
         let Some(selected_path) = selected else {
             // Cancelled (main.ts:328-330): stdout message, exit code 0.
             println!("No session selected");
-            std::process::exit(0);
+            crate::process_exit::exit(0);
         };
         return SessionManager::open(Path::new(&selected_path), session_dir, None)
             .map_err(|e| e.to_string());
@@ -605,6 +608,28 @@ pub async fn run_app(args: Vec<String>) -> i32 {
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
 
+    // V19-09 (ADR-0050, Windows): the hidden `--verify-extension <path>`
+    // preflight child — `rpi update` starts it to prove a freshly
+    // downloaded native extension loads before it is placed.
+    #[cfg(windows)]
+    if let Some(parsed) = crate::cli::package_command::parse_verify_extension(&args) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        return match parsed {
+            Ok(path) => {
+                crate::core::windows_update::startup::pin_additional_dirs(std::slice::from_ref(
+                    &path,
+                ));
+                crate::core::windows_update::preflight::run_verify_extension_in(
+                    &path, &cwd, &mut err,
+                )
+            }
+            Err(message) => {
+                let _ = writeln!(err, "Error: {message}");
+                1
+            }
+        };
+    }
+
     // Offline mode (main.ts:476-480).
     let offline_mode = args.iter().any(|a| a == "--offline")
         || is_truthy_env_flag(std::env::var(ENV_OFFLINE).ok().as_deref());
@@ -658,12 +683,22 @@ pub async fn run_app(args: Vec<String>) -> i32 {
             let _ = writeln!(err, "{prefix}: {diagnostic}");
         }
         if has_error(&parsed.diagnostics) {
+            // V19-09: an argument error runs no user command and still
+            // proves the new version starts (a confirmation point).
+            #[cfg(windows)]
+            crate::core::windows_update::startup::confirm_point(
+                crate::core::windows_update::startup::ConfirmPoint::NoUserCommand,
+            );
             return 1;
         }
     }
 
     if parsed.version {
         let _ = writeln!(out, "{VERSION}");
+        #[cfg(windows)]
+        crate::core::windows_update::startup::confirm_point(
+            crate::core::windows_update::startup::ConfirmPoint::NoUserCommand,
+        );
         return 0;
     }
 
@@ -746,16 +781,47 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         }
     };
 
-    // Header cwd missing (main.ts:579-591): interactive prompts (T12);
-    // headless errors out.
+    // Header cwd missing (main.ts:745-768): interactive startup offers a
+    // one-shot cwd override or a persisted fork. Print/RPC fail before any
+    // session is created.
     if let Some(issue) = get_missing_session_cwd_issue(&session_manager, &cwd) {
-        if app_mode == AppMode::Interactive {
-            // T12 prompt path; unreachable until interactive lands.
+        if app_mode != AppMode::Interactive {
             let _ = writeln!(err, "{}", format_missing_session_cwd_error(&issue));
             return 1;
         }
-        let _ = writeln!(err, "{}", format_missing_session_cwd_error(&issue));
-        return 1;
+        let options = get_missing_session_cwd_options(&issue);
+        let labels: Vec<String> = options.iter().map(|option| option.label.clone()).collect();
+        let selected = crate::modes::interactive::startup_ui::run_startup_selector(
+            &startup_settings_manager,
+            &format_missing_session_cwd_prompt(&issue),
+            &labels,
+        );
+        let decision = selected
+            .as_deref()
+            .and_then(|label| options.iter().find(|option| option.label == label))
+            .and_then(|option| option.decision);
+        let Some(session_file) = issue.session_file.as_deref() else {
+            return 0;
+        };
+        let recovered = match decision {
+            Some(MissingCwdDecision::Continue) => {
+                SessionManager::open(Path::new(session_file), session_dir.as_deref(), Some(&cwd))
+            }
+            Some(MissingCwdDecision::Fork) => SessionManager::fork_from(
+                Path::new(session_file),
+                &cwd,
+                session_dir.as_deref(),
+                crate::core::session_manager::ForkOptions::default(),
+            ),
+            None => return 0,
+        };
+        match recovered {
+            Ok(manager) => session_manager = manager,
+            Err(error) => {
+                let _ = writeln!(err, "Error: {error}");
+                return 1;
+            }
+        }
     }
 
     if let Some(name) = &parsed.name {
@@ -1421,6 +1487,10 @@ pub async fn run_app(args: Vec<String>) -> i32 {
             out,
             "{}",
             print_help(&extension_flags, std::io::stdout().is_terminal())
+        );
+        #[cfg(windows)]
+        crate::core::windows_update::startup::confirm_point(
+            crate::core::windows_update::startup::ConfirmPoint::NoUserCommand,
         );
         return 0;
     }

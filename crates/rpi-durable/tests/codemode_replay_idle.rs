@@ -2,20 +2,25 @@
 //! independently dispatched calls.
 
 mod generation_support;
+#[path = "tools_support.rs"]
+mod tools_support;
 
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures::{StreamExt, stream::FuturesUnordered};
-use rpi_ai::types::Message;
+use rpi_ai::types::{Message, ToolResultContent};
 use rpi_durable::chord::context::Context;
 use rpi_durable::chord::json::{JsonObject, JsonValue};
 use rpi_durable::codemode::{
-    CODEMODE_JOURNAL_DOC, CODEMODE_TOOL_NAME, CodemodeHost, CodemodeJournal, CodemodeOutcome,
-    CodemodeSandbox, CodemodeStart, CodemodeToolOptions, create_codemode_tool,
+    CODEMODE_JOURNAL_DOC, CODEMODE_TOOL_NAME, CodemodeHost, CodemodeImage, CodemodeJournal,
+    CodemodeOutcome, CodemodeSandbox, CodemodeStart, CodemodeToolOptions, create_codemode_tool,
 };
+use rpi_durable::env::node::{NodeExecutionEnv, NodeExecutionEnvOptions};
+use rpi_durable::env::types::ExecutionEnv;
 use rpi_durable::harness::{
     Extension, NestedToolExecutionResult, ToolCaller, ToolExecute, ToolExecuteError,
     ToolExecutionApi, ToolExecutionResult, ToolRegistration, ToolReplay,
@@ -23,11 +28,12 @@ use rpi_durable::harness::{
 use rpi_durable::ids::TaskId;
 use rpi_durable::session::DocOwner;
 use rpi_durable::storage::MemoryStorage;
+use rpi_durable::tools::create_read_tool;
 use rpi_durable::types::{EntryRecord, Storage};
 
 use generation_support::{
-    Script, context, entries, open_with_storage, root_ready, submit_input, test_models,
-    text_message, tool_use_message,
+    Script, context, entries, open_with_storage, open_with_storage_and_env, root_ready,
+    submit_input, test_models, text_message, tool_use_message,
 };
 
 fn tool(name: &str, execute: Arc<dyn ToolExecute>) -> ToolRegistration {
@@ -166,6 +172,196 @@ fn models() -> rpi_ai::models::Models {
         )),
         Script::Message(text_message("done", rpi_ai::types::StopReason::Stop)),
     ])
+}
+
+struct CountingRead {
+    execute: Arc<dyn ToolExecute>,
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ToolExecute for CountingRead {
+    async fn execute(
+        &self,
+        args: JsonObject,
+        api: &dyn ToolExecutionApi,
+        context: &Context,
+    ) -> Result<ToolExecutionResult, ToolExecuteError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        self.execute.execute(args, api, context).await
+    }
+}
+
+fn counting_read(runs: Arc<AtomicUsize>) -> ToolRegistration {
+    let mut registration = create_read_tool();
+    registration.execute = Arc::new(CountingRead {
+        execute: Arc::clone(&registration.execute),
+        runs,
+    });
+    registration
+}
+
+struct ReplayReadSandbox {
+    image_path: String,
+    expected_data: String,
+    attempts: AtomicUsize,
+    journaled: Arc<tokio::sync::Notify>,
+    crash: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl CodemodeSandbox for ReplayReadSandbox {
+    fn fingerprint(&self) -> String {
+        "replay-read-1".to_string()
+    }
+
+    async fn run(
+        &self,
+        _start: CodemodeStart,
+        host: &dyn CodemodeHost,
+        _context: &Context,
+    ) -> Result<CodemodeOutcome, String> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        let result = host
+            .call_tool(
+                "read",
+                serde_json::json!({ "path": self.image_path })
+                    .as_object()
+                    .cloned()
+                    .expect("read arguments"),
+                "read-image",
+            )
+            .await?;
+        assert!(!result.is_error, "{:?}", result.diagnostics);
+        let picture = result.structured_output.expect("image structured output");
+        assert_eq!(picture["type"], serde_json::json!("image"));
+        assert_eq!(picture["data"], serde_json::json!(self.expected_data));
+        assert_eq!(picture["mimeType"], serde_json::json!("image/png"));
+        let image = CodemodeImage {
+            data: picture["data"].as_str().expect("image data").to_string(),
+            mime_type: picture["mimeType"]
+                .as_str()
+                .expect("image MIME type")
+                .to_string(),
+        };
+        if attempt == 0 {
+            self.journaled.notify_one();
+            self.crash.notified().await;
+        }
+        host.idle(1, 1).await?;
+        Ok(CodemodeOutcome::output("replayed read").with_images(vec![image]))
+    }
+}
+
+#[tokio::test]
+async fn read_image_result_replays_without_reading_the_file_again() {
+    const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let dir = tools_support::TempDir::new("durable-codemode-read-replay");
+    let image_path = dir.path().join("pixel.png");
+    std::fs::write(
+        &image_path,
+        base64::engine::general_purpose::STANDARD
+            .decode(PNG_1X1)
+            .expect("PNG fixture"),
+    )
+    .expect("write PNG");
+    let env: Arc<dyn ExecutionEnv> = Arc::new(NodeExecutionEnv::new(NodeExecutionEnvOptions {
+        cwd: Some(dir.path_str()),
+        ..Default::default()
+    }));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let journaled = Arc::new(tokio::sync::Notify::new());
+    let crash = Arc::new(tokio::sync::Notify::new());
+    let sandbox = Arc::new(ReplayReadSandbox {
+        image_path: image_path.to_string_lossy().into_owned(),
+        expected_data: PNG_1X1.to_string(),
+        attempts: AtomicUsize::new(0),
+        journaled: Arc::clone(&journaled),
+        crash,
+    });
+    let extensions = || {
+        vec![extension(vec![
+            create_codemode_tool(CodemodeToolOptions {
+                sandbox: Arc::clone(&sandbox) as Arc<dyn CodemodeSandbox>,
+                ..Default::default()
+            }),
+            counting_read(Arc::clone(&runs)),
+        ])]
+    };
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let opened = open_with_storage_and_env(
+        Arc::clone(&storage),
+        extensions(),
+        models(),
+        Arc::clone(&env),
+    )
+    .await;
+    let conversation = root_ready(&opened.harness).await;
+    let submission = submit_input(&conversation, "hi").await;
+    journaled.notified().await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    let parent = parent_task(&opened.harness).await;
+    let journal = journal(&opened.harness, parent).await;
+    assert_eq!(journal.entries.len(), 1);
+    let stored = journal.entries[0]
+        .result
+        .as_ref()
+        .and_then(|result| result.structured_output.as_ref())
+        .expect("journaled image");
+    assert_eq!(stored["data"], serde_json::json!(PNG_1X1));
+    assert_eq!(stored["mimeType"], serde_json::json!("image/png"));
+
+    std::fs::remove_file(&image_path).expect("remove the already-read PNG");
+    let reopened = open_with_storage_and_env(
+        Arc::clone(&storage),
+        extensions(),
+        test_models(vec![Script::Message(text_message(
+            "done",
+            rpi_ai::types::StopReason::Stop,
+        ))]),
+        env,
+    )
+    .await;
+    reopened.harness.resume().expect("resume");
+    let recovered = reopened
+        .harness
+        .submission(submission.id(), &context())
+        .await
+        .expect("submission")
+        .expect("present");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        recovered.wait(&context()),
+    )
+    .await
+    .expect("replay did not settle")
+    .expect("replay settled");
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the first nested read result answered the replay"
+    );
+    let final_entries = entries(&root_ready(&reopened.harness).await).await;
+    let texts = tool_result_texts(&final_entries);
+    assert!(texts.iter().any(|text| text.contains("replayed read")));
+    let mut emitted_image = None;
+    for entry in &final_entries {
+        for message in entry.model.iter().flatten() {
+            let Message::ToolResult(result) = message else {
+                continue;
+            };
+            for content in &result.content {
+                if let ToolResultContent::Image(image) = content {
+                    emitted_image = Some(image);
+                }
+            }
+        }
+    }
+    let image = emitted_image.expect("replayed image block");
+    assert_eq!(image.data, PNG_1X1);
+    assert_eq!(image.mime_type, "image/png");
 }
 
 struct ConcurrentAfterFirstSandbox {

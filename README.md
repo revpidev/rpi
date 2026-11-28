@@ -9,7 +9,7 @@
 [![Platform: Linux · macOS · Windows](https://img.shields.io/badge/Platform-Linux%C2%B7macOS%C2%B7Windows-lightgrey)]()
 [![Build](https://img.shields.io/github/actions/workflow/status/revpidev/rpi/build.yml)](https://github.com/revpidev/rpi/actions/workflows/build.yml)
 
-Rpi is a terminal AI coding agent written in Rust, derived from the [Pi coding agent](https://github.com/earendil-works/pi). It inherits Pi's architecture, and behavior is continuously verified against a pinned upstream release — the current behavioral baseline is **Pi v1.4.0** (`4a080252f`, see [`UPSTREAM.md`](./UPSTREAM.md)). Rpi is an independent project and may diverge from Pi as both evolve. It compiles to a single static binary with no Node, Python, or other runtime dependency.
+Rpi is a terminal AI coding agent written in Rust, derived from the [Pi coding agent](https://github.com/earendil-works/pi). It inherits Pi's architecture, and behavior is continuously verified against a pinned upstream release — the current behavioral baseline is **Pi v1.5.2** (`b4afdddf`, see [`UPSTREAM.md`](./UPSTREAM.md)). Rpi is an independent project and may diverge from Pi as both evolve. It compiles to a single static binary with no Node, Python, or other runtime dependency.
 
 The current release line is **v0.1.8**, the latest stable release (2026-11-12). Install with the script below, or update an existing install with `rpi update` (see [Status](#status)).
 
@@ -102,6 +102,12 @@ Set your API key via the standard environment variable for your provider (e.g. `
 
 Kimi Code uses OpenAI Chat Completions. Its official base URL is `https://api.kimi.com/coding/v1`; any custom `baseUrl` in `models.json` or extension provider configuration must explicitly include `/v1` as a complete path segment. Update a legacy `https://api.kimi.com/coding` override to `https://api.kimi.com/coding/v1` or your proxy's explicit `/v1` URL. rpi does not append the suffix, rewrite the URL, or fall back to the old transport.
 
+### Provider compatibility
+
+`models.json` and extension models can carry `compat` overrides. OpenAI-compatible requests omit an empty `tools` array by default; set `requiresToolsWithToolHistory: true` only for legacy proxies that require it. `promptCacheKeyMode` accepts `auto`, `enabled`, or `disabled`, and `requiresNonNullAssistantContent` converts a null assistant body to an empty string. Official Anthropic origins use message threads for incremental continuation; set `supportsMessageThreads: false` to force full requests, or use `StreamOptions.disable_continuation` for one replay. Proxies default to full requests. Cache warming defaults to `idle`; set `cacheWarming` to `streaming` for the previous behavior or `off` to disable it.
+
+For Rust callers, `Model.compat` is `Option<Box<ModelCompat>>`; wrap an existing compat value with `Box::new(compat)`. The models.json and extension wire shapes are unchanged.
+
 ### Updating
 
 ```bash
@@ -119,6 +125,8 @@ When updating a Git-installed extension, rpi stops before resetting the checkout
 
 Interactive startup checks installed packages asynchronously. A stable host compares registry extensions against the latest stable version, while an RC host compares against the latest RC; an available update lists the packages and shows the matching `rpi update --extensions` or `rpi update --extensions --rc` command.
 
+**Windows: an update takes effect at the next start.** A running program cannot be replaced on Windows, so `rpi update --self` (and the rpi part of `rpi update --all`) only downloads and verifies the new version into `.update\` next to `rpi.exe` and prints `Downloaded rpi <version>. It takes effect the next time rpi starts.` The next start re-verifies the staged files and swaps the executable and the extensions of the same batch in one journaled transaction, then the old process starts the new `rpi.exe` with your original command line and waits for it, so the shell prompt returns only when rpi exits and Ctrl+C reaches the new instance only. Extensions install as versioned directories (`~/.rpi/agent/extensions/<name>/<version>/` behind a `current.json` pointer; layouts written by earlier versions keep loading), so other running rpi instances keep the libraries they already loaded and switch over when they restart. Every start removes old-version files that nobody uses any more and, in the interactive startup notice, says so when the previous version was cleaned up or warns when files are still in use by running instances or could not be deleted; `rpi update --cleanup` retries. A new version that crashes before its first start is confirmed is rolled back automatically — the previous executable, extension pointers and install manifest are restored, the failed version is blocked and rpi says so — and `rpi update --self --version <version> --force` stages that blocked version again (a plain `rpi update --self --force` follows the channel's latest). `%LOCALAPPDATA%\rpi\logs\update.log` records every step. Getting to `0.1.9-rc.4` from an older version is the one exception: that older `rpi update --self` still ends with the manual instructions, so run `install.ps1` once (or replace the executable by hand). Instances older than `0.1.9-rc.4` that are still running during an update are not protected by the pin registry — close them before `rpi update --all`. Known limits: shutting Windows down before the new version confirmed its first start counts as that crash; a crash after the confirmation is not rolled back (the previous image stays as `rpi.exe.old-<version>` until the next normal exit; rename it back by hand or re-run `install.ps1`, which also repairs a missing `rpi.exe`); targets older than `0.1.9-rc.4` switch without the first-start check; subagent children spawned by an instance that predates the update run the new version.
+
 ### Uninstalling
 
 Remove one plugin with `rpi remove <name>` (alias: `rpi uninstall <name>`), adding `--local` for a project-scoped install. This works both for settings-tracked plugins and for artifact installs shown as `(untracked)` by `rpi list`. Installed plugin files are deleted; a local path source is only removed from settings.
@@ -135,7 +143,7 @@ rpi self-uninstall           # removes the binary and install manifest; keeps ~/
 rpi self-uninstall --purge   # also deletes ~/.rpi (sessions, auth, settings)
 ```
 
-Manual leftovers: if you uninstalled without `--purge`, delete `~/.rpi/` yourself once you no longer need it; on Windows the running binary cannot delete itself, so `self-uninstall` prints the exact paths (`rpi.exe`, `rpi.install.json`) to remove by hand. The Unix installer's marked `# rpi` PATH block is removed automatically (symlinked profiles and symlinked install directories are matched through the executable path and the manifest's logical `installPath`); manual PATH lines without the marker are left alone. On Windows remove the user PATH entry manually if the installer added it.
+Manual leftovers: if you uninstalled without `--purge`, delete `~/.rpi/` yourself once you no longer need it; on Windows the running binary cannot delete itself, so `self-uninstall` prints the exact paths (`rpi.exe`, `rpi.install.json`) to remove by hand, refuses while other rpi instances still use the installation (close them and retry), and lists the update leftovers (`.update\`, `rpi.exe.old-*`, versioned extension directories, the update log). The Unix installer's marked `# rpi` PATH block is removed automatically (symlinked profiles and symlinked install directories are matched through the executable path and the manifest's logical `installPath`); manual PATH lines without the marker are left alone. On Windows remove the user PATH entry manually if the installer added it.
 
 ## Usage
 
@@ -168,7 +176,11 @@ rpi update [self|--all|--extensions|--models] [--rc]
 rpi config                 # resource-configuration TUI (Tab switches global/project scope)
 rpi mcp add|remove|list|login|logout ...   # manage MCP servers outside a session
 rpi auth check|print-api-key|print-bearer-token ...  # inspect provider credentials
+rpi auth login <provider>    # sign in with an API key, device code, or copy-code flow
+rpi auth logout <provider>   # remove a provider credential
 ```
+
+Update notices record previous/next version-or-commit and a changelog source, collapse to one line per package, and remember last-seen extension versions in `extensionChangelogVersions`. If an interactive session's original cwd no longer exists, startup/resume/import/switch explicitly offers Continue, Fork, or Cancel; Continue is not persisted, startup Fork uses the current cwd, and print/RPC still fails with `MissingSessionCwdError`. Summary and changelog surfaces share the assistant Markdown/Mermaid transformer, including pie, author styles, and clickable labels.
 
 ### Built-in tools and extensions
 
@@ -183,7 +195,7 @@ Four hidden built-in extensions provide agent-level surfaces:
 | `builtin:mcp` | MCP servers from `~/.rpi/agent/mcp.json` and `<cwd>/.rpi/mcp.json`: `mcp__*` tools, resource tools, `/mcp`, and OAuth. `rpi-mcp-adapter` is retired — the built-in client is the supported path. |
 | `builtin:llama.cpp` | llama.cpp router integration (`/llama`) and native decision-model classifiers. |
 
-Seven first-party extensions ship as `.rpix` archives in lockstep with the host release: `rpi-subagents` (delegation, background runs, worktrees), `rpi-smart-fetch` (fingerprinted web fetch), `rpi-statusline` (script or declarative 30-field footer with session totals, turns/steps, tiered token stats and a `/statusline` editor), `rpi-ask-user-question` (structured questions), `rpi-todo` (task list), `rpi-plan-mode` (read-only planning and approval), and `rpi-usage` (typed quota/balance footer for eight providers, `/usage [--cached] [--json] [provider|all]`, `/usage list|help`, and a local session-token report for providers without a quota script).
+Seven first-party extensions ship as `.rpix` archives in lockstep with the host release: `rpi-subagents` (delegation, background runs, worktrees), `rpi-smart-fetch` (fingerprinted web fetch), `rpi-statusline` (script or declarative 30-field footer with session totals, turns/steps, tiered token stats, `liveTokens.calculation: auto|estimate` and a `/statusline` editor), `rpi-ask-user-question` (structured questions), `rpi-todo` (task list), `rpi-plan-mode` (read-only planning and approval), and `rpi-usage` (typed quota/balance footer for eight providers, `/usage [--cached] [--json] [provider|all]`, `/usage list|help`, and a local session-token report for providers without a quota script).
 
 A global update also seeds an absent extension default when the manifest increases that key's `defaultSettingsMigration` version; existing values and project-local installs are unchanged. `rpi-statusline` uses migration version 1 for `statusLine`, so pre-fix RC installations gain the default token rows without requiring a manual `/statusline` save.
 
@@ -213,6 +225,7 @@ Configuration lives in `~/.rpi/agent/` (or `RPI_CODING_AGENT_DIR`); project-loca
 | `RPI_TUI_COLOR_TIMEOUT` | 100ms local / 500ms SSH | Terminal color-query deadline in milliseconds (issue #77 escape hatch) |
 | `RPI_CLIPBOARD_OSC52` | — | `1` also sends copies through OSC 52, for remote clients that leave no SSH markers (multiplexer attaches, IDE daemons) |
 | `RPI_HYPERLINKS` / `RPI_IMAGE_PROTOCOL` / `RPI_TRUE_COLOR` | auto-detect | Terminal capability overrides |
+| `MALLOC_ARENA_MAX` | `1` on Linux GNU; libc default elsewhere | Positive 32-bit integer override for glibc malloc arenas; invalid values warn and fall back to `1`. The default is applied with `mallopt` and is not exported to child processes |
 
 The same URLs can be set as `versionCheckUrl`, `modelCatalogUrl`, `telemetryUrl`, and `registryUrl` in `settings.json`; environment variables take precedence.
 
@@ -259,7 +272,7 @@ The site is deployed from the [rpi-pages](https://github.com/revpidev/rpi-pages)
 | `crates/rpi-test-*` | Faux provider, test environment helpers, and a native-plugin fixture |
 | `fixtures/` | Contract/parity test fixtures (generator scripts + golden data) |
 | `scripts/` | Dev scripts (upstream pin verification, parity harnesses, catalog refresh, release tooling) |
-| `external/` | Pinned upstream submodules: `pi` (v1.4.0), `pi-subagents` (v0.83.0), `rpiv-mono` (v2.15.0), `agent-smart-fetch` (v0.3.17) — see `UPSTREAM.md` |
+| `external/` | Pinned upstream submodules: `pi` (v1.5.2), `pi-subagents` (v0.83.0), `rpiv-mono` (v2.15.0), `agent-smart-fetch` (v0.3.17) — see `UPSTREAM.md` |
 | `vendor/syntect` | Patched syntect fork used by the build-time grammar rewrite (see `vendor/syntect/PATCHES.md`) |
 | `changes/` | Per-version release notes (the changelog single source of truth) |
 | `docs/` | Public protocol/reference docs (`json-rpc.md`, `codemode.md`) |

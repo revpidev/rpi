@@ -4,7 +4,7 @@
 //! (upstream `ProcessTerminal`): raw mode, stdin reading, Kitty keyboard
 //! protocol negotiation with modifyOtherKeys fallback (DA response without a
 //! Kitty answer falls back immediately, no startup timeout), bracketed paste,
-//! OSC 9;4 taskbar progress, OSC 7501 program status (V17-05, `@ 4a080252f`),
+//! OSC 9;4 taskbar progress, OSC 7501 program status (V17-05, `@ b4afdddf`),
 //! and terminal state restore on `stop()`.
 //!
 //! Intentional differences:
@@ -86,7 +86,7 @@
 //!   (`forwardInputSequence`, terminal.ts:317-327 @ 4181f66);
 //!   `is_native_modifier_pressed` now queries CoreGraphics on macOS
 //!   (V17-10 #69) and keeps the helper-unavailable fallback elsewhere —
-//!   notably the win32 modifier query, which the port does not implement
+//!   Windows uses `GetAsyncKeyState`; other platforms keep the fallback
 //!   (see `native_modifiers.rs`; ADR-0004).
 //! - `drain_input` observes pending input by consuming and discarding queued
 //!   channel events; upstream attaches a side listener that only timestamps
@@ -258,7 +258,7 @@ const MAX_COLOR_TIMEOUT: Duration = Duration::from_secs(5);
 /// gets 500ms and local terminals 100ms.
 ///
 /// The default query timeout is a deliberate rpi extension: upstream
-/// (`theme-controller.ts:25 @ 4a080252f`) uses 100ms everywhere, which is too
+/// (`theme-controller.ts:25 @ b4afdddf`) uses 100ms everywhere, which is too
 /// short for a high-latency SSH pty. See ADR-0045.
 pub fn resolve_terminal_color_timeout_ms_with(getenv: impl Fn(&str) -> Option<String>) -> Duration {
     let configured =
@@ -289,7 +289,7 @@ pub fn normalize_native_shift_enter_input<'a>(
     should_detect_native_shift_enter: bool,
     is_shift_pressed: bool,
 ) -> Cow<'a, str> {
-    if should_detect_native_shift_enter && data == "\r" && is_shift_pressed {
+    if should_detect_native_shift_enter && matches!(data, "\r" | "\x1b\r") && is_shift_pressed {
         return Cow::Borrowed(NATIVE_SHIFT_ENTER_SEQUENCE);
     }
     Cow::Borrowed(data)
@@ -313,6 +313,25 @@ pub type ResizeHandler = Box<dyn FnMut() + Send>;
 
 /// Minimal terminal interface for the TUI (upstream `Terminal`,
 /// terminal.ts:52-94).
+/// Replace each run of C0/C1 control characters with one space
+/// (upstream `replaceControlCharacters`, tui/utils.ts:372-377).
+pub fn replace_control_characters(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut in_run = false;
+    for character in value.chars() {
+        if character.is_control() {
+            if !in_run {
+                out.push(' ');
+                in_run = true;
+            }
+        } else {
+            out.push(character);
+            in_run = false;
+        }
+    }
+    out
+}
+
 pub trait Terminal {
     /// Start the terminal with input and resize handlers (upstream
     /// `start(onInput, onResize)`).
@@ -568,7 +587,7 @@ fn stdout_winsize() -> io::Result<(u16, u16)> {
 }
 
 /// `ENABLE_VIRTUAL_TERMINAL_INPUT` (wincon.h, 0x0200; terminal.ts:420-427
-/// @ `4a080252f`): without it Windows consoles lose modifier state and
+/// @ `b4afdddf`): without it Windows consoles lose modifier state and
 /// Shift+Tab arrives as plain `\t` instead of `\x1b[Z`.
 #[cfg(any(windows, test))]
 const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
@@ -1435,8 +1454,11 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
     }
 
     fn set_title(&mut self, title: &str) {
-        // OSC 0;title BEL - set terminal window title.
-        self.write_direct(&format!("\x1b]0;{title}\x07"));
+        // OSC 0;title BEL - set terminal window title. A BEL/ESC in the title
+        // would end the sequence early and send the rest to the terminal as
+        // escape sequences (session names come from session files), so each
+        // run of C0/C1 controls becomes one space (terminal.ts:600-604).
+        self.write_direct(&format!("\x1b]0;{}\x07", replace_control_characters(title)));
     }
 
     fn set_progress(&mut self, active: bool) {
@@ -1844,10 +1866,12 @@ mod tests {
 
     #[test]
     fn rewrites_apple_terminal_return_to_csi_u_shift_enter_when_shift_pressed() {
-        assert_eq!(
-            normalize_apple_terminal_input("\r", true, true),
-            "\x1b[13;2u"
-        );
+        for input in ["\r", "\x1b\r"] {
+            assert_eq!(
+                normalize_apple_terminal_input(input, true, true),
+                "\x1b[13;2u"
+            );
+        }
     }
 
     #[test]
@@ -2493,6 +2517,17 @@ mod tests {
                 "\x1b]0;hi\x07",
             ]
         );
+    }
+
+    #[test]
+    fn title_replaces_control_character_runs_with_one_space() {
+        let writer = SharedWriter::default();
+        let mut terminal = ProcessTerminal::with_writer(writer.clone());
+
+        terminal.set_title("safe\nname\u{7}");
+
+        assert_eq!(writer.writes(), ["\x1b]0;safe name \x07"]);
+        assert_eq!(replace_control_characters("a\u{1b}[31mred"), "a [31mred");
     }
 
     #[test]

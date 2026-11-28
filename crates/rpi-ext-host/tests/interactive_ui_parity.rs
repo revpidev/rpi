@@ -497,14 +497,19 @@ fn interactive_ui_parity_frames_and_done_values() {
             lines: vec!["x".to_owned()],
             cursor: Some(native::ComponentCursor { row: 3, col: 7 }),
             done: native::DoneValue::Absent,
+            captures_viewport_input: Some(false),
         },
         wasm::ComponentFrame {
             lines: vec!["x".to_owned()],
             cursor: Some(wasm::ComponentCursor { row: 3, col: 7 }),
             done: wasm::DoneValue::Absent,
+            captures_viewport_input: Some(false),
         }
     );
-    assert_eq!(cursor, r#"{"lines":["x"],"cursor":{"row":3,"col":7}}"#);
+    assert_eq!(
+        cursor,
+        r#"{"lines":["x"],"cursor":{"row":3,"col":7},"capturesViewportInput":false}"#
+    );
     assert_cross_parse!(
         cursor.as_str(),
         native::ComponentFrame,
@@ -963,14 +968,14 @@ fn interactive_ui_parity_run_component_trace() {
         native_calls[2],
         (
             "ui.renderComponent".to_owned(),
-            json!({"handle": 7, "lines": ["w=80 ticks=0"]})
+            json!({"handle": 7, "lines": ["w=80 ticks=0"], "capturesViewportInput": false})
         )
     );
     assert_eq!(
         native_calls[4],
         (
             "ui.renderComponent".to_owned(),
-            json!({"handle": 7, "lines": ["w=80 ticks=1"], "done": {"ticks": 1}})
+            json!({"handle": 7, "lines": ["w=80 ticks=1"], "done": {"ticks": 1}, "capturesViewportInput": false})
         )
     );
 
@@ -1090,6 +1095,7 @@ fn interactive_ui_parity_component_cursor_callback() {
                 "lines": ["cursor-frame"],
                 "cursor": {"row": 1, "col": 2},
                 "done": {"cursor": true},
+                "capturesViewportInput": false,
             })
         )
     );

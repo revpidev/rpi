@@ -1,5 +1,5 @@
 //! MCP tool adaptation (port of
-//! `packages/coding-agent/src/extensions/mcp/tools.ts` @ 4a080252f).
+//! `packages/coding-agent/src/extensions/mcp/tools.ts` @ b4afdddf).
 //!
 //! Results map onto the model-facing content (text and images). Text over
 //! 20 KB keeps its start and end with the middle cut out, and the full text
@@ -23,11 +23,8 @@ use serde_json::{Map, Value, json};
 
 use super::config::McpExposure;
 
-/// `MAX_TOOL_NAME_LENGTH` (tools.ts:49): provider tool names are limited to
-/// 64 characters of `[A-Za-z0-9_-]`.
-const MAX_TOOL_NAME_LENGTH: usize = 64;
 /// `MCP_OUTPUT_MAX_BYTES` (tools.ts:46).
-pub const MCP_OUTPUT_MAX_BYTES: usize = 20 * 1024;
+pub const MCP_OUTPUT_MAX_BYTES: usize = rpi_mcp::MCP_OUTPUT_MAX_BYTES;
 /// `OUTPUT_PREVIEW_LINES` (tools.ts:51).
 const OUTPUT_PREVIEW_LINES: usize = 5;
 /// Tool that reads the resources named by resource links (tools.ts:53).
@@ -79,25 +76,7 @@ pub fn save_to_temp_file(data: &McpOutputData, extension: &str) -> Result<String
 /// `createMcpToolName` (tools.ts:86): `mcp__<server>__<tool>`, everything
 /// but `[A-Za-z0-9_]` replaced by `_`, hash-suffixed when too long or taken.
 pub fn create_mcp_tool_name(server: &str, tool: &str, is_taken: impl Fn(&str) -> bool) -> String {
-    let name: String = format!("mcp__{server}__{tool}")
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if name.len() <= MAX_TOOL_NAME_LENGTH && !is_taken(&name) {
-        return name;
-    }
-    use sha2::Digest;
-    let digest = sha2::Sha256::digest(format!("{server}\0{tool}").as_bytes());
-    let hash = format!("{digest:x}");
-    let hash = &hash[..8];
-    let keep = (MAX_TOOL_NAME_LENGTH - hash.len() - 1).min(name.len());
-    format!("{}_{hash}", &name[..keep])
+    rpi_mcp::create_mcp_tool_name(server, tool, is_taken)
 }
 
 fn text_of(content: &[ToolResultContent]) -> String {
@@ -141,7 +120,7 @@ const SCHEMA_MAP_KEYWORDS: [&str; 6] = [
     "definitions",
 ];
 
-/// `relocateSchema` (tools.ts:135-156): rewrite local references so they
+/// `relocateSchema` (tools.ts:111-130): rewrite local references so they
 /// resolve below `pointer` of the enclosing schema.
 fn relocate_schema(schema: &Value, pointer: &str) -> Value {
     match schema {
@@ -187,7 +166,7 @@ fn relocate_schema(schema: &Value, pointer: &str) -> Value {
     }
 }
 
-/// `createMcpResultSchema` (tools.ts:159-174): the `CallToolResult` scripts
+/// `createMcpResultSchema` (tools.ts:135-152): the `CallToolResult` scripts
 /// receive (without `_meta`, which `convert_mcp_result` drops), with the
 /// tool's own output schema as `structuredContent`.
 pub fn create_mcp_result_schema(structured_content_schema: Option<&Value>) -> Value {
@@ -222,33 +201,36 @@ pub fn limit_mcp_content(
     content: Vec<ToolResultContent>,
     save_output: &McpOutputSaver,
 ) -> (Vec<ToolResultContent>, Option<String>) {
-    let combined = text_of(&content);
-    let truncation = crate::tools::truncate::truncate_middle(&combined, MCP_OUTPUT_MAX_BYTES);
-    if !truncation.truncated {
-        return (content, None);
-    }
-    let (full_output_path, where_line) = match save_output(&McpOutputData::Text(combined), ".txt") {
-        Ok(path) => {
-            let where_line = format!("[Full output: {path} (read it with offset/limit)]");
-            (Some(path), where_line)
-        }
-        Err(error) => (None, format!("[Could not save the full output: {error}]")),
-    };
-    let tokens = truncation.total_bytes.div_ceil(4);
-    let text = format!(
-        "Warning: truncated output (original token count: {tokens})\nTotal output lines: {}\n\n{}\n\n{}",
-        truncation.total_lines, truncation.content, where_line
-    );
-    let mut limited = vec![ToolResultContent::Text(TextContent {
-        text,
-        text_signature: None,
-    })];
-    limited.extend(
-        content
-            .into_iter()
-            .filter(|block| matches!(block, ToolResultContent::Image(_))),
-    );
-    (limited, full_output_path)
+    let content = content
+        .into_iter()
+        .map(|block| match block {
+            ToolResultContent::Text(text) => LlmContent::text(text.text),
+            ToolResultContent::Image(image) => LlmContent::image(image.data, image.mime_type),
+        })
+        .collect();
+    let save_output = save_output.clone();
+    let shared_saver: rpi_mcp::McpOutputSaver = Arc::new(move |data, extension| {
+        let data = match data {
+            rpi_mcp::McpOutputData::Text(text) => McpOutputData::Text(text),
+            rpi_mcp::McpOutputData::Binary(bytes) => McpOutputData::Binary(bytes),
+        };
+        save_output(&data, extension)
+    });
+    let limited = rpi_mcp::limit_mcp_content(content, Some(&shared_saver));
+    let content = limited
+        .content
+        .into_iter()
+        .map(|block| match block {
+            LlmContent::Text { text } => ToolResultContent::Text(TextContent {
+                text,
+                text_signature: None,
+            }),
+            LlmContent::Image { data, mime_type } => {
+                ToolResultContent::Image(ImageContent { data, mime_type })
+            }
+        })
+        .collect();
+    (content, limited.full_output_path)
 }
 
 /// `extensionOf` (tools.ts:158): the URI's dotted extension, else `.bin`.
@@ -472,12 +454,9 @@ pub fn convert_mcp_result(
 /// `toParameters` (tools.ts:263): MCP servers may omit `type`, and some
 /// providers reject object schemas without `properties`.
 fn to_parameters(schema: &Value) -> Value {
-    let mut schema = schema.as_object().cloned().unwrap_or_default();
-    schema
-        .entry("type")
-        .or_insert_with(|| Value::String("object".to_owned()));
-    schema.entry("properties").or_insert_with(|| json!({}));
-    Value::Object(schema)
+    Value::Object(rpi_mcp::normalize_mcp_input_schema(
+        &schema.as_object().cloned().unwrap_or_default(),
+    ))
 }
 
 /// `toToolAnnotations` (tools.ts:272).
@@ -569,7 +548,7 @@ fn text_component(text: String) -> ComponentTree {
     json!({"type": "text", "props": {"text": text}})
 }
 
-/// `createMcpToolRenderers` (tools.ts:298 @ 4a080252f, #10285): the
+/// `createMcpToolRenderers` (tools.ts:298 @ b4afdddf, #10285): the
 /// render slice of one MCP tool. Used both as the registered tool's own
 /// renderers and by the extension's `registerToolRenderer` resolver, so a
 /// resumed session renders calls to `mcp__<server>__<tool>` before the
@@ -787,7 +766,7 @@ mod tests {
         assert!(taken.starts_with("mcp__s__read_"));
         assert_eq!(taken.len(), "mcp__s__read".len() + 1 + 8);
         let long = create_mcp_tool_name("s", &"x".repeat(100), |_| false);
-        assert_eq!(long.len(), MAX_TOOL_NAME_LENGTH);
+        assert_eq!(long.len(), rpi_mcp::MAX_TOOL_NAME_LENGTH);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Built-in compaction task (port of
-//! `packages/durable/src/harness/compaction.ts` @ `4a080252f`).
+//! `packages/durable/src/harness/compaction.ts` @ `b4afdddf`).
 //!
 //! A compaction selects an old prefix of the model context, summarizes it with a
 //! separate model request, and appends a `pi.compaction` entry whose `head` is
@@ -138,6 +138,17 @@ impl TaskDefinition for CompactionTask {
         runtime: &dyn TaskRuntime,
         context: &Context,
     ) -> SessionResult<()> {
+        if runtime.signal().is_cancelled() {
+            return Err(SessionError::Aborted);
+        }
+        if runtime
+            .settings()
+            .restart_limit
+            .limit()
+            .is_some_and(|limit| task.record.restarts.unwrap_or(0) as u64 >= limit)
+        {
+            return end_cut_off(&task, runtime, context).await;
+        }
         let checkpoint: CompactionCheckpoint = parse_checkpoint(task.checkpoint())?;
         match phase {
             "select" => select_phase(&task, runtime, context).await,
@@ -181,6 +192,49 @@ impl TaskDefinition for CompactionTask {
         });
         runtime.commit(change, context).await
     }
+}
+
+async fn end_cut_off(
+    task: &RunningTask,
+    runtime: &dyn TaskRuntime,
+    context: &Context,
+) -> SessionResult<()> {
+    let count = task.record.restarts.unwrap_or(0);
+    let text = format!(
+        "The compaction was interrupted {count} times in its {} phase",
+        task.phase().unwrap_or("unknown")
+    );
+    runtime.report_info(
+        crate::harness::types::ReportInfo::new(crate::harness::types::ReportKind::TaskInterrupted)
+            .with_task(crate::harness::types::ReportTask::new(
+                task.id(),
+                COMPACTION_TASK_NAME,
+                task.record.conversation_id,
+            ))
+            .with_reason("restart_limit")
+            .with_restarts(count),
+    );
+    let conversation_id = runtime.conversation_id();
+    let task_id = runtime.task_id();
+    let change: TaskCommitFn = Arc::new(move |tx, _current| {
+        let text = text.clone();
+        Box::pin(async move {
+            let live = tx
+                .doc(&LIVE_DOC, DocOwner::Conversation(conversation_id), None)
+                .await?;
+            crate::harness::live::fail_compaction_status(&live, task_id, text.clone())?;
+            Ok(Some(NextTaskState::Terminal {
+                outcome: TaskOutcome::Failed {
+                    error: TaskOutcomeError {
+                        message: text,
+                        detail: Some(serde_json::json!({ "reason": "restart_limit" })),
+                    },
+                    result: None,
+                },
+            }))
+        })
+    });
+    runtime.commit(change, context).await
 }
 
 fn parse_checkpoint(checkpoint: Option<&JsonValue>) -> SessionResult<CompactionCheckpoint> {

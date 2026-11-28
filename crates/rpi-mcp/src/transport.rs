@@ -1,7 +1,9 @@
 //! The transport interface and shared listener bookkeeping (port of
-//! `packages/mcp/src/transports/transport.ts` @ 4a080252f).
+//! `packages/mcp/src/transports/transport.ts` @ b4afdddf).
 
 pub mod in_memory;
+mod lines;
+pub mod pipe;
 pub mod stdio;
 pub mod streamable_http;
 
@@ -251,7 +253,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
-/// `McpTransportSendOptions` (transport.ts:9-22 @ 4a080252f): aborted once
+/// `McpTransportSendOptions` (transport.ts:9-22 @ b4afdddf): aborted once
 /// the sender no longer waits for a reply, so a transport must not dispatch
 /// the message after that (for example when retrying after an authorization
 /// refresh).

@@ -193,6 +193,7 @@ fn usage_sample() -> Usage {
             cache_read: 0.3,
             cache_write: 0.4,
             total: 1.0,
+            total_from_provider: None,
         },
     }
 }
@@ -2972,6 +2973,9 @@ fn append_write_failure_in_readonly_directory_is_error_not_panic() {
 
     // The deferred create (#10000) happens with the first conversation
     // entry, so the read-only directory makes that append fail.
+    let before_entries = session.get_entries().len();
+    let before_leaf = session.get_leaf_id().map(str::to_owned);
+    let file = session.get_session_file().expect("file").to_path_buf();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
     let result = session.append_message(user_msg("hello"));
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
@@ -2980,6 +2984,27 @@ fn append_write_failure_in_readonly_directory_is_error_not_panic() {
         matches!(result, Err(RpiError::Io(_))),
         "io error, got: {result:?}"
     );
+    // `_appendEntry` rolls back the record, index and leaf so the next append
+    // cannot point at an entry that was never written.
+    assert_eq!(session.get_entries().len(), before_entries);
+    assert_eq!(session.get_leaf_id().map(str::to_owned), before_leaf);
+    assert!(!file.exists(), "a failed wx must not leave a partial file");
+
+    let id = session
+        .append_message(user_msg("after"))
+        .expect("append after restoring permissions");
+    let entry = session
+        .get_entries()
+        .into_iter()
+        .find(|entry| entry.id() == id)
+        .expect("appended entry");
+    assert_eq!(entry.parent_id().map(str::to_owned), before_leaf);
+    let written = std::fs::read_to_string(&file).expect("written file");
+    assert!(
+        !written.contains("hello"),
+        "failed entry must not be written"
+    );
+    assert!(written.contains("after"), "retry is written: {written}");
 }
 
 /// Unknown entry types: preserved on load → lossless write-back; unknown extension
@@ -3668,6 +3693,11 @@ fn migrate_float_version_2_0_is_not_treated_as_v1() {
 // Symlink session directory discovery (da66636cc, #7552)
 // ---------------------------------------------------------------------------
 
+/// Unix-only: creating a file-system symlink needs a privilege on Windows,
+/// and the `std::os::unix` call kept the whole lib test target from
+/// compiling there (the Windows settings-lock regressions live in the same
+/// target).
+#[cfg(unix)]
 #[test]
 fn list_all_discovers_sessions_through_symlinked_directories() {
     // da66636cc (#7552): session directories that are symlinks to external
@@ -4025,4 +4055,186 @@ fn path_to_root_or_compaction_parent_id_cycle_stops_at_revisit() {
         vec!["m1", "m2"],
         "cycle walked once, root-to-leaf order"
     );
+}
+
+#[test]
+fn append_fault_rolls_back_leaf_index_and_branch_summary_position() {
+    let tmp = TempDir::new();
+    let mut session =
+        SessionManager::create(tmp.path(), Some(tmp.path()), NewSessionOptions::default())
+            .expect("create");
+    let first = session.append_message(user_msg("first")).expect("first");
+    let file = session.get_session_file().expect("file").to_path_buf();
+    let original = std::fs::read(&file).expect("original bytes");
+
+    std::fs::remove_file(&file).expect("remove file");
+    std::fs::create_dir(&file).expect("fault directory");
+    session
+        .append_message(user_msg("not persisted"))
+        .expect_err("append must fail");
+    assert_eq!(session.get_leaf_id(), Some(first.as_str()));
+    assert_eq!(session.entry_count(), 1);
+    assert!(session.get_branch(None).iter().all(|entry| {
+        !matches!(entry.known(), Some(SessionEntry::Message(message))
+            if message.message == user_msg("not persisted"))
+    }));
+
+    session
+        .branch_with_summary(Some(&first), "also not persisted", None, None, None)
+        .expect_err("summary append must fail");
+    assert_eq!(session.get_leaf_id(), Some(first.as_str()));
+    assert_eq!(session.entry_count(), 1);
+
+    std::fs::remove_dir(&file).expect("remove fault directory");
+    std::fs::write(&file, original).expect("restore original bytes");
+    let second = session.append_message(user_msg("second")).expect("second");
+    assert_eq!(
+        session
+            .get_entry(&second)
+            .expect("second entry")
+            .parent_id(),
+        Some(first.as_str())
+    );
+
+    let reopened = SessionManager::open(&file, Some(tmp.path()), None).expect("reopen");
+    assert_eq!(reopened.entry_count(), 2);
+    assert_eq!(reopened.get_leaf_id(), Some(second.as_str()));
+    assert_eq!(reopened.get_tree().len(), 1);
+}
+
+// ===========================================================================
+// V19-07 (R5.2.8): O(1) message counts for the counts-only sessionStats probe
+// ===========================================================================
+
+/// The incremental counters must agree with the clone-and-count derivation
+/// (`get_entries()` + `AgentMessage::{User, Assistant}`) across every record
+/// mutation path: appends of every message kind, setup entries, a rejected
+/// append, `new_session`, a file load and a branch.
+#[test]
+fn message_counts_and_entry_total_match_get_entries_on_every_mutation_path() {
+    fn derived(manager: &SessionManager) -> (u64, u64, u64) {
+        let entries = manager.get_entries();
+        let mut user = 0u64;
+        let mut assistant = 0u64;
+        for entry in &entries {
+            if let Some(SessionEntry::Message(message_entry)) = entry.known() {
+                match &message_entry.message {
+                    AgentMessage::User(_) => user += 1,
+                    AgentMessage::Assistant(_) => assistant += 1,
+                    _ => {}
+                }
+            }
+        }
+        (entries.len() as u64, user, assistant)
+    }
+
+    fn check(manager: &SessionManager) {
+        let (entries, user, assistant) = derived(manager);
+        let counts = manager.message_counts();
+        assert_eq!((counts.user, counts.assistant), (user, assistant));
+        assert_eq!(
+            manager.entry_total(),
+            entries,
+            "entry_total == get_entries().len()"
+        );
+    }
+
+    let mut manager = in_memory();
+    check(&manager);
+    assert_eq!(manager.message_counts(), MessageRoleCounts::default());
+    assert_eq!(manager.entry_total(), 0);
+
+    manager.append_message(user_msg("hi")).expect("append user");
+    manager
+        .append_thinking_level_change("high")
+        .expect("append thinking level");
+    manager
+        .append_model_change("anthropic", "claude-test")
+        .expect("append model");
+    check(&manager);
+    manager
+        .append_message(assistant_msg("hello"))
+        .expect("append assistant");
+    manager
+        .append_message(tool_result_msg("output"))
+        .expect("append tool result");
+    manager
+        .append_custom_entry("note", Some(json!({"k": 1})))
+        .expect("append custom");
+    check(&manager);
+    assert_eq!(
+        manager.message_counts(),
+        MessageRoleCounts {
+            user: 1,
+            assistant: 1
+        }
+    );
+    assert_eq!(manager.entry_total(), 6);
+
+    // Branching rebuilds the index over the selected path.
+    let assistant_id = manager
+        .get_entries()
+        .iter()
+        .find_map(|entry| match entry.known() {
+            Some(SessionEntry::Message(message_entry)) => {
+                matches!(message_entry.message, AgentMessage::Assistant(_))
+                    .then(|| entry.id().to_owned())
+            }
+            _ => None,
+        })
+        .expect("assistant entry");
+    manager
+        .create_branched_session(&assistant_id)
+        .expect("branch");
+    check(&manager);
+    assert_eq!(
+        manager.message_counts(),
+        MessageRoleCounts {
+            user: 1,
+            assistant: 1
+        }
+    );
+
+    // A fresh session resets both counters.
+    manager
+        .new_session(NewSessionOptions::default())
+        .expect("new session");
+    check(&manager);
+    assert_eq!(manager.entry_total(), 0);
+
+    // A file load counts every non-header record (an unknown future entry
+    // type still counts as an entry, never as a message).
+    let tmp = TempDir::new();
+    let file = tmp.path().join("counts.jsonl");
+    let content = format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        header_line("s-counts", "/tmp"),
+        user_line("u1", "", "one"),
+        user_line("u2", "u1", "two"),
+        serde_json::to_string(&FileEntry::Message(MessageEntry {
+            id: "a1".into(),
+            parent_id: Some("u2".into()),
+            timestamp: TS.into(),
+            message: assistant_msg("three"),
+        }))
+        .expect("assistant line"),
+        json!({"type": "future-entry", "id": "x1", "parentId": "a1", "timestamp": TS}),
+    );
+    std::fs::write(&file, content).expect("write");
+    let loaded = SessionManager::open(&file, Some(tmp.path()), None).expect("open");
+    check(&loaded);
+    assert_eq!(
+        loaded.message_counts(),
+        MessageRoleCounts {
+            user: 2,
+            assistant: 1
+        }
+    );
+    assert_eq!(loaded.entry_total(), 4);
+    // Appending to the loaded file keeps the counters in step.
+    let mut loaded = loaded;
+    loaded.append_message(user_msg("four")).expect("append");
+    check(&loaded);
+    assert_eq!(loaded.message_counts().user, 3);
+    assert_eq!(loaded.entry_total(), 5);
 }

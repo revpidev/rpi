@@ -678,6 +678,9 @@ pub struct ComponentFrame {
     /// Present = finish the component; value recorded verbatim (R-U1.4).
     #[serde(default, skip_serializing_if = "DoneValue::is_absent")]
     pub done: DoneValue,
+    /// Dynamic fullscreen viewport routing; absent on legacy frames = false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captures_viewport_input: Option<bool>,
 }
 
 impl ComponentFrame {
@@ -1247,6 +1250,11 @@ pub fn probe_interactive_ui_method<H: HostCall + ?Sized>(
 /// The native carrier (`rpi_ext_host::interactive_ui::Component`) freezes
 /// the identical method set (G11 item 7).
 pub trait Component {
+    /// Whether fullscreen viewport navigation belongs to this component.
+    fn captures_viewport_input(&self) -> bool {
+        false
+    }
+
     /// Render the current state to lines (ANSI SGR allowed).
     fn render(&mut self, width: usize) -> Vec<String>;
     /// Raw key bytes for the focused component (R-U2.1).
@@ -1323,6 +1331,7 @@ pub fn run_component<C: Component, H: HostCall + ?Sized>(
                 let frame = ComponentFrame {
                     lines: component.render(width),
                     cursor: component.cursor(),
+                    captures_viewport_input: Some(component.captures_viewport_input()),
                     done: component
                         .done()
                         .map_or(DoneValue::Absent, DoneValue::Present),
@@ -1335,6 +1344,7 @@ pub fn run_component<C: Component, H: HostCall + ?Sized>(
         let frame = ComponentFrame {
             lines: component.render(width),
             cursor: component.cursor(),
+            captures_viewport_input: Some(component.captures_viewport_input()),
             done: component
                 .done()
                 .map_or(DoneValue::Absent, DoneValue::Present),
@@ -1546,6 +1556,7 @@ mod tests {
         let frame = ComponentFrame {
             lines: vec!["hello".to_owned()],
             cursor: Some(ComponentCursor { row: 3, col: 7 }),
+            captures_viewport_input: None,
             done: DoneValue::Absent,
         };
         let json = frame.to_json().unwrap();
@@ -1719,6 +1730,7 @@ mod tests {
         events: Vec<&'static str>,
         done_after: usize,
         ticks: usize,
+        capture: bool,
     }
 
     impl ScriptedComponent {
@@ -1729,11 +1741,16 @@ mod tests {
                 events: Vec::new(),
                 done_after,
                 ticks: 0,
+                capture: false,
             }
         }
     }
 
     impl Component for ScriptedComponent {
+        fn captures_viewport_input(&self) -> bool {
+            self.capture
+        }
+
         fn render(&mut self, width: usize) -> Vec<String> {
             let line = format!("w={width} events={}", self.events.len());
             self.frames.push(vec![line.clone()]);
@@ -1742,6 +1759,7 @@ mod tests {
 
         fn handle_input(&mut self, _data: &str) {
             self.events.push("input");
+            self.capture = !self.capture;
         }
 
         fn on_resize(&mut self, width: usize, _height: usize) {
@@ -1788,7 +1806,7 @@ mod tests {
         );
         assert_eq!(
             calls[2].1,
-            serde_json::json!({"handle": 7, "lines": ["w=80 events=1"]})
+            serde_json::json!({"handle": 7, "lines": ["w=80 events=1"], "capturesViewportInput": false})
         );
         assert_eq!(calls[3].0, METHOD_POLL_COMPONENT);
         assert_eq!(
@@ -1797,6 +1815,7 @@ mod tests {
                 "handle": 7,
                 "lines": ["w=80 events=2"],
                 "done": {"ticks": 1},
+                "capturesViewportInput": false,
             })
         );
         assert_eq!(calls.len(), 5);
@@ -1813,6 +1832,33 @@ mod tests {
             run_component(&host, ScriptedComponent::new(99), MountOptions::default()).unwrap();
         assert_eq!(result, Value::Null);
         assert_eq!(host.calls()[2].0, METHOD_RENDER_COMPONENT);
+    }
+
+    #[test]
+    fn component_frames_follow_dynamic_viewport_capture() {
+        let host = FakeHost::new(vec![
+            Ok(serde_json::json!({"handle": 9})),
+            Ok(serde_json::json!({"event": {"type": "input", "data": "x"}})),
+            Ok(serde_json::json!({"ok": true})),
+            Ok(serde_json::json!({"event": {"type": "input", "data": "x"}})),
+            Ok(serde_json::json!({"ok": true})),
+            Ok(serde_json::json!({"event": {"type": "tick"}})),
+            Ok(serde_json::json!({"ok": true})),
+        ]);
+        run_component(&host, ScriptedComponent::new(1), MountOptions::default()).unwrap();
+        let calls = host.calls();
+        let captures = calls
+            .iter()
+            .filter(|(method, _)| method == METHOD_RENDER_COMPONENT)
+            .map(|(_, args)| args["capturesViewportInput"].as_bool())
+            .collect::<Vec<_>>();
+        assert_eq!(captures, [Some(true), Some(false), Some(false)]);
+        assert_eq!(
+            ComponentFrame::from_json(r#"{"lines":[]}"#)
+                .unwrap()
+                .captures_viewport_input,
+            None
+        );
     }
 
     #[test]

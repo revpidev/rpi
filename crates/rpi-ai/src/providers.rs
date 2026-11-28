@@ -1,12 +1,12 @@
-//! Port of `packages/ai/src/providers/all.ts` @ pi 0.84.1 (`4181f66`) — T13 W4
-//! phase 1: the built-in provider registry (41 factory ids, upstream
+//! Port of `packages/ai/src/providers/all.ts` @ pi v1.5.2 (`b4afdddf`) — T13 W4
+//! phase 1: the built-in provider registry (43 factory ids, upstream
 //! registration order) and the catalog data path.
 //!
 //! Factory implementations (`xxxProvider()` per upstream `providers/xxx.ts`)
 //! landed in the follow-up W4 waves as `src/providers/<id>.rs` files.
 //!
 //! Intentional differences:
-//! - Upstream `builtinProviders()` constructs all 41 providers; the Rust
+//! - Upstream `builtinProviders()` constructs all 43 providers; the Rust
 //!   `builtin_providers()` does the same now that every W4 wave has landed
 //!   (while waves were in flight it yielded only the ported subset).
 //! - The `openrouter-images` image-generation provider is part of the images
@@ -49,6 +49,7 @@ pub mod openrouter_api;
 pub mod qwen_token_plan;
 pub mod qwen_token_plan_cn;
 pub mod qwen_token_plan_individual;
+pub mod qwen_token_plan_individual_cn;
 pub mod radius;
 pub mod radius_config;
 pub mod together;
@@ -78,7 +79,7 @@ pub struct BuiltinProviderSpec {
     pub factory: Option<ProviderFactory>,
 }
 
-/// All 41 built-in providers in upstream `builtinProviders()` registration
+/// All 43 built-in providers in upstream `builtinProviders()` registration
 /// order. Registration order is observable (insertion-ordered `Models`:
 /// initial-model fallback, available-model listings) — do not reorder.
 pub static BUILTIN_PROVIDERS: &[BuiltinProviderSpec] = &[
@@ -238,6 +239,11 @@ pub static BUILTIN_PROVIDERS: &[BuiltinProviderSpec] = &[
         factory: Some(qwen_token_plan_individual::qwen_token_plan_individual_provider),
     },
     BuiltinProviderSpec {
+        id: "qwen-token-plan-individual-cn",
+        in_catalog: true,
+        factory: Some(qwen_token_plan_individual_cn::qwen_token_plan_individual_cn_provider),
+    },
+    BuiltinProviderSpec {
         id: "radius",
         // Static public catalog since 4d38031fb (27 models @ 19451accd);
         // the gateway overlay lives inside the provider itself.
@@ -251,7 +257,7 @@ pub static BUILTIN_PROVIDERS: &[BuiltinProviderSpec] = &[
     },
     BuiltinProviderSpec {
         // Classifier-only provider (schema v6): `typesafeProvider()` @
-        // 4a080252f; upstream order = between together and vercel-ai-gateway.
+        // b4afdddf; upstream order = between together and vercel-ai-gateway.
         id: "typesafe",
         in_catalog: true,
         factory: Some(typesafe::typesafe_provider),
@@ -332,8 +338,8 @@ mod tests {
     use super::*;
     use crate::generated::{builtin_catalog, get_builtin_models};
 
-    /// Upstream `builtinProviders()` order, transcribed from `all.ts` @ 4181f66.
-    const UPSTREAM_ORDER: [&str; 42] = [
+    /// Upstream `builtinProviders()` order, transcribed from `all.ts` @ b4afdddf.
+    const UPSTREAM_ORDER: [&str; 43] = [
         "amazon-bedrock",
         "ant-ling",
         "anthropic",
@@ -365,6 +371,7 @@ mod tests {
         "qwen-token-plan",
         "qwen-token-plan-cn",
         "qwen-token-plan-individual",
+        "qwen-token-plan-individual-cn",
         "radius",
         "together",
         "typesafe",
@@ -422,7 +429,7 @@ mod tests {
         // Group C wave: 10 factories; group D wave: 12 more; group A wave:
         // 8 more; group B wave (this): 8 more. Other waves add their own ids
         // here as they land.
-        const PORTED: [&str; 42] = [
+        const PORTED: [&str; 43] = [
             "amazon-bedrock",
             "ant-ling",
             "anthropic",
@@ -454,6 +461,7 @@ mod tests {
             "qwen-token-plan",
             "qwen-token-plan-cn",
             "qwen-token-plan-individual",
+            "qwen-token-plan-individual-cn",
             "radius",
             "together",
             "typesafe",

@@ -1,5 +1,5 @@
 //! In-memory transport pair for tests (port of
-//! `packages/mcp/src/transports/in-memory.ts` @ 4a080252f).
+//! `packages/mcp/src/transports/in-memory.ts` @ b4afdddf).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

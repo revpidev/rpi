@@ -1,5 +1,5 @@
 //! Port of `packages/ai/src/providers/azure.ts` @ pi 0.82.1 (2efa728; provider
-//! rename + Foundry Chat Completions follow `a37306d43` / #9714 @ 4a080252f).
+//! rename + Foundry Chat Completions follow `a37306d43` / #9714 @ b4afdddf).
 //!
 //! No `baseUrl` upstream — the azure adapters derive it from the
 //! `AZURE_OPENAI_RESOURCE_NAME`/base-URL env at request time. The provider
@@ -27,7 +27,6 @@ use crate::api::azure_openai_responses::{
 use crate::api::lazy::lazy_stream;
 use crate::api::openai_completions::OpenAiCompletions;
 use crate::auth::{ModelsError, ModelsErrorCode, ProviderAuth, env_api_key_auth};
-use crate::generated::get_builtin_models;
 use crate::models::{
     CreateProviderOptions, Provider, ProviderApi, ProviderStreams, create_provider,
 };
@@ -60,7 +59,7 @@ pub fn azure_provider() -> Arc<dyn Provider> {
             ))),
             oauth: None,
         },
-        models: get_builtin_models("azure").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared("azure")),
         api: ProviderApi::Map(api),
         ..Default::default()
     })

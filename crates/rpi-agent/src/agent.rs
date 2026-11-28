@@ -53,7 +53,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub type AgentListener =
     Arc<dyn Fn(AgentEvent, CancellationToken) -> BoxFuture<'static, ()> + Send + Sync>;
 
-/// `finishTurn` (agent.ts:125 @ 4a080252f, agent-side variant). Receives the
+/// `finishTurn` (agent.ts:125 @ b4afdddf, agent-side variant). Receives the
 /// active run's abort signal as the second argument (upstream
 /// `this.signal`).
 pub type FinishTurnAgentFn = Arc<
@@ -86,6 +86,11 @@ pub type PrepareNextTurnWithContextFn = Arc<
         + Send
         + Sync,
 >;
+
+/// Transforms a drained steering/follow-up batch before it enters the run,
+/// request context, event stream, and transcript.
+pub type PrepareQueuedMessagesFn =
+    Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // AgentState (types.ts:327-352)
@@ -245,7 +250,7 @@ impl PendingMessageQueue {
         !self.messages.is_empty()
     }
 
-    /// `peek()` (agent.ts:159-162 @ 4a080252f): the next batch a drain would
+    /// `peek()` (agent.ts:159-162 @ b4afdddf): the next batch a drain would
     /// deliver, without consuming it.
     fn peek(&self) -> Vec<AgentMessage> {
         if self.mode == QueueMode::All {
@@ -403,6 +408,7 @@ pub struct Agent {
     next_listener_id: AtomicU64,
     steering_queue: Arc<Mutex<PendingMessageQueue>>,
     follow_up_queue: Arc<Mutex<PendingMessageQueue>>,
+    prepare_queued_messages: Arc<RwLock<Option<PrepareQueuedMessagesFn>>>,
     active_run: Arc<Mutex<Option<ActiveRun>>>,
 
     pub convert_to_llm: ConvertToLlmFn,
@@ -421,7 +427,7 @@ pub struct Agent {
     /// `finishTurn` — interior-mutable because the session installs the
     /// boundary-dispatch chain after building the shared agent (upstream
     /// assigns `this.agent.finishTurn` post-construction,
-    /// agent-session.ts:858-868 @ 4a080252f).
+    /// agent-session.ts:858-868 @ b4afdddf).
     finish_turn: RwLock<Option<FinishTurnAgentFn>>,
     /// `prepareRequest` — interior-mutable because the session layer installs
     /// the canonical-context projection after building the shared agent
@@ -502,6 +508,7 @@ impl Agent {
                 options.follow_up_mode.unwrap_or(QueueMode::OneAtATime),
             ))),
             active_run: Arc::new(Mutex::new(None)),
+            prepare_queued_messages: Arc::new(RwLock::new(None)),
             convert_to_llm: options
                 .convert_to_llm
                 .unwrap_or_else(default_convert_to_llm),
@@ -573,7 +580,7 @@ impl Agent {
 
     /// Post-construction install/clear of the `finishTurn` hook
     /// (`this.agent.finishTurn = ...`, agent-session.ts:858-868 @
-    /// 4a080252f).
+    /// b4afdddf).
     pub fn set_finish_turn(&self, hook: Option<FinishTurnAgentFn>) {
         *self.finish_turn.write().unwrap_or_else(|e| e.into_inner()) = hook;
     }
@@ -589,7 +596,7 @@ impl Agent {
 
     /// Post-construction install/clear of the `prepareRequest` hook
     /// (`this.agent.prepareRequest = ...`, agent-session.ts:760-761 @
-    /// 4a080252f).
+    /// b4afdddf).
     pub fn set_prepare_request(&self, hook: Option<PrepareRequestAgentFn>) {
         *self
             .prepare_request
@@ -701,6 +708,14 @@ impl Agent {
         lock(&self.follow_up_queue).mode = mode;
     }
 
+    /// Install the delivery-time transform shared by both pending queues.
+    pub fn set_prepare_queued_messages(&self, hook: Option<PrepareQueuedMessagesFn>) {
+        *self
+            .prepare_queued_messages
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = hook;
+    }
+
     /// Queue a message to be injected after the current assistant turn
     /// finishes.
     pub fn steer(&self, message: AgentMessage) {
@@ -733,7 +748,7 @@ impl Agent {
         lock(&self.steering_queue).has_items() || lock(&self.follow_up_queue).has_items()
     }
 
-    /// `peekQueuedMessages` (agent.ts:330-334 @ 4a080252f): preview the next
+    /// `peekQueuedMessages` (agent.ts:330-334 @ b4afdddf): preview the next
     /// queued batch without consuming it. Steering first, then follow-up.
     pub fn peek_queued_messages(&self) -> Vec<AgentMessage> {
         let steering = lock(&self.steering_queue).peek();
@@ -952,22 +967,38 @@ impl Agent {
         let get_steering_messages: GetQueuedMessagesFn = {
             let skip = skip.clone();
             let queue = self.steering_queue.clone();
+            let prepare = self.prepare_queued_messages.clone();
             Arc::new(move || {
                 let skip = skip.clone();
                 let queue = queue.clone();
+                let prepare = prepare.clone();
                 Box::pin(async move {
                     if skip.swap(false, Ordering::SeqCst) {
                         return Vec::new();
                     }
-                    lock(&queue).drain()
+                    let messages = lock(&queue).drain();
+                    let prepare = prepare.read().unwrap_or_else(|e| e.into_inner()).clone();
+                    match prepare {
+                        Some(prepare) => prepare(messages).await,
+                        None => messages,
+                    }
                 })
             })
         };
         let get_follow_up_messages: GetQueuedMessagesFn = {
             let queue = self.follow_up_queue.clone();
+            let prepare = self.prepare_queued_messages.clone();
             Arc::new(move || {
                 let queue = queue.clone();
-                Box::pin(async move { lock(&queue).drain() })
+                let prepare = prepare.clone();
+                Box::pin(async move {
+                    let messages = lock(&queue).drain();
+                    let prepare = prepare.read().unwrap_or_else(|e| e.into_inner()).clone();
+                    match prepare {
+                        Some(prepare) => prepare(messages).await,
+                        None => messages,
+                    }
+                })
             })
         };
 

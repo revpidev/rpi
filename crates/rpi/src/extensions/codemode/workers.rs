@@ -1,6 +1,6 @@
 //! Process-wide codemode worker capacity (port of the admission queue in
 //! `packages/coding-agent/src/extensions/codemode/execute.ts:55-110`
-//! @ 4a080252f).
+//! @ b4afdddf).
 //!
 //! Every script, including those started by in-process subagents, shares one
 //! queue in this process. A worker holds its slot until its thread actually

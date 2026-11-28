@@ -99,6 +99,22 @@ fn parse_credential(value: &Value) -> Result<Credential, ModelsError> {
         .map_err(|error| auth_error("Failed to parse stored credential", &error.to_string()))
 }
 
+/// A held flock: `WouldBlock` on Unix. Windows `LockFileEx` reports a held
+/// lock as `ERROR_LOCK_VIOLATION` (33) instead; both mean contention.
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(33)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn auth_error(message: impl Into<String>, cause: &str) -> ModelsError {
     ModelsError::with_cause(ModelsErrorCode::Auth, message, cause)
 }
@@ -192,18 +208,29 @@ impl FileAuthStorageBackend {
     /// over the target — a crash mid-write can no longer truncate the store
     /// to a partial file. The temp file inherits the EXISTING file's
     /// permission bits when one exists (admin-configured modes/ACLs must
-    /// survive the rewrite, auth-storage.ts:24-25 @ c49906ec7, #7779); a
-    /// new file is created 0o600.
+    /// survive the rewrite, auth-storage.ts:36-37 @ c49906ec7, #7779); a
+    /// new file is created 0o600. A symlink is resolved before the atomic
+    /// rename so the link and its target keep one lock/read identity. A
+    /// dangling symlink returns `NotFound` instead of creating its target,
+    /// matching upstream `realpath` behavior.
     fn write_file(&self, content: &str) -> std::io::Result<()> {
         use std::io::Write;
 
-        let parent = self
-            .auth_path
+        let target_path = std::fs::canonicalize(&self.auth_path).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound
+                && !std::fs::symlink_metadata(&self.auth_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                Ok(self.auth_path.clone())
+            } else {
+                Err(error)
+            }
+        })?;
+        let parent = target_path
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let file_name = self
-            .auth_path
+        let file_name = target_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "auth.json".to_string());
@@ -226,14 +253,14 @@ impl FileAuthStorageBackend {
         #[cfg(unix)]
         {
             // Preserve an existing file's permission bits (see doc note).
-            if let Ok(existing) = std::fs::metadata(&self.auth_path) {
+            if let Ok(existing) = std::fs::metadata(&target_path) {
                 let _ = std::fs::set_permissions(&tmp_path, existing.permissions());
             }
         }
 
         // Rename is atomic within the same directory; the old contents
         // stay intact until the new ones are fully on disk.
-        std::fs::rename(&tmp_path, &self.auth_path)?;
+        std::fs::rename(&tmp_path, &target_path)?;
 
         // Best-effort directory fsync so the rename itself is durable
         // (directory fsync is unsupported via std on some platforms —
@@ -266,6 +293,22 @@ impl FileAuthStorageBackend {
             .open(&self.auth_path)
     }
 
+    /// Bytes of the locked store, read through the handle that owns the
+    /// flock. A `LockFileEx` range (Windows) is mandatory for every *other*
+    /// handle — including a second handle of the locking process — so a path
+    /// read under the lock failed with `ERROR_LOCK_VIOLATION` (33) there:
+    /// the initial snapshot came back empty and every write reported the
+    /// store as locked. The read-only `BOM` handling matches the previous
+    /// `read_to_string` path (none).
+    fn read_locked(file: &std::fs::File) -> std::io::Result<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut reader = file;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut text = String::new();
+        reader.read_to_string(&mut text)?;
+        Ok(text)
+    }
+
     /// Async lock with the proper-lockfile retry policy (see [`RetryConfig`]).
     /// Returns the locked file handle; the flock releases on drop.
     async fn acquire_lock_with_retry(&self) -> Result<std::fs::File, ModelsError> {
@@ -282,7 +325,7 @@ impl FileAuthStorageBackend {
             })?;
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(file),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if is_lock_contended(&error) => {
                     last_error = Some(error);
                     if attempt < self.retry.retries {
                         tokio::time::sleep(self.retry.delay(attempt)).await;
@@ -325,7 +368,7 @@ impl FileAuthStorageBackend {
             })?;
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(file),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if is_lock_contended(&error) => {
                     last_error = Some(error);
                     if attempt < MAX_ATTEMPTS {
                         std::thread::sleep(Duration::from_millis(20));
@@ -376,8 +419,10 @@ impl FileAuthStorageBackend {
             )
         })?;
 
-        let lock_file = self.acquire_lock_with_retry().await?;
-        let current = match std::fs::read_to_string(&self.auth_path) {
+        // Only Windows takes the handle out before the replace (below).
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut lock_file = Some(self.acquire_lock_with_retry().await?);
+        let current = match Self::read_locked(lock_file.as_ref().expect("lock held")) {
             Ok(content) => Some(content),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
@@ -392,6 +437,11 @@ impl FileAuthStorageBackend {
         };
         let LockResult { result, next } = f(current).await?;
         if let Some(next) = next {
+            // Windows replaces the file by rename; close the locked handle
+            // first (the settings coordinator releases its legacy lock the
+            // same way) — the read above already ran under it.
+            #[cfg(windows)]
+            drop(lock_file.take());
             self.write_file(&next).map_err(|error| {
                 auth_error(
                     format!(
@@ -414,7 +464,7 @@ impl FileAuthStorageBackend {
         self.ensure_parent_dir().ok()?;
         self.ensure_file_exists().ok()?;
         let lock_file = self.acquire_lock_sync_with_retry().ok()?;
-        let content = std::fs::read_to_string(&self.auth_path).ok();
+        let content = Self::read_locked(&lock_file).ok();
         drop(lock_file);
         content
     }
@@ -1156,6 +1206,166 @@ mod tests {
                 "anthropic": { "type": "api_key", "key": "stored" },
                 "openai": { "type": "api_key", "key": "new" }
             })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The store is read through the handle that owns the flock. The
+    /// pre-fix read (`read_to_string(path)`) was a second handle, which
+    /// Windows denies with `ERROR_LOCK_VIOLATION` (33) while the first one
+    /// holds the exclusive `LockFileEx` range — the startup snapshot came
+    /// back empty and every write failed with "Failed to read auth storage
+    /// file" there.
+    #[test]
+    fn locked_store_is_read_through_the_lock_handle() {
+        let dir = temp_dir();
+        let auth_path = dir.join("auth.json");
+        write_auth_json(
+            &auth_path,
+            json!({ "anthropic": { "type": "api_key", "key": "stored" } }),
+        );
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&auth_path)
+            .expect("open");
+        lock.try_lock_exclusive().expect("lock");
+        #[cfg(windows)]
+        {
+            let error = std::fs::read_to_string(&auth_path)
+                .expect_err("a second handle cannot read the locked range");
+            assert_eq!(error.raw_os_error(), Some(33), "{error}");
+        }
+        let content =
+            FileAuthStorageBackend::read_locked(&lock).expect("read through the lock handle");
+        let parsed: Value = serde_json::from_str(&content).expect("json");
+        assert_eq!(parsed["anthropic"]["key"], "stored");
+        lock.unlock().expect("unlock");
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_lock_violation_counts_as_contention() {
+        assert!(is_lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        #[cfg(windows)]
+        assert!(is_lock_contended(&std::io::Error::from_raw_os_error(33)));
+        #[cfg(not(windows))]
+        assert!(!is_lock_contended(&std::io::Error::from_raw_os_error(33)));
+        assert!(!is_lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_auth_paths_share_the_file_lock() {
+        let dir = temp_dir();
+        let real = dir.join("shared-auth.json");
+        let alias = dir.join("auth.json");
+        write_auth_json(&real, json!({}));
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+        let backend = FileAuthStorageBackend::with_retry_config(
+            &alias,
+            RetryConfig {
+                retries: 0,
+                factor: 1,
+                min_timeout: Duration::from_millis(1),
+                max_timeout: Duration::from_millis(1),
+                randomize: false,
+            },
+        );
+        let storage = FileCredentialStore::with_backend_for_tests(Backend::File(backend), None);
+        let blocker = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&real)
+            .expect("open real auth");
+        blocker.try_lock_exclusive().expect("lock real auth");
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_callback = called.clone();
+        let error = storage
+            .modify(
+                "openai",
+                modify_fn(move |_| {
+                    called_callback.store(true, Ordering::SeqCst);
+                    Ok(None)
+                }),
+                None,
+            )
+            .await
+            .expect_err("alias must wait for the real file lock");
+        assert!(
+            error
+                .message
+                .contains("Failed to acquire auth storage lock")
+        );
+        assert!(!called.load(Ordering::SeqCst));
+        blocker.unlock().expect("unlock");
+        drop(blocker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn modify_preserves_the_symlink_target_and_lock_identity() {
+        let dir = temp_dir();
+        let real = dir.join("shared-auth.json");
+        let alias = dir.join("auth.json");
+        write_auth_json(
+            &real,
+            json!({ "anthropic": { "type": "api_key", "key": "old" } }),
+        );
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+        let storage = FileCredentialStore::new(&alias);
+        storage
+            .modify(
+                "anthropic",
+                modify_fn(|_| Ok(Some(api_key_credential("new")))),
+                None,
+            )
+            .await
+            .expect("modify through symlink");
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .expect("alias")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(read_file_json(&real)["anthropic"]["key"], "new");
+        assert_eq!(read_file_json(&alias)["anthropic"]["key"], "new");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&alias).expect("alias metadata").ino(),
+            std::fs::metadata(&real).expect("real metadata").ino()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_symlinks_do_not_create_the_missing_target() {
+        let dir = temp_dir();
+        let real = dir.join("missing-auth.json");
+        let alias = dir.join("auth.json");
+        std::os::unix::fs::symlink(&real, &alias).expect("dangling symlink");
+        let storage = FileCredentialStore::new(&alias);
+        storage
+            .modify(
+                "anthropic",
+                modify_fn(|_| Ok(Some(api_key_credential("new")))),
+                None,
+            )
+            .await
+            .expect_err("dangling symlink must not be replaced");
+        assert!(!real.exists());
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .expect("alias")
+                .file_type()
+                .is_symlink()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

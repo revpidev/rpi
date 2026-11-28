@@ -1,4 +1,4 @@
-//! Prompt-cache miss detection (`core/cache-stats.ts` @ 4a080252f).
+//! Prompt-cache miss detection (`core/cache-stats.ts` @ b4afdddf).
 //!
 //! Port of upstream `packages/coding-agent/src/core/cache-stats.ts` (174
 //! lines): the `prev` request state machine, the detection noise floor and

@@ -1131,7 +1131,7 @@ async fn w3_exec_runs_command_and_reports_timeout() {
             &["5".to_owned()],
             Some(rpi_ext_host::api::ExecOptions {
                 timeout: Some(50),
-                cwd: None,
+                ..Default::default()
             }),
         )
         .await

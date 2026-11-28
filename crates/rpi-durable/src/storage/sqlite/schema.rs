@@ -1,5 +1,5 @@
 //! Durable SQLite identifiers (port of `src/storage/sqlite/schema.ts` @
-//! `4a080252f`).
+//! `b4afdddf`).
 //!
 //! Every table and index can be moved under a caller prefix so durable storage
 //! can share a database with host tables. The identifier history is immutable:

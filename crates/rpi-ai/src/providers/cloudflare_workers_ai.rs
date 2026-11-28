@@ -14,7 +14,8 @@ use crate::api::cloudflare_workers_ai_system_one::{
 use crate::api::openai_completions::OpenAiCompletions;
 use crate::auth::ProviderAuth;
 use crate::auth::cloudflare_auth::cloudflare_workers_ai_auth;
-use crate::generated::{get_builtin_all_models, get_builtin_models};
+#[cfg(test)]
+use crate::generated::{get_builtin_all_models, get_builtin_chat_models};
 use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 use crate::types::{
     ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierResult, ProviderClassifier,
@@ -81,8 +82,9 @@ pub fn cloudflare_workers_ai_provider() -> Arc<dyn Provider> {
             api_key: Some(cloudflare_workers_ai_auth()),
             oauth: None,
         },
-        models: get_builtin_models("cloudflare-workers-ai").to_vec(),
-        all_models: get_builtin_all_models("cloudflare-workers-ai").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared(
+            "cloudflare-workers-ai",
+        )),
         classifiers: std::collections::HashMap::from([(
             CLOUDFLARE_WORKERS_AI_SYSTEM_ONE_API.to_owned(),
             std::sync::Arc::new(CloudflareClassifier {
@@ -101,7 +103,7 @@ mod tests {
 
     #[test]
     fn catalog_base_urls_carry_the_account_placeholder() {
-        let models = get_builtin_models("cloudflare-workers-ai");
+        let models = get_builtin_chat_models("cloudflare-workers-ai");
         assert!(!models.is_empty());
         for model in models {
             assert_eq!(model.api.as_str(), ApiKind::OPENAI_COMPLETIONS);

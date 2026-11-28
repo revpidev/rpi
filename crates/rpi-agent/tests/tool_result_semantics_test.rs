@@ -295,6 +295,7 @@ async fn loop_writes_nested_calls_and_combined_usage_on_the_message() {
             cache_read: 0.0,
             cache_write: 0.0,
             total: cost,
+            total_from_provider: None,
         },
     };
     let tool = fixed_tool(

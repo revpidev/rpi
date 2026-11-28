@@ -1,5 +1,5 @@
 //! Durable submission admission, waits, and withdrawal (port of
-//! `packages/durable/src/harness/submissions.ts` @ `4a080252f`).
+//! `packages/durable/src/harness/submissions.ts` @ `b4afdddf`).
 //!
 //! A submission is the durable hand-off between a host and a conversation: an
 //! *input* may start a run, a *write* appends a passive entry. Admission is one
@@ -97,7 +97,7 @@ impl Submissions {
         context: &Context,
     ) -> SessionResult<Arc<dyn Submission>> {
         (self.resume)();
-        let is_input = matches!(draft, SubmissionDraft::Input(_));
+        let is_input = !matches!(draft, SubmissionDraft::Write(_));
         let parent = if is_input {
             self.telemetry.clone()
         } else {
@@ -199,7 +199,9 @@ impl Submissions {
                 )
             })
             .await?;
-        record.ok_or_else(|| SessionError::message(format!("Submission {id} does not exist")))
+        record
+            .map(|record| (*record).clone())
+            .ok_or_else(|| SessionError::message(format!("Submission {id} does not exist")))
     }
 
     /// Resolve when the submission reaches a terminal status.
@@ -231,6 +233,7 @@ impl Submissions {
                         )));
                     };
                     if is_settled(&record) {
+                        let record = (*record).clone();
                         return Ok(
                             Box::pin(async move { Ok(record) }) as WaitFuture<SubmissionRecord>
                         );
@@ -394,18 +397,23 @@ async fn admit(
     {
         check_input_entry(entry)?;
     }
-    let (request_id, is_write) = match draft {
-        SubmissionDraft::Input(input) => (input.request_id.as_deref(), false),
-        SubmissionDraft::Write(write) => (write.request_id.as_deref(), true),
+    let (request_id, record_type) = match draft {
+        SubmissionDraft::Input(input) => (input.request_id.as_deref(), "input"),
+        SubmissionDraft::Continue(continuation) => (continuation.request_id.as_deref(), "continue"),
+        SubmissionDraft::Write(write) => (write.request_id.as_deref(), "write"),
     };
+    let is_write = record_type == "write";
     if let Some(request_id) = request_id
         && let Some(existing) = tx
             .submission_by_request(conversation_id, request_id)
             .await?
     {
-        let existing_is_write = matches!(existing, SubmissionRecord::Write { .. });
-        if existing_is_write != is_write {
-            let existing_type = if existing_is_write { "write" } else { "input" };
+        let existing_type = match &existing {
+            SubmissionRecord::Input { .. } => "input",
+            SubmissionRecord::Continue { .. } => "continue",
+            SubmissionRecord::Write { .. } => "write",
+        };
+        if existing_type != record_type {
             return Err(SessionError::message(format!(
                 "Request {request_id} already identifies a submission of type {existing_type}"
             )));
@@ -470,6 +478,17 @@ async fn admit(
     {
         return Err(StorageError::ConversationBusy(conversation_id).into());
     }
+    if busy && matches!(draft, SubmissionDraft::Continue(_)) {
+        return Err(StorageError::ConversationBusy(conversation_id).into());
+    }
+    if !busy
+        && let SubmissionDraft::Input(InputSubmissionDraft {
+            when_idle: Some(crate::harness::types::WhenIdle::Reject),
+            ..
+        }) = draft
+    {
+        return Err(StorageError::ConversationIdle(conversation_id).into());
+    }
     // A boundary reads the table, so it is prepared before the first table write;
     // a busy one needs none.
     let mut boundary = if busy {
@@ -477,6 +496,38 @@ async fn admit(
     } else {
         Some(prepare_boundary(tx, conversation_id, queue_modes).await?)
     };
+    if matches!(draft, SubmissionDraft::Continue(_)) {
+        let boundary = boundary
+            .take()
+            .ok_or_else(|| SessionError::message("Continue boundary disappeared"))?;
+        let record = tx
+            .create_submission(crate::session::SubmissionCreate::Continue {
+                conversation_id,
+                request_id: request_id.map(str::to_string),
+            })
+            .await?;
+        let result =
+            apply_boundary(tx, boundary, crate::harness::inbox::BoundaryAt::Final, now).await?;
+        let failed_first =
+            crate::harness::types::read_state::<crate::harness::live::LiveState>(&live)?
+                .run_failure
+                .and_then(|failure| failure.first);
+        let mut inputs = result.users;
+        inputs.push(record.id());
+        scheduler
+            .start_run(
+                tx,
+                conversation_id,
+                &live,
+                inputs,
+                failed_first.or(result.first),
+            )
+            .await?;
+        return Ok(Admission {
+            id: record.id(),
+            status: "placed",
+        });
+    }
     let queued_items = match &boundary {
         Some(boundary) => {
             let state: InboxState = read_state(&boundary.inbox)?;
@@ -490,6 +541,10 @@ async fn admit(
                 conversation_id,
                 request_id: request_id.map(str::to_string),
             },
+            SubmissionDraft::Continue(_) => crate::session::SubmissionCreate::Continue {
+                conversation_id,
+                request_id: request_id.map(str::to_string),
+            },
             SubmissionDraft::Write(_) => crate::session::SubmissionCreate::Write {
                 conversation_id,
                 request_id: request_id.map(str::to_string),
@@ -499,6 +554,7 @@ async fn admit(
         let id = record.id();
         // Hosts may leave optional fields `undefined`; drafts take strict JSON.
         let item = match draft {
+            SubmissionDraft::Continue(_) => unreachable!("continue is never queued"),
             SubmissionDraft::Write(write) => InboxItem::Write {
                 id,
                 entry: entry_to_json(&write.entry),
@@ -536,7 +592,7 @@ async fn admit(
         let placed = !result.users.is_empty() && result.users.last() == Some(&id);
         if !result.users.is_empty() {
             scheduler
-                .start_run(tx, conversation_id, &live, result.users)
+                .start_run(tx, conversation_id, &live, result.users, result.first)
                 .await?;
         }
         return Ok(Admission {
@@ -555,6 +611,7 @@ async fn admit(
         .take()
         .ok_or_else(|| SessionError::message("Boundary disappeared after preparation"))?;
     match draft {
+        SubmissionDraft::Continue(_) => unreachable!("continue was admitted above"),
         SubmissionDraft::Write(write) => {
             if is_stale(&boundary, &write.entry) {
                 let record = tx
@@ -600,7 +657,13 @@ async fn admit(
                 .await?;
             tx.place_submission(record.id(), entry.id)?;
             scheduler
-                .start_run(tx, conversation_id, &live, vec![record.id()])
+                .start_run(
+                    tx,
+                    conversation_id,
+                    &live,
+                    vec![record.id()],
+                    Some(entry.id),
+                )
                 .await?;
             Ok(Admission {
                 id: record.id(),

@@ -1,5 +1,5 @@
 //! Scheduler recovery, blocked-definition, and migration tests (port of
-//! `packages/durable/test/harness-tasks-recovery.test.ts` @ `4a080252f`).
+//! `packages/durable/test/harness-tasks-recovery.test.ts` @ `b4afdddf`).
 //!
 //! Fixtures stamp durable records directly (simulating a crash between commits)
 //! and then reopen a Harness over the same Storage, exercising `open()`'s
@@ -13,11 +13,10 @@ use std::sync::Arc;
 
 use rpi_durable::errors::StorageError;
 use rpi_durable::harness::{
-    BlockedReason, Extension, Harness, Registry, ReportInfo, ReportKind, TaskAbort,
-    TaskInspectionState,
+    BlockedReason, Extension, Registry, ReportKind, TaskAbort, TaskInspectionState,
 };
 use rpi_durable::storage::MemoryStorage;
-use rpi_durable::types::{Storage, TaskState, TaskStatus};
+use rpi_durable::types::{Storage, StorageExt, TaskState, TaskStatus};
 
 use scheduler_support::{
     DynamicTask, Spec, add_task, all_tasks, context, open_with, open_with_storage,
@@ -180,19 +179,24 @@ async fn orphans_abort_marked_task_without_definition() {
 
 // ─── Restart limits (V18-06 FR-E) ─────────────────────────────────────────
 
-async fn stamp_running(
-    harness: &Arc<rpi_durable::harness::HarnessImpl>,
-    id: rpi_durable::ids::TaskId,
-) {
-    let mut record = harness
-        .get_task(id, &context())
+async fn stamp_running_raw(storage: &Arc<dyn Storage>, id: rpi_durable::ids::TaskId) {
+    let mut record = storage
+        .task(id, &context())
         .await
-        .unwrap()
-        .expect("task");
+        .expect("task")
+        .expect("record")
+        .as_ref()
+        .clone();
     record.state = TaskState::Running {
         checkpoint: scheduler_support::checkpoint(&record),
     };
-    stamp_task(harness, record).await;
+    storage
+        .commit_one(
+            &[rpi_durable::types::StorageWrite::Task { value: record }],
+            &context(),
+        )
+        .await
+        .expect("raw crash record");
 }
 
 /// R-D7: five consecutive cut-offs park a task; `inspect()` reports the reason.
@@ -207,10 +211,10 @@ async fn five_restarts_park_the_task() {
         Spec::owned("test.count", serde_json::json!({ "phases": 3 })),
     )
     .await;
-    stamp_running(&opened.harness, id).await;
+    stamp_running_raw(&storage, id).await;
 
     for expected in 1..=5 {
-        stamp_running(&opened.harness, id).await;
+        stamp_running_raw(&storage, id).await;
         let reopened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
         let record = reopened
             .harness
@@ -221,31 +225,23 @@ async fn five_restarts_park_the_task() {
         assert_eq!(record.restarts, Some(expected));
     }
     let reopened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
+    reopened.harness.resume().expect("reserve the limited task");
     let record = reopened
         .harness
-        .get_task(id, &context())
+        .wait_for_task(id, &context())
         .await
-        .unwrap()
-        .expect("task");
-    assert_eq!(record.status(), TaskStatus::Pending);
-    assert!(record.restarts.unwrap_or(0) >= 5);
+        .expect("limited task settles")
+        .record;
+    assert_eq!(record.status(), TaskStatus::Terminal);
+    assert!(matches!(
+        record.state,
+        TaskState::Terminal {
+            outcome: rpi_durable::types::TaskOutcome::Faulted { ref error }
+        } if error.detail.as_ref().and_then(|detail| detail.get("reason"))
+            == Some(&serde_json::json!("restart_limit"))
+    ));
     let inspection = reopened.harness.inspect(&context()).await.unwrap();
-    let entry = inspection
-        .tasks
-        .iter()
-        .find(|task| task.record.id == id)
-        .expect("live");
-    assert!(
-        matches!(
-            entry.state,
-            TaskInspectionState::Blocked {
-                reason: BlockedReason::RestartLimit,
-                ..
-            }
-        ),
-        "state: {:?}",
-        entry.state
-    );
+    assert!(!inspection.tasks.iter().any(|task| task.record.id == id));
     reopened.harness.close(&context()).await.unwrap();
 }
 
@@ -367,9 +363,9 @@ async fn infinite_restart_limit_never_parks() {
         Spec::owned("test.count", serde_json::json!({ "phases": 3 })),
     )
     .await;
-    stamp_running(&opened.harness, id).await;
+    stamp_running_raw(&storage, id).await;
     for _ in 0..10 {
-        stamp_running(&opened.harness, id).await;
+        stamp_running_raw(&storage, id).await;
         let reopened = open_with_storage_and_settings(
             Arc::clone(&storage),
             all_tasks(),
@@ -393,13 +389,7 @@ async fn infinite_restart_limit_never_parks() {
         .iter()
         .find(|task| task.record.id == id)
         .expect("live");
-    assert!(!matches!(
-        entry.state,
-        TaskInspectionState::Blocked {
-            reason: BlockedReason::RestartLimit,
-            ..
-        }
-    ));
+    assert!(!matches!(entry.state, TaskInspectionState::Blocked { .. }));
     reopened.harness.close(&context()).await.unwrap();
 }
 
@@ -415,7 +405,7 @@ async fn commit_clears_the_restart_count() {
         Spec::owned("test.count", serde_json::json!({ "phases": 1 })),
     )
     .await;
-    stamp_running(&opened.harness, id).await;
+    stamp_running_raw(&storage, id).await;
     let reopened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
     let record = reopened
         .harness
@@ -435,9 +425,9 @@ async fn commit_clears_the_restart_count() {
     reopened.harness.close(&context()).await.unwrap();
 }
 
-/// R-D7: `retryTask()` unparks a task and it runs again.
+/// R-D7: reaching the restart limit faults instead of offering a retry.
 #[tokio::test]
-async fn retry_task_unparks() {
+async fn restart_limit_faults_instead_of_retrying() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let opened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
     let conversation = root(&opened.harness).await;
@@ -447,23 +437,19 @@ async fn retry_task_unparks() {
         Spec::owned("test.count", serde_json::json!({ "phases": 1 })),
     )
     .await;
-    stamp_running(&opened.harness, id).await;
+    stamp_running_raw(&storage, id).await;
     for _ in 0..5 {
+        stamp_running_raw(&storage, id).await;
         let reopened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
         let _ = reopened;
     }
     let reopened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
-    reopened
-        .harness
-        .retry_task(id, &context())
-        .await
-        .expect("retry");
     let settled = reopened
         .harness
         .wait_for_task(id, &context())
         .await
         .unwrap();
-    assert_eq!(terminal_status(&settled.record), Some("completed"));
+    assert_eq!(terminal_status(&settled.record), Some("faulted"));
     reopened.harness.close(&context()).await.unwrap();
 }
 
@@ -478,8 +464,8 @@ async fn abort_handler_at_the_limit_faults() {
         Arc::clone(&storage),
         all_tasks(),
         None,
-        Some(Arc::new(move |info: ReportInfo| {
-            sink.lock().expect("reports").push(info);
+        Some(Arc::new(move |report: rpi_durable::harness::Report| {
+            sink.lock().expect("reports").push(report.info);
         })),
     )
     .await;
@@ -506,8 +492,8 @@ async fn abort_handler_at_the_limit_faults() {
         Arc::clone(&storage),
         all_tasks(),
         None,
-        Some(Arc::new(move |info: ReportInfo| {
-            sink_again.lock().expect("reports").push(info);
+        Some(Arc::new(move |report: rpi_durable::harness::Report| {
+            sink_again.lock().expect("reports").push(report.info);
         })),
     )
     .await;
@@ -525,7 +511,7 @@ async fn abort_handler_at_the_limit_faults() {
                 .iter()
                 .any(|info| info.kind == ReportKind::TaskFaulted
                     && info.reason.as_deref() == Some("restart_limit")
-                    && info.task_id == Some(id)),
+                    && info.task.as_ref().map(|task| task.id) == Some(id)),
             "missing task_faulted report: {reports:?}"
         );
     }
@@ -629,9 +615,9 @@ async fn normal_close_does_not_count_a_restart() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// R-D9: a parked task produces one fixed-field `task_parked` report.
+/// R-D9: reaching the restart limit produces one fixed-field task_faulted report.
 #[tokio::test]
-async fn parked_tasks_report_task_parked() {
+async fn restart_limit_reports_task_faulted() {
     use rpi_durable::harness::{HarnessSettings, ReportInfo, ReportKind, RestartLimit};
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let opened = open_with_storage(Arc::clone(&storage), all_tasks()).await;
@@ -642,7 +628,7 @@ async fn parked_tasks_report_task_parked() {
         Spec::owned("test.count", serde_json::json!({ "phases": 3 })),
     )
     .await;
-    stamp_running(&opened.harness, id).await;
+    stamp_running_raw(&storage, id).await;
     let reports: Arc<std::sync::Mutex<Vec<ReportInfo>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&reports);
@@ -653,19 +639,41 @@ async fn parked_tasks_report_task_parked() {
             restart_limit: Some(RestartLimit::Limited(1)),
             ..Default::default()
         }),
-        Some(Arc::new(move |info| {
-            sink.lock().expect("reports").push(info);
+        Some(Arc::new(move |report| {
+            sink.lock().expect("reports").push(report.info);
         })),
     )
     .await;
-    let captured: Vec<ReportInfo> = reports.lock().expect("reports").clone();
+    reopened
+        .harness
+        .wait_for_task(id, &context())
+        .await
+        .expect("limited task settles");
+    // The report is emitted after the terminal publication becomes durable.
+    // On a multi-thread runtime the waiter may resume before `reserve` gets
+    // its post-commit turn, so wait for the durable report instead of
+    // assuming it is already in the sink.
+    let captured = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let captured: Vec<ReportInfo> = reports.lock().expect("reports").clone();
+            if captured.iter().any(|info| {
+                info.kind == ReportKind::TaskFaulted
+                    && info.task.as_ref().map(|task| task.id) == Some(id)
+                    && info.task.as_ref().map(|task| task.kind.as_str()) == Some("test.count")
+                    && info.reason.as_deref() == Some("restart_limit")
+            }) {
+                break captured;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("task_faulted report");
     assert!(captured.iter().any(|info| {
-        info.kind == ReportKind::TaskParked
-            && info.task_id == Some(id)
-            && info.task_kind.as_deref() == Some("test.count")
-            // Upstream's `task_parked` carries no fixed `reason`; the restart
-            // limit is the definition of parked.
-            && info.reason.is_none()
+        info.kind == ReportKind::TaskFaulted
+            && info.task.as_ref().map(|task| task.id) == Some(id)
+            && info.task.as_ref().map(|task| task.kind.as_str()) == Some("test.count")
+            && info.reason.as_deref() == Some("restart_limit")
     }));
     reopened.harness.close(&context()).await.unwrap();
 }
@@ -747,7 +755,7 @@ async fn abandon_on_restart_marks_and_aborts_the_task() {
         )
         .await
         .expect("create");
-    stamp_running(&opened.harness, id).await;
+    stamp_running_raw(&storage, id).await;
     let reopened = open_with_storage(Arc::clone(&storage), vec![Arc::new(RestartTask)]).await;
     reopened.harness.resume().unwrap();
     let settled = reopened
@@ -773,8 +781,8 @@ async fn listener_panics_report_listener_error() {
         Arc::clone(&storage),
         all_tasks(),
         None,
-        Some(Arc::new(move |info| {
-            sink.lock().expect("reports").push(info);
+        Some(Arc::new(move |report| {
+            sink.lock().expect("reports").push(report.info);
         })),
     )
     .await;
@@ -810,7 +818,7 @@ async fn listener_panics_report_listener_error() {
     assert!(
         !captured
             .iter()
-            .any(|info| info.kind == ReportKind::SessionFailed)
+            .any(|info| info.kind == ReportKind::StorageFailed)
     );
     assert!(opened.harness.session().failure().is_none());
     opened.harness.close(&context()).await.unwrap();
@@ -837,9 +845,20 @@ async fn a_scheduler_commit_failure_fails_the_session() {
         .unwrap()
         .expect("task");
     record.restarts = Some(5);
-    scheduler_support::stamp_task(&opened.harness, record).await;
     storage.fail_next_commit(StorageError::Message("commit failed".into()));
-    let _ = opened.harness.retry_task(id, &context()).await;
+    let result = opened
+        .harness
+        .session()
+        .commit_with(
+            rpi_durable::session::commit_fn(move |tx| {
+                let record = record.clone();
+                Box::pin(async move { tx.set_task(record) })
+            }),
+            &context(),
+            None,
+        )
+        .await;
+    assert!(result.is_err(), "the injected write must fail");
     assert!(
         opened
             .harness

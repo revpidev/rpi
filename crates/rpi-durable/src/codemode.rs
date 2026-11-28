@@ -1,6 +1,6 @@
 //! Durable code mode: a tool that runs a host-provided deterministic sandbox
 //! whose nested tool calls survive a restart (port of
-//! `packages/durable/src/codemode/codemode.ts` @ `4a080252f`).
+//! `packages/durable/src/codemode/codemode.ts` @ `b4afdddf`).
 //!
 //! The sandbox is the host's: rpi supplies the durable half. A run stores its
 //! start data in `pi.codemode.run` before the sandbox starts, the host's start

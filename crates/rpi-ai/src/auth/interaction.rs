@@ -117,6 +117,10 @@ pub enum AuthEvent {
         user_code: String,
         verification_uri: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        open_browser_on_confirm: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        copy_code_on_confirm: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         interval_seconds: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         expires_in_seconds: Option<u64>,
@@ -153,6 +157,8 @@ mod tests {
         let event = AuthEvent::DeviceCode {
             user_code: "ABCD-EFGH".to_owned(),
             verification_uri: "https://example.com/device".to_owned(),
+            open_browser_on_confirm: None,
+            copy_code_on_confirm: None,
             interval_seconds: Some(5),
             expires_in_seconds: None,
         };

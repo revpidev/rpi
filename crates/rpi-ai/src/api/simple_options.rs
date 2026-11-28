@@ -11,15 +11,17 @@ use crate::types::{
 use crate::utils::estimate::estimate_context_tokens;
 
 pub const CONTEXT_SAFETY_TOKENS: u64 = 4096;
+pub const CONTEXT_SAFETY_RATIO: f64 = 0.15;
+pub const MIN_OUTPUT_WITH_RATIO_MARGIN: i64 = 32768;
 pub const MIN_MAX_TOKENS: u32 = 1;
 
 /// `MIN_ANSWER_TOKENS` (d07889da0): tokens always left for the answer when a
 /// thinking budget shares the response ceiling.
 pub const MIN_ANSWER_TOKENS: u32 = 1024;
 
-/// `clampMaxTokensToContext`: `contextWindow - estimate - 4096` safety margin,
-/// `available` floored at 1. No outer floor — an explicit `maxTokens` of 0
-/// stays 0 (upstream `Math.min(maxTokens, Math.max(1, available))`).
+/// `clampMaxTokensToContext`: reserve 15% of estimated input (at least 4096
+/// tokens), falling back to the fixed reserve when that leaves less than 32768
+/// output tokens. No outer floor — an explicit `maxTokens` of 0 stays 0.
 pub fn clamp_max_tokens_to_context(
     model: &Model,
     context: &TranscriptContext,
@@ -28,10 +30,15 @@ pub fn clamp_max_tokens_to_context(
     if model.context_window == 0 {
         return max_tokens.max(MIN_MAX_TOKENS);
     }
-    let available = model.context_window as i64
-        - estimate_context_tokens(context).tokens as i64
-        - CONTEXT_SAFETY_TOKENS as i64;
-    (max_tokens as i64).min(available.max(MIN_MAX_TOKENS as i64)) as u32
+    let input = estimate_context_tokens(context).tokens as i64;
+    let margin =
+        (CONTEXT_SAFETY_TOKENS as i64).max((input as f64 * CONTEXT_SAFETY_RATIO).ceil() as i64);
+    let mut room = model.context_window as i64 - input - margin;
+    if room < MIN_OUTPUT_WITH_RATIO_MARGIN {
+        room = MIN_OUTPUT_WITH_RATIO_MARGIN
+            .min(model.context_window as i64 - input - CONTEXT_SAFETY_TOKENS as i64);
+    }
+    (max_tokens as i64).min(room.max(MIN_MAX_TOKENS as i64)) as u32
 }
 
 /// `buildBaseOptions`: builds the base `StreamOptions`, clamping maxTokens to
@@ -55,7 +62,7 @@ pub fn build_base_options(
     stream
 }
 
-/// `resolveSamplingParams` (simple-options.ts:26-34 @ 4a080252f, #9776):
+/// `resolveSamplingParams` (simple-options.ts:26-34 @ b4afdddf, #9776):
 /// merge `Model.samplingParams` → the effective (clamped) thinking level's
 /// `samplingParamsByThinkingLevel` entry → the request's own map, last key
 /// wins. `None` when all three are unset (request body unchanged).
@@ -194,6 +201,21 @@ mod tests {
         assert_eq!(clamp_max_tokens_to_context(&zero, &context, 0), 1);
         // Explicit maxTokens=0 stays 0 — upstream has no outer floor.
         assert_eq!(clamp_max_tokens_to_context(&model, &context, 0), 0);
+
+        let large = context_with_text(&"x".repeat(200_000));
+        let input = crate::utils::estimate::estimate_context_tokens(&large).tokens as i64;
+        let ratio_margin =
+            (CONTEXT_SAFETY_TOKENS as i64).max((input as f64 * CONTEXT_SAFETY_RATIO).ceil() as i64);
+        let ratio_room = 100_000 - input - ratio_margin;
+        let expected = if ratio_room < MIN_OUTPUT_WITH_RATIO_MARGIN {
+            MIN_OUTPUT_WITH_RATIO_MARGIN.min(100_000 - input - CONTEXT_SAFETY_TOKENS as i64)
+        } else {
+            ratio_room
+        };
+        assert_eq!(
+            clamp_max_tokens_to_context(&model, &large, 200_000),
+            expected.max(MIN_MAX_TOKENS as i64) as u32
+        );
     }
     #[test]
     fn test_clamp_reasoning() {

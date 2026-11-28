@@ -211,6 +211,18 @@ impl Loader {
         self.render_handle.request_render();
     }
 
+    fn current_frame_index(&self) -> usize {
+        if self.frames.is_empty() {
+            return 0;
+        }
+        // Replay owns a fixed logical cadence. Deriving the spinner from the
+        // recorded frame sequence avoids wall-clock races in output hashes;
+        // normal sessions keep the animation thread's atomic counter.
+        crate::benchmark::deterministic_frame_index()
+            .map(|index| index % self.frames.len())
+            .unwrap_or_else(|| self.current_frame.load(Ordering::SeqCst))
+    }
+
     /// The current frame, verbatim or spinner-colored
     /// (`getRenderedIndicator`, loader.ts:88-91 @ 9841914, 1d9787c11).
     /// Extracted so border-embedded status rendering can reuse the same
@@ -218,7 +230,7 @@ impl Loader {
     pub fn get_rendered_indicator(&self) -> String {
         let frame = self
             .frames
-            .get(self.current_frame.load(Ordering::SeqCst))
+            .get(self.current_frame_index())
             .map(String::as_str)
             .unwrap_or("");
         if self.render_indicator_verbatim {
@@ -233,7 +245,7 @@ impl Loader {
     fn display_text(&self) -> String {
         let frame = self
             .frames
-            .get(self.current_frame.load(Ordering::SeqCst))
+            .get(self.current_frame_index())
             .map(String::as_str)
             .unwrap_or("");
         let rendered_frame = self.get_rendered_indicator();

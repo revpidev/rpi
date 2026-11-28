@@ -839,6 +839,104 @@ try {
     Check-True (-not (Test-Path -LiteralPath $firstBin)) 'failed first install leaves no new binary'
     Check-True (-not (Test-Path -LiteralPath $firstStageManifest)) 'failed first install removes the unused stage manifest'
 
+    # ---- V19-09 (ADR-0050): parked-executable restore + plugin generations --
+
+    $v1909 = Join-Path $tempRoot 'v1909'
+    $v1909Prefix = Join-Path $v1909 'prefix'
+    New-Item -ItemType Directory -Force -Path $v1909Prefix | Out-Null
+    $v1909Exe = Join-Path $v1909Prefix 'rpi.exe'
+    Check-True ($null -eq (Restore-ParkedExecutable -InstallPath $v1909Exe)) 'V19-09: nothing to restore in an empty prefix'
+    [IO.File]::WriteAllText((Join-Path $v1909Prefix 'rpi.exe.old-0.1.8'), 'parked-1.8')
+    Start-Sleep -Milliseconds 30
+    [IO.File]::WriteAllText((Join-Path $v1909Prefix 'rpi.exe.old-0.1.9'), 'parked-1.9')
+    [IO.File]::WriteAllText((Join-Path $v1909Prefix 'rpi.exe.bad-0.1.9'), 'bad-1.9')
+    $restored = Restore-ParkedExecutable -InstallPath $v1909Exe
+    Check-True ($restored -like '*rpi.exe.old-0.1.9') 'V19-09: the newest parked image is restored'
+    Check-Equal 'parked-1.9' ([IO.File]::ReadAllText($v1909Exe)) 'V19-09: rpi.exe holds the restored image'
+    Check-True (Test-Path -LiteralPath (Join-Path $v1909Prefix 'rpi.exe.bad-0.1.9')) 'V19-09: a bad image is not touched'
+    Check-True ($null -eq (Restore-ParkedExecutable -InstallPath $v1909Exe)) 'V19-09: an installed rpi.exe is left alone'
+    Check-True ($null -eq (Restore-ParkedExecutable -InstallPath (Join-Path $v1909 'missing/rpi.exe'))) 'V19-09: a missing prefix is not an error'
+    Remove-Item -LiteralPath $v1909Exe -Force
+    $restoredAgain = Restore-ParkedExecutable -InstallPath $v1909Exe
+    Check-True ($restoredAgain -like '*rpi.exe.old-0.1.8') 'V19-09: the next parked image is restored when the newest is gone'
+    Check-Equal 'parked-1.8' ([IO.File]::ReadAllText($v1909Exe)) 'V19-09: the older image is in place'
+
+    Check-True (Test-GenerationLayout -PluginVersion '0.1.9-rc.4') 'V19-09: rc.4 reads the generational layout'
+    Check-True (Test-GenerationLayout -PluginVersion '0.1.9') 'V19-09: 0.1.9 reads the generational layout'
+    Check-True (Test-GenerationLayout -PluginVersion '1.0.0') 'V19-09: later versions read the generational layout'
+    Check-True (-not (Test-GenerationLayout -PluginVersion '0.1.9-rc.3')) 'V19-09: rc.3 and older keep the flat layout'
+    Check-True (-not (Test-GenerationLayout -PluginVersion '0.1.8')) 'V19-09: 0.1.8 keeps the flat layout'
+    Check-True (-not (Test-GenerationLayout -PluginVersion 'garbage')) 'V19-09: an invalid version keeps the flat layout'
+
+    $v1909Ext = Join-Path $v1909 'extensions'
+    function New-StagedPlugin {
+        param([string]$Name, [string]$PluginVersion, [string]$Author)
+        $dir = Join-Path $v1909 ("stage-$Name-$PluginVersion-$Author-" + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'lib') | Out-Null
+        $manifest = '{"name":"' + $Name + '","version":"' + $PluginVersion + '","native":"lib/' + $Name + '.dll","rpiAbi":1,"author":"' + $Author + '"}'
+        [IO.File]::WriteAllText((Join-Path $dir 'rpi-extension.json'), $manifest)
+        [IO.File]::WriteAllText((Join-Path $dir ("lib/$Name.dll")), "library-$PluginVersion-$Author")
+        $sums = ((Get-FileSha256 (Join-Path $dir 'rpi-extension.json')).ToLowerInvariant() + '  rpi-extension.json' + "`n" +
+                 (Get-FileSha256 (Join-Path $dir ("lib/$Name.dll"))).ToLowerInvariant() + '  lib/' + $Name + '.dll' + "`n")
+        [IO.File]::WriteAllText((Join-Path $dir 'SHA256SUMS'), $sums)
+        return $dir
+    }
+    # A legacy flat install the generation migrates.
+    $todo = Join-Path $v1909Ext 'rpi-todo'
+    New-Item -ItemType Directory -Force -Path $todo | Out-Null
+    [IO.File]::WriteAllText((Join-Path $todo 'rpi-extension.json'), '{"name":"rpi-todo","version":"0.1.8"}')
+    [IO.File]::WriteAllText((Join-Path $todo 'libtodo.dll'), 'flat-library')
+    $staged = New-StagedPlugin -Name 'rpi-todo' -PluginVersion '0.1.9-rc.4' -Author 'a'
+    $shaRc4 = Get-FileSha256 (Join-Path $staged 'rpi-extension.json')
+    Install-PluginGeneration -PluginDir $v1909Ext -Plugin 'rpi-todo' -Version '0.1.9-rc.4' -Staged $staged -ManifestSha $shaRc4
+    $pointerPath = Join-Path $todo 'current.json'
+    Check-True (Test-Path -LiteralPath (Join-Path $todo '0.1.9-rc.4/rpi-extension.json')) 'V19-09: the plugin is placed as a generation'
+    Check-True (-not (Test-Path -LiteralPath $staged)) 'V19-09: the staging directory moved'
+    Check-True (Test-Path -LiteralPath $pointerPath) 'V19-09: the pointer is written'
+    $pointer = $null
+    if (Test-Path -LiteralPath $pointerPath) { $pointer = Get-Content -LiteralPath $pointerPath -Raw | ConvertFrom-Json }
+    Check-Equal '0.1.9-rc.4' ([string]$pointer.version) 'V19-09: pointer names the installed version'
+    Check-Equal '0.1.9-rc.4' ([string]$pointer.path) 'V19-09: pointer path is the generation directory'
+    Check-Equal '1' ([string]$pointer.schemaVersion) 'V19-09: pointer schema version is 1'
+    Check-Equal '1' ([string]$pointer.rpiAbi) 'V19-09: pointer carries rpiAbi'
+    Check-Equal $shaRc4.ToLowerInvariant() ([string]$pointer.manifestSha256) 'V19-09: pointer records the manifest sha256'
+    Check-True ($null -eq $pointer.previous) 'V19-09: the first generation has no previous'
+    Check-True (Test-Path -LiteralPath (Join-Path $todo 'rpi-extension.json')) 'V19-09: the legacy flat manifest stays for the startup cleanup'
+    Check-True (@(Get-ChildItem -LiteralPath $todo -Filter '*.stage-*').Count -eq 0) 'V19-09: no pointer staging file is left behind'
+    $pointerBytes = [System.IO.File]::ReadAllBytes($pointerPath)
+    Check-True (-not ($pointerBytes.Length -ge 3 -and $pointerBytes[0] -eq 0xEF -and $pointerBytes[1] -eq 0xBB -and $pointerBytes[2] -eq 0xBF)) 'V19-09: the pointer has no UTF-8 BOM'
+
+    # An upgrade records the previous generation and keeps it.
+    $staged = New-StagedPlugin -Name 'rpi-todo' -PluginVersion '0.1.9-rc.5' -Author 'a'
+    Install-PluginGeneration -PluginDir $v1909Ext -Plugin 'rpi-todo' -Version '0.1.9-rc.5' -Staged $staged -ManifestSha (Get-FileSha256 (Join-Path $staged 'rpi-extension.json'))
+    $pointer = Get-Content -LiteralPath $pointerPath -Raw | ConvertFrom-Json
+    Check-Equal '0.1.9-rc.5' ([string]$pointer.version) 'V19-09: the upgrade flips the pointer'
+    Check-Equal '0.1.9-rc.4' ([string]$pointer.previous) 'V19-09: the upgrade records the previous generation'
+    Check-True (Test-Path -LiteralPath (Join-Path $todo '0.1.9-rc.4/lib/rpi-todo.dll')) 'V19-09: the previous generation stays for running instances'
+
+    # The same build of the same version is reused, not replaced.
+    $before = (Get-Item -LiteralPath (Join-Path $todo '0.1.9-rc.5/lib/rpi-todo.dll')).LastWriteTimeUtc
+    $staged = New-StagedPlugin -Name 'rpi-todo' -PluginVersion '0.1.9-rc.5' -Author 'a'
+    Install-PluginGeneration -PluginDir $v1909Ext -Plugin 'rpi-todo' -Version '0.1.9-rc.5' -Staged $staged -ManifestSha (Get-FileSha256 (Join-Path $staged 'rpi-extension.json'))
+    Check-Equal $before.ToString('o') ((Get-Item -LiteralPath (Join-Path $todo '0.1.9-rc.5/lib/rpi-todo.dll')).LastWriteTimeUtc.ToString('o')) 'V19-09: an identical same-version generation is reused'
+    Check-True (-not (Test-Path -LiteralPath $staged)) 'V19-09: the redundant staging directory is dropped'
+    $pointer = Get-Content -LiteralPath $pointerPath -Raw | ConvertFrom-Json
+    Check-Equal '0.1.9-rc.4' ([string]$pointer.previous) 'V19-09: a reused generation does not change the pointer history'
+
+    # A different build of the same version replaces it; a retirement is cleared.
+    [IO.File]::WriteAllText((Join-Path $todo '.retired'), '')
+    $staged = New-StagedPlugin -Name 'rpi-todo' -PluginVersion '0.1.9-rc.5' -Author 'b'
+    Install-PluginGeneration -PluginDir $v1909Ext -Plugin 'rpi-todo' -Version '0.1.9-rc.5' -Staged $staged -ManifestSha (Get-FileSha256 (Join-Path $staged 'rpi-extension.json'))
+    Check-Equal 'library-0.1.9-rc.5-b' ([IO.File]::ReadAllText((Join-Path $todo '0.1.9-rc.5/lib/rpi-todo.dll'))) 'V19-09: a different same-version build replaces the generation'
+    Check-True (-not (Test-Path -LiteralPath (Join-Path $todo '.retired'))) 'V19-09: a reinstall clears the retirement marker'
+
+    # A corrupt pointer is tolerated: the install still lands.
+    [IO.File]::WriteAllText($pointerPath, '{not json')
+    $staged = New-StagedPlugin -Name 'rpi-todo' -PluginVersion '0.1.9-rc.6' -Author 'a'
+    Install-PluginGeneration -PluginDir $v1909Ext -Plugin 'rpi-todo' -Version '0.1.9-rc.6' -Staged $staged -ManifestSha (Get-FileSha256 (Join-Path $staged 'rpi-extension.json'))
+    $pointer = Get-Content -LiteralPath $pointerPath -Raw | ConvertFrom-Json
+    Check-Equal '0.1.9-rc.6' ([string]$pointer.version) 'V19-09: a corrupt pointer is replaced'
+
     # ---- non-interactive environment ---------------------------------------
 
     $env:CI = ''

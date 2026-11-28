@@ -13,6 +13,19 @@ path = "src/main.rs"
 name = "rpi-rpc"
 path = "src/bin/rpi_rpc.rs"
 
+[[bin]]
+name = "rpi-v19-replay"
+path = "src/bin/rpi_v19_replay.rs"
+required-features = ["v19-benchmark"]
+
+[[bin]]
+name = "rpi-v19-schema-probe"
+path = "src/bin/rpi_v19_schema_probe.rs"
+required-features = ["v19-benchmark"]
+
+[features]
+v19-benchmark = ["rpi-tui/v19-benchmark"]
+
 [dependencies]
 rpi-ai.workspace = true
 rpi-agent.workspace = true
@@ -35,6 +48,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 regex.workspace = true
 unicode-normalization.workspace = true
+unicode-segmentation.workspace = true
 base64.workspace = true
 uuid.workspace = true
 image.workspace = true
@@ -68,6 +82,20 @@ syntect-assets.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# V19-09 (ADR-0050): Win32 calls of the startup self-update — the
+# trampoline launch (process attribute list, job object), the console
+# control handler, process start times and DELETE-access probes. No new
+# crate: the workspace already pins windows-sys for the TUI console mode.
+windows-sys = { workspace = true, features = [
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Environment",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 rpi-test-support.workspace = true

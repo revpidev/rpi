@@ -2,7 +2,7 @@
 // G3 built-in MCP parity: UPSTREAM (Node) side runner (V16-08 §6).
 //
 // Drives the pinned upstream package client `external/pi/packages/mcp`
-// (@ 4a080252f, read-only) against the shared fixture server
+// (@ b4afdddf, read-only) against the shared fixture server
 // (`fixture-server.mjs`) and prints one normalized JSON result document to
 // stdout with the same shape as the rpi side
 // (`cargo run --example builtin_mcp_parity_runner -p rpi-mcp`):

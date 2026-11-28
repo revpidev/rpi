@@ -1,5 +1,5 @@
 //! Shared System One classification transport (port of
-//! `packages/ai/src/api/system-one-shared.ts` @ 4a080252f, 7f225f25d).
+//! `packages/ai/src/api/system-one-shared.ts` @ b4afdddf, 7f225f25d).
 //!
 //! TypeSafe's System One protocol is served by several providers and by
 //! Cloudflare Workers AI behind its REST envelope. This module owns request

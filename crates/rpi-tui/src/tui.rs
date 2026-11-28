@@ -141,8 +141,20 @@
 //!   internally, same pattern as `SharedEntry`/`SharedChild`). Nested
 //!   forwarding containers must therefore forward `handle_mouse` like they
 //!   forward `handle_input`.
+//! - V19-06 additive extension of the frozen component contract (ADR-0049
+//!   decision 4): `Component::cache_instance_id` (process-unique identity for
+//!   cross-frame caches) and `Component::as_transcript_document` (a document
+//!   measured through a height index instead of a full render), both
+//!   defaulted like `layout_node`/`as_scroll_view`. `Component::render` keeps
+//!   its signature. `Container` keeps its public shape (the `children` field
+//!   and the constructor/methods); it gained a private, interior-mutable
+//!   height index that only the transcript contract touches — `render`,
+//!   `invalidate` and `handle_mouse` behave as before (`handle_mouse` still
+//!   reads the per-child heights `render` records, and the transcript path
+//!   keeps that hit-test cache fed).
 
 use std::cell::RefCell;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -150,10 +162,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::components::scroll_view::ScrollView;
+use crate::container_sequence::SequenceState;
 use crate::layout_node::LayoutNode;
 use crate::terminal::Terminal;
 use crate::terminal_colors::{TerminalColorScheme, TerminalColors};
 use crate::terminal_image::is_image_line;
+use crate::transcript::{TranscriptDocument, TranscriptStats, TranscriptSync};
 use crate::tui_main_screen::TuiMainScreen;
 use crate::utils::{extract_segments, slice_by_column, slice_with_width, visible_width};
 
@@ -194,6 +208,13 @@ pub trait Component: Send {
     /// Each returned string is one line; visible width must not exceed `width`.
     fn render(&self, width: usize) -> Vec<String>;
 
+    /// Whether this component consumes fullscreen viewport navigation keys.
+    /// Default false preserves the transcript-scroll behavior for existing
+    /// native and hosted components.
+    fn captures_viewport_input(&self) -> bool {
+        false
+    }
+
     /// Optional handler for keyboard input when the component has focus
     /// (upstream optional `handleInput`, tui.ts:75).
     fn handle_input(&mut self, _data: &str) {}
@@ -215,6 +236,43 @@ pub trait Component: Send {
 
     /// Invalidate any cached rendering state (theme change / full re-render).
     fn invalidate(&mut self) {}
+
+    /// Optional monotonic content revision (V19-04 FR-E, additive).
+    ///
+    /// Returning `Some` promises that every state change affecting the
+    /// rendered lines or height (including `invalidate()`, lazy
+    /// streaming/transform context, image/capability generations) bumps the
+    /// value. `None` (the default) means the component is untrusted and must
+    /// render every frame; containers that cannot aggregate their children's
+    /// revisions must return `None`.
+    fn cache_revision(&self) -> Option<u64> {
+        None
+    }
+
+    /// Process-unique instance identity for cross-frame caches (V19-06
+    /// additive, FR-A R3 / FR-B R1).
+    ///
+    /// A component returning `Some` promises the value was drawn from a
+    /// process-wide source that never hands the same value to two live
+    /// instances (see [`crate::tui::next_cache_instance_id`]). Together with
+    /// [`Component::cache_revision`] it identifies a block across frames:
+    /// `(instance id, revision)` is the identity a transcript height index
+    /// validates against, so a replaced block can never be served the cached
+    /// lines of the block it displaced — not even when the allocator reuses
+    /// the old block's address (the ABA case that a bare address or an
+    /// equal revision cannot rule out). `None` (the default) keeps the
+    /// component on the per-frame render fallback.
+    fn cache_instance_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// A document that is a vertical sequence of independently cacheable
+    /// blocks (V19-06 additive, FR-B): scroll views measure it through a
+    /// height index instead of rendering every off-screen block each frame.
+    /// `None` (the default) keeps the full-render path.
+    fn as_transcript_document(&self) -> Option<&dyn TranscriptDocument> {
+        None
+    }
 
     /// Mirror of upstream `isFocusable` (`"focused" in component`, tui.ts:110).
     fn as_focusable(&self) -> Option<&dyn Focusable> {
@@ -377,6 +435,10 @@ pub struct Container {
     /// invalidated by width changes. Interior mutability because upstream
     /// writes it from `render` (same pattern as `Box`'s render cache).
     mouse_layout: RefCell<Option<MouseLayout>>,
+    /// Height index and bounded retained lines behind the container's
+    /// [`TranscriptDocument`] impl (V19-06). Only the transcript contract
+    /// touches it; `render` keeps its frozen full-render behavior.
+    sequence: RefCell<SequenceState>,
 }
 
 /// `{ width, children: [{ component, height }] }` (tui.ts:321); the port
@@ -430,6 +492,13 @@ impl Component for Container {
         for child in &mut self.children {
             child.invalidate();
         }
+        // Theme/transform invalidation: drop the retained lines and heights
+        // along with the children's caches (the next sync re-measures).
+        self.sequence.get_mut().reset();
+    }
+
+    fn as_transcript_document(&self) -> Option<&dyn TranscriptDocument> {
+        Some(self)
     }
 
     /// `Container.prototype.handleMouse` (tui.ts:344-365 @ 9841914,
@@ -495,6 +564,98 @@ impl Component for Container {
             child_y += child_height;
         }
         None
+    }
+}
+
+// =============================================================================
+// Transcript document (V19-06): a `Container` is a sequence of blocks
+// =============================================================================
+
+impl TranscriptDocument for Container {
+    fn sync(&self, width: usize) -> TranscriptSync {
+        let sync = self.sequence.borrow_mut().sync(&self.children, width);
+        // `render` records the per-child heights for `handleMouse`; the
+        // virtual path never calls it, so keep the hit-test cache fed here.
+        let heights = self.sequence.borrow().child_heights();
+        *self.mouse_layout.borrow_mut() = Some(MouseLayout { width, heights });
+        sync
+    }
+
+    fn total_height(&self) -> usize {
+        self.sequence.borrow().total_height()
+    }
+
+    fn child_count(&self) -> usize {
+        self.sequence.borrow().child_count()
+    }
+
+    fn revision_at(&self, index: usize) -> Option<u64> {
+        self.sequence.borrow().revision_at(&self.children, index)
+    }
+
+    fn height_at(&self, index: usize) -> Option<usize> {
+        self.sequence.borrow().height_at(&self.children, index)
+    }
+
+    fn visible_range(&self, scroll_top: usize, viewport: usize, overscan: usize) -> Range<usize> {
+        self.sequence
+            .borrow()
+            .visible_range(&self.children, scroll_top, viewport, overscan)
+    }
+
+    fn render_range(&self, children: Range<usize>, width: usize) -> Arc<[String]> {
+        self.sequence
+            .borrow_mut()
+            .render_range(&self.children, children, width)
+    }
+
+    fn rows(&self, rows: Range<usize>, width: usize) -> Arc<[String]> {
+        self.sequence.borrow_mut().rows(&self.children, rows, width)
+    }
+
+    fn line(&self, row: usize, width: usize) -> Option<String> {
+        self.rows(row..row + 1, width).first().cloned()
+    }
+
+    fn materialize(&self, width: usize) -> Arc<[String]> {
+        self.sequence
+            .borrow_mut()
+            .materialize(&self.children, width)
+    }
+
+    fn prompt_rows(&self) -> Vec<usize> {
+        self.sequence.borrow().prompt_rows(&self.children)
+    }
+
+    fn block_row(&self, index: usize) -> usize {
+        self.sequence.borrow().block_row(&self.children, index)
+    }
+
+    fn stats(&self) -> TranscriptStats {
+        let state = self.sequence.borrow();
+        let mut stats = state.stats();
+        // Nested documents report their own counters; aggregate them so the
+        // document-level report covers the flattened transcript.
+        for (index, child) in self.children.iter().enumerate() {
+            if state.is_nested(index)
+                && let Some(document) = child.as_transcript_document()
+            {
+                // `blocks` already counts the nested document's blocks
+                // (flattened); the trusted/fallback split is per container.
+                let nested = document.stats();
+                stats.trusted_blocks += nested.trusted_blocks;
+                stats.fallback_blocks += nested.fallback_blocks;
+                stats.trusted_hits += nested.trusted_hits;
+                stats.trusted_renders += nested.trusted_renders;
+                stats.fallback_renders += nested.fallback_renders;
+                stats.on_demand_renders += nested.on_demand_renders;
+                stats.evictions += nested.evictions;
+                stats.corpus_rebuilds += nested.corpus_rebuilds;
+                stats.retained_children += nested.retained_children;
+                stats.retained_lines += nested.retained_lines;
+            }
+        }
+        stats
     }
 }
 
@@ -724,6 +885,15 @@ pub type SharedComponent = Arc<Mutex<Box<dyn Component>>>;
 /// Wrap a component into a [`SharedComponent`].
 pub fn shared_component(component: impl Component + 'static) -> SharedComponent {
     Arc::new(Mutex::new(Box::new(component)))
+}
+
+/// Process-wide source of [`Component::cache_instance_id`] values (V19-06
+/// additive). The counter never reuses a value while the process lives, so a
+/// live component's instance id is unique and a transcript index can treat
+/// `(instance id, revision)` as a block's identity across frames.
+pub fn next_cache_instance_id() -> u64 {
+    static NEXT_INSTANCE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Wrap an already-boxed component into a [`SharedComponent`].

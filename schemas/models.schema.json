@@ -282,6 +282,26 @@
             "boolean"
           ]
         },
+        "requiresToolsWithToolHistory": {
+          "description": "Restore legacy proxies that require an empty tools array when the\nconversation already contains tool calls or results.",
+          "type": [
+            "boolean"
+          ]
+        },
+        "requiresNonNullAssistantContent": {
+          "description": "Whether assistant messages without text must use an empty string\ninstead of JSON null content.",
+          "type": [
+            "boolean"
+          ]
+        },
+        "promptCacheKeyMode": {
+          "description": "Prompt-cache key emission policy. `auto` keeps endpoint/retention\ndetection; `enabled` and `disabled` are explicit overrides.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PromptCacheKeyMode"
+            }
+          ]
+        },
         "supportsAdditionalTools": {
           "description": "Whether the model supports message-anchored `additional_tools` input\nitems. Default: false.",
           "type": [
@@ -365,6 +385,12 @@
         },
         "supportsMidConvoToolChanges": {
           "description": "Whether the transport accepts `tool_addition`/`tool_removal` blocks\n(first-party Anthropic only; proxies reject them).",
+          "type": [
+            "boolean"
+          ]
+        },
+        "supportsMessageThreads": {
+          "description": "Whether the endpoint supports Anthropic message threads. Official\nAnthropic origins default to true; proxies default to false.",
           "type": [
             "boolean"
           ]
@@ -796,6 +822,15 @@
         "openai",
         "openai-nosession",
         "openrouter"
+      ]
+    },
+    "PromptCacheKeyMode": {
+      "description": "`OpenAIResponsesCompat.promptCacheKeyMode`.",
+      "type": "string",
+      "enum": [
+        "auto",
+        "enabled",
+        "disabled"
       ]
     },
     "AnthropicAllowedFallbackModel": {

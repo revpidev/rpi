@@ -66,13 +66,17 @@ use crate::api::anthropic_messages::resolve_cache_retention;
 use crate::api::bedrock::event_stream::{EventStreamDecoder, EventStreamMessage};
 use crate::api::bedrock::sigv4::{self, SigV4Credentials, extended_encode_uri_component};
 use crate::api::constrained_sampling::{
-    get_json_schema_tool_parameters, resolve_json_schema_strict_sampling,
+    get_json_schema_tool_parameters, prefers_json_schema_strict_sampling,
+    resolve_json_schema_strict_sampling,
 };
 use crate::api::simple_options::{
     adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context,
     clamp_reasoning,
 };
 use crate::api::stream_cancel::{StreamNext, next_chunk_or_cancelled};
+use crate::api::strict_tool_limits::{
+    bedrock_has_exceeded, bedrock_mark_exceeded, is_strict_tool_limit_error_message,
+};
 use crate::models::ProviderStreams;
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantRole, CacheRetention,
@@ -86,12 +90,12 @@ use crate::utils::error_body::NormalizedProviderError;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{headers_to_record, provider_headers_to_header_map};
 use crate::utils::json_parse::StreamingArgsPreview;
-use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_env::get_provider_env_value;
 use crate::utils::provider_retry::{
     ProviderErrorInfo, ProviderRetryOptions, retry_provider_request,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
+use crate::utils::streaming_json::ToolCallArgumentsStream;
 use crate::utils::transform_messages::transform_messages;
 
 // ---------------------------------------------------------------------------
@@ -813,26 +817,39 @@ pub fn convert_messages(
     Ok(result)
 }
 
-/// `convertToolConfig`: tool schemas with strict-mode gating; `None` tools or
-/// `toolChoice: "none"` yield no tool config.
-pub fn convert_tool_config(
+struct BuiltBedrockTools {
+    tool_config: Option<Value>,
+    has_preferred_strict_tools: bool,
+}
+
+fn convert_tool_config_inner(
     tools: Option<&[Tool]>,
     tool_choice: Option<&BedrockToolChoice>,
     supports_strict_mode: bool,
-) -> Result<Option<Value>, String> {
+    disable_preferred_strict_tools: bool,
+) -> Result<BuiltBedrockTools, String> {
+    let empty = |has_preferred_strict_tools| BuiltBedrockTools {
+        tool_config: None,
+        has_preferred_strict_tools,
+    };
     let Some(tools) = tools.filter(|tools| !tools.is_empty()) else {
-        return Ok(None);
+        return Ok(empty(false));
     };
     if tool_choice == Some(&BedrockToolChoice::None) {
-        return Ok(None);
+        return Ok(empty(false));
     }
 
+    let mut has_preferred_strict_tools = false;
     let mut bedrock_tools = Vec::new();
     for tool in tools {
-        let strict = resolve_json_schema_strict_sampling(tool, supports_strict_mode)?;
+        let preferred = prefers_json_schema_strict_sampling(tool);
+        let strict = if disable_preferred_strict_tools && preferred {
+            None
+        } else {
+            resolve_json_schema_strict_sampling(tool, supports_strict_mode)?
+        };
+        has_preferred_strict_tools |= preferred && strict == Some(true);
         let parameters = get_json_schema_tool_parameters(tool, strict)?;
-        // Wire member order follows the SDK schema (name, inputSchema,
-        // description, strict), not the upstream object-literal order.
         let mut tool_spec = Map::new();
         tool_spec.insert("name".to_owned(), json!(tool.name));
         tool_spec.insert("inputSchema".to_owned(), json!({"json": parameters}));
@@ -857,7 +874,21 @@ pub fn convert_tool_config(
     if let Some(choice) = bedrock_tool_choice {
         tool_config.insert("toolChoice".to_owned(), choice);
     }
-    Ok(Some(Value::Object(tool_config)))
+    Ok(BuiltBedrockTools {
+        tool_config: Some(Value::Object(tool_config)),
+        has_preferred_strict_tools,
+    })
+}
+
+/// `convertToolConfig`: tool schemas with strict-mode gating; `None` tools or
+/// `toolChoice: "none"` yield no tool config.
+pub fn convert_tool_config(
+    tools: Option<&[Tool]>,
+    tool_choice: Option<&BedrockToolChoice>,
+    supports_strict_mode: bool,
+) -> Result<Option<Value>, String> {
+    convert_tool_config_inner(tools, tool_choice, supports_strict_mode, false)
+        .map(|built| built.tool_config)
 }
 
 /// `THINKING_BINDING_CONTROLS_BETA` (bedrock-converse-stream.ts:121
@@ -1033,7 +1064,8 @@ fn build_command_input(
     context: &TranscriptContext,
     options: &BedrockOptions,
     cache_retention: CacheRetention,
-) -> Result<Value, String> {
+    disable_preferred_strict_tools: bool,
+) -> Result<(Value, bool), String> {
     let env = options.stream.env.as_ref();
     // Bedrock has no mid-conversation system messages; fold them into the
     // leading prompt (#9548, bedrock-converse-stream.ts:132).
@@ -1083,11 +1115,13 @@ fn build_command_input(
         .and_then(|compat| compat.supports_strict_mode)
         .unwrap_or(false);
     let current_tools = crate::utils::transcript::get_current_tools(&context.messages);
-    if let Some(tool_config) = convert_tool_config(
+    let tools = convert_tool_config_inner(
         Some(current_tools.as_slice()),
         options.tool_choice.as_ref(),
         supports_strict_mode,
-    )? {
+        disable_preferred_strict_tools,
+    )?;
+    if let Some(tool_config) = tools.tool_config {
         input.insert("toolConfig".to_owned(), tool_config);
     }
     if let Some(fields) = build_additional_model_request_fields(model, options) {
@@ -1099,7 +1133,7 @@ fn build_command_input(
             Value::Object(request_metadata.clone()),
         );
     }
-    Ok(Value::Object(input))
+    Ok((Value::Object(input), tools.has_preferred_strict_tools))
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,8 +1348,9 @@ struct StreamProcessor<'a> {
     model: &'a Model,
     /// Content index by Bedrock `contentBlockIndex`.
     blocks_by_bedrock_index: HashMap<u64, usize>,
-    /// Tool-call partial JSON by content index.
-    partial_json: HashMap<usize, String>,
+    /// #9265: tool-call argument streams by content index, never on the
+    /// content block.
+    arguments: HashMap<usize, ToolCallArgumentsStream>,
     /// rpi#78 A3: preview-parse throttle by content index.
     args_preview: HashMap<usize, StreamingArgsPreview>,
     /// Scratch buffer for encrypted reasoning deltas (base64-decoded
@@ -1338,7 +1373,7 @@ impl<'a> StreamProcessor<'a> {
             output,
             model,
             blocks_by_bedrock_index: HashMap::new(),
-            partial_json: HashMap::new(),
+            arguments: HashMap::new(),
             args_preview: HashMap::new(),
             redacted_chunks: HashMap::new(),
             failure,
@@ -1498,7 +1533,8 @@ impl<'a> StreamProcessor<'a> {
             }));
         let content_index = output.content.len() - 1;
         self.blocks_by_bedrock_index.insert(index, content_index);
-        self.partial_json.insert(content_index, String::new());
+        self.arguments
+            .insert(content_index, ToolCallArgumentsStream::default());
         self.args_preview
             .insert(content_index, StreamingArgsPreview::default());
         events.push(StreamEvent::ToolCallStart {
@@ -1561,18 +1597,22 @@ impl<'a> StreamProcessor<'a> {
                 && matches!(output.content[index], AssistantContent::ToolCall(_))
             {
                 let input = tool_use.get("input").and_then(Value::as_str).unwrap_or("");
-                let partial = self.partial_json.entry(index).or_default();
-                partial.push_str(input);
+                let args_len = {
+                    let stream = self.arguments.entry(index).or_default();
+                    stream.append(input);
+                    stream.text().len()
+                };
                 // rpi#78 A3: authoritative arguments land at content-block stop.
                 let refresh = self
                     .args_preview
                     .entry(index)
                     .or_default()
-                    .should_parse(partial.len());
-                if let AssistantContent::ToolCall(call) = &mut output.content[index]
-                    && refresh
-                {
-                    call.arguments = parse_streaming_json(Some(partial));
+                    .should_refresh(args_len);
+                if refresh && let Some(stream) = self.arguments.get_mut(&index) {
+                    let parsed = stream.arguments().clone();
+                    if let AssistantContent::ToolCall(call) = &mut output.content[index] {
+                        call.arguments = parsed;
+                    }
                 }
                 events.push(StreamEvent::ToolCallDelta {
                     content_index: index,
@@ -1709,8 +1749,7 @@ impl<'a> StreamProcessor<'a> {
             }
             AssistantContent::ToolCall(call) => {
                 self.args_preview.remove(&index);
-                let partial = self.partial_json.remove(&index).unwrap_or_default();
-                let parsed = crate::utils::json_parse::parse_tool_call_arguments(Some(&partial));
+                let parsed = self.arguments.remove(&index).unwrap_or_default().finish();
                 call.arguments = parsed.arguments;
                 call.arguments_error = parsed.arguments_error;
                 events.push(StreamEvent::ToolCallEnd {
@@ -1861,193 +1900,252 @@ async fn run(
     let cache_retention =
         resolve_cache_retention(options.stream.cache_retention, options.stream.env.as_ref());
 
-    let mut command_input = build_command_input(model, context, options, cache_retention)?;
-    if let Some(on_payload) = &options.stream.on_payload
-        && let Some(next_payload) = on_payload(command_input.clone(), model).await
-    {
-        command_input = next_payload;
-    }
+    let mut disable_preferred_strict_tools =
+        bedrock_has_exceeded(options.stream.session_id.as_deref());
+    let response = loop {
+        let (mut command_input, has_preferred_strict_tools) = build_command_input(
+            model,
+            context,
+            options,
+            cache_retention,
+            disable_preferred_strict_tools,
+        )?;
+        if let Some(on_payload) = &options.stream.on_payload
+            && let Some(next_payload) = on_payload(command_input.clone(), model).await
+        {
+            command_input = next_payload;
+        }
 
-    // `modelId` is an HTTP label: it goes to the path, not the body.
-    let model_id = command_input
-        .get("modelId")
-        .and_then(Value::as_str)
-        .unwrap_or(&model.id)
-        .to_owned();
-    let mut body = command_input;
-    if let Some(object) = body.as_object_mut() {
-        object.shift_remove("modelId");
-    }
-    let body_bytes = serde_json::to_vec(&body)
-        .map_err(|error| format!("Could not serialize payload: {error}"))?;
+        // `modelId` is an HTTP label: it goes to the path, not the body.
+        let model_id = command_input
+            .get("modelId")
+            .and_then(Value::as_str)
+            .unwrap_or(&model.id)
+            .to_owned();
+        let mut body = command_input;
+        if let Some(object) = body.as_object_mut() {
+            object.shift_remove("modelId");
+        }
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|error| format!("Could not serialize payload: {error}"))?;
 
-    let region = config.effective_region();
-    let endpoint = config
-        .endpoint
-        .clone()
-        .unwrap_or_else(|| derive_regional_endpoint(&region));
-    let path = format!(
-        "/model/{}/converse-stream",
-        extended_encode_uri_component(&model_id)
-    );
-    let url = format!("{}{path}", endpoint.trim_end_matches('/'));
-    let host = host_header(&endpoint)?;
+        let region = config.effective_region();
+        let endpoint = config
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| derive_regional_endpoint(&region));
+        let path = format!(
+            "/model/{}/converse-stream",
+            extended_encode_uri_component(&model_id)
+        );
+        let url = format!("{}{path}", endpoint.trim_end_matches('/'));
+        let host = host_header(&endpoint)?;
 
-    // Header set: content-type + host, then filtered caller headers
-    // (the build-step middleware runs before signing, so these are signed).
-    let mut headers: Vec<(String, String)> = vec![
-        ("content-type".to_owned(), "application/json".to_owned()),
-        ("host".to_owned(), host),
-    ];
-    headers.extend(filtered_custom_headers(options.stream.headers.as_ref()));
+        // Header set: content-type + host, then filtered caller headers
+        // (the build-step middleware runs before signing, so these are signed).
+        let mut headers: Vec<(String, String)> = vec![
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("host".to_owned(), host),
+        ];
+        headers.extend(filtered_custom_headers(options.stream.headers.as_ref()));
 
-    let signed_headers = if let Some(bearer_token) = &config.bearer_token {
-        headers.push((
-            sigv4::AUTHORIZATION_HEADER.to_owned(),
-            format!("Bearer {bearer_token}"),
-        ));
-        headers
-    } else {
-        let credentials = config
-            .credentials
-            .as_ref()
-            .ok_or_else(|| "Could not load credentials from any providers".to_owned())?;
-        sigv4::sign_request(
-            &sigv4::SigV4Request {
-                method: "POST",
-                path: &path,
-                query: &[],
-                headers: &headers,
-                payload: &body_bytes,
-            },
-            credentials,
-            &region,
-            SIGNING_SERVICE,
-            now_secs(),
-        )
-    };
-    let mut header_map = ProviderHeaders::new();
-    for (name, value) in signed_headers {
-        header_map.insert(name, Some(value));
-    }
-    let header_map = provider_headers_to_header_map(&header_map)?;
+        let signed_headers = if let Some(bearer_token) = &config.bearer_token {
+            headers.push((
+                sigv4::AUTHORIZATION_HEADER.to_owned(),
+                format!("Bearer {bearer_token}"),
+            ));
+            headers
+        } else {
+            let credentials = config
+                .credentials
+                .as_ref()
+                .ok_or_else(|| "Could not load credentials from any providers".to_owned())?;
+            sigv4::sign_request(
+                &sigv4::SigV4Request {
+                    method: "POST",
+                    path: &path,
+                    query: &[],
+                    headers: &headers,
+                    payload: &body_bytes,
+                },
+                credentials,
+                &region,
+                SIGNING_SERVICE,
+                now_secs(),
+            )
+        };
+        let mut header_map = ProviderHeaders::new();
+        for (name, value) in signed_headers {
+            header_map.insert(name, Some(value));
+        }
+        let header_map = provider_headers_to_header_map(&header_map)?;
 
-    let mut client_builder =
-        crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)?;
-    // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
-    // see api::stream_timeouts) — never a total-request deadline.
-    if let Some(timeout_ms) = options.stream.timeout_ms {
-        client_builder =
-            client_builder.connect_timeout(std::time::Duration::from_millis(timeout_ms));
-    }
-    let client = client_builder.build().map_err(|error| error.to_string())?;
+        let mut client_builder =
+            crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)?;
+        // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
+        // see api::stream_timeouts) — never a total-request deadline.
+        if let Some(timeout_ms) = options.stream.timeout_ms {
+            client_builder =
+                client_builder.connect_timeout(std::time::Duration::from_millis(timeout_ms));
+        }
+        let client = client_builder.build().map_err(|error| error.to_string())?;
 
-    let response = retry_provider_request(
-        || {
-            let request = client
-                .post(&url)
-                .headers(header_map.clone())
-                .body(body_bytes.clone());
-            let signal = options.stream.signal.clone();
-            let failure = Arc::clone(&failure);
-            async move {
-                // 70bbe47a9: each attempt starts clean — the diagnostic
-                // describes the final failure, like the SDK exception that
-                // surfaces upstream after its own retries.
-                if let Ok(mut guard) = failure.lock() {
-                    guard.status = None;
-                    guard.error_code = None;
-                    guard.request_id = None;
-                }
-                let send = crate::api::stream_timeouts::send_with_headers_timeout(
-                    request.send(),
-                    options.stream.timeout_ms,
-                );
-                let result = match &signal {
-                    Some(token) => tokio::select! {
-                        outcome = send => outcome,
-                        () = token.cancelled() => {
-                            return Err(ProviderErrorInfo {
-                                status: None,
-                                headers: None,
-                                message: "Request was aborted".to_owned(),
-                            });
-                        }
-                    },
-                    None => send.await,
-                };
-                match result {
-                    crate::api::stream_timeouts::SendOutcome::Ok(response) => {
-                        let status = response.status();
-                        if status.is_success() {
-                            Ok(response)
-                        } else {
-                            let status = status.as_u16();
-                            let response_headers = headers_to_record(response.headers());
-                            let body = response.text().await.unwrap_or_default();
-                            let exception_name =
-                                resolve_error_code(Some(&response_headers), Some(&body));
-                            // 70bbe47a9: `$metadata` capture for the
-                            // `bedrock_response_failure` diagnostic.
-                            if let Ok(mut guard) = failure.lock() {
-                                guard.status = Some(status);
-                                guard.error_code = exception_name.clone();
-                                guard.request_id =
-                                    response_headers.get("x-amzn-requestid").cloned();
+        let attempt = retry_provider_request(
+            || {
+                let request = client
+                    .post(&url)
+                    .headers(header_map.clone())
+                    .body(body_bytes.clone());
+                let signal = options.stream.signal.clone();
+                let failure = Arc::clone(&failure);
+                async move {
+                    // 70bbe47a9: each attempt starts clean — the diagnostic
+                    // describes the final failure, like the SDK exception that
+                    // surfaces upstream after its own retries.
+                    if let Ok(mut guard) = failure.lock() {
+                        guard.status = None;
+                        guard.error_code = None;
+                        guard.request_id = None;
+                    }
+                    let send = crate::api::stream_timeouts::send_with_headers_timeout(
+                        request.send(),
+                        options.stream.timeout_ms,
+                    );
+                    let result = match &signal {
+                        Some(token) => tokio::select! {
+                            outcome = send => outcome,
+                            () = token.cancelled() => {
+                                return Err(ProviderErrorInfo {
+                                    status: None,
+                                    headers: None,
+                                    message: "Request was aborted".to_owned(),
+                                });
                             }
-                            let message = extract_error_message(Some(&body))
-                                .unwrap_or_else(|| format!("Request failed with status {status}"));
+                        },
+                        None => send.await,
+                    };
+                    match result {
+                        crate::api::stream_timeouts::SendOutcome::Ok(response) => {
+                            let status = response.status();
+                            if status.is_success() {
+                                Ok(response)
+                            } else {
+                                let status = status.as_u16();
+                                let response_headers = headers_to_record(response.headers());
+                                let body = response.text().await.unwrap_or_default();
+                                let exception_name =
+                                    resolve_error_code(Some(&response_headers), Some(&body));
+                                // 70bbe47a9: `$metadata` capture for the
+                                // `bedrock_response_failure` diagnostic.
+                                if let Ok(mut guard) = failure.lock() {
+                                    guard.status = Some(status);
+                                    guard.error_code = exception_name.clone();
+                                    guard.request_id =
+                                        response_headers.get("x-amzn-requestid").cloned();
+                                }
+                                let message =
+                                    extract_error_message(Some(&body)).unwrap_or_else(|| {
+                                        format!("Request failed with status {status}")
+                                    });
+                                Err(ProviderErrorInfo {
+                                    status: Some(status),
+                                    headers: Some(response_headers),
+                                    // Surface the raw body (upstream
+                                    // `formatBedrockError`: `status: body` when
+                                    // the extracted message does not carry it) —
+                                    // a gateway 403 must not collapse to the
+                                    // generic status text.
+                                    message: format_bedrock_error(
+                                        exception_name.as_deref(),
+                                        Some(status),
+                                        Some(&body),
+                                        &message,
+                                    ),
+                                })
+                            }
+                        }
+                        crate::api::stream_timeouts::SendOutcome::Transport(error) => {
                             Err(ProviderErrorInfo {
-                                status: Some(status),
-                                headers: Some(response_headers),
-                                // Surface the raw body (upstream
-                                // `formatBedrockError`: `status: body` when
-                                // the extracted message does not carry it) —
-                                // a gateway 403 must not collapse to the
-                                // generic status text.
+                                status: error.status().map(|status| status.as_u16()),
+                                headers: None,
                                 message: format_bedrock_error(
-                                    exception_name.as_deref(),
-                                    Some(status),
-                                    Some(&body),
-                                    &message,
+                                    None,
+                                    None,
+                                    None,
+                                    &crate::utils::transport_error::format_reqwest_error(&error),
                                 ),
                             })
                         }
-                    }
-                    crate::api::stream_timeouts::SendOutcome::Transport(error) => {
-                        Err(ProviderErrorInfo {
-                            status: error.status().map(|status| status.as_u16()),
-                            headers: None,
-                            message: format_bedrock_error(
-                                None,
-                                None,
-                                None,
-                                &crate::utils::transport_error::format_reqwest_error(&error),
-                            ),
-                        })
-                    }
-                    crate::api::stream_timeouts::SendOutcome::HeadersTimeout(message) => {
-                        Err(ProviderErrorInfo {
-                            status: None,
-                            headers: None,
-                            message: format_bedrock_error(None, None, None, &message),
-                        })
+                        crate::api::stream_timeouts::SendOutcome::HeadersTimeout(message) => {
+                            Err(ProviderErrorInfo {
+                                status: None,
+                                headers: None,
+                                message: format_bedrock_error(None, None, None, &message),
+                            })
+                        }
                     }
                 }
+            },
+            ProviderRetryOptions {
+                // The AWS SDK defaults to standard-mode retries (2 extra
+                // attempts) and ignores `maxRetries` for Bedrock; rpi defaults
+                // to the same 2 when the caller leaves it unset (D-026).
+                max_retries: Some(options.stream.max_retries.unwrap_or(2)),
+                max_retry_delay_ms: options.stream.max_retry_delay_ms,
+                ..Default::default()
+            },
+            options.stream.signal.as_ref(),
+        )
+        .await;
+        match attempt {
+            Ok(response) => break response,
+            Err(error) => {
+                let message = error.message();
+                let validation_rejection = matches!(
+                    &error,
+                    crate::utils::provider_retry::RetryError::Provider(info)
+                        if info.status == Some(400)
+                ) && failure
+                    .lock()
+                    .map(|failure| failure.error_code.as_deref() == Some("ValidationException"))
+                    .unwrap_or(false);
+                if options
+                    .stream
+                    .signal
+                    .as_ref()
+                    .is_some_and(|signal| signal.is_cancelled())
+                    || disable_preferred_strict_tools
+                    || !has_preferred_strict_tools
+                    || !validation_rejection
+                    || !is_strict_tool_limit_error_message(&message)
+                {
+                    return Err(message);
+                }
+                disable_preferred_strict_tools = true;
+                if let Some(session_id) = options.stream.session_id.as_deref() {
+                    bedrock_mark_exceeded(session_id);
+                }
+                output.with_mut(|output| {
+                    output.diagnostics.get_or_insert_with(Vec::new).push(
+                        AssistantMessageDiagnostic {
+                            kind: "bedrock_strict_tools_fallback".to_owned(),
+                            timestamp: now_ms(),
+                            error: Some(crate::types::DiagnosticErrorInfo {
+                                name: Some("ValidationException".to_owned()),
+                                message,
+                                stack: None,
+                                code: None,
+                            }),
+                            details: Some(Map::from_iter([(
+                                "reason".to_owned(),
+                                json!("strict_tool_limits_exceeded"),
+                            )])),
+                        },
+                    );
+                });
             }
-        },
-        ProviderRetryOptions {
-            // The AWS SDK defaults to standard-mode retries (2 extra
-            // attempts) and ignores `maxRetries` for Bedrock; rpi defaults
-            // to the same 2 when the caller leaves it unset (D-026).
-            max_retries: Some(options.stream.max_retries.unwrap_or(2)),
-            max_retry_delay_ms: options.stream.max_retry_delay_ms,
-            ..Default::default()
-        },
-        options.stream.signal.as_ref(),
-    )
-    .await
-    .map_err(|error| error.message())?;
+        }
+    };
 
     // 70bbe47a9: kept so the error path can still correlate a mid-stream
     // failure — exceptions delivered as stream events carry no HTTP metadata

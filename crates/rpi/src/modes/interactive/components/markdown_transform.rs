@@ -26,21 +26,59 @@ use rpi_tui::components::markdown::MarkdownTransformFn;
 /// upstream always returns a function, but the extension chain is empty).
 pub fn create_markdown_transform(
     message_type: &str,
-    is_streaming: bool,
+    is_streaming: impl Fn() -> bool + Send + Sync + 'static,
     transformers: Vec<MarkdownTransformerFn>,
+) -> Option<MarkdownTransformFn> {
+    create_markdown_transform_with_metadata(message_type, is_streaming, transformers, None, None)
+}
+
+/// `isStreaming` is read per transform call (upstream 0f21a3319), so a
+/// reused Markdown component sees a stream end without being rebuilt.
+pub fn create_markdown_transform_with_metadata(
+    message_type: &str,
+    is_streaming: impl Fn() -> bool + Send + Sync + 'static,
+    transformers: Vec<MarkdownTransformerFn>,
+    message_id: Option<String>,
+    timestamp: Option<String>,
 ) -> Option<MarkdownTransformFn> {
     if transformers.is_empty() {
         return None;
     }
     let message_type = message_type.to_owned();
+    let is_streaming = Arc::new(is_streaming);
     Some(Arc::new(move |markdown: &str, available_width: usize| {
         let context = MarkdownTransformContext {
             message_type: message_type.clone(),
-            is_streaming,
+            is_streaming: is_streaming(),
             available_width,
+            message_id: message_id.clone(),
+            timestamp: timestamp.clone(),
         };
         apply_markdown_transformers(markdown, &context, &transformers)
     }))
+}
+
+pub fn create_header_prefixed_markdown_transform(
+    header: String,
+    message_type: &str,
+    transformers: Vec<MarkdownTransformerFn>,
+    message_id: Option<String>,
+    timestamp: Option<String>,
+) -> MarkdownTransformFn {
+    let transform = create_markdown_transform_with_metadata(
+        message_type,
+        || false,
+        transformers,
+        message_id,
+        timestamp,
+    );
+    Arc::new(move |markdown, width| {
+        let transformed = transform
+            .as_ref()
+            .map(|transform| transform(markdown, width))
+            .unwrap_or_else(|| markdown.to_owned());
+        format!("{header}{transformed}")
+    })
 }
 
 /// `applyMarkdownTransformers` (markdown-transform.ts:11-29): apply each
@@ -85,7 +123,7 @@ mod tests {
     fn empty_transformer_list_returns_none() {
         // markdown-transform.ts + upstream constructor defaults: no
         // transformers means the Markdown renders without a transform.
-        assert!(create_markdown_transform("assistant", false, Vec::new()).is_none());
+        assert!(create_markdown_transform("assistant", || false, Vec::new()).is_none());
     }
 
     #[test]
@@ -95,7 +133,7 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let transform = create_markdown_transform(
             "assistant",
-            true,
+            || true,
             vec![
                 transformer("a", Some(Arc::clone(&seen)), "A"),
                 transformer("b", Some(Arc::clone(&seen)), "B"),
@@ -124,7 +162,7 @@ mod tests {
         let counter_inner = Arc::clone(&counter);
         let transform = create_markdown_transform(
             "assistant-thinking",
-            false,
+            || false,
             vec![Arc::new(move |md, ctx| {
                 counter_inner.fetch_add(1, Ordering::Relaxed);
                 assert_eq!(ctx.message_type, "assistant-thinking");
@@ -136,5 +174,52 @@ mod tests {
         assert_eq!(transform("x", 10), "x");
         assert_eq!(transform("x", 20), "x");
         assert_eq!(counter.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn streaming_flag_is_read_per_transform_call() {
+        // Upstream 0f21a3319: a reused Markdown component must see a stream
+        // end without being rebuilt.
+        let streaming = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let streaming_inner = Arc::clone(&streaming);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_inner = Arc::clone(&seen);
+        let transform = create_markdown_transform(
+            "assistant",
+            move || streaming_inner.load(Ordering::Relaxed),
+            vec![Arc::new(move |md, ctx| {
+                seen_inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(ctx.is_streaming);
+                md
+            })],
+        )
+        .expect("transform");
+        transform("x", 10);
+        streaming.store(false, Ordering::Relaxed);
+        transform("x", 10);
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![true, false]
+        );
+    }
+
+    #[test]
+    fn persisted_metadata_is_forwarded_and_host_header_is_not_transformed() {
+        let transform = create_header_prefixed_markdown_transform(
+            "**Summary**\n\n".to_owned(),
+            "summary",
+            vec![Arc::new(|markdown, context| {
+                assert_eq!(markdown, "body");
+                assert_eq!(context.message_id.as_deref(), Some("entry-7"));
+                assert_eq!(context.timestamp.as_deref(), Some("2026-11-18T00:00:00Z"));
+                assert_eq!(context.message_type, "summary");
+                format!("transformed({markdown})")
+            })],
+            Some("entry-7".to_owned()),
+            Some("2026-11-18T00:00:00Z".to_owned()),
+        );
+        assert_eq!(transform("body", 80), "**Summary**\n\ntransformed(body)");
     }
 }

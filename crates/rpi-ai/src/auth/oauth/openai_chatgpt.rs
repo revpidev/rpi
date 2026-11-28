@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/auth/oauth/openai-chatgpt.ts` @ pi 4a080252f
+//! Port of `packages/ai/src/auth/oauth/openai-chatgpt.ts` @ pi b4afdddf
 //! (v1.0.0, `02eed88fd`) — OpenAI Responses API token sharing through Sign in
 //! with ChatGPT.
 //!
@@ -772,7 +772,7 @@ impl OAuthAuth for OpenAiChatGptOAuth {
         "OpenAI (ChatGPT subscription)"
     }
 
-    /// `isSubscription: true` (providers/openai.ts:15 @ 4a080252f).
+    /// `isSubscription: true` (providers/openai.ts:15 @ b4afdddf).
     fn is_subscription(&self) -> bool {
         true
     }
@@ -806,7 +806,7 @@ impl OAuthAuth for OpenAiChatGptOAuth {
 #[cfg(test)]
 mod tests {
     //! Test intents ported from `packages/ai/test/openai-chatgpt-oauth.test.ts`
-    //! @ pi 4a080252f (v1.4.0), same names in snake_case. The mocked `fetch`
+    //! @ pi b4afdddf (v1.5.2), same names in snake_case. The mocked `fetch`
     //! becomes a loopback axum token endpoint behind the `token_url` seam;
     //! the fixed callback port gets a `callback_port` seam so tests never
     //! collide with a real Codex CLI or another test.

@@ -465,14 +465,14 @@ impl FauxProvider {
                 Some(previous) => {
                     let cached_chars = common_prompt_prefix_length(previous, &prompt);
                     cache_read = estimate_len_tokens(cached_chars);
-                    cache_write = estimate_len_tokens(prompt_length - cached_chars);
-                    input = prompt_tokens.saturating_sub(cache_read);
+                    cache_write = prompt_tokens.saturating_sub(cache_read);
                 }
                 None => {
                     cache_write = prompt_tokens;
                 }
             }
             inner.prompt_cache.insert(session_id.clone(), prompt);
+            input = 0;
         }
 
         Usage {
@@ -829,10 +829,18 @@ async fn stream_with_deltas(
                 });
                 let args_json =
                     serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_owned());
+                // #9265: partial arguments come from the same incremental
+                // parser real providers use, so consumers see them grow.
+                let mut arguments =
+                    rpi_ai::utils::streaming_json::ToolCallArgumentsStream::default();
                 for chunk in split_string_by_token_size(&args_json, min_token_size, max_token_size)
                 {
                     schedule_chunk(&chunk, tokens_per_second).await;
                     abort_if_cancelled!();
+                    arguments.append(&chunk);
+                    if let Some(AssistantContent::ToolCall(cur)) = partial.content.get_mut(index) {
+                        cur.arguments = arguments.arguments().clone();
+                    }
                     let _ = tx.send(StreamEvent::ToolCallDelta {
                         content_index: index,
                         delta: chunk,
@@ -1171,7 +1179,7 @@ mod tests {
         // prompt "user:12345678" = 13 chars → ceil(13/4) = 4 tokens.
         assert_eq!(m1.usage.cache_write, 4);
         assert_eq!(m1.usage.cache_read, 0);
-        assert_eq!(m1.usage.input, 4);
+        assert_eq!(m1.usage.input, 0);
         assert_eq!(m1.usage.output, 1); // "abcd" = 4 chars → 1 token
 
         let e2 = collect(provider.stream_fn()(
@@ -1245,7 +1253,7 @@ mod tests {
         };
         assert_eq!(m2.usage.cache_read, 4);
         assert_eq!(m2.usage.cache_write, 3);
-        assert_eq!(m2.usage.input, 3); // ceil(27/4) - 4
+        assert_eq!(m2.usage.input, 0);
     }
 
     #[tokio::test]

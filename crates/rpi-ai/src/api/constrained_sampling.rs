@@ -59,51 +59,86 @@ pub fn get_grammar_tool_input(
     }
 }
 
-/// `appendGrammarToolInputJsonDelta`.
+/// `appendGrammarToolInputJsonDelta`: append `input_delta` to a streaming
+/// grammar tool input and return the matching piece of its JSON arguments
+/// text, or `None` for an empty delta. Costs time linear in the delta, never in
+/// the input so far.
 pub fn append_grammar_tool_input_json_delta(
     buffer: &mut GrammarToolInputJsonBuffer,
     input_property: &str,
-    next_input: &str,
-    close: bool,
+    input_delta: &str,
 ) -> Result<Option<String>, String> {
     if buffer.closed {
-        if close && next_input == buffer.input {
+        return Err(format!(
+            "grammar tool input for property \"{input_property}\" changed after it was closed"
+        ));
+    }
+    if input_delta.is_empty() {
+        return Ok(None);
+    }
+    buffer.input.push_str(input_delta);
+    let mut delta = grammar_tool_input_json_start(buffer, input_property);
+    // JSON.stringify(inputDelta).slice(1, -1): escape without the quotes.
+    let quoted = serde_json::to_string(input_delta).unwrap_or_default();
+    if quoted.len() >= 2 {
+        delta.push_str(&quoted[1..quoted.len() - 1]);
+    }
+    Ok(Some(delta))
+}
+
+/// `closeGrammarToolInputJson`: close a streaming grammar tool input and
+/// return the rest of its JSON arguments text. `final_input` is the complete
+/// input when the provider sends one; it must continue the input streamed so
+/// far. Closing again with the same input returns `None`.
+pub fn close_grammar_tool_input_json(
+    buffer: &mut GrammarToolInputJsonBuffer,
+    input_property: &str,
+    final_input: Option<&str>,
+) -> Result<Option<String>, String> {
+    if buffer.closed {
+        if final_input.is_none() || final_input == Some(buffer.input.as_str()) {
             return Ok(None);
         }
         return Err(format!(
             "grammar tool input for property \"{input_property}\" changed after it was closed"
         ));
     }
-    if !next_input.starts_with(&buffer.input) {
+    if let Some(final_input) = final_input
+        && !final_input.starts_with(&buffer.input)
+    {
         return Err(format!(
             "grammar tool input for property \"{input_property}\" changed non-monotonically"
         ));
     }
-
-    let input_delta = &next_input[buffer.input.len()..];
-    if !close && input_delta.is_empty() {
-        return Ok(None);
+    let rest = final_input
+        .map(|final_input| &final_input[buffer.input.len()..])
+        .unwrap_or("");
+    if let Some(final_input) = final_input {
+        buffer.input = final_input.to_owned();
     }
-
-    let mut delta = String::new();
-    if !buffer.started {
-        delta.push('{');
-        delta.push_str(&serde_json::to_string(input_property).unwrap_or_default());
-        delta.push_str(":\"");
-        buffer.started = true;
-    }
-    // JSON.stringify(inputDelta).slice(1, -1): escape without the quotes.
-    let quoted = serde_json::to_string(input_delta).unwrap_or_default();
+    buffer.closed = true;
+    let mut delta = grammar_tool_input_json_start(buffer, input_property);
+    let quoted = serde_json::to_string(rest).unwrap_or_default();
     if quoted.len() >= 2 {
         delta.push_str(&quoted[1..quoted.len() - 1]);
     }
-    buffer.input = next_input.to_owned();
-
-    if close {
-        delta.push_str("\"}");
-        buffer.closed = true;
-    }
+    delta.push_str("\"}");
     Ok(Some(delta))
+}
+
+/// The opening of the JSON arguments text, once.
+fn grammar_tool_input_json_start(
+    buffer: &mut GrammarToolInputJsonBuffer,
+    input_property: &str,
+) -> String {
+    if buffer.started {
+        return String::new();
+    }
+    buffer.started = true;
+    format!(
+        "{{{}:\"",
+        serde_json::to_string(input_property).unwrap_or_default()
+    )
 }
 
 fn infer_grammar_input_property(tool: &Tool) -> Result<String, String> {
@@ -363,6 +398,17 @@ pub fn get_json_schema_tool_parameters(tool: &Tool, strict: Option<bool>) -> Res
     } else {
         Ok(tool.parameters.clone())
     }
+}
+
+pub fn prefers_json_schema_strict_sampling(tool: &Tool) -> bool {
+    matches!(
+        tool.constrained_sampling,
+        Some(ConstrainedSampling::Config(
+            ConstrainedSamplingConfig::JsonSchema {
+                strict: ConstrainedSamplingStrict::Prefer,
+            }
+        ))
+    )
 }
 
 /// `resolveJsonSchemaStrictSampling` (:214-222 @ 295cc72b0): `None` = the
@@ -679,33 +725,62 @@ mod tests {
     #[test]
     fn test_append_grammar_tool_input_json_delta() {
         let mut buffer = GrammarToolInputJsonBuffer::default();
-        // No-op delta before close yields None.
+        // No-op delta before the first text yields None.
         assert_eq!(
-            append_grammar_tool_input_json_delta(&mut buffer, "input", "", false),
+            append_grammar_tool_input_json_delta(&mut buffer, "input", ""),
             Ok(None)
         );
         assert_eq!(
-            append_grammar_tool_input_json_delta(&mut buffer, "input", "hel", false),
+            append_grammar_tool_input_json_delta(&mut buffer, "input", "hel"),
             Ok(Some("{\"input\":\"hel".to_owned()))
         );
         assert_eq!(
-            append_grammar_tool_input_json_delta(&mut buffer, "input", "hello", true),
-            Ok(Some("lo\"}".to_owned()))
+            append_grammar_tool_input_json_delta(&mut buffer, "input", "lo"),
+            Ok(Some("lo".to_owned()))
+        );
+        assert_eq!(buffer.input, "hello");
+        assert_eq!(
+            close_grammar_tool_input_json(&mut buffer, "input", None),
+            Ok(Some("\"}".to_owned()))
         );
         assert!(buffer.closed);
         // Idempotent close after closed is a no-op.
         assert_eq!(
-            append_grammar_tool_input_json_delta(&mut buffer, "input", "hello", true),
+            close_grammar_tool_input_json(&mut buffer, "input", None),
             Ok(None)
+        );
+        assert_eq!(
+            close_grammar_tool_input_json(&mut buffer, "input", Some("hello")),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn test_close_grammar_tool_input_json_with_final_input() {
+        let mut buffer = GrammarToolInputJsonBuffer::default();
+        append_grammar_tool_input_json_delta(&mut buffer, "input", "ab").expect("delta");
+        assert_eq!(
+            close_grammar_tool_input_json(&mut buffer, "input", Some("abcd")),
+            Ok(Some("cd\"}".to_owned()))
+        );
+        assert_eq!(buffer.input, "abcd");
+        assert!(buffer.closed);
+        assert_eq!(
+            close_grammar_tool_input_json(&mut buffer, "input", Some("abcd")),
+            Ok(None)
+        );
+        assert_eq!(
+            close_grammar_tool_input_json(&mut buffer, "input", Some("abce")),
+            Err("grammar tool input for property \"input\" changed after it was closed".to_owned())
         );
     }
 
     #[test]
     fn test_append_grammar_tool_input_json_delta_non_monotonic() {
         let mut buffer = GrammarToolInputJsonBuffer::default();
-        append_grammar_tool_input_json_delta(&mut buffer, "input", "abc", false).expect("delta");
+        append_grammar_tool_input_json_delta(&mut buffer, "input", "abc").expect("delta");
         assert_eq!(
-            append_grammar_tool_input_json_delta(&mut buffer, "input", "abx", false),
+            close_grammar_tool_input_json(&mut buffer, "input", Some("abx")),
             Err("grammar tool input for property \"input\" changed non-monotonically".to_owned())
         );
     }

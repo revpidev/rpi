@@ -52,7 +52,7 @@ use crate::types::{
     RegisteredTool, ResolvedCommand, is_session_before_event,
 };
 
-/// `restoreSystemMessages` (runner.ts:284-293 @ 4a080252f): re-attach the
+/// `restoreSystemMessages` (runner.ts:284-293 @ b4afdddf): re-attach the
 /// prompt and tool state after a `context` handler changed the conversation.
 /// The replayed prompt/tool checkpoint becomes one leading system message so
 /// pruning, windowing, or slicing from a compaction summary cannot drop it.
@@ -280,7 +280,7 @@ impl ExtensionRunnerCore {
         ExtensionContext::new(self.runtime.clone(), self.cwd.clone())
     }
 
-    /// `createToolContext` (runner.ts:952-980 @ 4a080252f): the context a
+    /// `createToolContext` (runner.ts:952-980 @ b4afdddf): the context a
     /// tool's `execute` receives; carries the calling id and signal so
     /// `ctx.executeTool()` can run nested calls under it (V16-06 FR-E).
     pub fn create_tool_context(
@@ -555,7 +555,7 @@ impl ExtensionRunnerCore {
     }
 
     /// Renderers of calls to `toolName`: extension resolvers in load order,
-    /// then `base` (runner.ts:790-796 @ 4a080252f, #10285). `base` is the
+    /// then `base` (runner.ts:790-796 @ b4afdddf, #10285). `base` is the
     /// registered tool's renderers; tools without a resolver fall through
     /// unchanged. The chain is synchronous and re-entrancy-free — each
     /// resolver may call `next()` at most as often as it likes, but the
@@ -753,13 +753,31 @@ impl ExtensionRunnerCore {
             .find_map(|ext| ext.message_renderer(custom_type))
     }
 
-    /// `getMarkdownTransformers` (runner.ts:589-591 @ 4181f66): one
-    /// transformer per extension, flattened in load order; extensions
-    /// without a registered transformer contribute nothing.
+    /// `getMarkdownTransformers` (runner.ts:792 @ b4afdddf): each
+    /// registration leaves unlisted message surfaces unchanged.
     pub fn get_markdown_transformers(&self) -> Vec<crate::types::MarkdownTransformerFn> {
         self.extensions
             .iter()
-            .filter_map(|ext| ext.markdown_transformer())
+            .filter_map(|ext| ext.markdown_transformer_registration())
+            .map(|registration| {
+                let transformer = registration.transformer.clone();
+                Arc::new(
+                    move |markdown, context: crate::types::MarkdownTransformContext| {
+                        if registration.matches(&context.message_type) {
+                            transformer(markdown, context)
+                        } else {
+                            markdown
+                        }
+                    },
+                ) as crate::types::MarkdownTransformerFn
+            })
+            .collect()
+    }
+
+    pub fn get_extension_source_infos(&self) -> Vec<crate::types::ExtSourceInfo> {
+        self.extensions
+            .iter()
+            .map(|extension| extension.source_info.clone())
             .collect()
     }
 
@@ -819,7 +837,7 @@ impl ExtensionRunnerCore {
         // `ExtensionRunner.emit()` refuses the boundary events; they are
         // dispatched through `emit_boundary` with the chained
         // `{entries, continue, context}` state (runner.ts:172-189 @
-        // 4a080252f).
+        // b4afdddf).
         if matches!(event_type, EVENT_TURN_END | EVENT_AGENT_BEFORE_SETTLE) {
             self.emit_error(ExtensionError::new(
                 "<boundary>",
@@ -868,7 +886,7 @@ impl ExtensionRunnerCore {
         result
     }
 
-    /// `emitBoundary` (runner.ts:1020-1078 @ 4a080252f): chained
+    /// `emitBoundary` (runner.ts:1020-1078 @ b4afdddf): chained
     /// `{entries, continue}` state over the boundary handlers. After every
     /// handler the caller rebuilds the boundary context preview; a failed
     /// rebuild invalidates the dispatch (drafts and continuation are
@@ -1044,7 +1062,7 @@ impl ExtensionRunnerCore {
     /// non-undefined result field replaces the corresponding event field and
     /// later handlers observe earlier patches. A handler that replaces
     /// `content` without restating `structuredContent` drops it
-    /// (runner.ts:1185-1196 @ 4a080252f; V16-06 FR-C).
+    /// (runner.ts:1185-1196 @ b4afdddf; V16-06 FR-C).
     pub async fn emit_tool_result(&self, payload: Value) -> Option<Value> {
         let mut current_event = payload.clone();
         let mut modified = false;
@@ -1206,7 +1224,7 @@ impl ExtensionRunnerCore {
         }
         Ok(None)
     }
-    /// `emitContext` (runner.ts:1247-1355 @ 4a080252f): the two-phase
+    /// `emitContext` (runner.ts:1247-1355 @ b4afdddf): the two-phase
     /// request-time transform. `context` handlers see the conversation only
     /// and pi restores the prompt/tool state after each; then
     /// `context_with_system` handlers see the full transcript and their

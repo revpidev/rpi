@@ -27,7 +27,7 @@
 //! `ctx.ui.custom()` (`types.ts:197-212`, `tui.ts:111-135` @ `9841914`).
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -121,6 +121,9 @@ struct FrameBuffer {
     lines: Mutex<Vec<String>>,
     cursor: Mutex<Option<ComponentCursor>>,
     cursor_enabled: bool,
+    captures_viewport_input: AtomicBool,
+    generation: AtomicU64,
+    update: Mutex<()>,
 }
 
 /// Per-component runtime state. Self-closing: it owns every handle needed to
@@ -146,7 +149,7 @@ pub(crate) struct MountState {
     capturing: bool,
     disposing: AtomicBool,
     closed: AtomicBool,
-    dialog_open: AtomicBool,
+    dialog_depth: AtomicUsize,
     blur_for_dialog: AtomicBool,
     done: Mutex<Option<Value>>,
     last_resize: Mutex<Option<(usize, usize)>>,
@@ -190,7 +193,7 @@ impl MountState {
             capturing,
             disposing: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            dialog_open: AtomicBool::new(false),
+            dialog_depth: AtomicUsize::new(0),
             blur_for_dialog: AtomicBool::new(false),
             done: Mutex::new(None),
             last_resize: Mutex::new(None),
@@ -458,7 +461,7 @@ impl MountState {
     /// Apply the requested visibility to the mount point (R-U4.3).
     /// Idempotent per `mounted`; skipped while a dialog owns the screen.
     fn apply_visibility(&self) {
-        if self.is_closed() || self.dialog_open.load(Ordering::SeqCst) {
+        if self.is_closed() || self.dialog_depth.load(Ordering::SeqCst) > 0 {
             return;
         }
         let hidden = self.hidden.load(Ordering::SeqCst);
@@ -501,7 +504,7 @@ impl MountState {
 
     /// Host dialog opened (R-U2.2): the component loses focus and is told so.
     fn dialog_opened(&self) {
-        if self.is_closed() || self.dialog_open.swap(true, Ordering::SeqCst) {
+        if self.is_closed() || self.dialog_depth.fetch_add(1, Ordering::SeqCst) > 0 {
             return;
         }
         // Editor-region components lose their mount to the dialog (the region
@@ -528,7 +531,13 @@ impl MountState {
     /// component was focused before AND is still visible. A component that
     /// became visible while the dialog was open is mounted now.
     fn dialog_closed(&self) {
-        if !self.dialog_open.swap(false, Ordering::SeqCst) || self.is_closed() {
+        let previous = self
+            .dialog_depth
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |depth| {
+                Some(depth.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        if previous != 1 || self.is_closed() {
             return;
         }
         let restore_focus = self.blur_for_dialog.swap(false, Ordering::SeqCst);
@@ -563,7 +572,12 @@ impl MountState {
 
     /// Update the last frame (R-U1.3). Validation happens in
     /// [`ComponentRegistry::render`]; this only stores + redraws.
-    fn set_frame(&self, frame: &ComponentFrame) {
+    fn set_frame(&self, frame: &ComponentFrame) -> bool {
+        let generation = self.frame.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let _update = self.frame.update.lock().unwrap_or_else(|e| e.into_inner());
+        if self.frame.generation.load(Ordering::SeqCst) != generation {
+            return false;
+        }
         {
             let mut lines = self
                 .frame
@@ -580,7 +594,12 @@ impl MountState {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *cursor = frame.cursor;
         }
+        self.frame.captures_viewport_input.store(
+            frame.captures_viewport_input.unwrap_or(false),
+            Ordering::SeqCst,
+        );
         self.mount.request_render();
+        true
     }
 
     /// Effective tick interval (V14-22 C2; R-U5.1): `tickMs` clamped to the
@@ -782,6 +801,10 @@ struct HostComponentProxy {
 }
 
 impl Component for HostComponentProxy {
+    fn captures_viewport_input(&self) -> bool {
+        self.frame.captures_viewport_input.load(Ordering::SeqCst)
+    }
+
     fn render(&self, width: usize) -> Vec<String> {
         if let Some(state) = self.state.upgrade() {
             state.on_render_width(width);
@@ -817,7 +840,7 @@ impl Focusable for HostComponentProxy {
             // The TUI is the authority on keyboard focus; the flag is used
             // only to decide blur/focus event delivery (R-U2.2). No events
             // are emitted here — the host dialog hooks own that contract.
-            if focused || !state.dialog_open.load(Ordering::SeqCst) {
+            if focused || state.dialog_depth.load(Ordering::SeqCst) == 0 {
                 state.focused.store(focused, Ordering::SeqCst);
             }
         }
@@ -978,6 +1001,9 @@ pub(crate) struct ComponentRegistry {
     /// ADR-0043: host verdict callback for unprocessed external answers
     /// (delivered but never polled before the mount closes).
     answer_verdict_sink: Mutex<Option<AnswerVerdictSink>>,
+    /// Number of nested host dialogs currently owning the screen. New mounts
+    /// defer their editor region until every dialog has closed.
+    dialog_depth: AtomicUsize,
 }
 
 impl Default for ComponentRegistry {
@@ -1001,6 +1027,7 @@ impl ComponentRegistry {
             dispose_grace,
             lifecycle_limit: None,
             answer_verdict_sink: Mutex::new(None),
+            dialog_depth: AtomicUsize::new(0),
         }
     }
 
@@ -1176,6 +1203,9 @@ impl ComponentRegistry {
             lines: Mutex::new(Vec::new()),
             cursor: Mutex::new(None),
             cursor_enabled: options.cursor,
+            captures_viewport_input: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            update: Mutex::new(()),
         });
         let state = Arc::new(MountState::new(
             handle,
@@ -1233,6 +1263,7 @@ impl ComponentRegistry {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id);
         }
 
+        let dialog_depth = self.dialog_depth.load(Ordering::SeqCst);
         if options.overlay {
             let terminal_width = mount.terminal_size().0;
             let geometry = overlay_options(options.overlay_options.as_ref(), terminal_width);
@@ -1242,9 +1273,10 @@ impl ComponentRegistry {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(overlay);
             }
-        } else {
+        } else if dialog_depth == 0 {
             mount.show_editor_region(Arc::clone(&entry));
         }
+        state.dialog_depth.store(dialog_depth, Ordering::SeqCst);
         if let Some(sink) = self
             .answer_verdict_sink
             .lock()
@@ -1253,9 +1285,11 @@ impl ComponentRegistry {
         {
             state.set_answer_verdict_sink(sink);
         }
-        state.mounted.store(true, Ordering::SeqCst);
+        state
+            .mounted
+            .store(dialog_depth == 0 || options.overlay, Ordering::SeqCst);
         state.focused.store(
-            capturing && options.overlay || !options.overlay,
+            dialog_depth == 0 && (capturing && options.overlay || !options.overlay),
             Ordering::SeqCst,
         );
         state.log("mount", options.label.clone());
@@ -1304,7 +1338,9 @@ impl ComponentRegistry {
             state.log("frameTooLarge", Some(error.message.clone()));
             return Err(error);
         }
-        state.set_frame(&frame);
+        if !state.set_frame(&frame) {
+            return Ok(());
+        }
         if frame.is_done() {
             let done = frame.done.value().cloned();
             state.close(done);
@@ -1416,12 +1452,22 @@ impl ComponentRegistry {
 
     /// Host dialog opened/closed hooks (R-U2.2 / R-U10).
     pub(crate) fn dialog_opened(&self) {
+        self.dialog_depth.fetch_add(1, Ordering::SeqCst);
         for state in self.states() {
             state.dialog_opened();
         }
     }
 
     pub(crate) fn dialog_closed(&self) {
+        let previous = self
+            .dialog_depth
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |depth| {
+                Some(depth.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        if previous == 0 {
+            return;
+        }
         for state in self.states() {
             state.dialog_closed();
         }
@@ -2229,6 +2275,80 @@ mod interactive_component {
     // -- §4.4 input / focus / hidden / dialog matrix -----------------------
 
     #[tokio::test]
+    async fn component_registry_defers_an_inline_mount_while_a_dialog_is_open() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        registry.dialog_opened();
+        let handle = mount_overlay(
+            &registry,
+            &mount,
+            MountOptions {
+                overlay: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            mount.editor_shows.load(Ordering::SeqCst),
+            0,
+            "an inline component must not cover an open dialog"
+        );
+        assert!(
+            !registry
+                .lookup("ext", handle)
+                .expect("state")
+                .mounted
+                .load(Ordering::SeqCst)
+        );
+        registry.dialog_closed();
+        assert_eq!(
+            mount.editor_shows.load(Ordering::SeqCst),
+            1,
+            "dialog close lands the deferred inline mount"
+        );
+        assert_eq!(
+            registry.poll("ext", handle).await.unwrap(),
+            ComponentEvent::Focus
+        );
+    }
+
+    #[tokio::test]
+    async fn component_registry_nested_dialogs_keep_inline_mount_deferred_until_all_close() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        registry.dialog_opened();
+        registry.dialog_opened();
+        let handle = mount_overlay(
+            &registry,
+            &mount,
+            MountOptions {
+                overlay: false,
+                ..Default::default()
+            },
+        );
+        registry.dialog_closed();
+        assert_eq!(
+            mount.editor_shows.load(Ordering::SeqCst),
+            0,
+            "closing one nested dialog must not expose the inline mount"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                registry.poll("ext", handle)
+            )
+            .await
+            .is_err(),
+            "focus must stay with the remaining dialog"
+        );
+        registry.dialog_closed();
+        assert_eq!(mount.editor_shows.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry.poll("ext", handle).await.unwrap(),
+            ComponentEvent::Focus
+        );
+    }
+
+    #[tokio::test]
     async fn component_registry_input_focus_and_dialog_matrix() {
         let registry = ComponentRegistry::new();
         let mount = Arc::new(FakeMountPoint::with_size(80, 24));
@@ -2427,6 +2547,82 @@ mod interactive_component {
         registry.dispose("ext", handle).expect("dispose");
     }
 
+    #[test]
+    fn component_registry_viewport_capture_tracks_latest_frame_and_rejects_stale() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let handle = mount_overlay(&registry, &mount, MountOptions::default());
+        let state = registry.lookup("ext", handle).expect("state");
+        let component = state.entry.lock().unwrap().clone().expect("proxy");
+        assert!(
+            !component
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .captures_viewport_input()
+        );
+
+        registry
+            .render(
+                "ext",
+                handle,
+                ComponentFrame {
+                    lines: vec!["capturing".to_owned()],
+                    captures_viewport_input: Some(true),
+                    ..Default::default()
+                },
+            )
+            .expect("capture");
+        assert!(
+            component
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .captures_viewport_input()
+        );
+        registry
+            .render(
+                "ext",
+                handle,
+                ComponentFrame {
+                    lines: vec!["not capturing".to_owned()],
+                    captures_viewport_input: Some(false),
+                    ..Default::default()
+                },
+            )
+            .expect("release");
+        assert!(
+            !component
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .captures_viewport_input()
+        );
+
+        std::thread::scope(|scope| {
+            let gate = state.frame.update.lock().unwrap_or_else(|e| e.into_inner());
+            let before = state.frame.generation.load(Ordering::SeqCst);
+            let worker_state = Arc::clone(&state);
+            let worker = scope.spawn(move || {
+                worker_state.set_frame(&ComponentFrame {
+                    lines: vec!["stale".to_owned()],
+                    captures_viewport_input: Some(true),
+                    ..Default::default()
+                })
+            });
+            while state.frame.generation.load(Ordering::SeqCst) == before {
+                std::thread::yield_now();
+            }
+            state.frame.generation.fetch_add(10, Ordering::SeqCst);
+            drop(gate);
+            assert!(!worker.join().expect("frame worker"));
+        });
+        assert!(
+            !component
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .captures_viewport_input()
+        );
+        assert_eq!(render_entry(&registry, 80), vec!["not capturing"]);
+    }
+
     // -- §4.5 rendering and cursor -----------------------------------------
 
     #[test]
@@ -2442,6 +2638,7 @@ mod interactive_component {
                     lines: vec!["abcdef".to_owned(), "a\u{1b}[31mred\u{1b}[39mz".to_owned()],
                     cursor: Some(ComponentCursor { row: 0, col: 3 }),
                     done: rpi_ext_host::interactive_ui::DoneValue::Absent,
+                    captures_viewport_input: Some(false),
                 },
             )
             .expect("render");
@@ -2483,6 +2680,7 @@ mod interactive_component {
                     lines: vec![format!("ab{CURSOR_MARKER}cd")],
                     cursor: Some(ComponentCursor { row: 0, col: 1 }),
                     done: rpi_ext_host::interactive_ui::DoneValue::Absent,
+                    captures_viewport_input: Some(false),
                 },
             )
             .expect("render");
@@ -2506,6 +2704,7 @@ mod interactive_component {
                     lines: vec![format!("ab{CURSOR_MARKER}cd")],
                     cursor: Some(ComponentCursor { row: 0, col: 2 }),
                     done: rpi_ext_host::interactive_ui::DoneValue::Absent,
+                    captures_viewport_input: Some(false),
                 },
             )
             .expect("render");
@@ -2524,6 +2723,7 @@ mod interactive_component {
             lines: vec!["你好".to_owned()],
             cursor: Some(ComponentCursor { row: 0, col }),
             done: rpi_ext_host::interactive_ui::DoneValue::Absent,
+            captures_viewport_input: Some(false),
         };
         // Column 1 is inside the first wide grapheme → snaps to column 0.
         registry.render("ext", handle, frame_at(1)).expect("render");

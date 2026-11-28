@@ -153,6 +153,7 @@ pub struct ResolvedOpenAIResponsesCompat {
     /// true; some Codex-protocol gateways reject the field.
     pub supports_max_output_tokens: bool,
     pub supports_mid_convo_effort: bool,
+    pub prompt_cache_key_mode: crate::types::PromptCacheKeyMode,
 }
 
 /// `getCompat` (openai-responses).
@@ -192,6 +193,9 @@ pub fn get_compat(model: &Model) -> ResolvedOpenAIResponsesCompat {
         supports_mid_convo_effort: compat
             .and_then(|compat| compat.supports_mid_convo_effort)
             .unwrap_or(false),
+        prompt_cache_key_mode: compat
+            .and_then(|compat| compat.prompt_cache_key_mode)
+            .unwrap_or_default(),
     }
 }
 
@@ -252,7 +256,7 @@ fn get_prompt_cache_options(
 /// completions there is no `sendSessionAffinityHeaders` gate and no
 /// `x-session-affinity` header: a session id is always sent when present —
 /// openrouter gets `x-session-id`; every other format gets
-/// `x-client-request-id`, plus `session_id` for the openai format.
+/// `x-client-request-id`, plus `session-id` for the openai format.
 pub fn build_client_headers(
     model: &Model,
     context: &TranscriptContext,
@@ -287,7 +291,7 @@ pub fn build_client_headers(
                 headers.insert("x-session-id".to_owned(), Some(session_id.to_owned()));
             }
             SessionAffinityFormat::Openai => {
-                headers.insert("session_id".to_owned(), Some(session_id.to_owned()));
+                headers.insert("session-id".to_owned(), Some(session_id.to_owned()));
                 headers.insert(
                     "x-client-request-id".to_owned(),
                     Some(session_id.to_owned()),
@@ -368,6 +372,7 @@ pub fn build_params(
         "stream": true,
     });
     if cache_retention != CacheRetention::None
+        && compat.prompt_cache_key_mode != crate::types::PromptCacheKeyMode::Disabled
         && let Some(key) = clamp_openai_prompt_cache_key(options.stream.session_id.as_deref())
     {
         params["prompt_cache_key"] = json!(key);
@@ -1439,7 +1444,8 @@ mod tests {
         );
         // Responses variant: no sendSessionAffinityHeaders gate, no
         // x-session-affinity.
-        assert_eq!(headers.get("session_id"), Some(&Some("sess".to_owned())));
+        assert_eq!(headers.get("session-id"), Some(&Some("sess".to_owned())));
+        assert!(!headers.contains_key("session_id"));
         assert_eq!(
             headers.get("x-client-request-id"),
             Some(&Some("sess".to_owned()))
@@ -1455,6 +1461,7 @@ mod tests {
         let headers =
             build_client_headers(&m, &ctx, "key", None, None, Some("sess"), &get_compat(&m));
         assert_eq!(headers.get("x-session-id"), Some(&Some("sess".to_owned())));
+        assert!(!headers.contains_key("session-id"));
         assert!(!headers.contains_key("session_id"));
         assert!(!headers.contains_key("x-client-request-id"));
     }
@@ -1465,6 +1472,7 @@ mod tests {
         let ctx = common::context(vec![common::user_text("hi")], None);
         let headers =
             build_client_headers(&m, &ctx, "key", None, None, Some("sess"), &get_compat(&m));
+        assert!(!headers.contains_key("session-id"));
         assert!(!headers.contains_key("session_id"));
         assert_eq!(
             headers.get("x-client-request-id"),
@@ -1794,6 +1802,7 @@ mod tests {
                 cache_read: 2.0,
                 cache_write: 6.0,
                 total: 20.0,
+                total_from_provider: Some(false),
             },
             ..Usage::default()
         };
@@ -1812,6 +1821,7 @@ mod tests {
                 cache_read: 2.0,
                 cache_write: 6.0,
                 total: 20.0,
+                total_from_provider: Some(false),
             },
             ..Usage::default()
         };

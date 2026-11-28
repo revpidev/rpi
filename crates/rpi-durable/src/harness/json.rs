@@ -1,5 +1,5 @@
 //! Leaf-wise JSON assignment (port of `packages/durable/src/harness/json.ts`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 //!
 //! Chord records a container assignment as one full set and only emits an append
 //! when a string leaf is reassigned with a longer string. Writing a partial whole
@@ -128,6 +128,49 @@ mod tests {
         let mut target = json!([1, 2]);
         assign_json_index(&mut target, 3, json!(4));
         assert_eq!(target, json!([1, 2, null, 4]));
+    }
+
+    #[test]
+    fn partial_arguments_merge_own_keys_without_touching_reserved_names() {
+        let mut target = json!({
+            "generation": {
+                "message": {
+                    "content": [{
+                        "type": "toolCall",
+                        "id": "c1",
+                        "name": "demo",
+                        "arguments": "{\"city\":\"Par",
+                        "__proto__": { "polluted": false }
+                    }]
+                }
+            }
+        });
+        assign_json(
+            &mut target["generation"]["message"]["content"][0],
+            "arguments",
+            json!("{\"city\":\"Paris\",\"count\":1}"),
+        );
+        assign_json(
+            &mut target["generation"]["message"]["content"][0],
+            "__proto__",
+            json!({ "polluted": true }),
+        );
+        assert_eq!(
+            target["generation"]["message"]["content"][0]["arguments"],
+            json!("{\"city\":\"Paris\",\"count\":1}")
+        );
+        assert_eq!(
+            target["generation"]["message"]["content"][0]["__proto__"],
+            json!({ "polluted": true })
+        );
+        assert_eq!(
+            target["generation"]["message"]["content"][0]["id"],
+            json!("c1")
+        );
+        assert_eq!(
+            target["generation"]["message"]["content"][0]["name"],
+            json!("demo")
+        );
     }
 
     #[test]

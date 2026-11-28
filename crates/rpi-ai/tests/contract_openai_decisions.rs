@@ -582,6 +582,7 @@ fn create_provider_filter_all_models_hook_wins() {
             }))
             .expect("chat"),
         )],
+        shared_all_models: None,
         classifiers: std::collections::HashMap::from([(
             OPENAI_DECISIONS_API.to_owned(),
             openai_decisions_api(),

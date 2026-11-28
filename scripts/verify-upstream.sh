@@ -39,6 +39,10 @@ if [[ -z "$EXPECTED" ]]; then
 fi
 check_pin external/pi "$EXPECTED"
 
+# V19-00: verify both the retired regression track and the current target
+# track, including their immutable source trees and the reviewed range.
+python3 scripts/verify-pi-tracks.py
+
 # Plugin reference pins: one `| \`external/<name>\` | \`<sha>\` |` row per
 # submodule in UPSTREAM.md's plugin pin table.
 while IFS='|' read -r _ dir sha _; do

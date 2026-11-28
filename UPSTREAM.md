@@ -6,23 +6,27 @@ The behavioral gold standard of this repository is fixed to the following Pi ver
 |------|-------|
 | Remote | https://github.com/earendil-works/pi.git |
 | Local | `external/pi/` |
-| npm version | `1.4.0` (coding-agent; released tag, no unreleased commits included) |
-| Git commit | `4a080252f06caf63a525d7873c5d94d3c23887e0` |
-| Short hash | `4a080252f` |
-| Commit message | `Release v1.4.0` |
-| Commit date | 2026-10-22 |
+| npm version | `1.5.2` (coding-agent; released tag, no unreleased commits included) |
+| Git commit | `b4afdddf44e059c67ccf5097e5317d913521b470` |
+| Short hash | `b4afdddf` |
+| Commit message | `Release v1.5.2` |
+| Commit date | 2026-11-10 |
 
 Plugin reference pins (move only via the same ADR process; verified by `scripts/verify-upstream.sh`):
 
 | Submodule | Git commit | Upstream tag |
 |------|-------|------|
-| `external/pi-subagents` | `3a63e0ad8898cf116ce671feabb0f8a7b31731a4` | v0.83.0 |
+| `external/pi-subagents` | `83cf25f86b6a70ab917a7e198d0153bc32309f29` | v0.88.1 |
 | `external/rpiv-mono` | `ce6d3530410812ca504ec294995581a52170f9e1` | v2.15.0 |
-| `external/agent-smart-fetch` | `b01116124971de44f16a4477e34c06ba2ab1d0bf` | v0.3.17 |
+| `external/agent-smart-fetch` | `feb6da001161021df6c2de550f225ed5306a671f` | v0.3.23 |
 
-Upgrade note: v0.1.8 re-baselined (ADR-0038, 2026-10-26, including the V18-00 startup recheck) from `abe508e1b` (v1.1.0, ADR-0036) to `4a080252f` (**v1.4.0 tag itself**), spanning 225 commits / 906 files (+73831/−42639) across three release cycles (v1.2.0 / v1.3.0 / v1.4.0). The reviewed host scope covers settings and schemas; extension startup, busy state, dialogs and tool reachability; session restore and compaction; provider/catalog, transport, auth, classifier and client identity changes; codemode and built-in MCP; CLI/TUI/platform fixes; and the durable runtime/storage increments. Kimi custom base URLs must include `/v1`; durable schema v2 and its runtime API changes are explicit BREAKING surfaces. The implementation and parity work was tracked separately in V18-01–V18-10 and TE51–TE53; those tasks are complete and independently reviewed, and the v0.1.8 release itself remains pending the manual close-out (release notes, dry-run, tag, Release, endpoints and issue closing are human-initiated per ADR-0042). `session-manager.ts` and `packages/agent/src/types.ts` have no diff in this range, while `core/export-html` has five changed files (+62/−46), including the new CJK vendor asset; V18-00 owns the deterministic six-asset synchronizer, CJK consumption and real export smoke, and V18-04 owns the behavioral review. Plugin reference pins moved under ADR-0038 with TE51: pi-subagents `3a63e0ad` (v0.83.0) and rpiv-mono `ce6d3530` (v2.15.0); agent-smart-fetch remains `b0111612` (v0.3.17). The TE51 ledger records every commit classification, the target/regression parity tracks stay reproducible, and the pinned submodule trees are read-only. The mcp-adapter startup/update removal guidance was removed in V18-02 under ADR-0038 without restoring the plugin or deleting user files. Post-tag main overflow — Pi +67, pi-subagents +1 documentation-only commit, rpiv-mono +3 — is excluded; any newer stable tag requires another ADR review and user confirmation. ADR-0036's non-pin decisions continue except where ADR-0038 explicitly changes them; ADR-0037 is only partially superseded for that guidance. The change requirements, task evidence and design live in the separate documentation repository (not public).
+Upgrade note: v0.1.9 re-baselined (ADR-0048, including the V19-00 startup recheck) from `4a080252f` (v1.4.0, ADR-0038) to `b4afdddf` (**v1.5.2 tag itself**), spanning 703 commits / 3211 files (+483679/−39196) across v1.5.0, v1.5.1 and v1.5.2. The reviewed host scope covers provider/catalog and schema changes; session, extension, tool and terminal behavior; codemode and built-in MCP; durable runtime/storage; and the upstream Markdown/highlight reuse (#10971) and incremental tool-argument parsing (#9265) performance mechanisms. Implementation is split across V19-01–V19-07; this pin change does not claim that those behaviors are already ported. The V19-00 target/regression configuration fixes the v1.5.2 target tree `ed418d79cb44d3690f110e1077c4612db033f2c9` and the v1.4.0 regression tree `56ea45bfd3ef589feaddfaf504cfc08d838d812b`; verify both with `python3 scripts/verify-pi-tracks.py`.
 
-Current baseline: v0.1.8 pins `4a080252f` (v1.4.0, 2026-10-22, ADR-0038). Historical baselines: v0.1.7 pinned `abe508e1b` (v1.1.0, 2026-10-07, ADR-0036); v0.1.6 initially pinned `f07218c4d` (v0.87.1, 2026-09-22, ADR-0032), re-baselined mid-cycle to `005af57d8` (v0.99.2, 2026-09-30, ADR-0034) and again to `a13d35a74` (v1.0.0, 2026-10-01, ADR-0035); v0.1.5 pinned `19451accd` (v0.86.1+1, 2026-09-20, ADR-0031; initial pin `d1230ea` v0.86.0+2, ADR-0029, re-pinned in-cycle the same day); v0.1.4 pinned `9841914c` (v0.85.0+, 2026-09-05, ADR-0023); v0.11 pinned `4181f66e` (v0.84.1+, 2026-08-08, ADR-0012); v0.1 pinned `2efa728d` (v0.82.1, 2026-07-27).
+V19-03 switched the two plugin gitlinks atomically after its implementation, dual-track, specification and changelog gates: pi-subagents v0.88.1 `83cf25f86b6a70ab917a7e198d0153bc32309f29` (upgraded from the original v0.88.0 target after explicit user confirmation during the V19-00 startup recheck) and agent-smart-fetch v0.3.23 `feb6da001161021df6c2de550f225ed5306a671f`; rpiv-mono remains v2.15.0. Post-tag main overflow measured at V19-00 startup — Pi +262, pi-subagents +14 after v0.88.1, rpiv-mono +12, smart-fetch +0 — is excluded. Any newer stable tag requires another ADR review and user confirmation. ADR-0038 is now a historical pin record; its non-pin decisions continue except where ADR-0048 explicitly changes them. The change requirements, task evidence and design live in the separate documentation repository (not public).
+
+At the V19-08 closeout (2026-11-26) upstream had released newer stables after the pin was adopted — Pi v1.6.0 (2026-11-20) and v1.6.1 (2026-11-25), pi-subagents v0.89.0 through v0.90.0 — while rpiv-mono (v2.15.0) and agent-smart-fetch (v0.3.23) were unchanged. The maintainer re-confirmed the v1.5.2 / v0.88.1 / v2.15.0 / v0.3.23 pins for v0.1.9 (ADR-0048 closeout amendment): the v0.1.9 scope, parity evidence and release notes stay on v1.5.2, and moving to a newer stable is a separate ADR for the next version. The gitlinks above are unchanged.
+
+Current baseline: the v0.1.9 development branch pins `b4afdddf` (v1.5.2, 2026-11-10, ADR-0048). Historical baselines: v0.1.8 pinned `4a080252f` (v1.4.0, 2026-10-22, ADR-0038); v0.1.7 pinned `abe508e1b` (v1.1.0, 2026-10-07, ADR-0036); v0.1.6 initially pinned `f07218c4d` (v0.87.1, 2026-09-22, ADR-0032), re-baselined mid-cycle to `005af57d8` (v0.99.2, 2026-09-30, ADR-0034) and again to `a13d35a74` (v1.0.0, 2026-10-01, ADR-0035); v0.1.5 pinned `19451accd` (v0.86.1+1, 2026-09-20, ADR-0031; initial pin `d1230ea` v0.86.0+2, ADR-0029, re-pinned in-cycle the same day); v0.1.4 pinned `9841914c` (v0.85.0+, 2026-09-05, ADR-0023); v0.11 pinned `4181f66e` (v0.84.1+, 2026-08-08, ADR-0012); v0.1 pinned `2efa728d` (v0.82.1, 2026-07-27).
 
 Intentional differences established by ADR (outside the gold standard): product endpoint defaults moved to `revpi.dev` (including the Cloudflare Pages deployment in the rpi-pages repository); the override chain and upstream endpoint configurability semantics are unchanged.
 
@@ -30,5 +34,5 @@ Verification:
 
 ```bash
 cd external/pi && git rev-parse HEAD
-# expected: 4a080252f06caf63a525d7873c5d94d3c23887e0
+# expected: b4afdddf44e059c67ccf5097e5317d913521b470
 ```

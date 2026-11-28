@@ -68,6 +68,11 @@ const ACTIVITY_TICK_MS: u64 = 1000;
 const ABORT_POLL_MS: u64 = 500;
 
 pub const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
+/// S39 (#3245): a final assistant response that hit the output-token limit is
+/// a failure; the partial text is still returned.
+pub const TRUNCATED_RESPONSE_ERROR: &str =
+    "Response was truncated: the model reached its maximum output length.";
 const FINAL_STOP_GRACE_MS: u64 = 1000;
 const TIMEOUT_SIGINT_TO_TERM_MS: u64 = 1000;
 const TIMEOUT_TERM_TO_KILL_MS: u64 = 4000;
@@ -325,9 +330,14 @@ fn signal_pid(pid: u32, signal: Signal) {
             Signal::Term => libc::SIGTERM,
             Signal::Kill => libc::SIGKILL,
         };
-        // Safety: kill(2) with a checked pid.
+        // Safety: kill(2) with a checked pid. The child is its own process
+        // group leader (`process_group(0)`), so signal the whole group first
+        // to terminate a launcher wrapper's children too; fall back to the
+        // direct pid if the group is already gone.
         unsafe {
-            libc::kill(pid as i32, signum);
+            if libc::kill(-(pid as i32), signum) != 0 {
+                libc::kill(pid as i32, signum);
+            }
         }
     }
     #[cfg(not(unix))]
@@ -357,6 +367,8 @@ pub struct ForegroundRunInput {
     pub agent_tools: Option<Vec<String>>,
     /// #1776 (R7.1.4.2): agent deny-list → `--exclude-tools`.
     pub agent_exclude_tools: Vec<String>,
+    /// S32/S47: agent `mcp:server.tool` selectors.
+    pub mcp_direct_tools: Vec<String>,
     /// Agent `mutationTools` (long-running guard classification).
     pub mutation_tools: Vec<String>,
     pub agent_extensions: Option<Vec<String>>,
@@ -371,11 +383,21 @@ pub struct ForegroundRunInput {
     pub diff_baseline: Option<String>,
     /// Resolved tool budget env value (#2302); `None` leaves the env unset.
     pub tool_budget_env: Option<String>,
+    /// S17: raw structured_output schema for this child.
+    pub output_schema: Option<Value>,
     /// Parent session's project-trust decision (#2570); `Some(false)` adds
     /// `--no-approve` to the child argv.
     pub project_trusted: Option<bool>,
     pub agent_inherit_project_context: bool,
+    /// `inheritGlobalContext` (#3206) — see `BuildArgsInput`.
+    pub agent_inherit_global_context: bool,
     pub agent_inherit_skills: bool,
+    /// V19-03 S11: the resolved runner launcher (recorded in the trusted
+    /// recovery record; the argv below wraps the spawn).
+    #[allow(dead_code)]
+    pub launcher: Option<crate::recovery::LauncherRecord>,
+    /// The launcher argv (`[...launcher argv, program, ...args]`).
+    pub launcher_argv: Option<Vec<String>>,
     pub task: String,
     pub task_delivery: Option<TaskDelivery>,
     pub cwd: PathBuf,
@@ -455,6 +477,9 @@ pub struct ForegroundRunResult {
     /// labeled in `final_output`, never satisfies acceptance, and is never
     /// written to a bound output file.
     pub output_partial: bool,
+    /// S40 (#3227): a terminal acceptance report closed guidance; steer and
+    /// follow-up requests must be rejected until an explicit resume.
+    pub acceptance_final: bool,
     pub tool_count: u64,
     /// Assistant turns (`AgentProgress.turnCount` terminal projection).
     pub turns: u64,
@@ -829,6 +854,15 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         )
     });
 
+    let effective_agent_tools = if input.output_schema.is_some() {
+        let mut tools = input.agent_tools.clone().unwrap_or_default();
+        if !tools.iter().any(|tool| tool == "structured_output") {
+            tools.push("structured_output".to_string());
+        }
+        Some(tools)
+    } else {
+        input.agent_tools.clone()
+    };
     let launch = args::build_rpi_args(&BuildArgsInput {
         base_args: vec!["--mode".into(), "json".into(), "-p".into()],
         task: input.task.clone(),
@@ -841,13 +875,14 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         system_prompt: Some(input.agent_system_prompt.clone()),
         system_prompt_mode: input.agent_system_prompt_mode,
         inherit_project_context: input.agent_inherit_project_context,
+        inherit_global_context: input.agent_inherit_global_context,
         inherit_skills: input.agent_inherit_skills,
         require_read_tool: false,
-        tools: input.agent_tools.clone(),
+        tools: effective_agent_tools,
         exclude_tools: input.agent_exclude_tools.clone(),
         extensions: input.agent_extensions.clone(),
         subagent_only_extensions: input.agent_subagent_only_extensions.clone(),
-        mcp_direct_tools: Vec::new(),
+        mcp_direct_tools: input.mcp_direct_tools.clone(),
         prompt_file_stem: Some(input.agent_name.clone()),
         run_id: Some(input.run_id.clone()),
         child_agent_name: Some(input.agent_name.clone()),
@@ -868,10 +903,26 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         project_trusted: input.project_trusted,
     });
 
-    let launch = match launch {
+    let mut launch = match launch {
         Ok(launch) => launch,
         Err(error) => return failed_result(input, artifact_paths, start, error.to_string()),
     };
+    if let Some(schema) = &input.output_schema {
+        launch.env.insert(
+            "RPI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA".into(),
+            Some(serde_json::to_string(schema).unwrap_or_default()),
+        );
+        launch.env.insert(
+            "RPI_SUBAGENT_STRUCTURED_OUTPUT_PATH".into(),
+            Some(
+                launch
+                    .temp_dir
+                    .join("structured-output.json")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        );
+    }
 
     // Depth env rides on top of the shared env (execution.ts:476). #2440:
     // strip inherited Git routing variables so a child's Git commands act on
@@ -893,7 +944,10 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         env.insert(key, value);
     }
 
-    let spawn_command = binary::resolve_spawn_command(&launch.args);
+    let spawn_command = binary::apply_launcher(
+        binary::resolve_spawn_command(&launch.args),
+        input.launcher_argv.as_deref(),
+    );
     let mut command = Command::new(&spawn_command.program);
     command
         .args(&spawn_command.args)
@@ -1001,30 +1055,36 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     let drain_exited = child_exited.clone();
 
     // Timeout ladder: SIGINT → 1s → SIGTERM → 4s → SIGKILL (1021-1044).
+    // S38 (#3246/#3248): the budget is monotonic and pauses while the child
+    // blocks on a supervisor decision/interview.
     let timeout_ms = input.timeout_ms;
     let timed_out_flag = timed_out.clone();
     let timeout_exited = child_exited.clone();
-    let timeout_task = tokio::spawn(async move {
-        let Some(timeout_ms) = timeout_ms else {
-            return;
-        };
-        tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
-        timed_out_flag.store(true, Ordering::SeqCst);
-        if timeout_exited.load(Ordering::SeqCst) {
-            return;
-        }
-        signal_pid(child_pid, Signal::Int);
-        tokio::time::sleep(Duration::from_millis(TIMEOUT_SIGINT_TO_TERM_MS)).await;
-        if timeout_exited.load(Ordering::SeqCst) {
-            return;
-        }
-        signal_pid(child_pid, Signal::Term);
-        tokio::time::sleep(Duration::from_millis(TIMEOUT_TERM_TO_KILL_MS)).await;
-        if !timeout_exited.load(Ordering::SeqCst) {
-            signal_pid(child_pid, Signal::Kill);
-        }
+    let timeout_task = timeout_ms.map(|timeout_ms| {
+        crate::runner::pausable::PausableTimeout::start(
+            Duration::from_millis(timeout_ms),
+            move || {
+                timed_out_flag.store(true, Ordering::SeqCst);
+                if timeout_exited.load(Ordering::SeqCst) {
+                    return;
+                }
+                tokio::spawn(async move {
+                    signal_pid(child_pid, Signal::Int);
+                    tokio::time::sleep(Duration::from_millis(TIMEOUT_SIGINT_TO_TERM_MS)).await;
+                    if timeout_exited.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    signal_pid(child_pid, Signal::Term);
+                    tokio::time::sleep(Duration::from_millis(TIMEOUT_TERM_TO_KILL_MS)).await;
+                    if !timeout_exited.load(Ordering::SeqCst) {
+                        signal_pid(child_pid, Signal::Kill);
+                    }
+                });
+            },
+        )
     });
 
+    let timeout_for_events = timeout_task.clone();
     // Terminal-drain ladder: after the terminal event, 1s grace then
     // SIGTERM → 3s → SIGKILL (571-623). The event parser owns the lifecycle
     // flags: a compaction started after the terminal event holds the grace
@@ -1035,6 +1095,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     // this ladder on a clean terminal, so no error is recorded here.
     let drain_run_id = input.run_id.clone();
     let drain_inbox = input.steer_inbox.clone();
+    let acceptance_inbox = input.steer_inbox.clone();
     let drain_task = tokio::spawn(async move {
         let mut steer_hold_since: Option<u64> = None;
         loop {
@@ -1230,6 +1291,16 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                 let (outcome, status_fields, frame, control_events, drained_control) = {
                     let mut state = stdout_state.lock().unwrap_or_else(|e| e.into_inner());
                     let outcome = state.process_line(trimmed, now_ms);
+                    // S40: the acceptance report closes guidance immediately,
+                    // not only when the child finally exits. The marker is
+                    // the parent-visible signal `deliver_steer` checks during
+                    // the finishing window.
+                    if state.acceptance_final
+                        && let Some(inbox) = &acceptance_inbox
+                        && !inbox.join("steer-inbox-closed.json").exists()
+                    {
+                        let _ = std::fs::write(inbox.join("steer-inbox-closed.json"), "{}");
+                    }
                     let control_events = outcome
                         .tool_end
                         .as_ref()
@@ -1267,6 +1338,19 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                         (outcome, status_fields, frame, control_events, drained)
                     }
                 };
+                if let Some(timer) = &timeout_for_events {
+                    if let Some(start) = &outcome.tool_start
+                        && crate::runner::pausable::is_blocking_supervisor_tool(
+                            &start.tool,
+                            &start.args,
+                        )
+                    {
+                        timer.pause(&start.tool_call_id);
+                    }
+                    if let Some(end) = &outcome.tool_end {
+                        timer.resume(&end.tool_call_id);
+                    }
+                }
                 for event in &control_events {
                     if let Some(sink) = &control_sink {
                         sink(event);
@@ -1543,7 +1627,9 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             // flag closes the check-then-signal window for a task that is
             // already past its sleep.
             child_exited.store(true, Ordering::SeqCst);
-            timeout_task.abort();
+            if let Some(timer) = &timeout_task {
+                timer.clear();
+            }
             drain_task.abort();
             status
         }
@@ -1598,6 +1684,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             continuation_input.abort_probe = None;
             let notify = crate::runner::background::AsyncNotify {
                 calls: Some(detach_ctx.calls),
+                session_id: Some(detach_ctx.session_id.clone()),
             };
             let diagnostic_path = launch.tool_diagnostic_path.clone();
             let temp_dir = launch.temp_dir.clone();
@@ -1663,7 +1750,9 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             task.abort();
         }
     }
-    timeout_task.abort();
+    if let Some(timer) = &timeout_task {
+        timer.clear();
+    }
     drain_task.abort();
     unregister_child(child_id);
     args::cleanup_temp_dir(&launch.temp_dir);
@@ -1751,7 +1840,7 @@ async fn finish_detached_child(
     raw_tail: Arc<Mutex<BoundedByteTail>>,
     stdout_task: tokio::task::JoinHandle<()>,
     stderr_task: tokio::task::JoinHandle<()>,
-    timeout_task: tokio::task::JoinHandle<()>,
+    timeout_task: Option<crate::runner::pausable::PausableTimeout>,
     drain_task: tokio::task::JoinHandle<()>,
     timed_out: Arc<std::sync::atomic::AtomicBool>,
     stream_error: Arc<Mutex<Option<String>>>,
@@ -1850,7 +1939,9 @@ async fn finish_detached_child(
             task.abort();
         }
     }
-    timeout_task.abort();
+    if let Some(timer) = &timeout_task {
+        timer.clear();
+    }
     drain_task.abort();
     unregister_child(child_id);
     args::cleanup_temp_dir(&temp_dir);
@@ -2138,6 +2229,30 @@ fn synthesize_exit_from_parts(
             ));
         }
     }
+    // S17/S28: a structured child must finish with a validated
+    // structured_output; the raw JSON is the answer.
+    if state.structured_output_schema.is_some() && exit_code == 0 && error.is_none() {
+        if state.structured_output_valid {
+            if let Some(value) = &state.structured_output {
+                final_output =
+                    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+            }
+        } else {
+            exit_code = 1;
+            error = Some(crate::structured_output::MISSING_OUTPUT_ERROR.to_string());
+        }
+    }
+    // S39 (#3245): a terminal `length` stop is a failed run unless a
+    // validated structured_output already supplied the answer. Earlier
+    // errors keep precedence; the partial text stays in `final_output`.
+    if exit_code == 0
+        && error.is_none()
+        && !state.structured_output_valid
+        && events::get_terminal_assistant_stop_reason(&state.messages) == Some("length")
+    {
+        exit_code = 1;
+        error = Some(TRUNCATED_RESPONSE_ERROR.to_string());
+    }
     if error.is_some() && exit_code == 0 {
         exit_code = 1;
     }
@@ -2176,6 +2291,7 @@ fn synthesize_exit_from_parts(
         timed_out,
         process_signal,
         output_partial,
+        acceptance_final: state.acceptance_final,
         tool_count: state.tool_count,
         turns: state.turns,
         // Upstream keeps the terminal `progress.activityState` on the result
@@ -2221,6 +2337,7 @@ fn failed_result(
         timed_out: false,
         process_signal: None,
         output_partial: false,
+        acceptance_final: false,
         tool_count: 0,
         turns: 0,
         activity_state: None,
@@ -2626,9 +2743,14 @@ mod terminal_classification_tests {
             agent_allowed_agents: None,
             diff_baseline: None,
             tool_budget_env: None,
+            mcp_direct_tools: Vec::new(),
+            output_schema: None,
             project_trusted: None,
             agent_inherit_project_context: true,
+            agent_inherit_global_context: true,
             agent_inherit_skills: false,
+            launcher: None,
+            launcher_argv: None,
             task: "replay".to_string(),
             task_delivery: None,
             cwd: std::env::temp_dir(),
@@ -2715,6 +2837,80 @@ mod terminal_classification_tests {
                 "{file}: final output"
             );
         }
+    }
+
+    #[test]
+    fn length_stop_fails_and_keeps_partial_output() {
+        let mut state = events::ChildRunState::default();
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"cut off"}],"stopReason":"length","usage":{"output":9}}}"#,
+            0,
+        );
+        let result = synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            Some(0),
+            None,
+            false,
+            false,
+            None,
+            None,
+            String::new(),
+            0,
+        );
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.error.as_deref(), Some(TRUNCATED_RESPONSE_ERROR));
+        assert_eq!(result.final_output, "cut off");
+    }
+
+    #[test]
+    fn validated_structured_output_survives_length_stop() {
+        let mut state = events::ChildRunState {
+            structured_output_schema: Some(json!({"type": "object"})),
+            structured_output: Some(json!({"ok": true})),
+            structured_output_valid: true,
+            ..Default::default()
+        };
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"cut off"}],"stopReason":"length","usage":{"output":9}}}"#,
+            0,
+        );
+        let result = synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            Some(0),
+            None,
+            false,
+            false,
+            None,
+            None,
+            String::new(),
+            0,
+        );
+        assert_eq!(result.exit_code, 0, "{:?}", result.error);
+        assert!(result.final_output.contains("\"ok\""));
+    }
+
+    #[test]
+    fn terminal_acceptance_report_closes_guidance() {
+        let mut state = events::ChildRunState::default();
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"```acceptance-report\n{\"criteriaSatisfied\":true}\n```"}],"stopReason":"stop","usage":{"output":9}}}"#,
+            0,
+        );
+        let result = synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            Some(0),
+            None,
+            false,
+            false,
+            None,
+            None,
+            String::new(),
+            0,
+        );
+        assert!(result.acceptance_final);
     }
 
     #[test]

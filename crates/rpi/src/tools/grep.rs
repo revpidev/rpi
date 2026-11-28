@@ -28,7 +28,6 @@
 //! TUI rendering methods (`renderCall`, `renderResult`) are intentionally
 //! omitted — rendering lives in the TUI layer.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -66,8 +65,15 @@ pub trait GrepOperations: Send + Sync {
     /// Check if path is a directory. Errors if the path does not exist.
     async fn is_directory(&self, absolute_path: &Path) -> std::io::Result<bool>;
 
-    /// Read file contents for context lines.
-    async fn read_file(&self, absolute_path: &Path) -> std::io::Result<String>;
+    /// Deprecated compatibility hook. Context lines are collected from the
+    /// search stream; implementations are not required to provide this.
+    #[deprecated(note = "grep context comes from the search stream")]
+    async fn read_file(&self, _absolute_path: &Path) -> std::io::Result<String> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "GrepOperations::read_file is deprecated",
+        ))
+    }
 }
 
 /// Default local-filesystem implementation of [`GrepOperations`]
@@ -143,6 +149,8 @@ struct GrepMatch {
     /// Raw line text without the trailing `\n` (a trailing `\r` is kept, like
     /// rg's `lines.text` without `--crlf`).
     line_text: String,
+    before: Vec<(usize, String)>,
+    after: Vec<(usize, String)>,
 }
 
 /// Outcome of the blocking search phase.
@@ -178,6 +186,7 @@ fn search_stream(
     file_path: &Path,
     reader: &mut impl std::io::Read,
     limit: f64,
+    context: usize,
     suppress_binary: bool,
     matches: &mut Vec<GrepMatch>,
 ) -> std::io::Result<bool> {
@@ -186,15 +195,39 @@ fn search_stream(
     let mut line: Vec<u8> = Vec::new();
     let mut line_number = 0usize;
     let start_len = matches.len();
+    let mut recent = std::collections::VecDeque::<(usize, String)>::new();
+    let mut trailing: Option<(usize, usize)> = None;
+    let mut process_line = |line: &[u8], line_number: usize| {
+        let text = String::from_utf8_lossy(line).into_owned();
+        if let Some((match_index, remaining)) = trailing {
+            matches[match_index].after.push((line_number, text.clone()));
+            trailing = (remaining > 1).then_some((match_index, remaining - 1));
+        }
+        let limit_reached = matches.len() as f64 >= limit;
+        if !limit_reached && re.is_match(&text) {
+            matches.push(GrepMatch {
+                file_path: file_path.to_path_buf(),
+                line_number,
+                line_text: text.clone(),
+                before: recent.iter().cloned().collect(),
+                after: Vec::new(),
+            });
+            if context > 0 {
+                trailing = Some((matches.len() - 1, context));
+            }
+        }
+        recent.push_back((line_number, text));
+        while recent.len() > context {
+            recent.pop_front();
+        }
+        matches.len() as f64 >= limit && trailing.is_none()
+    };
     loop {
         let n = reader.read(&mut chunk)?;
         if n == 0 {
             break;
         }
         let data = &chunk[..n];
-        // Binary suppression: rg reports no matches at all for a file with
-        // any NUL byte (D-039 #4) — matches already collected for this file
-        // are rolled back.
         if suppress_binary && data.contains(&0) {
             matches.truncate(start_len);
             return Ok(false);
@@ -204,16 +237,8 @@ fn search_stream(
             if *byte == b'\n' {
                 line.extend_from_slice(&data[start..index]);
                 line_number += 1;
-                let text = String::from_utf8_lossy(&line);
-                if re.is_match(&text) {
-                    matches.push(GrepMatch {
-                        file_path: file_path.to_path_buf(),
-                        line_number,
-                        line_text: text.into_owned(),
-                    });
-                    if matches.len() as f64 >= limit {
-                        return Ok(true);
-                    }
+                if process_line(&line, line_number) {
+                    return Ok(true);
                 }
                 line.clear();
                 start = index + 1;
@@ -223,22 +248,15 @@ fn search_stream(
     }
     if !line.is_empty() {
         line_number += 1;
-        let text = String::from_utf8_lossy(&line);
-        if re.is_match(&text) {
-            matches.push(GrepMatch {
-                file_path: file_path.to_path_buf(),
-                line_number,
-                line_text: text.into_owned(),
-            });
-            if matches.len() as f64 >= limit {
-                return Ok(true);
-            }
+        if process_line(&line, line_number) {
+            return Ok(true);
         }
     }
     Ok(false)
 }
 
 /// Run the rg-equivalent search (blocking; call inside `spawn_blocking`).
+#[allow(clippy::too_many_arguments)]
 fn run_search(
     re: &regex::Regex,
     search_path: &Path,
@@ -246,6 +264,7 @@ fn run_search(
     cwd: &Path,
     glob: Option<&str>,
     limit: f64,
+    context: usize,
     signal: &CancellationToken,
 ) -> Result<SearchOutcome, AgentError> {
     let mut outcome = SearchOutcome {
@@ -267,6 +286,7 @@ fn run_search(
                     search_path,
                     &mut reader,
                     limit,
+                    context,
                     false,
                     &mut outcome.matches,
                 ) {
@@ -333,6 +353,7 @@ fn run_search(
                     entry.path(),
                     &mut reader,
                     limit,
+                    context,
                     true,
                     &mut outcome.matches,
                 ) {
@@ -474,6 +495,7 @@ impl AgentTool for GrepTool {
                 &cwd,
                 glob_owned.as_deref(),
                 effective_limit,
+                context_value as usize,
                 &signal_clone,
             )
         })
@@ -521,7 +543,6 @@ impl AgentTool for GrepTool {
         // --- Format matches after the search (grep.ts:316-331) ---
         let mut lines_truncated = false;
         let mut output_lines: Vec<String> = Vec::new();
-        let mut file_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
 
         for m in &outcome.matches {
             if context_value == 0.0 {
@@ -538,42 +559,22 @@ impl AgentTool for GrepTool {
                     m.line_number, truncated.text
                 ));
             } else {
-                // formatBlock (grep.ts:250-268): re-read the file for context.
+                // formatBlock (grep.ts:250-268): context comes from the
+                // search stream, never a second file read.
                 let relative_path = format_path(&m.file_path);
-                let lines = match file_cache.get(&m.file_path) {
-                    Some(lines) => lines.clone(),
-                    None => {
-                        let lines = match self.operations.read_file(&m.file_path).await {
-                            Ok(content) => content
-                                .replace("\r\n", "\n")
-                                .replace('\r', "\n")
-                                .split('\n')
-                                .map(str::to_owned)
-                                .collect::<Vec<String>>(),
-                            Err(_) => Vec::new(),
-                        };
-                        file_cache.insert(m.file_path.clone(), lines.clone());
-                        lines
-                    }
-                };
-                if lines.is_empty() {
-                    output_lines.push(format!(
-                        "{relative_path}:{}: (unable to read file)",
-                        m.line_number
-                    ));
-                    continue;
-                }
-                let context = context_value as usize;
-                let start = m.line_number.saturating_sub(context).max(1);
-                let end = (m.line_number + context).min(lines.len());
-                for current in start..=end {
-                    let line_text = lines.get(current - 1).map_or("", String::as_str);
+                let matching_line = (m.line_number, m.line_text.clone());
+                for (current, line_text) in m
+                    .before
+                    .iter()
+                    .chain(std::iter::once(&matching_line))
+                    .chain(m.after.iter())
+                {
                     let sanitized = line_text.replace('\r', "");
                     let truncated = truncate_line(&sanitized, None);
                     if truncated.was_truncated {
                         lines_truncated = true;
                     }
-                    if current == m.line_number {
+                    if *current == m.line_number {
                         output_lines.push(format!("{relative_path}:{current}: {}", truncated.text));
                     } else {
                         output_lines.push(format!("{relative_path}-{current}- {}", truncated.text));

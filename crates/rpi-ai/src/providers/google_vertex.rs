@@ -10,7 +10,6 @@ use crate::auth::{
     ApiKeyAuth, ApiKeyCredential, AuthContext, AuthEvent, AuthInfoLink, AuthInteraction,
     AuthPrompt, AuthResult, ModelAuth, ModelsError, ModelsErrorCode, ProviderAuth, SelectOption,
 };
-use crate::generated::get_builtin_models;
 use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `VERTEX_ADC_PATH`.
@@ -233,7 +232,9 @@ pub fn google_vertex_provider() -> Arc<dyn Provider> {
             api_key: Some(Arc::new(VertexAuth)),
             oauth: None,
         },
-        models: get_builtin_models("google-vertex").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared(
+            "google-vertex",
+        )),
         api: ProviderApi::Single(Arc::new(GoogleVertex)),
         ..Default::default()
     })

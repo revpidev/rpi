@@ -1,5 +1,5 @@
 //! Harness conversation and lifecycle integration tests (port of
-//! `packages/durable/test/harness-conversations.test.ts` @ `4a080252f`).
+//! `packages/durable/test/harness-conversations.test.ts` @ `b4afdddf`).
 //!
 //! Scoped to what does not need the task scheduler: lazy root creation, the
 //! built-in creation hook, agent edits, Tx-created conversations, and close
@@ -315,7 +315,10 @@ async fn open_jsonl_storage(dir: &TempDir) -> Arc<dyn Storage> {
     let storage = rpi_durable::storage::JsonlStorage::open(
         &directory,
         fs,
-        rpi_durable::storage::JsonlStorageOptions { fsync: false },
+        rpi_durable::storage::JsonlStorageOptions {
+            fsync: false,
+            read_only: false,
+        },
         &context(),
     )
     .await

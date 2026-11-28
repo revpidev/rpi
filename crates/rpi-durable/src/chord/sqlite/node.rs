@@ -1,5 +1,5 @@
 //! Node-adapter equivalents for the portable SQLite driver (port of
-//! `packages/chord/src/sqlite/node.ts` @ `4a080252f`).
+//! `packages/chord/src/sqlite/node.ts` @ `b4afdddf`).
 
 use crate::chord::sqlite::database::{SqliteDatabase, SqliteDatabaseOptions};
 use crate::errors::StorageResult;

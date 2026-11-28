@@ -49,9 +49,9 @@ use rpi_ai::auth::types::{AuthCheck, AuthType, BoxFutureSend, CredentialType, Lo
 use rpi_ai::auth::{ModelsError, ModelsErrorCode};
 use rpi_ai::types::{Model, ModelThinkingLevel, ThinkingLevel};
 use rpi_tui::terminal_colors::TerminalColorScheme;
-use rpi_tui::tui::{
-    Component, Focusable, SharedComponent, TuiStopOptions, shared_component_from_boxed,
-};
+#[cfg(unix)]
+use rpi_tui::tui::TuiStopOptions;
+use rpi_tui::tui::{Component, Focusable, SharedComponent, shared_component_from_boxed};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -1064,12 +1064,66 @@ fn login_dialog_with_interaction(
             state_cancel.signal.cancel();
             state_cancel.resolve(Err(login_cancelled()));
         }));
+        let dialog_action = Arc::downgrade(&dialog);
+        let ui_action = Arc::clone(ui);
+        dialog_guard.on_device_code_confirm = Some(Box::new(move |confirmation| {
+            let dialog_action = dialog_action.clone();
+            let ui_action = Arc::clone(&ui_action);
+            spawn_async(async move {
+                let copied = if confirmation.copy_code {
+                    let ui_copy = Arc::clone(&ui_action);
+                    let user_code = confirmation.user_code.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let env = ui_copy.clipboard_env();
+                        let mut runner_guard = lock(&ui_copy.clipboard_runner_override);
+                        let runner = runner_guard.as_mut();
+                        ui_copy.ui.with_terminal(|terminal| {
+                            crate::modes::interactive::clipboard::copy_to_clipboard_with_runner(
+                                &user_code,
+                                &env,
+                                runner,
+                                &mut |payload| {
+                                    terminal.write(payload);
+                                },
+                            )
+                        })
+                    })
+                    .await
+                    .map(|result| result.is_ok())
+                    .unwrap_or(false)
+                } else {
+                    false
+                };
+                if confirmation.open_browser {
+                    open_login_url(&confirmation.verification_uri);
+                }
+                if let Some(dialog) = dialog_action.upgrade() {
+                    let status = if confirmation.copy_code {
+                        if copied {
+                            "Code copied to clipboard"
+                        } else {
+                            "Copy code manually"
+                        }
+                    } else {
+                        "Browser open requested"
+                    };
+                    lock(&dialog).set_device_code_action_status(status);
+                }
+            });
+        }));
     }
     let interaction = LoginDialogInteraction {
         dialog: dialog.clone(),
         state,
     };
     (dialog, interaction)
+}
+
+fn open_login_url(url: &str) {
+    let Some(url) = rpi_ai::auth::oauth::trusted_url::trusted_http_url(url) else {
+        return;
+    };
+    crate::utils::open_browser::open_browser(&url);
 }
 
 /// Mount the dialog in place of the editor (upstream
@@ -1153,15 +1207,19 @@ impl AuthInteraction for LoginDialogInteraction {
             AuthEvent::DeviceCode {
                 user_code,
                 verification_uri,
+                open_browser_on_confirm,
+                copy_code_on_confirm,
                 ..
             } => {
                 // Upstream calls showDeviceCode + showWaiting
                 // (interactive-mode.ts:5264-5266); the port folds the
                 // waiting line into the device-code state.
-                dialog.show_device_code(
+                dialog.show_device_code_with_options(
                     &user_code,
                     &verification_uri,
                     Some("Waiting for authentication..."),
+                    open_browser_on_confirm,
+                    copy_code_on_confirm,
                 );
             }
             AuthEvent::Info { message, links } => {
@@ -1395,7 +1453,7 @@ async fn finish_authentication(
             auth_path.display()
         ));
         // `void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel)`
-        // (interactive-mode.ts:6120-6126 @ 4a080252f). The login flow no
+        // (interactive-mode.ts:6120-6126 @ b4afdddf). The login flow no
         // longer carries the removed upstream `checkDaxnutsEasterEgg`
         // (ADR-0036 decision 5; upstream deleted it in v1.0.1).
         ui.maybe_warn_about_anthropic_subscription_auth(Some(selected.clone()))
@@ -2365,7 +2423,9 @@ impl InteractiveUi {
                 }
             })
             .collect();
-        providers.sort_by(|a, b| a.name.cmp(&b.name));
+        providers.sort_by(|a, b| {
+            crate::core::preferred_providers::compare_providers(&a.id, &a.name, &b.id, &b.name)
+        });
 
         let select_ui = Arc::clone(ui);
         let selector = Arc::new(Mutex::new(OAuthSelectorComponent::new(
@@ -2632,6 +2692,7 @@ impl InteractiveUi {
             self.show_warning("Wait for compaction to finish before reloading.");
             return;
         }
+        self.reset_extension_overlays();
         self.reset_extension_autocomplete();
         let Some(ui) = self.upgrade_self() else {
             return;
@@ -2973,19 +3034,9 @@ impl InteractiveMode {
         }
     }
 
-    /// `/resume` — with a session-file argument it switches sessions
-    /// (`handleResumeSession`, interactive-mode.ts:4808-4843); without one it
-    /// shows the session selector (interactive-mode.ts:2777-2780).
-    pub(crate) async fn handle_resume_command(&mut self, args: &str) {
-        let path = args.trim();
-        if path.is_empty() {
-            InteractiveUi::show_session_selector(&self.ui_state);
-            return;
-        }
-        // ADR-0006/D-044 closure: cross-cwd resumes prompt via the TUI
-        // trust selector (async bridge, T15 W7).
+    fn session_trust_factory(&self) -> crate::core::trust_manager::ProjectTrustContextFactory {
         let ui_weak = Arc::downgrade(&self.ui_state);
-        let trust_factory = Arc::new(move |_cwd: &std::path::Path| {
+        Arc::new(move |_cwd: &std::path::Path| {
             let ui_weak = ui_weak.clone();
             crate::core::trust_manager::ProjectTrustContext {
                 has_ui: true,
@@ -3001,25 +3052,174 @@ impl InteractiveMode {
                     }) as futures::future::BoxFuture<'static, Option<String>>
                 })),
             }
-        });
+        })
+    }
+
+    pub(crate) async fn prompt_for_missing_cwd(
+        &self,
+        issue: &crate::core::session_cwd::SessionCwdIssue,
+    ) -> Option<crate::core::session_cwd::MissingCwdDecision> {
+        let options = crate::core::session_cwd::get_missing_session_cwd_options(issue);
+        let labels = options.iter().map(|option| option.label.clone()).collect();
+        let selected = show_extension_selector(
+            &self.ui_state,
+            &crate::core::session_cwd::format_missing_session_cwd_prompt(issue),
+            labels,
+            BlockedStatus {
+                kind: ProgramStatusKind::Permission,
+                message: "Session cwd not found".to_string(),
+            },
+        )
+        .await;
+        options
+            .iter()
+            .find(|option| Some(option.label.as_str()) == selected.as_deref())
+            .and_then(|option| option.decision)
+    }
+
+    pub(crate) async fn switch_to_forked_session(
+        &mut self,
+        source_path: &str,
+        cwd: &str,
+        mut with_session: crate::core::agent_session_runtime::WithSessionCallback,
+    ) -> Result<bool, crate::error::RpiError> {
+        let session_dir = self
+            .runtime
+            .session()
+            .session_manager()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_session_dir()
+            .to_path_buf();
+        let fork = crate::core::session_manager::SessionManager::fork_from(
+            std::path::Path::new(source_path),
+            std::path::Path::new(cwd),
+            Some(&session_dir),
+            crate::core::session_manager::ForkOptions::default(),
+        )?;
+        let fork_path = fork
+            .get_session_file()
+            .expect("persisted fork")
+            .to_path_buf();
+        let result = self
+            .runtime
+            .switch_session(
+                &fork_path.to_string_lossy(),
+                None,
+                with_session.take(),
+                Some(self.session_trust_factory()),
+            )
+            .await;
+        match result {
+            Ok(cancelled) => {
+                if cancelled {
+                    let _ = std::fs::remove_file(&fork_path);
+                }
+                Ok(cancelled)
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&fork_path);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn handle_resume_session_path(
+        &mut self,
+        path: &str,
+        mut with_session: crate::core::agent_session_runtime::WithSessionCallback,
+    ) {
         match self
             .runtime
-            .switch_session(path, None, None, Some(trust_factory))
+            .switch_session(
+                path,
+                None,
+                with_session.take(),
+                Some(self.session_trust_factory()),
+            )
             .await
         {
             Ok(cancelled) => {
-                if cancelled {
-                    return;
+                if !cancelled {
+                    self.rebind_session_ui().await;
+                    self.ui_state.show_status("Resumed session");
                 }
-                self.rebind_session_ui().await;
-                self.ui_state.show_status("Resumed session");
             }
-            // interactive-mode.ts:5164 @ 4181f66: resume failure is fatal.
+            Err(crate::error::RpiError::MissingSessionCwd(error)) => {
+                match self.prompt_for_missing_cwd(&error.issue).await {
+                    Some(crate::core::session_cwd::MissingCwdDecision::Continue) => {
+                        let cwd = error.issue.fallback_cwd.clone();
+                        match self
+                            .runtime
+                            .switch_session(
+                                path,
+                                Some(&cwd),
+                                with_session.take(),
+                                Some(self.session_trust_factory()),
+                            )
+                            .await
+                        {
+                            Ok(cancelled) => {
+                                if !cancelled {
+                                    self.rebind_session_ui().await;
+                                    self.ui_state
+                                        .show_status(&format!("Resumed session in {cwd}"));
+                                }
+                            }
+                            Err(error) => {
+                                self.handle_fatal_runtime_error(
+                                    "Failed to resume session",
+                                    &error.raw_message(),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    Some(crate::core::session_cwd::MissingCwdDecision::Fork) => {
+                        match self
+                            .switch_to_forked_session(path, &error.issue.fallback_cwd, with_session)
+                            .await
+                        {
+                            Ok(cancelled) => {
+                                if !cancelled {
+                                    self.rebind_session_ui().await;
+                                    self.ui_state.show_status(&format!(
+                                        "Forked session into {}",
+                                        error.issue.fallback_cwd
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                self.handle_fatal_runtime_error(
+                                    "Failed to resume session",
+                                    &error.raw_message(),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    None => {
+                        self.ui_state.show_status("Resume cancelled");
+                    }
+                }
+            }
             Err(error) => {
                 self.handle_fatal_runtime_error("Failed to resume session", &error.raw_message())
-                    .await
+                    .await;
             }
         }
+    }
+
+    /// `/resume` — with a session-file argument it switches sessions
+    /// (`handleResumeSession`, interactive-mode.ts:4808-4843); without one it
+    /// shows the session selector (interactive-mode.ts:2777-2780).
+    pub(crate) async fn handle_resume_command(&mut self, args: &str) {
+        let path = args.trim();
+        if path.is_empty() {
+            InteractiveUi::show_session_selector(&self.ui_state);
+            return;
+        }
+        self.handle_resume_session_path(path, None).await;
     }
 
     /// `rebindCurrentSession({ renderBeforeBind: true })`
@@ -4219,7 +4419,8 @@ mod tests {
     use crate::core::session_manager::NewSessionOptions;
     use crate::modes::interactive::interactive_mode::InteractiveModeOptions;
     use crate::modes::interactive::test_support::{
-        TempDir, TestSession, TestTerminal, build_test_session, build_test_session_with,
+        TempDir, TestSession, TestTerminal, build_switchable_test_session_with, build_test_session,
+        build_test_session_with,
     };
     use crate::sdk::{CreateAgentSessionOptions, NoTools, create_agent_session};
 
@@ -4612,6 +4813,18 @@ mod tests {
         let (mode, _terminal, _session, _tmp) = mode_harness().await;
         InteractiveUi::show_session_selector(&mode.ui_state);
         assert!(selector_mounted(&mode.ui_state), "session selector mounted");
+    }
+
+    #[tokio::test]
+    async fn set_session_closes_open_host_selectors() {
+        let (mode, _terminal, session, _tmp) = mode_harness().await;
+        InteractiveUi::show_session_selector(&mode.ui_state);
+        assert!(selector_mounted(&mode.ui_state), "session selector mounted");
+        mode.ui_state.set_session(session);
+        assert!(
+            !selector_mounted(&mode.ui_state),
+            "session rebind must close the outgoing selector stack"
+        );
     }
 
     #[tokio::test]
@@ -5178,7 +5391,7 @@ mod tests {
         let feeder = async move {
             // Confirm the import, then confirm the cwd prompt (fallback cwd).
             answer_mounted_dialog(&ui, &terminal, "Import session", &["\r"]).await;
-            answer_mounted_dialog(&ui, &terminal, "Session cwd not found", &["\r"]).await;
+            answer_mounted_dialog(&ui, &terminal, "Session cwd does not exist", &["\r"]).await;
         };
         let command = format!("/import {}", source.display());
         let (_, ()) = tokio::join!(mode.handle_import_command(&command), feeder);
@@ -5192,6 +5405,164 @@ mod tests {
             imported_cwd, expected_cwd,
             "imported under the fallback cwd"
         );
+        // The failed first copy must not survive the Continue retry: exactly
+        // one imported file, not `imported.jsonl` + `imported-1.jsonl`.
+        let imported_files: Vec<_> = std::fs::read_dir(tmp.path().join("sessions"))
+            .expect("session dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("imported"))
+            .collect();
+        assert_eq!(
+            imported_files.len(),
+            1,
+            "failed import left a stray copy: {:?}",
+            imported_files
+                .iter()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_command_missing_cwd_continue_uses_fallback_without_rewriting() {
+        let (mut mode, terminal, _session, tmp) = switchable_harness_with_session_dir().await;
+        mode.init().await;
+        let path = tmp.path().join("sessions").join("resume.jsonl");
+        write_import_file(&path, &tmp.path().join("gone-cwd"));
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(&ui, &terminal, "Session cwd does not exist", &["\r"]).await;
+        };
+        let command = path.display().to_string();
+        let (_, ()) = tokio::join!(mode.handle_resume_command(&command), feeder);
+
+        let manager = mode.ui_state.session().session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(manager.get_cwd(), tmp.path().join("cwd"));
+        assert_eq!(manager.get_session_file(), Some(path.as_path()));
+        drop(manager);
+        let header = std::fs::read_to_string(&path).expect("session kept");
+        assert!(
+            header
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("gone-cwd")),
+            "Continue must not rewrite the stored cwd: {header}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_command_missing_cwd_fork_creates_a_new_session_and_keeps_the_original() {
+        let (mut mode, terminal, session, tmp) = switchable_harness_with_session_dir().await;
+        mode.init().await;
+        let path = tmp.path().join("sessions").join("resume.jsonl");
+        write_import_file(&path, &tmp.path().join("gone-cwd"));
+        let original = std::fs::read(&path).expect("session bytes");
+        let old_session_id = session.session_id();
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(
+                &ui,
+                &terminal,
+                "Session cwd does not exist",
+                &["\x1b[B", "\r"],
+            )
+            .await;
+        };
+        let command = path.display().to_string();
+        let (_, ()) = tokio::join!(mode.handle_resume_command(&command), feeder);
+
+        let manager = mode.ui_state.session().session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(manager.get_cwd(), tmp.path().join("cwd"));
+        assert_ne!(manager.get_session_id(), old_session_id);
+        let forked = manager
+            .get_session_file()
+            .expect("forked file")
+            .to_path_buf();
+        drop(manager);
+        assert_ne!(forked, path);
+        assert!(forked.exists(), "forked session file exists");
+        assert_eq!(
+            std::fs::read(&path).expect("original kept"),
+            original,
+            "fork keeps the original session file"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_command_missing_cwd_fork_preserves_original_and_uses_fallback() {
+        let (mut mode, terminal, session, tmp) = switchable_harness_with_session_dir().await;
+        mode.init().await;
+        let source = tmp.path().join("outside").join("imported.jsonl");
+        write_import_file(&source, &tmp.path().join("gone-cwd"));
+        let original = std::fs::read(&source).expect("source bytes");
+        let old_session_id = session.session_id();
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(&ui, &terminal, "Import session", &["\r"]).await;
+            answer_mounted_dialog(
+                &ui,
+                &terminal,
+                "Session cwd does not exist",
+                &["\x1b[B", "\r"],
+            )
+            .await;
+        };
+        let command = format!("/import {}", source.display());
+        let (_, ()) = tokio::join!(mode.handle_import_command(&command), feeder);
+
+        let manager = mode.ui_state.session().session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(manager.get_cwd(), tmp.path().join("cwd"));
+        assert_ne!(manager.get_session_id(), old_session_id);
+        assert_eq!(std::fs::read(&source).expect("original kept"), original);
+        assert!(source.exists());
+    }
+
+    #[tokio::test]
+    async fn missing_cwd_fork_veto_removes_the_new_copy() {
+        let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new("/tmp"));
+        let canceller = rpi_ext_host::loader::InlineExtension::Anonymous(Arc::new(|api| {
+            api.on(
+                rpi_ext_host::types::EVENT_SESSION_BEFORE_SWITCH,
+                Arc::new(|_, _| Box::pin(async { Ok(serde_json::json!({"cancel": true})) })),
+            )
+            .expect("register veto");
+            Box::pin(async { Ok(()) })
+        }));
+        assert!(host.load_inline(&[canceller]).await.is_empty());
+        let tmp = TempDir::new();
+        let cwd = tmp.path().join("cwd");
+        let session_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let manager = crate::core::session_manager::SessionManager::create(
+            &cwd,
+            Some(&session_dir),
+            NewSessionOptions::default(),
+        )
+        .expect("session");
+        let harness = build_switchable_test_session_with(Some(manager), Some(host)).await;
+        let mut mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::new()),
+        );
+        let source = tmp.path().join("outside.jsonl");
+        write_import_file(&source, &tmp.path().join("gone"));
+
+        let cancelled = mode
+            .switch_to_forked_session(&source.to_string_lossy(), &cwd.to_string_lossy(), None)
+            .await
+            .expect("veto result");
+        assert!(cancelled);
+        assert_eq!(
+            std::fs::read_dir(&session_dir)
+                .expect("session dir")
+                .count(),
+            0
+        );
+        assert!(source.exists());
     }
 
     /// A provider whose catalog refresh never completes — the `/model`
@@ -5293,6 +5664,57 @@ mod tests {
     /// #63 /import: declining the missing-cwd prompt cancels the import and
     /// keeps the current session.
     #[tokio::test]
+    async fn resume_command_missing_cwd_cancel_keeps_session_and_original_file() {
+        let (mut mode, terminal, _session, tmp) = switchable_harness_with_session_dir().await;
+        mode.init().await;
+        let path = tmp.path().join("sessions").join("resume.jsonl");
+        write_import_file(&path, &tmp.path().join("gone-cwd"));
+        let original = std::fs::read(&path).expect("session bytes");
+        let session_id_before = mode.ui_state.session().session_id();
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(
+                &ui,
+                &terminal,
+                "Session cwd does not exist",
+                &["\x1b[B", "\x1b[B", "\r"],
+            )
+            .await;
+        };
+        let command = path.display().to_string();
+        let (_, ()) = tokio::join!(mode.handle_resume_command(&command), feeder);
+
+        let chat = rendered_chat(&mode.ui_state);
+        assert!(chat.contains("Resume cancelled"), "chat: {chat}");
+        assert_eq!(mode.ui_state.session().session_id(), session_id_before);
+        assert_eq!(std::fs::read(&path).expect("original kept"), original);
+    }
+
+    /// `ctx.switchSession()` uses the same missing-cwd prompt as `/resume`;
+    /// the extension command entry must offer Continue/Fork/Cancel too.
+    #[tokio::test]
+    async fn extension_switch_session_missing_cwd_continue_uses_fallback() {
+        let (mut mode, terminal, _session, tmp) = switchable_harness_with_session_dir().await;
+        mode.init().await;
+        let path = tmp.path().join("sessions").join("extension-resume.jsonl");
+        write_import_file(&path, &tmp.path().join("gone-cwd"));
+        let ui = Arc::clone(&mode.ui_state);
+        let feeder = async move {
+            answer_mounted_dialog(&ui, &terminal, "Session cwd does not exist", &["\r"]).await;
+        };
+        let command = super::super::ExtensionSessionCommand::SwitchSession {
+            session_path: path.display().to_string(),
+            with_session: None,
+        };
+        let (_, ()) = tokio::join!(mode.handle_extension_session_command(command), feeder);
+
+        let manager = mode.ui_state.session().session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(manager.get_cwd(), tmp.path().join("cwd"));
+        assert_eq!(manager.get_session_file(), Some(path.as_path()));
+    }
+
+    #[tokio::test]
     async fn import_command_missing_cwd_cancel_keeps_session() {
         let (mut mode, terminal, _session, tmp) = switchable_harness_with_session_dir().await;
         mode.init().await;
@@ -5300,11 +5722,17 @@ mod tests {
         write_import_file(&source, &tmp.path().join("gone-cwd"));
         let session_id_before = mode.ui_state.session().session_id();
 
-        // Confirm the import, decline the cwd prompt (down + Enter).
+        // Confirm the import, then choose Cancel (down twice + Enter).
         let ui = Arc::clone(&mode.ui_state);
         let feeder = async move {
             answer_mounted_dialog(&ui, &terminal, "Import session", &["\r"]).await;
-            answer_mounted_dialog(&ui, &terminal, "Session cwd not found", &["\x1b[B", "\r"]).await;
+            answer_mounted_dialog(
+                &ui,
+                &terminal,
+                "Session cwd does not exist",
+                &["\x1b[B", "\x1b[B", "\r"],
+            )
+            .await;
         };
         let command = format!("/import {}", source.display());
         let (_, ()) = tokio::join!(mode.handle_import_command(&command), feeder);

@@ -494,8 +494,38 @@ async fn run_web_fetch_with_spinner(
     }
 }
 
+/// The successful final-frame details (index.ts:718-731 @ feb6da00): the
+/// compact `fetchSummary` replaces the full `fetchResult`, so a persisted
+/// session never duplicates the extracted body. `maxChars` is the effective
+/// limit and `durationMs` the wall-clock run time.
+fn web_fetch_success_details(
+    result: &crate::types::FetchResult,
+    verbose: bool,
+    format: &str,
+    effective_max_chars: u64,
+    spinner_tick: u64,
+    url: String,
+    duration_ms: u64,
+) -> Value {
+    let summary = crate::types::WebFetchResultSummary::from_result(result, effective_max_chars);
+    json!({
+        "verbose": verbose,
+        "format": format,
+        "maxChars": effective_max_chars,
+        "fetchSummary": serde_json::to_value(summary).unwrap_or(Value::Null),
+        "started": true,
+        "status": "done",
+        "progress": 1,
+        "phase": "done",
+        "url": url,
+        "spinnerTick": spinner_tick,
+        "durationMs": duration_ms,
+    })
+}
+
 /// `web_fetch` execute (index.ts:489-626 + the FR-P2-B/D stream).
 fn execute_web_fetch(params: &Value, state: &PluginState, tool_call_id: Option<&str>) -> Value {
+    let started_at = std::time::Instant::now();
     let params_url = params
         .get("url")
         .and_then(Value::as_str)
@@ -527,6 +557,9 @@ fn execute_web_fetch(params: &Value, state: &PluginState, tool_call_id: Option<&
         .map(types::OutputFormat::from)
         .unwrap_or_default();
     let opts = batch::build_fetch_options_from_params(&parsed_params, &defaults);
+    // `effectiveMaxChars` (index.ts:714-716 @ feb6da00): the call's limit,
+    // else the resolved settings default.
+    let effective_max_chars = parsed_params.max_chars.unwrap_or(defaults.max_chars);
 
     // FR-P2-B/D: the streaming layer exists only under a real dispatch id.
     let sink = tool_call_id.zip(state.channel()).map(|(id, channel)| {
@@ -611,6 +644,7 @@ fn execute_web_fetch(params: &Value, state: &PluginState, tool_call_id: Option<&
                     "phase": latest_phase,
                     "url": opts_url,
                     "spinnerTick": final_spinner_tick,
+                    "durationMs": started_at.elapsed().as_millis() as u64,
                 },
             })
         }
@@ -625,18 +659,15 @@ fn execute_web_fetch(params: &Value, state: &PluginState, tool_call_id: Option<&
             };
             json!({
                 "content": [{ "type": "text", "text": response_text }],
-                "details": {
-                    "verbose": verbose,
-                    "format": format.as_str(),
-                    "maxChars": defaults.max_chars,
-                    "fetchResult": serde_json::to_value(&result).unwrap_or(Value::Null),
-                    "started": true,
-                    "status": "done",
-                    "progress": 1,
-                    "phase": "done",
-                    "url": url,
-                    "spinnerTick": final_spinner_tick,
-                },
+                "details": web_fetch_success_details(
+                    &result,
+                    verbose,
+                    format.as_str(),
+                    effective_max_chars,
+                    final_spinner_tick,
+                    url,
+                    started_at.elapsed().as_millis() as u64,
+                ),
             })
         }
     }
@@ -709,6 +740,7 @@ fn execute_batch_web_fetch(
     state: &PluginState,
     tool_call_id: Option<&str>,
 ) -> Value {
+    let started_at = std::time::Instant::now();
     let parsed: batch::BatchWebFetchParams = match serde_json::from_value(params.clone()) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -726,6 +758,7 @@ fn execute_batch_web_fetch(
 
     let (resolved, defaults) = resolve_runtime(state);
     let verbose = parsed.verbose.unwrap_or(resolved.verbose_by_default);
+    let defaults_max_chars = defaults.max_chars;
 
     // FR-P2-B/D: same streaming gate as web_fetch — a real dispatch id.
     let sink = tool_call_id.zip(state.channel()).map(|(id, channel)| {
@@ -797,7 +830,12 @@ fn execute_batch_web_fetch(
     let final_spinner_tick = *spinner_tick.lock().unwrap_or_else(|e| e.into_inner());
     // index.ts:753-755: the agent text carries the FULL per-item headers.
     let response_text = batch::build_batch_fetch_response_text(&batch_result, true);
-    let mut details = batch::batch_details_json(&batch_result, verbose);
+    let mut details = batch::batch_details_json(
+        &batch_result,
+        verbose,
+        defaults_max_chars,
+        started_at.elapsed().as_millis() as u64,
+    );
     if let Some(details) = details.as_object_mut() {
         details.insert("spinnerTick".to_string(), json!(final_spinner_tick));
     }
@@ -1135,5 +1173,60 @@ mod tests {
             "no spinner frame before the first snapshot or after completion: {ticks:?}"
         );
         assert_eq!(*spinner_tick.lock().unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod details_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn content_result() -> crate::types::FetchResult {
+        let mut result = crate::types::FetchResult::content(
+            "https://ex.com/a",
+            "https://ex.com/final",
+            5,
+            "the extracted body",
+            "chrome_145",
+            "windows",
+        );
+        result.title = "T".to_string();
+        result.published = "2026-01-01".to_string();
+        result
+    }
+
+    #[test]
+    fn success_details_write_summary_not_result() {
+        let details = web_fetch_success_details(
+            &content_result(),
+            false,
+            "markdown",
+            1234,
+            7,
+            "https://ex.com/final".to_string(),
+            99,
+        );
+        assert!(details.get("fetchResult").is_none());
+        assert_eq!(details["maxChars"], json!(1234), "effective maxChars");
+        assert_eq!(details["durationMs"], json!(99));
+        assert_eq!(details["spinnerTick"], json!(7));
+        assert_eq!(details["url"], json!("https://ex.com/final"));
+        let summary = &details["fetchSummary"];
+        assert_eq!(summary["kind"], json!("content"));
+        assert_eq!(summary["charCount"], json!(18));
+        assert_eq!(summary["wordCount"], json!(5));
+        assert!(!details.to_string().contains("the extracted body"));
+    }
+
+    #[test]
+    fn success_details_file_variant() {
+        let mut result = content_result();
+        result.kind = "file".to_string();
+        result.file_path = Some("/tmp/report.pdf".to_string());
+        result.file_size = Some(9);
+        let details =
+            web_fetch_success_details(&result, true, "raw", 50_000, 0, "u".to_string(), 1);
+        assert_eq!(details["fetchSummary"]["kind"], json!("file"));
+        assert_eq!(details["fetchSummary"]["fileSize"], json!(9));
     }
 }

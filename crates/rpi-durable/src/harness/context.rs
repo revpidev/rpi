@@ -1,5 +1,5 @@
 //! Committed transcript derivation for model context (port of
-//! `packages/durable/src/harness/context.ts` @ `4a080252f`).
+//! `packages/durable/src/harness/context.ts` @ `b4afdddf`).
 //!
 //! The active context is fixed by a *head marker*: the newest visible entry that
 //! carries a `head`, or the transcript start. Within that range, per target the
@@ -68,6 +68,8 @@ pub struct ContextRange {
     /// Contributed messages from the last assistant message on, before tool
     /// result ordering.
     pub open: Vec<Message>,
+    /// Whether this range reached the conversation tail when read.
+    pub current: bool,
 }
 
 /// Capture the bounds of the current context, or of the context cut off at the
@@ -166,7 +168,7 @@ pub async fn read_context_from(
     let Some(bounds) = bounds else {
         return Ok((empty_view(), None));
     };
-    let range = match previous {
+    let mut range = match previous {
         None => {
             let entries = scan_range(storage.as_ref(), conversation_id, &bounds, context).await?;
             derive_range(bounds, entries)
@@ -200,6 +202,7 @@ pub async fn read_context_from(
             extend_range(previous, bounds, added)
         }
     };
+    range.current = at.is_none();
     let view = ContextView {
         head: range.view.head.clone(),
         entries: range.view.entries.clone(),
@@ -281,6 +284,7 @@ fn derive_range(bounds: ContextBounds, entries: Vec<EntryRecord>) -> ContextRang
         edited: edits.keys().copied().collect(),
         settled,
         open,
+        current: false,
     }
 }
 
@@ -322,7 +326,55 @@ fn extend_range(
         edited: previous.edited,
         settled,
         open,
+        current: previous.current,
     }
+}
+
+pub(crate) fn advance_range(
+    previous: ContextRange,
+    appended: &[EntryRecord],
+) -> Option<ContextRange> {
+    if !previous.current || appended.is_empty() {
+        return Some(previous);
+    }
+    let mut head = previous.bounds.head.clone();
+    for entry in appended {
+        if entry.head.is_some() {
+            head = Some(entry.clone());
+        }
+    }
+    let bounds = ContextBounds {
+        head,
+        tail: appended.last().expect("nonempty").id,
+    };
+    if bounds.head.as_ref().map(|entry| entry.id)
+        == previous.bounds.head.as_ref().map(|entry| entry.id)
+    {
+        let mut range = extend_range(previous, bounds, appended.to_vec());
+        range.current = true;
+        return Some(range);
+    }
+    let start = bounds.head.as_ref().and_then(|entry| entry.head);
+    if previous
+        .bounds
+        .head
+        .as_ref()
+        .and_then(|entry| entry.head)
+        .zip(start)
+        .is_some_and(|(previous, start)| start < previous)
+    {
+        return None;
+    }
+    let entries = previous
+        .entries
+        .iter()
+        .chain(appended)
+        .filter(|entry| start.is_none_or(|start| entry.id >= start))
+        .cloned()
+        .collect();
+    let mut range = derive_range(bounds, entries);
+    range.current = true;
+    Some(range)
 }
 
 /// Move a system message that only user messages precede to the front.

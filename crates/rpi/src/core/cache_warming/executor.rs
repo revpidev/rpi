@@ -151,6 +151,7 @@ impl CacheWarmer {
         let mut options = request.options;
         options.simple.stream.max_tokens = Some(1);
         options.simple.stream.max_retries = Some(0);
+        options.simple.stream.disable_continuation = Some(true);
         options.simple.stream.request.signal = Some(token);
         let stream: AssistantMessageEventStream =
             self.deps

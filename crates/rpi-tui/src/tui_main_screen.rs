@@ -40,7 +40,9 @@ use crate::tui::{
     TuiStopOptions, lock_component, lock_shared, same_component,
 };
 use crate::tui_base::{
-    CursorPos, RenderSchedule, TerminalSizeCache, TuiBase, env_flag_is_1, schedule_render,
+    CursorPos, RenderSchedule, RenderScheduleStats, TerminalSizeCache, TuiBase, env_flag_is_1,
+    promote_pending_render, record_frame_cost, render_schedule_stats, schedule_render,
+    take_render_synchronous,
 };
 use crate::utils::{slice_by_column, visible_width, width_divergence_extra};
 
@@ -304,11 +306,7 @@ impl TuiMainScreen {
         log_directory: Option<PathBuf>,
         size_cache: TerminalSizeCache,
     ) -> TuiMainScreen {
-        let schedule = Arc::new(Mutex::new(RenderSchedule {
-            requested: false,
-            deadline: None,
-            last_render_at: None,
-        }));
+        let schedule = Arc::new(Mutex::new(RenderSchedule::default()));
         let base = TuiBase::new(
             Arc::clone(&terminal),
             show_hardware_cursor,
@@ -781,15 +779,19 @@ impl TuiMainScreen {
         if force {
             inner.reset_render_state();
         }
-        {
-            let mut schedule = lock_shared(&self.schedule);
-            schedule.requested = false;
-            schedule.deadline = None;
-            schedule.last_render_at = Some(Instant::now());
-        }
+        take_render_synchronous(&self.schedule, Instant::now());
+        let started = Instant::now();
         inner.do_render();
+        let frame_cost = started.elapsed();
         drop(inner);
+        record_frame_cost(&self.schedule, frame_cost);
         self.drain_pending_ops();
+    }
+
+    /// Render schedule snapshot (V19-06): latest-wins generations, the
+    /// adaptive backpressure tier and the latest frame cost.
+    pub fn render_schedule_stats(&self) -> RenderScheduleStats {
+        render_schedule_stats(&self.schedule)
     }
 
     /// `captureRenderState` (tui-main-screen.ts:68-78): shallow-copy the
@@ -866,18 +868,28 @@ impl TuiMainScreen {
     /// `handleInput` flow, run queued mutations, then fire the render
     /// deadline and introspection query timeouts that expired by `now`.
     pub fn tick(&self, now: Instant) {
+        let mut dispatched_input = false;
         loop {
             let event = lock_shared(&self.inbox).pop_front();
             match event {
                 Some(InboxEvent::Input(data)) => {
+                    dispatched_input = true;
                     self.lock_inner().handle_input(&data);
                     self.drain_pending_ops();
                 }
-                Some(InboxEvent::Resize) => self.request_render(false),
+                Some(InboxEvent::Resize) => {
+                    dispatched_input = true;
+                    self.request_render(false);
+                }
                 None => break,
             }
         }
         self.drain_pending_ops();
+        // V19-06 FR-D R3: a frame owed to keyboard/mouse/paste/resize input
+        // is latency-class and never waits behind the 30/20 fps backoff.
+        if dispatched_input {
+            promote_pending_render(&self.schedule, now);
+        }
         self.lock_inner().tick(now);
         self.drain_pending_ops();
     }
@@ -1071,6 +1083,7 @@ impl TuiMainScreenInner {
         width: i32,
         height: i32,
     ) {
+        crate::benchmark::mark_paint();
         self.full_redraw_count += 1;
         let mut buffer = String::from("\x1b[?2026h"); // begin synchronized output
         if clear {
@@ -1105,7 +1118,7 @@ impl TuiMainScreenInner {
             i += 1;
         }
         buffer.push_str("\x1b[?2026l"); // end synchronized output
-        self.terminal().write(&buffer);
+        crate::benchmark::terminal_write(&buffer, || self.terminal().write(&buffer));
         self.cursor_row = 0.max(new_lines.len() as i32 - 1);
         self.hardware_cursor_row = self.cursor_row;
         // Reset max lines when clearing, otherwise track growth.
@@ -1245,6 +1258,8 @@ impl TuiMainScreenInner {
         if self.stopped {
             return;
         }
+        let _frame_probe = crate::benchmark::FrameProbe::new("regular");
+        crate::benchmark::note_backpressure(self.schedule_stats());
         // V13-07 S5: read the terminal size ONCE per frame (upstream reads a
         // cached property, tui-main-screen.ts:182-183; each `columns()`/
         // `rows()` here is an ioctl — the old code called them four times,
@@ -1283,7 +1298,14 @@ impl TuiMainScreenInner {
         // Render all components to get new lines. Resolve fake cursors before
         // compositing so overlays and line slicing see plain SGR codes
         // (tui-main-screen.ts:265).
-        let mut new_lines = self.resolve_fake_cursors(self.render_children(width));
+        let rendered_children = self.render_children(width);
+        crate::benchmark::mark_layout();
+        let mut new_lines = self.resolve_fake_cursors(
+            rendered_children
+                .into_iter()
+                .map(|line| crate::utils::strip_osc133_zone_prefix(&line))
+                .collect(),
+        );
 
         // Composite overlays into the rendered lines (before differential compare).
         if !self.overlay_stack.is_empty() {
@@ -1388,6 +1410,7 @@ impl TuiMainScreenInner {
         // No changes - but still need to update the hardware cursor position
         // if it moved.
         if first_changed == -1 {
+            crate::benchmark::mark_paint();
             self.position_hardware_cursor(cursor_pos, new_lines.len() as i32);
             self.previous_viewport_top = prev_viewport_top;
             self.previous_height = height;
@@ -1397,6 +1420,7 @@ impl TuiMainScreenInner {
         // All changes are in deleted lines (nothing to render, just clear).
         if first_changed >= new_lines.len() as i32 {
             if self.previous_lines.len() > new_lines.len() {
+                crate::benchmark::mark_paint();
                 let mut buffer = String::from("\x1b[?2026h");
                 buffer.push_str(&self.delete_changed_kitty_images(first_changed, last_changed));
                 // Move to the end of new content (clamp to 0 for empty content).
@@ -1450,7 +1474,7 @@ impl TuiMainScreenInner {
                     buffer.push_str(&format!("\x1b[{move_back}A"));
                 }
                 buffer.push_str("\x1b[?2026l");
-                self.terminal().write(&buffer);
+                crate::benchmark::terminal_write(&buffer, || self.terminal().write(&buffer));
                 self.cursor_row = target_row;
                 self.hardware_cursor_row = target_row;
             }
@@ -1478,6 +1502,7 @@ impl TuiMainScreenInner {
 
         // Render from the first changed line to the end; all updates are
         // wrapped in synchronized output.
+        crate::benchmark::mark_paint();
         let mut buffer = String::from("\x1b[?2026h");
         buffer.push_str(&self.delete_changed_kitty_images(first_changed, last_changed));
         let prev_viewport_bottom = prev_viewport_top + height - 1;
@@ -1626,7 +1651,7 @@ impl TuiMainScreenInner {
         }
 
         // Write the entire buffer at once.
-        self.terminal().write(&buffer);
+        crate::benchmark::terminal_write(&buffer, || self.terminal().write(&buffer));
 
         // Track cursor position for the next render. cursorRow tracks the end
         // of content (for viewport calculation); hardwareCursorRow tracks the
@@ -1680,7 +1705,7 @@ impl TuiMainScreenInner {
         buffer.push_str(&format!("\x1b[{}G", target_col + 1));
 
         if !buffer.is_empty() {
-            self.terminal().write(&buffer);
+            crate::benchmark::terminal_write(&buffer, || self.terminal().write(&buffer));
         }
 
         self.hardware_cursor_row = target_row;
@@ -1696,7 +1721,9 @@ impl TuiMainScreenInner {
     /// [`TuiMainScreen::tick`].
     fn tick(&mut self, now: Instant) {
         if self.take_render_due(now) {
+            let started = Instant::now();
             self.do_render();
+            record_frame_cost(&self.schedule, started.elapsed());
         }
         self.fire_expired_queries(now);
     }
@@ -2139,17 +2166,23 @@ mod tests {
     }
 
     /// Sets Kitty image capabilities + cell dimensions, restores on drop
-    /// (tui-render.test.ts try/finally blocks).
-    struct CapsGuard;
+    /// (tui-render.test.ts try/finally blocks). Holds the shared caps lock so
+    /// concurrent markdown/image/alt-screen tests cannot overwrite them.
+    struct CapsGuard {
+        _caps: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl CapsGuard {
         fn kitty(cell_px: f64) -> CapsGuard {
+            let caps = crate::terminal_image::TEST_CAPS_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             set_capabilities(KITTY_CAPS);
             set_cell_dimensions(CellDimensions {
                 width_px: cell_px,
                 height_px: cell_px,
             });
-            CapsGuard
+            CapsGuard { _caps: caps }
         }
     }
 

@@ -1485,12 +1485,34 @@ async fn export_html_in_memory_session_errors() {
     assert_eq!(rpc.close_and_wait().await, 0);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_extension_shutdown_starts_draining_without_eof() {
+    let host = Arc::new(rpi_ext_host::host::NativeExtensionHost::new("/tmp"));
+    let mut rpc =
+        start_rpc_with_host(FauxProviderOptions::default(), Vec::new(), host.clone()).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while host.runtime().context_actions().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "RPC input never became ready"
+        );
+        tokio::task::yield_now().await;
+    }
+    host.core().create_context().shutdown().expect("shutdown");
+    let handle = rpc.handle.take().expect("rpc handle");
+    let code = tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("idle shutdown must not wait for EOF")
+        .expect("join");
+    assert_eq!(code, 0);
+}
+
 // ---------------------------------------------------------------------------
 // Signal exit codes (print-mode.ts / rpc-mode.ts: SIGTERM=143 / SIGHUP=129)
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-fn signal_exit_code(signal: libc::c_int, expected_code: i32) {
+fn signal_exit_code(signal: libc::c_int, expected_code: i32, repeat_signal: bool) {
     let tmp = TempDir::new();
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
@@ -1518,23 +1540,57 @@ fn signal_exit_code(signal: libc::c_int, expected_code: i32) {
 
     // Wait for the startup pipeline (rpc loop in place), then send the signal.
     std::thread::sleep(std::time::Duration::from_millis(800));
+    let output_writer = repeat_signal.then(|| {
+        let mut input = child.stdin.take().expect("stdin");
+        std::thread::spawn(move || {
+            for index in 0..2000 {
+                let command = format!("{{\"id\":\"fill-{index}\",\"type\":\"get_state\"}}\n");
+                if std::io::Write::write_all(&mut input, command.as_bytes()).is_err() {
+                    break;
+                }
+            }
+        })
+    });
     unsafe {
         libc::kill(child.id() as libc::pid_t, signal);
+        if repeat_signal {
+            // Distinct deliveries are required: POSIX coalesces identical
+            // standard signals sent back-to-back.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            libc::kill(child.id() as libc::pid_t, signal);
+        }
     }
+    // Keep stdin open for the single-signal case: `Child::wait` closes it,
+    // which would race the signal with the EOF path (exit 0 instead of 143).
+    let held_stdin = if repeat_signal {
+        None
+    } else {
+        child.stdin.take()
+    };
     let status = child.wait().expect("wait");
+    drop(held_stdin);
+    if let Some(writer) = output_writer {
+        writer.join().expect("output writer");
+    }
     assert_eq!(status.code(), Some(expected_code));
 }
 
 #[cfg(unix)]
 #[test]
 fn rpc_mode_sigterm_exits_143() {
-    signal_exit_code(libc::SIGTERM, 143);
+    signal_exit_code(libc::SIGTERM, 143, true);
 }
 
 #[cfg(unix)]
 #[test]
 fn rpc_mode_sighup_exits_129() {
-    signal_exit_code(libc::SIGHUP, 129);
+    signal_exit_code(libc::SIGHUP, 129, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_mode_first_sigterm_finishes_cleanup() {
+    signal_exit_code(libc::SIGTERM, 143, false);
 }
 
 #[test]

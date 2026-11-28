@@ -1,5 +1,5 @@
 //! Built-in tool task (port of `packages/durable/src/harness/tool.ts`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 //!
 //! A tool task resolves the called tool among its phase agent's tools, validates
 //! the arguments, records the intent, executes the tool, and appends the result
@@ -63,6 +63,9 @@ pub enum ToolTaskInput {
         assistant: EntryId,
         /// Provider call ID.
         call_id: String,
+        /// The request did not offer this tool; never resolve or execute it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unoffered: Option<bool>,
     },
     /// A nested call of a running tool.
     Nested {
@@ -222,6 +225,7 @@ enum Ending {
     Completed,
     Aborted,
     Failed(String),
+    FailedWithReason(String, &'static str),
 }
 
 /// Built-in tool task (`pi.tool`).
@@ -234,7 +238,7 @@ impl TaskDefinition for ToolTask {
     }
 
     fn version(&self) -> u64 {
-        2
+        3
     }
 
     fn initial(&self) -> JsonValue {
@@ -247,20 +251,21 @@ impl TaskDefinition for ToolTask {
         checkpoint: JsonValue,
         from_version: u64,
     ) -> Option<crate::harness::types::Migration> {
-        if from_version >= 2 {
+        if from_version >= 3 {
             return None;
         }
-        // Version 1 had only model-issued calls.
-        let assistant = input.get("assistant").cloned()?;
-        let call_id = input.get("callId").cloned()?;
-        Some(crate::harness::types::Migration {
-            input: serde_json::json!({
+        let input = if input.get("kind").is_some() {
+            input
+        } else {
+            let assistant = input.get("assistant").cloned()?;
+            let call_id = input.get("callId").cloned()?;
+            serde_json::json!({
                 "kind": "model",
                 "assistant": assistant,
                 "callId": call_id,
-            }),
-            checkpoint,
-        })
+            })
+        };
+        Some(crate::harness::types::Migration { input, checkpoint })
     }
 
     fn has_migration(&self) -> bool {
@@ -274,6 +279,17 @@ impl TaskDefinition for ToolTask {
         runtime: &dyn TaskRuntime,
         context: &Context,
     ) -> SessionResult<()> {
+        if runtime.signal().is_cancelled() {
+            return Err(SessionError::Aborted);
+        }
+        if runtime
+            .settings()
+            .restart_limit
+            .limit()
+            .is_some_and(|limit| task.record.restarts.unwrap_or(0) as u64 >= limit)
+        {
+            return end_cut_off(&task, runtime, context).await;
+        }
         match phase {
             "call" => call_phase(&task, runtime, context).await,
             "execute" => execute_phase(&task, runtime, context).await,
@@ -296,18 +312,30 @@ impl TaskDefinition for ToolTask {
             task.checkpoint(),
             &call.call.name,
         );
-        let result = from_slot(read_slot(runtime, context).await?.as_ref(), code, &message);
-        settle(
+        let allow_hooks = runtime
+            .settings()
+            .restart_limit
+            .limit()
+            .is_none_or(|limit| {
+                (task.record.restarts.unwrap_or(0) as u64) < limit.saturating_sub(1)
+            });
+        let tool = if allow_hooks {
+            Some(
+                resolve_tool(runtime, &input, &call.call.name, context)
+                    .await
+                    .unwrap_or(None),
+            )
+        } else {
+            None
+        };
+        settle_from_slot(
             runtime,
             &input,
             &call,
+            tool,
             Ending::Aborted,
-            {
-                let owned = result.clone();
-                Arc::new(move |_| owned.clone())
-            },
+            (code, &message),
             context,
-            None,
         )
         .await
     }
@@ -352,6 +380,54 @@ fn parse_checkpoint(checkpoint: Option<&JsonValue>) -> SessionResult<ToolCheckpo
     }
 }
 
+async fn end_cut_off(
+    task: &RunningTask,
+    runtime: &dyn TaskRuntime,
+    context: &Context,
+) -> SessionResult<()> {
+    let input = parse_input(task)?;
+    let call = read_call(runtime, &input, context).await?;
+    let message = format!(
+        "Tool {} was interrupted {} times; it is not run again",
+        call.call.name,
+        task.record.restarts.unwrap_or(0)
+    );
+    let salvage = runtime
+        .settings()
+        .restart_limit
+        .limit()
+        .is_none_or(|limit| task.record.restarts.unwrap_or(0) as u64 <= limit);
+    let tool = if salvage {
+        Some(
+            resolve_tool(runtime, &input, &call.call.name, context)
+                .await
+                .unwrap_or(None),
+        )
+    } else {
+        None
+    };
+    runtime.report_info(
+        crate::harness::types::ReportInfo::new(crate::harness::types::ReportKind::TaskInterrupted)
+            .with_task(crate::harness::types::ReportTask::new(
+                task.id(),
+                TOOL_TASK_NAME,
+                task.record.conversation_id,
+            ))
+            .with_reason("restart_limit")
+            .with_restarts(task.record.restarts.unwrap_or(0)),
+    );
+    settle_from_slot(
+        runtime,
+        &input,
+        &call,
+        tool,
+        Ending::FailedWithReason(message.clone(), "restart_limit"),
+        ("restart_limit", &message),
+        context,
+    )
+    .await
+}
+
 async fn call_phase(
     task: &RunningTask,
     runtime: &dyn TaskRuntime,
@@ -360,10 +436,18 @@ async fn call_phase(
     let input = parse_input(task)?;
     let call = read_call(runtime, &input, context).await?;
     let Some(tool) = resolve_tool(runtime, &input, &call.call.name, context).await? else {
-        let error = harness_error(
-            "tool_unavailable",
-            &format!("Tool {} is not available", call.call.name),
-        );
+        let error = prepare_harness_result(
+            runtime,
+            &input,
+            &call,
+            None,
+            harness_error(
+                "tool_unavailable",
+                &format!("Tool {} is not available", call.call.name),
+            ),
+            context,
+        )
+        .await?;
         return settle(
             runtime,
             &input,
@@ -384,7 +468,15 @@ async fn call_phase(
     };
     let mut args = match prepared {
         Err(error) => {
-            let result = invalid(&error);
+            let result = prepare_harness_result(
+                runtime,
+                &input,
+                &call,
+                Some(&tool),
+                invalid(&error),
+                context,
+            )
+            .await?;
             return settle(
                 runtime,
                 &input,
@@ -411,7 +503,15 @@ async fn call_phase(
             let api = crate::harness::types::RuntimeHookApi { runtime };
             let mut call_with_args = call.clone();
             call_with_args.call.arguments = args.clone();
-            if let Some(decision) = hooks.before_tool(&call_with_args, &api, context).await {
+            if let Some(decision) = crate::harness::types::contain_hook(
+                hooks.before_tool(&call_with_args, &api, context),
+                runtime,
+                "beforeTool",
+                TOOL_TASK_NAME,
+            )
+            .await
+            .flatten()
+            {
                 if let Some(reason) = decision.block {
                     block = Some(reason);
                 } else if let Some(replacement) = decision.arguments {
@@ -421,7 +521,15 @@ async fn call_phase(
         }
     }
     if let Some(reason) = block {
-        let result = harness_error("blocked", &format!("Tool call blocked: {reason}"));
+        let result = prepare_harness_result(
+            runtime,
+            &input,
+            &call,
+            Some(&tool),
+            harness_error("blocked", &format!("Tool call blocked: {reason}")),
+            context,
+        )
+        .await?;
         return settle(
             runtime,
             &input,
@@ -439,7 +547,15 @@ async fn call_phase(
     let final_args = match validate(&tool, &call.call, args) {
         Ok(args) => args,
         Err(error) => {
-            let result = invalid(&error);
+            let result = prepare_harness_result(
+                runtime,
+                &input,
+                &call,
+                Some(&tool),
+                invalid(&error),
+                context,
+            )
+            .await?;
             return settle(
                 runtime,
                 &input,
@@ -527,16 +643,38 @@ async fn execute_phase(
         "Tool {} was interrupted and may have partially run",
         call.call.name
     );
-    let result = from_slot(
-        read_slot(runtime, context).await?.as_ref(),
-        "interrupted",
-        &message,
-    );
-    settle(
+    settle_from_slot(
         runtime,
         &input,
         &call,
-        Ending::Failed(message),
+        Some(tool),
+        Ending::Failed(message.clone()),
+        ("interrupted", &message),
+        context,
+    )
+    .await
+}
+
+async fn settle_from_slot(
+    runtime: &dyn TaskRuntime,
+    input: &ToolTaskInput,
+    call: &ToolHookCall,
+    tool: Option<Option<ToolRegistration>>,
+    ending: Ending,
+    failure: (&str, &str),
+    context: &Context,
+) -> SessionResult<()> {
+    let (code, message) = failure;
+    let mut result = from_slot(read_slot(runtime, context).await?.as_ref(), code, message);
+    if let Some(tool) = tool {
+        result =
+            prepare_harness_result(runtime, input, call, tool.as_ref(), result, context).await?;
+    }
+    settle(
+        runtime,
+        input,
+        call,
+        ending,
         {
             let owned = result.clone();
             Arc::new(move |_| owned.clone())
@@ -555,6 +693,15 @@ async fn resolve_tool(
     name: &str,
     context: &Context,
 ) -> SessionResult<Option<ToolRegistration>> {
+    if matches!(
+        input,
+        ToolTaskInput::Model {
+            unoffered: Some(true),
+            ..
+        }
+    ) {
+        return Ok(None);
+    }
     let agent: Agent = runtime.agent(context).await?;
     let tools = match input {
         ToolTaskInput::Model { .. } => &agent.tools,
@@ -744,7 +891,11 @@ async fn run(
                     crate::harness::types::ReportInfo::new(
                         crate::harness::types::ReportKind::TaskError,
                     )
-                    .with_task(runtime.task_id(), TOOL_TASK_NAME),
+                    .with_task(crate::harness::types::ReportTask::new(
+                        runtime.task_id(),
+                        TOOL_TASK_NAME,
+                        runtime.conversation_id(),
+                    )),
                 );
                 error_result(&error.to_string())
             }
@@ -761,7 +912,7 @@ async fn run(
     // Details still waiting for a progress commit settle with the terminal
     // commit, the final flush.
     let pending = progress.stop().await;
-    let settled = final_result(runtime, input, call, tool, result, &reported, context).await;
+    let settled = final_result(runtime, input, call, Some(tool), result, &reported, context).await;
     let result = match settled {
         Ok(result) => result,
         Err(error) => {
@@ -951,7 +1102,13 @@ async fn flush_reported(
         })
     });
     runtime
-        .commit(commit, &context)
+        .commit_with_options(
+            commit,
+            &context,
+            crate::session::CommitOptions {
+                persistence: Some(crate::session::CommitPersistence::Deferred { within_ms: None }),
+            },
+        )
         .await
         .map_err(|error| error.to_string())?;
     {
@@ -971,7 +1128,7 @@ async fn final_result(
     runtime: &dyn TaskRuntime,
     input: &ToolTaskInput,
     call: &ToolHookCall,
-    tool: &ToolRegistration,
+    tool: Option<&ToolRegistration>,
     result: ToolExecutionResult,
     reported: &Arc<Mutex<Reported>>,
     context: &Context,
@@ -1027,9 +1184,14 @@ async fn final_result(
     for handlers in agent_hooks(&agent, TOOL_TASK_NAME) {
         if let HookHandlers::Tool(hooks) = handlers {
             let api = crate::harness::types::RuntimeHookApi { runtime };
-            if let Some(replaced) = hooks
-                .after_tool(call, final_result.clone(), &api, context)
-                .await
+            if let Some(replaced) = crate::harness::types::contain_hook(
+                hooks.after_tool(call, final_result.clone(), &api, context),
+                runtime,
+                "afterTool",
+                TOOL_TASK_NAME,
+            )
+            .await
+            .flatten()
             {
                 final_result = replaced;
             }
@@ -1063,7 +1225,9 @@ async fn final_result(
         ));
     }
     final_result.output = Some(bounded.clone());
-    if let Some(broken) = structured_output_error(tool, &final_result) {
+    if let Some(tool) = tool
+        && let Some(broken) = structured_output_error(tool, &final_result)
+    {
         final_result.structured_output = None;
         if input.is_nested() {
             final_result.is_error = Some(true);
@@ -1077,18 +1241,22 @@ async fn final_result(
                 crate::harness::types::ReportInfo::new(
                     crate::harness::types::ReportKind::ExtensionError,
                 )
-                .with_task(runtime.task_id(), TOOL_TASK_NAME),
+                .with_task(crate::harness::types::ReportTask::new(
+                    runtime.task_id(),
+                    TOOL_TASK_NAME,
+                    runtime.conversation_id(),
+                )),
             );
         }
     }
     // Programs get the tool's own value: without a schema, its output.
-    if input.is_nested() && tool.structured_output_schema.is_none() {
+    if input.is_nested() && tool.is_none_or(|tool| tool.structured_output_schema.is_none()) {
         final_result.structured_output = Some(output_value(&bounded));
     }
     // A schema tool's error result without structured output has its text only
     // in the output, which programs never get: it becomes an error diagnostic.
     if input.is_nested()
-        && tool.structured_output_schema.is_some()
+        && tool.is_some_and(|tool| tool.structured_output_schema.is_some())
         && final_result.is_error == Some(true)
         && final_result.structured_output.is_none()
         && !final_result
@@ -1178,7 +1346,7 @@ fn structured_output_error(
                 .iter_errors(value)
                 .next()
                 .map(|error| {
-                    let path = error.instance_path.to_string();
+                    let path = error.instance_path().to_string();
                     let path = path.trim_start_matches('/').replace('/', ".");
                     let path = if path.is_empty() {
                         "root".to_string()
@@ -1393,6 +1561,13 @@ async fn settle(
                     error: TaskOutcomeError {
                         message,
                         detail: None,
+                    },
+                    result: Some(settled),
+                },
+                Ending::FailedWithReason(message, reason) => TaskOutcome::Failed {
+                    error: TaskOutcomeError {
+                        message,
+                        detail: Some(serde_json::json!({ "reason": reason })),
                     },
                     result: Some(settled),
                 },
@@ -1822,6 +1997,31 @@ fn bound_content(
 }
 
 /// Append a failed tool result entry for a tool the model was not offered.
+async fn prepare_harness_result(
+    runtime: &dyn TaskRuntime,
+    input: &ToolTaskInput,
+    call: &ToolHookCall,
+    tool: Option<&ToolRegistration>,
+    result: ToolExecutionResult,
+    context: &Context,
+) -> SessionResult<ToolExecutionResult> {
+    let limits = resolve_output_limits(tool.and_then(|tool| tool.output_limits));
+    let reported = Arc::new(Mutex::new(Reported {
+        output: crate::harness::output::OutputBuffer::new(crate::harness::output::OutputLimits {
+            max_bytes: limits.max_bytes,
+            max_lines: limits.max_lines,
+            retain: limits.retain,
+        }),
+        limits,
+        diagnostics: Vec::new(),
+        details: None,
+    }));
+    let mut result = final_result(runtime, input, call, tool, result, &reported, context).await?;
+    result.structured_output = None;
+    result.control = None;
+    Ok(result)
+}
+
 pub fn harness_error(code: &str, message: &str) -> ToolExecutionResult {
     ToolExecutionResult {
         output: Some(Vec::new()),
@@ -1858,7 +2058,9 @@ async fn read_call(
                 call_id: parent_call_id.clone(),
             }),
         }),
-        ToolTaskInput::Model { assistant, call_id } => {
+        ToolTaskInput::Model {
+            assistant, call_id, ..
+        } => {
             let entry = runtime.entry(*assistant, context).await?.ok_or_else(|| {
                 SessionError::message(format!("Entry {assistant} has no tool call {call_id}"))
             })?;

@@ -16,7 +16,6 @@ use std::sync::Arc;
 use crate::api::anthropic_messages::AnthropicMessages;
 use crate::api::openai_completions::OpenAiCompletions;
 use crate::auth::{ProviderAuth, env_api_key_auth};
-use crate::generated::get_builtin_models;
 use crate::models::{
     CreateProviderOptions, Provider, ProviderApi, ProviderStreams, create_provider,
 };
@@ -46,7 +45,7 @@ pub fn fireworks_provider() -> Arc<dyn Provider> {
             ))),
             oauth: None,
         },
-        models: get_builtin_models("fireworks").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared("fireworks")),
         api: ProviderApi::Map(api),
         ..Default::default()
     })

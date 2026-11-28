@@ -517,18 +517,32 @@ pub struct SendUserMessageOptions {
     pub expand_prompt_templates: Option<bool>,
 }
 
-/// `ExecOptions` (exec.ts:11-18). `signal` is not serializable; cancellation
-/// support lands with the W3 binding.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `ExecOptions` (exec.ts:11-28 @ b4afdddf). `signal` stays process-local;
+/// `maxBuffer` is additive on the JSON ABI and defaults to the shared cap.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_buffer: Option<usize>,
+    #[serde(skip)]
+    pub signal: Option<CancellationToken>,
 }
 
-/// `ExecResult` (exec.ts:23-28).
+impl PartialEq for ExecOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.timeout == other.timeout
+            && self.cwd == other.cwd
+            && self.max_buffer == other.max_buffer
+    }
+}
+
+impl Eq for ExecOptions {}
+
+/// `ExecResult` (exec.ts:31-41 @ b4afdddf).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecResult {
@@ -536,9 +550,11 @@ pub struct ExecResult {
     pub stderr: String,
     pub code: i32,
     pub killed: bool,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
-/// `ExecuteToolOptions` (types.ts:368-373 @ 4a080252f) for
+/// `ExecuteToolOptions` (types.ts:368-373 @ b4afdddf) for
 /// [`ExtensionContext::execute_tool`]. `on_update` and the cancellation
 /// signal cannot cross a JSON ABI boundary; wasm guests use the host-call
 /// form documented in `docs/extension-abi.md`.
@@ -550,7 +566,23 @@ pub struct ExecuteToolOptions {
     pub signal: Option<CancellationToken>,
 }
 
-/// `AgentToolCallOutcome` (packages/agent/src/types.ts:449-453 @ 4a080252f)
+/// V19-03 S13/S46 additive host surface: the aggregated outcome of the
+/// `tool_call` handler chain for a synthetic call that is never executed.
+/// Extensions use it to offer workflow child launches to permission
+/// handlers (`subagent_launch`) without re-entering their own tool dispatch.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallApproval {
+    #[serde(default)]
+    pub block: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The input after every handler ran (`None` when no handler changed it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Value>,
+}
+
+/// `AgentToolCallOutcome` (packages/agent/src/types.ts:449-453 @ b4afdddf)
 /// carried over the
 /// host boundary: the tool call JSON, its result, and the error flag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -604,7 +636,7 @@ pub trait HostActions: Send + Sync {
     fn get_all_tools(&self) -> Vec<Value>;
 
     /// Evaluate a tool's `reachesTools(input)` declaration (types.ts:614-621
-    /// @ 4a080252f; native/L0 only). Returns the JSON `"all"` or a word
+    /// @ b4afdddf; native/L0 only). Returns the JSON `"all"` or a word
     /// array, or `None` when the tool has no declaration/does not exist.
     fn tool_reaches(&self, _name: &str, _input: Value) -> Option<Value> {
         None
@@ -754,7 +786,7 @@ pub trait HostActions: Send + Sync {
     fn model_registry_find(&self, provider: &str, model_id: &str) -> Option<Value>;
 
     /// `ctx.modelRegistry.findOfType(type, provider, modelId)` — non-chat
-    /// catalog lookup (model-registry.ts:76-77 @ 4a080252f). `model_type`
+    /// catalog lookup (model-registry.ts:76-77 @ b4afdddf). `model_type`
     /// is the wire tag `"chat" | "image" | "classifier"`; returns the
     /// `AnyModel` JSON or `None` for an unknown type/entry.
     fn model_registry_find_of_type(
@@ -766,7 +798,7 @@ pub trait HostActions: Send + Sync {
 
     /// `ctx.modelRegistry.classify(model, context, options)` — structured
     /// classification with request-time authentication
-    /// (model-registry.ts:173-179 @ 4a080252f). Never rejects: parse
+    /// (model-registry.ts:173-179 @ b4afdddf). Never rejects: parse
     /// failures return an error `ClassifierResult` JSON. Callback-bearing
     /// options cannot cross the JSON boundary and are ignored.
     async fn model_registry_classify(
@@ -823,8 +855,23 @@ pub trait HostActions: Send + Sync {
     /// `ctx.removeRuntimeApiKey(providerId)` (model-runtime.ts:549-560).
     async fn remove_runtime_api_key(&self, provider_id: &str) -> Result<(), String>;
 
+    /// V19-03 S13 additive: run the session's `tool_call` handler chain for a
+    /// synthetic tool call and return the aggregated block/rewrite decision.
+    /// Unlike `execute_tool` this never dispatches a tool, so a native plugin
+    /// can offer a workflow child launch to permission handlers without
+    /// re-entering its own tool dispatch. Default: unbound.
+    async fn approve_tool_call(
+        &self,
+        _tool_name: &str,
+        _input: Value,
+    ) -> Result<ToolCallApproval, ExtError> {
+        Err(ExtError::Unbound(
+            "approveToolCall is not bound to a session".to_owned(),
+        ))
+    }
+
     /// Backs `ExtensionToolContext.executeTool()` (types.ts:390-394 @
-    /// 4a080252f; `_executeNestedToolCall`, agent-session.ts:702-735): run
+    /// b4afdddf; `_executeNestedToolCall`, agent-session.ts:702-735): run
     /// another tool through the same validation, hooks, and permission
     /// checks as model-issued calls. Never rejects for tool failures — they
     /// come back as `is_error: true`. Default: unbound (the action surface
@@ -1388,6 +1435,15 @@ pub trait ContextActions: Send + Sync {
     fn session_stats(&self) -> Option<crate::types::SessionStatsSnapshot> {
         None
     }
+
+    /// `ctx.sessionStats({countsOnly:true})` (rpi additive, ADR-0049
+    /// decision 8 / V19-07): identity plus counts, answered in O(1) by a
+    /// host that implements it. `None` when unbound or not implemented; the
+    /// dispatch layer then falls back to the full snapshot so an old host
+    /// stays compatible (`rpiAbi` unchanged).
+    fn session_counts(&self) -> Option<crate::types::SessionCountsSnapshot> {
+        None
+    }
 }
 
 /// `withSession` callback (types.ts:358): receives the
@@ -1887,7 +1943,7 @@ pub struct ExtensionContext {
     /// the current value through `ctx.getSystemPrompt()`
     /// (runner.ts:1075-1082).
     system_prompt_override: Option<Arc<RwLock<String>>>,
-    /// `createToolContext` binding (runner.ts:952-980 @ 4a080252f): set for a
+    /// `createToolContext` binding (runner.ts:952-980 @ b4afdddf): set for a
     /// tool's execution context; `ctx.executeTool()` is only available then.
     /// The signal is the calling tool's default signal.
     tool_call: Option<ToolCallBinding>,
@@ -1912,7 +1968,7 @@ impl ExtensionContext {
     }
 
     /// Context bound to one tool execution (`createToolContext`,
-    /// runner.ts:952-980 @ 4a080252f): the calling id and signal back
+    /// runner.ts:952-980 @ b4afdddf): the calling id and signal back
     /// `ctx.executeTool()` (V16-06 FR-E).
     pub(crate) fn for_tool(
         runtime: ExtensionRuntime,
@@ -1973,7 +2029,7 @@ impl ExtensionContext {
     }
 
     /// `ctx.executeTool(name, args, options?)` (types.ts:390-394 @
-    /// 4a080252f; V16-06 FR-E): run another tool through the same
+    /// b4afdddf; V16-06 FR-E): run another tool through the same
     /// validation, hooks, and permission checks as model-issued calls. Only
     /// available while a tool executes; tool failures come back as
     /// `is_error: true` outcomes.
@@ -2208,6 +2264,15 @@ impl ExtensionContext {
             .context_actions()?
             .and_then(|actions| actions.session_stats()))
     }
+
+    /// `ctx.sessionStats({countsOnly:true})` — the O(1) identity + counts
+    /// probe. `None` when the host does not implement it (the dispatch layer
+    /// falls back to the full snapshot) or is unbound.
+    pub fn session_counts(&self) -> Result<Option<crate::types::SessionCountsSnapshot>, ExtError> {
+        Ok(self
+            .context_actions()?
+            .and_then(|actions| actions.session_counts()))
+    }
 }
 
 // ============================================================================
@@ -2408,15 +2473,15 @@ pub struct LoadedExtension {
     tools: RwLock<InsertionMap<RegisteredTool>>,
     message_renderers: RwLock<InsertionMap<MessageRenderFn>>,
     entry_renderers: RwLock<InsertionMap<EntryRenderFn>>,
-    /// `extension.toolRenderers` (types.ts:2247 @ 4a080252f, #10285): the
+    /// `extension.toolRenderers` (types.ts:2247 @ b4afdddf, #10285): the
     /// resolver chain this extension registered, in registration order.
     tool_renderers: RwLock<Vec<crate::types::ToolRendererResolver>>,
     commands: RwLock<InsertionMap<RegisteredCommand>>,
     flags: RwLock<InsertionMap<ExtensionFlag>>,
     shortcuts: RwLock<InsertionMap<ExtensionShortcut>>,
-    /// `extension.markdownTransformer` (types.ts:1703 @ 4181f66): one
-    /// transformer per extension, chained in load order by the runner.
-    markdown_transformer: RwLock<Option<crate::types::MarkdownTransformerFn>>,
+    /// `extension.markdownTransformer` (types.ts:1762 @ b4afdddf): one
+    /// registration per extension, chained in load order by the runner.
+    markdown_transformer: RwLock<Option<crate::types::MarkdownTransformerRegistration>>,
     /// The live wasm guest backing this extension (L1; T15 W6). Owns the
     /// guest thread; dropping the extension shuts it down.
     wasm_guest: RwLock<Option<crate::wasm::WasmGuest>>,
@@ -2661,15 +2726,33 @@ impl LoadedExtension {
             .is_some_and(|handlers| !handlers.is_empty())
     }
 
-    /// `extension.markdownTransformer = transformer` (loader.ts:309-312
-    /// @ 4181f66). One per extension — last call wins.
+    /// One registration per extension — last call wins. This legacy setter
+    /// keeps the original three surfaces.
     pub fn set_markdown_transformer(&self, transformer: crate::types::MarkdownTransformerFn) {
-        *write(&self.markdown_transformer) = Some(transformer);
+        self.set_markdown_transformer_registration(
+            crate::types::MarkdownTransformerRegistration::new(
+                transformer,
+                crate::types::MarkdownTransformerOptions::default(),
+            ),
+        );
     }
 
-    /// `getMarkdownTransformers()` flatMap source (runner.ts:589-591
-    /// @ 4181f66).
+    pub fn set_markdown_transformer_registration(
+        &self,
+        registration: crate::types::MarkdownTransformerRegistration,
+    ) {
+        *write(&self.markdown_transformer) = Some(registration);
+    }
+
     pub fn markdown_transformer(&self) -> Option<crate::types::MarkdownTransformerFn> {
+        read(&self.markdown_transformer)
+            .as_ref()
+            .map(|registration| registration.transformer.clone())
+    }
+
+    pub fn markdown_transformer_registration(
+        &self,
+    ) -> Option<crate::types::MarkdownTransformerRegistration> {
         read(&self.markdown_transformer).clone()
     }
 
@@ -2826,7 +2909,7 @@ fn parse_model_and_context(
     model: Value,
     context: Value,
 ) -> Result<(rpi_ai::types::Model, rpi_ai::types::Context), ExtError> {
-    // `assertChatModel` (utils/model-operations.ts:26-30 @ 4a080252f): a
+    // `assertChatModel` (utils/model-operations.ts:26-30 @ b4afdddf): a
     // non-chat model reaching the chat stream entry is a caller error; the
     // `type` discriminator is lost when deserializing straight into `Model`,
     // so parse the union first and narrow.
@@ -3155,7 +3238,7 @@ impl ExtensionApi {
         Ok(removed)
     }
 
-    /// `pi.registerMcpServer(name, config)` (loader.ts:464-479 @ 4a080252f):
+    /// `pi.registerMcpServer(name, config)` (loader.ts:464-479 @ b4afdddf):
     /// validates the registration shape, enforces ownership and `-`/`_`
     /// namespace uniqueness, and registers into the runtime registry. The
     /// registration is not written to `mcp.json`. Deep config validation
@@ -3382,7 +3465,7 @@ impl ExtensionApi {
         Ok(())
     }
 
-    /// `pi.registerToolRenderer(resolver)` (loader.ts:369-371 @ 4a080252f,
+    /// `pi.registerToolRenderer(resolver)` (loader.ts:369-371 @ b4afdddf,
     /// #10285): choose how calls to a tool are drawn — including tools that
     /// are not registered (resumed-session MCP tools). Resolvers run in
     /// extension load order; each may defer to `next()`.
@@ -3399,17 +3482,29 @@ impl ExtensionApi {
         Ok(())
     }
 
-    /// `pi.registerMarkdownTransformer(transformer)` (loader.ts:309-312,
-    /// types.ts:1292 @ 4181f66). One transformer per extension; chained in
-    /// load order by `runner.getMarkdownTransformers()`. TUI rendering
-    /// wiring is T29.
+    /// `pi.registerMarkdownTransformer(transformer)` keeps the original
+    /// user/assistant/thinking surfaces.
     pub fn register_markdown_transformer(
         &self,
         transformer: crate::types::MarkdownTransformerFn,
     ) -> Result<(), ExtError> {
+        self.register_markdown_transformer_with_options(
+            transformer,
+            crate::types::MarkdownTransformerOptions::default(),
+        )
+    }
+
+    /// `pi.registerMarkdownTransformer(transformer, options)` @ b4afdddf.
+    pub fn register_markdown_transformer_with_options(
+        &self,
+        transformer: crate::types::MarkdownTransformerFn,
+        options: crate::types::MarkdownTransformerOptions,
+    ) -> Result<(), ExtError> {
         self.assert_api_active()?;
         self.runtime.assert_active()?;
-        self.extension.set_markdown_transformer(transformer);
+        self.extension.set_markdown_transformer_registration(
+            crate::types::MarkdownTransformerRegistration::new(transformer, options),
+        );
         Ok(())
     }
 
@@ -3747,7 +3842,7 @@ impl ExtensionApi {
     }
 
     /// `ctx.modelRegistry.findOfType(type, provider, modelId)`
-    /// (model-registry.ts:76-77 @ 4a080252f).
+    /// (model-registry.ts:76-77 @ b4afdddf).
     pub fn model_registry_find_of_type(
         &self,
         model_type: &str,

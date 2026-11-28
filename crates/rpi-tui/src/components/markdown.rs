@@ -81,7 +81,9 @@
 //!     fallbacks there echo comrak node values, which would leak the `.`
 //!     bytes (D-078 supplement).
 
-use std::cell::RefCell;
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use comrak::Arena;
@@ -173,6 +175,13 @@ impl MarkdownTheme {
 /// `MarkdownTransformContext`) is adapted onto it by the rpi crate.
 pub type MarkdownTransformFn = Arc<dyn Fn(&str, usize) -> String + Send + Sync>;
 
+/// Optional revision source for a [`MarkdownTransformFn`] (V19-04 FR-E):
+/// a cheap, monotonic value that changes whenever the transform output could
+/// change for the same source/width (lazy streaming flag, Mermaid mode,
+/// terminal capabilities). `None` means the transform context is untrusted
+/// and [`Component::cache_revision`] returns `None`.
+pub type MarkdownTransformRevisionFn = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 /// `MarkdownOptions` (markdown.ts:98-103). Not `Copy`/`PartialEq`/`Debug`:
 /// the `transform` field carries a closure. `render_latex` defaults to
 /// `true` (markdown.ts:98-99), so `Default` is implemented manually.
@@ -190,6 +199,9 @@ pub struct MarkdownOptions {
     /// Optional width-aware source transform, applied before parsing
     /// (markdown.ts:285). `None` = pass-through.
     pub transform: Option<MarkdownTransformFn>,
+    /// Optional revision source for `transform` (V19-04 FR-E). Required for
+    /// `cache_revision()` to return `Some` when a transform is configured.
+    pub transform_revision: Option<MarkdownTransformRevisionFn>,
 }
 
 impl Default for MarkdownOptions {
@@ -200,6 +212,7 @@ impl Default for MarkdownOptions {
             // markdown.ts:98-99: latex rendering is on by default.
             render_latex: true,
             transform: None,
+            transform_revision: None,
         }
     }
 }
@@ -261,17 +274,61 @@ const STYLE_SENTINEL: char = '\0';
 /// are part of the cache key so a stateful transform closure or a flipped
 /// option cannot serve stale lines (deviation from upstream, which keys on
 /// the raw source text only — T29).
+///
+/// V19-04 (#10971): the entry also owns the current generation of rendered
+/// top-level blocks. `set_text` moves them to [`Markdown::previous_blocks`]
+/// so the next render can reuse the blocks that did not change.
 struct MarkdownCache {
-    text: String,
-    transformed: String,
+    text: Arc<str>,
+    transformed: Arc<str>,
     width: usize,
     render_latex: bool,
-    lines: Vec<String>,
+    lines: Arc<[String]>,
+    blocks: BlockMap,
+}
+
+/// One top-level block of the last render (upstream `RenderedBlock`,
+/// markdown.ts @ 0f21a3319). `raw` is the map key only; the block keeps the
+/// rendered products and the highlighted code of its code blocks.
+struct RenderedBlock {
+    width: usize,
+    next_token_type: Option<TokenType>,
+    lines: Arc<[String]>,
+    highlighted_code: HashMap<HighlightKey, Arc<[String]>>,
+}
+
+impl Clone for RenderedBlock {
+    fn clone(&self) -> Self {
+        Self {
+            width: self.width,
+            next_token_type: self.next_token_type,
+            lines: Arc::clone(&self.lines),
+            highlighted_code: self.highlighted_code.clone(),
+        }
+    }
+}
+
+/// Highlight cache key (upstream `${lang}\0${code}`): the block cache lives
+/// for one theme/grammar generation — `invalidate()` drops it — so the
+/// generation does not need to be repeated in every key.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct HighlightKey {
+    language: Option<String>,
+    code: String,
+}
+
+type BlockMap = HashMap<String, Arc<RenderedBlock>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Counts `render_block` calls (V19-04 R3.2.2: stable top-level blocks
+    /// must not be re-converted/re-wrapped).
+    static BLOCK_RENDER_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Markdown component (upstream `Markdown`, markdown.ts:110).
 pub struct Markdown {
-    text: String,
+    text: Arc<str>,
     padding_x: usize, // Left/right padding
     padding_y: usize, // Top/bottom padding
     default_text_style: Option<DefaultTextStyle>,
@@ -279,6 +336,20 @@ pub struct Markdown {
     options: MarkdownOptions,
     default_style_prefix: RefCell<Option<String>>,
     cache: RefCell<Option<MarkdownCache>>,
+    /// Blocks of the previous render, kept for one generation so a text
+    /// change can reuse the blocks it did not touch (V19-04 R3.2.5).
+    previous_blocks: RefCell<BlockMap>,
+    /// `render_latex` generation of `previous_blocks`; a mismatch drops them.
+    previous_blocks_render_latex: Cell<Option<bool>>,
+    /// Highlighted code of the block currently being rendered (upstream
+    /// `blockHighlightedCode`). Set only while `render_block` runs.
+    block_highlighted_code: RefCell<Option<HashMap<HighlightKey, Arc<[String]>>>>,
+    /// Monotonic content revision for [`Component::cache_revision`].
+    revision: Cell<u64>,
+    /// Process-unique instance id (V19-06).
+    instance_id: u64,
+    /// Last observed external (transform-context) revision.
+    last_external_revision: Cell<u64>,
 }
 
 /// Parse options: GFM extensions matching marked's defaults (tables,
@@ -378,6 +449,154 @@ fn node_raw<'a>(source: &'a str, index: &LineIndex, sp: Sourcepos) -> &'a str {
         return source.get(start..=end + 1).unwrap_or(slice);
     }
     slice
+}
+
+/// Cache key of a top-level block (upstream `token.raw`, markdown.ts
+/// @ 0f21a3319). The sourcepos slice is used instead of [`node_raw`]: the
+/// latter appends the following newline for table parity, which would make a
+/// block's key change when text is appended after it. Synthesized `space`
+/// blocks all render one empty line, so they share a constant key.
+fn block_raw(block: &Block<'_>, source: &str, index: &LineIndex) -> String {
+    match block {
+        Block::Space => "\n".to_string(),
+        Block::Node(node) => {
+            let sp = node.data.borrow().sourcepos;
+            node_slice(source, index, sp).to_string()
+        }
+    }
+}
+
+/// `Object.keys(tokens.links).length === 0` (markdown.ts @ 0f21a3319): a
+/// reference link resolves through a definition anywhere in the document, so
+/// blocks with the same source can render differently. Such documents render
+/// without block reuse.
+///
+/// Comrak resolves definitions inside blockquotes and list items too, so the
+/// scanner strips container prefixes before the check. Lines covered by a
+/// parsed code block are skipped using the AST's source ranges (the parser is
+/// the authority for fences, container termination and illegal info strings).
+/// Conservative: any definition-shaped line outside code (even in an indented
+/// code block) disables reuse; false positives only lose the optimization.
+fn has_reference_definitions(source: &str, code_block_lines: &[(usize, usize)]) -> bool {
+    for (index, line) in source.split_inclusive('\n').enumerate() {
+        let line_number = index + 1;
+        if code_block_lines
+            .iter()
+            .any(|(start, end)| line_number >= *start && line_number <= *end)
+        {
+            continue;
+        }
+        if is_reference_definition(line) || opens_unterminated_label(line) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A line that starts a link label without closing it on the same line: the
+/// label (and its `]:`) may continue on the next line, which CommonMark
+/// accepts. Conservative: an unterminated `[` in ordinary prose also disables
+/// block reuse, which only loses the optimization.
+fn opens_unterminated_label(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut index = content_start(line);
+    while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'[') {
+        return false;
+    }
+    let mut cursor = index + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor += 2,
+            b']' => return false,
+            _ => cursor += 1,
+        }
+    }
+    true
+}
+
+/// 1-based inclusive source line ranges of every parsed code block (fenced or
+/// indented, including nested blocks).
+fn code_block_line_ranges(root: Node<'_>) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for node in root.descendants() {
+        let data = node.data.borrow();
+        if matches!(data.value, NodeValue::CodeBlock(_)) {
+            let sp = data.sourcepos;
+            if sp.start.line > 0 && sp.end.line >= sp.start.line {
+                ranges.push((sp.start.line, sp.end.line));
+            }
+        }
+    }
+    ranges
+}
+
+/// Byte offset where a line's content starts after any indentation and any
+/// blockquote/list container prefixes. The AST code-block ranges already
+/// exclude real code, so widening the indentation only adds conservative
+/// definition candidates (which lose block reuse, never correctness).
+fn content_start(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    loop {
+        while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+            index += 1;
+        }
+        match bytes.get(index) {
+            Some(b'>') => {
+                index += 1;
+                if matches!(bytes.get(index), Some(b' ' | b'\t')) {
+                    index += 1;
+                }
+            }
+            Some(b'-' | b'*' | b'+') if matches!(bytes.get(index + 1), Some(b' ' | b'\t')) => {
+                index += 2;
+            }
+            Some(b'0'..=b'9') => {
+                let digits_start = index;
+                while index - digits_start < 9 && bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                    index += 1;
+                }
+                if matches!(bytes.get(index), Some(b'.' | b')'))
+                    && matches!(bytes.get(index + 1), Some(b' ' | b'\t'))
+                {
+                    index += 2;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    index
+}
+
+/// Whether a line is a reference definition (`[label]: ...`) after container
+/// prefixes and any indentation. Indented code is treated as a definition on
+/// purpose (conservative: it only disables block reuse). The closing `]` must
+/// not be backslash-escaped.
+fn is_reference_definition(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut index = content_start(line);
+    while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'[') {
+        return false;
+    }
+    let mut cursor = index + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor += 2,
+            b']' => {
+                return cursor > index + 1 && bytes.get(cursor + 1) == Some(&b':');
+            }
+            _ => cursor += 1,
+        }
+    }
+    false
 }
 
 /// ECMA-262 `\s` (WhiteSpace + LineTerminator + U+FEFF); used for marked
@@ -988,6 +1207,20 @@ fn is_blank_quoted_line(line: &str) -> bool {
 /// blocks where the source has blank lines (marked emits `space` tokens for
 /// blank lines between block tokens; comrak drops them). Leading/trailing
 /// blank lines become leading/trailing space blocks.
+fn strip_html_comments(html: &str) -> String {
+    let mut output = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find("<!--") {
+        output.push_str(&rest[..start]);
+        rest = match rest[start + 4..].find("-->") {
+            Some(end) => &rest[start + 4 + end + 3..],
+            None => "",
+        };
+    }
+    output.push_str(rest);
+    output
+}
+
 fn synthesize_blocks<'a>(
     children: Vec<Node<'a>>,
     source: &str,
@@ -1022,6 +1255,32 @@ fn synthesize_blocks<'a>(
         }
     }
 
+    let mut position = blocks.len();
+    while position > 0 {
+        position -= 1;
+        let comment_only = match &blocks[position] {
+            Block::Node(node) => match &node.data.borrow().value {
+                NodeValue::HtmlBlock(html) => strip_html_comments(&html.literal).trim().is_empty(),
+                _ => false,
+            },
+            Block::Space => false,
+        };
+        if !comment_only {
+            continue;
+        }
+        blocks.remove(position);
+        if matches!(blocks.get(position), Some(Block::Space))
+            && (position == 0 || matches!(blocks.get(position - 1), Some(Block::Space)))
+        {
+            blocks.remove(position);
+        } else if position == blocks.len()
+            && position > 0
+            && matches!(blocks.get(position - 1), Some(Block::Space))
+        {
+            blocks.remove(position - 1);
+        }
+        position = position.min(blocks.len());
+    }
     blocks
 }
 
@@ -1305,7 +1564,7 @@ impl Markdown {
         options: Option<MarkdownOptions>,
     ) -> Self {
         Self {
-            text: text.into(),
+            text: text.into().into(),
             padding_x,
             padding_y,
             default_text_style,
@@ -1313,12 +1572,309 @@ impl Markdown {
             options: options.unwrap_or_default(),
             default_style_prefix: RefCell::new(None),
             cache: RefCell::new(None),
+            previous_blocks: RefCell::new(BlockMap::new()),
+            previous_blocks_render_latex: Cell::new(None),
+            block_highlighted_code: RefCell::new(None),
+            revision: Cell::new(0),
+            instance_id: crate::tui::next_cache_instance_id(),
+            last_external_revision: Cell::new(0),
         }
     }
 
+    /// `setText` (markdown.ts:319-322 @ 0f21a3319): keep the rendered blocks
+    /// for the next render; only the frame cache is cleared. An unchanged
+    /// text keeps the frame cache too, so a stable slot's revision does not
+    /// churn on every delta (the lazy transform still runs on each render and
+    /// can invalidate the frame by itself).
     pub fn set_text(&mut self, text: impl Into<String>) {
+        let text: String = text.into();
+        if text == *self.text {
+            return;
+        }
+        if let Some(cache) = self.cache.get_mut().take() {
+            if cache.render_latex == self.options.render_latex {
+                *self.previous_blocks.get_mut() = cache.blocks;
+                self.previous_blocks_render_latex
+                    .set(Some(cache.render_latex));
+            } else {
+                self.previous_blocks.get_mut().clear();
+                self.previous_blocks_render_latex.set(None);
+            }
+        }
         self.text = text.into();
-        self.invalidate();
+        self.bump_revision();
+    }
+
+    fn bump_revision(&self) {
+        self.revision.set(self.revision.get().wrapping_add(1));
+    }
+
+    /// Shared render output (V19-04 R1.4.6.2): internal/layout consumers can
+    /// reuse the immutable line set without materializing a `Vec<String>`.
+    /// The frozen [`Component::render`] wrapper materializes on the public
+    /// boundary.
+    pub fn render_shared(&self, width: usize) -> Arc<[String]> {
+        // Available width for content (subtract horizontal padding).
+        let content_width = width.saturating_sub(self.padding_x * 2).max(1);
+
+        // Apply the width-aware transform (markdown.ts:285). The transform
+        // runs on every render (not only on cache misses like upstream):
+        // the transformed text is part of the cache key, so a stateful
+        // transform (e.g. the mermaid streaming/final switch) cannot serve
+        // stale lines.
+        let transformed_text: Arc<str> = match &self.options.transform {
+            Some(transform) => {
+                let transformed = transform(&self.text, content_width);
+                if transformed == *self.text {
+                    Arc::clone(&self.text)
+                } else {
+                    Arc::from(transformed)
+                }
+            }
+            None => Arc::clone(&self.text),
+        };
+
+        // Check cache.
+        if let Some(cache) = self.cache.borrow().as_ref()
+            && (Arc::ptr_eq(&cache.text, &self.text) || cache.text == self.text)
+            && (Arc::ptr_eq(&cache.transformed, &transformed_text)
+                || cache.transformed == transformed_text)
+            && cache.width == width
+            && cache.render_latex == self.options.render_latex
+        {
+            return Arc::clone(&cache.lines);
+        }
+
+        // Don't render anything if there's no actual text (upstream checks
+        // the transformed text, markdown.ts:288).
+        if transformed_text.trim().is_empty() {
+            let result: Arc<[String]> = Arc::from(vec![String::new()]);
+            *self.cache.borrow_mut() = Some(MarkdownCache {
+                text: Arc::clone(&self.text),
+                transformed: transformed_text,
+                width,
+                render_latex: self.options.render_latex,
+                lines: Arc::clone(&result),
+                blocks: BlockMap::new(),
+            });
+            self.previous_blocks.borrow_mut().clear();
+            return result;
+        }
+
+        // Replace tabs with 3 spaces for consistent rendering.
+        let normalized_text: Cow<'_, str> = if transformed_text.contains('\t') {
+            Cow::Owned(transformed_text.replace('\t', "   "))
+        } else {
+            Cow::Borrowed(&transformed_text)
+        };
+        let normalized_text = normalized_text.as_ref();
+
+        // Display-math shadow source (see `rewrite_setext_lone_operators`):
+        // comrak parses the rewritten copy so a setext underline inside a
+        // `$$`/`\[` block cannot cut the paragraph in half before the
+        // render-layer LaTeX recognizer sees it. The rewrite is
+        // same-length, so every sourcepos below still slices the original
+        // `normalized_text`. Skipped when LaTeX rendering is off — the raw
+        // fallbacks there echo comrak node values, which would show the
+        // `.` bytes.
+        let parse_text;
+        let parse_source: &str = if self.options.render_latex {
+            parse_text = rewrite_setext_lone_operators(normalized_text);
+            &parse_text
+        } else {
+            normalized_text
+        };
+
+        // Parse markdown (comrak replaces marked's lexer). The line index
+        // is built once here (single pass, FR-L1) and shared by every
+        // sourcepos → offset translation below.
+        let line_index = LineIndex::build(normalized_text);
+        let arena = Arena::new();
+        let root = parse_document(&arena, parse_source, &parser_options());
+        trim_partial_closing_fences(root, normalized_text, &line_index);
+
+        let top_blocks = synthesize_blocks(
+            root.children().collect(),
+            normalized_text,
+            &line_index,
+            0,
+            normalized_text.len(),
+        );
+
+        // Reuse rendered top-level blocks (#10971). Reference-link
+        // definitions resolve anywhere in the document, so documents that
+        // define them render without block reuse (upstream `tokens.links`).
+        let code_block_lines = code_block_line_ranges(root);
+        let reuse_blocks = !has_reference_definitions(normalized_text, &code_block_lines);
+        let mut previous_blocks = std::mem::take(&mut *self.previous_blocks.borrow_mut());
+        if self.previous_blocks_render_latex.get() != Some(self.options.render_latex) {
+            previous_blocks.clear();
+        }
+        self.previous_blocks_render_latex.set(None);
+        if let Some(cache) = self.cache.borrow_mut().take()
+            && cache.render_latex == self.options.render_latex
+        {
+            previous_blocks.extend(cache.blocks);
+        }
+
+        let default_style_prefix = self.get_default_style_prefix();
+        let default_context = InlineStyleContext {
+            apply_text: &|text: &str| self.apply_default_style(text),
+            style_prefix: &default_style_prefix,
+            wrap_style_prefix: "",
+        };
+
+        let mut block_map: BlockMap = BlockMap::new();
+        let mut content_lines: Vec<String> = Vec::new();
+        for (position, block) in top_blocks.iter().enumerate() {
+            let next_type = top_blocks.get(position + 1).map(Block::token_type);
+            let raw = block_raw(block, normalized_text, &line_index);
+            let mut reused = if reuse_blocks {
+                block_map
+                    .get(&raw)
+                    .cloned()
+                    .or_else(|| previous_blocks.remove(&raw))
+            } else {
+                None
+            };
+            let needs_render = match &reused {
+                None => true,
+                Some(rendered) => rendered.width != width || rendered.next_token_type != next_type,
+            };
+            if needs_render {
+                let mut rendered = match reused.take() {
+                    Some(shared) => {
+                        Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
+                    }
+                    None => RenderedBlock {
+                        width,
+                        next_token_type: next_type,
+                        lines: Arc::from(Vec::new()),
+                        highlighted_code: HashMap::new(),
+                    },
+                };
+                self.render_block(
+                    block,
+                    normalized_text,
+                    &line_index,
+                    width,
+                    content_width,
+                    next_type,
+                    &default_context,
+                    &mut rendered,
+                );
+                reused = Some(Arc::new(rendered));
+            }
+            let rendered = reused.expect("block is either reused or rendered");
+            if reuse_blocks {
+                block_map.insert(raw, Arc::clone(&rendered));
+            }
+            content_lines.extend(rendered.lines.iter().cloned());
+        }
+
+        // Top/bottom padding (empty lines).
+        let bg_fn = self
+            .default_text_style
+            .as_ref()
+            .and_then(|s| s.bg_color.as_ref());
+        let empty_line = " ".repeat(width);
+        let mut empty_lines: Vec<String> = Vec::new();
+        for _ in 0..self.padding_y {
+            let line = if let Some(bg_fn) = bg_fn {
+                apply_background_to_line(&empty_line, width, |text| bg_fn(text))
+            } else {
+                empty_line.clone()
+            };
+            empty_lines.push(line);
+        }
+
+        // Combine top padding, content, and bottom padding.
+        let mut result = empty_lines.clone();
+        result.extend(content_lines);
+        result.extend(empty_lines);
+        if result.is_empty() {
+            result.push(String::new());
+        }
+        let result: Arc<[String]> = Arc::from(result);
+
+        // Update cache.
+        *self.cache.borrow_mut() = Some(MarkdownCache {
+            text: Arc::clone(&self.text),
+            transformed: transformed_text,
+            width,
+            render_latex: self.options.render_latex,
+            lines: Arc::clone(&result),
+            blocks: block_map,
+        });
+        result
+    }
+
+    /// Render one top-level block to final output lines: wrapped, with
+    /// margins, and padded or backgrounded to the width (upstream
+    /// `renderBlock`, markdown.ts @ 0f21a3319). The block's highlighted code
+    /// survives a resize or a spacing change.
+    #[allow(clippy::too_many_arguments)]
+    fn render_block(
+        &self,
+        block: &Block<'_>,
+        source: &str,
+        index: &LineIndex,
+        width: usize,
+        content_width: usize,
+        next_token_type: Option<TokenType>,
+        style_context: &InlineStyleContext<'_>,
+        rendered: &mut RenderedBlock,
+    ) {
+        #[cfg(test)]
+        BLOCK_RENDER_COUNT.with(|count| count.set(count.get() + 1));
+        let highlighted = std::mem::take(&mut rendered.highlighted_code);
+        *self.block_highlighted_code.borrow_mut() = Some(highlighted);
+
+        let left_margin = " ".repeat(self.padding_x);
+        let right_margin = " ".repeat(self.padding_x);
+        let bg_fn = self
+            .default_text_style
+            .as_ref()
+            .and_then(|s| s.bg_color.as_ref());
+        let mut lines: Vec<String> = Vec::new();
+        for line in self.render_token(
+            block,
+            source,
+            index,
+            content_width,
+            next_token_type,
+            style_context,
+        ) {
+            if is_image_line(&line) {
+                lines.push(line);
+                continue;
+            }
+            for wrapped_line in wrap_text_with_ansi(&line, content_width) {
+                let line_with_margins = format!("{left_margin}{wrapped_line}{right_margin}");
+                if let Some(bg_fn) = bg_fn {
+                    lines.push(apply_background_to_line(
+                        &line_with_margins,
+                        width,
+                        |text| bg_fn(text),
+                    ));
+                } else {
+                    let visible_len = visible_width(&line_with_margins);
+                    lines.push(format!(
+                        "{line_with_margins}{}",
+                        " ".repeat(width.saturating_sub(visible_len))
+                    ));
+                }
+            }
+        }
+
+        rendered.highlighted_code = self
+            .block_highlighted_code
+            .borrow_mut()
+            .take()
+            .unwrap_or_default();
+        rendered.lines = Arc::from(lines);
+        rendered.width = width;
+        rendered.next_token_type = next_token_type;
     }
 
     /// `applyDefaultStyle` (markdown.ts:250-277): base styling for all text.
@@ -1450,6 +2006,7 @@ impl Markdown {
         };
 
         let mut position = 0;
+        let mut drop_leading_space = false;
         while position < children.len() {
             let token = children[position];
             let value = &token.data.borrow().value;
@@ -1458,6 +2015,12 @@ impl Markdown {
                     // Escape tokens (upstream `escape`) are resolved into
                     // text nodes; re-emit the backslash when preserving.
                     let raw = node_slice(source, index, token.data.borrow().sourcepos);
+                    let raw = if drop_leading_space {
+                        raw.trim_start_matches([' ', '\t'])
+                    } else {
+                        raw
+                    };
+                    drop_leading_space = false;
                     if self.options.render_latex {
                         if let Some(pending_tail) = self.render_inline_text_with_latex(
                             raw,
@@ -1509,27 +2072,40 @@ impl Markdown {
                 }
                 NodeValue::Link(link) => {
                     let link_text = self.render_inline_tokens(token, source, index, style_context);
-                    let styled_link = (self.theme.link)(&(self.theme.underline)(&link_text));
+                    let raw = node_slice(source, index, token.data.borrow().sourcepos);
+                    let (href, punctuation) = if raw.starts_with("http://")
+                        || raw.starts_with("https://")
+                    {
+                        match link.url.char_indices().find(|(_, character)| {
+                            crate::utils::is_cjk_punctuation_char(*character)
+                        }) {
+                            Some((position, _)) => (&link.url[..position], &link.url[position..]),
+                            None => (link.url.as_str(), ""),
+                        }
+                    } else {
+                        (link.url.as_str(), "")
+                    };
+                    let link_text = if !punctuation.is_empty() && link_text.ends_with(punctuation) {
+                        &link_text[..link_text.len() - punctuation.len()]
+                    } else {
+                        link_text.as_str()
+                    };
+                    let styled_link = (self.theme.link)(&(self.theme.underline)(link_text));
                     if get_capabilities().hyperlinks {
-                        // OSC 8: clickable hyperlink; the URL is not printed
-                        // inline, so the link text always shows.
-                        result.push_str(&hyperlink(&styled_link, &link.url));
+                        result.push_str(&hyperlink(&styled_link, href));
                         result.push_str(style_context.style_prefix);
                     } else {
-                        // Fallback: print the URL in parentheses when the
-                        // text differs from the href. mailto: links compare
-                        // with the prefix stripped (autolinked emails).
-                        let href_for_comparison =
-                            link.url.strip_prefix("mailto:").unwrap_or(&link.url);
-                        let plain_text = strip_ansi(&link_text);
-                        if plain_text == link.url || plain_text == href_for_comparison {
+                        let href_for_comparison = href.strip_prefix("mailto:").unwrap_or(href);
+                        let plain_text = strip_ansi(link_text);
+                        if plain_text == href || plain_text == href_for_comparison {
                             result.push_str(&styled_link);
                         } else {
                             result.push_str(&styled_link);
-                            result.push_str(&(self.theme.link_url)(&format!(" ({})", link.url)));
+                            result.push_str(&(self.theme.link_url)(&format!(" ({href})")));
                         }
                         result.push_str(style_context.style_prefix);
                     }
+                    result.push_str(punctuation);
                 }
                 NodeValue::Strikethrough => {
                     let raw = node_slice(source, index, token.data.borrow().sourcepos);
@@ -1578,7 +2154,17 @@ impl Markdown {
                 }
                 NodeValue::LineBreak | NodeValue::SoftBreak => result.push('\n'),
                 NodeValue::HtmlInline(html) => {
-                    result.push_str(&apply_text_with_newlines(html));
+                    if html.starts_with("<!--") {
+                        drop_leading_space = position == 0
+                            || node_slice(
+                                source,
+                                index,
+                                children[position - 1].data.borrow().sourcepos,
+                            )
+                            .ends_with([' ', '\t']);
+                    } else {
+                        result.push_str(&apply_text_with_newlines(html));
+                    }
                 }
                 // Images and any other inline nodes render as nothing,
                 // matching the upstream default case (no `text` property).
@@ -1858,6 +2444,7 @@ impl Markdown {
         token: Node<'_>,
         source: &str,
         index: &LineIndex,
+        width: usize,
         next_token_type: Option<TokenType>,
         style_context: &InlineStyleContext<'_>,
     ) -> Option<Vec<String>> {
@@ -1898,6 +2485,11 @@ impl Markdown {
                     } else {
                         render_latex(latex.text, true)
                             .unwrap_or_else(|| trim_js(&raw[*start..*end]).to_string())
+                    };
+                    let rendered = if rendered.split('\n').any(|line| visible_width(line) > width) {
+                        trim_js(&raw[*start..*end]).to_string()
+                    } else {
+                        rendered
                     };
                     for line in rendered.split('\n') {
                         lines.push(self.apply_default_style(line));
@@ -1987,6 +2579,7 @@ impl Markdown {
                         token,
                         source,
                         index,
+                        width,
                         next_token_type,
                         style_context,
                     )
@@ -2024,11 +2617,37 @@ impl Markdown {
                     remove_code_indent(node_slice(source, index, token.data.borrow().sourcepos))
                 };
                 if let Some(highlight_code) = &self.theme.highlight_code {
-                    let highlighted_lines = highlight_code(
-                        &code_text,
-                        if lang.is_empty() { None } else { Some(&lang) },
-                    );
-                    for highlighted_line in highlighted_lines {
+                    // Reuse the block's highlighted code across resizes and
+                    // spacing changes (upstream `blockHighlightedCode`,
+                    // markdown.ts @ 0f21a3319). The block cache lives for
+                    // one theme/grammar generation; `invalidate()` clears it.
+                    let key = HighlightKey {
+                        language: if lang.is_empty() {
+                            None
+                        } else {
+                            Some(lang.clone())
+                        },
+                        code: code_text.clone(),
+                    };
+                    let mut highlighted = self.block_highlighted_code.borrow_mut();
+                    let highlighted_lines = if let Some(cache) = highlighted.as_mut() {
+                        if let Some(cached) = cache.get(&key) {
+                            Arc::clone(cached)
+                        } else {
+                            let lines: Arc<[String]> = highlight_code(
+                                &code_text,
+                                if lang.is_empty() { None } else { Some(&lang) },
+                            )
+                            .into();
+                            cache.insert(key, Arc::clone(&lines));
+                            lines
+                        }
+                    } else {
+                        highlight_code(&code_text, if lang.is_empty() { None } else { Some(&lang) })
+                            .into()
+                    };
+                    drop(highlighted);
+                    for highlighted_line in highlighted_lines.iter() {
                         lines.push(format!("{indent}{highlighted_line}"));
                     }
                 } else {
@@ -2088,11 +2707,36 @@ impl Markdown {
                     source_start,
                     source_end,
                 );
+                if width < 3 {
+                    for (position, quote_block) in quote_blocks.iter().enumerate() {
+                        let next_quote_type = quote_blocks
+                            .get(position + 1)
+                            .map(Block::token_type)
+                            .or(next_token_type)
+                            .unwrap_or(TokenType::Other);
+                        lines.extend(self.render_token(
+                            quote_block,
+                            source,
+                            index,
+                            width,
+                            Some(next_quote_type),
+                            style_context,
+                        ));
+                    }
+                    if spacing_after(next_token_type) {
+                        lines.push(String::new());
+                    }
+                    while lines.last().is_some_and(|line| line.is_empty()) {
+                        lines.pop();
+                    }
+                    return lines;
+                }
                 let mut rendered_quote_lines: Vec<String> = Vec::new();
                 for (position, quote_block) in quote_blocks.iter().enumerate() {
                     let next_quote_type = quote_blocks
                         .get(position + 1)
                         .map(Block::token_type)
+                        .or(next_token_type)
                         .unwrap_or(TokenType::Other);
                     rendered_quote_lines.extend(self.render_token(
                         quote_block,
@@ -2129,8 +2773,10 @@ impl Markdown {
                 }
             }
             NodeValue::HtmlBlock(html) => {
-                // Render HTML as plain text (escaped for terminal).
-                lines.push(self.apply_default_style(html.literal.trim()));
+                let without_comments = strip_html_comments(&html.literal);
+                if !without_comments.trim().is_empty() {
+                    lines.push(self.apply_default_style(without_comments.trim()));
+                }
             }
             _ => {
                 // Any other block types render as nothing (upstream default
@@ -2586,185 +3232,36 @@ impl Markdown {
 
 impl Component for Markdown {
     fn render(&self, width: usize) -> Vec<String> {
-        // Available width for content (subtract horizontal padding).
-        let content_width = width.saturating_sub(self.padding_x * 2).max(1);
-
-        // Apply the width-aware transform (markdown.ts:285). The transform
-        // runs on every render (not only on cache misses like upstream):
-        // the transformed text is part of the cache key, so a stateful
-        // transform (e.g. the mermaid streaming/final switch) cannot serve
-        // stale lines.
-        //
-        // P2-1 (registered deviation, not yet fixed): this re-runs the
-        // transform inside the render path — for wasm-backed transforms
-        // that is a host call bounded by the 2s host-call budget while the
-        // caller holds the TUI render lock, so a pathological transform
-        // can stall a frame for up to 2s. Fixing it requires an
-        // invalidation protocol for stateful transforms (transform result
-        // keyed by (text, width) + explicit bust) — deferred to avoid
-        // serving stale mermaid frames; see the review registry.
-        let transformed_text = self
-            .options
-            .transform
-            .as_ref()
-            .map(|transform| transform(&self.text, content_width))
-            .unwrap_or_else(|| self.text.clone());
-
-        // Check cache.
-        if let Some(cache) = self.cache.borrow().as_ref()
-            && cache.text == self.text
-            && cache.transformed == transformed_text
-            && cache.width == width
-            && cache.render_latex == self.options.render_latex
-        {
-            return cache.lines.clone();
-        }
-
-        // Don't render anything if there's no actual text (upstream checks
-        // the transformed text, markdown.ts:288).
-        if transformed_text.trim().is_empty() {
-            let result = vec![String::new()];
-            *self.cache.borrow_mut() = Some(MarkdownCache {
-                text: self.text.clone(),
-                transformed: transformed_text,
-                width,
-                render_latex: self.options.render_latex,
-                lines: result.clone(),
-            });
-            return result;
-        }
-
-        // Replace tabs with 3 spaces for consistent rendering.
-        let normalized_text = transformed_text.replace('\t', "   ");
-
-        // Display-math shadow source (see `rewrite_setext_lone_operators`):
-        // comrak parses the rewritten copy so a setext underline inside a
-        // `$$`/`\[` block cannot cut the paragraph in half before the
-        // render-layer LaTeX recognizer sees it. The rewrite is
-        // same-length, so every sourcepos below still slices the original
-        // `normalized_text`. Skipped when LaTeX rendering is off — the raw
-        // fallbacks there echo comrak node values, which would show the
-        // `.` bytes.
-        let parse_text;
-        let parse_source: &str = if self.options.render_latex {
-            parse_text = rewrite_setext_lone_operators(&normalized_text);
-            &parse_text
-        } else {
-            &normalized_text
-        };
-
-        // Parse markdown (comrak replaces marked's lexer). The line index
-        // is built once here (single pass, FR-L1) and shared by every
-        // sourcepos → offset translation below.
-        let line_index = LineIndex::build(&normalized_text);
-        let arena = Arena::new();
-        let root = parse_document(&arena, parse_source, &parser_options());
-        trim_partial_closing_fences(root, &normalized_text, &line_index);
-
-        // Convert tokens to styled terminal output.
-        let mut rendered_lines: Vec<String> = Vec::new();
-        let blocks = synthesize_blocks(
-            root.children().collect(),
-            &normalized_text,
-            &line_index,
-            0,
-            normalized_text.len(),
-        );
-        let default_style_prefix = self.get_default_style_prefix();
-        let default_context = InlineStyleContext {
-            apply_text: &|text: &str| self.apply_default_style(text),
-            style_prefix: &default_style_prefix,
-            wrap_style_prefix: "",
-        };
-
-        for (index, block) in blocks.iter().enumerate() {
-            let next_type = blocks.get(index + 1).map(Block::token_type);
-            let token_lines = self.render_token(
-                block,
-                &normalized_text,
-                &line_index,
-                content_width,
-                next_type,
-                &default_context,
-            );
-            rendered_lines.extend(token_lines);
-        }
-
-        // Wrap lines (NO padding, NO background yet).
-        let mut wrapped_lines: Vec<String> = Vec::new();
-        for line in rendered_lines {
-            if is_image_line(&line) {
-                wrapped_lines.push(line);
-            } else {
-                wrapped_lines.extend(wrap_text_with_ansi(&line, content_width));
-            }
-        }
-
-        // Add margins and background to each wrapped line.
-        let left_margin = " ".repeat(self.padding_x);
-        let right_margin = " ".repeat(self.padding_x);
-        let bg_fn = self
-            .default_text_style
-            .as_ref()
-            .and_then(|s| s.bg_color.as_ref());
-        let mut content_lines: Vec<String> = Vec::new();
-
-        for line in wrapped_lines {
-            if is_image_line(&line) {
-                content_lines.push(line);
-                continue;
-            }
-
-            let line_with_margins = format!("{left_margin}{line}{right_margin}");
-            if let Some(bg_fn) = bg_fn {
-                content_lines.push(apply_background_to_line(&line_with_margins, width, |t| {
-                    bg_fn(t)
-                }));
-            } else {
-                let visible_len = visible_width(&line_with_margins);
-                let padding_needed = width.saturating_sub(visible_len);
-                content_lines.push(format!("{line_with_margins}{}", " ".repeat(padding_needed)));
-            }
-        }
-
-        // Top/bottom padding (empty lines).
-        let empty_line = " ".repeat(width);
-        let mut empty_lines: Vec<String> = Vec::new();
-        for _ in 0..self.padding_y {
-            let line = if let Some(bg_fn) = bg_fn {
-                apply_background_to_line(&empty_line, width, |t| bg_fn(t))
-            } else {
-                empty_line.clone()
-            };
-            empty_lines.push(line);
-        }
-
-        // Combine top padding, content, and bottom padding.
-        let mut result = empty_lines.clone();
-        result.extend(content_lines);
-        result.extend(empty_lines);
-
-        let result = if result.is_empty() {
-            vec![String::new()]
-        } else {
-            result
-        };
-
-        // Update cache.
-        *self.cache.borrow_mut() = Some(MarkdownCache {
-            text: self.text.clone(),
-            transformed: transformed_text,
-            width,
-            render_latex: self.options.render_latex,
-            lines: result.clone(),
-        });
-
-        result
+        self.render_shared(width).to_vec()
     }
 
     fn invalidate(&mut self) {
-        *self.cache.borrow_mut() = None;
-        *self.default_style_prefix.borrow_mut() = None;
+        *self.cache.get_mut() = None;
+        self.previous_blocks.get_mut().clear();
+        self.previous_blocks_render_latex.set(None);
+        *self.block_highlighted_code.get_mut() = None;
+        *self.default_style_prefix.get_mut() = None;
+        self.bump_revision();
+    }
+
+    fn cache_revision(&self) -> Option<u64> {
+        // V19-04 FR-E: the transform context is trusted only when the caller
+        // supplied a revision source (the built-in Mermaid transformer does;
+        // opaque extension transformers do not).
+        let external = match (&self.options.transform, &self.options.transform_revision) {
+            (None, _) => 0,
+            (Some(_), Some(revision)) => revision(),
+            (Some(_), None) => return None,
+        };
+        if self.last_external_revision.get() != external {
+            self.last_external_revision.set(external);
+            self.bump_revision();
+        }
+        Some(self.revision.get())
+    }
+
+    fn cache_instance_id(&self) -> Option<u64> {
+        Some(self.instance_id)
     }
 }
 
@@ -2777,6 +3274,14 @@ mod tests {
 
     use super::*;
     use crate::terminal_image::{TerminalCapabilities, reset_capabilities_cache, set_capabilities};
+
+    fn reset_block_render_count() {
+        BLOCK_RENDER_COUNT.with(|count| count.set(0));
+    }
+
+    fn block_render_count() -> usize {
+        BLOCK_RENDER_COUNT.with(|count| count.get())
+    }
 
     /// V15-13 FR-L1 R3 (rpi#53): the [`LineIndex`] table must produce
     /// byte-identical offsets to the pre-fix scan ([`byte_offset_of_scan`])
@@ -3041,8 +3546,10 @@ mod tests {
     }
 
     /// Serializes tests that mutate the global capabilities cache (cargo
-    /// runs tests in one binary with parallel threads).
-    static TEST_CAPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// runs tests in one binary with parallel threads). Shared with the
+    /// image/alt-screen/main-screen suites so capabilities cannot change
+    /// mid-test.
+    use crate::terminal_image::TEST_CAPS_LOCK;
 
     // ── Lists ──────────────────────────────────────────────────────────────
 
@@ -3686,6 +4193,305 @@ mod tests {
         state.store(true, std::sync::atomic::Ordering::Relaxed);
         let second = markdown.render(80).join("\n");
         assert!(second.contains("\x1b[1mhello\x1b[22m"));
+    }
+
+    // ── V19-04 FR-C: rendered block and highlight reuse ────────────────────
+
+    type HighlightCalls = Arc<std::sync::Mutex<Vec<(Option<String>, String)>>>;
+
+    /// Theme whose `highlight_code` records every call (lang, code) and
+    /// returns a recognizable line prefix.
+    fn counting_markdown(calls: HighlightCalls) -> Markdown {
+        let mut theme = MarkdownTheme::identity();
+        theme.highlight_code = Some(Box::new(move |code: &str, lang: Option<&str>| {
+            calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((lang.map(str::to_string), code.to_string()));
+            code.split('\n').map(|line| format!("HL({line})")).collect()
+        }));
+        Markdown::new("", 0, 0, Arc::new(theme), None, None)
+    }
+
+    #[test]
+    fn reuses_highlighted_code_across_streamed_text_and_resizes() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut markdown = counting_markdown(Arc::clone(&calls));
+        markdown.set_text("```ts\nx\n```");
+        markdown.render(80);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        // The code block's raw is unchanged; only its following block (and
+        // therefore its spacing) changes, and the width shrinks. The stable
+        // block must not be highlighted again.
+        markdown.set_text("```ts\nx\n```\n\nafter");
+        let streamed = plain(&markdown, 40);
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "a stable code block must not re-run syntect"
+        );
+        assert!(streamed.iter().any(|line| line.contains("HL(x)")));
+
+        // `invalidate` drops the block generation (theme change / reload).
+        markdown.invalidate();
+        markdown.render(40);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn duplicate_raw_blocks_with_different_spacing_render_correctly() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut markdown = counting_markdown(Arc::clone(&calls));
+        let source = "```ts\nx\n```\n\ntext\n\n```ts\nx\n```";
+        markdown.set_text(source);
+        let streamed = plain(&markdown, 60);
+        let mut fresh = counting_markdown(Arc::new(std::sync::Mutex::new(Vec::new())));
+        fresh.set_text(source);
+        let fresh_lines = plain(&fresh, 60);
+        // The second occurrence has no following block, so its spacing
+        // differs from the first; the map key is the raw source, so the
+        // next-token-type check must re-render instead of serving the first
+        // occurrence's lines.
+        assert_eq!(streamed, fresh_lines);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reference_link_documents_disable_block_reuse() {
+        let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let original = crate::terminal_image::get_capabilities();
+        crate::terminal_image::set_capabilities(caps(false));
+
+        let mut markdown = md("[a][x]\n\n[x]: https://one.example");
+        let first = plain(&markdown, 80).join("\n");
+        assert!(first.contains("one.example"));
+
+        // The link target changes but the link's raw source does not; a
+        // reference definition anywhere in the document disables block reuse.
+        markdown.set_text("[a][x]\n\n[x]: https://two.example");
+        let second = plain(&markdown, 80).join("\n");
+        assert!(second.contains("two.example"), "{second}");
+        assert!(!second.contains("one.example"), "{second}");
+
+        crate::terminal_image::set_capabilities(original);
+    }
+
+    #[test]
+    fn reference_definitions_inside_containers_disable_block_reuse() {
+        let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let original = crate::terminal_image::get_capabilities();
+        crate::terminal_image::set_capabilities(caps(false));
+
+        for (first_source, second_source) in [
+            (
+                "[a][x]\n\n> [x]: https://one.example",
+                "[a][x]\n\n> [x]: https://two.example",
+            ),
+            (
+                "[a][x]\n\n- [x]: https://one.example",
+                "[a][x]\n\n- [x]: https://two.example",
+            ),
+            (
+                "[a][x]\n\n1. [x]: https://one.example",
+                "[a][x]\n\n1. [x]: https://two.example",
+            ),
+        ] {
+            let mut markdown = md(first_source);
+            let first = plain(&markdown, 80).join("\n");
+            assert!(first.contains("one.example"), "{first}");
+            markdown.set_text(second_source);
+            let second = plain(&markdown, 80).join("\n");
+            assert!(second.contains("two.example"), "{second}");
+            assert!(!second.contains("one.example"), "{second}");
+        }
+
+        crate::terminal_image::set_capabilities(original);
+    }
+
+    /// The block-reuse oracle for reference-definition edge cases: a streamed
+    /// `set_text` render must match a fresh component rendering the same final
+    /// source (no stale URL from a reused block).
+    fn assert_set_text_matches_fresh(first: &str, second: &str) {
+        let mut streamed = md(first);
+        let _ = streamed.render(80);
+        streamed.set_text(second);
+        let streamed_lines = plain(&streamed, 80);
+        let fresh_lines = plain(&md(second), 80);
+        assert_eq!(
+            streamed_lines, fresh_lines,
+            "stale block after set_text\nfirst: {first:?}\nsecond: {second:?}"
+        );
+    }
+
+    #[test]
+    fn reference_definition_edge_cases_do_not_serve_stale_blocks() {
+        let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let original = crate::terminal_image::get_capabilities();
+        crate::terminal_image::set_capabilities(caps(false));
+
+        // Top-level fence containing a list marker: the AST code-block range
+        // covers it, so the definition after the fence is still detected.
+        assert_set_text_matches_fresh(
+            "```\n- ```\n```\n\n[a][x]\n\n[x]: https://one.example",
+            "```\n- ```\n```\n\n[a][x]\n\n[x]: https://two.example",
+        );
+        // A fence inside a blockquote/list does not hide a later definition.
+        assert_set_text_matches_fresh(
+            "> ```\n> quote\n\n[a][x]\n\n[x]: https://one.example",
+            "> ```\n> quote\n\n[a][x]\n\n[x]: https://two.example",
+        );
+        assert_set_text_matches_fresh(
+            "- ```\n  item\n\n[a][x]\n\n[x]: https://one.example",
+            "- ```\n  item\n\n[a][x]\n\n[x]: https://two.example",
+        );
+        // An illegal backtick info string is a paragraph, not a fence; the
+        // definition after it is detected.
+        assert_set_text_matches_fresh(
+            "```foo```\n\n[a][x]\n\n[x]: https://one.example",
+            "```foo```\n\n[a][x]\n\n[x]: https://two.example",
+        );
+        // An unclosed fence consumes the rest of its container; a definition
+        // after the container is still detected.
+        assert_set_text_matches_fresh(
+            "> ```\n> unclosed\n\n[a][x]\n\n[x]: https://one.example",
+            "> ```\n> unclosed\n\n[a][x]\n\n[x]: https://two.example",
+        );
+        // A link label may span lines (CommonMark); the definition must still
+        // disable block reuse.
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n[x\n]: https://one.example",
+            "[a][x]\n\n[x\n]: https://two.example",
+        );
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n> [x\n> ]: https://one.example",
+            "[a][x]\n\n> [x\n> ]: https://two.example",
+        );
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n- [x\n  ]: https://one.example",
+            "[a][x]\n\n- [x\n  ]: https://two.example",
+        );
+        // Nested containers with 4+ spaces of content indentation.
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n- item\n\n    > [x\n    > ]: https://one.example",
+            "[a][x]\n\n- item\n\n    > [x\n    > ]: https://two.example",
+        );
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n- a\n  - b\n\n    - [x\n      ]: https://one.example",
+            "[a][x]\n\n- a\n  - b\n\n    - [x\n      ]: https://two.example",
+        );
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n- a\n  - b\n\n    1. [x\n       ]: https://one.example",
+            "[a][x]\n\n- a\n  - b\n\n    1. [x\n       ]: https://two.example",
+        );
+        assert_set_text_matches_fresh(
+            "[a][x]\n\n- a\n  - b\n\n    > - [x\n    >   ]: https://one.example",
+            "[a][x]\n\n- a\n  - b\n\n    > - [x\n    >   ]: https://two.example",
+        );
+
+        crate::terminal_image::set_capabilities(original);
+    }
+
+    #[test]
+    fn reference_definition_detection_is_conservative() {
+        assert!(has_reference_definitions("[x]: https://example.com\n", &[]));
+        assert!(has_reference_definitions(
+            "   [x]: https://example.com\n",
+            &[]
+        ));
+        // Conservative: an indented code block containing a definition-like
+        // line disables reuse (it only loses the optimization).
+        assert!(has_reference_definitions(
+            "    [x]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "> [x]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "- [x]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "1. [x]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "> - [x]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "    > [x]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "    - [x]: https://example.com\n",
+            &[]
+        ));
+        // Escaped closing brackets do not end the label.
+        assert!(has_reference_definitions(
+            "[x\\]]: https://example.com\n",
+            &[]
+        ));
+        assert!(has_reference_definitions(
+            "[x\n]: https://example.com\n",
+            &[]
+        ));
+        assert!(!has_reference_definitions("plain [x] text\n", &[]));
+        // The parsed code-block ranges are authoritative: a definition-shaped
+        // line inside a fence is not a definition.
+        assert!(!has_reference_definitions("```\n[x]: y\n```\n", &[(1, 3)]));
+        assert!(!has_reference_definitions("```\n- ```\n```\n", &[(1, 3)]));
+    }
+
+    #[test]
+    fn cache_revision_tracks_text_and_transform_context() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let context = Arc::new(AtomicU64::new(0));
+        let context_inner = Arc::clone(&context);
+        let mut markdown = Markdown::new(
+            "hello",
+            0,
+            0,
+            theme(),
+            None,
+            Some(MarkdownOptions {
+                transform: Some(Arc::new(|text: &str, _| text.to_owned())),
+                transform_revision: Some(Arc::new(move || context_inner.load(Ordering::Relaxed))),
+                ..Default::default()
+            }),
+        );
+        let first = markdown
+            .cache_revision()
+            .expect("trusted transform revision");
+        assert_eq!(markdown.cache_revision(), Some(first));
+
+        context.fetch_add(1, Ordering::Relaxed);
+        let second = markdown.cache_revision().expect("revision");
+        assert!(second > first, "external context change must bump revision");
+
+        markdown.set_text("world");
+        let third = markdown.cache_revision().expect("revision");
+        assert!(third > second, "text change must bump revision");
+
+        // An opaque transform without a revision source is untrusted.
+        let untrusted = Markdown::new(
+            "x",
+            0,
+            0,
+            theme(),
+            None,
+            Some(MarkdownOptions {
+                transform: Some(Arc::new(|text: &str, _| text.to_owned())),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(untrusted.cache_revision(), None);
+
+        // No transform: a plain content revision is trustworthy.
+        assert!(md("plain").cache_revision().is_some());
     }
 
     // ── Pre-styled text (thinking traces) ──────────────────────────────────
@@ -4743,6 +5549,106 @@ $$");
         assert_eq!(
             render("`**这是测试。**`"),
             ["\x1b[33m**这是测试。**\x1b[0m"]
+        );
+    }
+
+    #[test]
+    fn html_comments_leave_no_text_or_extra_block_gap() {
+        assert_eq!(plain(&md("a <!-- hidden --> b"), 80), ["a b"]);
+        assert_eq!(plain(&md("<!-- streamed"), 80), [""]);
+        assert_eq!(
+            plain(&md("before\n\n<!-- hidden -->\n\nafter"), 80),
+            ["before", "", "after"]
+        );
+        assert_eq!(plain(&md("<!-- first -->\n\nafter"), 80), ["after"]);
+        assert_eq!(plain(&md("before\n\n<!-- last -->"), 80), ["before"]);
+        assert_eq!(plain(&md("<span>keep</span>"), 80), ["<span>keep</span>"]);
+    }
+
+    #[test]
+    fn bare_urls_stop_before_cjk_punctuation_but_explicit_links_do_not() {
+        let _guard = TEST_CAPS_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        set_capabilities(caps(true));
+        let linked = md("https://example.com/path，next").render(120).join("\n");
+        assert!(
+            linked.contains("\x1b]8;;https://example.com/path\x1b\\"),
+            "{linked:?}"
+        );
+        assert!(linked.contains("path\x1b[24m"), "{linked:?}");
+        assert!(linked.contains("，next"), "{linked:?}");
+        assert!(
+            !linked.contains("\x1b]8;;https://example.com/path，"),
+            "{linked:?}"
+        );
+        let explicit = md("[label](https://example.com/，next)")
+            .render(120)
+            .join("\n");
+        assert!(
+            explicit.contains("https://example.com/%EF%BC%8Cnext")
+                || explicit.contains("https://example.com/，next")
+        );
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    fn overwide_display_math_falls_back_to_raw_source() {
+        let math = r"$$\begin{matrix}a&b\\c&d\end{matrix}$$";
+        let wide = plain(&md(math), 80).join("\n");
+        let narrow = plain(&md(math), 3).join("\n");
+        assert!(
+            !wide.contains("\\begin{matrix}"),
+            "wide={wide:?}; narrow={narrow:?}"
+        );
+        assert_eq!(
+            narrow.replace('\n', ""),
+            math,
+            "wide={wide:?}; narrow={narrow:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_blockquotes_drop_the_border() {
+        assert_eq!(plain(&md("> xy"), 2), ["xy"]);
+        assert_eq!(plain(&md("> xy"), 3), ["│ x", "│ y"]);
+    }
+
+    #[test]
+    fn stable_blocks_are_not_rerendered_after_set_text() {
+        reset_block_render_count();
+        let mut markdown = md("first\n\nsecond");
+        markdown.render(80);
+        let initial = block_render_count();
+        assert_eq!(initial, 3, "paragraph + space + paragraph");
+
+        // Only the changed top-level block is converted/wrapped again; the
+        // unchanged block and the synthesized space come from the previous
+        // generation.
+        markdown.set_text("first\n\nsecond changed");
+        markdown.render(80);
+        assert_eq!(block_render_count(), initial + 1);
+
+        // A width change re-wraps every block (the highlighted code, if any,
+        // would still be reused).
+        markdown.render(40);
+        assert_eq!(block_render_count(), initial + 1 + 3);
+    }
+
+    #[test]
+    fn set_text_with_the_same_text_keeps_the_revision_and_frame_cache() {
+        let mut markdown = md("hello");
+        let revision = markdown.cache_revision().expect("revision");
+        markdown.render(80);
+        reset_block_render_count();
+
+        markdown.set_text("hello");
+        assert_eq!(markdown.cache_revision(), Some(revision));
+        markdown.render(80);
+        assert_eq!(
+            block_render_count(),
+            0,
+            "an unchanged slot must keep its frame and block caches"
         );
     }
 }

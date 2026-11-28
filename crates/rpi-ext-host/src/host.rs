@@ -8,6 +8,7 @@
 //! `ExtensionRunner` seam.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde_json::{Value, json};
@@ -67,6 +68,7 @@ pub struct NativeExtensionHost {
     /// `ctx.command.*` actions are per session/mode too; kept so `/reload`
     /// can re-bind them on the fresh runtime (the runtime itself is replaced).
     command_actions: RwLock<Option<Arc<dyn CommandContextActions>>>,
+    reload_generation: AtomicU64,
 }
 
 fn read<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -96,6 +98,7 @@ impl NativeExtensionHost {
             last_warnings: RwLock::new(Vec::new()),
             answer_channel_installer: RwLock::new(None),
             command_actions: RwLock::new(None),
+            reload_generation: AtomicU64::new(0),
         }
     }
 
@@ -393,6 +396,7 @@ impl NativeExtensionHost {
     /// session-level caller re-binds actions and emits
     /// `session_start`/`resources_discover` with reason `"reload"`.
     pub async fn reload(self: &Arc<Self>) -> Vec<crate::types::ExtensionLoadError> {
+        let generation = self.reload_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let spec = read(&self.last_load).clone();
         let previous_flags = self.runtime().flag_values();
 
@@ -449,6 +453,9 @@ impl NativeExtensionHost {
         };
         let loader = read(&self.loader).clone();
         let result = loader.discover_and_load(&config).await;
+        if self.reload_generation.load(Ordering::SeqCst) != generation {
+            return Vec::new();
+        }
         let mut errors = result.errors;
         self.install(result.extensions);
         *write(&self.last_warnings) = self.builtin_replacement_warnings();
@@ -622,7 +629,7 @@ impl NativeExtensionHost {
     }
 
     /// `resolveToolRenderers(toolName, base)` (runner.ts:790-796 @
-    /// 4a080252f, #10285): the registered tool's renderers resolved through
+    /// b4afdddf, #10285): the registered tool's renderers resolved through
     /// the extension resolver chain in load order. The TUI's
     /// `getRegisteredToolDefinition` consumes this.
     pub fn resolve_tool_renderers(
@@ -685,6 +692,10 @@ impl NativeExtensionHost {
         self.core().get_extension_paths()
     }
 
+    pub fn get_extension_source_infos(&self) -> Vec<crate::types::ExtSourceInfo> {
+        self.core().get_extension_source_infos()
+    }
+
     // ========================================================================
     // Errors + stale lifecycle
     // ========================================================================
@@ -726,6 +737,55 @@ mod tests {
     /// `dispose{extensionUnload}` through the bound bridge before the
     /// runtime goes stale. The live registry (rpi crate) dedups a second
     /// delivery; this test pins the seam contract on the host side.
+    #[tokio::test]
+    async fn reload_generation_discards_the_older_discovery_result() {
+        use crate::loader::InlineExtension;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let host = Arc::new(NativeExtensionHost::new("/tmp"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let factory = {
+            let calls = calls.clone();
+            let release_first = release_first.clone();
+            Arc::new(move |api: crate::api::ExtensionApi| {
+                let calls = calls.clone();
+                let release_first = release_first.clone();
+                Box::pin(async move {
+                    let invocation = calls.fetch_add(1, Ordering::SeqCst);
+                    let command = format!("generation-{invocation}");
+                    api.register_command(
+                        &command,
+                        None,
+                        Arc::new(|_args, _ctx| Box::pin(async { Ok(()) })),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    if invocation == 1 {
+                        release_first.notified().await;
+                    }
+                    Ok(())
+                }) as futures::future::BoxFuture<'static, Result<(), String>>
+            })
+        };
+        host.load_inline(&[InlineExtension::Anonymous(factory)])
+            .await;
+        assert!(host.get_command("generation-0").is_some());
+
+        let first = {
+            let host = host.clone();
+            tokio::spawn(async move { host.reload().await })
+        };
+        while calls.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        let second = host.reload().await;
+        assert!(second.is_empty());
+        release_first.notify_one();
+        let _ = first.await.expect("first reload");
+        assert!(host.get_command("generation-2").is_some());
+        assert!(host.get_command("generation-1").is_none());
+    }
+
     #[tokio::test]
     async fn component_dispose_extension_unload_fires_on_reload_and_clear_ui() {
         let dir = std::env::temp_dir().join(format!("rpi-ext-host-c3-{}", std::process::id()));

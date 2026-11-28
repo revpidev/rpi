@@ -32,6 +32,7 @@ pub mod host;
 pub mod i18n;
 pub mod mode;
 pub mod plan_file;
+pub mod progress;
 pub mod prompt;
 pub mod review;
 pub mod tool;
@@ -198,6 +199,8 @@ fn install_with_host(host: &dyn HostCall) -> Value {
         "session_start",
         "session_tree",
         "before_agent_start",
+        "turn_end",
+        "agent_end",
         "mcp_servers_change",
         // Round-2: evict the per-session mirror state at shutdown so STATES
         // does not grow with every session the process hosts.
@@ -291,6 +294,14 @@ fn edit_plan_file(host: &dyn HostCall) {
 fn handle_event(host: &dyn HostCall, event: &str, payload: &Value) -> Value {
     match event {
         "before_agent_start" => prompt::handle_before_agent_start(host, payload),
+        "turn_end" => {
+            progress::record_turn(host, payload);
+            Value::Null
+        }
+        "agent_end" => {
+            progress::record_agent_end(host, payload);
+            Value::Null
+        }
         "session_start" => {
             mode::on_session_start(host);
             Value::Null
@@ -300,6 +311,7 @@ fn handle_event(host: &dyn HostCall, event: &str, payload: &Value) -> Value {
             Value::Null
         }
         "session_shutdown" => {
+            progress::forget(host);
             mode::forget_session(host);
             Value::Null
         }
@@ -457,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn install_registers_the_tool_command_and_six_events() {
+    fn install_registers_the_tool_command_and_eight_events() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         __reset_state();
         let host = FakeHost::new();
@@ -472,6 +484,8 @@ mod tests {
             vec![
                 "registerTool",
                 "registerCommand",
+                "on",
+                "on",
                 "on",
                 "on",
                 "on",
@@ -493,6 +507,8 @@ mod tests {
                 "session_start",
                 "session_tree",
                 "before_agent_start",
+                "turn_end",
+                "agent_end",
                 "mcp_servers_change",
                 "session_shutdown",
             ]

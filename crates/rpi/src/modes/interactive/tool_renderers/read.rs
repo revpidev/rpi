@@ -1311,4 +1311,28 @@ mod tests {
         assert!(stripped.contains("Read image file [image/png]"));
         assert!(!stripped.contains("[Image:"));
     }
+
+    #[test]
+    fn result_highlights_dart_nix_groovy_and_gradle() {
+        for (path, code) in [
+            ("Main.dart", "void main() { print('hi'); }"),
+            ("flake.nix", "{ name = \"demo\"; }"),
+            ("Build.groovy", "class Demo { String value = 'hi' }"),
+            ("build.gradle", "plugins { id 'java' }"),
+        ] {
+            let rendered = format_read_result(
+                &json!({"path": path}),
+                &result_with(code, None),
+                ResultRenderOptions {
+                    expanded: true,
+                    is_partial: false,
+                },
+                &theme(),
+                false,
+                false,
+            );
+            assert!(rendered.contains('\x1b'), "{path} should be highlighted");
+            assert_eq!(strip_escape_sequences(&rendered).trim(), code, "{path}");
+        }
+    }
 }

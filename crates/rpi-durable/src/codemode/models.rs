@@ -1,5 +1,5 @@
 //! `models.*` for code mode scripts (port of
-//! `packages/durable/src/codemode/models.ts` @ `4a080252f`).
+//! `packages/durable/src/codemode/models.ts` @ `b4afdddf`).
 //!
 //! The catalog functions are host globals; the paid classifier and image calls
 //! are internal tools of the extension, hidden from scripts and turned from a

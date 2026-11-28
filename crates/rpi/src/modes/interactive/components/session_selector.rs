@@ -139,12 +139,7 @@ fn shorten_path(path: &str) -> String {
     if path.is_empty() {
         return path.to_string();
     }
-    if let Some(home) = home_dir()
-        && let Some(rest) = path.strip_prefix(&home)
-    {
-        return format!("~{rest}");
-    }
-    path.to_string()
+    crate::tools::path_utils::shorten_home_path(path, &home_dir().unwrap_or_default())
 }
 
 /// `formatSessionDate` (session-selector.ts:35-49): relative age label.

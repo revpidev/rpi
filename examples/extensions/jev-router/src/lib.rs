@@ -1,6 +1,6 @@
 //! Jev router — a virtual model that plans on a strong model and implements
 //! on a cheap one (V16-12 port of
-//! `packages/coding-agent/examples/extensions/jev-router.ts` @ 4a080252f).
+//! `packages/coding-agent/examples/extensions/jev-router.ts` @ b4afdddf).
 //!
 //! Registers `jev/auto`, which routes between three OpenAI Codex models:
 //!

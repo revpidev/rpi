@@ -36,6 +36,11 @@ use rpi_durable::types::Storage;
 pub enum Script {
     /// A terminal assistant message pushed as `start` + `done`/`error`.
     Message(AssistantMessage),
+    /// A partial that waits before completing, allowing durable state inspection.
+    GatedMessage {
+        message: AssistantMessage,
+        gate: Arc<tokio::sync::Notify>,
+    },
     /// A partial that never terminates (drives abort).
     Pending(String),
     /// Deltas released one at a time by the test, with a count of emitted deltas.
@@ -77,6 +82,8 @@ impl ApiKeyAuth for AlwaysAuth {
 pub type IdentityLog = Arc<Mutex<Vec<Option<rpi_ai::utils::identity::ClientIdentity>>>>;
 /// Deferred fetch/cancel calls observed at the provider boundary.
 pub type DeferredLog = Arc<Mutex<Vec<String>>>;
+/// Provider payloads after the generation hook chain.
+pub type PayloadLog = Arc<Mutex<Vec<serde_json::Value>>>;
 
 /// A provider that returns scripted responses in order.
 pub struct ScriptedProvider {
@@ -85,6 +92,8 @@ pub struct ScriptedProvider {
     scripts: Mutex<VecDeque<Script>>,
     identity_log: Option<IdentityLog>,
     deferred_log: Option<DeferredLog>,
+    request_log: Option<DeferredLog>,
+    payload_log: Option<PayloadLog>,
 }
 
 impl ScriptedProvider {
@@ -101,6 +110,18 @@ impl ScriptedProvider {
     fn record_identity(&self, identity: Option<rpi_ai::utils::identity::ClientIdentity>) {
         if let Some(log) = &self.identity_log {
             log.lock().expect("identity log").push(identity);
+        }
+    }
+
+    fn apply_payload(&self, request: &rpi_ai::types::ProviderRequestOptions) {
+        let payload = serde_json::json!({ "provider": "test" });
+        let payload = match request.on_payload.as_ref() {
+            Some(callback) => futures::executor::block_on(callback(payload.clone(), &self.model))
+                .unwrap_or_else(|| payload.clone()),
+            None => payload.clone(),
+        };
+        if let Some(log) = &self.payload_log {
+            log.lock().expect("payload log").push(payload);
         }
     }
 
@@ -133,6 +154,37 @@ impl ScriptedProvider {
                         message,
                     }),
                 }
+            }
+            Script::GatedMessage { message, gate } => {
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    producer.push(StreamEvent::Start {
+                        partial: SharedAssistantMessage::new(partial(&message)),
+                    });
+                    gate.notified().await;
+                    match message.stop_reason {
+                        StopReason::Error => producer.push(StreamEvent::Error {
+                            reason: ErrorReason::Error,
+                            error: message,
+                        }),
+                        StopReason::Deferred => producer.push(StreamEvent::Done {
+                            reason: DoneReason::Deferred,
+                            message,
+                        }),
+                        StopReason::ToolUse => producer.push(StreamEvent::Done {
+                            reason: DoneReason::ToolUse,
+                            message,
+                        }),
+                        StopReason::Length => producer.push(StreamEvent::Done {
+                            reason: DoneReason::Length,
+                            message,
+                        }),
+                        _ => producer.push(StreamEvent::Done {
+                            reason: DoneReason::Stop,
+                            message,
+                        }),
+                    }
+                });
             }
             Script::Pending(text) => {
                 let message = text_message(&text, StopReason::Pending);
@@ -217,7 +269,17 @@ impl Provider for ScriptedProvider {
         _context: &TranscriptContext,
         options: Option<StreamOptions>,
     ) -> AssistantMessageEventStream {
-        self.record_identity(options.and_then(|options| options.identity.clone()));
+        self.record_identity(
+            options
+                .as_ref()
+                .and_then(|options| options.identity.clone()),
+        );
+        if let Some(options) = &options {
+            self.apply_payload(&options.request);
+        }
+        if let Some(log) = &self.request_log {
+            log.lock().expect("request log").push("request".to_string());
+        }
         self.stream_of(self.next())
     }
 
@@ -227,7 +289,17 @@ impl Provider for ScriptedProvider {
         _context: &TranscriptContext,
         options: Option<SimpleStreamOptions>,
     ) -> Result<AssistantMessageEventStream, String> {
-        self.record_identity(options.and_then(|options| options.stream.identity.clone()));
+        self.record_identity(
+            options
+                .as_ref()
+                .and_then(|options| options.stream.identity.clone()),
+        );
+        if let Some(options) = &options {
+            self.apply_payload(&options.stream.request);
+        }
+        if let Some(log) = &self.request_log {
+            log.lock().expect("request log").push("request".to_string());
+        }
         Ok(self.stream_of(self.next()))
     }
 
@@ -237,7 +309,11 @@ impl Provider for ScriptedProvider {
         handle: &rpi_ai::types::DeferredHandle,
         options: Option<rpi_ai::types::DeferredFetchOptions>,
     ) -> Option<AssistantMessageEventStream> {
-        self.record_identity(options.and_then(|options| options.stream.identity.clone()));
+        self.record_identity(
+            options
+                .as_ref()
+                .and_then(|options| options.stream.identity.clone()),
+        );
         if let Some(log) = &self.deferred_log {
             log.lock()
                 .expect("deferred log")
@@ -252,7 +328,11 @@ impl Provider for ScriptedProvider {
         handle: &rpi_ai::types::DeferredHandle,
         options: Option<rpi_ai::types::ProviderRequestOptions>,
     ) -> Option<futures::future::BoxFuture<'static, Result<(), rpi_ai::auth::ModelsError>>> {
-        self.record_identity(options.and_then(|options| options.identity.clone()));
+        self.record_identity(
+            options
+                .as_ref()
+                .and_then(|options| options.identity.clone()),
+        );
         if let Some(log) = &self.deferred_log {
             log.lock()
                 .expect("deferred log")
@@ -301,6 +381,8 @@ pub fn test_models_with_model(scripts: Vec<Script>, model: Model) -> Models {
         scripts: Mutex::new(scripts.into()),
         identity_log: None,
         deferred_log: None,
+        request_log: None,
+        payload_log: None,
     });
     let models = Models::new(None);
     models.set_provider(provider);
@@ -319,6 +401,8 @@ pub fn test_models_with_identity_log(scripts: Vec<Script>) -> (Models, IdentityL
         scripts: Mutex::new(scripts.into()),
         identity_log: Some(Arc::clone(&identity_log)),
         deferred_log: None,
+        request_log: None,
+        payload_log: None,
     });
     let models = Models::new(None);
     models.set_provider(provider);
@@ -337,10 +421,53 @@ pub fn test_models_with_deferred_log(scripts: Vec<Script>) -> (Models, DeferredL
         scripts: Mutex::new(scripts.into()),
         identity_log: None,
         deferred_log: Some(Arc::clone(&deferred_log)),
+        request_log: None,
+        payload_log: None,
     });
     let models = Models::new(None);
     models.set_provider(provider);
     (models, deferred_log)
+}
+
+/// Build a provider that records new requests separately from deferred fetches.
+pub fn test_models_with_recovery_log(scripts: Vec<Script>) -> (Models, DeferredLog, DeferredLog) {
+    let deferred_log = Arc::new(Mutex::new(Vec::new()));
+    let request_log = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider {
+        model: model(),
+        auth: ProviderAuth {
+            api_key: Some(Arc::new(AlwaysAuth)),
+            oauth: None,
+        },
+        scripts: Mutex::new(scripts.into()),
+        identity_log: None,
+        deferred_log: Some(Arc::clone(&deferred_log)),
+        request_log: Some(Arc::clone(&request_log)),
+        payload_log: None,
+    });
+    let models = Models::new(None);
+    models.set_provider(provider);
+    (models, deferred_log, request_log)
+}
+
+/// Build a provider that records generation payloads after hook replacement.
+pub fn test_models_with_payload_log(scripts: Vec<Script>) -> (Models, PayloadLog) {
+    let payload_log = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider {
+        model: model(),
+        auth: ProviderAuth {
+            api_key: Some(Arc::new(AlwaysAuth)),
+            oauth: None,
+        },
+        scripts: Mutex::new(scripts.into()),
+        identity_log: None,
+        deferred_log: None,
+        request_log: None,
+        payload_log: Some(Arc::clone(&payload_log)),
+    });
+    let models = Models::new(None);
+    models.set_provider(provider);
+    (models, payload_log)
 }
 
 /// The shared background context.
@@ -403,6 +530,30 @@ pub async fn open_with_storage(
     open_with_storage_and_identity(storage, extensions, settings, models, None).await
 }
 
+/// Open a Harness over `storage` with one fixed execution environment.
+pub async fn open_with_storage_and_env(
+    storage: Arc<dyn Storage>,
+    extensions: Vec<Extension>,
+    models: Models,
+    env: Arc<dyn rpi_durable::env::types::ExecutionEnv>,
+) -> Opened {
+    let env: rpi_durable::harness::EnvFactory = Arc::new(move |_, _| {
+        let env = Some(Arc::clone(&env));
+        Box::pin(async move { env })
+    });
+    open_with_timing_and_env(
+        storage,
+        extensions,
+        None,
+        models.into(),
+        None,
+        None,
+        None,
+        Some(env),
+    )
+    .await
+}
+
 /// Open a Harness over `storage` with explicit request identity.
 pub async fn open_with_storage_and_identity(
     storage: Arc<dyn Storage>,
@@ -442,6 +593,23 @@ pub async fn open_with_timing(
     now: Option<rpi_durable::session::NowFn>,
     set_timer: Option<rpi_durable::harness::SetTimer>,
 ) -> Opened {
+    open_with_timing_and_env(
+        storage, extensions, settings, models, identity, now, set_timer, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_with_timing_and_env(
+    storage: Arc<dyn Storage>,
+    extensions: Vec<Extension>,
+    settings: Option<rpi_durable::harness::SettingsSource>,
+    models: rpi_durable::harness::ModelsSource,
+    identity: Option<rpi_ai::utils::identity::ClientIdentity>,
+    now: Option<rpi_durable::session::NowFn>,
+    set_timer: Option<rpi_durable::harness::SetTimer>,
+    env: Option<rpi_durable::harness::EnvFactory>,
+) -> Opened {
     let registry = Arc::new(RegistryImpl::with_builtins(builtin_tasks()));
     for extension in extensions {
         registry.install(extension).expect("install extension");
@@ -454,15 +622,15 @@ pub async fn open_with_timing(
         identity,
         registry: Arc::clone(&registry) as Arc<dyn rpi_durable::harness::RegistryReader>,
         settings,
-        env: None,
+        env,
         conversation_created: None,
         now,
         set_timer,
         on_wake: None,
-        on_report_info: None,
+        read_only: false,
         on_report: Some(Arc::new(move |message| {
             if let Ok(mut log) = captured.0.lock() {
-                log.push(message);
+                log.push(message.error);
             }
         })),
     };
@@ -522,6 +690,7 @@ pub async fn submit_input(
                 request_id: None,
                 content: rpi_ai::types::UserContent::Text(content.to_string()),
                 when_busy: None,
+                when_idle: None,
                 entry: None,
             }),
             &context(),

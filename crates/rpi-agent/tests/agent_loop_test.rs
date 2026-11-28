@@ -532,6 +532,10 @@ async fn handles_tool_calls_and_results() {
         cache_read: 3,
         cache_write: 4,
         total_tokens: 10,
+        cost: rpi_ai::types::UsageCost {
+            total_from_provider: Some(false),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let patched_tool_usage = Usage {
@@ -540,6 +544,10 @@ async fn handles_tool_calls_and_results() {
         cache_read: 7,
         cache_write: 8,
         total_tokens: 26,
+        cost: rpi_ai::types::UsageCost {
+            total_from_provider: Some(false),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -2541,6 +2549,50 @@ async fn validation_failure_yields_error_result_without_executing() {
 }
 
 #[tokio::test]
+async fn malformed_final_arguments_yield_error_result_without_executing() {
+    // A provider whose authoritative final parse failed sets
+    // `arguments_error`; validate_tool_arguments rejects it before the tool
+    // runs, so a malformed preview can never execute.
+    let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let tool = echo_tool(executed.clone());
+    let context = AgentContext {
+        messages: Vec::new(),
+        tools: Some(vec![Arc::new(tool)]),
+    };
+    let mut call = tool_call("tool-1", "echo", json!({}));
+    if let AssistantContent::ToolCall(call) = &mut call {
+        call.arguments_error = Some("expected value at line 1 column 1".to_owned());
+    }
+
+    let (stream_fn, state) = mock_stream_fn(vec![
+        assistant_message(vec![call], StopReason::ToolUse),
+        text_assistant("done"),
+    ]);
+    let stream = agent_loop(
+        vec![user_message("echo something")],
+        context,
+        test_config(),
+        None,
+        stream_fn,
+    );
+    let (events, messages) = collect(stream).await;
+
+    assert!(executed.lock().unwrap().is_empty());
+    let (is_error, result_text) = first_tool_execution_end_outcome(&events);
+    assert!(is_error);
+    assert!(
+        result_text.starts_with("Invalid arguments for tool \"echo\":"),
+        "unexpected error text: {result_text}"
+    );
+    let tool_result = messages.iter().find_map(|m| match m {
+        AgentMessage::ToolResult(t) => Some(t),
+        _ => None,
+    });
+    assert_eq!(tool_result.map(|t| t.is_error), Some(true));
+    assert_eq!(call_count(&state), 2);
+}
+
+#[tokio::test]
 async fn after_tool_call_hook_error_degrades_to_error_result() {
     // Upstream wraps `afterToolCall` in try/catch: a failing hook replaces
     // the whole outcome with an error result carrying the error text
@@ -2986,7 +3038,7 @@ fn message_kinds(messages: &[AgentMessage]) -> Vec<&'static str> {
         .collect()
 }
 
-/// V16-03 FR-D R5 (`prepareRequest`, agent-loop.ts:218-235 @ 4a080252f):
+/// V16-03 FR-D R5 (`prepareRequest`, agent-loop.ts:218-235 @ b4afdddf):
 /// the hook runs immediately before every conversational provider request,
 /// including the first, and its replacement context reaches the request.
 /// It does not poll queues (steering is polled by the loop's own gates).
@@ -3078,7 +3130,7 @@ async fn prepare_request_runs_for_every_request_and_replaces_context() {
 }
 
 /// V16-03 FR-D R1 (`finishTurn` continuation, agent-loop.ts:255-275 @
-/// 4a080252f): `{action: "continue"}` ensures one next provider request;
+/// b4afdddf): `{action: "continue"}` ensures one next provider request;
 /// since no tool result/steering/follow-up scheduling satisfies it, the loop
 /// runs one context-only turn.
 #[tokio::test]
@@ -3167,7 +3219,7 @@ async fn finish_turn_end_exits_before_polling_queues() {
 }
 
 /// V16-03 FR-D R1: error/aborted responses still invoke `finishTurn` but
-/// ignore its decision (agent-loop.ts:245-252 @ 4a080252f).
+/// ignore its decision (agent-loop.ts:245-252 @ b4afdddf).
 #[tokio::test]
 async fn finish_turn_runs_on_error_but_decision_is_ignored() {
     let context = AgentContext {

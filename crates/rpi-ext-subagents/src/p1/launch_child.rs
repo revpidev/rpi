@@ -24,7 +24,7 @@ use crate::{ParentSession, PluginRuntime, session_fork};
 
 /// Per-child output override (`normalizeOutputOverride` chain step
 /// semantics): a path, disabled, or inherit the agent default.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum OutputOverride {
     Path(PathBuf),
     Disabled,
@@ -47,6 +47,11 @@ pub struct ChildSpec {
     pub context_profile: bool,
     pub cwd: Option<PathBuf>,
     pub output: OutputOverride,
+    /// S11/S42: a resumed run's recorded output path. It is an *inherited*
+    /// output (upstream `inheritedOutputPath`), not a call-level
+    /// `params.output`: the new run writes a suffixed file and never
+    /// overwrites the original report.
+    pub inherited_output: Option<PathBuf>,
     /// #1305 call/step-level `outputMode`: inline | file-only (defaults
     /// through to the agent's own `outputMode`, then "inline").
     pub output_mode: Option<String>,
@@ -66,6 +71,8 @@ pub struct ChildSpec {
     /// Budget payloads inherited from the top-level call (FR-P1-09).
     pub turn_budget: Option<Value>,
     pub tool_budget: Option<Value>,
+    /// S17: outputSchema for this child (validated raw structured_output).
+    pub output_schema: Option<Value>,
     /// Skill resolution fallback cwd (chain scratch dir); defaults to base.
     pub skill_fallback_cwd: Option<PathBuf>,
     /// Extra cwd for skill resolution when the chain dir differs.
@@ -117,6 +124,11 @@ impl ChildSpec {
                 .filter(|s| !s.is_empty())
                 .map(crate::paths::expand_tilde_and_resolve),
             output,
+            inherited_output: object
+                .get("inheritedOutput")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .map(crate::paths::expand_tilde_and_resolve),
             output_mode: match object.get("outputMode").and_then(Value::as_str) {
                 Some("inline") | Some("file-only") => object
                     .get("outputMode")
@@ -134,6 +146,7 @@ impl ChildSpec {
                 .map(str::to_string),
             turn_budget: object.get("turnBudget").cloned(),
             tool_budget: object.get("toolBudget").cloned(),
+            output_schema: crate::structured_output::parse_call_schema(object.get("outputSchema")),
             session_file: object
                 .get("sessionFile")
                 .and_then(Value::as_str)
@@ -236,6 +249,17 @@ pub struct RunCtx {
     /// [`crate::runner::foreground::AbortProbe`]); `None` when there is no
     /// host channel or the context outlives its dispatch (async runs).
     pub abort_probe: Option<crate::runner::foreground::AbortProbe>,
+    /// V19-03 S13: approval seam for workflow child launches; survives the
+    /// async ctx clone (permission handlers must see background children).
+    pub approval: Option<crate::ApprovalSeam>,
+    /// V19-03 S11: `requireLauncher` for a top-level single launch.
+    pub required_launcher: Option<crate::recovery::RequiredLauncher>,
+    /// V19-03 S11: trusted-record launcher for a resume (`Some(None)` =
+    /// explicitly unwrapped). `None` = a fresh launch uses the agent field.
+    pub resume_launcher: Option<Option<crate::recovery::LauncherRecord>>,
+    /// True for async background runs: child launches write the trusted
+    /// recovery record.
+    pub async_recovery: bool,
     /// #55 intercom detach context: Some only on the sync single dispatch
     /// (the blocking face) — a child's blocking `contact_supervisor` ask
     /// detaches the run instead of deadlocking the dispatch. Async paths
@@ -251,6 +275,15 @@ impl RunCtx {
         object: &serde_json::Map<String, Value>,
         config: ExtensionConfig,
     ) -> Result<Self, String> {
+        crate::recovery::validate_require_launcher_shape(object)?;
+        let required_launcher = object
+            .get("requireLauncher")
+            .map(crate::recovery::RequiredLauncher::parse)
+            .transpose()?;
+        let resume_context = crate::recovery::resume_context();
+        let resume_launcher = resume_context
+            .as_ref()
+            .and_then(|context| context.launcher.clone());
         let parent_model = host.parent_model();
         let settings = crate::config::read_settings_pair_trusted(
             &host.cwd(),
@@ -349,6 +382,10 @@ impl RunCtx {
             control,
             control_sink: None,
             abort_probe: None,
+            approval: host.approval_seam(),
+            required_launcher,
+            resume_launcher,
+            async_recovery: false,
             detach_ctx: None,
         })
     }
@@ -421,6 +458,38 @@ pub enum ForkOutcome {
 /// (upstream #1137 keeps explicit `context: "fork"` fail-fast for the
 /// in-memory/missing-parent cases; ADR-0026 broadened degradation to every
 /// path — the e2e scenario-2 expectation change is registered under G2).
+/// Root of this run's fork copies (V19-03 S42, #3232).
+///
+/// Derived roots mirror upstream `fork-context.ts:184-205`: the copy lives
+/// under `<parent session dir>/<parent stem>/forks/<run id>/`, never loose
+/// next to the parent session file (Pi's non-recursive `-c` discovery would
+/// pick a still-running child over the conversation the user left) and never
+/// next to the `run-N/` result dirs. An explicit `sessionDir` is a user-owned
+/// root, so it keeps the copies but keys them by run id — two fork runs must
+/// never share one `fork.jsonl`. The `cleanupDays` sweep in `artifacts.rs`
+/// only walks the derived layout (plugin-owned), never a user root.
+pub fn fork_session_root(ctx: &RunCtx) -> PathBuf {
+    let base = if ctx.session_root_is_derived {
+        ctx.session_root
+            .parent()
+            .map(|parent| parent.join("forks"))
+            .unwrap_or_else(|| ctx.session_root.join("forks"))
+    } else {
+        ctx.session_root.clone()
+    };
+    base.join(&ctx.run_id)
+}
+
+/// Predictable branch file for one fork child inside [`fork_session_root`].
+pub fn fork_session_file(ctx: &RunCtx, child_index: u32) -> PathBuf {
+    let root = fork_session_root(ctx);
+    if child_index == 0 {
+        root.join("fork.jsonl")
+    } else {
+        root.join(format!("fork-{child_index}.jsonl"))
+    }
+}
+
 pub fn try_fork_session(ctx: &RunCtx, branch_file: &Path, effective_cwd: &Path) -> ForkOutcome {
     if let Some(parent) = &ctx.parent_session
         && parent.file.is_none()
@@ -482,6 +551,89 @@ fn project_prompt_overlays(
 
 /// Launch one child to completion (foreground, with model fallback chain).
 /// Synchronous entry for the single-run path (host dispatch thread).
+/// Serialize the synchronous approval host calls: parallel/chain children
+/// run concurrently on the plugin runtime, and the native host-call
+/// trampoline is not reentrant.
+static APPROVAL_LOCK: Mutex<()> = Mutex::new(());
+
+/// V19-03 S13/S46: offer one workflow child launch to the session's
+/// `tool_call` handler chain before any process/file action. `Ok(())` keeps
+/// the child (possibly with a handler-rewritten task); `Err` is the refusal
+/// reason and the caller must not launch it.
+pub fn approve_workflow_child(
+    ctx: &RunCtx,
+    spec: &mut ChildSpec,
+    key: &str,
+    workflow_identity: Option<&str>,
+    agent: Option<&AgentConfig>,
+) -> Result<(), String> {
+    let Some(seam) = &ctx.approval else {
+        return Ok(());
+    };
+    let cwd = spec.cwd.clone().unwrap_or_else(|| ctx.base_cwd.clone());
+    let mut args = json!({
+        "workflowRunId": ctx.run_id,
+        "key": key,
+        "agent": spec.agent_name,
+        "task": spec.task,
+        "cwd": cwd.to_string_lossy(),
+        "async": false,
+    });
+    if let Some(model) = &spec.model {
+        args["model"] = json!(model);
+    }
+    if let Some(identity) = workflow_identity {
+        args["workflow"] = json!(identity);
+    }
+    if let Some(gate) = spec.gate.as_deref().filter(|gate| !gate.trim().is_empty()) {
+        args["commands"] = json!([{
+            "command": gate,
+            "cwd": cwd.to_string_lossy(),
+        }]);
+    }
+    // The permission handler must see the path the child will actually
+    // write: a call-level output wins, otherwise the agent's default output
+    // (with the resume suffix applied) is the effective path (R19-S13).
+    let output_path = resolved_output_path(
+        spec,
+        agent.and_then(|agent| agent.output.as_deref()),
+        &ctx.run_id,
+    );
+    if let Some(path) = output_path {
+        args["output"] = json!(path.to_string_lossy());
+    }
+    let approval = {
+        let _guard = APPROVAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seam("subagent_launch", args)?
+    };
+    if approval.get("block").and_then(Value::as_bool) == Some(true) {
+        let reason = approval
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or("the subagent_launch call was refused");
+        return Err(format!(
+            "Workflow child '{key}' was not started: the subagent_launch call was refused: {reason}"
+        ));
+    }
+    // S46: handlers may rewrite `task`; apply it only to a non-resume child
+    // and re-run the existing non-empty task validation.
+    if spec.session_file.is_none()
+        && let Some(task) = approval
+            .get("input")
+            .and_then(|input| input.get("task"))
+            .and_then(Value::as_str)
+    {
+        if task.trim().is_empty() {
+            return Err(format!(
+                "Workflow child '{key}' was not started: the subagent_launch task was rewritten to an empty value."
+            ));
+        }
+        spec.task = task.to_string();
+    }
+    Ok(())
+}
+
 pub fn run_child(
     spec: &ChildSpec,
     agent: &AgentConfig,
@@ -544,6 +696,31 @@ pub fn preflight_self_extension(
 
 /// `<dir>/<name>.<suffix><ext>` next to `output_path`, with `.md` when it has
 /// no extension (`suffixedOutputPath`, subagent-executor.ts:3737-3740).
+/// Effective output path for a child: call-level `output` wins; a resumed
+/// run's recorded output is inherited and gets the new run id suffix so the
+/// original report is never overwritten; otherwise the agent default applies.
+pub(crate) fn resolved_output_path(
+    spec: &ChildSpec,
+    agent_output: Option<&str>,
+    run_id: &str,
+) -> Option<std::path::PathBuf> {
+    match &spec.output {
+        OutputOverride::Path(path) => Some(path.clone()),
+        OutputOverride::Disabled => None,
+        OutputOverride::Inherit => spec
+            .inherited_output
+            .clone()
+            .or_else(|| agent_output.map(crate::paths::expand_tilde_and_resolve))
+            .map(|path| {
+                if spec.session_file.is_some() {
+                    suffixed_output_path(&path, &run_id.chars().take(8).collect::<String>())
+                } else {
+                    path
+                }
+            }),
+    }
+}
+
 fn suffixed_output_path(output_path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let stem = output_path
         .file_stem()
@@ -600,6 +777,26 @@ pub async fn run_child_async(
 
     let effective_cwd = spec.cwd.clone().unwrap_or_else(|| ctx.base_cwd.clone());
 
+    // V19-03 S11: resolve the runner launcher before any process/file action
+    // and enforce `requireLauncher` (name + exact definition digest).
+    let (resume_launcher, resume_launcher_explicit) = match &ctx.resume_launcher {
+        Some(recorded) => (recorded.as_ref(), true),
+        None => (None, false),
+    };
+    let launcher = crate::recovery::resolve_launcher(
+        &ctx.config,
+        agent,
+        resume_launcher,
+        resume_launcher_explicit,
+    )?;
+    if let Some(required) = &ctx.required_launcher {
+        crate::recovery::check_required_launcher(
+            agent,
+            launcher.as_ref().map(|(record, _)| record),
+            required,
+        )?;
+    }
+
     // Fresh session dir / fork branch file are per child (executor 5929-5966:
     // explicit roots verbatim, derived roots get runId/<child>).
     // Resume overrides the session file regardless of context resolution.
@@ -611,12 +808,7 @@ pub async fn run_child_async(
         // failing the run — covering the in-memory parent (V13-02 FR-A R2),
         // the missing parent session, and `create_fork_session` failures.
         // The effective mode is reflected in the result's `context` field.
-        let branch_file = if spec.child_index == 0 {
-            ctx.session_root.join("fork.jsonl")
-        } else {
-            ctx.session_root
-                .join(format!("fork-{}.jsonl", spec.child_index))
-        };
+        let branch_file = fork_session_file(ctx, spec.child_index);
         match try_fork_session(ctx, &branch_file, &effective_cwd) {
             ForkOutcome::Forked(file) => (Some(file), None),
             ForkOutcome::Degraded(reason) => {
@@ -723,6 +915,39 @@ pub async fn run_child_async(
         ),
     };
 
+    // V19-03 S11: persist the trusted launch facts before the child starts.
+    // A write failure fails the launch (resume would otherwise have no
+    // trustworthy source). Only async runs carry a recovery folder.
+    if ctx.async_recovery {
+        crate::recovery::record_child(
+            &ctx.run_id,
+            crate::recovery::RecoveryChild {
+                index: spec.child_index,
+                agent: agent.name.clone(),
+                agent_path: agent.file_path.to_string_lossy().to_string(),
+                definition_digest: crate::recovery::agent_definition_digest(agent),
+                cwd: effective_cwd.to_string_lossy().to_string(),
+                session_dir: session_dir
+                    .as_ref()
+                    .map(|dir| dir.to_string_lossy().to_string()),
+                session_file: session_file
+                    .as_ref()
+                    .map(|file| file.to_string_lossy().to_string()),
+                model: candidates.first().cloned(),
+                thinking: thinking.clone(),
+                launcher: launcher.as_ref().map(|(record, _)| record.clone()),
+                launcher_recorded: true,
+                required_launcher: ctx.required_launcher.clone(),
+                output: match &spec.output {
+                    OutputOverride::Path(path) => Some(path.to_string_lossy().to_string()),
+                    _ => None,
+                },
+                workflow_key: None,
+                state: "running".to_string(),
+            },
+        )?;
+    }
+
     // #1397 `subagents.maxThinking` (thinking-ceiling.ts @ 0fc0eebb): the
     // settings ceiling (project wins) intersected with the inherited
     // ceiling (env — a child launched under a tighter ancestor keeps it,
@@ -803,21 +1028,7 @@ pub async fn run_child_async(
     // Output path: child override > agent frontmatter. A resumed run without
     // its own output must not overwrite the report the original run owns
     // (#2840): write `<name>.<new run id prefix><ext>` next to it instead.
-    let output_path = match &spec.output {
-        OutputOverride::Path(path) => Some(path.clone()),
-        OutputOverride::Disabled => None,
-        OutputOverride::Inherit => agent
-            .output
-            .as_deref()
-            .map(crate::paths::expand_tilde_and_resolve)
-            .map(|path| {
-                if spec.session_file.is_some() {
-                    suffixed_output_path(&path, &ctx.run_id.chars().take(8).collect::<String>())
-                } else {
-                    path
-                }
-            }),
-    };
+    let output_path = resolved_output_path(spec, agent.output.as_deref(), &ctx.run_id);
 
     // Effective output mode (#1305, subagent-executor.ts:3260 @ 0fc0eebb):
     // call/step param > agent frontmatter/builtin override > "inline".
@@ -978,14 +1189,19 @@ pub async fn run_child_async(
         agent_system_prompt_mode: agent.system_prompt_mode,
         agent_tools: agent_tools.clone(),
         agent_exclude_tools: agent.exclude_tools.clone(),
+        mcp_direct_tools: agent.mcp_direct_tools.clone(),
         agent_extensions: agent.extensions.clone(),
         agent_subagent_only_extensions: agent.subagent_only_extensions.clone(),
         agent_allowed_agents: agent.allowed_agents.clone(),
         diff_baseline,
         tool_budget_env,
+        output_schema: spec.output_schema.clone(),
         // #2570: children follow the parent session's project trust.
         project_trusted: ctx.project_trusted,
         agent_inherit_project_context: agent.inherit_project_context,
+        agent_inherit_global_context: agent.inherit_global_context,
+        launcher: launcher.as_ref().map(|(record, _)| record.clone()),
+        launcher_argv: launcher.as_ref().map(|(_, argv)| argv.clone()),
         agent_inherit_skills: agent.inherit_skills,
         task: task_text,
         task_delivery: None,
@@ -1294,8 +1510,46 @@ mod te18_fork_tests {
             control: crate::runner::control::ResolvedControlConfig::default(),
             control_sink: None,
             abort_probe: None,
+            approval: None,
+            required_launcher: None,
+            resume_launcher: None,
+            async_recovery: false,
             detach_ctx: None,
         }
+    }
+
+    /// S42 layout: derived roots mirror upstream `<parent stem>/forks/<run
+    /// id>/`, and an explicit `sessionDir` is keyed by run id so two fork runs
+    /// never share one `fork.jsonl`.
+    #[test]
+    fn fork_copies_live_under_the_parent_forks_dir() {
+        let parent = PathBuf::from("/sessions/--proj--/2026-08-14_parent.jsonl");
+        let mut ctx = ctx_with(None, Some(parent));
+        ctx.session_root = PathBuf::from("/sessions/--proj--/2026-08-14_parent/run-a");
+        ctx.session_root_is_derived = true;
+        assert_eq!(
+            fork_session_root(&ctx),
+            PathBuf::from("/sessions/--proj--/2026-08-14_parent/forks/te18fork1")
+        );
+        assert_eq!(
+            fork_session_file(&ctx, 0),
+            PathBuf::from("/sessions/--proj--/2026-08-14_parent/forks/te18fork1/fork.jsonl")
+        );
+        assert_eq!(
+            fork_session_file(&ctx, 2),
+            PathBuf::from("/sessions/--proj--/2026-08-14_parent/forks/te18fork1/fork-2.jsonl")
+        );
+
+        // Explicit sessionDir: user-owned root, still keyed by run id.
+        ctx.session_root = PathBuf::from("/work/child-sessions");
+        ctx.session_root_is_derived = false;
+        let first = fork_session_file(&ctx, 0);
+        assert_eq!(
+            first,
+            PathBuf::from("/work/child-sessions/te18fork1/fork.jsonl")
+        );
+        ctx.run_id = "te18fork2".to_string();
+        assert_ne!(first, fork_session_file(&ctx, 0));
     }
 
     fn prompt_agent(memory: Option<crate::agents::discover::MemoryConfig>) -> AgentConfig {
@@ -1314,7 +1568,9 @@ mod te18_fork_tests {
             thinking: crate::agents::discover::ThinkingSpec::Unset,
             system_prompt_mode: "replace",
             inherit_project_context: true,
+            inherit_global_context: false,
             inherit_skills: false,
+            launcher: None,
             default_context: None,
             default_async: None,
             default_timeout_ms: None,
@@ -1549,6 +1805,63 @@ mod te18_gate_budget_tests {
     }
 
     #[test]
+    fn resumed_inherited_output_never_overwrites_the_original_report() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-resume-output-{}-{}",
+            std::process::id(),
+            crate::runner::budget::random_run_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("report.md");
+        std::fs::write(&original, "original report").unwrap();
+
+        let mut child = ChildSpec {
+            agent_name: "worker".into(),
+            task: "continue".into(),
+            ..Default::default()
+        };
+        child.output = OutputOverride::Inherit;
+        child.inherited_output = Some(original.clone());
+        child.session_file = Some(dir.join("child.jsonl"));
+        let resolved = resolved_output_path(&child, Some("/agent/default.md"), "abcdef12")
+            .expect("inherited output");
+        assert_eq!(resolved, dir.join("report.abcdef12.md"));
+        assert_ne!(resolved, original);
+        assert_eq!(
+            std::fs::read_to_string(&original).unwrap(),
+            "original report"
+        );
+
+        // A call-level output still wins over the inherited path.
+        child.output = OutputOverride::Path(dir.join("explicit.md"));
+        assert_eq!(
+            resolved_output_path(&child, None, "abcdef12").unwrap(),
+            dir.join("explicit.md")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_params_reads_the_internal_inherited_output_key() {
+        let parsed = ChildSpec::from_params(
+            json!({
+                "agent": "worker",
+                "task": "continue",
+                "sessionFile": "/tmp/child.jsonl",
+                "inheritedOutput": "/x/report.md",
+            })
+            .as_object()
+            .unwrap(),
+        );
+        assert_eq!(parsed.output, OutputOverride::Inherit);
+        assert_eq!(
+            parsed.inherited_output,
+            Some(std::path::PathBuf::from("/x/report.md"))
+        );
+        assert!(parsed.session_file.is_some());
+    }
+
+    #[test]
     fn resumed_output_is_suffixed_next_to_the_original_report() {
         assert_eq!(
             suffixed_output_path(std::path::Path::new("/x/report.md"), "abc12345"),
@@ -1595,6 +1908,10 @@ mod te18_gate_budget_tests {
             control: crate::runner::control::ResolvedControlConfig::default(),
             control_sink: None,
             abort_probe: None,
+            approval: None,
+            required_launcher: None,
+            resume_launcher: None,
+            async_recovery: false,
             detach_ctx: None,
         };
         let agent = AgentConfig {
@@ -1612,7 +1929,9 @@ mod te18_gate_budget_tests {
             thinking: crate::agents::discover::ThinkingSpec::Unset,
             system_prompt_mode: "replace",
             inherit_project_context: true,
+            inherit_global_context: false,
             inherit_skills: false,
+            launcher: None,
             default_context: None,
             default_async: None,
             default_timeout_ms: None,
@@ -1762,5 +2081,138 @@ mod te18_gate_budget_tests {
             "the assembled agent prompt survives the bridge: {prompt}"
         );
         assert_ne!(prompt, "AGENT PROMPT BODY", "bridge guidance is added");
+    }
+}
+
+#[cfg(test)]
+mod workflow_approval_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn ctx(seam: Option<crate::ApprovalSeam>) -> RunCtx {
+        RunCtx {
+            settings: Default::default(),
+            config: Default::default(),
+            base_cwd: PathBuf::from("/tmp"),
+            parent_session: None,
+            parent_session_file: None,
+            parent_session_id: None,
+            parent_model: None,
+            project_trusted: None,
+            registry: Vec::new(),
+            host_builtin_tool_names: Ok(Vec::new()),
+            run_id: "approval-run".to_string(),
+            top_model: None,
+            top_thinking: None,
+            top_context: None,
+            top_timeout_ms: None,
+            top_turn_budget: None,
+            top_tool_budget: None,
+            usage_budget: None,
+            artifacts_dir: None,
+            session_root: std::env::temp_dir(),
+            session_root_is_derived: true,
+            frame_sink: None,
+            step_status: None,
+            control: crate::runner::control::ResolvedControlConfig::default(),
+            control_sink: None,
+            abort_probe: None,
+            approval: seam,
+            required_launcher: None,
+            resume_launcher: None,
+            async_recovery: false,
+            detach_ctx: None,
+        }
+    }
+
+    fn spec(task: &str) -> ChildSpec {
+        ChildSpec {
+            agent_name: "worker".into(),
+            task: task.into(),
+            ..Default::default()
+        }
+    }
+
+    type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+
+    fn seam(response: Value) -> (crate::ApprovalSeam, Seen) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for = Arc::clone(&seen);
+        let seam: crate::ApprovalSeam = Arc::new(move |name: &str, input: Value| {
+            seen_for.lock().unwrap().push((name.to_string(), input));
+            Ok(response.clone())
+        });
+        (seam, seen)
+    }
+
+    #[test]
+    fn allow_keeps_the_child_and_carries_commands_and_output() {
+        let (seam, seen) = seam(json!({ "block": false }));
+        let mut child = spec("original");
+        child.gate = Some("cargo test".into());
+        child.output = OutputOverride::Path(PathBuf::from("/tmp/out.md"));
+        approve_workflow_child(
+            &ctx(Some(seam)),
+            &mut child,
+            "task-1",
+            Some("parallel"),
+            None,
+        )
+        .expect("allowed");
+        assert_eq!(child.task, "original");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].0, "subagent_launch");
+        assert_eq!(seen[0].1["key"], json!("task-1"));
+        assert_eq!(seen[0].1["agent"], json!("worker"));
+        assert_eq!(seen[0].1["workflow"], json!("parallel"));
+        assert_eq!(seen[0].1["commands"][0]["command"], json!("cargo test"));
+        assert_eq!(seen[0].1["output"], json!("/tmp/out.md"));
+    }
+
+    #[test]
+    fn deny_refuses_with_the_reason() {
+        let (seam, _) = seam(json!({ "block": true, "reason": "not allowed" }));
+        let mut child = spec("original");
+        let error = approve_workflow_child(&ctx(Some(seam)), &mut child, "task-1", None, None)
+            .expect_err("denied");
+        assert!(error.contains("not allowed"), "{error}");
+        assert_eq!(child.task, "original");
+    }
+
+    #[test]
+    fn handler_task_rewrite_applies_only_to_non_resume_children() {
+        let (seam, _) = seam(json!({
+            "block": false,
+            "input": { "task": "rewritten" }
+        }));
+        let mut child = spec("original");
+        approve_workflow_child(&ctx(Some(seam.clone())), &mut child, "task-1", None, None)
+            .expect("allowed");
+        assert_eq!(child.task, "rewritten");
+
+        let mut resumed = spec("original");
+        resumed.session_file = Some(PathBuf::from("/tmp/session.jsonl"));
+        approve_workflow_child(&ctx(Some(seam)), &mut resumed, "task-1", None, None)
+            .expect("allowed");
+        assert_eq!(resumed.task, "original", "resume message is immutable");
+    }
+
+    #[test]
+    fn empty_rewrite_is_rejected() {
+        let (seam, _) = seam(json!({
+            "block": false,
+            "input": { "task": "   " }
+        }));
+        let mut child = spec("original");
+        let error = approve_workflow_child(&ctx(Some(seam)), &mut child, "task-1", None, None)
+            .expect_err("empty rewrite");
+        assert!(error.contains("empty value"), "{error}");
+    }
+
+    #[test]
+    fn no_seam_keeps_the_existing_behavior() {
+        let mut child = spec("original");
+        approve_workflow_child(&ctx(None), &mut child, "task-1", None, None).expect("no host");
+        assert_eq!(child.task, "original");
     }
 }

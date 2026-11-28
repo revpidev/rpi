@@ -14,7 +14,6 @@ use std::sync::Arc;
 use crate::api::openai_responses::OpenAiResponses;
 use crate::auth::oauth::meta_oauth;
 use crate::auth::{ProviderAuth, env_api_key_auth};
-use crate::generated::get_builtin_models;
 use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 
 /// `metaProvider()`.
@@ -31,7 +30,7 @@ pub fn meta_provider() -> Arc<dyn Provider> {
             ))),
             oauth: Some(meta_oauth()),
         },
-        models: get_builtin_models("meta").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared("meta")),
         api: ProviderApi::Single(Arc::new(OpenAiResponses)),
         ..Default::default()
     })

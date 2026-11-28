@@ -1157,6 +1157,62 @@ pub struct SessionManager {
     /// session-manager.ts:1447-1451).
     labels_order: Vec<String>,
     leaf_id: Option<String>,
+    /// Persisted user/assistant message counts, maintained incrementally by
+    /// [`Self::build_index`] and [`Self::append_entry`] so the counts-only
+    /// `ctx.sessionStats({countsOnly:true})` probe (V19-07 / R5.2.8) is O(1):
+    /// it must neither iterate nor clone entries, so its cost cannot grow
+    /// with the entry count of a long session. Same discriminator as
+    /// `get_entries()` + `AgentMessage::{User, Assistant}`.
+    message_counts: MessageRoleCounts,
+    /// Non-header record count (the O(1) twin of `get_entries().len()`,
+    /// which includes id-less records unlike [`Self::entry_count`]).
+    entry_total: u64,
+}
+
+/// Persisted `message` entry counts by role (header excluded), the O(1)
+/// twin of counting `AgentMessage::{User, Assistant}` over `get_entries()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessageRoleCounts {
+    /// Conversation turns (`role == "user"`).
+    pub user: u64,
+    /// Model outputs/steps (`role == "assistant"`).
+    pub assistant: u64,
+}
+
+impl MessageRoleCounts {
+    fn add(&mut self, role: MessageRole) {
+        match role {
+            MessageRole::User => self.user += 1,
+            MessageRole::Assistant => self.assistant += 1,
+        }
+    }
+
+    fn remove(&mut self, role: MessageRole) {
+        match role {
+            MessageRole::User => self.user = self.user.saturating_sub(1),
+            MessageRole::Assistant => self.assistant = self.assistant.saturating_sub(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageRole {
+    User,
+    Assistant,
+}
+
+/// The role a non-header record contributes to [`MessageRoleCounts`], or
+/// `None` for every other entry kind. Read off the already-parsed typed
+/// record: no clone, no allocation.
+fn message_role_of(record: &FileEntryRecord) -> Option<MessageRole> {
+    match record.typed()? {
+        FileEntry::Message(entry) => match &entry.message {
+            AgentMessage::User(_) => Some(MessageRole::User),
+            AgentMessage::Assistant(_) => Some(MessageRole::Assistant),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 impl SessionManager {
@@ -1186,6 +1242,8 @@ impl SessionManager {
             labels_by_id: HashMap::new(),
             labels_order: Vec::new(),
             leaf_id: None,
+            message_counts: MessageRoleCounts::default(),
+            entry_total: 0,
         };
 
         if let Some(file) = session_file {
@@ -1321,6 +1379,8 @@ impl SessionManager {
         self.labels_by_id.clear();
         self.labels_order.clear();
         self.leaf_id = None;
+        self.message_counts = MessageRoleCounts::default();
+        self.entry_total = 0;
         self.flushed = false;
 
         self.session_file = None;
@@ -1361,9 +1421,17 @@ impl SessionManager {
         // Label ops are collected during the scan and applied afterwards so
         // the records borrow can end first (order of ops is replay order).
         let mut label_ops: Vec<(String, Option<String>, String)> = Vec::new();
+        self.message_counts = MessageRoleCounts::default();
+        self.entry_total = 0;
         for (i, record) in self.records.iter().enumerate() {
             if record.is_header() {
                 continue;
+            }
+            self.entry_total += 1;
+            // Counted before the id check: `get_entries()` keeps id-less
+            // records too, and the counts must agree with it exactly.
+            if let Some(role) = message_role_of(record) {
+                self.message_counts.add(role);
             }
             let Some(id) = record.entry_id() else {
                 continue;
@@ -1490,15 +1558,31 @@ impl SessionManager {
         Ok(())
     }
 
-    /// `_appendEntry` (session-manager.ts:1044-1049): push, index, advance
-    /// leaf, then persist the appended entry.
+    /// `_appendEntry` (session-manager.ts:1192-1207): roll back the in-memory
+    /// entry and leaf when persistence fails so later entries cannot point at
+    /// a parent that was never written.
     fn append_entry(&mut self, typed: FileEntry) -> Result<String, RpiError> {
         let record = FileEntryRecord::from_typed(typed)?;
         let id = record.entry_id().unwrap_or_default().to_owned();
-        self.by_id.insert(id.clone(), self.records.len());
-        self.leaf_id = Some(id.clone());
+        let previous_leaf_id = self.leaf_id.clone();
+        let role = message_role_of(&record);
+        if let Some(role) = role {
+            self.message_counts.add(role);
+        }
+        self.entry_total += 1;
         self.records.push(record);
-        self.persist_appended_entry()?;
+        self.by_id.insert(id.clone(), self.records.len() - 1);
+        self.leaf_id = Some(id.clone());
+        if let Err(error) = self.persist_appended_entry() {
+            self.records.pop();
+            self.by_id.remove(&id);
+            self.leaf_id = previous_leaf_id;
+            self.entry_total = self.entry_total.saturating_sub(1);
+            if let Some(role) = role {
+                self.message_counts.remove(role);
+            }
+            return Err(error);
+        }
         Ok(id)
     }
 
@@ -1565,7 +1649,7 @@ impl SessionManager {
         self.append_entry(entry)
     }
 
-    /// `appendCompaction` (session-manager.ts:1240-1270 @ 4a080252f). The main
+    /// `appendCompaction` (session-manager.ts:1240-1270 @ b4afdddf). The main
     /// path writes the `firstKeptEntryId` form (ADR-0003 §1) and snapshots the
     /// current prompt/tool state (`systemMessage`) at the compaction boundary.
     ///
@@ -2093,9 +2177,11 @@ impl SessionManager {
         // `from_id` records the pre-navigation leaf the summary covers,
         // not the navigation target (`parent_id` keeps that).
         let from_id = self.leaf_id.clone().unwrap_or_else(|| "root".to_owned());
+        let previous_leaf_id = self.leaf_id.clone();
         self.leaf_id = branch_from_id.map(str::to_owned);
+        let summary_id = self.next_entry_id();
         let entry = FileEntry::BranchSummary(BranchSummaryEntry {
-            id: self.next_entry_id(),
+            id: summary_id.clone(),
             parent_id: branch_from_id.map(str::to_owned),
             timestamp: now_iso8601(),
             from_id,
@@ -2104,7 +2190,11 @@ impl SessionManager {
             usage,
             from_hook,
         });
-        self.append_entry(entry)
+        if let Err(error) = self.append_entry(entry) {
+            self.leaf_id = previous_leaf_id;
+            return Err(error);
+        }
+        Ok(summary_id)
     }
 
     /// `createBranchedSession` (session-manager.ts:1412-1512): extract the
@@ -2272,6 +2362,22 @@ impl SessionManager {
     /// [`Self::get_entries`], so render paths can call it every frame.
     pub fn entry_count(&self) -> usize {
         self.by_id.len()
+    }
+
+    /// Persisted user/assistant message counts in O(1) (V19-07 / R5.2.8):
+    /// unlike [`Self::get_entries`] this neither clones nor iterates entries,
+    /// so the statusline counts-only `ctx.sessionStats({countsOnly:true})`
+    /// probe costs the same on a short and on a multi-thousand-entry
+    /// session. The values equal counting `AgentMessage::{User, Assistant}`
+    /// over `get_entries()`.
+    pub fn message_counts(&self) -> MessageRoleCounts {
+        self.message_counts
+    }
+
+    /// `get_entries().len()` in O(1) (header excluded, id-less records
+    /// included), for the same counts-only probe.
+    pub fn entry_total(&self) -> u64 {
+        self.entry_total
     }
 
     /// `getSessionFile` — `None` for in-memory sessions.
@@ -2502,6 +2608,8 @@ impl SessionManager {
                 labels_by_id: HashMap::new(),
                 labels_order: Vec::new(),
                 leaf_id: None,
+                message_counts: MessageRoleCounts::default(),
+                entry_total: 0,
             };
             let selected = source_manager.entries_to_fork(&options)?;
             let mut lines = Vec::new();
@@ -2529,26 +2637,44 @@ impl SessionManager {
         });
         let header_record = FileEntryRecord::from_typed(new_header)?;
         // `wx` exclusive create (writeFileSync flag "wx", session-manager.ts:1620).
-        let mut fd = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&new_session_file)?;
-        fd.write_all(header_record.to_line()?.as_bytes())?;
-        fd.write_all(b"\n")?;
-        for line in &copy_lines {
-            fd.write_all(line.as_bytes())?;
+        // One writer owns the complete file. A failed write/open never leaves
+        // a partial fork that a later resume could mistake for a valid copy.
+        let mut created = false;
+        let write_result = (|| -> Result<(), RpiError> {
+            let mut fd = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&new_session_file)?;
+            created = true;
+            fd.write_all(header_record.to_line()?.as_bytes())?;
             fd.write_all(b"\n")?;
+            for line in &copy_lines {
+                fd.write_all(line.as_bytes())?;
+                fd.write_all(b"\n")?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            if created {
+                let _ = std::fs::remove_file(&new_session_file);
+            }
+            return Err(error);
         }
-        drop(fd);
 
-        SessionManager::new(
+        match SessionManager::new(
             &resolved_target_cwd,
             &dir,
             Some(&new_session_file),
             true,
             None,
             None,
-        )
+        ) {
+            Ok(manager) => Ok(manager),
+            Err(error) => {
+                let _ = std::fs::remove_file(&new_session_file);
+                Err(error)
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

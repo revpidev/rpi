@@ -9,7 +9,7 @@
 [![Platform: Linux · macOS · Windows](https://img.shields.io/badge/Platform-Linux%C2%B7macOS%C2%B7Windows-lightgrey)]()
 [![Build](https://img.shields.io/github/actions/workflow/status/revpidev/rpi/build.yml)](https://github.com/revpidev/rpi/actions/workflows/build.yml)
 
-Rpi 是一个用 Rust 编写的终端 AI 编程助手，源自 [Pi coding agent](https://github.com/earendil-works/pi)：继承了 Pi 的架构，行为持续与钉死的上游版本对拍验证——当前行为基线为 **Pi v1.4.0**（`4a080252f`，见 [`UPSTREAM.md`](./UPSTREAM.md)）。rpi 是独立项目，随着两者演进可能出现偏差。编译产出为单个静态二进制，不依赖 Node、Python 或任何运行时。
+Rpi 是一个用 Rust 编写的终端 AI 编程助手，源自 [Pi coding agent](https://github.com/earendil-works/pi)：继承了 Pi 的架构，行为持续与钉死的上游版本对拍验证——当前行为基线为 **Pi v1.5.2**（`b4afdddf`，见 [`UPSTREAM.md`](./UPSTREAM.md)）。rpi 是独立项目，随着两者演进可能出现偏差。编译产出为单个静态二进制，不依赖 Node、Python 或任何运行时。
 
 当前发布线为 **v0.1.8**，即最新稳定版（2026-11-12）。使用下方脚本安装，已有安装用 `rpi update` 更新（见[状态](#状态)）。
 
@@ -102,6 +102,12 @@ cargo build --release
 
 Kimi Code 使用 OpenAI Chat Completions，官方 base URL 为 `https://api.kimi.com/coding/v1`。`models.json` 或扩展服务商配置中的自定义 `baseUrl` 必须显式包含完整的 `/v1` 路径段。请将旧的 `https://api.kimi.com/coding` 改为 `https://api.kimi.com/coding/v1`，或使用代理本身明确的 `/v1` URL；rpi 不会自动追加后缀、改写 URL 或回退到旧传输协议。
 
+### 服务商兼容性
+
+`models.json` 与扩展模型可携带 `compat` 覆盖项。OpenAI 兼容请求默认省略空 `tools` 数组，仅旧代理需要时才设置 `requiresToolsWithToolHistory: true`。`promptCacheKeyMode` 支持 `auto`、`enabled`、`disabled`，`requiresNonNullAssistantContent` 会把 null assistant 内容改为空字符串。Anthropic 官方 origin 默认使用 message threads 进行增量续接；设置 `supportsMessageThreads: false` 可强制全量请求，单次 replay 也可使用 `StreamOptions.disable_continuation`。代理默认仍走全量请求。缓存预热默认模式为 `idle`；设置 `cacheWarming: "streaming"` 可恢复旧行为，设为 `off` 则关闭。
+
+Rust 调用方请注意：`Model.compat` 的类型为 `Option<Box<ModelCompat>>`，已有 compat 值需用 `Box::new(compat)` 包装。`models.json` 与扩展 wire 形状不变。
+
 ### 更新
 
 ```bash
@@ -119,6 +125,8 @@ rpi update --models     # 刷新远程模型目录
 
 交互模式启动时会异步检查已安装的插件。正式版主体只比较最新正式版插件，RC 主体只比较最新 RC 插件；发现更新时会列出插件，并提示对应的 `rpi update --extensions` 或 `rpi update --extensions --rc` 命令。
 
+**Windows：更新在下次启动时生效。** Windows 不能替换运行中的程序，所以 `rpi update --self`（以及 `rpi update --all` 的本体部分）只把新版本下载并校验到 `rpi.exe` 旁的 `.update\` 目录，输出「Downloaded rpi <version>. It takes effect the next time rpi starts.」。下次启动时重新校验暂存文件，用一个带 journal 的事务把本体与同批扩展一并换入，随后旧进程用原始命令行启动新的 `rpi.exe` 并等待它：shell 提示符在 rpi 退出后才返回，Ctrl+C 只交给新实例。扩展以分代目录安装（`~/.rpi/agent/extensions/<name>/<version>/` 加 `current.json` 指针；旧版本写入的扁平布局照常加载），其他正在运行的 rpi 实例继续使用已加载的库，重启后切换。每次启动都会清理不再被任何实例使用的旧版本文件，并在交互模式的启动通知里说明：旧版本已清理；或旧文件仍被运行中的实例占用、或无法删除时给出警告（`rpi update --cleanup` 可重试）。新版本在首次启动确认之前崩溃时自动回滚——恢复旧的可执行文件、扩展指针与安装清单，禁用该版本并明确提示——之后用 `rpi update --self --version <版本> --force` 才能再次暂存该版本（不带 `--version` 的 `rpi update --self --force` 跟随通道最新版）。`%LOCALAPPDATA%\rpi\logs\update.log` 记录每一步。唯一的例外是从更旧版本升到 `0.1.9-rc.4`：旧版本的 `rpi update --self` 仍以手动步骤结束，请先运行一次 `install.ps1`（或手动替换可执行文件）。更新期间仍在运行的、低于 `0.1.9-rc.4` 的 rpi 实例不受 pin 登记保护——执行 `rpi update --all` 前请先关闭它们。已知限制：新版本确认首启之前关机视同首启崩溃；确认之后的崩溃不自动回滚（旧映像以 `rpi.exe.old-<version>` 保留到下一次正常退出，可手动改回或重跑 `install.ps1`，它也会修复缺失的 `rpi.exe`）；低于 `0.1.9-rc.4` 的目标版本切换时没有首启检查；更新前已运行的实例派生的子代理子进程运行的是新版本。
+
 ### 卸载
 
 使用 `rpi remove <name>`（别名：`rpi uninstall <name>`）卸载单个插件；项目级安装需加 `--local`。settings 中登记的插件和 `rpi list` 显示为 `(untracked)` 的安装产物都支持卸载。已安装的插件文件会被删除；本地路径源只移除 settings 条目，不删除原目录。
@@ -135,7 +143,7 @@ rpi self-uninstall           # 删除二进制与安装清单；保留 ~/.rpi
 rpi self-uninstall --purge   # 连同 ~/.rpi（会话、认证、设置）一起删除
 ```
 
-手动清理遗留物：未加 `--purge` 卸载时，`~/.rpi/` 目录需要自行删除；Windows 上运行中的二进制无法删除自身，`self-uninstall` 会打印需要手动删除的准确路径（`rpi.exe`、`rpi.install.json`）。Unix 安装器写入的 `# rpi` PATH 块会被自动移除（symlink profile 和 symlink 安装目录会通过可执行文件路径与 manifest 的逻辑 `installPath` 匹配）；没有标记的手动 PATH 行不会被改动。Windows 上如安装器加入过用户 PATH，请手动删除该条目。
+手动清理遗留物：未加 `--purge` 卸载时，`~/.rpi/` 目录需要自行删除；Windows 上运行中的二进制无法删除自身，`self-uninstall` 会打印需要手动删除的准确路径（`rpi.exe`、`rpi.install.json`），在其他 rpi 实例仍在使用该安装时拒绝执行（关闭它们后重试），并列出更新遗留物（`.update\`、`rpi.exe.old-*`、分代扩展目录、更新日志）。Unix 安装器写入的 `# rpi` PATH 块会被自动移除（symlink profile 和 symlink 安装目录会通过可执行文件路径与 manifest 的逻辑 `installPath` 匹配）；没有标记的手动 PATH 行不会被改动。Windows 上如安装器加入过用户 PATH，请手动删除该条目。
 
 ## 使用
 
@@ -168,7 +176,11 @@ rpi update [self|--all|--extensions|--models] [--rc]
 rpi config                 # 资源配置 TUI（Tab 切换全局/项目作用域）
 rpi mcp add|remove|list|login|logout ...   # 在会话外管理 MCP 服务器
 rpi auth check|print-api-key|print-bearer-token ...  # 查看 provider 凭据
+rpi auth login <provider>    # 通过 API key、设备码或复制代码流程登录
+rpi auth logout <provider>   # 删除 provider 凭据
 ```
+
+更新提示会记录 previous/next version-or-commit 与 changelog 来源，按插件折叠为一行，并通过 `extensionChangelogVersions` 记忆各插件已读版本。交互式会话的原 cwd 不存在时，启动、恢复、导入和切换会明确提供 Continue、Fork、Cancel；Continue 不持久化，启动时的 Fork 使用当前 cwd，print/RPC 仍报告 `MissingSessionCwdError`。摘要和 changelog 与 assistant 共用 Markdown/Mermaid 转换管线，包括 pie、作者样式和可点击标签。
 
 ### 内置工具与扩展
 
@@ -183,7 +195,7 @@ rpi auth check|print-api-key|print-bearer-token ...  # 查看 provider 凭据
 | `builtin:mcp` | 读取 `~/.rpi/agent/mcp.json` 与 `<cwd>/.rpi/mcp.json`：`mcp__*` 工具、资源工具、`/mcp` 与 OAuth。`rpi-mcp-adapter` 已退役，内建客户端是受支持的路径。 |
 | `builtin:llama.cpp` | llama.cpp router 集成（`/llama`）与原生 decision-model classifier。 |
 
-七款第一方扩展以 `.rpix` 形式随宿主版本 lockstep 发布：`rpi-subagents`（委派、后台运行、worktree）、`rpi-smart-fetch`（浏览器指纹 web fetch）、`rpi-statusline`（脚本或 30 字段声明式 footer（含会话总量、轮次/步数与 token 分级统计），含 `/statusline` 编辑器）、`rpi-ask-user-question`（结构化提问）、`rpi-todo`（任务列表）、`rpi-plan-mode`（只读规划与批准流）、`rpi-usage`（八家 provider 的类型化配额/余额 footer，支持 `/usage [--cached] [--json] [provider|all]`、`/usage list|help`；无配额脚本的 provider 只显示本会话本地 token）。
+七款第一方扩展以 `.rpix` 形式随宿主版本 lockstep 发布：`rpi-subagents`（委派、后台运行、worktree）、`rpi-smart-fetch`（浏览器指纹 web fetch）、`rpi-statusline`（脚本或 30 字段声明式 footer（含会话总量、轮次/步数与 token 分级统计），支持 `liveTokens.calculation: auto|estimate`，含 `/statusline` 编辑器）、`rpi-ask-user-question`（结构化提问）、`rpi-todo`（任务列表）、`rpi-plan-mode`（只读规划与批准流）、`rpi-usage`（八家 provider 的类型化配额/余额 footer，支持 `/usage [--cached] [--json] [provider|all]`、`/usage list|help`；无配额脚本的 provider 只显示本会话本地 token）。
 
 全局升级时，如果扩展 manifest 提高了某个配置键的 `defaultSettingsMigration` 版本，且该键在全局设置中缺失，也会补入默认值；已有用户值和项目级安装不受影响。`rpi-statusline` 为 `statusLine` 使用迁移版本 1，因此未播种的旧 RC 安装升级后会直接显示默认 token 行，无需再打开 `/statusline` 手动保存。
 
@@ -213,6 +225,7 @@ rpi auth check|print-api-key|print-bearer-token ...  # 查看 provider 凭据
 | `RPI_TUI_COLOR_TIMEOUT` | 本地 100ms / SSH 500ms | 终端颜色查询超时（毫秒；issue #77 调优入口） |
 | `RPI_CLIPBOARD_OSC52` | — | 设为 `1` 时复制内容同时走 OSC 52，适用于没有 SSH 标记的远程客户端（多路复用器接入、IDE 守护进程） |
 | `RPI_HYPERLINKS` / `RPI_IMAGE_PROTOCOL` / `RPI_TRUE_COLOR` | 自动探测 | 终端能力覆盖 |
+| `MALLOC_ARENA_MAX` | Linux GNU 为 `1`；其他平台沿用 libc 默认值 | 以 32 位正整数覆盖 glibc malloc arena 上限；非法值会警告并回退为 `1`。默认值通过 `mallopt` 设置，不会导出给子进程 |
 
 同样的 URL 也可在 `settings.json` 中以 `versionCheckUrl`、`modelCatalogUrl`、`telemetryUrl`、`registryUrl` 设置；环境变量优先。
 
@@ -259,7 +272,7 @@ rpi auth check|print-api-key|print-bearer-token ...  # 查看 provider 凭据
 | `crates/rpi-test-*` | Faux provider、测试环境辅助与原生插件 fixture |
 | `fixtures/` | 契约/对拍测试 fixtures（生成脚本 + golden 数据） |
 | `scripts/` | 开发脚本（上游 pin 校验、对拍 harness、catalog 刷新、发布工具） |
-| `external/` | 钉死的上游 submodule：`pi`（v1.4.0）、`pi-subagents`（v0.76.1）、`rpiv-mono`（v2.13.8）、`agent-smart-fetch`（v0.3.17）——见 `UPSTREAM.md` |
+| `external/` | 钉死的上游 submodule：`pi`（v1.5.2）、`pi-subagents`（v0.83.0）、`rpiv-mono`（v2.15.0）、`agent-smart-fetch`（v0.3.17）——见 `UPSTREAM.md` |
 | `vendor/syntect` | 构建期文法重写使用的 syntect 补丁 fork（见 `vendor/syntect/PATCHES.md`） |
 | `changes/` | 各版本发布说明（changelog 单一事实源） |
 | `docs/` | 公开协议/参考文档（`json-rpc.md`、`codemode.md`） |

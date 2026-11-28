@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use rpi_ai::auth::{ModelsError, ModelsErrorCode};
 use rpi_ai::models::{
-    InflightRefresh, ModelsPublication, Provider, RefreshModelsContext, merge_any_models,
-    merge_models, now_millis,
+    InflightRefresh, ModelsPublication, Provider, RefreshModelsContext, SharedChatProjection,
+    SharedMerge, merge_any_models, merge_shared, now_millis, project_shared_chat_models,
 };
 use rpi_ai::models_store::ModelsStoreEntry;
 use rpi_ai::types::{
@@ -61,7 +61,7 @@ pub fn model_catalog_endpoint(settings_url: Option<&str>) -> Option<String> {
 }
 
 /// `REMOTE_CATALOG_MODEL_TYPES` (remote-catalog-provider.ts:17-24 @
-/// 4a080252f): model types this client can consume, sent as `?types=` so the
+/// b4afdddf): model types this client can consume, sent as `?types=` so the
 /// catalog server returns the full-type shard. A server that ignores the
 /// parameter still returns the chat-only shard, which this client handles
 /// unchanged.
@@ -193,7 +193,9 @@ pub fn with_remote_catalog(
         inner: provider,
         catalog_base_url: catalog_base_url.unwrap_or_else(|| DEFAULT_CATALOG_BASE_URL.to_owned()),
         local_generated_at,
-        dynamic_models: Arc::new(Mutex::new(Vec::new())),
+        dynamic_models: Arc::new(Mutex::new(Arc::from(Vec::new()))),
+        merged_all_models: Mutex::new(None),
+        chat_models: Mutex::new(None),
         inflight: InflightRefresh::new(),
     })
 }
@@ -206,7 +208,9 @@ pub struct RemoteCatalogProvider {
     inner: Arc<dyn Provider>,
     catalog_base_url: String,
     local_generated_at: Option<i64>,
-    dynamic_models: Arc<Mutex<Vec<AnyModel>>>,
+    dynamic_models: Arc<Mutex<Arc<[AnyModel]>>>,
+    merged_all_models: Mutex<Option<SharedMerge<AnyModel>>>,
+    chat_models: Mutex<Option<SharedChatProjection>>,
     inflight: InflightRefresh,
 }
 
@@ -214,6 +218,14 @@ impl RemoteCatalogProvider {
     /// The decorated static provider.
     pub fn inner(&self) -> &Arc<dyn Provider> {
         &self.inner
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_dynamic_models_for_test(&self, models: Vec<AnyModel>) {
+        *self
+            .dynamic_models
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = models.into();
     }
 }
 
@@ -239,28 +251,36 @@ impl Provider for RemoteCatalogProvider {
     }
 
     fn get_models(&self) -> Vec<Model> {
-        let dynamic = self
-            .dynamic_models
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Schema v6: `getModels` merges only the chat entries
-        // (remote-catalog-provider.ts:60-68).
-        let chat: Vec<Model> = dynamic
-            .iter()
-            .filter_map(AnyModel::as_chat)
-            .cloned()
-            .collect();
-        merge_models(&self.inner.get_models(), &chat)
+        self.get_models_shared().to_vec()
+    }
+
+    fn get_models_shared(&self) -> Arc<[Model]> {
+        let all = self.get_all_models_shared();
+        project_shared_chat_models(&self.chat_models, &all)
     }
 
     /// `getAllModels` (remote-catalog-provider.ts:64-68): every model type,
     /// keyed by `type\0id`.
     fn get_all_models(&self) -> Vec<AnyModel> {
+        self.get_all_models_shared().to_vec()
+    }
+
+    fn get_all_models_shared(&self) -> Arc<[AnyModel]> {
         let dynamic = self
             .dynamic_models
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        merge_any_models(&self.inner.get_all_models(), &dynamic)
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let baseline = self.inner.get_all_models_shared();
+        if dynamic.is_empty() {
+            return baseline;
+        }
+        merge_shared(
+            &self.merged_all_models,
+            &baseline,
+            &dynamic,
+            merge_any_models,
+        )
     }
 
     /// `refreshModels` (remote-catalog-provider.ts:55-121): restore the
@@ -459,7 +479,8 @@ impl Provider for RemoteCatalogProvider {
                         .publish(ModelsPublication {
                             persist: Some(Some(entry)),
                             update: Some(Box::new(move || {
-                                *dynamic_models.lock().unwrap_or_else(|e| e.into_inner()) = overlay;
+                                *dynamic_models.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    overlay.into();
                             })),
                         })
                         .await?;
@@ -529,7 +550,8 @@ pub struct OpenRouterCatalogProvider {
     inner: Arc<dyn Provider>,
     catalog_base_url: String,
     local_generated_at: Option<i64>,
-    personal_models: Arc<Mutex<Vec<AnyModel>>>,
+    personal_models: Arc<Mutex<Arc<[AnyModel]>>>,
+    chat_models: Mutex<Option<SharedChatProjection>>,
     source: Arc<Mutex<OpenRouterCatalogSource>>,
     inflight: InflightRefresh,
 }
@@ -544,7 +566,8 @@ pub fn with_openrouter_catalog(
         inner: provider,
         catalog_base_url: catalog_base_url.unwrap_or_else(|| DEFAULT_CATALOG_BASE_URL.to_owned()),
         local_generated_at,
-        personal_models: Arc::new(Mutex::new(Vec::new())),
+        personal_models: Arc::new(Mutex::new(Arc::from(Vec::new()))),
+        chat_models: Mutex::new(None),
         source: Arc::new(Mutex::new(OpenRouterCatalogSource::BuiltIn)),
         inflight: InflightRefresh::new(),
     })
@@ -560,13 +583,17 @@ impl OpenRouterCatalogProvider {
     }
 
     fn current_models(&self) -> Vec<AnyModel> {
+        self.current_models_shared().to_vec()
+    }
+
+    fn current_models_shared(&self) -> Arc<[AnyModel]> {
         let personal = self
             .personal_models
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if personal.is_empty() {
-            self.inner.get_all_models()
+            self.inner.get_all_models_shared()
         } else {
             personal
         }
@@ -595,14 +622,20 @@ impl Provider for OpenRouterCatalogProvider {
     }
 
     fn get_models(&self) -> Vec<Model> {
-        self.current_models()
-            .into_iter()
-            .filter_map(AnyModel::into_chat)
-            .collect()
+        self.get_models_shared().to_vec()
+    }
+
+    fn get_models_shared(&self) -> Arc<[Model]> {
+        let all = self.current_models_shared();
+        project_shared_chat_models(&self.chat_models, &all)
     }
 
     fn get_all_models(&self) -> Vec<AnyModel> {
         self.current_models()
+    }
+
+    fn get_all_models_shared(&self) -> Arc<[AnyModel]> {
+        self.current_models_shared()
     }
 
     fn filter_models(
@@ -657,7 +690,7 @@ impl Provider for OpenRouterCatalogProvider {
                     } else {
                         OpenRouterCatalogSource::Cache
                     };
-                    let restored_for_update = restored.clone();
+                    let restored_for_update: Arc<[AnyModel]> = restored.into();
                     let personal_for_update = personal_models.clone();
                     let source_for_update = source.clone();
                     let published = context
@@ -728,7 +761,7 @@ impl Provider for OpenRouterCatalogProvider {
                             remote = catalog;
                         }
                     }
-                    let merged = merge_any_models(&inner.get_all_models(), &remote);
+                    let merged = merge_any_models(&inner.get_all_models_shared(), &remote);
                     let personalized =
                         rpi_ai::providers::openrouter::personalize_openrouter_catalog(
                             &merged, &context,
@@ -757,7 +790,7 @@ impl Provider for OpenRouterCatalogProvider {
                             update: Some(Box::new(move || {
                                 *personal_for_update
                                     .lock()
-                                    .unwrap_or_else(|e| e.into_inner()) = personalized;
+                                    .unwrap_or_else(|e| e.into_inner()) = personalized.into();
                                 *source_for_update.lock().unwrap_or_else(|e| e.into_inner()) =
                                     next_source;
                             })),
@@ -917,6 +950,80 @@ mod tests {
                 ..Default::default()
             });
         with_remote_catalog(inner, Some(catalog_base_url.to_owned()), local_generated_at)
+    }
+
+    #[test]
+    fn dynamic_catalog_reuses_and_retires_merged_generations() {
+        let provider = test_provider("http://127.0.0.1:1", None);
+        *provider
+            .dynamic_models
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            vec![AnyModel::Chat(model("dynamic"))].into();
+        let first = provider.get_all_models_shared();
+        let second = provider.get_all_models_shared();
+        assert!(Arc::ptr_eq(&first, &second));
+        let first_chat = provider.get_models_shared();
+        let second_chat = provider.get_models_shared();
+        assert!(Arc::ptr_eq(&first_chat, &second_chat));
+        assert_eq!(
+            first_chat
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["static", "dynamic"]
+        );
+        let retired = Arc::downgrade(&first);
+
+        *provider
+            .dynamic_models
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            vec![AnyModel::Chat(model("next"))].into();
+        let refreshed = provider.get_all_models_shared();
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert!(Arc::ptr_eq(&refreshed, &provider.get_all_models_shared()));
+        let refreshed_chat = provider.get_models_shared();
+        assert!(Arc::ptr_eq(&refreshed_chat, &provider.get_models_shared()));
+        assert_eq!(
+            refreshed_chat
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["static", "next"]
+        );
+
+        drop(first);
+        drop(second);
+        drop(first_chat);
+        drop(second_chat);
+        assert!(retired.upgrade().is_none());
+    }
+
+    #[test]
+    fn dynamic_catalog_concurrent_readers_share_generations() {
+        let provider = test_provider("http://127.0.0.1:1", None);
+        provider.set_dynamic_models_for_test(vec![AnyModel::Chat(model("dynamic"))]);
+        let expected_all = provider.get_all_models_shared();
+        let expected_chat = provider.get_models_shared();
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let provider = provider.clone();
+            let expected_all = expected_all.clone();
+            let expected_chat = expected_chat.clone();
+            readers.push(std::thread::spawn(move || {
+                for _ in 0..32 {
+                    assert!(Arc::ptr_eq(
+                        &expected_all,
+                        &provider.get_all_models_shared()
+                    ));
+                    assert!(Arc::ptr_eq(&expected_chat, &provider.get_models_shared()));
+                }
+            }));
+        }
+        for reader in readers {
+            reader.join().expect("reader completes");
+        }
     }
 
     async fn make_context(
@@ -1629,6 +1736,10 @@ mod tests {
         let models = provider.get_models();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "auto");
+        assert!(Arc::ptr_eq(
+            &provider.get_models_shared(),
+            &provider.get_models_shared()
+        ));
         assert_eq!(models[0].context_window, 123_456);
         assert_eq!(models[0].max_tokens, 789);
         assert_eq!(models[0].cost.rates, Default::default());

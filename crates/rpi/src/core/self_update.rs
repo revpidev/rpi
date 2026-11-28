@@ -204,15 +204,11 @@ pub fn replace_failure_guidance(
     }
 }
 
-/// Phase-1 platform gate (ADR-0011 §4): Windows cannot rename over a
-/// running executable, so the binary branch degrades to instructions there.
-pub fn binary_inplace_replace_supported() -> bool {
-    !cfg!(windows)
-}
-
-/// The Windows phase-1 outcome for `update --self` on a binary install
-/// (ADR-0011 §4): no automatic replace — point at install.ps1 / a manual
-/// replace. Pure so the text is unit-tested on every platform.
+/// The manual fallback of a Windows self-update (ADR-0011 §4, kept as the
+/// degraded exit of ADR-0050): since V19-09 `rpi update --self` normally
+/// stages the update and the next start applies it; when that cannot
+/// happen, these steps apply. Pure so the text is unit-tested on every
+/// platform.
 pub fn windows_manual_update_instructions(version: &str, exe_path: &Path) -> String {
     let mut lines = vec![format!(
         "{APP_NAME} cannot replace the running executable on Windows."
@@ -220,7 +216,7 @@ pub fn windows_manual_update_instructions(version: &str, exe_path: &Path) -> Str
     if let Some(target) = build_target() {
         lines.push(format!(
             "Download {} and its .sha256 sidecar, verify the checksum,",
-            asset_url(RELEASE_DOWNLOAD_BASE_URL, version, target),
+            asset_url(RELEASE_DOWNLOAD_BASE_URL, version, target)
         ));
     } else {
         lines.push(format!(
@@ -229,8 +225,21 @@ pub fn windows_manual_update_instructions(version: &str, exe_path: &Path) -> Str
     }
     lines.push(format!(
         "then exit {APP_NAME} and replace {} with the extracted {APP_NAME}.exe (or re-run install.ps1).",
-        exe_path.display(),
+        exe_path.display()
     ));
+    if semver::Version::parse(version.trim().trim_start_matches(['v', 'V']))
+        .is_ok_and(|parsed| !parsed.pre.is_empty())
+    {
+        lines.push(format!(
+            "Channel: {version} is a pre-release (RC) build; {APP_NAME} update --self --rc installs the \
+             latest RC (the asset named above is the RC asset)."
+        ));
+    } else {
+        lines.push(format!(
+            "Channel: {version} is a stable build; {APP_NAME} update --self installs the latest \
+             stable build (the asset named above is the stable asset)."
+        ));
+    }
     lines.join("\n")
 }
 
@@ -411,6 +420,64 @@ pub async fn run_binary_self_update_observed(
     base_urls: &[String],
     observer: &dyn DownloadObserver,
 ) -> Result<SelfUpdateOutcome, String> {
+    let verified = download_release_asset(request, transport, base_urls, observer).await?;
+    let target = request.target.unwrap_or_default();
+    let binary = extract_release_binary(target, &verified.archive)?;
+    observer.on_download_event(&crate::core::download::DownloadEvent::Installing {
+        target: request.exe_path.to_path_buf(),
+    });
+    install_binary(request.exe_path, &binary).map_err(|error| {
+        let kind = classify_replace_error(&error);
+        format!(
+            "Could not replace {}: {error}. {}",
+            request.exe_path.display(),
+            replace_failure_guidance(kind, request.exe_path, request.version, Some(target)),
+        )
+    })?;
+
+    let manifest = InstallManifest {
+        version: request.version.to_string(),
+        target: target.to_string(),
+        installed_at: now_iso8601(),
+        source_url: verified.asset_url.clone(),
+        sha256: verified.sha256.clone(),
+        install_path: request.exe_path.to_string_lossy().into_owned(),
+        method: InstallManifest::METHOD_BINARY.to_string(),
+    };
+    let manifest_warning = write_install_manifest_for(request.exe_path, &manifest)
+        .err()
+        .map(|error| format!("the install manifest could not be updated: {error}"));
+    Ok(SelfUpdateOutcome {
+        source_url: verified.asset_url,
+        manifest_warning,
+    })
+}
+
+/// A downloaded release asset whose sha256 matched its sidecar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRelease {
+    /// The URL the asset came from (the manifest `sourceUrl`).
+    pub asset_url: String,
+    /// sha256 of the archive (the manifest's integrity value).
+    pub sha256: String,
+    /// The archive bytes.
+    pub archive: Vec<u8>,
+}
+
+/// Download the release asset of `request.version` and its sha256 sidecar
+/// and verify the checksum. This is the first half of
+/// [`run_binary_self_update_observed`], shared with the Windows staging
+/// path (V19-09), which must not touch the installed executable.
+///
+/// A failed DOWNLOAD moves on to the next base; an integrity failure
+/// (malformed sidecar or sha256 mismatch) aborts immediately — never switch
+/// sources on a failed integrity check (ADR-0011).
+pub async fn download_release_asset(
+    request: &BinarySelfUpdateRequest<'_>,
+    transport: &dyn BinaryDownloadTransport,
+    base_urls: &[String],
+    observer: &dyn DownloadObserver,
+) -> Result<VerifiedRelease, String> {
     let Some(target) = request.target else {
         return Err(format!(
             "This build does not know its target triple, so the correct release asset cannot be determined. To update, {}.",
@@ -430,7 +497,7 @@ pub async fn run_binary_self_update_observed(
     let downloader = Downloader::new(&adapter, policy, observer);
 
     let mut download_failures: Vec<String> = Vec::new();
-    let mut verified: Option<(String, Vec<u8>, String)> = None;
+    let mut verified: Option<VerifiedRelease> = None;
     for (index, base_url) in base_urls.iter().enumerate() {
         let candidate_url = asset_url(base_url, request.version, target);
         let sidecar_url = sha256_sidecar_url(&candidate_url);
@@ -498,52 +565,38 @@ pub async fn run_binary_self_update_observed(
                 "Integrity check failed for {asset_name}: expected sha256 {expected}, got {actual}. The download was discarded."
             ));
         }
-        let tarball = std::fs::read(&outcome.path).map_err(|error| {
+        let archive = std::fs::read(&outcome.path).map_err(|error| {
             format!(
                 "Could not read the downloaded asset {}: {error}",
                 outcome.path.display()
             )
         })?;
         let _ = std::fs::remove_file(&outcome.path);
-        verified = Some((candidate_url, tarball, actual));
+        verified = Some(VerifiedRelease {
+            asset_url: candidate_url,
+            sha256: actual,
+            archive,
+        });
         break;
     }
-    let Some((asset_url, tarball, actual)) = verified else {
-        return Err(format!(
-            "Could not download {asset_name} from any source: {}",
-            download_failures.join("; "),
-        ));
-    };
-
-    let binary = extract_rpi_binary(&tarball)?;
-    observer.on_download_event(&crate::core::download::DownloadEvent::Installing {
-        target: request.exe_path.to_path_buf(),
-    });
-    install_binary(request.exe_path, &binary).map_err(|error| {
-        let kind = classify_replace_error(&error);
+    verified.ok_or_else(|| {
         format!(
-            "Could not replace {}: {error}. {}",
-            request.exe_path.display(),
-            replace_failure_guidance(kind, request.exe_path, request.version, Some(target)),
+            "Could not download {asset_name} from any source: {}",
+            download_failures.join("; ")
         )
-    })?;
-
-    let manifest = InstallManifest {
-        version: request.version.to_string(),
-        target: target.to_string(),
-        installed_at: now_iso8601(),
-        source_url: asset_url.clone(),
-        sha256: actual,
-        install_path: request.exe_path.to_string_lossy().into_owned(),
-        method: InstallManifest::METHOD_BINARY.to_string(),
-    };
-    let manifest_warning = write_install_manifest_for(request.exe_path, &manifest)
-        .err()
-        .map(|error| format!("the install manifest could not be updated: {error}"));
-    Ok(SelfUpdateOutcome {
-        source_url: asset_url,
-        manifest_warning,
     })
+}
+
+/// Extract the rpi executable from a verified release asset: a `.tar.gz`
+/// on Unix targets, a `.zip` with `rpi.exe` at its root on Windows targets
+/// (build.yml; V19-09 reads it with the in-tree ZIP reader because the
+/// workspace has no ZIP crate).
+pub fn extract_release_binary(target: &str, archive: &[u8]) -> Result<Vec<u8>, String> {
+    if target.contains("windows") {
+        crate::core::windows_update::zip_archive::extract_member(archive, "rpi.exe")
+    } else {
+        extract_rpi_binary(archive)
+    }
 }
 
 /// Test seam / explicit context for the binary self-update branch of
@@ -556,6 +609,10 @@ pub struct BinarySelfUpdateSeam {
     /// Ordered download bases: GitHub first, official-site mirror last.
     pub base_urls: Vec<String>,
     pub transport: Arc<dyn BinaryDownloadTransport>,
+    /// V19-09 (ADR-0050): whether `update --self` stages the executable for
+    /// the next start instead of replacing it in place. `None` follows the
+    /// platform (Windows stages); tests force either landing.
+    pub stage_for_next_start: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -826,6 +883,16 @@ fn cleanup_installer_path(exe_path: &Path, manifest_install_path: Option<&Path>)
 /// (default keep; `--purge` deletes; non-interactive never asks and keeps) →
 /// delete the manifest → report leftovers and the manual removal instructions.
 pub fn run_self_uninstall_in(request: &SelfUninstallRequest<'_>) -> i32 {
+    // V19-09 (ADR-0050, revising ADR-0011 decision 5): on Windows the
+    // uninstall refuses while other rpi instances still use this
+    // installation or old-version files of it are in use.
+    #[cfg(windows)]
+    if let Some(message) =
+        crate::core::windows_update::startup::self_uninstall_blocker(request.exe_path)
+    {
+        eprintln!("Error: {message}");
+        return 1;
+    }
     let manifest_path = crate::config::install_manifest_path_for(request.exe_path);
     let manifest = crate::config::read_install_manifest_for(request.exe_path);
     match &manifest {
@@ -931,6 +998,19 @@ pub fn run_self_uninstall_in(request: &SelfUninstallRequest<'_>) -> i32 {
             "Remove them manually with: rm -rf {}",
             request.data_dir.display()
         );
+    }
+    // V19-09 (R7.6.5): the update-related leftovers on Windows — the
+    // update directory, old executables, extension generations, the log.
+    #[cfg(windows)]
+    {
+        let leftovers = crate::core::windows_update::startup::uninstall_leftovers(request.exe_path);
+        if !leftovers.is_empty() {
+            println!();
+            println!("Update leftovers (remove them manually):");
+            for path in leftovers {
+                println!("  {path}");
+            }
+        }
     }
     println!("{APP_NAME} has been uninstalled.");
     0

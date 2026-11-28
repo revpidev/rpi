@@ -1,5 +1,5 @@
 //! MCP protocol types and result validation (port of
-//! `packages/mcp/src/protocol/types.ts` @ 4a080252f).
+//! `packages/mcp/src/protocol/types.ts` @ b4afdddf).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};

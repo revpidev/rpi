@@ -16,6 +16,29 @@ fn is_word_boundary_char(c: Option<char>) -> bool {
     matches!(c, None | Some(' ' | '\t' | '-' | '_' | '.' | '/' | ':'))
 }
 
+fn score_positions(text_lower: &[char], positions: &[usize]) -> f64 {
+    let mut score = 0.0;
+    let mut last_match_index = -1i64;
+    let mut consecutive_matches = 0i64;
+    for &index in positions {
+        if last_match_index == index as i64 - 1 {
+            consecutive_matches += 1;
+            score -= (consecutive_matches * 5) as f64;
+        } else {
+            consecutive_matches = 0;
+            if last_match_index >= 0 {
+                score += ((index as i64 - last_match_index - 1) * 2) as f64;
+            }
+        }
+        if is_word_boundary_char(index.checked_sub(1).map(|previous| text_lower[previous])) {
+            score -= 10.0;
+        }
+        score += index as f64 * 0.1;
+        last_match_index = index as i64;
+    }
+    score
+}
+
 /// `fuzzyMatch` (fuzzy.ts:12-96).
 pub fn fuzzy_match(query: &str, text: &str) -> FuzzyMatch {
     let query_lower: Vec<char> = query.to_lowercase().chars().collect();
@@ -35,49 +58,33 @@ pub fn fuzzy_match(query: &str, text: &str) -> FuzzyMatch {
             };
         }
 
-        let mut query_index = 0usize;
-        let mut score = 0.0f64;
-        let mut last_match_index: i64 = -1;
-        let mut consecutive_matches = 0i64;
-
-        for (i, &ch) in text_lower.iter().enumerate() {
-            if query_index >= normalized_query.len() {
-                break;
-            }
-            if ch == normalized_query[query_index] {
-                let is_word_boundary =
-                    is_word_boundary_char(i.checked_sub(1).map(|j| text_lower[j]));
-
-                // Reward consecutive matches.
-                if last_match_index == i as i64 - 1 {
-                    consecutive_matches += 1;
-                    score -= (consecutive_matches * 5) as f64;
-                } else {
-                    consecutive_matches = 0;
-                    // Penalize gaps.
-                    if last_match_index >= 0 {
-                        score += ((i as i64 - last_match_index - 1) * 2) as f64;
-                    }
-                }
-
-                // Reward word boundary matches.
-                if is_word_boundary {
-                    score -= 10.0;
-                }
-
-                // Slight penalty for later matches.
-                score += i as f64 * 0.1;
-
-                last_match_index = i as i64;
-                query_index += 1;
-            }
+        let mut positions = Vec::with_capacity(normalized_query.len());
+        let mut last_match_index = -1i64;
+        for character in normalized_query {
+            let Some(index) = text_lower
+                .iter()
+                .enumerate()
+                .skip((last_match_index + 1) as usize)
+                .find(|(_, candidate)| *candidate == character)
+                .map(|(index, _)| index)
+            else {
+                return FuzzyMatch {
+                    matches: false,
+                    score: 0.0,
+                };
+            };
+            positions.push(index);
+            last_match_index = index as i64;
         }
 
-        if query_index < normalized_query.len() {
-            return FuzzyMatch {
-                matches: false,
-                score: 0.0,
-            };
+        let mut score = score_positions(&text_lower, &positions);
+        for start in 0..=text_lower.len().saturating_sub(normalized_query.len()) {
+            if text_lower[start..].starts_with(normalized_query) {
+                for (offset, position) in positions.iter_mut().enumerate() {
+                    *position = start + offset;
+                }
+                score = score.min(score_positions(&text_lower, &positions));
+            }
         }
 
         if normalized_query == text_lower.as_slice() {
@@ -196,6 +203,21 @@ mod tests {
         let exact = fuzzy_match("gpt-4o", "gpt-4o");
         let partial = fuzzy_match("gpt-4o", "gpt-4o-mini");
         assert!(exact.score < partial.score);
+    }
+
+    #[test]
+    fn contiguous_occurrence_beats_a_greedy_scattered_match() {
+        let text = "openrouter openrouter/anthropic/claude-opus";
+        let matched = fuzzy_match("opus", text);
+        assert!(matched.matches);
+        assert_eq!(
+            matched.score,
+            score_positions(&text.chars().collect::<Vec<_>>(), &[39, 40, 41, 42])
+        );
+        assert!(matched.score < score_positions(&text.chars().collect::<Vec<_>>(), &[0, 1, 6, 42]));
+        let long = format!("{}{}", "9".repeat(1020), "opus");
+        assert!(fuzzy_match("opus", &long).matches);
+        assert!(fuzzy_match("123e4567-e89b", "123e4567-e89b-42d3-a456-426614174000").matches);
     }
 
     #[test]

@@ -64,7 +64,7 @@ pub(crate) fn auto_theme_pair(setting: Option<&str>) -> Option<(String, String)>
 }
 
 // =============================================================================
-// Terminal appearance detection (theme.ts:697-716 @ 4a080252f)
+// Terminal appearance detection (theme.ts:697-716 @ b4afdddf)
 // =============================================================================
 
 /// Map between the rpi-tui scheme enum and the rpi theme enum.
@@ -82,7 +82,7 @@ fn to_scheme(theme: TerminalTheme) -> TerminalColorScheme {
     }
 }
 
-/// `detectColorFgBgTheme` (theme.ts:697-705 @ 4a080252f): `COLORFGBG`'s last
+/// `detectColorFgBgTheme` (theme.ts:697-705 @ b4afdddf): `COLORFGBG`'s last
 /// field is an ANSI index classified like Vim (0-6 and 8 dark, 7 and 9-15
 /// light); missing/invalid values have no answer.
 pub(crate) fn detect_color_fg_bg_theme(colorfgbg: Option<&str>) -> Option<TerminalColorScheme> {
@@ -90,12 +90,12 @@ pub(crate) fn detect_color_fg_bg_theme(colorfgbg: Option<&str>) -> Option<Termin
 }
 
 /// `detectTerminalBackgroundFromEnv` (theme.ts:734-753 @ 9841914, superseded
-/// by `detectTerminalTheme` @ 4a080252f): `COLORFGBG`, falling back to dark.
+/// by `detectTerminalTheme` @ b4afdddf): `COLORFGBG`, falling back to dark.
 pub(crate) fn detect_terminal_background_from_env(colorfgbg: Option<&str>) -> TerminalColorScheme {
     detect_color_fg_bg_theme(colorfgbg).unwrap_or(TerminalColorScheme::Dark)
 }
 
-/// `detectTerminalTheme` (theme.ts:707-716 @ 4a080252f): the reported
+/// `detectTerminalTheme` (theme.ts:707-716 @ b4afdddf): the reported
 /// background (with the foreground as a tiebreaker) decides; without one the
 /// terminal's light/dark report, then `COLORFGBG`, then dark.
 pub(crate) fn detect_terminal_theme(

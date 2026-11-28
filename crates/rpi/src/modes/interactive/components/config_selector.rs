@@ -164,11 +164,10 @@ fn get_item_scope(item: &ResourceItem) -> SourceScope {
 fn format_base_dir(base_dir: &str) -> String {
     let home_dir = config::user_home_dir().map(|p| p.to_string_lossy().into_owned());
     let display_path = match &home_dir {
-        Some(home) if base_dir == home => "~".to_string(),
-        Some(home) if base_dir.starts_with(home) => {
-            format!("~{}", base_dir[home.len()..].replace('\\', "/"))
+        Some(home) => {
+            crate::tools::path_utils::shorten_home_path(base_dir, home).replace('\\', "/")
         }
-        _ => base_dir.replace('\\', "/"),
+        None => base_dir.replace('\\', "/"),
     };
     if display_path.ends_with('/') {
         display_path
@@ -1855,6 +1854,7 @@ mod tests {
                 SourceScope::User => dirs.agent_dir.clone(),
                 _ => dirs.cwd.join(CONFIG_DIR_NAME),
             }),
+            changelog_path: None,
         }
     }
 
@@ -1993,6 +1993,7 @@ mod tests {
             scope: SourceScope::User,
             origin: SourceOrigin::TopLevel,
             base_dir: None,
+            changelog_path: None,
         };
         let project_metadata = ResourcePathMetadata {
             scope: SourceScope::Project,
@@ -2067,6 +2068,7 @@ mod tests {
             scope: SourceScope::User,
             origin: SourceOrigin::Package,
             base_dir: Some(package_root.clone()),
+            changelog_path: None,
         };
         let paths = ScopedResolvedPaths {
             global: ResolvedPaths {
@@ -2174,6 +2176,7 @@ mod tests {
             scope: SourceScope::User,
             origin: SourceOrigin::Package,
             base_dir: Some(package_root.clone()),
+            changelog_path: None,
         };
         let skill_resource = resource(
             package_root.join("skills/tool/SKILL.md"),

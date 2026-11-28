@@ -60,6 +60,10 @@ pub fn format_agent_detail(agent: &AgentConfig) -> String {
     let mut lines = vec![
         format!("Agent: {} ({})", agent.name, agent.source_str()),
         format!("Path: {}", agent.file_path.to_string_lossy()),
+        format!(
+            "Definition digest: {}",
+            crate::recovery::agent_definition_digest(agent)
+        ),
         format!("Description: {}", agent.description),
     ];
     if agent.package_name.is_some() {
@@ -220,9 +224,35 @@ fn append_restricted_agent_lines(
 /// `Executable agents (capabilities):`. #2338: the session's capability
 /// ceiling partitions non-allowlisted agents into their own restricted
 /// section (both list modes share `appendRestrictedAgentLines` upstream).
+#[allow(dead_code)] // wrapper kept for tests/back-compat callers
 pub fn format_agent_capabilities_list(
     agents: &[AgentConfig],
     ceiling: Option<&crate::launch::args::DescendantAllowlist>,
+) -> String {
+    format_agent_capabilities_list_with_models(agents, ceiling, &[])
+}
+
+/// S22: a declared model pin that does not resolve in the active registry is
+/// marked in the prose and structured capability rows. An empty registry
+/// means "unknown", not "unavailable".
+fn model_unavailable(
+    model: &str,
+    available_models: &[crate::launch::model::AvailableModel],
+    preferred_provider: Option<&str>,
+) -> bool {
+    !available_models.is_empty()
+        && crate::launch::model::resolve_subagent_model_candidate(
+            model,
+            Some(available_models),
+            preferred_provider,
+        )
+        .is_none()
+}
+
+pub fn format_agent_capabilities_list_with_models(
+    agents: &[AgentConfig],
+    ceiling: Option<&crate::launch::args::DescendantAllowlist>,
+    available_models: &[crate::launch::model::AvailableModel],
 ) -> String {
     let mut sorted: Vec<&AgentConfig> = agents.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
@@ -246,6 +276,15 @@ pub fn format_agent_capabilities_list(
                 tools = format!("{tools}; excludes: {}", agent.exclude_tools.join(", "));
             }
             let model = match &agent.model {
+                Some(model)
+                    if model_unavailable(
+                        model,
+                        available_models,
+                        agent.model_provider.as_deref(),
+                    ) =>
+                {
+                    format!("{model} (unavailable in the active model registry)")
+                }
                 Some(model) => model.clone(),
                 None => "inherits current session".to_string(),
             };
@@ -299,9 +338,18 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 /// array with `executable: false` + `restrictionSources`, carries the real
 /// `restrictedCount`, and names the ceiling's sources in
 /// `capabilityCeilingSources` when present.
+#[allow(dead_code)] // wrapper kept for tests/back-compat callers
 pub fn agent_capabilities_snapshot(
     agents: &[AgentConfig],
     ceiling: Option<&crate::launch::args::DescendantAllowlist>,
+) -> Value {
+    agent_capabilities_snapshot_with_models(agents, ceiling, &[])
+}
+
+pub fn agent_capabilities_snapshot_with_models(
+    agents: &[AgentConfig],
+    ceiling: Option<&crate::launch::args::DescendantAllowlist>,
+    available_models: &[crate::launch::model::AvailableModel],
 ) -> Value {
     let mut sorted: Vec<&AgentConfig> = agents.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
@@ -358,6 +406,11 @@ pub fn agent_capabilities_snapshot(
         }
         if let Some(aliases) = &agent.aliases {
             record["aliases"] = json!(aliases);
+        }
+        if agent.model.as_deref().is_some_and(|model| {
+            model_unavailable(model, available_models, agent.model_provider.as_deref())
+        }) {
+            record["model"]["unavailable"] = json!(true);
         }
         record
     };
@@ -544,6 +597,7 @@ fn resume_from_foreground_record(
         child["thinking"]
             .as_str()
             .filter(|thinking| !thinking.is_empty()),
+        child["output"].as_str().filter(|output| !output.is_empty()),
     );
     let result = crate::tool::execute_subagent_tool(&params, host, settings, config, runtime, None);
     ToolOutcome {
@@ -566,6 +620,7 @@ fn revived_run_params(
     cwd: Option<&str>,
     model: Option<&str>,
     thinking: Option<&str>,
+    output: Option<&str>,
 ) -> Value {
     let mut params = serde_json::json!({
         "agent": agent,
@@ -581,6 +636,12 @@ fn revived_run_params(
     }
     if let Some(thinking) = thinking.filter(|value| !value.is_empty()) {
         params["thinking"] = json!(thinking);
+    }
+    // S11/S42: the trusted record's output is an *inherited* path, not a
+    // call-level `params.output`: the resumed run must write a suffixed file
+    // next to the original report, never overwrite it (#2840).
+    if let Some(output) = output.filter(|value| !value.is_empty()) {
+        params["inheritedOutput"] = json!(output);
     }
     params
 }
@@ -669,12 +730,56 @@ fn handle_management_action_inner(
             // records (agent-management.ts:972-995 + agentCapabilityRow @
             // 0fc0eebb); the default listing shape is unchanged.
             let capability_mode = raw_params.get("capabilities") == Some(&Value::Bool(true));
+            // S37 (#3225): `options.search` matches name/description/alias,
+            // stable-sorted, at most 30 rows with a continuation hint.
+            let search = raw_params
+                .get("options")
+                .and_then(|options| options.get("search"))
+                .or_else(|| raw_params.get("search"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|search| !search.is_empty())
+                .map(str::to_lowercase);
+            let (agents, search_truncated) = match &search {
+                Some(query) => {
+                    let mut matches: Vec<discover::AgentConfig> = agents
+                        .into_iter()
+                        .filter(|agent| {
+                            agent.name.to_lowercase().contains(query)
+                                || agent.description.to_lowercase().contains(query)
+                                || agent.aliases.as_ref().is_some_and(|aliases| {
+                                    aliases
+                                        .iter()
+                                        .any(|alias| alias.to_lowercase().contains(query))
+                                })
+                        })
+                        .collect();
+                    matches.sort_by(|a, b| a.name.cmp(&b.name));
+                    let truncated = matches.len() > 30;
+                    matches.truncate(30);
+                    (matches, truncated)
+                }
+                None => (agents, false),
+            };
             let session_ceiling = crate::launch::args::DescendantAllowlist::from_env();
+            let available_models = deps
+                .host
+                .map(|host| host.scoped_models())
+                .unwrap_or_default();
             let mut text = if capability_mode {
-                format_agent_capabilities_list(&agents, session_ceiling.as_ref())
+                format_agent_capabilities_list_with_models(
+                    &agents,
+                    session_ceiling.as_ref(),
+                    &available_models,
+                )
             } else {
                 format_agent_list_with_ceiling(&agents, session_ceiling.as_ref())
             };
+            if search_truncated {
+                text.push_str(
+                    "\n\nShowing the first 30 matches; refine options.search to narrow the list.",
+                );
+            }
             let diagnostic_lines = format_discovery_diagnostics(&diagnostics);
             if !diagnostic_lines.is_empty() {
                 text.push('\n');
@@ -685,7 +790,13 @@ fn handle_management_action_inner(
                 details = json!({
                     "mode": "management",
                     "results": [],
-                    "agentCapabilities": agent_capabilities_snapshot(&agents, session_ceiling.as_ref()),
+                    "agentCapabilities": agent_capabilities_snapshot_with_models(
+                        &agents,
+                        session_ceiling.as_ref(),
+                        &available_models,
+                    ),
+                    "search": search,
+                    "searchTruncated": search_truncated,
                 });
             }
             ToolOutcome {
@@ -723,6 +834,7 @@ fn handle_management_action_inner(
             }
         }
         "status" => {
+            let current_session = parent_session_id(deps, settings);
             // Optional view selectors (#1963): `view:"transcript"` requires
             // an id and reads that run's live child transcript on demand;
             // the fleet view is [DEFER] (03 §2.13) so transcript is the only
@@ -739,6 +851,22 @@ fn handle_management_action_inner(
                         "status view \"transcript\" requires the run id (use { id }).".to_string(),
                     );
                 };
+                // S24: a run owned by another session is invisible here.
+                match crate::runner::background::read_run_status(&id) {
+                    Ok(Some(status))
+                        if !crate::runner::background::status_owned_by(
+                            &status,
+                            current_session.as_deref(),
+                        ) =>
+                    {
+                        return ToolOutcome::error(format!("No background run matches '{id}'."));
+                    }
+                    Ok(None) => {
+                        return ToolOutcome::error(format!("No background run matches '{id}'."));
+                    }
+                    Err(message) => return ToolOutcome::error(message),
+                    Ok(Some(_)) => {}
+                }
                 let lines = raw_params
                     .get("lines")
                     .and_then(Value::as_u64)
@@ -754,10 +882,6 @@ fn handle_management_action_inner(
                 };
             }
             // Foreground memory + live async registry (async-status.ts shape).
-            let current_session = deps
-                .host
-                .and_then(|host| host.parent_session(settings))
-                .map(|session| session.id);
             let memory = FOREGROUND_RUN_MEMORY
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
@@ -859,7 +983,8 @@ fn handle_management_action_inner(
             }
             lines.push(String::new());
             lines.push("Background runs:".to_string());
-            let async_runs = crate::runner::background::list_runs();
+            let async_runs =
+                crate::runner::background::list_runs_for_session(current_session.as_deref());
             if async_runs.is_empty() {
                 lines.push("- (none)".to_string());
             }
@@ -886,6 +1011,23 @@ fn handle_management_action_inner(
                     "action \"debug.run\" requires the run id (use { id }).".to_string(),
                 );
             };
+            // S24: debug surfaces are session-scoped like status.
+            let current_session = parent_session_id(deps, settings);
+            match crate::runner::background::read_run_status(&id) {
+                Ok(Some(status))
+                    if !crate::runner::background::status_owned_by(
+                        &status,
+                        current_session.as_deref(),
+                    ) =>
+                {
+                    return ToolOutcome::error(format!("No background run matches '{id}'."));
+                }
+                Ok(None) => {
+                    return ToolOutcome::error(format!("No background run matches '{id}'."));
+                }
+                Err(message) => return ToolOutcome::error(message),
+                Ok(Some(_)) => {}
+            }
             match format_run_lifecycle_debug(&id) {
                 Ok(text) => ToolOutcome::text(text),
                 Err(message) => ToolOutcome::error(message),
@@ -893,7 +1035,13 @@ fn handle_management_action_inner(
         }
         // Async control actions (async-stop-action.ts / control-channel.ts).
         "interrupt" => match id_param(&raw_params) {
-            Some(id) => match crate::runner::background::interrupt_run(&id) {
+            Some(id) => match crate::runner::background::interrupt_run_for_session(
+                &id,
+                deps.host
+                    .and_then(|host| host.parent_session(settings))
+                    .map(|session| session.id)
+                    .as_deref(),
+            ) {
                 Ok(status) => ToolOutcome::text(format_async_status("interrupted", &status)),
                 Err(message) => ToolOutcome::error(message),
             },
@@ -914,6 +1062,17 @@ fn handle_management_action_inner(
                     .map(str::to_string);
                 match crate::runner::background::find_run(&id) {
                     Some(handle) => {
+                        if !crate::runner::background::run_owned_by(
+                            &handle,
+                            deps.host
+                                .and_then(|host| host.parent_session(settings))
+                                .map(|session| session.id)
+                                .as_deref(),
+                        ) {
+                            return ToolOutcome::error(format!(
+                                "No active background run matches '{id}'."
+                            ));
+                        }
                         // Terminal runs stay registered (wait/status read
                         // them); stopping one is invalid_state (#1965) —
                         // report instead of queueing or silently succeeding.
@@ -923,7 +1082,7 @@ fn handle_management_action_inner(
                         let state = snapshot["state"].as_str().unwrap_or_default();
                         if matches!(
                             state,
-                            "complete" | "failed" | "stopped" | "paused" | "rejected"
+                            "complete" | "failed" | "stopped" | "paused" | "rejected" | "partial"
                         ) {
                             return ToolOutcome::error(format!(
                                 "invalid_state: Background run {} is {state}; stop only supports running async runs.",
@@ -982,6 +1141,38 @@ fn handle_management_action_inner(
                             return ToolOutcome::text(format!(
                                 "Stop requested for child {child_id} in background run {}.",
                                 handle.run_id
+                            ));
+                        }
+                        // S29 (#3202): drain is a workflow-only stop that
+                        // admits no new child and lets started children finish.
+                        let drain = raw_params
+                            .get("drain")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if drain {
+                            let mode = snapshot["mode"].as_str().unwrap_or("single");
+                            if mode == "single" {
+                                return ToolOutcome::error(format!(
+                                    "drain applies only to live multi-child runs in this session; '{}' is a single run.",
+                                    handle.run_id
+                                ));
+                            }
+                            let started = steps
+                                .iter()
+                                .filter(|step| step["status"].as_str() == Some("running"))
+                                .count();
+                            handle.control.request_drain();
+                            crate::artifacts::append_jsonl(
+                                &handle.run_dir.join("events.jsonl"),
+                                &serde_json::json!({
+                                    "type": "control.drain",
+                                    "runId": handle.run_id,
+                                })
+                                .to_string(),
+                            );
+                            return ToolOutcome::text(format!(
+                                "Drain requested for background run {}: no new children will start; {} started child(ren) will finish.",
+                                handle.run_id, started
                             ));
                         }
                         // Cooperative stop + direct child signalling; the
@@ -1057,7 +1248,13 @@ fn handle_management_action_inner(
                     "action \"steer\" requires a non-empty message.".to_string(),
                 );
             };
-            match crate::runner::background::deliver_steer(&id, &message, &mode, target_index) {
+            match crate::runner::background::deliver_steer(
+                &id,
+                &message,
+                &mode,
+                target_index,
+                parent_session_id(deps, settings).as_deref(),
+            ) {
                 Ok(request) => ToolOutcome::text(format!(
                     "Steer request {} delivered to child {} of run {}.",
                     request["id"].as_str().unwrap_or("?"),
@@ -1140,10 +1337,18 @@ fn handle_management_action_inner(
                     "Async run '{id}' was not found in the active session."
                 ));
             }
-            if matches!(status["state"].as_str(), Some("running") | Some("queued")) {
+            // V19-03 S11: the trusted record is the lifecycle authority;
+            // run-dir status is diagnostics. An interrupt whose status write
+            // failed leaves status `running` while the record is `paused` —
+            // resume must follow the record, not the stale diagnostic. A
+            // legacy run without a record skips this gate and is refused by
+            // `trusted_resume_child` with the relaunch hint.
+            if let Some(record) = crate::recovery::read_record(&id).ok().flatten()
+                && matches!(record.state.as_str(), "running" | "queued")
+            {
                 return ToolOutcome::error(format!(
-                    "Background run {id} is still {state}; resume applies to interrupted or stopped runs.",
-                    state = status["state"].as_str().unwrap_or("?")
+                    "Background run {id} is still {}; resume applies to interrupted or stopped runs.",
+                    record.state
                 ));
             }
             let steps = status["steps"].as_array().cloned().unwrap_or_default();
@@ -1154,60 +1359,23 @@ fn handle_management_action_inner(
                 Ok(index) => index,
                 Err(message) => return ToolOutcome::error(message),
             };
-            let Some(selected) = steps.get(step_index) else {
-                return ToolOutcome::error(format!(
-                    "Background run {id} has no persisted child session to resume from."
-                ));
-            };
             // TE38 W5 (#2242 @ b72714de): a stopped child has no continuation
             // to revive — resume must not resurrect it (`resolveAsyncResumeTarget`
             // rejects `status == "stopped" || stopped == true` for the selected
             // step).
-            if selected["status"].as_str() == Some("stopped")
-                || selected["stopped"].as_bool() == Some(true)
+            if let Some(selected) = steps.get(step_index)
+                && (selected["status"].as_str() == Some("stopped")
+                    || selected["stopped"].as_bool() == Some(true))
             {
                 return ToolOutcome::error(format!(
                     "Async run '{id}' child {step_index} was stopped and cannot be resumed. Start a new run instead."
                 ));
             }
-            let session_file = selected["sessionFile"].as_str().map(str::to_string);
-            let Some(session_file) = session_file else {
-                return ToolOutcome::error(format!(
-                    "Background run {id} has no persisted child session to resume from."
-                ));
-            };
-            if !session_file.ends_with(".jsonl") {
-                return ToolOutcome::error(format!(
-                    "Async run '{id}' session file must be a .jsonl file: {session_file}"
-                ));
-            }
-            if !Path::new(&session_file).is_file() {
-                return ToolOutcome::error(format!(
-                    "Async run '{id}' session file does not exist: {session_file}"
-                ));
-            }
-            let agent_name = selected["agent"].as_str().unwrap_or("worker").to_string();
-            let task = task
-                .unwrap_or_else(|| "Continue the interrupted task from this session.".to_string());
-            // New async run reviving the old session file in the selected
-            // child's cwd/model/thinking (upstream `resolveAsyncResumeTarget`);
-            // the run-level cwd covers single-agent records written before
-            // the per-step field existed.
-            let params = revived_run_params(
-                &agent_name,
-                &task,
-                &session_file,
-                selected["cwd"]
-                    .as_str()
-                    .filter(|cwd| !cwd.is_empty())
-                    .or_else(|| status["cwd"].as_str().filter(|cwd| !cwd.is_empty())),
-                selected["model"].as_str().filter(|model| !model.is_empty()),
-                selected["thinking"]
-                    .as_str()
-                    .filter(|thinking| !thinking.is_empty()),
-            );
+            // V19-03 S11: resume reads only the parent-owned trusted record.
+            // The run-dir status above is diagnostics; a legacy run without a
+            // record is refused with a relaunch/reuseFrom hint.
             let host_cwd = host.cwd();
-            let settings = match crate::config::read_settings_pair_trusted(
+            let resume_settings = match crate::config::read_settings_pair_trusted(
                 &host_cwd,
                 host.project_trusted() != Some(false),
             ) {
@@ -1220,10 +1388,85 @@ fn handle_management_action_inner(
                     return ToolOutcome::error(format!("Subagent settings error: {error}"));
                 }
             };
-            let config = crate::config::load_config();
-            let result = crate::tool::execute_subagent_tool(
-                &params, host, &settings, &config, runtime, None,
+            let resume_config = crate::config::load_config();
+            let agents = match crate::agents::discover::discover_agents_trusted(
+                &host_cwd,
+                "both",
+                &resume_settings,
+                None,
+                host.project_trusted() != Some(false),
+            ) {
+                Ok(agents) => agents,
+                Err(error) => {
+                    return ToolOutcome::error(format!("Agent discovery error: {error}"));
+                }
+            };
+            let (record, child) = match crate::recovery::trusted_resume_child(
+                &id,
+                current_session.as_deref(),
+                &agents,
+                step_index,
+            ) {
+                Ok(found) => found,
+                Err(message) => return ToolOutcome::error(message),
+            };
+            if matches!(record.state.as_str(), "running" | "queued") {
+                return ToolOutcome::error(format!(
+                    "Background run {id} is still {}; resume applies to interrupted or stopped runs.",
+                    record.state
+                ));
+            }
+            let Some(session_file) = child.session_file.clone() else {
+                return ToolOutcome::error(format!(
+                    "Background run {id} has no trusted persisted child session to resume from."
+                ));
+            };
+            if !session_file.ends_with(".jsonl") {
+                return ToolOutcome::error(format!(
+                    "Async run '{id}' session file must be a .jsonl file: {session_file}"
+                ));
+            }
+            if !Path::new(&session_file).is_file() {
+                // S42: a fork copy may have been removed by the cleanupDays
+                // sweep; say so instead of a bare "does not exist".
+                let fork_note = missing_fork_copy_note(&session_file);
+                return ToolOutcome::error(format!(
+                    "Async run '{id}' session file does not exist: {session_file}{fork_note}"
+                ));
+            }
+            let task = task
+                .unwrap_or_else(|| "Continue the interrupted task from this session.".to_string());
+            // New async run reviving the recorded session file in the trusted
+            // child's cwd/model/thinking; the launcher (or its explicit
+            // absence) also comes from the record.
+            let params = revived_run_params(
+                &child.agent,
+                &task,
+                &session_file,
+                Some(&child.cwd),
+                child.model.as_deref(),
+                child.thinking.as_deref(),
+                child.output.as_deref(),
             );
+            let resume_context = crate::recovery::ResumeContext {
+                launcher: if child.launcher_recorded {
+                    Some(child.launcher.clone())
+                } else {
+                    None
+                },
+                required_launcher: child.required_launcher.clone(),
+            };
+            let _ = resume_settings;
+            let result = crate::recovery::with_resume_context(Some(resume_context), || {
+                crate::tool::execute_subagent_tool(
+                    &params,
+                    host,
+                    settings,
+                    &resume_config,
+                    runtime,
+                    None,
+                )
+            });
             ToolOutcome {
                 text: result["content"][0]["text"]
                     .as_str()
@@ -1319,9 +1562,82 @@ fn handle_management_action_inner(
             };
             manage_refine(action, name, &raw_params, cwd, settings, trusted)
         }
+        "mission.show" => {
+            let Some(id) = raw_params.get("missionId").and_then(Value::as_str) else {
+                return ToolOutcome::error(
+                    "action \"mission.show\" requires missionId.".to_string(),
+                );
+            };
+            match crate::missions::show(cwd, id) {
+                Ok((record, warnings)) => {
+                    let mut text = crate::missions::format_mission(&record);
+                    for warning in &warnings {
+                        text.push_str(&format!("\nWarning: {warning}"));
+                    }
+                    ToolOutcome {
+                        text,
+                        details: json!({
+                            "mode": "management",
+                            "results": [],
+                            "missionId": record.id,
+                            "mission": record,
+                            "missions": { "warnings": warnings },
+                        }),
+                        is_error: false,
+                    }
+                }
+                Err(message) => ToolOutcome::error(message),
+            }
+        }
+        "mission.close" => {
+            let Some(id) = raw_params.get("missionId").and_then(Value::as_str) else {
+                return ToolOutcome::error(
+                    "action \"mission.close\" requires missionId.".to_string(),
+                );
+            };
+            let status = raw_params
+                .get("missionStatus")
+                .and_then(Value::as_str)
+                .unwrap_or("completed");
+            let summary = raw_params.get("summary").and_then(Value::as_str);
+            match crate::missions::close(cwd, id, status, summary) {
+                Ok(record) => ToolOutcome {
+                    text: format!("Closed mission {} as {}.", record.id, record.status),
+                    details: json!({
+                        "mode": "management",
+                        "results": [],
+                        "missionId": record.id,
+                        "mission": record,
+                    }),
+                    is_error: false,
+                },
+                Err(message) => ToolOutcome::error(message),
+            }
+        }
+        "mission.list" => {
+            let (records, warnings) = crate::missions::list(cwd);
+            let text = if records.is_empty() {
+                "No missions.".to_string()
+            } else {
+                records
+                    .iter()
+                    .map(|record| format!("- {} ({}): {}", record.id, record.status, record.title))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            ToolOutcome {
+                text,
+                details: json!({
+                    "mode": "management",
+                    "results": [],
+                    "missions": { "records": records, "warnings": warnings },
+                }),
+                is_error: false,
+            }
+        }
         "doctor" => ToolOutcome::text(doctor_report(cwd, settings, config, trusted)),
         other => ToolOutcome::error(format!(
-            "Unknown subagent action \"{other}\". Supported actions: list, get, status, interrupt, stop, steer, resume, refine, refine.show, refine.rollback, grant-spawn-budget, debug.run, doctor."
+            "Unknown subagent action \"{other}\". Supported actions: list, get, status, interrupt, stop, steer, resume, refine, refine.show, refine.rollback, grant-spawn-budget, mission.list, mission.show, mission.close, debug.run, doctor."
         )),
     }
 }
@@ -1878,6 +2194,13 @@ pub fn format_run_lifecycle_debug(id: &str) -> Result<String, String> {
         }
     }
     Ok(lines.join("\n"))
+}
+
+/// Current parent session id (S24 ownership scope).
+fn parent_session_id(deps: &ActionDeps<'_>, settings: &SettingsPair) -> Option<String> {
+    deps.host
+        .and_then(|host| host.parent_session(settings))
+        .map(|session| session.id)
 }
 
 /// `{ id }` or `{ runId }` param for control actions.
@@ -2473,20 +2796,14 @@ fn manage_disable_enable(
     // document atomically.
     let result = crate::settings_lease::with_settings_file_lease(
         &settings_path,
-        || -> Result<(), String> {
-            let mut root: Value = match std::fs::read_to_string(&settings_path) {
-                Ok(raw) if !raw.trim().is_empty() => {
-                    serde_json::from_str(&raw).map_err(|error| {
-                        format!(
-                            "settings.json is not valid JSON; refusing to overwrite it: {error}"
-                        )
-                    })?
-                }
-                Ok(_) => json!({}),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
-                Err(error) => {
-                    return Err(format!("cannot read settings.json: {error}"));
-                }
+        |file| -> Result<(), String> {
+            // The content was read through the host lock handle; a path read
+            // here would be a second handle, which Windows denies under A.
+            let mut root: Value = match file.content() {
+                raw if !raw.trim().is_empty() => serde_json::from_str(raw).map_err(|error| {
+                    format!("settings.json is not valid JSON; refusing to overwrite it: {error}")
+                })?,
+                _ => json!({}),
             };
             let Some(root_object) = root.as_object_mut() else {
                 return Err("settings root is not an object.".to_string());
@@ -2518,8 +2835,7 @@ fn manage_disable_enable(
             } else {
                 entry_object.remove("disabled");
             }
-            crate::settings_lease::write_settings_json(&settings_path, &root)
-                .map_err(|error| error.to_string())
+            file.write(&root).map_err(|error| error.to_string())
         },
     );
     let _ = settings;
@@ -2563,17 +2879,10 @@ fn manage_reset(
         // file's cross-session lease; the save is atomic.
         let reset_result = crate::settings_lease::with_settings_file_lease(
             &settings_path,
-            || -> Result<bool, String> {
-                let raw = match std::fs::read_to_string(&settings_path) {
-                    Ok(raw) => raw,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(false);
-                    }
-                    Err(error) => {
-                        return Err(format!("cannot read settings.json: {error}"));
-                    }
-                };
-                let mut root: Value = serde_json::from_str(&raw).map_err(|error| {
+            |file| -> Result<bool, String> {
+                // Read through the host lock handle (see the override write).
+                let raw = file.content();
+                let mut root: Value = serde_json::from_str(raw).map_err(|error| {
                     format!("settings.json is not valid JSON; refusing to overwrite it: {error}")
                 })?;
                 if !root.is_object() {
@@ -2597,8 +2906,7 @@ fn manage_reset(
                     }
                 }
                 if changed {
-                    crate::settings_lease::write_settings_json(&settings_path, &root)
-                        .map_err(|error| error.to_string())?;
+                    file.write(&root).map_err(|error| error.to_string())?;
                 }
                 Ok(changed)
             },
@@ -2810,9 +3118,44 @@ fn manage_refine(
     }
 }
 
+/// S42 resume hint: a missing session file whose grandparent directory is
+/// `forks` is a fork copy that the `cleanupDays` sweep may have removed
+/// (upstream `missingForkCopyNote`, artifacts.ts:374-377).
+fn missing_fork_copy_note(session_file: &str) -> &'static str {
+    let fork_copy = Path::new(session_file)
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "forks");
+    if fork_copy {
+        " (it looks like a fork copy; fork copies older than the configured cleanupDays may have been cleaned up)"
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_fork_copy_note_matches_the_derived_layout_only() {
+        assert!(
+            missing_fork_copy_note(
+                "/agent/sessions/--proj--/2026-08-14_parent/forks/run-1/fork.jsonl"
+            )
+            .contains("fork copy")
+        );
+        assert!(
+            !missing_fork_copy_note(
+                "/agent/sessions/--proj--/2026-08-14_parent/run-1/session.jsonl"
+            )
+            .contains("fork copy")
+        );
+        assert!(
+            !missing_fork_copy_note("/work/child-sessions/run-1/fork.jsonl").contains("fork copy")
+        );
+    }
 
     /// Registry scratch handle for the action-path tests.
     fn action_test_run(run_id: &str, state: &str, steps: Value) {
@@ -3117,6 +3460,7 @@ mod tests {
             Some("/tmp/child-cwd"),
             Some("anthropic/model"),
             Some("high"),
+            Some("/tmp/report.md"),
         );
         assert_eq!(params["agent"], json!("worker"));
         assert_eq!(params["task"], json!("continue"));
@@ -3124,11 +3468,33 @@ mod tests {
         assert_eq!(params["cwd"], json!("/tmp/child-cwd"));
         assert_eq!(params["model"], json!("anthropic/model"));
         assert_eq!(params["thinking"], json!("high"));
+        assert_eq!(params["inheritedOutput"], json!("/tmp/report.md"));
+        assert!(params.get("output").is_none());
         assert_eq!(params["async"], json!(true));
-        let bare = revived_run_params("scout", "x", "/tmp/s.jsonl", None, None, None);
+        let bare = revived_run_params("scout", "x", "/tmp/s.jsonl", None, None, None, None);
         assert!(bare.get("cwd").is_none());
         assert!(bare.get("model").is_none());
         assert!(bare.get("thinking").is_none());
+        assert!(bare.get("inheritedOutput").is_none());
+
+        // Full resume param flow: the record output is inherited and gets
+        // the new run id suffix; it never becomes a call-level output.
+        let params = revived_run_params(
+            "worker",
+            "continue",
+            "/tmp/child.jsonl",
+            None,
+            None,
+            None,
+            Some("/x/report.md"),
+        );
+        assert!(params.get("output").is_none());
+        let spec =
+            crate::p1::launch_child::ChildSpec::from_params(params.as_object().expect("object"));
+        assert_eq!(
+            crate::p1::launch_child::resolved_output_path(&spec, None, "abcdef12"),
+            Some(std::path::PathBuf::from("/x/report.abcdef12.md"))
+        );
     }
 
     /// Integral JSON floats are accepted like `Number.isInteger(1.0)`;
@@ -3243,16 +3609,15 @@ mod tests {
             out_of_range.text,
             format!("Async run '{run_id}' has 2 children. Index 5 is out of range.")
         );
+        // V19-03 S11: without a trusted recovery record the run is refused
+        // (BREAKING) instead of trusting the child-writable status file.
         let selected = invoke(json!({
             "action": "resume", "id": run_id, "index": 1, "task": "continue"
         }));
         assert!(selected.is_error, "{}", selected.text);
         assert!(
-            selected.text.contains(&format!(
-                "session file does not exist: {}",
-                missing.display()
-            )),
-            "selected child 1, not the last/first step: {}",
+            selected.text.contains("no trusted recovery record"),
+            "legacy run refused: {}",
             selected.text
         );
         cleanup_run(&run_id);
@@ -3447,6 +3812,83 @@ mod tests {
                 params: Some(params),
             },
         )
+    }
+
+    /// S37 (#3225): `options.search` matches name/description/alias
+    /// case-insensitively, sorts by name and caps at 30 rows with a
+    /// continuation hint.
+    #[test]
+    fn list_search_matches_name_alias_and_description_with_a_thirty_row_cap() {
+        let root = paths::temp_root_dir().join(format!("mgmt-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        let agents_dir = paths::get_project_config_dir(&project).join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        for index in 0..31 {
+            std::fs::write(
+                agents_dir.join(format!("search-{index:02}.md")),
+                format!("---\nname: search-{index:02}\ndescription: fixture\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            agents_dir.join("alias-hit.md"),
+            "---\nname: alias-hit\ndescription: fixture\naliases: [zzalias]\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agents_dir.join("desc-hit.md"),
+            "---\nname: desc-hit\ndescription: unique-needle\n---\nbody\n",
+        )
+        .unwrap();
+        let trusted = TrustHost {
+            trusted: Some(true),
+            cwd: project.clone(),
+        };
+
+        let capped = manage_with_host(
+            &trusted,
+            json!({ "action": "list", "agentScope": "project",
+                    "options": { "search": "search-" } }),
+        );
+        assert!(!capped.is_error, "{}", capped.text);
+        assert_eq!(
+            capped.text.matches("- search-").count(),
+            30,
+            "search caps at 30 rows: {}",
+            capped.text
+        );
+        assert!(
+            capped
+                .text
+                .contains("Showing the first 30 matches; refine options.search"),
+            "{}",
+            capped.text
+        );
+
+        let alias = manage_with_host(
+            &trusted,
+            json!({ "action": "list", "agentScope": "project", "search": "ZZALIAS" }),
+        );
+        assert!(alias.text.contains("alias-hit"), "{}", alias.text);
+
+        let description = manage_with_host(
+            &trusted,
+            json!({ "action": "list", "agentScope": "project",
+                    "options": { "search": "unique-needle" } }),
+        );
+        assert!(
+            description.text.contains("desc-hit"),
+            "{}",
+            description.text
+        );
+
+        let empty = manage_with_host(
+            &trusted,
+            json!({ "action": "list", "agentScope": "project", "search": "no-such-agent" }),
+        );
+        assert!(empty.text.contains("(none)"), "{}", empty.text);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4361,5 +4803,26 @@ mod tests {
         assert!(detail.contains("Thinking: high"));
         assert!(detail.contains("Default context: fork"));
         assert!(detail.contains("System Prompt:"));
+    }
+
+    #[test]
+    fn model_availability_uses_the_agent_provider_preference() {
+        let models = vec![
+            crate::launch::model::AvailableModel {
+                full_id: "alpha/shared".into(),
+                provider: "alpha".into(),
+                id: "shared".into(),
+            },
+            crate::launch::model::AvailableModel {
+                full_id: "beta/shared".into(),
+                provider: "beta".into(),
+                id: "shared".into(),
+            },
+        ];
+        assert!(!model_unavailable("shared", &models, Some("alpha")));
+        assert!(!model_unavailable("shared", &models, Some("beta")));
+        assert!(model_unavailable("missing", &models, Some("alpha")));
+        // An empty registry means "unknown", not "unavailable".
+        assert!(!model_unavailable("missing", &[], Some("alpha")));
     }
 }

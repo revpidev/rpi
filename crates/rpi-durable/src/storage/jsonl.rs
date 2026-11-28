@@ -1,5 +1,5 @@
 //! Portable JSONL implementation of the storage contract
-//! (port of `src/storage/jsonl/storage.ts` @ `4a080252f`).
+//! (port of `src/storage/jsonl/storage.ts` @ `b4afdddf`).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,8 @@ pub struct JsonlStorageOptions {
     /// Flush every affected sidecar before appending the main marker. Defaults
     /// to false (upstream `JsonlStorageOptions.fsync`).
     pub fsync: bool,
+    /// Replay confirmed records without creating or modifying files.
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +239,7 @@ pub struct JsonlStorage {
     directory: String,
     main_path: String,
     fsync: bool,
+    read_only: bool,
     memory: MemoryStorage,
     current_only_documents: Mutex<HashSet<DocumentId>>,
     live_task_sidecars: Mutex<HashSet<TaskId>>,
@@ -256,9 +259,11 @@ impl JsonlStorage {
             .absolute_path(directory, context)
             .await
             .map_err(|error| error_from_file("path resolution", error))?;
-        fs.create_dir(&absolute, true, context)
-            .await
-            .map_err(|error| error_from_file("directory creation", error))?;
+        if !options.read_only {
+            fs.create_dir(&absolute, true, context)
+                .await
+                .map_err(|error| error_from_file("directory creation", error))?;
+        }
         let main_path = fs
             .join_path(&[absolute.as_str(), MAIN_FILE], context)
             .await
@@ -268,6 +273,7 @@ impl JsonlStorage {
             directory: absolute,
             main_path,
             fsync: options.fsync,
+            read_only: options.read_only,
             memory: MemoryStorage::new(),
             current_only_documents: Mutex::new(HashSet::new()),
             live_task_sidecars: Mutex::new(HashSet::new()),
@@ -602,7 +608,10 @@ impl JsonlStorage {
             .await
             .map_err(|error| error_from_file("directory listing", error))?;
         for info in &listed {
-            if info.kind == DirEntryKind::File && is_reclaim_file_name(&info.name) {
+            if !self.read_only
+                && info.kind == DirEntryKind::File
+                && is_reclaim_file_name(&info.name)
+            {
                 let _ = self.fs.remove(&info.path, true, context).await;
             }
         }
@@ -913,7 +922,9 @@ impl JsonlStorage {
                     unconfirmed_at = Some(line.start);
                 }
             }
-            if let Some(offset) = unconfirmed_at {
+            if !self.read_only
+                && let Some(offset) = unconfirmed_at
+            {
                 self.fs
                     .truncate_file(&parsed.path, offset, context)
                     .await
@@ -971,7 +982,9 @@ impl JsonlStorage {
                 reclamations.push((file, content));
             }
         }
-        self.reclaim_sidecars(&reclamations, context).await;
+        if !self.read_only {
+            self.reclaim_sidecars(&reclamations, context).await;
+        }
 
         {
             let mut current_only = self
@@ -1043,12 +1056,14 @@ impl JsonlStorage {
                 Some(position) => position as u64 + 1,
                 None => 0,
             };
-            self.fs
-                .truncate_file(path, complete_size, context)
-                .await
-                .map_err(|error| {
-                    error_from_file(&format!("torn-line truncation of {name}"), error)
-                })?;
+            if !self.read_only {
+                self.fs
+                    .truncate_file(path, complete_size, context)
+                    .await
+                    .map_err(|error| {
+                        error_from_file(&format!("torn-line truncation of {name}"), error)
+                    })?;
+            }
         }
         let mut lines = Vec::new();
         let mut start = 0usize;
@@ -1085,43 +1100,82 @@ impl JsonlStorage {
 
 #[async_trait]
 impl Storage for JsonlStorage {
-    async fn commit(&self, writes: &[StorageWrite], context: &Context) -> StorageResult<Seq> {
-        self.assert_usable()?;
-        let mut prepared: PreparedMemoryCommit =
-            self.memory.prepare_commit(writes.to_vec(), None)?;
-        let encoded = self.encode_commit(prepared.seq(), prepared.writes())?;
-        let reclamations = self.plan_reclamations(prepared.writes(), &encoded)?;
-        let mut sidecars: Vec<(String, String)> = Vec::new();
-        for (file, content) in &encoded.sidecars {
-            let path = self.resolve_file(file, context).await?;
-            sidecars.push((file.clone(), path.clone()));
-            let result = self.fs.append_file(&path, content, context).await;
-            if let Err(error) = result {
-                return Err(self.poison(error_from_file(&format!("append to {file}"), error)));
-            }
+    async fn commit(
+        &self,
+        batches: &[Vec<StorageWrite>],
+        receive: &mut (dyn FnMut(usize, Seq) + Send),
+        context: &Context,
+    ) -> StorageResult<crate::types::CommitResult> {
+        if self.read_only {
+            return Err(StorageError::JsonlStorageReadOnlyError);
         }
-        if self.fsync {
-            for (file, path) in &sidecars {
-                let result = self.fs.flush_file(path, context).await;
-                if let Err(error) = result {
-                    return Err(self.poison(error_from_file(&format!("flush of {file}"), error)));
+        let mut seqs = Vec::new();
+        let outcome = async {
+            self.assert_usable()?;
+            for writes in batches {
+                let mut prepared: PreparedMemoryCommit =
+                    match self.memory.prepare_commit(writes.clone(), None) {
+                        Ok(prepared) => prepared,
+                        Err(refused) => {
+                            return Ok(crate::types::CommitResult {
+                                stored: seqs.len(),
+                                refused: Some(refused),
+                            });
+                        }
+                    };
+                let encoded = self.encode_commit(prepared.seq(), prepared.writes())?;
+                let reclamations = self.plan_reclamations(prepared.writes(), &encoded)?;
+                let mut sidecars: Vec<(String, String)> = Vec::new();
+                for (file, content) in &encoded.sidecars {
+                    let path = self.resolve_file(file, context).await?;
+                    sidecars.push((file.clone(), path.clone()));
+                    let result = self.fs.append_file(&path, content, context).await;
+                    if let Err(error) = result {
+                        return Err(
+                            self.poison(error_from_file(&format!("append to {file}"), error))
+                        );
+                    }
                 }
+                if self.fsync {
+                    for (file, path) in &sidecars {
+                        let result = self.fs.flush_file(path, context).await;
+                        if let Err(error) = result {
+                            return Err(
+                                self.poison(error_from_file(&format!("flush of {file}"), error))
+                            );
+                        }
+                    }
+                }
+                let marker = self
+                    .fs
+                    .append_file(&self.main_path, &encoded.marker, context)
+                    .await;
+                if let Err(error) = marker {
+                    return Err(
+                        self.poison(error_from_file(&format!("append to {MAIN_FILE}"), error))
+                    );
+                }
+                let seq = self.memory.apply_prepared(&mut prepared)?;
+                seqs.push(seq);
+                self.adopt_sidecar_state(prepared.writes())?;
+                self.reclaim_sidecars(&reclamations, context).await;
             }
+            Ok(crate::types::CommitResult {
+                stored: seqs.len(),
+                refused: None,
+            })
         }
-        let marker = self
-            .fs
-            .append_file(&self.main_path, &encoded.marker, context)
-            .await;
-        if let Err(error) = marker {
-            return Err(self.poison(error_from_file(&format!("append to {MAIN_FILE}"), error)));
+        .await;
+        for (index, seq) in seqs.iter().copied().enumerate() {
+            receive(index, seq);
         }
-        let seq = self.memory.apply_prepared(&mut prepared)?;
-        self.adopt_sidecar_state(prepared.writes())?;
-        self.reclaim_sidecars(&reclamations, context).await;
-        Ok(seq)
+        outcome
     }
 
     async fn mint_id(&self) -> StorageResult<u64> {
+        if self.read_only {
+            return Err(StorageError::JsonlStorageReadOnlyError);
+        }
         self.assert_usable()?;
         self.memory.mint_id().await
     }
@@ -1130,7 +1184,7 @@ impl Storage for JsonlStorage {
         &self,
         id: ConversationId,
         context: &Context,
-    ) -> StorageResult<Option<ConversationRecord>> {
+    ) -> StorageResult<Option<Arc<ConversationRecord>>> {
         self.assert_usable()?;
         self.memory.conversation(id, context).await
     }
@@ -1194,7 +1248,7 @@ impl Storage for JsonlStorage {
             .await
     }
 
-    async fn task(&self, id: TaskId, context: &Context) -> StorageResult<Option<TaskRecord>> {
+    async fn task(&self, id: TaskId, context: &Context) -> StorageResult<Option<Arc<TaskRecord>>> {
         self.assert_usable()?;
         self.memory.task(id, context).await
     }
@@ -1214,7 +1268,7 @@ impl Storage for JsonlStorage {
         &self,
         id: SubmissionId,
         context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         self.assert_usable()?;
         self.memory.submission(id, context).await
     }
@@ -1237,7 +1291,7 @@ impl Storage for JsonlStorage {
         conversation_id: ConversationId,
         request_id: &str,
         context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         self.assert_usable()?;
         self.memory
             .submission_by_request(conversation_id, request_id, context)

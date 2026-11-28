@@ -1,5 +1,5 @@
 //! Harness submission admission/abort/wait integration tests (port of
-//! `packages/durable/test/harness-submissions.test.ts` @ `4a080252f`).
+//! `packages/durable/test/harness-submissions.test.ts` @ `b4afdddf`).
 //!
 //! Scoped to what does not need the task scheduler: the recording scheduler
 //! performs the `live.run` bookkeeping so the boundary and wait paths are

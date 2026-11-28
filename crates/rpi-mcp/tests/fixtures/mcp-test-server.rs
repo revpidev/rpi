@@ -1,18 +1,31 @@
 //! Test-only stdio MCP server used by `tests/stdio.rs` (counterpart of
-//! `packages/mcp/test/fixtures/stdio-server.mjs` @ 4a080252f).
+//! `packages/mcp/test/fixtures/stdio-server.mjs` @ b4afdddf).
 //!
 //! Modes:
 //! - default: LF-delimited JSON-RPC echo server; exits on stdin EOF.
 //! - `--stubborn`: ignores SIGTERM and stdin EOF, spawns a grandchild (itself
 //!   with `--grandchild`) that keeps running, so shutdown must reap the whole
 //!   process group.
-//! - `--grandchild`: sleeps forever.
+//! - `--parent`: spawns a grandchild and serves MCP normally.
+//! - `--exiting-parent`: exits after spawning a SIGTERM-resistant grandchild.
+//! - `--grandchild` / `--stubborn-grandchild`: sleep forever.
 
 use std::io::{BufRead, Write};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|arg| arg == "--grandchild") {
+    if args
+        .iter()
+        .any(|arg| arg == "--grandchild" || arg == "--stubborn-grandchild")
+    {
+        #[cfg(unix)]
+        if args.iter().any(|arg| arg == "--stubborn-grandchild") {
+            // SAFETY: the process is single-threaded at this point and the
+            // handler only ignores SIGTERM (async-signal-safe).
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            }
+        }
         loop {
             std::thread::sleep(std::time::Duration::from_secs(3600));
         }
@@ -26,15 +39,25 @@ fn main() {
             libc::signal(libc::SIGTERM, libc::SIG_IGN);
         }
     }
-    if stubborn {
+    let parent = args.iter().any(|arg| arg == "--parent");
+    let exiting_parent = args.iter().any(|arg| arg == "--exiting-parent");
+    if stubborn || parent || exiting_parent {
         // The grandchild must outlive this server; the transport's process
         // group kill reaps it on shutdown, so it is intentionally not waited.
         #[allow(clippy::zombie_processes)]
         let child = std::process::Command::new(std::env::current_exe().expect("current exe"))
-            .arg("--grandchild")
+            .arg(if exiting_parent {
+                "--stubborn-grandchild"
+            } else {
+                "--grandchild"
+            })
             .spawn()
             .expect("spawn grandchild");
         eprintln!("grandchild {}", child.id());
+    }
+    if exiting_parent {
+        eprintln!("server {}", std::process::id());
+        return;
     }
     eprintln!("stdio fixture ready");
     let stdin = std::io::stdin();

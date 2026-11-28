@@ -1,19 +1,21 @@
 //! Portable SQLite implementation of the storage contract
-//! (port of `src/storage/sqlite/storage.ts` @ `4a080252f`).
+//! (port of `src/storage/sqlite/storage.ts` @ `b4afdddf`).
 
 use async_trait::async_trait;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::chord::context::Context;
 use crate::chord::delta::{Op, apply_immutable_batches};
 use crate::chord::json::{JsonObject, JsonValue};
 use crate::chord::sqlite::database::{SqliteDatabase, SqliteTransaction, SqliteValue};
 use crate::errors::{StorageError, StorageResult};
-use crate::ids::{ConversationId, DocumentId, EntryId, Seq, SubmissionId, TaskId, id_from_number};
+use crate::ids::{ConversationId, DocumentId, EntryId, Seq, SubmissionId, TaskId};
 use crate::storage::scan::{ScanStart, scan_start};
+use crate::storage::sqlite::commit_state::{CommitRefusal, CommitState, CopyResolution};
 use crate::storage::sqlite::migrations::{
     apply_sqlite_migrations_for_schema, create_sqlite_migrations,
 };
+use crate::storage::sqlite::pending_writes::PendingWrites;
 use crate::storage::sqlite::schema::{SqliteSchema, create_sqlite_schema};
 use crate::storage::{is_alive_at, is_current_only, page_values};
 use crate::types::{
@@ -25,13 +27,13 @@ use crate::types::{
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
-fn encode_json<T: serde::Serialize>(value: &T) -> StorageResult<String> {
+pub(super) fn encode_json<T: serde::Serialize>(value: &T) -> StorageResult<String> {
     Ok(serde_json::to_string(value)?)
 }
 
 /// Some SQLite bindings replace lone UTF-16 surrogates. JSON encoding keeps
 /// indexed identities lossless.
-fn encode_indexed_string(value: &str) -> String {
+pub(super) fn encode_indexed_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
 }
 
@@ -59,15 +61,15 @@ fn scope_columns(scope: &DocumentScope) -> ScopeColumns {
     }
 }
 
-struct AddressParts {
-    kind: String,
-    scope_kind: &'static str,
-    owner_id: i64,
-    family: i64,
-    key_value: String,
+pub(super) struct AddressParts {
+    pub(super) kind: String,
+    pub(super) scope_kind: &'static str,
+    pub(super) owner_id: i64,
+    pub(super) family: i64,
+    pub(super) key_value: String,
 }
 
-fn address_parts(kind: &str, scope: &DocumentScope, key: Option<&str>) -> AddressParts {
+pub(super) fn address_parts(kind: &str, scope: &DocumentScope, key: Option<&str>) -> AddressParts {
     let scope = scope_columns(scope);
     AddressParts {
         kind: encode_indexed_string(kind),
@@ -98,11 +100,11 @@ fn scan_sql(start: ScanStart) -> (&'static str, i64, &'static str) {
 }
 
 #[derive(Debug, Clone, Default)]
-struct DocumentAction {
-    create: Option<DocumentCreate>,
-    content: Option<DocumentContent>,
-    copy: Option<crate::types::DocumentCopySource>,
-    retire: bool,
+pub(super) struct DocumentAction {
+    pub(super) create: Option<DocumentCreate>,
+    pub(super) content: Option<DocumentContent>,
+    pub(super) copy: Option<crate::types::DocumentCopySource>,
+    pub(super) retire: bool,
 }
 
 #[derive(Default)]
@@ -114,7 +116,7 @@ struct Admission {
 /// Portable SQLite implementation of the storage contract.
 pub struct SqliteStorage {
     db: SqliteDatabase,
-    schema: SqliteSchema,
+    pub(super) schema: SqliteSchema,
     next_id: Mutex<u64>,
     admission: Mutex<Admission>,
     drained: tokio::sync::Notify,
@@ -494,60 +496,6 @@ impl SqliteStorage {
         Ok(next)
     }
 
-    async fn check_global_ids(
-        &self,
-        tx: &SqliteTransaction,
-        writes: &[StorageWrite],
-    ) -> StorageResult<()> {
-        let mut claimed: std::collections::HashMap<u64, &'static str> =
-            std::collections::HashMap::new();
-        for write in writes {
-            let Some(table) = write.table_name() else {
-                continue;
-            };
-            let id = write.write_id().expect("table implies id");
-            let existing = tx
-                .get_text(
-                    &format!(
-                        "SELECT record_type FROM {} WHERE id = ?",
-                        self.schema.tables.record_ids
-                    ),
-                    vec![id.into()],
-                )
-                .await?;
-            let earlier = claimed.get(&id).copied();
-            if table == "conversation" || table == "entry" || table == "document" {
-                if let Some(existing) = existing {
-                    return Err(StorageError::message(format!(
-                        "ID {id} already belongs to {existing}"
-                    )));
-                }
-                if earlier.is_some() {
-                    return Err(StorageError::message(format!(
-                        "ID {id} is written more than once"
-                    )));
-                }
-            } else {
-                if let Some(existing) = existing
-                    && existing != table
-                {
-                    return Err(StorageError::message(format!(
-                        "ID {id} already belongs to {existing}"
-                    )));
-                }
-                if let Some(earlier) = earlier
-                    && earlier != table
-                {
-                    return Err(StorageError::message(format!(
-                        "ID {id} is written as two record types"
-                    )));
-                }
-            }
-            claimed.insert(id, table);
-        }
-        Ok(())
-    }
-
     fn prepare_document_actions(
         writes: &[StorageWrite],
     ) -> StorageResult<Vec<(DocumentId, DocumentAction)>> {
@@ -615,240 +563,7 @@ impl SqliteStorage {
         Ok(actions)
     }
 
-    async fn current_document_id(
-        &self,
-        tx: &SqliteTransaction,
-        parts: &AddressParts,
-    ) -> StorageResult<Option<DocumentId>> {
-        let id = tx
-            .get_i64(
-                &format!(
-                    "SELECT id FROM {} WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ? AND retired_at IS NULL LIMIT 1",
-                    self.schema.tables.documents
-                ),
-                vec![
-                    parts.kind.as_str().into(),
-                    parts.scope_kind.into(),
-                    parts.owner_id.into(),
-                    parts.family.into(),
-                    parts.key_value.as_str().into(),
-                ],
-            )
-            .await?;
-        Ok(id.map(|value| id_from_number(value as u64)))
-    }
-
-    async fn check_document_actions(
-        &self,
-        tx: &SqliteTransaction,
-        actions: &[(DocumentId, DocumentAction)],
-    ) -> StorageResult<()> {
-        let mut live_counts: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        for (id, action) in actions {
-            if let Some(copy) = &action.copy
-                && actions.iter().any(|(other, _)| other == &copy.id)
-            {
-                return Err(StorageError::Request(
-                    crate::errors::StorageRequestError::new(format!(
-                        "Document copy {id} source is changed in the copy batch"
-                    )),
-                ));
-            }
-            let existing: Option<DocumentRecord> = tx
-                .get(
-                    &format!(
-                        "SELECT record FROM {} WHERE id = ?",
-                        self.schema.tables.documents
-                    ),
-                    vec![id.get().into()],
-                )
-                .await?;
-            if action.create.is_none() && existing.is_none() {
-                return Err(StorageError::message(format!("Unknown document: {id}")));
-            }
-            if action.create.is_some() && existing.is_some() {
-                return Err(StorageError::message(format!(
-                    "Document {id} already exists"
-                )));
-            }
-            if let Some(existing) = &existing
-                && existing.retired_at.is_some()
-            {
-                return Err(StorageError::message(format!("Document {id} is retired")));
-            }
-            if let Some(DocumentContent::Delta { version, .. }) = &action.content {
-                let previous: Option<i64> = tx
-                    .get_i64(
-                        &format!(
-                            "SELECT version FROM {} WHERE document_id = ? ORDER BY seq DESC LIMIT 1",
-                            self.schema.tables.document_revisions
-                        ),
-                        vec![id.get().into()],
-                    )
-                    .await?;
-                let Some(previous) = previous else {
-                    return Err(StorageError::message(format!(
-                        "Document {id} delta has no base"
-                    )));
-                };
-                if previous as u64 != *version {
-                    return Err(StorageError::message(format!(
-                        "Document {id} version transition requires a base"
-                    )));
-                }
-            }
-            let parts = match (&action.create, &existing) {
-                (Some(create), _) => {
-                    address_parts(&create.kind, &create.scope, create.key.as_deref())
-                }
-                (None, Some(existing)) => {
-                    address_parts(&existing.kind, &existing.scope, existing.key.as_deref())
-                }
-                (None, None) => {
-                    return Err(StorageError::message(format!(
-                        "Document {id} has neither a create record nor an existing version"
-                    )));
-                }
-            };
-            let key = serde_json::to_string(&[
-                parts.kind.as_str(),
-                parts.scope_kind,
-                &parts.owner_id.to_string(),
-                &parts.family.to_string(),
-                parts.key_value.as_str(),
-            ])
-            .unwrap_or_default();
-            let current_id = self.current_document_id(tx, &parts).await?;
-            let mut live = live_counts
-                .get(&key)
-                .copied()
-                .unwrap_or(i64::from(current_id.is_some()));
-            if action.retire && existing.is_some() {
-                live -= 1;
-            }
-            if action.create.is_some() && !action.retire {
-                live += 1;
-            }
-            live_counts.insert(key, live);
-        }
-        for live in live_counts.values() {
-            if *live > 1 {
-                return Err(StorageError::message(
-                    "Document address already has a current incarnation",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    async fn apply_table_write(
-        &self,
-        tx: &SqliteTransaction,
-        write: &StorageWrite,
-        seq: Seq,
-    ) -> StorageResult<()> {
-        let tables = &self.schema.tables;
-        match write {
-            StorageWrite::Conversation { value } => {
-                self.claim_id(tx, value.id.get(), "conversation").await?;
-                tx.run(
-                    &format!(
-                        "INSERT INTO {} (id, owner_conversation_id, owner_task_id, record) VALUES (?, ?, ?, ?)",
-                        tables.conversations
-                    ),
-                    vec![
-                        value.id.get().into(),
-                        value.owner.as_ref().map(|owner| owner.conversation_id.get() as i64).into(),
-                        value.owner.as_ref().map(|owner| owner.task_id.get() as i64).into(),
-                        encode_json(value)?.into(),
-                    ],
-                )
-                .await
-            }
-            StorageWrite::Entry { value } => {
-                self.claim_id(tx, value.id.get(), "entry").await?;
-                tx.run(
-                    &format!(
-                        "INSERT INTO {} (id, conversation_id, head, commit_seq, record) VALUES (?, ?, ?, ?, ?)",
-                        tables.entries
-                    ),
-                    vec![
-                        value.id.get().into(),
-                        value.conversation_id.get().into(),
-                        value.head.map(EntryId::get).into(),
-                        seq.0.into(),
-                        encode_json(value)?.into(),
-                    ],
-                )
-                .await
-            }
-            StorageWrite::Task { value } => {
-                self.claim_id(tx, value.id.get(), "task").await?;
-                tx.run(
-                    &format!(
-                        "INSERT INTO {} (id, conversation_id, kind, status, abort_requested, background, record)
-						VALUES (?, ?, ?, ?, ?, ?, ?)
-						ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id, kind = excluded.kind,
-						status = excluded.status, abort_requested = excluded.abort_requested,
-						background = excluded.background, record = excluded.record",
-                        tables.tasks
-                    ),
-                    vec![
-                        value.id.get().into(),
-                        value.conversation_id.get().into(),
-                        encode_indexed_string(&value.kind).into(),
-                        value.status().as_str().into(),
-                        value.abort_requested.into(),
-                        value.background.into(),
-                        encode_json(value)?.into(),
-                    ],
-                )
-                .await
-            }
-            StorageWrite::Submission { value } => {
-                self.claim_id(tx, value.id().get(), "submission").await?;
-                tx.run(
-                    &format!(
-                        "INSERT INTO {} (id, conversation_id, request_id, status, record) VALUES (?, ?, ?, ?, ?)
-						ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id,
-						request_id = excluded.request_id, status = excluded.status, record = excluded.record",
-                        tables.submissions
-                    ),
-                    vec![
-                        value.id().get().into(),
-                        value.conversation_id().get().into(),
-                        value.request_id().map(encode_indexed_string).into(),
-                        value.status().into(),
-                        encode_json(value)?.into(),
-                    ],
-                )
-                .await
-            }
-            StorageWrite::DocumentCreate { .. }
-            | StorageWrite::DocumentCopy { .. }
-            | StorageWrite::DocumentChange { .. }
-            | StorageWrite::DocumentRetire { .. } => Ok(()),
-        }
-    }
-
-    async fn claim_id(
-        &self,
-        tx: &SqliteTransaction,
-        id: u64,
-        table: &'static str,
-    ) -> StorageResult<()> {
-        tx.run(
-            &format!(
-                "INSERT OR IGNORE INTO {} (id, record_type) VALUES (?, ?)",
-                self.schema.tables.record_ids
-            ),
-            vec![id.into(), table.into()],
-        )
-        .await
-    }
-
-    async fn materialize_document(
+    pub(super) async fn materialize_document(
         &self,
         tx: &SqliteTransaction,
         id: DocumentId,
@@ -941,181 +656,33 @@ impl SqliteStorage {
             deltas_since_base: tail.len() as u64,
         }))
     }
-
-    async fn apply_document_actions(
-        &self,
-        tx: &SqliteTransaction,
-        actions: &[(DocumentId, DocumentAction)],
-        seq: Seq,
-    ) -> StorageResult<()> {
-        for (id, action) in actions {
-            let id = *id;
-            let mut content = action.content.clone();
-            if let Some(source) = &action.copy {
-                let resolved = async {
-                    let stored = self.materialize_document(tx, source.id, source.at).await?;
-                    let stored = stored.ok_or_else(|| {
-                        StorageError::message(format!(
-                            "Fork source document {} cannot be read",
-                            source.id
-                        ))
-                    })?;
-                    let create = action.create.as_ref().expect("copy carries create");
-                    if !matches!(stored.record.scope, DocumentScope::Conversation { .. })
-                        || !matches!(create.scope, DocumentScope::Conversation { .. })
-                    {
-                        return Err(StorageError::message(format!(
-                            "Fork source document {} does not match the copied record",
-                            source.id
-                        )));
-                    }
-                    if stored.record.kind != create.kind
-                        || stored.record.key != create.key
-                        || stored.record.history != create.history
-                        || stored.record.fork != create.fork
-                    {
-                        return Err(StorageError::message(format!(
-                            "Fork source document {} does not match the copied record",
-                            source.id
-                        )));
-                    }
-                    Ok(DocumentContent::Base {
-                        version: stored.version,
-                        value: stored.value,
-                    })
-                }
-                .await;
-                content = Some(resolved.map_err(|error| match error {
-                    StorageError::Request(_) => error,
-                    other => StorageError::Request(crate::errors::StorageRequestError::new(
-                        format!("Document copy {id} was rejected: {other}"),
-                    )),
-                })?);
-            }
-
-            let mut record: DocumentRecord;
-            if let Some(create) = &action.create {
-                record = DocumentRecord {
-                    id,
-                    kind: create.kind.clone(),
-                    key: create.key.clone(),
-                    created_at: seq,
-                    retired_at: action.retire.then_some(seq),
-                    scope: create.scope.clone(),
-                    history: create.history,
-                    fork: create.fork,
-                };
-                let parts = address_parts(&record.kind, &record.scope, record.key.as_deref());
-                self.claim_id(tx, id.get(), "document").await?;
-                tx.run(
-                    &format!(
-                        "INSERT INTO {} (id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        self.schema.tables.documents
-                    ),
-                    vec![
-                        id.get().into(),
-                        parts.kind.as_str().into(),
-                        parts.family.into(),
-                        parts.key_value.as_str().into(),
-                        parts.scope_kind.into(),
-                        parts.owner_id.into(),
-                        seq.0.into(),
-                        action.retire.then_some(seq.0 as i64).into(),
-                        encode_json(&record)?.into(),
-                    ],
-                )
-                .await?;
-            } else {
-                record = tx
-                    .get::<DocumentRecord>(
-                        &format!(
-                            "SELECT record FROM {} WHERE id = ?",
-                            self.schema.tables.documents
-                        ),
-                        vec![id.get().into()],
-                    )
-                    .await?
-                    .ok_or_else(|| StorageError::message(format!("Unknown document: {id}")))?;
-            }
-
-            if let Some(content) = &content {
-                if content.is_base() && is_current_only(&record) {
-                    tx.run(
-                        &format!(
-                            "DELETE FROM {} WHERE document_id = ?",
-                            self.schema.tables.document_revisions
-                        ),
-                        vec![id.get().into()],
-                    )
-                    .await?;
-                }
-                let encoded = match content {
-                    DocumentContent::Base { value, .. } => encode_json(value)?,
-                    DocumentContent::Delta { ops, .. } => encode_json(ops)?,
-                };
-                let kind = if content.is_base() { "base" } else { "delta" };
-                tx.run(
-                    &format!(
-                        "INSERT INTO {} (document_id, seq, kind, version, content) VALUES (?, ?, ?, ?, ?)",
-                        self.schema.tables.document_revisions
-                    ),
-                    vec![
-                        id.get().into(),
-                        seq.0.into(),
-                        kind.into(),
-                        content.version().into(),
-                        encoded.into(),
-                    ],
-                )
-                .await?;
-            }
-
-            if action.retire {
-                if action.create.is_none() {
-                    record.retired_at = Some(seq);
-                    tx.run(
-                        &format!(
-                            "UPDATE {} SET retired_at = ?, record = ? WHERE id = ?",
-                            self.schema.tables.documents
-                        ),
-                        vec![seq.0.into(), encode_json(&record)?.into(), id.get().into()],
-                    )
-                    .await?;
-                }
-                if is_current_only(&record) {
-                    tx.run(
-                        &format!(
-                            "DELETE FROM {} WHERE document_id = ?",
-                            self.schema.tables.document_revisions
-                        ),
-                        vec![id.get().into()],
-                    )
-                    .await?;
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
 impl Storage for SqliteStorage {
-    async fn commit(&self, writes: &[StorageWrite], _context: &Context) -> StorageResult<Seq> {
+    async fn commit(
+        &self,
+        batches: &[Vec<StorageWrite>],
+        receive: &mut (dyn FnMut(usize, Seq) + Send),
+        _context: &Context,
+    ) -> StorageResult<crate::types::CommitResult> {
         self.assert_open()?;
-        let actions = Self::prepare_document_actions(writes)?;
-        let candidate_next_id = self.candidate_next_id(writes)?;
-        let seq = self
+        let batches = batches.to_vec();
+        let (seqs, refused, candidate_next_id) = self
             .db
             .transaction(move |tx| async move {
-                let metadata = &self.schema.tables.durable_metadata;
+                let tables = &self.schema.tables;
+                let metadata = &tables.durable_metadata;
                 let metadata_next_id = tx
                     .get_text(
                         &format!("SELECT next_id FROM {metadata} WHERE singleton = 1"),
                         vec![],
                     )
                     .await?
-                    .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?;
-                let committed_seq = tx
+                    .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?
+                    .parse::<u64>()
+                    .map_err(|_| StorageError::message("Durable SQLite metadata is missing"))?;
+                let mut next_seq = tx
                     .get_i64(
                         &format!("SELECT next_seq FROM {metadata} WHERE singleton = 1"),
                         vec![],
@@ -1123,30 +690,70 @@ impl Storage for SqliteStorage {
                     .await?
                     .ok_or_else(|| StorageError::message("Durable SQLite metadata is missing"))?
                     as u64;
-                let committed_seq = Seq(committed_seq);
-                self.check_global_ids(&tx, writes).await?;
-                self.check_document_actions(&tx, &actions).await?;
-                for write in writes {
-                    self.apply_table_write(&tx, write, committed_seq).await?;
+                // D02: read every batch's check state before checking any batch.
+                // A malformed document record fails the whole call (Err), not a
+                // refusal.
+                let mut state = CommitState::read(&tx, &self, &batches).await?;
+                let mut pending = PendingWrites::default();
+                let mut seqs = Vec::new();
+                let mut refused: Option<CommitRefusal> = None;
+                let mut candidate_next_id = self.next_id_snapshot()?;
+                for writes in &batches {
+                    let mut actions = match Self::prepare_document_actions(writes) {
+                        Ok(actions) => actions,
+                        Err(error) => {
+                            refused = Some(CommitRefusal::from_storage(error));
+                            break;
+                        }
+                    };
+                    if let Err(error) = state.check(writes, &actions) {
+                        refused = Some(error);
+                        break;
+                    }
+                    // Copies read their sources from this transaction, including
+                    // the accepted batches before them.
+                    if actions.iter().any(|(_, action)| action.copy.is_some()) {
+                        pending.flush(&tx, &self.schema.tables).await?;
+                        match self.resolve_copies(&tx, &mut actions).await {
+                            Ok(()) => {}
+                            Err(CopyResolution::Refused(error)) => {
+                                refused = Some(error);
+                                break;
+                            }
+                            Err(CopyResolution::Storage(error)) => return Err(error),
+                        }
+                    }
+                    let seq = Seq(next_seq);
+                    next_seq += 1;
+                    state.apply(writes, &actions, seq);
+                    pending.add(writes, &actions, seq, &state)?;
+                    seqs.push(seq);
+                    candidate_next_id = candidate_next_id.max(self.candidate_next_id(writes)?);
                 }
-                self.apply_document_actions(&tx, &actions, committed_seq)
+                pending.flush(&tx, &self.schema.tables).await?;
+                if !seqs.is_empty() {
+                    tx.run(
+                        &format!(
+                            "UPDATE {metadata} SET next_id = ?, next_seq = ? WHERE singleton = 1"
+                        ),
+                        vec![
+                            metadata_next_id.max(candidate_next_id).to_string().into(),
+                            next_seq.into(),
+                        ],
+                    )
                     .await?;
-                let current_next_id = metadata_next_id
-                    .parse::<u64>()
-                    .map_err(|_| StorageError::message("Durable SQLite metadata is missing"))?;
-                tx.run(
-                    &format!("UPDATE {metadata} SET next_id = ?, next_seq = ? WHERE singleton = 1"),
-                    vec![
-                        current_next_id.max(candidate_next_id).to_string().into(),
-                        (committed_seq.0 + 1).into(),
-                    ],
-                )
-                .await?;
-                Ok(committed_seq)
+                }
+                Ok((seqs, refused.map(|refusal| refusal.0), candidate_next_id))
             })
             .await?;
         self.advance_next_id(candidate_next_id)?;
-        Ok(seq)
+        for (index, seq) in seqs.iter().copied().enumerate() {
+            receive(index, seq);
+        }
+        Ok(crate::types::CommitResult {
+            stored: seqs.len(),
+            refused,
+        })
     }
 
     async fn mint_id(&self) -> StorageResult<u64> {
@@ -1167,9 +774,11 @@ impl Storage for SqliteStorage {
         &self,
         id: ConversationId,
         _context: &Context,
-    ) -> StorageResult<Option<ConversationRecord>> {
+    ) -> StorageResult<Option<Arc<ConversationRecord>>> {
         self.assert_open()?;
-        self.read_conversation(id).await
+        self.read_conversation(id)
+            .await
+            .map(|value| value.map(Arc::new))
     }
 
     async fn scan_conversations(
@@ -1252,9 +861,10 @@ impl Storage for SqliteStorage {
         }
     }
 
-    async fn task(&self, id: TaskId, _context: &Context) -> StorageResult<Option<TaskRecord>> {
+    async fn task(&self, id: TaskId, _context: &Context) -> StorageResult<Option<Arc<TaskRecord>>> {
         self.assert_open()?;
-        self.db
+        let value: Option<TaskRecord> = self
+            .db
             .get(
                 &format!(
                     "SELECT record FROM {} WHERE id = ?",
@@ -1262,7 +872,8 @@ impl Storage for SqliteStorage {
                 ),
                 vec![id.get().into()],
             )
-            .await
+            .await?;
+        Ok(value.map(Arc::new))
     }
 
     async fn scan_tasks(
@@ -1317,9 +928,10 @@ impl Storage for SqliteStorage {
         &self,
         id: SubmissionId,
         _context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         self.assert_open()?;
-        self.db
+        let value: Option<SubmissionRecord> = self
+            .db
             .get(
                 &format!(
                     "SELECT record FROM {} WHERE id = ?",
@@ -1327,7 +939,8 @@ impl Storage for SqliteStorage {
                 ),
                 vec![id.get().into()],
             )
-            .await
+            .await?;
+        Ok(value.map(Arc::new))
     }
 
     async fn scan_submissions(
@@ -1371,9 +984,10 @@ impl Storage for SqliteStorage {
         conversation_id: ConversationId,
         request_id: &str,
         _context: &Context,
-    ) -> StorageResult<Option<SubmissionRecord>> {
+    ) -> StorageResult<Option<Arc<SubmissionRecord>>> {
         self.assert_open()?;
-        self.db
+        let value: Option<SubmissionRecord> = self
+            .db
             .get(
                 &format!(
                     "SELECT record FROM {} WHERE conversation_id = ? AND request_id = ?",
@@ -1384,7 +998,8 @@ impl Storage for SqliteStorage {
                     encode_indexed_string(request_id).into(),
                 ],
             )
-            .await
+            .await?;
+        Ok(value.map(Arc::new))
     }
 
     async fn find_document(

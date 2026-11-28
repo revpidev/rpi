@@ -1,5 +1,5 @@
 //! Document/state service subset (port of `chord/src/services/state.ts` and the
-//! `replicatedState` factory in `chord/src/api.ts` @ `4a080252f`).
+//! `replicatedState` factory in `chord/src/api.ts` @ `b4afdddf`).
 //!
 //! V17-13 carries the consumed surface: mutable and attached replicated states,
 //! publication ordering, source attachments with cursor checks, and operation

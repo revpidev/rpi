@@ -21,6 +21,7 @@ use std::sync::Arc;
 use rpi_agent::messages::CustomMessage;
 use rpi_ai::types::UserContent;
 use rpi_ai::types::UserContentBlock;
+use rpi_ext_host::types::MarkdownTransformerFn;
 use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 use rpi_tui::components::spacer::Spacer;
@@ -28,6 +29,8 @@ use rpi_tui::components::text::Text;
 use rpi_tui::tui::{Component, Container};
 
 use crate::core::themes::Theme;
+
+use super::markdown_transform::create_markdown_transform_with_metadata;
 
 /// `MessageRenderer` (extensions/types.ts:1140-1144): a custom renderer for
 /// [`CustomMessage`]s, invoked before the default box rendering. The renderer
@@ -55,6 +58,9 @@ pub struct CustomMessageComponent {
     theme: Arc<Theme>,
     expanded: bool,
     output_pad: usize,
+    markdown_transformers: Vec<MarkdownTransformerFn>,
+    message_id: Option<String>,
+    timestamp: Option<String>,
     // Children: [Spacer(1), content (custom component or box)].
     container: Container,
 }
@@ -74,11 +80,26 @@ impl CustomMessageComponent {
             theme,
             expanded: false,
             output_pad,
+            markdown_transformers: Vec::new(),
+            message_id: None,
+            timestamp: None,
             container: Container::new(),
         };
         component.container.add_child(StdBox::new(Spacer::new(1)));
         component.rebuild();
         component
+    }
+
+    pub fn set_markdown_context(
+        &mut self,
+        transformers: Vec<MarkdownTransformerFn>,
+        message_id: Option<String>,
+        timestamp: Option<String>,
+    ) {
+        self.markdown_transformers = transformers;
+        self.message_id = message_id;
+        self.timestamp = timestamp;
+        self.rebuild();
     }
 
     /// `setExpanded` (custom-message.ts:41-46).
@@ -159,7 +180,16 @@ impl CustomMessageComponent {
                 color: Some(color),
                 ..Default::default()
             }),
-            None,
+            Some(rpi_tui::components::markdown::MarkdownOptions {
+                transform: create_markdown_transform_with_metadata(
+                    "custom",
+                    || false,
+                    self.markdown_transformers.clone(),
+                    self.message_id.clone(),
+                    self.timestamp.clone(),
+                ),
+                ..Default::default()
+            }),
         )));
         self.container.add_child(StdBox::new(box_component));
     }

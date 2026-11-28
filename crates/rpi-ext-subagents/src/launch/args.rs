@@ -335,6 +335,9 @@ pub struct BuildArgsInput {
     pub system_prompt: Option<String>,
     pub system_prompt_mode: &'static str,
     pub inherit_project_context: bool,
+    /// `inheritGlobalContext` (#3206): when false the child gets
+    /// `RPI_NO_GLOBAL_CONTEXT=1` and skips the global AGENTS.md.
+    pub inherit_global_context: bool,
     pub inherit_skills: bool,
     pub require_read_tool: bool,
     pub tools: Option<Vec<String>>,
@@ -410,6 +413,7 @@ pub struct LaunchToolPlan {
 pub fn resolve_launch_tool_plan(
     tools: Option<&Vec<String>>,
     exclude_tools: &[String],
+    mcp_direct_tools: &[String],
     extensions: Option<&Vec<String>>,
     subagent_only_extensions: Option<&Vec<String>>,
     require_read_tool: bool,
@@ -427,7 +431,7 @@ pub fn resolve_launch_tool_plan(
     // extension paths, not builtin tool names (pi-args.ts:385-389, 408-414).
     let is_path_shaped =
         |tool: &str| tool.contains('/') || tool.ends_with(".ts") || tool.ends_with(".js");
-    let requested_builtin: Vec<String> = tools
+    let mut requested_builtin: Vec<String> = tools
         .map(|list| {
             list.iter()
                 .filter(|t| !is_path_shaped(t))
@@ -435,6 +439,27 @@ pub fn resolve_launch_tool_plan(
                 .collect()
         })
         .unwrap_or_default();
+    // S32/S47: `mcp:server.tool` selectors map to the host's built-in MCP
+    // tool name (`mcp__server__tool`, `-` → `_`). `server.*` keeps the
+    // namespace wildcard. Explicit builtin allowlists carry them; with no
+    // allowlist the child's ambient MCP tools stay intact.
+    for selector in mcp_direct_tools {
+        let selector = selector.trim();
+        if selector.is_empty() || selector == "search" {
+            continue;
+        }
+        let normalized = selector.replace('-', "_");
+        let name = if let Some((server, tool)) = normalized.split_once(['.', '/']) {
+            if tool == "*" {
+                format!("mcp__{server}__*")
+            } else {
+                format!("mcp__{server}__{tool}")
+            }
+        } else {
+            format!("mcp__{normalized}")
+        };
+        requested_builtin.push(name);
+    }
     let tool_extension_paths: Vec<String> = tools
         .map(|list| list.iter().filter(|t| is_path_shaped(t)).cloned().collect())
         .unwrap_or_default();
@@ -611,6 +636,7 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
     let tool_plan = resolve_launch_tool_plan(
         input.tools.as_ref(),
         &input.exclude_tools,
+        &input.mcp_direct_tools,
         input.extensions.as_ref(),
         input.subagent_only_extensions.as_ref(),
         input.require_read_tool,
@@ -743,7 +769,9 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
         );
         tool_diagnostic_path = Some(path);
     }
-    // MCP direct tools are P2: always the upstream "__none__" sentinel.
+    // The upstream `MCP_DIRECT_TOOLS` carrier has no rpi host reader; keep
+    // the frozen v0.48 golden value for third-party readers, while the
+    // selected tools ride the normal `--tools` allowlist above.
     env.insert("MCP_DIRECT_TOOLS".into(), Some("__none__".into()));
     let _ = &input.mcp_direct_tools;
     env.insert(SUBAGENT_CHILD_ENV.into(), Some("1".into()));
@@ -753,7 +781,9 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
     // (`resource_loader::no_global_context`); a host that does not know the
     // switch keeps loading it (old-host fallback — no refusal, no crash).
     // No user-visible config key in v0.1.4 (ADR-0026 decision 4).
-    env.insert(NO_GLOBAL_CONTEXT_ENV.into(), Some("1".into()));
+    if !input.inherit_global_context {
+        env.insert(NO_GLOBAL_CONTEXT_ENV.into(), Some("1".into()));
+    }
     env.insert(
         SUBAGENT_FANOUT_CHILD_ENV.into(),
         Some(
@@ -1209,22 +1239,42 @@ mod tests {
     #[test]
     fn tools_three_branches() {
         // omitted: no --tools flag
-        let plan = resolve_launch_tool_plan(None, &[], None, None, false, None);
+        let plan = resolve_launch_tool_plan(None, &[], &[], None, None, false, None);
         assert!(!plan.explicit_tool_allowlist);
         // empty list: --no-tools
-        let plan = resolve_launch_tool_plan(Some(&Vec::new()), &[], None, None, false, None);
+        let plan = resolve_launch_tool_plan(Some(&Vec::new()), &[], &[], None, None, false, None);
         assert!(plan.explicit_tool_allowlist);
         assert!(plan.effective_tool_allowlist.is_empty());
         // values: --tools with read auto-added when skills require it
         let tools = vec!["bash".to_string(), "write".to_string()];
-        let plan = resolve_launch_tool_plan(Some(&tools), &[], None, None, true, None);
+        let plan = resolve_launch_tool_plan(Some(&tools), &[], &[], None, None, true, None);
         assert_eq!(plan.effective_tool_allowlist, vec!["read", "bash", "write"]);
         assert_eq!(plan.required_child_tools, vec!["read", "bash", "write"]);
         assert!(!plan.fanout_authorized);
         // subagent in tools authorizes fanout
         let tools = vec!["read".to_string(), "subagent".to_string()];
-        let plan = resolve_launch_tool_plan(Some(&tools), &[], None, None, false, None);
+        let plan = resolve_launch_tool_plan(Some(&tools), &[], &[], None, None, false, None);
         assert!(plan.fanout_authorized);
+        // S32/S47: both upstream `server/tool` and rpi `server.tool` selectors
+        // map to the host MCP tool name.
+        let tools = vec!["read".to_string()];
+        let plan = resolve_launch_tool_plan(
+            Some(&tools),
+            &[],
+            &["github/search".to_string(), "docs.fetch".to_string()],
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            plan.effective_tool_allowlist
+                .contains(&"mcp__github__search".to_string())
+        );
+        assert!(
+            plan.effective_tool_allowlist
+                .contains(&"mcp__docs__fetch".to_string())
+        );
     }
 
     #[test]
@@ -1233,6 +1283,7 @@ mod tests {
         // present (even empty) disables ambient + lists runtime first
         let plan = resolve_launch_tool_plan(
             Some(&vec!["read".into()]),
+            &[],
             &[],
             Some(&vec![]),
             None,
@@ -1245,6 +1296,7 @@ mod tests {
         let plan = resolve_launch_tool_plan(
             None,
             &[],
+            &[],
             Some(&vec!["/ext/other.so".into()]),
             None,
             false,
@@ -1256,6 +1308,7 @@ mod tests {
         let plan = resolve_launch_tool_plan(
             None,
             &[],
+            &[],
             None,
             Some(&vec!["/path/to/ext.so".to_string()]),
             false,
@@ -1265,7 +1318,7 @@ mod tests {
         assert_eq!(plan.extension_args, vec![SELF, "/path/to/ext.so"]);
         // tool entries with path shapes route to extensions, not --tools
         let tools = vec!["read".to_string(), "/abs/tool.so".to_string()];
-        let plan = resolve_launch_tool_plan(Some(&tools), &[], None, None, false, Some(SELF));
+        let plan = resolve_launch_tool_plan(Some(&tools), &[], &[], None, None, false, Some(SELF));
         assert_eq!(plan.effective_tool_allowlist, vec!["read"]);
         assert_eq!(plan.extension_args, vec![SELF, "/abs/tool.so"]);
     }
@@ -1377,6 +1430,7 @@ mod tests {
                 .ends_with("Do not print tool-call syntax, patches, or pseudo-tool calls as text."),
             "#2693: the boundary block is last, not first"
         );
+        #[cfg(unix)]
         let mode = std::fs::metadata(&prompt_path).unwrap();
         #[cfg(unix)]
         {
@@ -1560,6 +1614,7 @@ mod te18_args_tests {
         let plan = resolve_launch_tool_plan(
             Some(&vec!["subagent".to_string(), "read".to_string()]),
             &["subagent".to_string()],
+            &[],
             None,
             None,
             false,
@@ -1647,5 +1702,65 @@ mod te18_args_tests {
         assert!(!build(Some(true)).contains(&"--no-approve".to_string()));
         assert!(!build(None).contains(&"--no-approve".to_string()));
         assert!(build(Some(false)).contains(&"--no-approve".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod inherit_global_context_env_tests {
+    use super::*;
+
+    fn input(inherit_global_context: bool) -> BuildArgsInput {
+        BuildArgsInput {
+            base_args: vec!["--mode".into(), "json".into()],
+            task: "do it".into(),
+            task_delivery: None,
+            session_enabled: false,
+            session_dir: None,
+            session_file: None,
+            model: None,
+            thinking: None,
+            system_prompt: None,
+            system_prompt_mode: "replace",
+            inherit_project_context: false,
+            inherit_global_context,
+            inherit_skills: false,
+            require_read_tool: false,
+            tools: None,
+            exclude_tools: Vec::new(),
+            extensions: None,
+            subagent_only_extensions: None,
+            mcp_direct_tools: Vec::new(),
+            prompt_file_stem: None,
+            run_id: None,
+            child_agent_name: None,
+            child_index: None,
+            parent_session_id: None,
+            fanout_authorized: false,
+            self_extension: None,
+            steer_inbox: None,
+            thinking_ceiling: None,
+            session_name: None,
+            supervisor_channel: None,
+            descendant_allowed_agents: None,
+            diff_baseline: None,
+            tool_budget_env: None,
+            project_trusted: None,
+        }
+    }
+
+    #[test]
+    fn global_context_switch_follows_the_agent_flag() {
+        let skipped = build_rpi_args(&input(false)).expect("args");
+        assert_eq!(
+            skipped.env.get(NO_GLOBAL_CONTEXT_ENV),
+            Some(&Some("1".into())),
+            "opt-out sets the skip env"
+        );
+        let inherited = build_rpi_args(&input(true)).expect("args");
+        assert_ne!(
+            inherited.env.get(NO_GLOBAL_CONTEXT_ENV),
+            Some(&Some("1".into())),
+            "inheriting never sets the skip env"
+        );
     }
 }

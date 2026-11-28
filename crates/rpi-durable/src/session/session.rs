@@ -1,15 +1,17 @@
 //! Session kernel: one mutation line, the loaded document tracker cache, and
 //! committed publication (port of `packages/durable/src/session/session.ts`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 //!
-//! Only committed state is observable. Every commit callback, storage
-//! settlement, adoption and publication runs while the single mutation line is
-//! held; listeners run after adoption but before the line releases, and must not
-//! re-enter.
+//! Only committed state is observable. Commit callbacks and settlement run on
+//! the single mutation line; the Writer stores admitted batches off the line
+//! and publishes them in admission order. Listeners run synchronously during
+//! that publication and must not re-enter.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use futures::FutureExt;
 
 use crate::chord::context::{AbortSignal, Context, without_abort_signal};
 use crate::chord::json::{JsonObject, JsonValue};
@@ -20,17 +22,26 @@ use crate::documents::{
 };
 use crate::harness::types::{ReportFn, SetTimer, TimerDisarm};
 use crate::ids::{ConversationId, DocumentId, EntryId, Seq};
+use crate::session::gated::GatedStorage;
 use crate::session::guarded::GuardedStorage;
+use crate::session::keys::document_key;
 use crate::session::observation::{
     CommittedStateSource, CommittedWatch, WatchListener, attach_state,
 };
 use crate::session::transaction::{LoadedDocument, Transaction, TransactionScope};
+use crate::session::writer::{CommitJob, JobOutcome, PublishFailure, Writer};
 use crate::session::{
-    CommitChange, CommitPublication, DocOwner, SessionEnd, SessionError, SessionFuture,
-    SessionResult, Subscription, doc_target, observed_operations,
+    CommitChange, CommitOptions, CommitPersistence, CommitPublication, DeferredCommit, DocOwner,
+    SessionEnd, SessionError, SessionFuture, SessionResult, Subscription, doc_target,
+    observed_operations, observed_operations_for,
 };
 use crate::timers::Timers;
 use crate::types::{ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, Storage};
+
+tokio::task_local! {
+    /// Set while a fenced job runs on the mutation line in this task.
+    static ON_LINE: ();
+}
 
 /// Wall clock used for task lifecycle times (upstream `Date.now`).
 pub type NowFn = Arc<dyn Fn() -> f64 + Send + Sync>;
@@ -39,6 +50,150 @@ struct DocumentSweep {
     id: u64,
     at: f64,
     disarm: Option<TimerDisarm>,
+}
+
+struct FailureState {
+    cause: String,
+    at: u64,
+    own: std::collections::HashSet<u64>,
+}
+
+#[derive(Clone)]
+enum CloseError {
+    Storage(String),
+    Failed(String),
+    Closed,
+    Message(String),
+}
+
+impl CloseError {
+    fn from_session_error(error: &SessionError) -> Self {
+        match error {
+            SessionError::Storage(_) => Self::Storage(error.to_string()),
+            SessionError::Failed { cause } => Self::Failed(cause.clone()),
+            SessionError::Closed => Self::Closed,
+            _ => Self::Message(error.to_string()),
+        }
+    }
+
+    fn into_session_error(self) -> SessionError {
+        match self {
+            Self::Storage(error) => {
+                SessionError::Storage(crate::errors::StorageError::message(error))
+            }
+            Self::Failed(cause) => SessionError::Failed { cause },
+            Self::Closed => SessionError::Closed,
+            Self::Message(error) => SessionError::Message(error),
+        }
+    }
+}
+
+type WriterOutcome = tokio::sync::oneshot::Receiver<SessionResult<()>>;
+type SharedWriterOutcome = Arc<tokio::sync::Mutex<Option<WriterOutcome>>>;
+
+struct CurrentJobGuard {
+    session: Arc<SessionImpl>,
+    index: u64,
+}
+
+impl CurrentJobGuard {
+    fn new(session: &Arc<SessionImpl>, index: u64, outcome: &SharedWriterOutcome) -> Self {
+        if let Ok(mut current) = session.current_job.lock() {
+            *current = Some((index, Arc::clone(outcome)));
+        }
+        Self {
+            session: Arc::clone(session),
+            index,
+        }
+    }
+}
+
+impl Drop for CurrentJobGuard {
+    fn drop(&mut self) {
+        if let Ok(mut current) = self.session.current_job.lock()
+            && current.as_ref().map(|(index, _)| *index) == Some(self.index)
+        {
+            *current = None;
+        }
+    }
+}
+
+struct LineJob {
+    session: Arc<SessionImpl>,
+    index: u64,
+    outcome: SharedWriterOutcome,
+    delivered: bool,
+    maintenance: bool,
+}
+
+impl LineJob {
+    fn new(session: &Arc<SessionImpl>, index: u64) -> Self {
+        Self {
+            session: Arc::clone(session),
+            index,
+            outcome: Arc::new(tokio::sync::Mutex::new(None)),
+            delivered: false,
+            maintenance: false,
+        }
+    }
+
+    fn maintenance(session: &Arc<SessionImpl>, index: u64) -> Self {
+        let mut job = Self::new(session, index);
+        job.maintenance = true;
+        job
+    }
+
+    fn track_outcome(&self, outcome: WriterOutcome) {
+        *self.outcome.try_lock().expect("writer outcome slot") = Some(outcome);
+    }
+
+    async fn wait_writer(&mut self) -> SessionResult<()> {
+        let mut outcome = self.outcome.lock().await;
+        let result = outcome
+            .as_mut()
+            .expect("writer outcome")
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        *outcome = None;
+        result
+    }
+
+    async fn deliver<T: Send>(mut self, result: SessionResult<T>) -> SessionResult<T> {
+        let result = if self.maintenance {
+            self.session.deliver_maintenance(self.index, result).await
+        } else {
+            self.session.deliver(self.index, result).await
+        };
+        self.delivered = true;
+        result
+    }
+}
+
+impl Drop for LineJob {
+    fn drop(&mut self) {
+        if self.delivered {
+            return;
+        }
+        let session = Arc::clone(&self.session);
+        let index = self.index;
+        let outcome = Arc::clone(&self.outcome);
+        let maintenance = self.maintenance;
+        tokio::spawn(async move {
+            let outcome = outcome.lock().await.take();
+            if let Some(outcome) = outcome {
+                let _ = outcome.await;
+            }
+            if maintenance {
+                let _ = session
+                    .deliver_maintenance(index, Err::<(), _>(SessionError::Aborted))
+                    .await;
+            } else {
+                let _ = session
+                    .deliver(index, Err::<(), _>(SessionError::Aborted))
+                    .await;
+            }
+        });
+    }
 }
 
 /// Loaded-document cache counts (upstream `documentCacheSizes`).
@@ -53,6 +208,12 @@ pub struct DocumentCacheSizes {
 /// A synchronous post-adoption commit listener. It must not throw, block, or
 /// call session operations (upstream `subscribeCommits`).
 pub type CommitListener = Arc<dyn Fn(&CommitPublication, &Context) + Send + Sync>;
+
+type CommitObserverRegistration = (
+    u64,
+    Arc<dyn crate::session::CommitObserver>,
+    Arc<AtomicBool>,
+);
 
 /// A synchronous close listener, called once when close begins (upstream
 /// `subscribeClose`).
@@ -84,7 +245,7 @@ fn error_future<'a, T>(error: SessionError) -> SessionFuture<'a, T> {
 }
 
 /// Reset an atomic flag when dropped unless disarmed. Close paths use this so a
-/// cancelled or failed await leaves the resource retryable.
+/// cancelled await leaves the resource retryable.
 struct ResetOnDrop<'a> {
     flag: &'a AtomicBool,
     armed: bool,
@@ -122,21 +283,30 @@ pub struct ConversationDocumentView {
 
 /// Session kernel (upstream `SessionImpl`). Always shared as `Arc<SessionImpl>`.
 pub struct SessionImpl {
+    read_only: bool,
     raw: Arc<dyn Storage>,
     guarded: Arc<dyn Storage>,
     guarded_typed: Arc<GuardedStorage>,
+    gated: OnceLock<Arc<dyn Storage>>,
+    writer: OnceLock<Arc<Writer>>,
     now: NowFn,
     documents: Mutex<HashMap<String, Arc<LoadedDocument>>>,
     /// Commit listeners: `true` marks the Session's own component listener,
     /// whose throw fails the Session; host listeners report only.
     commit_listeners: Arc<Mutex<Vec<(u64, CommitListener, bool)>>>,
+    commit_observers: Arc<Mutex<Vec<CommitObserverRegistration>>>,
     close_listeners: Arc<Mutex<Vec<(u64, CloseListener)>>>,
     conversation_created_hook: Mutex<Option<ConversationCreatedHook>>,
     line: tokio::sync::Mutex<()>,
     closing: AtomicBool,
     cleanup_done: AtomicBool,
-    /// The first error that failed the Session.
-    failure: Mutex<Option<String>>,
+    close_error: Mutex<Option<CloseError>>,
+    /// The first error that failed the Session and its outcome boundary.
+    failure: Mutex<Option<FailureState>>,
+    current_job: Mutex<Option<(u64, SharedWriterOutcome)>>,
+    next_job_index: AtomicU64,
+    completed_jobs: Mutex<std::collections::BTreeSet<u64>>,
+    outcome_delivered: tokio::sync::watch::Sender<u64>,
     /// The terminal session state, once close or failure set it.
     end: Mutex<Option<SessionEnd>>,
     end_notify: tokio::sync::Notify,
@@ -157,6 +327,13 @@ pub struct SessionImpl {
     next_sweep_id: AtomicU64,
     sweep_jobs: AtomicU64,
     document_timers_unavailable: AtomicBool,
+    deferred: Mutex<Option<DeferredCommit>>,
+    deferred_pending: AtomicBool,
+    /// Documents pinned by an unflushed deferred commit.
+    pinned: Mutex<std::collections::HashSet<DocumentId>>,
+    outstanding_commits: tokio::sync::Semaphore,
+    next_deferred_id: AtomicU64,
+    persist_within_ms: Mutex<Option<f64>>,
 }
 
 /// Reads `settings.documentRetentionMs` at each use.
@@ -175,21 +352,39 @@ pub fn create_session(storage: Arc<dyn Storage>, now: Option<NowFn>) -> Arc<Sess
 impl SessionImpl {
     /// Build a session over `storage` with the given clock (default [`crate::session::default_now`]).
     pub fn new(storage: Arc<dyn Storage>, now: Option<NowFn>) -> Arc<Self> {
+        Self::new_with_options(storage, now, false)
+    }
+
+    /// Build a session with explicit read-only admission.
+    pub fn new_with_options(
+        storage: Arc<dyn Storage>,
+        now: Option<NowFn>,
+        read_only: bool,
+    ) -> Arc<Self> {
         let guarded_typed = GuardedStorage::new(Arc::clone(&storage));
         let guarded: Arc<dyn Storage> = guarded_typed.clone();
         let session = Arc::new(Self {
+            read_only,
             raw: Arc::clone(&storage),
             guarded,
             guarded_typed,
+            gated: OnceLock::new(),
+            writer: OnceLock::new(),
             now: now.unwrap_or_else(|| Arc::new(crate::session::default_now)),
             documents: Mutex::new(HashMap::new()),
             commit_listeners: Arc::new(Mutex::new(Vec::new())),
+            commit_observers: Arc::new(Mutex::new(Vec::new())),
             close_listeners: Arc::new(Mutex::new(Vec::new())),
             conversation_created_hook: Mutex::new(None),
             line: tokio::sync::Mutex::new(()),
             closing: AtomicBool::new(false),
             cleanup_done: AtomicBool::new(false),
+            close_error: Mutex::new(None),
             failure: Mutex::new(None),
+            current_job: Mutex::new(None),
+            next_job_index: AtomicU64::new(1),
+            completed_jobs: Mutex::new(std::collections::BTreeSet::new()),
+            outcome_delivered: tokio::sync::watch::channel(0).0,
             end: Mutex::new(None),
             end_notify: tokio::sync::Notify::new(),
             failure_reporter: Mutex::new(None),
@@ -203,14 +398,38 @@ impl SessionImpl {
             next_sweep_id: AtomicU64::new(1),
             sweep_jobs: AtomicU64::new(0),
             document_timers_unavailable: AtomicBool::new(false),
+            deferred: Mutex::new(None),
+            deferred_pending: AtomicBool::new(false),
+            pinned: Mutex::new(std::collections::HashSet::new()),
+            outstanding_commits: tokio::sync::Semaphore::new(256),
+            next_deferred_id: AtomicU64::new(1),
+            persist_within_ms: Mutex::new(Some(1000.0)),
         });
         session.guarded_typed.attach(&session);
+        let weak = Arc::downgrade(&session);
+        let writer = Writer::new(Arc::clone(&session.guarded), weak.clone());
+        let gated = GatedStorage::new(Arc::clone(&session.guarded), weak);
+        let _ = session.writer.set(writer);
+        let _ = session.gated.set(gated);
         session
     }
 
-    /// The storage backend, guarded so a failure fails this Session.
+    /// The storage backend used by line jobs, with failure and read gates.
     pub fn storage(&self) -> &Arc<dyn Storage> {
-        &self.guarded
+        self.gated.get().expect("session gated storage")
+    }
+
+    fn writer(&self) -> &Arc<Writer> {
+        self.writer.get().expect("session writer")
+    }
+
+    pub(crate) async fn wait_for_writer(&self, key: &str) -> SessionResult<()> {
+        self.writer().wait_key(key).await;
+        self.assert_healthy()
+    }
+
+    pub(crate) async fn wait_for_all_writers(&self) -> SessionResult<()> {
+        self.wait_for_writer(crate::session::keys::ALL_KEYS).await
     }
 
     /// The raw storage backend, for closing and tests.
@@ -218,9 +437,31 @@ impl SessionImpl {
         &self.raw
     }
 
+    /// Whether this session rejects all writes before Storage.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Commit outcomes admitted but not delivered yet (bounded to 256).
+    pub fn outstanding_commit_count(&self) -> usize {
+        256 - self.outstanding_commits.available_permits()
+    }
+
+    /// Document writes still held for deferred persistence.
+    pub fn deferred_write_count(&self) -> usize {
+        self.deferred
+            .lock()
+            .ok()
+            .and_then(|deferred| deferred.as_ref().map(|deferred| deferred.writes.len()))
+            .unwrap_or(0)
+    }
+
     /// The first error that failed the Session, if one did.
     pub fn failure(&self) -> Option<String> {
-        self.failure.lock().ok().and_then(|failure| failure.clone())
+        self.failure
+            .lock()
+            .ok()
+            .and_then(|failure| failure.as_ref().map(|failure| failure.cause.clone()))
     }
 
     /// Register a callback run when the Session fails; it rejects the
@@ -245,6 +486,14 @@ impl SessionImpl {
         }
     }
 
+    pub(crate) fn report_listener_error(&self, message: String, context: Option<Context>) {
+        if let Ok(slot) = self.listener_reporter.lock()
+            && let Some(reporter) = slot.as_ref()
+        {
+            reporter(message, context);
+        }
+    }
+
     /// Fail the Session: the first failure wins. Admission ends, the close
     /// listeners run at once, and Storage closes in the background. Later
     /// calls and waits reject with `SessionFailed`.
@@ -252,12 +501,32 @@ impl SessionImpl {
         self.fail_with_context(cause, None);
     }
 
+    pub(crate) fn fail_at(self: &Arc<Self>, cause: String, at: u64, own: Vec<u64>) {
+        self.fail_with_boundary(cause, None, Some(at), own);
+    }
+
     pub(crate) fn fail_with_context(
         self: &Arc<Self>,
         cause: impl Into<String>,
         context: Option<&Context>,
     ) {
-        let cause = cause.into();
+        self.fail_with_boundary(cause.into(), context, None, Vec::new());
+    }
+
+    fn fail_with_boundary(
+        self: &Arc<Self>,
+        cause: String,
+        context: Option<&Context>,
+        at: Option<u64>,
+        own: Vec<u64>,
+    ) {
+        let at = at.unwrap_or_else(|| {
+            self.current_job
+                .lock()
+                .ok()
+                .and_then(|current| current.as_ref().map(|(index, _)| *index))
+                .unwrap_or_else(|| *self.outcome_delivered.borrow())
+        });
         {
             let Ok(mut failure) = self.failure.lock() else {
                 return;
@@ -265,7 +534,11 @@ impl SessionImpl {
             if failure.is_some() {
                 return;
             }
-            *failure = Some(cause.clone());
+            *failure = Some(FailureState {
+                cause: cause.clone(),
+                at,
+                own: own.into_iter().collect(),
+            });
         }
         self.closing.store(true, Ordering::SeqCst);
         let hooks: Vec<FailureHook> = match self.failure_hooks.lock() {
@@ -357,6 +630,18 @@ impl SessionImpl {
         document
     }
 
+    /// Whether the caller is already running a fenced job on the mutation line.
+    fn is_on_line(&self) -> bool {
+        ON_LINE.try_with(|_| ()).is_ok()
+    }
+
+    /// Set the default deferred persistence deadline; `None` means no timer.
+    pub fn set_persist_within_ms(&self, within_ms: Option<f64>) {
+        if let Ok(mut slot) = self.persist_within_ms.lock() {
+            *slot = within_ms;
+        }
+    }
+
     /// Install the live `documentRetentionMs` reader.
     pub fn set_document_retention(&self, retention: DocumentRetentionReader) {
         if let Ok(mut slot) = self.document_retention_ms.lock() {
@@ -434,7 +719,7 @@ impl SessionImpl {
         self.schedule_eviction();
     }
 
-    fn schedule_eviction(self: &Arc<Self>) {
+    pub(crate) fn schedule_eviction(self: &Arc<Self>) {
         if self.closing.load(Ordering::SeqCst) {
             return;
         }
@@ -460,9 +745,9 @@ impl SessionImpl {
         let oldest = self.idle_since.lock().ok().and_then(|idle| {
             idle.iter()
                 .filter(|(address, _)| {
-                    documents
-                        .get(*address)
-                        .is_some_and(|id| !attached.contains_key(id))
+                    documents.get(*address).is_some_and(|id| {
+                        !attached.contains_key(id) && !self.writer().has_key(&document_key(address))
+                    })
                 })
                 .min_by(|(left_address, left), (right_address, right)| {
                     left.total_cmp(right)
@@ -596,16 +881,22 @@ impl SessionImpl {
                         .collect()
                 })
                 .unwrap_or_default();
+            let pinned = self
+                .pinned
+                .lock()
+                .map(|pinned| pinned.clone())
+                .unwrap_or_default();
             let mut expired: Vec<(String, f64)> = self
                 .idle_since
                 .lock()
                 .map(|idle| {
                     idle.iter()
                         .filter(|(address, since)| {
-                            documents
-                                .get(*address)
-                                .is_some_and(|id| !attached.contains_key(id))
-                                && **since <= expired_at
+                            documents.get(*address).is_some_and(|id| {
+                                !attached.contains_key(id)
+                                    && !pinned.contains(id)
+                                    && !self.writer().has_key(&document_key(address))
+                            }) && **since <= expired_at
                         })
                         .map(|(address, since)| (address.clone(), *since))
                         .collect()
@@ -699,19 +990,22 @@ impl SessionImpl {
         address: &DocumentAddress,
         context: &Context,
     ) -> SessionResult<Option<Arc<LoadedDocument>>> {
+        self.wait_for_writer(&document_key(address_id)).await?;
         let cached = self.cached(address_id);
         if let Some(cached) = &cached
             && cached.value_version == definition.version
         {
             return Ok(Some(Arc::clone(cached)));
         }
-        if cached.is_some()
-            && let Ok(mut documents) = self.documents.lock()
-        {
-            documents.remove(address_id);
+        if let Some(cached) = &cached {
+            self.flush_deferred_document_on_line(cached.record.id)
+                .await?;
+            if let Ok(mut documents) = self.documents.lock() {
+                documents.remove(address_id);
+            }
         }
         let record = self
-            .guarded
+            .storage()
             .find_document(
                 address.clone(),
                 crate::types::DocumentPoint::CURRENT,
@@ -722,7 +1016,7 @@ impl SessionImpl {
             return Ok(None);
         };
         let stored = self
-            .guarded
+            .storage()
             .document(record.id, crate::types::DocumentPoint::CURRENT, context)
             .await?
             .ok_or_else(|| {
@@ -774,7 +1068,26 @@ impl SessionImpl {
         }
         let this = Arc::clone(self);
         let context = context.clone();
-        Box::pin(async move { this.run_commit(change, context, scope).await })
+        Box::pin(async move {
+            this.run_commit(change, context, scope, CommitOptions::default())
+                .await
+        })
+    }
+
+    /// Commit one callback with explicit persistence options.
+    pub fn commit_with_options<T: Send + 'static>(
+        self: &Arc<Self>,
+        change: CommitFn<T>,
+        context: &Context,
+        scope: Option<TransactionScope>,
+        options: CommitOptions,
+    ) -> SessionFuture<'_, T> {
+        if let Err(error) = self.assert_usable() {
+            return error_future(error);
+        }
+        let this = Arc::clone(self);
+        let context = context.clone();
+        Box::pin(async move { this.run_commit(change, context, scope, options).await })
     }
 
     /// Commit one callback (upstream `commit`).
@@ -786,13 +1099,60 @@ impl SessionImpl {
         self.commit_with(change, context, None)
     }
 
-    async fn run_commit<T: Send>(
+    async fn run_commit<T: Send + 'static>(
         self: Arc<Self>,
         change: CommitFn<T>,
         context: Context,
         scope: Option<TransactionScope>,
+        options: CommitOptions,
     ) -> SessionResult<T> {
-        let _guard = self.line.lock().await;
+        let _outstanding = self
+            .outstanding_commits
+            .acquire()
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        let guard = self.line.lock().await;
+        let index = self.next_job_index.fetch_add(1, Ordering::SeqCst);
+        let mut job = LineJob::new(&self, index);
+        let result = std::panic::AssertUnwindSafe(ON_LINE.scope((), async {
+            Arc::clone(&self)
+                .run_commit_on_line(guard, &mut job, change, context, scope, options)
+                .await
+        }))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|payload| {
+            Err(SessionError::message(format!(
+                "A commit callback panicked: {}",
+                panic_message(payload)
+            )))
+        });
+        job.deliver(result).await
+    }
+
+    async fn run_commit_on_line<T: Send>(
+        self: Arc<Self>,
+        _guard: tokio::sync::MutexGuard<'_, ()>,
+        job: &mut LineJob,
+        change: CommitFn<T>,
+        context: Context,
+        scope: Option<TransactionScope>,
+        options: CommitOptions,
+    ) -> SessionResult<T> {
+        if self.read_only {
+            return Err(SessionError::ReadOnlySession);
+        }
+        if let Some(CommitPersistence::Deferred {
+            within_ms: Some(within_ms),
+        }) = &options.persistence
+            && (within_ms.is_nan() || *within_ms < 0.0)
+        {
+            return Err(SessionError::message(
+                "CommitPersistence.within_ms must be a number of milliseconds, 0 or more",
+            ));
+        }
+        let index = job.index;
+        let _current = CurrentJobGuard::new(&self, index, &job.outcome);
         // Re-check close after waiting on the line: `commit_with` checked it
         // before the future was polled, but a concurrent close may have won
         // the line first. It must not run the callback or fail the Session.
@@ -803,6 +1163,7 @@ impl SessionImpl {
         {
             return Err(SessionError::Aborted);
         }
+        let persistence = options.persistence.unwrap_or(CommitPersistence::Immediate);
         let mut tx = Transaction::new(
             Arc::clone(&self),
             context.clone(),
@@ -835,28 +1196,442 @@ impl SessionImpl {
             self.evict_idle();
             return Ok(result);
         }
-        let seq = match self
-            .storage()
-            .commit(&writes, &without_abort_signal(&context))
-            .await
+        if let CommitPersistence::Deferred { within_ms } = persistence
+            && tx.can_defer()
+            && within_ms != Some(0.0)
         {
-            Ok(seq) => seq,
-            Err(error) => {
-                tx.discard();
-                self.fail(error.to_string());
-                return Err(error.into());
-            }
-        };
-        let documents = match tx.adopt(seq) {
-            Ok(documents) => documents,
-            Err(error) => {
-                self.fail(error.to_string());
-                return Err(error);
-            }
-        };
-        self.publish(seq, &writes, &documents, &context);
+            let keys = tx.write_keys(&writes);
+            let this = Arc::clone(&self);
+            let job_context = context.clone();
+            self.deferred_pending.store(true, Ordering::SeqCst);
+            let outcome = self.writer().admit(CommitJob::held(
+                index,
+                keys,
+                context.clone(),
+                Box::new(move |outcome| {
+                    let mut tx = tx;
+                    match outcome {
+                        JobOutcome::Held => this
+                            .defer_commit(tx, writes, (), within_ms, &job_context)
+                            .map(|_| ()),
+                        JobOutcome::Discard => {
+                            tx.discard();
+                            if let Ok(deferred) = this.deferred.lock()
+                                && deferred.is_none()
+                            {
+                                this.deferred_pending.store(false, Ordering::SeqCst);
+                            }
+                            Ok(())
+                        }
+                        JobOutcome::Stored(_) => unreachable!(),
+                    }
+                }),
+            ));
+            job.track_outcome(outcome);
+            self.evict_idle();
+            drop(_current);
+            drop(_guard);
+            job.wait_writer().await?;
+            return Ok(result);
+        }
+        let previous = self
+            .deferred
+            .lock()
+            .ok()
+            .and_then(|mut deferred| deferred.take());
+        let previous_deadline = previous.as_ref().and_then(|held| held.deadline);
+        let had_previous = previous.is_some();
+        let (writes, remaining, taken_pins) = tx.take_held(previous);
+        self.restore_deferred(had_previous, previous_deadline, remaining);
+        let keys = tx.write_keys(&writes);
+        let this = Arc::clone(&self);
+        let job_context = context.clone();
+        let published_writes = writes.clone();
+        let outcome = self.writer().admit(CommitJob::stored(
+            index,
+            writes,
+            keys,
+            context.clone(),
+            Box::new(move |outcome| {
+                let mut tx = tx;
+                match outcome {
+                    JobOutcome::Stored(seq) => {
+                        let documents = match tx.adopt(seq) {
+                            Ok(documents) => documents,
+                            Err(error) => {
+                                tx.discard();
+                                this.release_pins(&taken_pins);
+                                return Err(PublishFailure::adoption(error));
+                            }
+                        };
+                        let result = if taken_pins.is_empty() {
+                            this.publish(seq, &published_writes, &documents, &job_context)
+                        } else {
+                            let (observed, stored) = tx.split_publications(documents);
+                            this.publish_taken(
+                                seq,
+                                &published_writes,
+                                &observed,
+                                &stored,
+                                &job_context,
+                            )
+                        };
+                        this.release_pins(&taken_pins);
+                        result
+                    }
+                    JobOutcome::Discard => {
+                        tx.discard();
+                        this.release_pins(&taken_pins);
+                        Ok(())
+                    }
+                    JobOutcome::Held => unreachable!(),
+                }
+            }),
+        ));
+        job.track_outcome(outcome);
         self.evict_idle();
+        drop(_current);
+        drop(_guard);
+        job.wait_writer().await?;
         Ok(result)
+    }
+
+    fn complete_job(&self, index: u64) {
+        let Ok(mut completed) = self.completed_jobs.lock() else {
+            return;
+        };
+        completed.insert(index);
+        let mut next = *self.outcome_delivered.borrow() + 1;
+        while completed.remove(&next) {
+            next += 1;
+        }
+        let watermark = next - 1;
+        let _ = self.outcome_delivered.send_replace(watermark);
+    }
+
+    async fn deliver_maintenance<T: Send>(
+        &self,
+        index: u64,
+        result: SessionResult<T>,
+    ) -> SessionResult<T> {
+        self.complete_job(index);
+        result
+    }
+
+    async fn deliver<T: Send>(
+        self: &Arc<Self>,
+        index: u64,
+        result: SessionResult<T>,
+    ) -> SessionResult<T> {
+        let mut delivered = self.outcome_delivered.subscribe();
+        while *delivered.borrow_and_update() < index - 1 {
+            if delivered.changed().await.is_err() {
+                return Err(SessionError::Closed);
+            }
+        }
+        let poisoned = self.failure.lock().ok().and_then(|failure| {
+            failure.as_ref().and_then(|failure| {
+                (index > failure.at && !failure.own.contains(&index)).then(|| failure.cause.clone())
+            })
+        });
+        let result = match poisoned {
+            Some(cause) => Err(SessionError::Failed { cause }),
+            None => result,
+        };
+        self.complete_job(index);
+        result
+    }
+
+    fn defer_commit<T: Send>(
+        self: &Arc<Self>,
+        tx: Transaction,
+        writes: Vec<crate::types::StorageWrite>,
+        result: T,
+        within_ms: Option<f64>,
+        context: &Context,
+    ) -> Result<T, PublishFailure> {
+        let previous = self
+            .deferred
+            .lock()
+            .ok()
+            .and_then(|mut deferred| deferred.take());
+        let previous_deadline = previous.as_ref().and_then(|held| held.deadline);
+        let new_deadline = within_ms
+            .or(self.persist_within_ms.lock().ok().and_then(|value| *value))
+            .map(|within_ms| self.now() + within_ms);
+        let id = previous
+            .as_ref()
+            .map(|held| held.id)
+            .unwrap_or_else(|| self.next_deferred_id.fetch_add(1, Ordering::SeqCst));
+        let (previous_writes, previous_changes, mut keys, mut pinned, mut deadlines, mut replaces) =
+            match previous {
+                Some(held) => (
+                    Some(held.writes),
+                    Some(held.changes),
+                    held.keys,
+                    held.pinned,
+                    held.deadlines,
+                    held.replaces,
+                ),
+                None => (
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    HashMap::new(),
+                    std::collections::HashSet::new(),
+                ),
+            };
+        for id in tx.document_ids() {
+            if !pinned.contains(&id) {
+                pinned.push(id);
+            }
+            let deadline = deadlines.entry(id).or_insert(new_deadline);
+            *deadline = match (*deadline, new_deadline) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            };
+        }
+        let deadline = crate::session::earliest_deferred_deadline(&deadlines);
+        let arm_timer = deadline.is_some() && previous_deadline != deadline;
+        for key in tx.write_keys(&writes) {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        let mut writes = merge_deferred_writes(previous_writes.as_ref(), writes);
+        let current_changes = tx
+            .adopt(crate::ids::Seq(0))
+            .map_err(PublishFailure::adoption)?;
+        let mut changes =
+            merge_deferred_changes(previous_changes, current_changes.clone(), &replaces);
+        compact_deferred_operations(&mut writes, &mut changes, &mut replaces);
+        if let Ok(mut deferred) = self.deferred.lock() {
+            *deferred = Some(DeferredCommit {
+                id,
+                deadline,
+                deadlines,
+                writes,
+                changes,
+                keys,
+                pinned: pinned.clone(),
+                replaces,
+            });
+        }
+        if let Ok(mut set) = self.pinned.lock() {
+            set.extend(pinned);
+        }
+        if arm_timer && let Some(deadline) = deadline {
+            self.arm_deferred_timer(id, deadline);
+        }
+        self.publish_deferred(&current_changes, context)?;
+        Ok(result)
+    }
+
+    fn restore_deferred(
+        self: &Arc<Self>,
+        had_previous: bool,
+        previous_deadline: Option<f64>,
+        remaining: Option<DeferredCommit>,
+    ) {
+        if !had_previous {
+            return;
+        }
+        let mut timer = None;
+        // A poisoned lock means the deferred state is unrecoverable; the
+        // Session is already failing, so no timer is armed.
+        if let Ok(mut deferred) = self.deferred.lock() {
+            if let Some(mut held) = remaining {
+                if held.deadline != previous_deadline {
+                    held.id = self.next_deferred_id.fetch_add(1, Ordering::SeqCst);
+                    timer = held.deadline.map(|deadline| (held.id, deadline));
+                }
+                *deferred = Some(held);
+                self.deferred_pending.store(true, Ordering::SeqCst);
+            } else {
+                *deferred = None;
+                self.deferred_pending.store(false, Ordering::SeqCst);
+            }
+        }
+        if let Some((id, deadline)) = timer {
+            self.arm_deferred_timer(id, deadline);
+        }
+    }
+
+    fn arm_deferred_timer(self: &Arc<Self>, id: u64, deadline: f64) {
+        if !deadline.is_finite() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let delay = (deadline - self.now()).max(0.0);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+            if let Some(session) = weak.upgrade() {
+                let _guard = session.line.lock().await;
+                if session.closing.load(Ordering::SeqCst) || session.failure().is_some() {
+                    return;
+                }
+                if session
+                    .deferred
+                    .lock()
+                    .ok()
+                    .and_then(|deferred| deferred.as_ref().map(|held| held.id))
+                    == Some(id)
+                {
+                    let _ = session.flush_deferred_on_line().await;
+                }
+            }
+        });
+    }
+
+    async fn flush_deferred_document_on_line(
+        self: &Arc<Self>,
+        id: DocumentId,
+    ) -> SessionResult<()> {
+        self.flush_deferred_impl(Some(id)).await
+    }
+
+    pub(crate) async fn flush_deferred_on_line(self: &Arc<Self>) -> SessionResult<()> {
+        self.flush_deferred_impl(None).await
+    }
+
+    async fn flush_deferred_impl(self: &Arc<Self>, only: Option<DocumentId>) -> SessionResult<()> {
+        // A barrier even without holds, as upstream `#storeHolds` (and so
+        // `unloadDocuments`): a commit admitted before this job must publish
+        // before the cache is cleared, or its adoption would re-install a
+        // document after the unload.
+        self.writer().drained().await;
+        if !self.deferred_pending.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let previous = self
+            .deferred
+            .lock()
+            .ok()
+            .and_then(|mut deferred| deferred.take());
+        let had_previous = previous.is_some();
+        let previous_deadline = previous.as_ref().and_then(|held| held.deadline);
+        let (held, remaining) = match previous {
+            Some(held) => split_deferred(held, only),
+            None => return Ok(()),
+        };
+        self.restore_deferred(had_previous, previous_deadline, remaining);
+        self.assert_healthy()?;
+        let Some(held) = held else {
+            return Ok(());
+        };
+        let this = Arc::clone(self);
+        let writes = held.writes.clone();
+        let current_index = self
+            .current_job
+            .lock()
+            .ok()
+            .and_then(|current| current.as_ref().map(|(index, _)| *index));
+        let maintenance = current_index.is_none();
+        let index =
+            current_index.unwrap_or_else(|| self.next_job_index.fetch_add(1, Ordering::SeqCst));
+        let shared = self
+            .current_job
+            .lock()
+            .ok()
+            .and_then(|current| current.as_ref().map(|(_, outcome)| Arc::clone(outcome)));
+        let maintenance_job = maintenance.then(|| LineJob::maintenance(self, index));
+        let outcome = self.writer().admit(CommitJob::stored(
+            index,
+            writes,
+            held.keys.clone(),
+            crate::chord::context::BACKGROUND_CONTEXT.clone(),
+            Box::new(move |outcome| match outcome {
+                JobOutcome::Stored(seq) => {
+                    this.advance_deferred_metadata(&held.writes, &held.changes);
+                    let result = this.publish_stored(
+                        seq,
+                        &held.writes,
+                        &held.changes,
+                        &crate::chord::context::BACKGROUND_CONTEXT,
+                    );
+                    this.release_pins(&held.pinned);
+                    result
+                }
+                JobOutcome::Discard => {
+                    this.release_pins(&held.pinned);
+                    Ok(())
+                }
+                JobOutcome::Held => unreachable!(),
+            }),
+        ));
+        if let Some(shared) = shared {
+            let mut slot = shared.lock().await;
+            *slot = Some(outcome);
+            let result = slot
+                .as_mut()
+                .expect("deferred writer outcome")
+                .await
+                .map_err(|_| SessionError::Closed)?;
+            *slot = None;
+            result?;
+        } else if let Some(mut job) = maintenance_job {
+            job.track_outcome(outcome);
+            let result = job.wait_writer().await;
+            job.deliver(result).await?;
+        } else {
+            outcome.await.map_err(|_| SessionError::Closed)??;
+        }
+        Ok(())
+    }
+
+    /// Advance the cached incarnations of a maintenance-stored deferred
+    /// commit: a stored base resets the delta count, a delta adds one
+    /// (upstream `#storeHolds`'s publish callback).
+    fn advance_deferred_metadata(
+        &self,
+        writes: &[crate::types::StorageWrite],
+        changes: &[CommitChange],
+    ) {
+        let Ok(documents) = self.documents.lock() else {
+            return;
+        };
+        for change in changes {
+            let CommitChange::Document(document) = change else {
+                continue;
+            };
+            let address = crate::documents::address_id(&crate::types::DocumentAddress {
+                kind: document.record.kind.clone(),
+                scope: document.record.scope.clone(),
+                key: document.record.key.clone(),
+            });
+            let Some(loaded) = documents.get(&address) else {
+                continue;
+            };
+            if loaded.record.id != document.record.id {
+                continue;
+            }
+            let Some(crate::types::StorageWrite::DocumentChange { content, .. }) =
+                writes.iter().find(|write| {
+                    matches!(
+                        write,
+                        crate::types::StorageWrite::DocumentChange { id, .. }
+                            if *id == document.record.id
+                    )
+                })
+            else {
+                continue;
+            };
+            if content.is_base() {
+                loaded.set_deltas_since_base(0);
+            } else {
+                loaded.set_deltas_since_base(loaded.deltas_since_base() + 1);
+            }
+        }
+    }
+
+    fn release_pins(&self, pinned: &[DocumentId]) {
+        if let Ok(mut set) = self.pinned.lock() {
+            for id in pinned {
+                set.remove(id);
+            }
+        }
     }
 
     fn publish(
@@ -865,16 +1640,61 @@ impl SessionImpl {
         writes: &[crate::types::StorageWrite],
         documents: &[CommitChange],
         context: &Context,
-    ) {
+    ) -> Result<(), PublishFailure> {
+        self.publish_filtered(seq, writes, documents, context, None)
+    }
+
+    fn publish_taken(
+        self: &Arc<Self>,
+        seq: Seq,
+        writes: &[crate::types::StorageWrite],
+        observed: &[CommitChange],
+        stored: &[CommitChange],
+        context: &Context,
+    ) -> Result<(), PublishFailure> {
+        let internal = self.publish_filtered(seq, writes, observed, context, Some(true));
+        let host = self.publish_filtered(seq, writes, stored, context, Some(false));
+        match internal {
+            Err(failure) => Err(failure),
+            Ok(()) => host,
+        }
+    }
+
+    fn publish_deferred(
+        self: &Arc<Self>,
+        documents: &[CommitChange],
+        context: &Context,
+    ) -> Result<(), PublishFailure> {
+        self.publish_filtered(crate::ids::Seq(0), &[], documents, context, Some(true))
+    }
+
+    fn publish_stored(
+        self: &Arc<Self>,
+        seq: Seq,
+        writes: &[crate::types::StorageWrite],
+        documents: &[CommitChange],
+        context: &Context,
+    ) -> Result<(), PublishFailure> {
+        self.publish_filtered(seq, writes, documents, context, Some(false))
+    }
+
+    fn publish_filtered(
+        self: &Arc<Self>,
+        seq: Seq,
+        writes: &[crate::types::StorageWrite],
+        documents: &[CommitChange],
+        context: &Context,
+        only_internal: Option<bool>,
+    ) -> Result<(), PublishFailure> {
         let listeners: Vec<(CommitListener, bool)> = match self.commit_listeners.lock() {
             Ok(listeners) => listeners
                 .iter()
                 .map(|(_, listener, internal)| (Arc::clone(listener), *internal))
                 .collect(),
-            Err(_) => return,
+            Err(_) => return Ok(()),
         };
         if listeners.is_empty() {
-            return;
+            return Ok(());
         }
         let mut changes = Vec::new();
         for write in writes {
@@ -894,17 +1714,22 @@ impl SessionImpl {
         // sets and publishes to the internal one first).
         let mut ordered = listeners;
         ordered.sort_by_key(|(_, internal)| !*internal);
+        let mut failure = None;
         for (listener, internal) in ordered {
+            if only_internal.is_some_and(|expected| expected != internal) {
+                continue;
+            }
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 listener(&publication, context);
             }));
             if let Err(payload) = outcome {
                 let message = panic_message(payload);
                 if internal {
-                    self.fail_with_context(
-                        format!("A component commit listener failed: {message}"),
-                        Some(context),
-                    );
+                    if failure.is_none() {
+                        failure = Some(PublishFailure::listener(SessionError::message(format!(
+                            "A component commit listener failed: {message}"
+                        ))));
+                    }
                 } else if let Ok(reporter) = self.listener_reporter.lock()
                     && let Some(reporter) = reporter.as_ref()
                 {
@@ -914,6 +1739,10 @@ impl SessionImpl {
                     );
                 }
             }
+        }
+        match failure {
+            Some(failure) => Err(failure),
+            None => Ok(()),
         }
     }
 
@@ -928,9 +1757,29 @@ impl SessionImpl {
         }
         let this = Arc::clone(self);
         Box::pin(async move {
-            let _guard = this.line.lock().await;
-            this.assert_healthy()?;
-            job().await
+            let _outstanding = this
+                .outstanding_commits
+                .acquire()
+                .await
+                .map_err(|_| SessionError::Closed)?;
+            let guard = this.line.lock().await;
+            let index = this.next_job_index.fetch_add(1, Ordering::SeqCst);
+            let line_job = LineJob::new(&this, index);
+            let result = std::panic::AssertUnwindSafe(ON_LINE.scope((), async {
+                let _guard = guard;
+                let _current = CurrentJobGuard::new(&this, index, &line_job.outcome);
+                this.assert_healthy()?;
+                job().await
+            }))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|payload| {
+                Err(SessionError::message(format!(
+                    "A read job panicked: {}",
+                    panic_message(payload)
+                )))
+            });
+            line_job.deliver(result).await
         })
     }
 
@@ -966,17 +1815,35 @@ impl SessionImpl {
         address: DocumentAddress,
         context: &Context,
     ) -> SessionResult<Option<JsonObject>> {
-        if let Some(cached) = self.cached(&address_id)
-            && cached.value_version == definition.version
-        {
-            check_record_scope_record(definition, &cached.record)?;
-            check_record_version_record(definition, &cached.record, cached.stored_version())?;
-            return Ok(cached.tracker.value().as_object().cloned());
+        self.assert_usable()?;
+        // A read is fenced behind earlier outcomes, including a cache hit:
+        // the load still waits for the target key's write gate.
+        if self.is_on_line() {
+            return self
+                .snapshot_load_on_line(definition, &address_id, &address, context)
+                .await;
         }
-        let _guard = self.line.lock().await;
-        self.assert_healthy()?;
+        let this = Arc::clone(self);
+        let definition = Arc::clone(definition);
+        let context = context.clone();
+        self.read_on_line(move || {
+            Box::pin(async move {
+                this.snapshot_load_on_line(&definition, &address_id, &address, &context)
+                    .await
+            })
+        })
+        .await
+    }
+
+    async fn snapshot_load_on_line(
+        self: &Arc<Self>,
+        definition: &Arc<crate::documents::DocDefinition>,
+        address_id: &str,
+        address: &DocumentAddress,
+        context: &Context,
+    ) -> SessionResult<Option<JsonObject>> {
         let loaded = self
-            .load_document(definition, &address_id, &address, context)
+            .load_document(definition, address_id, address, context)
             .await?;
         let Some(loaded) = loaded else {
             return Ok(None);
@@ -1016,10 +1883,33 @@ impl SessionImpl {
         address: DocumentAddress,
         context: &Context,
     ) -> SessionResult<Option<crate::chord::state::AttachedReplicatedState>> {
-        let _guard = self.line.lock().await;
-        self.assert_healthy()?;
+        self.assert_usable()?;
+        if self.is_on_line() {
+            return self
+                .document_state_on_line(definition, &address_id, &address, context)
+                .await;
+        }
+        let this = Arc::clone(self);
+        let definition = Arc::clone(definition);
+        let context = context.clone();
+        self.read_on_line(move || {
+            Box::pin(async move {
+                this.document_state_on_line(&definition, &address_id, &address, &context)
+                    .await
+            })
+        })
+        .await
+    }
+
+    async fn document_state_on_line(
+        self: &Arc<Self>,
+        definition: &Arc<crate::documents::DocDefinition>,
+        address_id: &str,
+        address: &DocumentAddress,
+        context: &Context,
+    ) -> SessionResult<Option<crate::chord::state::AttachedReplicatedState>> {
         let loaded = self
-            .load_document(definition, &address_id, &address, context)
+            .load_document(definition, address_id, address, context)
             .await?;
         let Some(loaded) = loaded else {
             return Ok(None);
@@ -1055,9 +1945,18 @@ impl SessionImpl {
             let failure = weak.upgrade().and_then(|session| session.failure());
             source_close.close_session(failure);
         }));
-        self.attach_document(&address_id, record_id);
+        // Close/failure may have won while the document loaded. Upstream
+        // `subscribeClose` throws from `assertUsable`; the Rust registration is
+        // inert then, so reject the attachment instead of returning one that
+        // can never end.
+        if let Err(error) = self.assert_usable() {
+            subscription_commit.unsubscribe();
+            subscription_close.unsubscribe();
+            return Err(error);
+        }
+        self.attach_document(address_id, record_id);
         let weak = Arc::downgrade(self);
-        let attached = address_id.clone();
+        let attached = address_id.to_string();
         source.set_release(Box::new(move || {
             subscription_commit.unsubscribe();
             subscription_close.unsubscribe();
@@ -1068,13 +1967,15 @@ impl SessionImpl {
         Ok(Some(attach_state(&source)))
     }
 
-    /// Attach a serialized async watch to one document (upstream `watchDoc`).
-    pub fn watch_doc(
+    /// Attach a synchronous observer atomically to one document address.
+    pub fn observe_doc<'a>(
         self: &Arc<Self>,
         token: &DocToken,
-        owner: DocOwner<'_>,
+        owner: DocOwner<'a>,
+        observer: Arc<dyn crate::session::Observer<crate::session::ObservedDocumentValue>>,
         context: &Context,
-    ) -> SessionFuture<'_, Option<CommittedWatch>> {
+    ) -> SessionFuture<'a, Option<crate::session::Observation<crate::session::ObservedDocumentValue>>>
+    {
         let definition = Arc::clone(&token.definition);
         let resolved = match resolve_address(&definition, doc_target(&definition, owner)) {
             Ok(resolved) => resolved,
@@ -1087,8 +1988,68 @@ impl SessionImpl {
         let this = Arc::clone(self);
         let context = context.clone();
         Box::pin(async move {
-            this.watch_doc_resolved(&definition, resolved.id, resolved.address, &context, signal)
-                .await
+            let owner_task = match owner {
+                DocOwner::Task(task) | DocOwner::TaskFamily(task, _) => Some(task),
+                _ => None,
+            };
+            let Some(watch) = this
+                .watch_doc_resolved(
+                    &definition,
+                    resolved.id,
+                    resolved.address,
+                    &context,
+                    signal,
+                    owner_task,
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            let weak = Arc::downgrade(&this);
+            let reporter = Arc::new(move |message: String, context: Option<Context>| {
+                if let Some(session) = weak.upgrade()
+                    && let Ok(slot) = session.listener_reporter.lock()
+                    && let Some(reporter) = slot.as_ref()
+                {
+                    reporter(message, context);
+                }
+            });
+            Ok(Some(watch.observe(observer, reporter)))
+        })
+    }
+
+    /// Attach a serialized async watch to one document (upstream `watchDoc`).
+    pub fn watch_doc<'a>(
+        self: &Arc<Self>,
+        token: &DocToken,
+        owner: DocOwner<'a>,
+        context: &Context,
+    ) -> SessionFuture<'a, Option<CommittedWatch>> {
+        let definition = Arc::clone(&token.definition);
+        let resolved = match resolve_address(&definition, doc_target(&definition, owner)) {
+            Ok(resolved) => resolved,
+            Err(error) => return error_future(error.into()),
+        };
+        if let Err(error) = self.assert_usable() {
+            return error_future(error);
+        }
+        let signal = context.abort_signal();
+        let this = Arc::clone(self);
+        let context = context.clone();
+        Box::pin(async move {
+            let owner_task = match owner {
+                DocOwner::Task(task) | DocOwner::TaskFamily(task, _) => Some(task),
+                _ => None,
+            };
+            this.watch_doc_resolved(
+                &definition,
+                resolved.id,
+                resolved.address,
+                &context,
+                signal,
+                owner_task,
+            )
+            .await
         })
     }
 
@@ -1099,17 +2060,56 @@ impl SessionImpl {
         address: DocumentAddress,
         context: &Context,
         signal: Option<AbortSignal>,
+        owner_task: Option<crate::ids::TaskId>,
     ) -> SessionResult<Option<CommittedWatch>> {
         if signal.as_ref().is_some_and(|signal| signal.is_cancelled()) {
             return Err(SessionError::Aborted);
         }
-        let _guard = self.line.lock().await;
-        self.assert_healthy()?;
+        if self.is_on_line() {
+            return self
+                .watch_doc_on_line(
+                    definition,
+                    &address_id,
+                    &address,
+                    context,
+                    signal,
+                    owner_task,
+                )
+                .await;
+        }
+        let this = Arc::clone(self);
+        let definition = Arc::clone(definition);
+        let context = context.clone();
+        self.read_on_line(move || {
+            Box::pin(async move {
+                this.watch_doc_on_line(
+                    &definition,
+                    &address_id,
+                    &address,
+                    &context,
+                    signal,
+                    owner_task,
+                )
+                .await
+            })
+        })
+        .await
+    }
+
+    async fn watch_doc_on_line(
+        self: &Arc<Self>,
+        definition: &Arc<crate::documents::DocDefinition>,
+        address_id: &str,
+        address: &DocumentAddress,
+        context: &Context,
+        signal: Option<AbortSignal>,
+        owner_task: Option<crate::ids::TaskId>,
+    ) -> SessionResult<Option<CommittedWatch>> {
         if signal.as_ref().is_some_and(|signal| signal.is_cancelled()) {
             return Err(SessionError::Aborted);
         }
         let loaded = self
-            .load_document(definition, &address_id, &address, context)
+            .load_document(definition, address_id, address, context)
             .await?;
         if signal.as_ref().is_some_and(|signal| signal.is_cancelled()) {
             return Err(SessionError::Aborted);
@@ -1121,20 +2121,71 @@ impl SessionImpl {
         check_record_version_record(definition, &loaded.record, loaded.stored_version())?;
         let watch = CommittedWatch::new(loaded.tracker.value());
         let observed = Arc::new(AtomicU64::new(loaded.value_version));
+        let observed_id = Arc::new(AtomicU64::new(loaded.record.id.get()));
         let record_id = loaded.record.id;
         let watch_commit = watch.clone();
+        let watched_address = address_id.to_string();
+        let watch_owner = watch.clone();
+        let watch_session = Arc::downgrade(self);
+        let detach_id = Arc::clone(&observed_id);
         let subscription_commit =
             self.subscribe_internal_commits(Arc::new(move |publication, context| {
                 for change in &publication.changes {
-                    if let CommitChange::Document(document) = change {
-                        if document.record.id != record_id {
-                            continue;
+                    match change {
+                        CommitChange::Document(document) => {
+                            let changed_address =
+                                crate::documents::address_id(&crate::types::DocumentAddress {
+                                    kind: document.record.kind.clone(),
+                                    scope: document.record.scope.clone(),
+                                    key: document.record.key.clone(),
+                                });
+                            if changed_address != watched_address {
+                                continue;
+                            }
+                            let retired = document.is_retirement();
+                            if retired {
+                                if document.record.id.get() != observed_id.load(Ordering::SeqCst) {
+                                    continue;
+                                }
+                                if let Some(session) = watch_session.upgrade() {
+                                    session.detach_document(&watched_address, document.record.id);
+                                }
+                                watch_commit.advance(
+                                    document.frame_value(),
+                                    Vec::new(),
+                                    true,
+                                    context.clone(),
+                                );
+                                continue;
+                            }
+                            let previous_id = observed_id.load(Ordering::SeqCst);
+                            let ops = observed_operations_for(&observed_id, &observed, document);
+                            if document.record.id.get() != previous_id
+                                && let Some(session) = watch_session.upgrade()
+                            {
+                                session.detach_document(
+                                    &watched_address,
+                                    DocumentId::from_number(previous_id),
+                                );
+                                session.attach_document(&watched_address, document.record.id);
+                            }
+                            watch_commit.advance(
+                                document.frame_value(),
+                                ops,
+                                false,
+                                context.clone(),
+                            );
                         }
-                        let ops = observed_operations(&observed, document);
-                        if ops.is_empty() {
-                            continue;
+                        CommitChange::Table(crate::types::StorageWrite::Task { value })
+                            if owner_task == Some(value.id)
+                                && matches!(
+                                    value.state,
+                                    crate::types::TaskState::Terminal { .. }
+                                ) =>
+                        {
+                            watch_owner.close_session(None);
                         }
-                        watch_commit.advance(document.frame_value(), ops, context.clone());
+                        _ => {}
                     }
                 }
             }));
@@ -1144,14 +2195,24 @@ impl SessionImpl {
             let failure = weak.upgrade().and_then(|session| session.failure());
             watch_close.close_session(failure);
         }));
-        self.attach_document(&address_id, record_id);
+        // As `document_state_resolved`: a registration during close is inert,
+        // so a watch created here would never receive `end`.
+        if let Err(error) = self.assert_usable() {
+            subscription_commit.unsubscribe();
+            subscription_close.unsubscribe();
+            return Err(error);
+        }
+        self.attach_document(address_id, record_id);
         let weak = Arc::downgrade(self);
-        let attached = address_id.clone();
+        let attached = address_id.to_string();
         watch.set_detach(Box::new(move || {
             subscription_commit.unsubscribe();
             subscription_close.unsubscribe();
             if let Some(session) = weak.upgrade() {
-                session.detach_document(&attached, record_id);
+                session.detach_document(
+                    &attached,
+                    DocumentId::from_number(detach_id.load(Ordering::SeqCst)),
+                );
             }
         }));
         if let Some(signal) = signal {
@@ -1194,14 +2255,37 @@ impl SessionImpl {
     }
 
     async fn snapshot_as_of_resolved(
-        &self,
+        self: &Arc<Self>,
         definition: &Arc<crate::documents::DocDefinition>,
         conversation: ConversationId,
         at: EntryId,
         context: &Context,
     ) -> SessionResult<Option<JsonObject>> {
-        let _guard = self.line.lock().await;
-        self.assert_healthy()?;
+        self.assert_usable()?;
+        if self.is_on_line() {
+            return self
+                .snapshot_as_of_on_line(definition, conversation, at, context)
+                .await;
+        }
+        let this = Arc::clone(self);
+        let definition = Arc::clone(definition);
+        let context = context.clone();
+        self.read_on_line(move || {
+            Box::pin(async move {
+                this.snapshot_as_of_on_line(&definition, conversation, at, &context)
+                    .await
+            })
+        })
+        .await
+    }
+
+    async fn snapshot_as_of_on_line(
+        self: &Arc<Self>,
+        definition: &Arc<crate::documents::DocDefinition>,
+        conversation: ConversationId,
+        at: EntryId,
+        context: &Context,
+    ) -> SessionResult<Option<JsonObject>> {
         let stored_entry = self
             .storage()
             .entry_in_conversation(conversation, at, context)
@@ -1219,7 +2303,10 @@ impl SessionImpl {
             key: None,
         };
         let point = crate::types::DocumentPoint::At(stored_entry.commit_seq);
-        let record = self.guarded.find_document(address, point, context).await?;
+        let record = self
+            .storage()
+            .find_document(address, point, context)
+            .await?;
         let Some(record) = record else {
             return Ok(None);
         };
@@ -1277,8 +2364,12 @@ impl SessionImpl {
         let this = Arc::clone(self);
         Box::pin(async move {
             let _guard = this.line.lock().await;
+            this.flush_deferred_on_line().await?;
             if let Ok(mut documents) = this.documents.lock() {
                 documents.clear();
+            }
+            if let Ok(mut idle) = this.idle_since.lock() {
+                idle.clear();
             }
             Ok(())
         })
@@ -1297,23 +2388,37 @@ impl SessionImpl {
             let _guard = this.line.lock().await;
             if this.cleanup_done.swap(true, Ordering::SeqCst) {
                 this.settle_end();
+                if let Some(error) = this.close_error.lock().ok().and_then(|error| error.clone()) {
+                    return Err(error.into_session_error());
+                }
                 return Ok(());
             }
-            // If closing is cancelled or fails, the flag must go back to
-            // false so a later close can retry (the old code left the
-            // session permanently "cleaned up" without a closed storage).
             let mut reset = ResetOnDrop::new(&this.cleanup_done);
+            this.writer().drained().await;
             if let Ok(mut pending) = this.document_sweep.lock()
                 && let Some(sweep) = pending.take()
                 && let Some(disarm) = sweep.disarm
             {
                 disarm();
             }
+            let deferred_result = if this.failure().is_none() {
+                this.flush_deferred_on_line().await
+            } else {
+                Ok(())
+            };
+            if let Ok(mut deferred) = this.deferred.lock() {
+                deferred.take();
+                this.deferred_pending.store(false, Ordering::SeqCst);
+            }
+            this.end_commit_observers();
             if let Ok(mut documents) = this.documents.lock() {
                 documents.clear();
             }
             if let Ok(mut idle) = this.idle_since.lock() {
                 idle.clear();
+            }
+            if let Ok(mut pinned) = this.pinned.lock() {
+                pinned.clear();
             }
             if let Ok(mut attached) = this.attached.lock() {
                 attached.clear();
@@ -1321,15 +2426,24 @@ impl SessionImpl {
             if let Ok(mut listeners) = this.commit_listeners.lock() {
                 listeners.clear();
             }
+            this.writer().shutdown();
             let result = this.guarded.close(&context).await;
             if let Err(error) = &result {
                 this.fail(error.to_string());
             }
+            let outcome = match result {
+                Ok(()) => deferred_result,
+                Err(error) => Err(error.into()),
+            };
+            if let Err(error) = &outcome
+                && let Ok(mut close_error) = this.close_error.lock()
+            {
+                *close_error = Some(CloseError::from_session_error(error));
+            }
             // `closed` settles only after the backend close, like upstream.
             this.settle_end();
             reset.disarm();
-            result?;
-            Ok(())
+            outcome
         })
     }
 
@@ -1343,47 +2457,208 @@ impl SessionImpl {
 
     // ─── Listeners ──────────────────────────────────────────────────────────
 
-    /// Register a synchronous post-adoption commit listener (upstream `subscribeCommits`).
+    /// Register a synchronous post-adoption host commit listener. This is the
+    /// Rust lower-level counterpart of the `observeCommits()` dispatch; upstream
+    /// has no separate `subscribeCommits` method and schedules host observers as
+    /// a microtask (D-111 registers the synchronous Rust form).
     pub fn subscribe_commits(&self, listener: CommitListener) -> Subscription {
+        if self.assert_usable().is_err() {
+            return Subscription::new(|| {});
+        }
         let store = Arc::clone(&self.commit_listeners);
         let id = NEXT_LISTENER_ID.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut listeners) = store.lock() {
             listeners.push((id, listener, false));
         }
-        Subscription::new(move || {
+        let subscription = Subscription::new(move || {
             if let Ok(mut listeners) = store.lock() {
                 listeners.retain(|(existing, _, _)| *existing != id);
             }
-        })
+        });
+        if self.assert_usable().is_err() {
+            subscription.unsubscribe();
+            return Subscription::new(|| {});
+        }
+        subscription
+    }
+
+    /// Observe stored publications without replaying a synthetic value.
+    pub fn observe_commits(
+        self: &Arc<Self>,
+        observer: Arc<dyn crate::session::CommitObserver>,
+    ) -> crate::session::CommitObservation {
+        // Upstream `observeCommits()` calls `assertUsable()` and throws. The
+        // Rust API has no error return here, so an observation registered after
+        // close is ended immediately instead of being stored where it would
+        // never receive `end` (the close path already drained the observers).
+        if let Err(error) = self.assert_usable() {
+            let end = match error {
+                SessionError::Failed { cause } => crate::session::WatchEnd::Failed { error: cause },
+                _ => crate::session::WatchEnd::Ended,
+            };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.end(end))).is_err()
+            {
+                self.report_listener_error("commit observer end panicked".to_string(), None);
+            }
+            return crate::session::CommitObservation {
+                detach: Subscription::new(|| {}),
+            };
+        }
+        let active = Arc::new(AtomicBool::new(true));
+        let observer_id = NEXT_LISTENER_ID.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut observers) = self.commit_observers.lock() {
+            observers.push((observer_id, Arc::clone(&observer), Arc::clone(&active)));
+        }
+        let detachment = Arc::new(Mutex::new(None::<crate::session::Subscription>));
+        let commit_subscription = {
+            let active = Arc::clone(&active);
+            let detachment = Arc::clone(&detachment);
+            let observer = Arc::clone(&observer);
+            let weak = Arc::downgrade(self);
+            self.subscribe_commits(Arc::new(move |publication, context| {
+                if !active.load(Ordering::SeqCst) {
+                    return;
+                }
+                let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    observer.advance(publication, context);
+                }));
+                if failed.is_err() && active.swap(false, Ordering::SeqCst) {
+                    observer.end(crate::session::WatchEnd::ListenerError {
+                        error: "commit observer panicked".to_string(),
+                    });
+                    if let Some(session) = weak.upgrade()
+                        && let Ok(reporter) = session.listener_reporter.lock()
+                        && let Some(reporter) = reporter.as_ref()
+                    {
+                        reporter(
+                            "listener_error: commit observer panicked".to_string(),
+                            Some(context.clone()),
+                        );
+                    }
+                    if let Ok(mut slot) = detachment.lock()
+                        && let Some(subscription) = slot.take()
+                    {
+                        subscription.unsubscribe();
+                    }
+                }
+            }))
+        };
+        let observers = Arc::clone(&self.commit_observers);
+        let detach_active = Arc::clone(&active);
+        let detach = Subscription::new(move || {
+            detach_active.store(false, Ordering::SeqCst);
+            commit_subscription.unsubscribe();
+            if let Ok(mut registered) = observers.lock() {
+                registered.retain(|(id, _, _)| *id != observer_id);
+            }
+        });
+        let detach = Arc::new(detach);
+        if let Ok(mut slot) = detachment.lock() {
+            *slot = Some(Subscription::new({
+                let detach = Arc::clone(&detach);
+                move || detach.unsubscribe()
+            }));
+        }
+        if let Err(error) = self.assert_usable() {
+            let end = match error {
+                SessionError::Failed { cause } => crate::session::WatchEnd::Failed { error: cause },
+                _ => crate::session::WatchEnd::Ended,
+            };
+            let should_end = active.swap(false, Ordering::SeqCst);
+            detach.unsubscribe();
+            if should_end
+                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.end(end)))
+                    .is_err()
+            {
+                self.report_listener_error("commit observer end panicked".to_string(), None);
+            }
+        }
+        crate::session::CommitObservation {
+            detach: Subscription::new(move || detach.unsubscribe()),
+        }
+    }
+
+    fn end_commit_observers(&self) {
+        let observers = match self.commit_observers.lock() {
+            Ok(mut registered) => registered.drain(..).collect::<Vec<_>>(),
+            Err(_) => return,
+        };
+        let end = match self.failure() {
+            Some(error) => crate::session::WatchEnd::Failed { error },
+            None => crate::session::WatchEnd::Ended,
+        };
+        for (_, observer, active) in observers {
+            if !active.swap(false, Ordering::SeqCst) {
+                continue;
+            }
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer.end(end.clone());
+            }))
+            .is_err()
+            {
+                self.report_listener_error("commit observer end panicked".to_string(), None);
+            }
+        }
     }
 
     /// Register the Session's own component commit listener: its throw fails
     /// the Session (upstream `subscribeInternalCommits`).
     pub fn subscribe_internal_commits(&self, listener: CommitListener) -> Subscription {
+        if self.assert_usable().is_err() {
+            return Subscription::new(|| {});
+        }
         let store = Arc::clone(&self.commit_listeners);
         let id = NEXT_LISTENER_ID.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut listeners) = store.lock() {
             listeners.push((id, listener, true));
         }
-        Subscription::new(move || {
+        let subscription = Subscription::new(move || {
             if let Ok(mut listeners) = store.lock() {
                 listeners.retain(|(existing, _, _)| *existing != id);
             }
-        })
+        });
+        if self.assert_usable().is_err() {
+            subscription.unsubscribe();
+            return Subscription::new(|| {});
+        }
+        subscription
     }
 
     /// Register a synchronous close listener (upstream `subscribeClose`).
     pub fn subscribe_close(&self, listener: CloseListener) -> Subscription {
+        if self.assert_usable().is_err() {
+            return Subscription::new(|| {});
+        }
         let store = Arc::clone(&self.close_listeners);
         let id = NEXT_LISTENER_ID.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut listeners) = store.lock() {
             listeners.push((id, listener));
         }
-        Subscription::new(move || {
-            if let Ok(mut listeners) = store.lock() {
+        let subscription_store = Arc::clone(&store);
+        let subscription = Subscription::new(move || {
+            if let Ok(mut listeners) = subscription_store.lock() {
                 listeners.retain(|(existing, _)| *existing != id);
             }
-        })
+        });
+        if self.assert_usable().is_err() {
+            // Close/failure won between the check and the push: a listener
+            // still in the set never saw `notify_close`, so call it now (once,
+            // as the registration is immediately closed).
+            let removed = store.lock().ok().and_then(|mut listeners| {
+                listeners
+                    .iter()
+                    .position(|(existing, _)| *existing == id)
+                    .map(|index| listeners.remove(index).1)
+            });
+            subscription.unsubscribe();
+            if let Some(listener) = removed
+                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener())).is_err()
+            {
+                self.report_listener_error("A close listener panicked".to_string(), None);
+            }
+            return Subscription::new(|| {});
+        }
+        subscription
     }
 
     fn assert_usable(&self) -> SessionResult<()> {
@@ -1402,6 +2677,239 @@ impl SessionImpl {
     }
 }
 
+fn split_deferred(
+    held: DeferredCommit,
+    only: Option<DocumentId>,
+) -> (Option<DeferredCommit>, Option<DeferredCommit>) {
+    let Some(only) = only else {
+        return (Some(held), None);
+    };
+    if !held.writes.iter().any(|write| {
+        matches!(write, crate::types::StorageWrite::DocumentChange { id, .. } if *id == only)
+    }) {
+        return (None, Some(held));
+    }
+    let DeferredCommit {
+        id,
+        writes,
+        changes,
+        pinned,
+        deadlines,
+        replaces,
+        ..
+    } = held;
+    let mut selected_writes = Vec::new();
+    let mut remaining_writes = Vec::new();
+    for write in writes {
+        if matches!(&write, crate::types::StorageWrite::DocumentChange { id, .. } if *id == only) {
+            selected_writes.push(write);
+        } else {
+            remaining_writes.push(write);
+        }
+    }
+    let mut selected_changes = Vec::new();
+    let mut remaining_changes = Vec::new();
+    for change in changes {
+        if matches!(&change, CommitChange::Document(document) if document.record.id == only) {
+            selected_changes.push(change);
+        } else {
+            remaining_changes.push(change);
+        }
+    }
+    let selected_pinned = pinned
+        .iter()
+        .copied()
+        .filter(|id| *id == only)
+        .collect::<Vec<_>>();
+    let remaining_pinned = pinned
+        .into_iter()
+        .filter(|id| *id != only)
+        .collect::<Vec<_>>();
+    let selected_deadlines = deadlines
+        .iter()
+        .filter(|(id, _)| **id == only)
+        .map(|(id, deadline)| (*id, *deadline))
+        .collect::<HashMap<_, _>>();
+    let remaining_deadlines = deadlines
+        .into_iter()
+        .filter(|(id, _)| *id != only)
+        .collect::<HashMap<_, _>>();
+    let selected_replaces = replaces
+        .iter()
+        .copied()
+        .filter(|id| *id == only)
+        .collect::<std::collections::HashSet<_>>();
+    let remaining_replaces = replaces
+        .into_iter()
+        .filter(|id| *id != only)
+        .collect::<std::collections::HashSet<_>>();
+    let selected = DeferredCommit {
+        id,
+        deadline: crate::session::earliest_deferred_deadline(&selected_deadlines),
+        deadlines: selected_deadlines,
+        writes: selected_writes,
+        keys: crate::session::transaction::deferred_keys(&selected_changes),
+        changes: selected_changes,
+        pinned: selected_pinned,
+        replaces: selected_replaces,
+    };
+    let has_remaining = !remaining_writes.is_empty();
+    let remaining = DeferredCommit {
+        id,
+        deadline: crate::session::earliest_deferred_deadline(&remaining_deadlines),
+        deadlines: remaining_deadlines,
+        writes: remaining_writes,
+        keys: crate::session::transaction::deferred_keys(&remaining_changes),
+        changes: remaining_changes,
+        pinned: remaining_pinned,
+        replaces: remaining_replaces,
+    };
+    (Some(selected), has_remaining.then_some(remaining))
+}
+
+fn merge_deferred_writes(
+    previous: Option<&Vec<crate::types::StorageWrite>>,
+    current: Vec<crate::types::StorageWrite>,
+) -> Vec<crate::types::StorageWrite> {
+    let mut merged = previous.cloned().unwrap_or_default();
+    for write in current {
+        let crate::types::StorageWrite::DocumentChange { id, content } = &write else {
+            merged.push(write);
+            continue;
+        };
+        let existing = merged.iter_mut().find(|existing| {
+            matches!(existing, crate::types::StorageWrite::DocumentChange { id: existing_id, .. } if existing_id == id)
+        });
+        if let Some(crate::types::StorageWrite::DocumentChange {
+            content: existing_content,
+            ..
+        }) = existing
+        {
+            match (existing_content, content) {
+                (
+                    crate::types::DocumentContent::Delta {
+                        version: existing_version,
+                        ops: existing_ops,
+                    },
+                    crate::types::DocumentContent::Delta { version, ops },
+                ) if existing_version == version => existing_ops.extend(ops.iter().cloned()),
+                (
+                    crate::types::DocumentContent::Base { .. },
+                    crate::types::DocumentContent::Delta { .. },
+                ) => {}
+                (existing_content, content) => {
+                    *existing_content = content.clone();
+                }
+            }
+        } else {
+            merged.push(write);
+        }
+    }
+    merged
+}
+
+fn merge_deferred_changes(
+    previous: Option<Vec<CommitChange>>,
+    current: Vec<CommitChange>,
+    replaces: &std::collections::HashSet<crate::ids::DocumentId>,
+) -> Vec<CommitChange> {
+    let mut merged = previous.unwrap_or_default();
+    for change in current {
+        let CommitChange::Document(document) = &change else {
+            merged.push(change);
+            continue;
+        };
+        let existing = merged.iter_mut().find(|existing| {
+            matches!(existing, CommitChange::Document(existing_document) if existing_document.record.id == document.record.id)
+        });
+        if let Some(CommitChange::Document(existing_document)) = existing {
+            if replaces.contains(&document.record.id) {
+                // The held pending operations are a replacement: later
+                // operations are covered by the current value (upstream
+                // `PendingOps` ignores pushes in its `replace` state).
+                *existing_document = document.clone();
+                continue;
+            }
+            let mut operations = std::mem::take(&mut existing_document.ops);
+            operations.extend(document.ops.iter().cloned());
+            *existing_document = document.clone();
+            existing_document.ops = operations;
+        } else {
+            merged.push(change);
+        }
+    }
+    merged
+}
+
+fn compact_deferred_operations(
+    writes: &mut [crate::types::StorageWrite],
+    changes: &mut [CommitChange],
+    replaces: &mut std::collections::HashSet<crate::ids::DocumentId>,
+) {
+    let mut operations_by_document = std::collections::HashMap::new();
+    for change in &mut *changes {
+        let CommitChange::Document(document) = change else {
+            continue;
+        };
+        let id = document.record.id;
+        if replaces.contains(&id) {
+            // Upstream `Hold.pending` stays in its `replace` state: later
+            // operations are covered by the current value, and the stored
+            // change is the replacement.
+            let operations = vec![crate::chord::delta::Op::Replace(document.frame_value())];
+            operations_by_document.insert(id, operations.clone());
+            document.ops = operations;
+            continue;
+        }
+        let mut pending = crate::chord::delta::PendingOps::new();
+        pending.push(&document.ops);
+        let operations = match pending.take() {
+            crate::chord::delta::PendingTake::Ops(operations) => operations,
+            crate::chord::delta::PendingTake::Replace => {
+                replaces.insert(id);
+                vec![crate::chord::delta::Op::Replace(document.frame_value())]
+            }
+        };
+        operations_by_document.insert(id, operations.clone());
+        document.ops = operations;
+    }
+    for write in writes {
+        let crate::types::StorageWrite::DocumentChange { id, content } = write else {
+            continue;
+        };
+        if replaces.contains(id) {
+            if let Some(document) = changes.iter().find_map(|change| match change {
+                CommitChange::Document(document) if document.record.id == *id => Some(document),
+                _ => None,
+            }) {
+                // An overflowed held commit stores the whole value as a base,
+                // as upstream `storeHeld` does for `replace`.
+                *content = crate::types::DocumentContent::Base {
+                    version: document.version.unwrap_or(0),
+                    value: document.value.clone().unwrap_or_default(),
+                };
+            }
+            continue;
+        }
+        match content {
+            crate::types::DocumentContent::Delta { ops, .. } => {
+                if let Some(operations) = operations_by_document.get(id) {
+                    *ops = operations.clone();
+                }
+            }
+            crate::types::DocumentContent::Base { value, version } => {
+                if let Some(document) = changes.iter().find_map(|change| match change {
+                    CommitChange::Document(document) if document.record.id == *id => Some(document),
+                    _ => None,
+                }) {
+                    *value = document.value.clone().unwrap_or_default();
+                    *version = document.version.unwrap_or(*version);
+                }
+            }
+        }
+    }
+}
+
 /// The message of a caught panic payload.
 pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -1416,11 +2924,7 @@ pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// Install a watch listener helper used by tests and consumers.
 pub fn watch_listener<F>(function: F) -> WatchListener
 where
-    F: Fn(
-            crate::session::ObservedDocumentValue,
-            Vec<crate::chord::delta::Op>,
-            Context,
-        ) -> crate::session::WatchFuture
+    F: Fn(crate::session::WatchCall, Context) -> crate::session::WatchFuture
         + Send
         + Sync
         + 'static,

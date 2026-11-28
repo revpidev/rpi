@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::keybindings::{Keybinding, get_keybindings};
+use crate::keybindings::{Keybinding, get_keybindings, get_select_page_index};
 use crate::tui::{
     Component, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
     TuiMouseHandlerResult,
@@ -356,6 +356,10 @@ impl SelectList {
 }
 
 impl Component for SelectList {
+    fn captures_viewport_input(&self) -> bool {
+        true
+    }
+
     fn invalidate(&mut self) {
         // No cached state to invalidate currently
     }
@@ -493,6 +497,17 @@ impl Component for SelectList {
 
         let kb = get_keybindings();
         let kb = kb.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = get_select_page_index(
+            &kb,
+            key_data,
+            self.selected_index,
+            self.filtered_items.len(),
+            self.max_visible,
+        ) {
+            self.selected_index = index;
+            self.notify_selection_change();
+            return;
+        }
         // Up arrow - wrap to bottom when at top
         if kb.matches(key_data, Keybinding::SelectUp) {
             self.selected_index = if self.selected_index == 0 {

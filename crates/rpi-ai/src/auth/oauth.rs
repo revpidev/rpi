@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/auth/oauth/` @ pi 4a080252f (v1.4.0) — OAuth flow
+//! Port of `packages/ai/src/auth/oauth/` @ pi b4afdddf (v1.5.2) — OAuth flow
 //! building blocks: PKCE (`pkce`), the RFC 8628 device-code polling framework
 //! (`device_code`), the shared loopback callback server (`callback_server`),
 //! the shared browser page (`callback_page`), the flow registry (`load`) and
@@ -18,6 +18,7 @@ pub mod openai_codex;
 pub mod openrouter;
 pub mod pkce;
 pub mod radius;
+pub mod trusted_url;
 pub mod xai;
 
 pub use anthropic::anthropic_oauth;

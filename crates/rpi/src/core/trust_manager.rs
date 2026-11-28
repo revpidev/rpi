@@ -248,9 +248,12 @@ fn with_trust_file_lock<T>(
         match file.try_lock_exclusive() {
             Ok(()) => break,
             // Retry only on contention (proper-lockfile retries on
-            // `ELOCKED` and fails on anything else; T14 review m3).
+            // `ELOCKED` and fails on anything else; T14 review m3). Windows
+            // reports a held lock as `ERROR_LOCK_VIOLATION` (33), not
+            // `WouldBlock`.
             Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock && attempt < MAX_ATTEMPTS =>
+                if crate::core::settings_write::is_lock_contended(&error)
+                    && attempt < MAX_ATTEMPTS =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -414,7 +417,7 @@ pub fn resolve_project_trusted(
         return Ok(trust_override);
     }
     if !has_trust_requiring_project_resources(cwd) {
-        return Ok(true);
+        return Ok(trust_store.get(cwd)?.unwrap_or(true));
     }
 
     // The `project_trust` extension event (project-trust.ts:54-70): the
@@ -502,7 +505,7 @@ pub async fn resolve_project_trusted_async(
         return Ok(trust_override);
     }
     if !has_trust_requiring_project_resources(cwd) {
-        return Ok(true);
+        return Ok(trust_store.get(cwd)?.unwrap_or(true));
     }
     if let Some(event) = extension_event
         && event.trusted != ProjectTrustEventDecision::Undecided
@@ -1121,6 +1124,24 @@ mod tests {
         .unwrap();
         assert!(!trusted);
         assert!(!dirs.agent_dir.join("trust.json").exists());
+    }
+
+    #[test]
+    fn saved_distrust_wins_even_without_sensitive_project_resources() {
+        let dirs = test_dirs();
+        let store = ProjectTrustStore::new(&dirs.agent_dir);
+        store.set(&dirs.cwd, Some(false)).expect("save distrust");
+        assert!(!has_trust_requiring_project_resources(&dirs.cwd));
+        let trusted = resolve_project_trusted(
+            &dirs.cwd,
+            &store,
+            None,
+            DefaultProjectTrust::Always,
+            None,
+            &mut ProjectTrustContext::headless(),
+        )
+        .expect("resolve saved decision");
+        assert!(!trusted);
     }
 
     #[test]

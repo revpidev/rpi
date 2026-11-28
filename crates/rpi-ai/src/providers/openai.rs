@@ -1,14 +1,12 @@
 //! Port of `packages/ai/src/providers/openai.ts` @ pi 0.82.1 (2efa728).
 
-use std::sync::Arc;
-
 use crate::api::openai_decisions::{OPENAI_DECISIONS_API, openai_decisions_api};
 use crate::api::openai_responses::OpenAiResponses;
 use crate::auth::oauth::openai_chatgpt_oauth;
 use crate::auth::{Credential, ProviderAuth, env_api_key_auth};
-use crate::generated::{get_builtin_all_models, get_builtin_models};
 use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
 use crate::types::AnyModel;
+use std::sync::Arc;
 
 /// `openaiProvider()`.
 pub fn openai_provider() -> Arc<dyn Provider> {
@@ -26,10 +24,9 @@ pub fn openai_provider() -> Arc<dyn Provider> {
             // (`02eed88fd`); loginLabel has no `OAuthAuth` slot in rpi.
             oauth: Some(openai_chatgpt_oauth()),
         },
-        models: get_builtin_models("openai").to_vec(),
         // Schema-v6 all-type baseline: chat + the `openai-decisions`
         // classifier (`gpt-6-luna`, R2.4.1).
-        all_models: get_builtin_all_models("openai").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared("openai")),
         classifiers: std::collections::HashMap::from([(
             OPENAI_DECISIONS_API.to_owned(),
             openai_decisions_api(),

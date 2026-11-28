@@ -1,5 +1,5 @@
 //! Asynchronous SQLite facade (port of `packages/chord/src/sqlite/database.ts`
-//! and `node.ts` @ `4a080252f`; re-exported as `rpi_durable::storage::sqlite::database`
+//! and `node.ts` @ `b4afdddf`; re-exported as `rpi_durable::storage::sqlite::database`
 //! for the durable entry points).
 //!
 //! Selected stack (FR-C R4): `rusqlite` + `bundled` + a dedicated blocking
@@ -309,6 +309,8 @@ fn in_transaction() -> bool {
 /// Asynchronous SQL executor shared by a database and its transaction handles.
 pub struct SqliteExecutor {
     worker: Arc<Worker>,
+    /// Number of statements/connection operations issued (D02 evidence).
+    queries: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SqliteExecutor {
@@ -338,6 +340,19 @@ impl SqliteExecutor {
                 let bindings = rusqlite_params(&params);
                 statement.execute(rusqlite::params_from_iter(bindings.iter()))?;
                 Ok(())
+            }
+        })
+        .await
+    }
+
+    /// Execute one statement and return the number of affected rows.
+    pub async fn run_counted(&self, sql: &str, params: Vec<SqliteValue>) -> StorageResult<usize> {
+        self.with_connection({
+            let sql = sql.to_string();
+            move |conn| {
+                let mut statement = conn.prepare_cached(&sql)?;
+                let bindings = rusqlite_params(&params);
+                Ok(statement.execute(rusqlite::params_from_iter(bindings.iter()))?)
             }
         })
         .await
@@ -392,10 +407,17 @@ impl SqliteExecutor {
     }
 
     /// Escape hatch for statements that need the raw rusqlite connection.
+    /// Number of statements/connection operations issued so far.
+    pub fn query_count(&self) -> u64 {
+        self.queries.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub async fn with_connection<T: Send + 'static>(
         &self,
         op: impl FnOnce(&Connection) -> StorageResult<T> + Send + 'static,
     ) -> StorageResult<T> {
+        self.queries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let worker = Arc::clone(&self.worker);
         tokio::task::spawn_blocking(move || worker.run(op))
             .await
@@ -428,6 +450,12 @@ impl SqliteTransaction {
     pub async fn run(&self, sql: &str, params: Vec<SqliteValue>) -> StorageResult<()> {
         self.assert_active()?;
         self.executor.run(sql, params).await
+    }
+
+    /// See [`SqliteExecutor::run_counted`].
+    pub async fn run_counted(&self, sql: &str, params: Vec<SqliteValue>) -> StorageResult<usize> {
+        self.assert_active()?;
+        self.executor.run_counted(sql, params).await
     }
 
     /// See [`SqliteExecutor::get`].
@@ -519,6 +547,7 @@ impl SqliteDatabase {
                     }
                 };
                 let configured = (|| -> StorageResult<()> {
+                    connection.set_prepared_statement_cache_capacity(256);
                     connection.busy_timeout(std::time::Duration::from_millis(timeout))?;
                     connection.execute_batch("PRAGMA journal_mode = WAL")?;
                     connection.execute_batch("PRAGMA synchronous = NORMAL")?;
@@ -556,12 +585,20 @@ impl SqliteDatabase {
         });
         Ok(Self {
             inner: Arc::new(DbInner {
-                executor: SqliteExecutor { worker },
+                executor: SqliteExecutor {
+                    worker,
+                    queries: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                },
                 access: tokio::sync::Mutex::new(()),
                 closed: AtomicBool::new(false),
                 broken: Arc::new(AtomicBool::new(false)),
             }),
         })
+    }
+
+    /// Number of statements/connection operations issued so far.
+    pub fn query_count(&self) -> u64 {
+        self.inner.executor.query_count()
     }
 
     /// Clone the database handle (shared worker and close state).
@@ -604,6 +641,17 @@ impl SqliteDatabase {
         let _guard = self.inner.access.lock().await;
         self.assert_open()?;
         self.inner.executor.run(sql, params).await
+    }
+
+    /// See [`SqliteExecutor::run_counted`].
+    pub async fn run_counted(&self, sql: &str, params: Vec<SqliteValue>) -> StorageResult<usize> {
+        self.assert_open()?;
+        if in_transaction() {
+            return Err(StorageError::TransactionReentrant);
+        }
+        let _guard = self.inner.access.lock().await;
+        self.assert_open()?;
+        self.inner.executor.run_counted(sql, params).await
     }
 
     /// See [`SqliteExecutor::get`].
@@ -696,6 +744,7 @@ impl SqliteDatabase {
         let transaction = SqliteTransaction {
             executor: SqliteExecutor {
                 worker: Arc::clone(&self.inner.executor.worker),
+                queries: Arc::clone(&self.inner.executor.queries),
             },
             active: Arc::clone(&active),
         };

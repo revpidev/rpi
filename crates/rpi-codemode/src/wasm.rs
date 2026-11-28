@@ -1,5 +1,5 @@
 //! Vendored `quickjs.wasm` loading (port of `packages/codemode/src/wasm.ts`
-//! @ 4a080252f) and the shared wasmtime engine.
+//! @ b4afdddf) and the shared wasmtime engine.
 //!
 //! The binary is embedded into the release binary with `include_bytes!`
 //! (avoids the upstream #10204 class of "packaged worker/wasm not found"),

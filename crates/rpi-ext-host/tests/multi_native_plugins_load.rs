@@ -115,9 +115,17 @@ async fn each_native_plugin_gets_its_own_module_table() {
             .map(|(name, _)| name.clone())
             .collect()
     };
+    // pi-subagents v0.88.1 (V19-03) renamed the wait tool to `bg_wait` and
+    // keeps `subagent_wait` as a compatibility alias, so the extension
+    // registers both beside `subagent` and `subagent_supervisor`.
     assert_eq!(
         tools_of("librpi_ext_subagents.so"),
-        vec!["subagent", "subagent_supervisor", "subagent_wait"],
+        vec![
+            "subagent",
+            "subagent_supervisor",
+            "bg_wait",
+            "subagent_wait"
+        ],
         "subagents tools belong to the subagents extension"
     );
     assert_eq!(

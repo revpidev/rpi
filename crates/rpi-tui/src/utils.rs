@@ -1199,10 +1199,7 @@ fn split_into_tokens_with_ansi(text: &str) -> Vec<String> {
             continue;
         }
 
-        let mut end = i;
-        while end < text.len() && extract_ansi_code(text, end).is_none() {
-            end += 1;
-        }
+        let end = next_ansi_start(text, i);
 
         for segment in text[i..end].graphemes(true) {
             let segment_is_space = segment == " ";
@@ -1465,55 +1462,42 @@ fn break_long_word(word: &str, width: usize, tracker: &mut AnsiCodeTracker) -> V
     let mut current_line = tracker.get_active_codes();
     let mut current_width = 0usize;
 
-    // First, separate ANSI codes from visible content
-    // We need to handle ANSI codes specially since they're not graphemes
+    // ANSI codes and visible content are handled differently (ANSI codes are
+    // not graphemes), so walk the non-ANSI runs between the codes and
+    // process each run's graphemes as it is found. This is the same pass
+    // order as collecting every segment first, without materializing one
+    // segment per grapheme (a 40 KiB single-word line used to allocate a
+    // 40,000-entry vector on every wrap).
     let mut i = 0;
-    let mut segments: Vec<WordSegment> = Vec::new();
 
     while i < word.len() {
         if let Some(ansi_result) = extract_ansi_code(word, i) {
-            segments.push(WordSegment::Ansi(ansi_result.code));
+            current_line.push_str(ansi_result.code);
+            tracker.process(ansi_result.code);
             i += ansi_result.length;
-        } else {
-            // Find the next ANSI code or end of string
-            let mut end = i;
-            while end < word.len() && extract_ansi_code(word, end).is_none() {
-                end += 1;
-            }
-            // Segment this non-ANSI portion into graphemes
-            for seg in word[i..end].graphemes(true) {
-                segments.push(WordSegment::Grapheme(seg));
-            }
-            i = end;
+            continue;
         }
-    }
 
-    // Now process segments
-    for seg in segments {
-        match seg {
-            WordSegment::Ansi(value) => {
-                current_line.push_str(value);
-                tracker.process(value);
-                continue;
-            }
-            WordSegment::Grapheme(grapheme) => {
-                let grapheme_width = visible_width(grapheme);
+        let end = next_ansi_start(word, i);
+        // Segment this non-ANSI portion into graphemes
+        for grapheme in word[i..end].graphemes(true) {
+            let grapheme_width = visible_width(grapheme);
 
-                if current_width + grapheme_width > width {
-                    // Add specific reset for underline only (preserves background)
-                    let line_end_reset = tracker.get_line_end_reset();
-                    if !line_end_reset.is_empty() {
-                        current_line.push_str(&line_end_reset);
-                    }
-                    lines.push(std::mem::take(&mut current_line));
-                    current_line = tracker.get_active_codes();
-                    current_width = 0;
+            if current_width + grapheme_width > width {
+                // Add specific reset for underline only (preserves background)
+                let line_end_reset = tracker.get_line_end_reset();
+                if !line_end_reset.is_empty() {
+                    current_line.push_str(&line_end_reset);
                 }
-
-                current_line.push_str(grapheme);
-                current_width += grapheme_width;
+                lines.push(std::mem::take(&mut current_line));
+                current_line = tracker.get_active_codes();
+                current_width = 0;
             }
+
+            current_line.push_str(grapheme);
+            current_width += grapheme_width;
         }
+        i = end;
     }
 
     if !current_line.is_empty() {
@@ -1527,9 +1511,27 @@ fn break_long_word(word: &str, width: usize, tracker: &mut AnsiCodeTracker) -> V
     lines
 }
 
-enum WordSegment<'a> {
-    Ansi(&'a str),
-    Grapheme(&'a str),
+/// First byte at or after `from` where [`extract_ansi_code`] starts a code, or
+/// the text length. Escape bytes that do not start a recognized code
+/// (unterminated or unsupported sequences) belong to the surrounding
+/// non-ANSI run, exactly as the previous byte-by-byte scan treated them; a
+/// byte search replaces one `extract_ansi_code` call per character.
+fn next_ansi_start(text: &str, from: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut index = from;
+    while index < bytes.len() {
+        match bytes[index..].iter().position(|&byte| byte == 0x1b) {
+            None => return bytes.len(),
+            Some(offset) => {
+                let candidate = index + offset;
+                if extract_ansi_code(text, candidate).is_some() {
+                    return candidate;
+                }
+                index = candidate + 1;
+            }
+        }
+    }
+    bytes.len()
 }
 
 /// Apply background color to a line, padding to full width (utils.ts:914-923,
@@ -1918,6 +1920,29 @@ pub fn extract_segments(
 pub struct GraphemeCellRange {
     pub start: usize,
     pub end: usize,
+}
+
+/// Strip OSC 133 prompt markers at the start of a rendered line. OSC 7501
+/// program status is deliberately preserved.
+pub fn strip_osc133_zone_prefix(line: &str) -> String {
+    let mut rest = line;
+    while let Some(kind) = rest.strip_prefix("\x1b]133;") {
+        let Some(first) = kind.chars().next() else {
+            break;
+        };
+        if !matches!(first, 'A' | 'B' | 'C') {
+            break;
+        }
+        let after_kind = &kind[first.len_utf8()..];
+        if let Some(after) = after_kind.strip_prefix('\x07') {
+            rest = after;
+        } else if let Some(after) = after_kind.strip_prefix("\x1b\\") {
+            rest = after;
+        } else {
+            break;
+        }
+    }
+    rest.to_owned()
 }
 
 /// Remove ANSI, OSC, and APC control sequences while preserving visible text
@@ -6214,5 +6239,350 @@ mod tests {
         for segment in ["", "/", "-", ",", " ", "。", "👍", "→", "()"] {
             assert!(!segmenter.is_word_like(segment), "{segment:?}");
         }
+    }
+
+    /// The pre-optimization `breakLongWord` (utils.ts:821-885), kept verbatim as the
+    /// oracle of `wrap_single_line_matches_the_reference_implementation`: it collects
+    /// one segment per grapheme before processing them.
+    #[allow(dead_code)]
+    fn break_long_word_reference(
+        word: &str,
+        width: usize,
+        tracker: &mut AnsiCodeTracker,
+    ) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        let mut current_line = tracker.get_active_codes();
+        let mut current_width = 0usize;
+
+        // First, separate ANSI codes from visible content
+        // We need to handle ANSI codes specially since they're not graphemes
+        let mut i = 0;
+        let mut segments: Vec<ReferenceWordSegment> = Vec::new();
+
+        while i < word.len() {
+            if let Some(ansi_result) = extract_ansi_code(word, i) {
+                segments.push(ReferenceWordSegment::Ansi(ansi_result.code));
+                i += ansi_result.length;
+            } else {
+                // Find the next ANSI code or end of string
+                let mut end = i;
+                while end < word.len() && extract_ansi_code(word, end).is_none() {
+                    end += 1;
+                }
+                // Segment this non-ANSI portion into graphemes
+                for seg in word[i..end].graphemes(true) {
+                    segments.push(ReferenceWordSegment::Grapheme(seg));
+                }
+                i = end;
+            }
+        }
+
+        // Now process segments
+        for seg in segments {
+            match seg {
+                ReferenceWordSegment::Ansi(value) => {
+                    current_line.push_str(value);
+                    tracker.process(value);
+                    continue;
+                }
+                ReferenceWordSegment::Grapheme(grapheme) => {
+                    let grapheme_width = visible_width(grapheme);
+
+                    if current_width + grapheme_width > width {
+                        // Add specific reset for underline only (preserves background)
+                        let line_end_reset = tracker.get_line_end_reset();
+                        if !line_end_reset.is_empty() {
+                            current_line.push_str(&line_end_reset);
+                        }
+                        lines.push(std::mem::take(&mut current_line));
+                        current_line = tracker.get_active_codes();
+                        current_width = 0;
+                    }
+
+                    current_line.push_str(grapheme);
+                    current_width += grapheme_width;
+                }
+            }
+        }
+
+        if !current_line.is_empty() {
+            // No reset at end of final segment - caller handles continuation
+            lines.push(current_line);
+        }
+
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines
+    }
+    #[derive(Clone, Copy)]
+    enum ReferenceWordSegment<'a> {
+        Ansi(&'a str),
+        Grapheme(&'a str),
+    }
+
+    /// The pre-optimization `splitIntoTokensWithAnsi`, kept verbatim as the oracle of
+    /// `wrap_single_line_matches_the_reference_implementation` (one `extract_ansi_code`
+    /// call per byte).
+    #[allow(dead_code)]
+    fn split_into_tokens_with_ansi_reference(text: &str) -> Vec<String> {
+        let mut tokens: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut pending_ansi = String::new(); // ANSI codes waiting to be attached to next visible content
+        let mut current_kind: Option<SegmentKind> = None;
+        let mut i = 0;
+
+        while i < text.len() {
+            if let Some(ansi_result) = extract_ansi_code(text, i) {
+                // Hold ANSI codes separately - they'll be attached to the next visible char
+                pending_ansi.push_str(ansi_result.code);
+                i += ansi_result.length;
+                continue;
+            }
+
+            let mut end = i;
+            while end < text.len() && extract_ansi_code(text, end).is_none() {
+                end += 1;
+            }
+
+            for segment in text[i..end].graphemes(true) {
+                let segment_is_space = segment == " ";
+                if !segment_is_space && cjk_break_regex(segment) {
+                    flush_current(&mut current, &mut current_kind, &mut tokens);
+                    let token = pending_ansi.clone() + segment;
+                    pending_ansi.clear();
+                    tokens.push(token);
+                    continue;
+                }
+
+                let segment_kind = if segment_is_space {
+                    SegmentKind::Space
+                } else {
+                    SegmentKind::Word
+                };
+                if !current.is_empty() && current_kind != Some(segment_kind) {
+                    flush_current(&mut current, &mut current_kind, &mut tokens);
+                }
+
+                // Attach any pending ANSI codes to this visible character
+                if !pending_ansi.is_empty() {
+                    current.push_str(&pending_ansi);
+                    pending_ansi.clear();
+                }
+
+                current_kind = Some(segment_kind);
+                current.push_str(segment);
+            }
+
+            i = end;
+        }
+
+        // Handle any remaining pending ANSI codes (attach to last token)
+        if !pending_ansi.is_empty() {
+            if !current.is_empty() {
+                current.push_str(&pending_ansi);
+            } else if let Some(last) = tokens.last_mut() {
+                last.push_str(&pending_ansi);
+            } else {
+                current = pending_ansi;
+            }
+        }
+
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+
+        tokens
+    }
+
+    /// `wrapSingleLine` over the reference helpers.
+    #[allow(dead_code)]
+    fn wrap_single_line_reference(line: &str, width: usize) -> Vec<String> {
+        if line.is_empty() {
+            return vec![String::new()];
+        }
+
+        let visible_length = visible_width(line);
+        if visible_length <= width {
+            return vec![line.to_string()];
+        }
+
+        let mut wrapped: Vec<String> = Vec::new();
+        let mut tracker = AnsiCodeTracker::default();
+        let tokens = split_into_tokens_with_ansi_reference(line);
+
+        let mut current_line = String::new();
+        let mut current_visible_length = 0usize;
+
+        for token in tokens {
+            let token_visible_length = visible_width(&token);
+            let is_whitespace = is_all_js_whitespace(&token);
+
+            // Token itself is too long - break it character by character
+            if token_visible_length > width && !is_whitespace {
+                if !current_line.is_empty() {
+                    // Add specific reset for underline only (preserves background)
+                    let line_end_reset = tracker.get_line_end_reset();
+                    if !line_end_reset.is_empty() {
+                        current_line.push_str(&line_end_reset);
+                    }
+                    wrapped.push(std::mem::take(&mut current_line));
+                    // (upstream also assigns currentVisibleLength = 0 here; the
+                    // value is overwritten below before being read, so it is dropped)
+                }
+
+                // Break long token - breakLongWord handles its own resets
+                let broken = break_long_word_reference(&token, width, &mut tracker);
+                for broken_line in &broken[..broken.len() - 1] {
+                    wrapped.push(broken_line.clone());
+                }
+                current_line = broken.last().cloned().unwrap_or_default();
+                current_visible_length = visible_width(&current_line);
+                continue;
+            }
+
+            // Check if adding this token would exceed width
+            let total_needed = current_visible_length + token_visible_length;
+
+            if total_needed > width && current_visible_length > 0 {
+                // Trim trailing whitespace, then add underline reset (not full
+                // reset, to preserve background)
+                let mut line_to_wrap = trim_end_js(&current_line).to_string();
+                let line_end_reset = tracker.get_line_end_reset();
+                if !line_end_reset.is_empty() {
+                    line_to_wrap.push_str(&line_end_reset);
+                }
+                wrapped.push(line_to_wrap);
+                if is_whitespace {
+                    // Don't start new line with whitespace
+                    current_line = tracker.get_active_codes();
+                    current_visible_length = 0;
+                } else {
+                    current_line = tracker.get_active_codes() + &token;
+                    current_visible_length = token_visible_length;
+                }
+            } else {
+                // Add to current line
+                current_line.push_str(&token);
+                current_visible_length += token_visible_length;
+            }
+
+            update_tracker_from_text(&token, &mut tracker);
+        }
+
+        if !current_line.is_empty() {
+            // No reset at end of final line - let caller handle it
+            wrapped.push(current_line);
+        }
+
+        // Trailing whitespace can cause lines to exceed the requested width
+        if wrapped.is_empty() {
+            wrapped.push(String::new());
+        }
+        wrapped
+            .into_iter()
+            .map(|line| trim_end_js(&line).to_string())
+            .collect()
+    }
+
+    /// The single-pass `wrapSingleLine` (byte search for the next ANSI code,
+    /// no per-grapheme segment vector) produces the same lines as the
+    /// pre-optimization implementation on random ANSI/CJK/emoji/tab text at
+    /// every width, including long single-word lines with codes in the middle.
+    #[test]
+    fn wrap_single_line_matches_the_reference_implementation() {
+        let pieces: [&str; 25] = [
+            "a",
+            "bc",
+            "word",
+            "longerword",
+            " ",
+            "  ",
+            "   ",
+            "\t",
+            "é",
+            "e\u{301}",
+            "中",
+            "日本語",
+            "한국어",
+            "ｶ",
+            "Ａ",
+            "👍",
+            "👍🏽",
+            "🇯🇵",
+            "\u{200b}",
+            "。",
+            "\x1b[31m",
+            "\x1b[1;4m",
+            "\x1b[0m",
+            "\x1b[38;2;1;2;3m",
+            "\x1b[31",
+        ];
+        let hyperlinks: [&str; 5] = [
+            "\x1b]8;;https://example.invalid\x07link\x1b]8;;\x07",
+            "\x1b_apc\x07",
+            "\x1b[?25l",
+            "\x1b[K",
+            "\x07",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let widths = [1usize, 2, 3, 5, 8, 13, 21, 40, 80];
+        for case in 0..6000 {
+            let count = 1 + (next() % 28) as usize;
+            let mut text = String::new();
+            for _ in 0..count {
+                let pool: &[&str] = if next() % 4 == 0 {
+                    &hyperlinks
+                } else {
+                    &pieces
+                };
+                text.push_str(pool[(next() % pool.len() as u64) as usize]);
+            }
+            for &width in &widths {
+                assert_eq!(
+                    wrap_single_line(&text, width),
+                    wrap_single_line_reference(&text, width),
+                    "case {case} width {width} text {text:?}"
+                );
+            }
+        }
+        // The shape that used to allocate one segment per grapheme.
+        for injected in [
+            "",
+            "\x1b[31m",
+            "\x1b[31",
+            "\x1b]8;;https://example.invalid\x07",
+            "\x1b[0m\t\x1b[1m中\x1b[4m",
+        ] {
+            let text = format!("{}{injected}{}", "x".repeat(20_000), "y".repeat(20_000));
+            for &width in &widths[..7] {
+                assert_eq!(
+                    wrap_single_line(&text, width),
+                    wrap_single_line_reference(&text, width),
+                    "long line width {width} injected {injected:?}"
+                );
+            }
+        }
+    }
+
+    /// `next_ansi_start` skips escape bytes that do not start a recognized code,
+    /// like the byte-by-byte scan it replaced.
+    #[test]
+    fn next_ansi_start_skips_unrecognized_escape_bytes() {
+        // ESC plus an unsupported introducer and an unterminated CSI are plain
+        // bytes of the surrounding run; the first recognized code wins.
+        let text = "ab\x1bZc\x1b[31";
+        assert_eq!(next_ansi_start(text, 0), text.len());
+        assert_eq!(next_ansi_start("ab\x1bZc\x1b[1md", 0), "ab\x1bZc".len());
+        assert_eq!(next_ansi_start(text, text.len()), text.len());
+        assert_eq!(next_ansi_start("plain", 2), 5);
+        assert_eq!(next_ansi_start("\x1b]8;;u\x07", 0), 0);
+        assert_eq!(next_ansi_start("x\x1b[31\x1b[1my", 0), 1);
     }
 }

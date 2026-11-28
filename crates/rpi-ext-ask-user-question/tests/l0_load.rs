@@ -415,6 +415,7 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
             duration_ms: None,
             output_pad: 1,
             terminal_width: Some(100),
+            keybinding_hints: Default::default(),
         };
 
     // The v2.15.0 receipt call line: bold `Ask` + the question headers.

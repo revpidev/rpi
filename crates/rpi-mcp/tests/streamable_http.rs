@@ -1,5 +1,5 @@
 //! streamable HTTP transport tests, ported from
-//! `packages/mcp/test/streamable-http.test.ts` @ 4a080252f.
+//! `packages/mcp/test/streamable-http.test.ts` @ b4afdddf.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -832,4 +832,42 @@ async fn close_during_authorization_recovery_does_not_dispatch_the_late_request(
         executed.lock().unwrap().is_empty(),
         "the late request must not be dispatched after close"
     );
+}
+
+#[tokio::test]
+async fn enforces_max_message_bytes_for_json_responses() {
+    let handler = Arc::new(|request: RecordedRequest| {
+        Box::pin(async move {
+            if request.body_method() == Some("tools/list") {
+                return TestResponse::json(
+                    200,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request.body.as_ref().and_then(|body| body.get("id")).cloned().unwrap_or_default(),
+                        "result": {"tools": [{"name": "echo", "description": "x".repeat(2048), "inputSchema": {}}]}
+                    }),
+                    &[("content-type", "application/json")],
+                );
+            }
+            protocol_response(&request)
+        }) as HandlerResult
+    });
+    let (url, _) = start_server(handler).await;
+    let mut options = StreamableHttpTransportOptions::new(&url);
+    options.max_message_bytes = Some(512);
+    options.open_get_stream = false;
+    let transport = Arc::new(StreamableHttpTransport::new(options).unwrap());
+    let client = McpClient::new(McpClientOptions::new("json-limit", "1.0.0"));
+    client.connect(transport).await.unwrap();
+    let error = client
+        .list_tools(McpRequestOptions::default())
+        .await
+        .expect_err("oversized JSON response");
+    assert!(
+        error
+            .to_string()
+            .contains("MCP JSON response exceeds 512 bytes"),
+        "{error}"
+    );
+    client.close().await.unwrap();
 }

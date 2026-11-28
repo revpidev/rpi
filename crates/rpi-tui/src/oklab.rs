@@ -1,7 +1,7 @@
 //! Oklab and OKHSL <-> sRGB conversion. `colors.rs` builds its OKLCH, OKHSL,
 //! and color mixing on it.
 //!
-//! Port of `packages/tui/src/oklab.ts` @ pi v1.4.0 (4a080252f).
+//! Port of `packages/tui/src/oklab.ts` @ pi v1.5.2 (b4afdddf).
 //!
 //! Oklab and OKHSL are Björn Ottosson's color spaces; OKHSL's saturation is
 //! relative to the sRGB gamut at each hue and lightness. This is a port of his

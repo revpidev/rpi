@@ -6,17 +6,19 @@ mod test_support;
 use std::sync::Arc;
 
 use rpi_durable::chord::context::BACKGROUND_CONTEXT;
+use rpi_durable::chord::delta::{Op, PathSegment};
 use rpi_durable::errors::StorageError;
 use rpi_durable::ids::{DocumentId, EntryId, ROOT_CONVERSATION_ID, id_from_number};
 use rpi_durable::storage::{
     CURRENT_SQLITE_SCHEMA_VERSION, DEFAULT_SQLITE_SCHEMA, NodeSqliteStorageOptions, SqliteDatabase,
     SqliteDatabaseOptions, SqliteMigration, SqliteStorage, SqliteValue, apply_sqlite_migrations,
-    create_sqlite_migrations, open_node_sqlite_storage, sqlite_migrations,
+    create_sqlite_migrations, open_node_sqlite_database, open_node_sqlite_storage,
+    sqlite_migrations,
 };
 use rpi_durable::testing::run_storage_conformance;
 use rpi_durable::types::{
-    ConversationRecord, DocumentContent, DocumentCreate, DocumentScope, EntryRecord, JoinPolicy,
-    Storage, StorageWrite, TaskRecord, TaskState,
+    ConversationRecord, DocumentContent, DocumentCreate, DocumentPoint, DocumentScope, EntryRecord,
+    JoinPolicy, Storage, StorageExt, StorageWrite, TaskRecord, TaskState,
 };
 use test_support::{ReopeningStorage, TempDir, cleanup_temp_dirs};
 
@@ -27,6 +29,262 @@ async fn open_sqlite(temp: &TempDir) -> SqliteStorage {
     )
     .await
     .expect("open storage")
+}
+
+#[tokio::test]
+async fn batched_commit_128_conversations_and_run_counted() {
+    let temp = TempDir::new("sqlite-benchmark");
+    let database = open_node_sqlite_database(
+        &temp.path().join("benchmark.sqlite").to_string_lossy(),
+        SqliteDatabaseOptions::default(),
+    )
+    .await
+    .expect("open database");
+    let storage = SqliteStorage::open(database.clone_handle())
+        .await
+        .expect("open storage");
+    let writes = (2..=129)
+        .map(|id| StorageWrite::Conversation {
+            value: ConversationRecord {
+                id: rpi_durable::ids::id_from_number(id),
+                parent: None,
+                owner: None,
+            },
+        })
+        .collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let queries_before = database.query_count();
+    let mut receipts = Vec::new();
+    let result = storage
+        .commit(
+            &[writes],
+            &mut |index, seq| receipts.push((index, seq)),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("commit 128 conversations");
+    assert_eq!(result.stored, 1);
+    assert!(result.refused.is_none());
+    assert_eq!(receipts.len(), 1);
+    let queries = database.query_count() - queries_before;
+    assert!(
+        queries <= 16,
+        "128-conversation commit used {queries} SQL operations (expected <= 16)"
+    );
+    let count = database
+        .get_i64("SELECT COUNT(*) FROM conversations", vec![])
+        .await
+        .expect("count conversations")
+        .expect("count row");
+    assert_eq!(count, 128);
+    let affected = database
+        .run_counted(
+            "UPDATE durable_metadata SET next_id = next_id WHERE singleton = 1",
+            vec![],
+        )
+        .await
+        .expect("run counted");
+    assert_eq!(affected, 1);
+    println!(
+        "128-conversation batch: conversations=128, receipts=1, run_counted=1, elapsed={:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn batched_commit_128_single_conversation_batches_uses_constant_statements() {
+    let temp = TempDir::new("sqlite-group-benchmark");
+    let database = open_node_sqlite_database(
+        &temp.path().join("benchmark.sqlite").to_string_lossy(),
+        SqliteDatabaseOptions::default(),
+    )
+    .await
+    .expect("open database");
+    let storage = SqliteStorage::open(database.clone_handle())
+        .await
+        .expect("open storage");
+    let batches = (2..=129)
+        .map(|id| {
+            vec![StorageWrite::Conversation {
+                value: ConversationRecord {
+                    id: id_from_number(id),
+                    parent: None,
+                    owner: None,
+                },
+            }]
+        })
+        .collect::<Vec<_>>();
+    let queries_before = database.query_count();
+    let mut receipts = Vec::new();
+    let result = storage
+        .commit(
+            &batches,
+            &mut |index, seq| receipts.push((index, seq)),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("commit 128 batches");
+    assert_eq!(result.stored, 128);
+    assert!(result.refused.is_none());
+    assert_eq!(receipts.len(), 128);
+    let queries = database.query_count() - queries_before;
+    assert!(
+        queries <= 16,
+        "128 single-conversation batches used {queries} SQL operations (expected <= 16)"
+    );
+    let count = database
+        .get_i64("SELECT COUNT(*) FROM conversations", vec![])
+        .await
+        .expect("count conversations")
+        .expect("count row");
+    assert_eq!(count, 128);
+}
+
+#[tokio::test]
+async fn batched_commit_128_document_deltas_uses_constant_statements() {
+    let temp = TempDir::new("sqlite-document-group-benchmark");
+    let database = open_node_sqlite_database(
+        &temp.path().join("benchmark.sqlite").to_string_lossy(),
+        SqliteDatabaseOptions::default(),
+    )
+    .await
+    .expect("open database");
+    let storage = SqliteStorage::open(database.clone_handle())
+        .await
+        .expect("open storage");
+    let id: DocumentId = id_from_number(storage.mint_id().await.expect("mint document"));
+    storage
+        .commit_one(
+            &[StorageWrite::DocumentCreate {
+                record: DocumentCreate {
+                    id,
+                    kind: "benchmark.document".to_string(),
+                    key: None,
+                    scope: DocumentScope::Session,
+                    history: None,
+                    fork: None,
+                },
+                content: DocumentContent::Base {
+                    version: 1,
+                    value: serde_json::json!({"count": 0})
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                },
+            }],
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("create document");
+    let batches = (1..=128)
+        .map(|count| {
+            vec![StorageWrite::DocumentChange {
+                id,
+                content: DocumentContent::Delta {
+                    version: 1,
+                    ops: vec![Op::Set {
+                        path: vec![PathSegment::Key("count".to_string())],
+                        value: serde_json::json!(count),
+                    }],
+                },
+            }]
+        })
+        .collect::<Vec<_>>();
+    let queries_before = database.query_count();
+    let mut receipts = Vec::new();
+    let result = storage
+        .commit(
+            &batches,
+            &mut |index, seq| receipts.push((index, seq)),
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("commit 128 document batches");
+    assert_eq!(result.stored, 128);
+    assert_eq!(receipts.len(), 128);
+    let queries = database.query_count() - queries_before;
+    assert!(
+        queries <= 16,
+        "128 document batches used {queries} SQL operations (expected <= 16)"
+    );
+    let document = storage
+        .document(id, DocumentPoint::CURRENT, &BACKGROUND_CONTEXT)
+        .await
+        .expect("read document")
+        .expect("document");
+    assert_eq!(document.value["count"], serde_json::json!(128));
+}
+
+#[tokio::test]
+async fn corrupt_document_record_is_a_storage_error_not_a_refusal() {
+    let dir = TempDir::new("rpi-durable-sqlite-bad-document");
+    let path = dir
+        .path()
+        .join("storage.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    let storage = open_node_sqlite_storage(&path, NodeSqliteStorageOptions::default())
+        .await
+        .expect("open storage");
+    let id: DocumentId = id_from_number(storage.mint_id().await.expect("mint"));
+    storage
+        .commit_one(
+            &[StorageWrite::DocumentCreate {
+                record: DocumentCreate {
+                    id,
+                    kind: "corrupt".to_string(),
+                    key: None,
+                    scope: DocumentScope::Session,
+                    history: None,
+                    fork: None,
+                },
+                content: DocumentContent::Base {
+                    version: 1,
+                    value: serde_json::json!({ "value": 1 })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+            }],
+            &BACKGROUND_CONTEXT,
+        )
+        .await
+        .expect("create");
+    let database = open_node_sqlite_database(&path, SqliteDatabaseOptions::default())
+        .await
+        .expect("database");
+    database
+        .run(
+            "UPDATE documents SET record = '{}' WHERE id = ?",
+            vec![id.get().into()],
+        )
+        .await
+        .expect("corrupt record");
+    let result = storage
+        .commit_one(
+            &[StorageWrite::DocumentChange {
+                id,
+                content: DocumentContent::Base {
+                    version: 1,
+                    value: serde_json::json!({ "value": 2 })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+            }],
+            &BACKGROUND_CONTEXT,
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(StorageError::Json(_)) | Err(StorageError::Message(_))
+        ),
+        "corrupt document must be a storage error, not a refusal: {result:?}"
+    );
+    database.close().await.expect("close database");
+    storage.close(&BACKGROUND_CONTEXT).await.expect("close");
+    cleanup_temp_dirs("rpi-durable-sqlite-bad-document");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -175,8 +433,8 @@ async fn two_namespaced_storages_commit_concurrently_in_one_database() {
             value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "second"),
         },
     ];
-    let commit_first = first.commit(&first_writes, &BACKGROUND_CONTEXT);
-    let commit_second = second.commit(&second_writes, &BACKGROUND_CONTEXT);
+    let commit_first = first.commit_one(&first_writes, &BACKGROUND_CONTEXT);
+    let commit_second = second.commit_one(&second_writes, &BACKGROUND_CONTEXT);
     let (first_result, second_result) = tokio::join!(commit_first, commit_second);
     first_result.expect("first commit");
     second_result.expect("second commit");
@@ -257,7 +515,7 @@ async fn namespaced_storage_shares_a_database_with_host_tables_and_other_prefixe
         .await
         .expect("open rpi_ storage");
     storage
-        .commit(
+        .commit_one(
             &[
                 StorageWrite::Conversation {
                     value: ConversationRecord {
@@ -318,7 +576,7 @@ async fn namespaced_storage_shares_a_database_with_host_tables_and_other_prefixe
         "another prefix must not see rpi_ entries"
     );
     other
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: ROOT_CONVERSATION_ID,
@@ -482,7 +740,7 @@ async fn survives_kill_minus_nine_and_continues_after_reopen() {
     let next: EntryId = id_from_number(storage.mint_id().await.expect("mint"));
     assert!(next.get() > entry_id.get());
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Entry {
                 value: EntryRecord::new(next, ROOT_CONVERSATION_ID, "after-crash"),
             }],
@@ -729,7 +987,7 @@ async fn version_one_database_migrates_and_keeps_tasks_and_indexes() {
             .await
             .expect("read task")
             .expect("task retained");
-        assert_eq!(stored, task);
+        assert_eq!(stored.as_ref(), &task);
         storage.close(&BACKGROUND_CONTEXT).await.expect("close");
     }
 
@@ -958,7 +1216,7 @@ async fn document_reads_observe_one_committed_state_across_replacements() {
     );
     let id: DocumentId = id_from_number(storage.mint_id().await.expect("mint"));
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::DocumentCreate {
                 record: DocumentCreate {
                     id,
@@ -991,7 +1249,7 @@ async fn document_reads_observe_one_committed_state_across_replacements() {
             .await
     });
     let replace = storage
-        .commit(
+        .commit_one(
             &[StorageWrite::DocumentChange {
                 id,
                 content: DocumentContent::Base {
@@ -1192,7 +1450,7 @@ async fn facade_defers_ids_until_commit_settles() {
         .expect("open");
     let entry_id: EntryId = id_from_number(100);
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Entry {
                 value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "settled"),
             }],
@@ -1218,7 +1476,7 @@ async fn facade_publication_is_atomic_with_secondary_indexes() {
         .await
         .expect("open");
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: ROOT_CONVERSATION_ID,
@@ -1232,7 +1490,7 @@ async fn facade_publication_is_atomic_with_secondary_indexes() {
         .expect("root");
     let entry_id: EntryId = id_from_number(storage.mint_id().await.expect("mint"));
     let result = storage
-        .commit(
+        .commit_one(
             &[
                 StorageWrite::Entry {
                     value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "transient"),
@@ -1386,7 +1644,7 @@ async fn admitted_multi_query_reads_finish_before_storage_closes() {
             .expect("open"),
     );
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: ROOT_CONVERSATION_ID,
@@ -1400,7 +1658,7 @@ async fn admitted_multi_query_reads_finish_before_storage_closes() {
         .expect("root");
     let entry_id: EntryId = id_from_number(storage.mint_id().await.expect("mint"));
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Entry {
                 value: EntryRecord::new(entry_id, ROOT_CONVERSATION_ID, "probe"),
             }],

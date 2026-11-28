@@ -61,13 +61,30 @@ pub fn set_linger_for_test(ms: u64) {
     LINGER_MS_TEST.store(ms, Ordering::SeqCst);
 }
 
-const MAX_TERMINAL_ROWS: usize = 3;
+const MAX_TERMINAL_ROWS: usize = 4;
 /// Expanded tree row cap (upstream `MAX_AGENT_ROWS`).
 const MAX_TREE_ROWS: usize = 6;
 
 /// Singleton guard: true while a refresh task is alive (the loop clears it
 /// on exit so the next 0→1 boundary can respawn).
 static FLEET_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// S24: the session the singleton loop renders for. `session_start` rebinds
+/// it after take/leave so the strip follows the active session without
+/// waiting for a new run to respawn the loop.
+static CURRENT_SESSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn bind_session(session_id: Option<String>) {
+    *CURRENT_SESSION.lock().unwrap_or_else(|e| e.into_inner()) =
+        session_id.filter(|id| !id.is_empty());
+}
+
+fn current_session() -> Option<String> {
+    CURRENT_SESSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 
 /// One run's strip row.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -87,6 +104,9 @@ pub struct FleetRow {
     pub current_tool: Option<String>,
     /// Long-running guard activity (`needs_attention`/`active_long_running`).
     pub activity_state: Option<String>,
+    /// S36: latest `contact_supervisor(progress_update)` text and age.
+    pub progress: Option<String>,
+    pub progress_age_ms: Option<u64>,
 }
 
 /// Everything one push renders from.
@@ -97,6 +117,9 @@ pub struct FleetSnapshot {
     pub lingering: Vec<FleetRow>,
     /// Configured `maxActiveAsyncRunsPerSession` (`None` = unlimited).
     pub limit: Option<u64>,
+    /// S16: terminal rows observed inside the linger window (including the
+    /// newest rows kept in `lingering`).
+    pub earlier_done: usize,
 }
 
 impl FleetSnapshot {
@@ -124,7 +147,11 @@ fn now_millis() -> u64 {
 /// from observation, not from ISO timestamp parsing. Freezing the terminal
 /// duration keeps the quiet period quiet: the row text — and with it the
 /// dirty-key — stops changing once every run has settled.
-pub fn capture_fleet(now_ms: u64, linger: &mut HashMap<String, (u64, u64)>) -> FleetSnapshot {
+pub fn capture_fleet(
+    now_ms: u64,
+    linger: &mut HashMap<String, (u64, u64)>,
+    current_session: Option<&str>,
+) -> FleetSnapshot {
     let linger_ms = terminal_linger_ms();
     let runs: Vec<Arc<AsyncRunHandle>> = {
         let registry = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
@@ -139,6 +166,11 @@ pub fn capture_fleet(now_ms: u64, linger: &mut HashMap<String, (u64, u64)>) -> F
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        // V19-03 S24: the fleet strip is session-scoped; a forked/reopened
+        // session must not see another session's runs.
+        if !crate::runner::background::status_owned_by(&status, current_session) {
+            continue;
+        }
         let state = status
             .get("state")
             .and_then(Value::as_str)
@@ -175,6 +207,7 @@ pub fn capture_fleet(now_ms: u64, linger: &mut HashMap<String, (u64, u64)>) -> F
     linger.retain(|run_id, _| seen_ids.contains(run_id));
     // Newest terminal runs first, capped.
     terminal.sort_by_key(|&(seen, _)| std::cmp::Reverse(seen));
+    let earlier_done = terminal.len();
     let lingering: Vec<FleetRow> = terminal
         .into_iter()
         .take(MAX_TERMINAL_ROWS)
@@ -189,6 +222,7 @@ pub fn capture_fleet(now_ms: u64, linger: &mut HashMap<String, (u64, u64)>) -> F
         active: active.into_iter().map(|(_, _, row)| row).collect(),
         lingering,
         limit: config::load_config().max_active_async_runs_per_session(),
+        earlier_done,
     }
 }
 
@@ -241,6 +275,25 @@ fn fleet_row(run_id: &str, status: &Value, started_ms: u64, now_ms: u64) -> Flee
                     .map(str::to_owned)
             })
         });
+    let progress = steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| {
+            let agent = step.get("agent").and_then(Value::as_str)?;
+            let channel = crate::p1::supervisor::channel_dir(run_id, agent, index);
+            crate::p1::supervisor::latest_progress(&channel)
+        })
+        .max_by_key(|progress| progress.received_at_monotonic);
+    let (progress, progress_age_ms) = match progress {
+        Some(progress) => (
+            Some(progress.text),
+            Some(
+                crate::p1::supervisor::monotonic_millis()
+                    .saturating_sub(progress.received_at_monotonic),
+            ),
+        ),
+        None => (None, None),
+    };
     FleetRow {
         run_id: run_id.to_string(),
         mode,
@@ -250,6 +303,8 @@ fn fleet_row(run_id: &str, status: &Value, started_ms: u64, now_ms: u64) -> Flee
         duration_ms: now_ms.saturating_sub(started_ms),
         current_tool,
         activity_state,
+        progress,
+        progress_age_ms,
     }
 }
 
@@ -257,8 +312,13 @@ fn fleet_row(run_id: &str, status: &Value, started_ms: u64, now_ms: u64) -> Flee
 /// during activity the key never matches, by design; the quiet period is
 /// where it saves the re-push).
 pub fn dirty_key(snapshot: &FleetSnapshot) -> String {
-    serde_json::to_string(&(&snapshot.active, &snapshot.lingering, snapshot.limit))
-        .unwrap_or_default()
+    serde_json::to_string(&(
+        &snapshot.active,
+        &snapshot.lingering,
+        snapshot.limit,
+        snapshot.earlier_done,
+    ))
+    .unwrap_or_default()
 }
 
 /// `Async runs {used}/{limit}` (unlimited renders as `∞`).
@@ -332,6 +392,11 @@ pub fn fleet_tree(snapshot: &FleetSnapshot, expanded: bool) -> Value {
                 capacity_text(snapshot)
             )
         };
+        let line = if snapshot.earlier_done > 0 {
+            format!("{line} · … {} earlier done", snapshot.earlier_done)
+        } else {
+            line
+        };
         return json!({
             "type": "column",
             "props": {},
@@ -341,7 +406,26 @@ pub fn fleet_tree(snapshot: &FleetSnapshot, expanded: bool) -> Value {
             })],
         });
     }
-    let mut children: Vec<Value> = Vec::new();
+    let mut children: Vec<Value> = vec![json!({
+        "type": "text",
+        "props": {
+            "text": format!(
+                "{} agents · {} active · {} done · {}",
+                snapshot
+                    .active
+                    .iter()
+                    .chain(snapshot.lingering.iter())
+                    .map(|row| row.agents)
+                    .sum::<usize>()
+                    .max(snapshot.run_count()),
+                snapshot.active.len(),
+                snapshot.earlier_done,
+                capacity_text(snapshot),
+            ),
+            "fg": "muted",
+            "truncate": true,
+        },
+    })];
     let rows: Vec<&FleetRow> = snapshot
         .active
         .iter()
@@ -371,6 +455,13 @@ pub fn fleet_tree(snapshot: &FleetSnapshot, expanded: bool) -> Value {
         }
         if let Some(tool) = &row.current_tool {
             text.push_str(&format!(" · ⎿ {tool}"));
+        }
+        if let Some(progress) = &row.progress {
+            let age = row
+                .progress_age_ms
+                .map(crate::render::format_duration)
+                .unwrap_or_default();
+            text.push_str(&format!(" · {progress} ({age})"));
         }
         children.push(json!({
             "type": "text",
@@ -405,15 +496,16 @@ pub fn ensure_refresh_loop(
     calls: AsyncHostCalls,
     session_id: Option<String>,
 ) {
+    bind_session(session_id.clone());
     if FLEET_LOOP_RUNNING.swap(true, Ordering::SeqCst) {
-        return; // already ticking
+        return; // already ticking; the bound session is updated above
     }
     runtime.spawn(async move {
         fleet_refresh_loop(calls, session_id).await;
     });
 }
 
-async fn fleet_refresh_loop(calls: AsyncHostCalls, session_id: Option<String>) {
+async fn fleet_refresh_loop(calls: AsyncHostCalls, _initial_session: Option<String>) {
     let mut linger: HashMap<String, (u64, u64)> = HashMap::new();
     let mut last_key = String::new();
     let mut mounted = false;
@@ -422,6 +514,7 @@ async fn fleet_refresh_loop(calls: AsyncHostCalls, session_id: Option<String>) {
     let fleet_expanded = config::load_config().fleet_expanded();
     loop {
         tokio::time::sleep(Duration::from_millis(REFRESH_MS)).await;
+        let session_id = current_session();
         let now = now_millis();
         // #55 supervisor-ask delivery (upstream `poll()` — the wake face the
         // port originally dropped): every tick, surface session-owned
@@ -434,7 +527,7 @@ async fn fleet_refresh_loop(calls: AsyncHostCalls, session_id: Option<String>) {
             session_id.as_deref().unwrap_or(""),
             &mut delivered_asks,
         );
-        let snapshot = capture_fleet(now, &mut linger);
+        let snapshot = capture_fleet(now, &mut linger, session_id.as_deref());
         if snapshot.is_empty() {
             if mounted {
                 let _ = set_widget(&calls, Value::Null);
@@ -560,7 +653,44 @@ mod tests {
             duration_ms,
             current_tool: None,
             activity_state: None,
+            progress: None,
+            progress_age_ms: None,
         }
+    }
+
+    /// S36: the row shows the most recent child progress text (by monotonic
+    /// receive time) and its age, and clearing the run removes it.
+    #[test]
+    fn fleet_row_uses_the_latest_progress_and_age() {
+        let run_id = format!("fleet-progress-{}", crate::runner::budget::random_run_id());
+        let first = crate::p1::supervisor::channel_dir(&run_id, "scout", 0);
+        let second = crate::p1::supervisor::channel_dir(&run_id, "worker", 1);
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+        crate::p1::supervisor::write_progress(&first, &run_id, "step zero");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        crate::p1::supervisor::write_progress(&second, &run_id, "step one");
+        let status = json!({
+            "mode": "parallel",
+            "state": "running",
+            "steps": [
+                { "agent": "scout", "status": "running" },
+                { "agent": "worker", "status": "running" },
+            ],
+        });
+        let projected = fleet_row(&run_id, &status, 0, 10_000);
+        assert_eq!(projected.progress.as_deref(), Some("step one"));
+        assert!(
+            projected.progress_age_ms.is_some(),
+            "a live progress record carries its monotonic age"
+        );
+
+        crate::p1::supervisor::clear_progress_for_run(&run_id);
+        let projected = fleet_row(&run_id, &status, 0, 10_000);
+        assert!(projected.progress.is_none());
+        assert!(projected.progress_age_ms.is_none());
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
     }
 
     #[test]
@@ -569,6 +699,7 @@ mod tests {
             active: vec![row("a", "researcher", STATE_RUNNING, 5_000)],
             lingering: vec![row("b", "scout", "complete", 90_000)],
             limit: Some(4),
+            earlier_done: 1,
         };
         let tree = fleet_tree(&snapshot, false);
         let text = tree["children"][0]["props"]["text"].as_str().unwrap();
@@ -585,6 +716,7 @@ mod tests {
             ],
             lingering: vec![row("c", "scout", "complete", 40_000)],
             limit: None,
+            earlier_done: 1,
         };
         let tree = fleet_tree(&snapshot, true);
         let texts: Vec<&str> = tree["children"]
@@ -593,9 +725,9 @@ mod tests {
             .iter()
             .map(|n| n["props"]["text"].as_str().unwrap())
             .collect();
-        assert_eq!(texts.len(), 4, "{texts:?}"); // 3 rows + footer
+        assert_eq!(texts.len(), 5, "{texts:?}"); // summary + 3 rows + footer
         assert!(
-            texts[0].contains("researcher · running · 12.5s"),
+            texts[1].contains("researcher · running · 12.5s"),
             "{texts:?}"
         );
         assert!(
@@ -617,12 +749,13 @@ mod tests {
             active,
             lingering: vec![],
             limit: None,
+            earlier_done: 0,
         };
         let tree = fleet_tree(&snapshot, true);
         let children = tree["children"].as_array().unwrap();
-        assert_eq!(children.len(), 6 + 1 + 1); // cap + "+N more" + footer
+        assert_eq!(children.len(), 1 + 6 + 1 + 1); // summary + cap + "+N more" + footer
         assert!(
-            children[6]["props"]["text"]
+            children[7]["props"]["text"]
                 .as_str()
                 .unwrap()
                 .contains("+2 more")
@@ -635,6 +768,7 @@ mod tests {
             active: vec![row("a", "researcher", STATE_RUNNING, 5_000)],
             lingering: vec![],
             limit: None,
+            earlier_done: 0,
         };
         let mut advanced = base.clone();
         advanced.active[0].duration_ms = 5_500;
@@ -669,7 +803,7 @@ mod tests {
         });
         let handle_done = spawn_test_handle("fleet-t2", status_done, 200_000);
         let mut linger = HashMap::new();
-        let snapshot = capture_fleet(300_000, &mut linger);
+        let snapshot = capture_fleet(300_000, &mut linger, None);
         assert_eq!(snapshot.active.len(), 1);
         assert_eq!(snapshot.active[0].agent_label, "researcher");
         assert_eq!(snapshot.active[0].current_tool.as_deref(), Some("grep"));
@@ -679,14 +813,14 @@ mod tests {
         // Terminal durations freeze at first sight: the row text (and the
         // dirty-key) stays constant across ticks.
         assert_eq!(snapshot.lingering[0].duration_ms, 100_000); // 300k - 200k
-        let snapshot = capture_fleet(300_500, &mut linger);
+        let snapshot = capture_fleet(300_500, &mut linger, None);
         assert_eq!(snapshot.lingering[0].duration_ms, 100_000);
         // Linger window: past first sight + the window the terminal row
         // drops (forced window via the test seam for determinism).
         set_linger_for_test(1_000);
         let mut linger = HashMap::new();
-        let _ = capture_fleet(300_000, &mut linger); // first sight at t=300s
-        let snapshot = capture_fleet(300_000 + 1_000 + 1, &mut linger);
+        let _ = capture_fleet(300_000, &mut linger, None); // first sight at t=300s
+        let snapshot = capture_fleet(300_000 + 1_000 + 1, &mut linger, None);
         set_linger_for_test(u64::MAX);
         assert!(
             snapshot.lingering.is_empty(),
@@ -752,7 +886,7 @@ mod tests {
             1_000,
         );
         let mut linger = HashMap::new();
-        let snapshot = capture_fleet(40_000, &mut linger);
+        let snapshot = capture_fleet(40_000, &mut linger, None);
         let ids: Vec<&str> = snapshot
             .active
             .iter()
@@ -771,7 +905,7 @@ mod tests {
         assert_eq!(snapshot.lingering.len(), 1);
         assert_eq!(snapshot.lingering[0].run_id, "fleet-sort-terminal");
         // Repeat calls are stable (no registry-iteration reshuffle).
-        let again = capture_fleet(40_500, &mut linger);
+        let again = capture_fleet(40_500, &mut linger, None);
         let ids_again: Vec<&str> = again.active.iter().map(|row| row.run_id.as_str()).collect();
         assert_eq!(ids, ids_again);
         drop(late);

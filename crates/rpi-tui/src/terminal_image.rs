@@ -9,7 +9,7 @@
 //! `set_capability_overrides`, e86823096 / #8665) and the Zed branch
 //! (`649214477` / #8828) tracking 9841914. The `-direct` TERM truecolor hint
 //! (terminal-image.ts:75) and `get_terminal_color_mode`
-//! (terminal-image.ts:170-172) track 4a080252f / pi v1.4.0. The Kitty image
+//! (terminal-image.ts:170-172) track b4afdddf / pi v1.5.2. The Kitty image
 //! metadata registry
 //! (`register_kitty_image_metadata` / `get_kitty_image_metadata` /
 //! `crop_kitty_image_line` / `get_kitty_image_placement`) and the
@@ -114,6 +114,21 @@ pub struct ImageRenderOptions {
 static CELL_DIMENSIONS: Mutex<CellDimensions> = Mutex::new(CellDimensions::DEFAULT);
 
 static CACHED_CAPABILITIES: Mutex<Option<TerminalCapabilities>> = Mutex::new(None);
+
+/// Monotonic generation of the cached capabilities. Any code that derives
+/// rendered output from capabilities (Mermaid clickable labels, images,
+/// hyperlinks) can include it in a cache key or revision. Bumped whenever the
+/// cached value is replaced or invalidated.
+static CAPABILITIES_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Current capabilities generation (V19-04 R3.1.2 / R4.1.2).
+pub fn capabilities_generation() -> u64 {
+    CAPABILITIES_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn bump_capabilities_generation() {
+    CAPABILITIES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// `capabilityOverrides` (terminal-image.ts:29) — programmatic overrides
 /// applied on top of environment detection by `get_capabilities`.
@@ -296,7 +311,7 @@ fn detect_capabilities_inner(
     let terminal_emulator = env_var("TERMINAL_EMULATOR").to_lowercase();
     let term = env_var("TERM").to_lowercase();
     let color_term = env_var("COLORTERM").to_lowercase();
-    // terminal-image.ts:75 @ 4a080252f also treats a `-direct` TERM suffix as a
+    // terminal-image.ts:75 @ b4afdddf also treats a `-direct` TERM suffix as a
     // truecolor hint (e.g. `xterm-direct`).
     let has_true_color_hint =
         color_term == "truecolor" || color_term == "24bit" || term.ends_with("-direct");
@@ -321,7 +336,7 @@ fn detect_capabilities_inner(
     }
 
     // Herdr forwards OSC 8 and supports the Kitty graphics protocol
-    // (terminal-image.ts:85-89 @ 4a080252f, #10774). Checked BEFORE the Kitty
+    // (terminal-image.ts:85-89 @ b4afdddf, #10774). Checked BEFORE the Kitty
     // branch so leaked variables such as KITTY_WINDOW_ID do not change the
     // reported capabilities inside Herdr panes.
     if term_program == "herdr" {
@@ -336,6 +351,14 @@ fn detect_capabilities_inner(
     // protocol (no Unicode placeholders), which is enough for rpi
     // (terminal-image.ts:91-96, #11131/#11150/#11183).
     if term_program == "rex" {
+        return TerminalCapabilities {
+            images: Some(ImageProtocol::Kitty),
+            true_color: true,
+            hyperlinks: true,
+        };
+    }
+
+    if term_program == "orca" && env_var("ORCA_IMAGE_PROTOCOL") == "kitty" {
         return TerminalCapabilities {
             images: Some(ImageProtocol::Kitty),
             true_color: true,
@@ -399,7 +422,10 @@ fn detect_capabilities_inner(
     // termProgram === "zed"` (terminal-image.ts:112-115 @ 9841914;
     // `zed` joined in 649214477 / #8828): truecolor + hyperlinks on, images
     // off.
-    if term_program == "alacritty" || term_program == "vscode" || term_program == "zed" {
+    let is_alacritty = term_program == "alacritty"
+        || term.starts_with("alacritty")
+        || env_flag("ALACRITTY_WINDOW_ID");
+    if is_alacritty || term_program == "vscode" || term_program == "zed" {
         return TerminalCapabilities {
             images: None,
             true_color: true,
@@ -463,7 +489,7 @@ pub fn get_capabilities() -> TerminalCapabilities {
     })
 }
 
-/// `getTerminalColorMode` (terminal-image.ts:170-172 @ 4a080252f): truecolor
+/// `getTerminalColorMode` (terminal-image.ts:170-172 @ b4afdddf): truecolor
 /// when the detected capabilities advertise it, otherwise 256-color.
 pub fn get_terminal_color_mode() -> crate::colors::TerminalColorMode {
     if get_capabilities().true_color {
@@ -476,6 +502,7 @@ pub fn get_terminal_color_mode() -> crate::colors::TerminalColorMode {
 /// `resetCapabilitiesCache` (terminal-image.ts:134-136).
 pub fn reset_capabilities_cache() {
     *lock_cached_capabilities() = None;
+    bump_capabilities_generation();
 }
 
 /// `setCapabilityOverrides` (terminal-image.ts:170-182 @ 9841914,
@@ -496,6 +523,7 @@ pub fn set_capability_overrides(overrides: TerminalCapabilityOverrides) {
 /// capabilities. Useful in tests to exercise both code paths.
 pub fn set_capabilities(caps: TerminalCapabilities) {
     *lock_cached_capabilities() = Some(caps);
+    bump_capabilities_generation();
 }
 
 const KITTY_PREFIX: &str = "\x1b_G";
@@ -1300,6 +1328,13 @@ pub fn image_fallback(
 #[cfg(test)]
 pub(crate) static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Serializes every test that mutates the process-global terminal
+/// capabilities, across modules. Each suite used to keep a private lock, which
+/// let a concurrent markdown/image/main-screen test overwrite the capabilities
+/// an alt-screen test had just pinned (B07/Kitty review observation).
+#[cfg(test)]
+pub(crate) static TEST_CAPS_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,8 +1342,10 @@ mod tests {
     /// `withEnv` (terminal-image.test.ts:37-55): clears every capability env
     /// var, applies `overrides` (None = unset), runs `f`, then restores.
     fn with_env(overrides: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        const ENV_KEYS: [&str; 16] = [
+        const ENV_KEYS: [&str; 18] = [
             "TERM",
+            "ORCA_IMAGE_PROTOCOL",
+            "ALACRITTY_WINDOW_ID",
             "TERM_PROGRAM",
             "TERMINAL_EMULATOR",
             "COLORTERM",
@@ -1349,9 +1386,12 @@ mod tests {
     }
 
     /// Guards tests that read/write the capabilities cache and cell dimension
-    /// globals.
+    /// globals. Takes the shared caps lock after `TEST_STATE_LOCK` so a
+    /// concurrent markdown/image/alt-screen test cannot overwrite the
+    /// capabilities under test (same order as the other suites).
     fn with_globals(f: impl FnOnce()) {
         let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _caps = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         f();
     }
 
@@ -1554,7 +1594,7 @@ mod tests {
 
     #[test]
     fn test_detect_capabilities_enables_truecolor_from_direct_color_term() {
-        // terminal-image.ts:75 @ 4a080252f: a `-direct` TERM suffix is a
+        // terminal-image.ts:75 @ b4afdddf: a `-direct` TERM suffix is a
         // truecolor hint (terminal-image.test.ts:446-450, `xterm-direct`).
         with_env(&[("TERM", Some("xterm-direct"))], || {
             let caps = detect_capabilities_with(|| false);
@@ -1786,6 +1826,36 @@ mod tests {
                 }
             );
         });
+    }
+
+    #[test]
+    fn orca_and_alacritty_capability_matrix() {
+        with_env(
+            &[
+                ("TERM_PROGRAM", Some("orca")),
+                ("ORCA_IMAGE_PROTOCOL", Some("kitty")),
+            ],
+            || assert_eq!(detect_capabilities(), KITTY_CAPS),
+        );
+        with_env(&[("TERM_PROGRAM", Some("orca"))], || {
+            assert_eq!(detect_capabilities().images, None);
+        });
+        for overrides in [
+            &[("TERM_PROGRAM", Some("alacritty"))][..],
+            &[("TERM", Some("alacritty-direct"))][..],
+            &[("ALACRITTY_WINDOW_ID", Some("1"))][..],
+        ] {
+            with_env(overrides, || {
+                assert_eq!(
+                    detect_capabilities(),
+                    TerminalCapabilities {
+                        images: None,
+                        true_color: true,
+                        hyperlinks: true,
+                    }
+                );
+            });
+        }
     }
 
     /// "applies environment overrides" (terminal-image.test.ts:228-238,

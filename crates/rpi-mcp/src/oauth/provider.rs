@@ -1,5 +1,5 @@
 //! Stateful OAuth provider backed by a store (port of
-//! `packages/mcp/src/oauth/provider.ts` @ 4a080252f).
+//! `packages/mcp/src/oauth/provider.ts` @ b4afdddf).
 
 use std::sync::Arc;
 
@@ -36,11 +36,20 @@ pub struct McpOAuthState {
     pub discovery: Option<OAuthDiscoveryState>,
 }
 
+pub type McpRefreshLockGuard = Box<dyn std::any::Any + Send>;
+
 /// `McpOAuthStateStore` (provider.ts:14).
 #[async_trait::async_trait]
 pub trait McpOAuthStateStore: Send + Sync {
     async fn load(&self) -> Option<McpOAuthState>;
     async fn save(&self, state: McpOAuthState);
+
+    async fn acquire_refresh_lock(
+        &self,
+        _signal: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<McpRefreshLockGuard, OAuthFlowError> {
+        Ok(Box::new(()))
+    }
 }
 
 /// `MemoryOAuthStateStore` (provider.ts:28).

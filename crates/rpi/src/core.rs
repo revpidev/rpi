@@ -12,6 +12,7 @@ pub mod config_schemas;
 pub mod crash_attribution;
 pub mod deprecated_extensions;
 pub mod download;
+pub mod early_init;
 pub mod environment;
 pub mod export_html;
 pub mod extension_actions;
@@ -29,6 +30,11 @@ pub mod model_runtime;
 pub mod output_guard;
 pub mod package_manager;
 pub mod permission_mode;
+pub mod preferred_providers;
+/// V19-07 counts-only probe cost harness (lib tests only: it installs the
+/// counting global allocator of the lib test binary).
+#[cfg(test)]
+mod probe_bench;
 pub mod prompt_templates;
 pub mod radius;
 pub mod remote_catalog_provider;
@@ -51,3 +57,4 @@ pub mod usage_providers;
 pub mod usage_totals;
 pub mod version_check;
 pub mod virtual_models;
+pub mod windows_update;

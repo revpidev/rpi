@@ -79,10 +79,14 @@ pub fn is_auth_command_help(args: &[String]) -> bool {
 pub fn print_auth_command_help() -> String {
     format!(
         "Usage:\n  \
+         {APP_NAME} auth login <provider> [--api-key] [--no-browser]\n  \
+         {APP_NAME} auth logout <provider>\n  \
          {APP_NAME} auth print-api-key [--provider <provider>] [--model <model>]\n  \
          {APP_NAME} auth print-bearer-token [--provider <provider>] [--model <model>] [--min-expiry <duration>]\n  \
          {APP_NAME} auth check [--provider <provider>] [--model <model>] [--json] [--credentials] [--no-refresh]\n\n\
-         Auth commands require at least one of --provider or --model. Checks refresh expired OAuth credentials by default; \
+         Log in to and out of model providers, print their credentials for external clients, or check that they are ready.\n\
+         login --api-key saves an API key; --no-browser selects a non-browser account method such as device code.\n\
+         Credential print/check commands require at least one of --provider or --model. Checks refresh expired OAuth credentials by default; \
          --no-refresh prevents this. --credentials emits the credential, or includes it in JSON output.\n",
         APP_NAME = crate::config::APP_NAME,
     )
@@ -135,7 +139,7 @@ pub fn parse_auth_command(args: &[String]) -> Result<Option<AuthCommand>, AuthCo
         _ => {
             let sub = args.get(1).cloned().unwrap_or_default();
             return Err(AuthCommandError(format!(
-                "Unknown auth command \"{sub}\". Use \"rpi auth print-api-key\", \"rpi auth print-bearer-token\", or \"rpi auth check\"."
+                "Unknown auth command \"{sub}\". Use \"rpi auth login\", \"rpi auth logout\", \"rpi auth print-api-key\", \"rpi auth print-bearer-token\", or \"rpi auth check\"."
             )));
         }
     };

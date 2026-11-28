@@ -70,10 +70,13 @@ use crate::keys::is_key_release;
 use crate::kitty_registry::{
     clear_kitty_image_cache, kitty_image_cache_has_entries, prepare_kitty_screen,
 };
+use crate::layout::ScrollContent;
+use crate::layout::with_transcript;
 use crate::layout::{
     LayoutBox, LayoutFrame, ScrollbarGeometry, get_layout_boxes_at, get_scroll_view_box,
-    get_scroll_views_at, render_layout_frame,
+    get_scroll_views_at, render_layout_frame_cached,
 };
+use crate::layout_cache::LayoutRenderCache;
 use crate::mouse::{
     DISABLE_MOUSE, ENABLE_ALL_MOTION_MOUSE, ENABLE_BUTTON_MOTION_MOUSE, FOCUS_IN, FOCUS_OUT,
     SgrMouseEvent, WheelEvent, is_mouse_sequence, is_multiplexer_env, parse_sgr_mouse_event,
@@ -85,6 +88,7 @@ use crate::terminal_image::{
     ImageProtocol, TerminalCapabilities, delete_all_kitty_images, delete_all_kitty_placements,
     get_capabilities, get_kitty_image_placement_rows, is_image_line, set_capabilities,
 };
+use crate::transcript::is_osc133_prompt_start;
 use crate::tui::{
     CURSOR_MARKER, Component, OverlayAnchor, OverlayBounds, OverlayHandle, OverlayHandleOps,
     OverlayMarginSpec, OverlayOptions, OverlayUnfocusOptions, RenderHandle, SharedComponent,
@@ -94,7 +98,10 @@ use crate::tui::{
     TuiStopOptions, ViewportTui, composite_tui_line, dispatch_mouse_event, lock_component,
     lock_shared, retarget_mouse_event, same_component, shared_component,
 };
-use crate::tui_base::{RenderSchedule, TerminalSizeCache, TuiBase, schedule_render};
+use crate::tui_base::{
+    RenderSchedule, RenderScheduleStats, TerminalSizeCache, TuiBase, promote_pending_render,
+    record_frame_cost, render_schedule_stats, schedule_render, take_render_synchronous,
+};
 use crate::utils::{
     extract_ansi_code, get_grapheme_cell_range, get_osc8_link_at_column, get_word_segmenter,
     slice_by_column, strip_terminal_sequences, truncate_to_width, visible_width,
@@ -131,7 +138,7 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// terminal emulator. Fullscreen owns mouse selection, so mirror common
 /// terminal word-selection behavior by keeping paths and kebab-case tokens
 /// whole.
-const TERMINAL_WORD_SELECTION_JOINERS: [&str; 2] = ["/", "-"];
+const TERMINAL_WORD_SELECTION_JOINERS: [&str; 7] = ["/", "-", "+", "\\", "~", "_", "."];
 /// The selection auto-scroll `setInterval` period (tui-alt-screen.ts:737).
 const AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -168,13 +175,10 @@ fn strip_osc133_zone_prefix(line: &str) -> &str {
     rest
 }
 
-/// `OSC133_PROMPT_START` (tui-alt-screen.ts:56): `/^\x1b\]133;A(?:\x07|\x1b\\)/`.
-fn is_osc133_prompt_start(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("\x1b]133;A") else {
-        return false;
-    };
-    rest.starts_with('\x07') || rest.starts_with("\x1b\\")
-}
+// `OSC133_PROMPT_START` (tui-alt-screen.ts:56) is
+// [`crate::transcript::is_osc133_prompt_start`], shared with the transcript
+// prompt index (V19-06) so the row scan and the index recognize the same
+// lines.
 
 // =============================================================================
 // Types (tui-alt-screen.ts:70-126)
@@ -598,6 +602,9 @@ pub(crate) struct TuiAltScreenInner {
     previous_screen_height: usize,
     layout_root: Option<SharedComponent>,
     current_layout: Option<LayoutFrame>,
+    /// Cross-frame layout render cache (V19-06 FR-A); owned by this renderer
+    /// and cleared on invalidation, layout-root swaps and restarts.
+    render_cache: LayoutRenderCache,
     /// Mirror of `TuiBase::children` feeding the implicit document
     /// (tui-alt-screen.ts:170-172).
     implicit_children: Arc<Mutex<Vec<SharedComponent>>>,
@@ -761,11 +768,7 @@ impl TuiAltScreen {
         options: TuiAltScreenOptions,
         size_cache: TerminalSizeCache,
     ) -> TuiAltScreen {
-        let schedule = Arc::new(Mutex::new(RenderSchedule {
-            requested: false,
-            deadline: None,
-            last_render_at: None,
-        }));
+        let schedule = Arc::new(Mutex::new(RenderSchedule::default()));
         let base = TuiBase::new(
             Arc::clone(&terminal),
             show_hardware_cursor,
@@ -806,6 +809,7 @@ impl TuiAltScreen {
             previous_screen_height: 0,
             layout_root: None,
             current_layout: None,
+            render_cache: LayoutRenderCache::new(),
             implicit_children,
             implicit_scroll_view: implicit_scroll_view.clone(),
             flashes: AltScreenFlashContainer::new(render_handle.clone()),
@@ -941,6 +945,7 @@ impl TuiAltScreen {
             {
                 inner.children.remove(index);
             }
+            inner.render_cache.remove_component(&component);
             let mut mirror = lock_shared(&inner.implicit_children);
             if let Some(index) = mirror
                 .iter()
@@ -954,7 +959,10 @@ impl TuiAltScreen {
     /// Upstream `clear`.
     pub fn clear(&self) {
         self.run_or_queue(|inner| {
-            inner.children.clear();
+            let removed: Vec<SharedComponent> = std::mem::take(&mut inner.children);
+            for component in &removed {
+                inner.render_cache.remove_component(component);
+            }
             lock_shared(&inner.implicit_children).clear();
         });
     }
@@ -986,6 +994,7 @@ impl TuiAltScreen {
                 .position(|child| same_component(child, &old))
             {
                 inner.children[index] = new.clone();
+                inner.render_cache.remove_component(&old);
                 lock_shared(&inner.implicit_children)[index] = new;
             } else if !inner
                 .children
@@ -1064,6 +1073,8 @@ impl TuiAltScreen {
             }
             inner.layout_root = root;
             inner.current_layout = None;
+            // Renderer swap: the previous tree's lines are not reusable.
+            inner.render_cache.invalidate();
             inner.request_render(false);
         });
     }
@@ -1445,15 +1456,19 @@ impl TuiAltScreen {
         if force {
             inner.reset_render_state();
         }
-        {
-            let mut schedule = lock_shared(&self.schedule);
-            schedule.requested = false;
-            schedule.deadline = None;
-            schedule.last_render_at = Some(Instant::now());
-        }
+        take_render_synchronous(&self.schedule, Instant::now());
+        let started = Instant::now();
         inner.do_render();
+        let frame_cost = started.elapsed();
         drop(inner);
+        record_frame_cost(&self.schedule, frame_cost);
         self.drain_pending_ops();
+    }
+
+    /// Render schedule snapshot (V19-06): latest-wins generations, the
+    /// adaptive backpressure tier and the latest frame cost.
+    pub fn render_schedule_stats(&self) -> RenderScheduleStats {
+        render_schedule_stats(&self.schedule)
     }
 
     /// The next instant at which [`TuiAltScreen::tick`] has work to do: a
@@ -1529,18 +1544,28 @@ impl TuiAltScreen {
     /// expired deadlines and the render deadline (see
     /// [`TuiAltScreenInner::tick`]).
     pub fn tick(&self, now: Instant) {
+        let mut dispatched_input = false;
         loop {
             let event = lock_shared(&self.inbox).pop_front();
             match event {
                 Some(InboxEvent::Input(data)) => {
+                    dispatched_input = true;
                     self.lock_inner().handle_input(&data);
                     self.drain_pending_ops();
                 }
-                Some(InboxEvent::Resize) => self.request_render(false),
+                Some(InboxEvent::Resize) => {
+                    dispatched_input = true;
+                    self.request_render(false);
+                }
                 None => break,
             }
         }
         self.drain_pending_ops();
+        // V19-06 FR-D R3: a frame owed to keyboard/mouse/paste/resize input
+        // is latency-class and never waits behind the 30/20 fps backoff.
+        if dispatched_input {
+            promote_pending_render(&self.schedule, now);
+        }
         self.lock_inner().tick(now);
         self.drain_pending_ops();
     }
@@ -1605,6 +1630,9 @@ impl TuiAltScreenInner {
         self.stop_scrollbar_drag();
         self.flashes.dispose();
         self.alt_screen_active = true;
+        // Restart: the terminal capability snapshot below may differ from
+        // the previous session's generation.
+        self.render_cache.invalidate();
         let capabilities = get_capabilities();
         self.image_protocol = capabilities.images;
         // The registry is process-global here (upstream: per-instance field);
@@ -1761,6 +1789,9 @@ impl TuiAltScreenInner {
     /// tui-alt-screen.ts:204-206): the layout root (or the children) plus the
     /// overlay stack.
     fn invalidate_mounted(&mut self) {
+        // Theme/transform/capability invalidation: every retained layout line
+        // belongs to the previous generation (V19-06 FR-A R2).
+        self.render_cache.invalidate();
         match &self.layout_root {
             Some(root) => lock_component(root).invalidate(),
             None => {
@@ -1806,10 +1837,10 @@ impl TuiAltScreenInner {
     /// `scrollToPrompt` (tui-alt-screen.ts:366-378): scan the primary scroll
     /// view's content lines for the next/previous OSC 133 prompt-start zone.
     fn scroll_to_prompt(&mut self, direction: i64) {
-        let Some(lines) = self.current_layout.as_ref().and_then(|layout| {
+        let Some(content) = self.current_layout.as_ref().and_then(|layout| {
             let scroll_view = self.get_primary_scroll_view();
             get_scroll_view_box(layout, &scroll_view)
-                .and_then(|layout_box| layout_box.scroll_content_lines.clone())
+                .and_then(|layout_box| layout_box.scroll_content())
         }) else {
             return;
         };
@@ -1817,9 +1848,27 @@ impl TuiAltScreenInner {
         let Some(scroll_top) = with_scroll_view(&scroll_view, ScrollView::scroll_top) else {
             return;
         };
+        // V19-06 FR-C R3: a transcript document answers from its OSC 133
+        // prompt index (kept with the height index) instead of a row scan.
+        if let ScrollContent::Virtual { document, .. } = &content {
+            let prompts =
+                with_transcript(document, |document| document.prompt_rows()).unwrap_or_default();
+            let target = if direction >= 0 {
+                prompts.iter().find(|row| **row > scroll_top)
+            } else {
+                prompts.iter().rev().find(|row| **row < scroll_top)
+            };
+            if let Some(&row) = target {
+                with_scroll_view(&scroll_view, |view| view.scroll_to(row as i64));
+                self.request_render(false);
+            }
+            return;
+        }
         let mut row = scroll_top as i64 + direction;
-        while row >= 0 && (row as usize) < lines.len() {
-            if is_osc133_prompt_start(&lines[row as usize]) {
+        while row >= 0 && (row as usize) < content.len() {
+            if let Some(line) = content.line(row as usize)
+                && is_osc133_prompt_start(&line)
+            {
                 with_scroll_view(&scroll_view, |view| view.scroll_to(row));
                 self.request_render(false);
                 return;
@@ -2028,8 +2077,8 @@ impl TuiAltScreenInner {
             .primary_scroll_view
             .clone()
             .unwrap_or_else(|| self.implicit_scroll_view.clone());
-        let lines = get_scroll_view_box(layout, &scroll_view)
-            .and_then(|layout_box| layout_box.scroll_content_lines.clone());
+        let content = get_scroll_view_box(layout, &scroll_view)
+            .and_then(|layout_box| layout_box.scroll_content());
         // (upstream `!lines || !search.query.trim()` — both arms share the
         // same reset)
         let bail_no_query = |search: &mut ActiveSearch| {
@@ -2043,15 +2092,18 @@ impl TuiAltScreenInner {
                 component.set_result(-1, 0);
             }
         };
-        if lines.is_none() {
+        let Some(content) = content else {
             bail_no_query(search);
             return false;
-        }
+        };
         if search.query.trim().is_empty() {
             bail_no_query(search);
             return false;
         }
-        let lines = lines.expect("checked above");
+        // V19-06 FR-C R2: a transcript document serves its lazy full-text
+        // corpus (cached per content stamp); `Arc<[String]>` derefs to the
+        // slice — no per-frame copy.
+        let lines = content.to_lines();
 
         let should_reveal_selection = search.selection_mode != SearchSelectionMode::Retain;
         let query = search.query.clone();
@@ -2339,6 +2391,19 @@ impl TuiAltScreenInner {
                 }
                 return Some(consume());
             }
+        }
+        let is_viewport_key = keybindings.matches(data, Keybinding::AltScreenPageUp)
+            || keybindings.matches(data, Keybinding::AltScreenPageDown)
+            || keybindings.matches(data, Keybinding::AltScreenHalfPageUp)
+            || keybindings.matches(data, Keybinding::AltScreenHalfPageDown);
+        if is_viewport_key
+            && self
+                .base
+                .focused_component
+                .as_ref()
+                .is_some_and(|component| lock_component(component).captures_viewport_input())
+        {
+            return None;
         }
         // The active-search overlay exception (tui-alt-screen.ts:644-645
         // second conjunct, V14-15): a focused search overlay still lets
@@ -3048,9 +3113,8 @@ impl TuiAltScreenInner {
         }
         let pointer_row = (y as isize).clamp(visible_top, visible_bottom);
         let max_content_row = layout_box
-            .scroll_content_lines
-            .as_ref()
-            .map_or(1, |lines| lines.len())
+            .scroll_content()
+            .map_or(1, |content| content.len())
             .saturating_sub(1);
         let scroll_top = with_scroll_view(scroll_view, ScrollView::scroll_top).unwrap_or(0);
         let row = (scroll_top as isize + pointer_row - layout_box.rect.y)
@@ -3094,10 +3158,10 @@ impl TuiAltScreenInner {
     /// line a selection point refers to.
     fn get_selection_source_line(&self, point: &SelectionPoint) -> String {
         if let (Some(scroll_view), Some(layout)) = (&point.scroll_view, &self.current_layout)
-            && let Some(lines) = get_scroll_view_box(layout, scroll_view)
-                .and_then(|layout_box| layout_box.scroll_content_lines.as_ref())
+            && let Some(content) = get_scroll_view_box(layout, scroll_view)
+                .and_then(|layout_box| layout_box.scroll_content())
         {
-            return lines.get(point.row).cloned().unwrap_or_default();
+            return content.line(point.row).unwrap_or_default();
         }
         self.previous_screen
             .get(point.row)
@@ -3545,19 +3609,22 @@ impl TuiAltScreenInner {
     fn get_active_selection_text(&self) -> Option<String> {
         let selection = self.get_selection_bounds()?;
         // The scroll-content-lines source (tui-alt-screen.ts:1417-1422).
-        let source_lines: Option<Arc<[String]>> = match &selection.start.scroll_view {
+        // A transcript document materializes the selected rows on demand
+        // (V19-06 FR-C R1): the copied text is the same source line the
+        // full array would hold.
+        let source: Option<ScrollContent> = match &selection.start.scroll_view {
             Some(scroll_view) => {
                 let layout = self.current_layout.as_ref()?;
-                let lines = get_scroll_view_box(layout, scroll_view)
-                    .and_then(|layout_box| layout_box.scroll_content_lines.clone())?;
-                Some(lines)
+                let content = get_scroll_view_box(layout, scroll_view)
+                    .and_then(|layout_box| layout_box.scroll_content())?;
+                Some(content)
             }
             None => None,
         };
         let mut lines: Vec<String> = Vec::new();
         for row in selection.start.row..=selection.end.row {
-            let line = match &source_lines {
-                Some(source) => source.get(row).cloned().unwrap_or_default(),
+            let line = match &source {
+                Some(source) => source.line(row).unwrap_or_default(),
                 None => self.previous_screen.get(row).cloned().unwrap_or_default(),
             };
             let columns = selection_columns(
@@ -3786,7 +3853,7 @@ impl TuiAltScreenInner {
     }
 
     /// `compositeScrollToEndIndicator` (tui-alt-screen.ts:1611-1648 @
-    /// 4a080252f; 79680533c, #9842 8c7279378): center the jump-to-end label
+    /// b4afdddf; 79680533c, #9842 8c7279378): center the jump-to-end label
     /// on the last row of a follow-end primary scroll view scrolled away
     /// from its end, independently of scrollbar visibility, and record its
     /// hit rectangle.
@@ -3827,7 +3894,7 @@ impl TuiAltScreenInner {
         let scrollbar_column = crate::layout::get_scrollbar_geometry(box_, false)
             .map(|geometry| geometry.column)
             .unwrap_or(clip.x + clip.width as isize);
-        // #9842 (8c7279378, tui-alt-screen.ts:1630-1641 @ 4a080252f): center
+        // #9842 (8c7279378, tui-alt-screen.ts:1630-1641 @ b4afdddf): center
         // the label on the clip independently of scrollbar visibility, then
         // clip drawing/click bounds before the scrollbar column.
         let label = truncate_to_width(&indicator(), clip.width, "", false);
@@ -4024,6 +4091,8 @@ impl TuiAltScreenInner {
         if self.stopped || !self.alt_screen_active {
             return;
         }
+        let _frame_probe = crate::benchmark::FrameProbe::new("fullscreen");
+        crate::benchmark::note_backpressure(self.schedule_stats());
         let width = usize::from(self.terminal().columns()).max(1);
         let height = usize::from(self.terminal().rows()).max(1);
         // Refresh the lock-free size cache (same role as TuiMainScreen).
@@ -4037,13 +4106,26 @@ impl TuiAltScreenInner {
             .layout_root
             .clone()
             .unwrap_or_else(|| self.implicit_scroll_view.clone());
-        let mut next_layout = render_layout_frame(&root, width, height, self.render_handle.clone());
+        let mut next_layout = render_layout_frame_cached(
+            &root,
+            width,
+            height,
+            self.render_handle.clone(),
+            &mut self.render_cache,
+        );
         // `refreshSearch` (tui-alt-screen.ts:1652-1654 @ 9841914): a
         // selection reveal scrolls the view — re-render the layout so the
         // highlight and indicator composite against the scrolled frame.
         if self.refresh_search(&next_layout) {
-            next_layout = render_layout_frame(&root, width, height, self.render_handle.clone());
+            next_layout = render_layout_frame_cached(
+                &root,
+                width,
+                height,
+                self.render_handle.clone(),
+                &mut self.render_cache,
+            );
         }
+        crate::benchmark::mark_layout();
         let screen: Vec<String> = next_layout
             .lines
             .iter()
@@ -4112,6 +4194,7 @@ impl TuiAltScreenInner {
             None => &screen,
         };
 
+        crate::benchmark::mark_paint();
         let mut buffer = String::from(BEGIN_SYNCHRONIZED_OUTPUT);
         if full_redraw {
             self.full_redraw_count += 1;
@@ -4212,7 +4295,7 @@ impl TuiAltScreenInner {
             buffer.push_str("\x1b[?25l");
         }
         buffer.push_str(END_SYNCHRONIZED_OUTPUT);
-        self.terminal().write(&buffer);
+        crate::benchmark::terminal_write(&buffer, || self.terminal().write(&buffer));
 
         self.previous_screen = screen;
         self.previous_screen_width = width;
@@ -4239,7 +4322,9 @@ impl TuiAltScreenInner {
         }
         self.tick_scroll_views(now);
         if self.take_render_due(now) {
+            let started = Instant::now();
             self.do_render();
+            record_frame_cost(&self.schedule, started.elapsed());
         }
         self.fire_expired_queries(now);
     }
@@ -4515,6 +4600,8 @@ mod tests {
         EnvGuard, RecordingTerminal, TestTui, VirtualTerminal, VtEvent, osc52_sequence, send_input,
         settle, state_lock,
     };
+    use crate::transcript::TranscriptDocument;
+    use crate::tui::Container;
     use crate::tui::{
         CURSOR_MARKER, FAKE_CURSOR_START, Focusable, SizeValue, TuiMouseEventResult,
         render_fake_cursor, shared_component,
@@ -6555,6 +6642,7 @@ mod tests {
     struct CapsGuard {
         _state: MutexGuard<'static, ()>,
         _image_state: MutexGuard<'static, ()>,
+        _caps: MutexGuard<'static, ()>,
     }
 
     impl CapsGuard {
@@ -6563,9 +6651,15 @@ mod tests {
             let image_state = crate::terminal_image::TEST_STATE_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The shared caps lock keeps markdown/image/main-screen tests from
+            // overwriting the capabilities this suite pinned.
+            let caps = crate::terminal_image::TEST_CAPS_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             CapsGuard {
                 _state: state,
                 _image_state: image_state,
+                _caps: caps,
             }
         }
 
@@ -7506,6 +7600,7 @@ mod tests {
     /// screen test).
     #[test]
     fn hardware_cursor_suppresses_the_focused_fake_cursor_in_fullscreen() {
+        let _caps = CapsGuard::lock_only();
         let terminal = RecordingTerminal::new(40, 10);
         let tui = TuiAltScreen::with_options(
             Box::new(terminal.clone()),
@@ -8856,6 +8951,487 @@ mod tests {
             row.contains("↓ Jump to latest message · Ctrl+End"),
             "label with bottom shortcut: {row:?}"
         );
+        stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
+    // V19-06: transcript virtualization through the real renderer
+    // ---------------------------------------------------------------------
+
+    /// The application's document regions: a `Container` behind an
+    /// `Arc<Mutex<..>>`. `expose` selects the transcript contract (the
+    /// virtual path) or the opaque full-render oracle; both render the same
+    /// children.
+    struct Region {
+        container: Arc<Mutex<Container>>,
+        expose: bool,
+    }
+
+    impl Component for Region {
+        fn render(&self, width: usize) -> Vec<String> {
+            lock_shared(&self.container).render(width)
+        }
+        fn invalidate(&mut self) {
+            lock_shared(&self.container).invalidate();
+        }
+        fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+            lock_shared(&self.container).handle_mouse(event)
+        }
+        fn as_transcript_document(&self) -> Option<&dyn TranscriptDocument> {
+            self.expose.then_some(self)
+        }
+    }
+
+    impl TranscriptDocument for Region {
+        fn sync(&self, width: usize) -> crate::transcript::TranscriptSync {
+            lock_shared(&self.container).sync(width)
+        }
+        fn total_height(&self) -> usize {
+            lock_shared(&self.container).total_height()
+        }
+        fn child_count(&self) -> usize {
+            lock_shared(&self.container).child_count()
+        }
+        fn revision_at(&self, index: usize) -> Option<u64> {
+            lock_shared(&self.container).revision_at(index)
+        }
+        fn height_at(&self, index: usize) -> Option<usize> {
+            lock_shared(&self.container).height_at(index)
+        }
+        fn visible_range(
+            &self,
+            scroll_top: usize,
+            viewport: usize,
+            overscan: usize,
+        ) -> std::ops::Range<usize> {
+            lock_shared(&self.container).visible_range(scroll_top, viewport, overscan)
+        }
+        fn render_range(&self, children: std::ops::Range<usize>, width: usize) -> Arc<[String]> {
+            lock_shared(&self.container).render_range(children, width)
+        }
+        fn rows(&self, rows: std::ops::Range<usize>, width: usize) -> Arc<[String]> {
+            lock_shared(&self.container).rows(rows, width)
+        }
+        fn line(&self, row: usize, width: usize) -> Option<String> {
+            lock_shared(&self.container).line(row, width)
+        }
+        fn materialize(&self, width: usize) -> Arc<[String]> {
+            lock_shared(&self.container).materialize(width)
+        }
+        fn prompt_rows(&self) -> Vec<usize> {
+            lock_shared(&self.container).prompt_rows()
+        }
+        fn block_row(&self, index: usize) -> usize {
+            lock_shared(&self.container).block_row(index)
+        }
+        fn stats(&self) -> crate::transcript::TranscriptStats {
+            lock_shared(&self.container).stats()
+        }
+    }
+
+    /// A fullscreen session shaped like the application's: a transcript
+    /// scroll view over nested document regions (header + chat, with OSC 133
+    /// prompt lines, trusted `Text` blocks, a spacer and a Kitty image), and
+    /// an editor dock. Returns the observable log of every interaction: the
+    /// oracle (`expose: false`, full render) and the virtual transcript must
+    /// produce the same log.
+    fn transcript_scenario(expose: bool) -> Vec<String> {
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(40, 8);
+        let copied: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let copied_handle = Arc::clone(&copied);
+        let tui = TuiAltScreen::with_options(
+            Box::new(terminal.clone()),
+            None,
+            None,
+            TuiAltScreenOptions {
+                copy_selection: Some(Arc::new(move |text: &str| {
+                    lock_shared(&copied_handle).push(text.to_string());
+                    CopySelectionOutcome::Copied
+                })),
+                ..TuiAltScreenOptions::default()
+            },
+        );
+        let image_id = 4_243u32;
+        let image_line = encode_kitty(
+            "AAAA",
+            &KittyEncodeOptions {
+                columns: Some(2),
+                rows: Some(3),
+                image_id: Some(image_id),
+                move_cursor: Some(false),
+            },
+        );
+        register_kitty_image_metadata(KittyImageMetadata {
+            image_id,
+            columns: 2,
+            rows: 3,
+            width_px: 100.0,
+            height_px: 100.0,
+        });
+        let header = Arc::new(Mutex::new(Container::new()));
+        lock_shared(&header)
+            .children
+            .push(Box::new(Text::new("header", 0, 0, None)));
+        let chat = Arc::new(Mutex::new(Container::new()));
+        {
+            let mut chat = lock_shared(&chat);
+            chat.children
+                .push(Box::new(Text::new("intro line", 0, 0, None)));
+            for message in 1..=6 {
+                chat.children.push(Box::new(Text::new(
+                    format!("\x1b]133;A\x07user question {message}"),
+                    0,
+                    0,
+                    None,
+                )));
+                chat.children.push(Box::new(Text::new(
+                    format!(
+                        "answer {message} mentions needle {message}\nsecond row of answer {message}"
+                    ),
+                    0,
+                    0,
+                    None,
+                )));
+            }
+            chat.children.push(Box::new(Text::new(
+                format!("{image_line}\n\nafter the image"),
+                0,
+                0,
+                None,
+            )));
+            chat.children
+                .push(Box::new(crate::components::spacer::Spacer::new(1)));
+            // A tail after the image, so the viewport can scroll past the
+            // image's first line (Kitty residual crop).
+            chat.children.push(Box::new(Text::new(
+                "tail 1\ntail 2\ntail 3\ntail 4\ntail 5",
+                0,
+                0,
+                None,
+            )));
+        }
+        let document = Arc::new(Mutex::new(Container::new()));
+        {
+            let mut document = lock_shared(&document);
+            document.children.push(Box::new(Region {
+                container: header,
+                expose: true,
+            }));
+            document.children.push(Box::new(Region {
+                container: chat,
+                expose: true,
+            }));
+        }
+        let transcript = shared_component(ScrollView::new(
+            shared_component(Region {
+                container: document,
+                expose,
+            }),
+            ScrollViewOptions {
+                follow: Follow::End,
+                primary: true,
+                scrollbar: ScrollbarMode::Auto,
+                ..ScrollViewOptions::default()
+            },
+        ));
+        struct EditorStub;
+        impl Component for EditorStub {
+            fn render(&self, _width: usize) -> Vec<String> {
+                vec!["editor".to_string()]
+            }
+            fn as_focusable(&self) -> Option<&dyn Focusable> {
+                Some(self)
+            }
+            fn as_focusable_mut(&mut self) -> Option<&mut dyn Focusable> {
+                Some(self)
+            }
+        }
+        impl Focusable for EditorStub {
+            fn focused(&self) -> bool {
+                false
+            }
+            fn set_focused(&mut self, _focused: bool) {}
+        }
+        let editor = shared_component(EditorStub);
+        tui.set_layout_root(Some(shared_component(VStack::new(
+            vec![
+                StackChild::Entry(
+                    transcript.clone(),
+                    StackEntryOptions {
+                        basis: Some(Basis::Fixed(0.0)),
+                        grow: Some(1.0),
+                        min_size: Some(1.0),
+                        ..StackEntryOptions::default()
+                    },
+                ),
+                StackChild::Entry(
+                    editor.clone(),
+                    StackEntryOptions {
+                        basis: Some(Basis::Fixed(1.0)),
+                        shrink: Some(0.0),
+                        ..StackEntryOptions::default()
+                    },
+                ),
+            ],
+            StackOptions::default(),
+        ))));
+        tui.set_focus(Some(editor));
+        tui.start();
+        settle(&tui);
+
+        let mut log = Vec::new();
+        macro_rules! snap {
+            ($label:expr) => {{
+                settle(&tui);
+                log.push(format!(
+                    "{}: top={} follow={} viewport={:?}",
+                    $label,
+                    tui.viewport_top(),
+                    tui.is_following_output(),
+                    trimmed_viewport(&terminal)
+                ));
+            }};
+        }
+        snap!("start");
+        // Wheel up over the transcript, then a drag selection across rows.
+        for _ in 0..9 {
+            send_input(&terminal, &tui, "\x1b[<64;1;4M");
+        }
+        snap!("wheel-up");
+        send_input(&terminal, &tui, "\x1b[<0;3;2M");
+        send_input(&terminal, &tui, "\x1b[<32;12;5M");
+        send_input(&terminal, &tui, "\x1b[<0;12;5m");
+        snap!("selected");
+        log.push(format!("copied={:?}", lock_shared(&copied).as_slice()));
+        // OSC 133 prompt jumps.
+        send_input(&terminal, &tui, "\x1b[1;6A");
+        snap!("prompt-prev");
+        send_input(&terminal, &tui, "\x1b[1;6B");
+        snap!("prompt-next");
+        send_input(&terminal, &tui, "\x1b[57419;6u");
+        snap!("prompt-prev-kitty-u");
+        // Top, then search across the whole transcript.
+        tui.scroll_to_top();
+        snap!("top");
+        send_input(&terminal, &tui, "\x1b[102;6u");
+        send_input(&terminal, &tui, "needle 4");
+        snap!("search");
+        send_input(&terminal, &tui, "\x07");
+        snap!("search-next");
+        send_input(&terminal, &tui, "\x1b[103;6u");
+        snap!("search-prev");
+        send_input(&terminal, &tui, "\x1b");
+        snap!("search-closed");
+        // Kitty residual crop: the image block starts at content row 20
+        // (header, intro, six three-row messages); with `scroll_top` 21 its
+        // first line is one row above the viewport and the placement must be
+        // rewritten cropped (`y=` offset) on the top row.
+        with_sv(&transcript, |view| view.scroll_to(21));
+        snap!("kitty-residual");
+        log.push(format!(
+            "image-writes={:?}",
+            terminal
+                .writes()
+                .split('\x1b')
+                .filter(|part| part.contains(&format!("i={image_id}")))
+                .map(|part| part.chars().take(48).collect::<String>())
+                .collect::<Vec<_>>()
+        ));
+        // Back to the end.
+        with_sv(&transcript, |view| view.scroll_to_end());
+        snap!("end");
+        stop(&tui);
+        log
+    }
+
+    #[test]
+    fn transcript_virtualization_matches_the_full_render_for_every_consumer() {
+        let oracle = transcript_scenario(false);
+        let virtual_ = transcript_scenario(true);
+        assert_eq!(oracle, virtual_);
+        // The scenario exercised non-trivial states (not a single blank frame).
+        assert!(oracle.iter().any(|entry| entry.contains("copied=[\"")));
+        assert!(
+            oracle.iter().any(|entry| entry.contains("1/1")),
+            "search found the match"
+        );
+
+        assert!(
+            oracle
+                .iter()
+                .any(|entry| entry.contains("image-writes=[") && entry.contains("y=")),
+            "the Kitty residual crop rewrote a cropped placement"
+        );
+        assert!(
+            oracle
+                .iter()
+                .any(|entry| entry.contains("prompt-prev: top=11"))
+        );
+        assert!(
+            oracle
+                .iter()
+                .any(|entry| entry.contains("prompt-next: top=14"))
+        );
+        assert!(
+            oracle
+                .iter()
+                .any(|entry| entry.contains("kitty-residual: top=21"))
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // V19-06 FR-D: latest-wins scheduling, adaptive backpressure, input bypass
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn slow_frames_fold_500_deltas_into_the_latest_state_and_keep_final_frames() {
+        let terminal = VirtualTerminal::new(30, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let (content, lines) = test_text(&["start".to_string()]);
+        tui.add_child(content);
+        tui.start();
+        let rendered_at = settle(&tui);
+        terminal.clear_writes();
+
+        // 500 deltas arrive while one frame is already pending.
+        for index in 0..500 {
+            set_lines(&lines, &[format!("delta-{index:05}")]);
+            tui.request_render(false);
+        }
+        let pending = tui.render_schedule_stats();
+        assert_eq!(
+            pending.superseded_requests, 499,
+            "latest-wins folds the deltas"
+        );
+        assert_eq!(
+            pending.requested_generation - pending.rendered_generation,
+            500,
+            "every delta bumped the requested generation"
+        );
+        assert!(
+            tui.next_deadline().is_some(),
+            "one pending frame covers them"
+        );
+        // The frame fires at the baseline interval and shows only the newest state.
+        tui.tick(rendered_at + Duration::from_millis(17));
+        let after = tui.render_schedule_stats();
+        assert_eq!(after.rendered_generation, after.requested_generation);
+        assert_eq!(after.superseded_requests, 499);
+        assert!(terminal.get_writes().contains("delta-00499"));
+        assert!(!terminal.get_writes().contains("delta-00498"));
+        assert!(!terminal.get_writes().contains("delta-00000"));
+        assert!(!tui.has_pending_work(), "no stale frame is left queued");
+
+        // Forced renders (message_end / resize / theme / final invalidate)
+        // are immediate and never folded away.
+        set_lines(&lines, &["final".to_string()]);
+        tui.request_render(true);
+        tui.tick(rendered_at + Duration::from_millis(18));
+        assert!(terminal.get_writes().contains("final"));
+        stop(&tui);
+    }
+
+    #[test]
+    fn input_frames_bypass_the_adaptive_backpressure_tier() {
+        let terminal = VirtualTerminal::new(30, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let (content, lines) = test_text(&["start".to_string()]);
+        tui.add_child(content);
+        tui.start();
+        let rendered_at = settle(&tui);
+        terminal.clear_writes();
+
+        // Slow frames drove the schedule to the 20 fps tier.
+        record_frame_cost(&tui.schedule, Duration::from_millis(40));
+        assert_eq!(tui.render_schedule_stats().tier_fps, 20);
+
+        // A streaming request waits for the 50 ms interval...
+        set_lines(&lines, &["stream".to_string()]);
+        tui.request_render(false);
+        tui.tick(rendered_at + Duration::from_millis(20));
+        assert!(
+            !terminal.get_writes().contains("stream"),
+            "the 20 fps tier throttles streaming frames"
+        );
+        // ...while a keystroke in the same window is latency-class: the
+        // pending frame is promoted and renders at the baseline interval.
+        terminal.send_input("x");
+        tui.tick(rendered_at + Duration::from_millis(21));
+        assert_eq!(tui.render_schedule_stats().latency_promotions, 1);
+        tui.tick(rendered_at + Duration::from_millis(37));
+        assert!(
+            terminal.get_writes().contains("stream"),
+            "the input-promoted frame did not wait for 50 ms"
+        );
+        assert!(!tui.has_pending_work());
+        stop(&tui);
+    }
+
+    #[test]
+    fn resize_events_are_latency_class_and_render_at_the_baseline_interval() {
+        let terminal = VirtualTerminal::new(30, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let (content, _) = test_text(&["start".to_string()]);
+        tui.add_child(content);
+        tui.start();
+        let rendered_at = settle(&tui);
+        terminal.clear_writes();
+        record_frame_cost(&tui.schedule, Duration::from_millis(40));
+        terminal.resize(40, 6);
+        tui.tick(rendered_at + Duration::from_millis(1));
+        assert_eq!(tui.render_schedule_stats().latency_promotions, 1);
+        tui.tick(rendered_at + Duration::from_millis(17));
+        assert!(
+            terminal.get_writes().contains("\x1b[2J"),
+            "full redraw after the resize"
+        );
+        assert!(!tui.has_pending_work());
+        stop(&tui);
+    }
+
+    #[test]
+    fn removed_children_drop_their_layout_cache_entries() {
+        let terminal = VirtualTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let leaf = text("leaf");
+        let dock = text("dock");
+        let replacement = text("replacement");
+        // The same shared components are TUI children and layout-root leaves,
+        // so the cross-frame cache holds entries for them.
+        tui.add_child(leaf.clone());
+        tui.add_child(dock.clone());
+        tui.set_layout_root(Some(shared_component(VStack::new(
+            vec![
+                StackChild::Component(leaf.clone()),
+                StackChild::Component(dock.clone()),
+            ],
+            StackOptions::default(),
+        ))));
+        tui.start();
+        settle(&tui);
+        {
+            let inner = tui.lock_inner();
+            assert_eq!(
+                inner.render_cache.stats().retained_entries,
+                2,
+                "both trusted leaves are retained"
+            );
+        }
+        tui.remove_child(&leaf);
+        {
+            let inner = tui.lock_inner();
+            assert_eq!(inner.render_cache.stats().retained_entries, 1);
+        }
+        tui.swap_child(&dock, &replacement);
+        {
+            let inner = tui.lock_inner();
+            assert_eq!(
+                inner.render_cache.stats().retained_entries,
+                0,
+                "the swapped-out leaf is forgotten"
+            );
+        }
         stop(&tui);
     }
 }

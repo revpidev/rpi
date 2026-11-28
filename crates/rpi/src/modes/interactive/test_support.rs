@@ -427,7 +427,14 @@ pub(crate) async fn build_test_session_with(
 /// [`build_test_session`] with a working session factory, so runtime-level
 /// commands (`/import`, `/new`, `/resume`, `/clone`) can switch sessions.
 pub(crate) async fn build_switchable_test_session() -> TestSession {
-    build_test_session_inner(None, None, None, None, true).await
+    build_switchable_test_session_with(None, None).await
+}
+
+pub(crate) async fn build_switchable_test_session_with(
+    manager: Option<SessionManager>,
+    extension_host: Option<Arc<rpi_ext_host::host::NativeExtensionHost>>,
+) -> TestSession {
+    build_test_session_inner(manager, extension_host, None, None, true).await
 }
 
 /// [`build_test_session_with`] with a caller-provided model runtime and

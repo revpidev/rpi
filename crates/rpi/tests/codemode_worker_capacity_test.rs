@@ -1,6 +1,6 @@
 //! Process-wide codemode worker admission (V18-03 FR-B; upstream
 //! `packages/coding-agent/test/codemode-worker-admission.test.ts`
-//! @ 4a080252f). This is its own test binary so the process-global pool and
+//! @ b4afdddf). This is its own test binary so the process-global pool and
 //! `RPI_CODEMODE_MAX_WORKERS` changes cannot race other suites.
 
 use std::path::{Path, PathBuf};

@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/auth/resolve.ts` @ `4a080252f` (v1.4.0,
+//! Port of `packages/ai/src/auth/resolve.ts` @ `b4afdddf` (v1.5.2,
 //! `bde882c74`).
 //!
 //! Shared auth resolution: a stored credential owns the provider (hit stops),
@@ -202,7 +202,7 @@ async fn refresh_stored_oauth_credential_with_timeout(
                             {
                                 Ok(Ok(refreshed)) => Ok(Some(Credential::OAuth(refreshed))),
                                 Ok(Err(error)) => Err(ModelsError::with_cause(
-                                    ModelsErrorCode::Oauth,
+                                    error.code,
                                     format!("OAuth refresh failed for {provider_id}"),
                                     &error.message,
                                 )),

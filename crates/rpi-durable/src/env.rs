@@ -1,5 +1,5 @@
 //! Portable execution environment (port of `packages/durable/src/env/*`
-//! @ `4a080252f`).
+//! @ `b4afdddf`).
 //!
 //! The module carries the upstream `ExecutionEnv` surface: the result-shaped
 //! [`FileSystem`] and [`Shell`] capability traits, the snapshot-scanning file
@@ -22,11 +22,11 @@ pub use node::{NodeExecutionEnv, NodeExecutionEnvOptions};
 pub use node_watch::{NodeFileWatcher, NodeWatchMode, NodeWatchOptions};
 pub use types::{
     BinaryReader, CreateDirOptions, CreateTempFileOptions, DirPage, DirReader, ExcludeOptions,
-    ExecutionEnv, ExecutionError, ExecutionErrorCode, FileContent, FileInfo, FileKind, FileSystem,
-    FileWatcher, LineScan, OpenBinaryReaderOptions, ReadTextLinesOptions, RemoveOptions,
-    ScanLinesOptions, Shell, ShellCommand, ShellExecOptions, ShellExecResult, ShellOutputInfo,
-    ShellOutputSkip, ShellOutputWindow, ShellSpillOptions, ShellStream, TextLine, TextLineReader,
-    WatchChange, WatchMode, WatchTarget,
+    ExecutionEnv, ExecutionError, ExecutionErrorCode, FileChange, FileContent, FileInfo, FileKind,
+    FileSystem, FileWatcher, LineScan, OpenBinaryReaderOptions, ReadTextLinesOptions,
+    RemoveOptions, ScanLinesOptions, Shell, ShellCommand, ShellExecOptions, ShellExecResult,
+    ShellOutputInfo, ShellOutputSkip, ShellOutputWindow, ShellSpillOptions, ShellStream, TextLine,
+    TextLineReader, WatchMode, WatchTarget,
 };
 
 pub use crate::errors::{FileError, FileErrorCode};
@@ -34,7 +34,7 @@ pub use crate::errors::{FileError, FileErrorCode};
 use crate::chord::context::Context;
 
 /// Change callback installed by [`FileSystem::watch`].
-pub type WatchCallback = std::sync::Arc<dyn Fn(WatchChange) + Send + Sync>;
+pub type WatchCallback = std::sync::Arc<dyn Fn(FileChange) + Send + Sync>;
 
 /// Abort marker embedded in environment callbacks (upstream `AbortError`).
 pub const ABORTED_MESSAGE: &str = "aborted";

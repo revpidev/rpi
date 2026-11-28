@@ -1,5 +1,5 @@
 //! Model-facing codemode description (port of the description helpers in
-//! `packages/coding-agent/src/extensions/codemode/tool.ts` @ 4a080252f,
+//! `packages/coding-agent/src/extensions/codemode/tool.ts` @ b4afdddf,
 //! v1.0.0 slimmed form). The rendered text is a byte-parity surface.
 
 use std::collections::{HashMap, HashSet};
@@ -14,12 +14,12 @@ use crate::config::get_docs_path;
 use crate::extensions::codemode::tool::{ToolInfo, to_codemode_declaration};
 
 /// Characters per token when estimating the cost of a tool section
-/// (tool.ts:139).
+/// (tool.ts:144).
 const CHARS_PER_TOKEN: usize = 4;
 
 const DESCRIPTION_INTRO: &str = "Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async function body in a QuickJS sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.\n- `await tools.<name>({ ...args })` resolves to a string, or an object if the tool's declaration says so, and rejects with an Error on failure. A tool whose declaration returns an object resolves on failure too when it returned that object; check its fields. Calls still running when the script ends are cancelled.\n- Optional first line: `// @options: {\"max_output_tokens\": 10000, \"timeout_ms\": 60000}`";
 
-/// `CODEMODE_DOCS_PATH` (tool.ts:116): the reference model-facing doc.
+/// `CODEMODE_DOCS_PATH` (tool.ts:121): the reference model-facing doc.
 pub fn codemode_docs_path() -> String {
     get_docs_path()
         .join("codemode.md")
@@ -280,7 +280,7 @@ fn describe_fields(schema: Option<&serde_json::Value>, depth: usize) -> Option<S
 
 /// What a script call resolves to, in one line: `a string`, the field names
 /// of an object (see [`describe_fields`]), or the rendered type for anything
-/// else (tool.ts:293-299).
+/// else (tool.ts:308-318).
 pub fn describe_output(schema: Option<&serde_json::Value>) -> String {
     let rendered = render_tool_output_type(schema);
     if rendered == "string" {
@@ -296,7 +296,7 @@ pub fn describe_output(schema: Option<&serde_json::Value>) -> String {
 }
 
 /// A declared tool's description followed by how scripts call it and what
-/// the call resolves to (tool.ts:293-313).
+/// the call resolves to (tool.ts:354-357).
 pub fn describe_script_call(tool: &ToolInfo) -> String {
     let declaration = to_codemode_declaration(tool, &[]);
     format!(

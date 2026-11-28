@@ -236,6 +236,8 @@ async fn radius_device_login_runs_through_the_factory_oauth() {
         &[AuthEvent::DeviceCode {
             user_code: "ABCD-1234".to_owned(),
             verification_uri: "https://radius-ui.example/pair".to_owned(),
+            open_browser_on_confirm: None,
+            copy_code_on_confirm: None,
             interval_seconds: Some(5),
             expires_in_seconds: Some(600),
         }]

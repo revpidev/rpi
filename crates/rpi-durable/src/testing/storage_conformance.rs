@@ -1,5 +1,5 @@
 //! Shared storage conformance suite, ported from
-//! `src/testing/storage-conformance.ts` @ `4a080252f` (runner-independent
+//! `src/testing/storage-conformance.ts` @ `b4afdddf` (runner-independent
 //! cases).
 //!
 //! The upstream `describe`/`expect`/`it` runner injection maps to a Rust case
@@ -18,8 +18,8 @@ use crate::ids::{ConversationId, DocumentId, EntryId, SubmissionId, TaskId, id_f
 use crate::types::{
     ConversationQuery, ConversationRecord, Cursor, DocumentAddress, DocumentContent,
     DocumentCreate, DocumentPoint, DocumentQuery, DocumentScope, EntryQuery, EntryRecord,
-    InputSubmissionStatus, ScanOrder, Storage, StorageWrite, SubmissionQuery, SubmissionRecord,
-    TaskQuery, TaskRecord, TaskState,
+    InputSubmissionStatus, ScanOrder, Storage, StorageExt, StorageWrite, SubmissionQuery,
+    SubmissionRecord, TaskQuery, TaskRecord, TaskState,
 };
 
 /// Boxed case future.
@@ -73,7 +73,7 @@ fn check_rejected<T>(result: StorageResult<T>) -> Result<(), String> {
 
 async fn create_root(storage: &Arc<dyn Storage>) -> Result<ConversationId, String> {
     storage
-        .commit(
+        .commit_one(
             &[StorageWrite::Conversation {
                 value: ConversationRecord {
                     id: crate::ids::ROOT_CONVERSATION_ID,
@@ -158,6 +158,7 @@ fn task_by_id(
             .task(id, &BACKGROUND_CONTEXT)
             .await
             .map_err(|error| error.to_string())?
+            .map(|record| (*record).clone())
             .ok_or_else(|| "task missing".to_string())
     }
 }
@@ -172,6 +173,7 @@ fn submission_by_id(
             .submission(id, &BACKGROUND_CONTEXT)
             .await
             .map_err(|error| error.to_string())?
+            .map(|record| (*record).clone())
             .ok_or_else(|| "submission missing".to_string())
     }
 }
@@ -187,7 +189,7 @@ fn case_1_reserves_root(storage: Arc<dyn Storage>) -> ConformanceFuture {
             .map_err(|e| e.to_string())?
             .ok_or("root missing")?;
         check_eq!(
-            record,
+            record.as_ref().clone(),
             ConversationRecord {
                 id: root,
                 parent: None,
@@ -196,7 +198,7 @@ fn case_1_reserves_root(storage: Arc<dyn Storage>) -> ConformanceFuture {
         );
         check_err(
             storage
-                .commit(
+                .commit_one(
                     &[StorageWrite::Conversation {
                         value: ConversationRecord {
                             id: root,
@@ -230,7 +232,7 @@ fn case_2_mixed_commit_rollback(storage: Arc<dyn Storage>) -> ConformanceFuture 
             trace: None,
         };
         let initial_seq = storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Entry {
                         value: stored_entry.clone(),
@@ -276,7 +278,7 @@ fn case_2_mixed_commit_rollback(storage: Arc<dyn Storage>) -> ConformanceFuture 
         };
         check_err(
             storage
-                .commit(
+                .commit_one(
                     &[
                         StorageWrite::Task { value: running },
                         StorageWrite::Submission { value: done_input },
@@ -307,7 +309,7 @@ fn case_2_mixed_commit_rollback(storage: Arc<dyn Storage>) -> ConformanceFuture 
             true
         );
         let after = storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Entry {
                     value: entry(
                         id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?),
@@ -352,7 +354,7 @@ fn case_3_detaches_writes(storage: Arc<dyn Storage>) -> ConformanceFuture {
             trace: None,
         };
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Entry {
                         value: stored_entry.clone(),
@@ -399,7 +401,7 @@ fn case_4_prototype_like_keys(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let mut stored = entry(entry_id, root, "note");
         stored.data = Some(data);
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Entry {
                     value: stored.clone(),
                 }],
@@ -433,7 +435,7 @@ fn case_5_out_of_order_entries(storage: Arc<dyn Storage>) -> ConformanceFuture {
     Box::pin(async move {
         let root = create_root(&storage).await?;
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Entry {
                         value: entry(id_from_number(30), root, "message"),
@@ -485,7 +487,7 @@ fn case_6_entry_cursor_after_newer_commit(storage: Arc<dyn Storage>) -> Conforma
         let middle: EntryId = id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         let newest: EntryId = id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Entry {
                         value: entry(oldest, root, "message"),
@@ -525,7 +527,7 @@ fn case_6_entry_cursor_after_newer_commit(storage: Arc<dyn Storage>) -> Conforma
         );
         let appended: EntryId = id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Entry {
                     value: entry(appended, root, "message"),
                 }],
@@ -568,7 +570,7 @@ fn case_7_conversation_cursor(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let third: ConversationId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Conversation {
                         value: ConversationRecord {
@@ -649,7 +651,7 @@ fn case_8_owner_edges(storage: Arc<dyn Storage>) -> ConformanceFuture {
             })
         };
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Conversation {
                         value: ConversationRecord {
@@ -782,7 +784,7 @@ fn case_9_deep_fork_scan(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let root_excluded_same_commit: EntryId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         let root_seq = storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Entry {
                         value: entry(root_first, root, "message"),
@@ -805,7 +807,7 @@ fn case_9_deep_fork_scan(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let child: ConversationId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Conversation {
                     value: ConversationRecord {
                         id: child,
@@ -825,7 +827,7 @@ fn case_9_deep_fork_scan(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let child_excluded: EntryId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Entry {
                         value: entry(child_fork_point, child, "note"),
@@ -841,7 +843,7 @@ fn case_9_deep_fork_scan(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let root_excluded_later: EntryId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Entry {
                     value: entry(root_excluded_later, root, "message"),
                 }],
@@ -852,7 +854,7 @@ fn case_9_deep_fork_scan(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let grandchild: ConversationId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Conversation {
                     value: ConversationRecord {
                         id: grandchild,
@@ -872,7 +874,7 @@ fn case_9_deep_fork_scan(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let grandchild_tail: EntryId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         let grandchild_seq = storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Entry {
                         value: {
@@ -892,7 +894,7 @@ fn case_9_deep_fork_scan(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let child_excluded_later: EntryId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Entry {
                     value: entry(child_excluded_later, child, "message"),
                 }],
@@ -1287,7 +1289,7 @@ fn case_10_table_order_and_cursor(storage: Arc<dyn Storage>) -> ConformanceFutur
             let submission: SubmissionId =
                 id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
             storage
-                .commit(
+                .commit_one(
                     &[
                         StorageWrite::Conversation {
                             value: ConversationRecord {
@@ -1595,7 +1597,7 @@ fn case_11_task_replacement_and_pages(storage: Arc<dyn Storage>) -> ConformanceF
         let mut third_task = pending_task(third, root, "ready");
         third_task.abort_requested = true;
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Task {
                         value: first_task.clone(),
@@ -1618,7 +1620,7 @@ fn case_11_task_replacement_and_pages(storage: Arc<dyn Storage>) -> ConformanceF
         };
         running.abort_requested = true;
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Task {
                     value: running.clone(),
                 }],
@@ -1636,7 +1638,7 @@ fn case_11_task_replacement_and_pages(storage: Arc<dyn Storage>) -> ConformanceF
             ..running
         };
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Task {
                     value: terminal.clone(),
                 }],
@@ -1757,7 +1759,7 @@ fn case_12_task_owners_and_status(storage: Arc<dyn Storage>) -> ConformanceFutur
             },
         };
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Task {
                         value: owner_task.clone(),
@@ -1818,7 +1820,7 @@ fn case_12_task_owners_and_status(storage: Arc<dyn Storage>) -> ConformanceFutur
             ..completing_task.clone()
         };
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Task {
                     value: terminal.clone(),
                 }],
@@ -1854,7 +1856,7 @@ fn case_sleeping(storage: Arc<dyn Storage>) -> ConformanceFuture {
             memos
         });
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Task {
                     value: sleeping.clone(),
                 }],
@@ -1892,7 +1894,7 @@ fn case_sleeping(storage: Arc<dyn Storage>) -> ConformanceFuture {
             ..sleeping
         };
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Task {
                     value: running.clone(),
                 }],
@@ -1918,7 +1920,7 @@ fn case_13_request_ids(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let second_conversation: ConversationId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Conversation {
                     value: ConversationRecord {
                         id: second_conversation,
@@ -1942,7 +1944,7 @@ fn case_13_request_ids(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let second_record = input_queued(second, root, Some("other"));
         let other_record = input_queued(other, second_conversation, Some("same"));
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Submission {
                         value: first_record.clone(),
@@ -1962,14 +1964,16 @@ fn case_13_request_ids(storage: Arc<dyn Storage>) -> ConformanceFuture {
             storage
                 .submission_by_request(root, "same", &BACKGROUND_CONTEXT)
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| e.to_string())?
+                .map(|record| (*record).clone()),
             Some(first_record.clone())
         );
         check_eq!(
             storage
                 .submission_by_request(second_conversation, "same", &BACKGROUND_CONTEXT)
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| e.to_string())?
+                .map(|record| (*record).clone()),
             Some(other_record.clone())
         );
         let placed = SubmissionRecord::Input {
@@ -1982,7 +1986,7 @@ fn case_13_request_ids(storage: Arc<dyn Storage>) -> ConformanceFuture {
             trace: None,
         };
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Submission {
                     value: placed.clone(),
                 }],
@@ -1995,7 +1999,8 @@ fn case_13_request_ids(storage: Arc<dyn Storage>) -> ConformanceFuture {
             storage
                 .submission_by_request(root, "other", &BACKGROUND_CONTEXT)
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| e.to_string())?
+                .map(|record| (*record).clone()),
             Some(placed.clone())
         );
         let ids = |query: SubmissionQuery| {
@@ -2096,7 +2101,7 @@ fn case_14_passive_submissions(storage: Arc<dyn Storage>) -> ConformanceFuture {
             trace: None,
         };
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Submission {
                         value: queued_done.clone(),
@@ -2129,7 +2134,7 @@ fn case_14_passive_submissions(storage: Arc<dyn Storage>) -> ConformanceFuture {
             trace: None,
         };
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Submission {
                         value: done.clone(),
@@ -2147,7 +2152,8 @@ fn case_14_passive_submissions(storage: Arc<dyn Storage>) -> ConformanceFuture {
             storage
                 .submission_by_request(root, "passive-done", &BACKGROUND_CONTEXT)
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| e.to_string())?
+                .map(|record| (*record).clone()),
             Some(done)
         );
         check_eq!(submission_by_id(&storage, failed_id).await?, unanswered);
@@ -2176,7 +2182,7 @@ fn case_15_rewindable_documents(storage: Arc<dyn Storage>) -> ConformanceFuture 
             value
         };
         let created_at = storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentCreate {
                     record: first_record.clone(),
                     content: DocumentContent::Base {
@@ -2204,7 +2210,7 @@ fn case_15_rewindable_documents(storage: Arc<dyn Storage>) -> ConformanceFuture 
             },
         ];
         let changed_at = storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentChange {
                     id: first,
                     content: DocumentContent::Delta { version: 1, ops },
@@ -2252,7 +2258,7 @@ fn case_15_rewindable_documents(storage: Arc<dyn Storage>) -> ConformanceFuture 
             value
         };
         let checkpoint_at = storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentChange {
                     id: first,
                     content: DocumentContent::Base {
@@ -2265,7 +2271,7 @@ fn case_15_rewindable_documents(storage: Arc<dyn Storage>) -> ConformanceFuture 
             .await
             .map_err(|e| e.to_string())?;
         let replaced = storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentChange {
                     id: first,
                     content: DocumentContent::Delta {
@@ -2312,7 +2318,7 @@ fn case_15_rewindable_documents(storage: Arc<dyn Storage>) -> ConformanceFuture 
         let second: DocumentId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         let retired_at = storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::DocumentCreate {
                         record: DocumentCreate {
@@ -2455,7 +2461,7 @@ fn case_16_long_tails(storage: Arc<dyn Storage>) -> ConformanceFuture {
         initial.insert("revision".to_string(), serde_json::json!(0));
         initial.insert("rows".to_string(), JsonValue::Array(rows));
         let created_at = storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentCreate {
                     record,
                     content: DocumentContent::Base {
@@ -2480,7 +2486,7 @@ fn case_16_long_tails(storage: Arc<dyn Storage>) -> ConformanceFuture {
             }
             before_replacement.insert("revision".to_string(), serde_json::json!(revision));
             before_replacement_at = storage
-                .commit(
+                .commit_one(
                     &[StorageWrite::DocumentChange {
                         id,
                         content: DocumentContent::Delta {
@@ -2515,7 +2521,7 @@ fn case_16_long_tails(storage: Arc<dyn Storage>) -> ConformanceFuture {
         replacement.insert("revision".to_string(), serde_json::json!(100));
         replacement.insert("rows".to_string(), JsonValue::Array(replacement_rows));
         let replacement_at = storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentChange {
                     id,
                     content: DocumentContent::Delta {
@@ -2537,7 +2543,7 @@ fn case_16_long_tails(storage: Arc<dyn Storage>) -> ConformanceFuture {
             }
             current.insert("revision".to_string(), serde_json::json!(revision));
             storage
-                .commit(
+                .commit_one(
                     &[StorageWrite::DocumentChange {
                         id,
                         content: DocumentContent::Delta {
@@ -2613,7 +2619,7 @@ fn case_17_document_copies(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let second_child: ConversationId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Conversation {
                         value: ConversationRecord {
@@ -2647,7 +2653,7 @@ fn case_17_document_copies(storage: Arc<dyn Storage>) -> ConformanceFuture {
             fork: Some(crate::types::DocumentFork::AsOf),
         };
         let created_at = storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentCreate {
                     record: source_record.clone(),
                     content: DocumentContent::Base {
@@ -2663,7 +2669,7 @@ fn case_17_document_copies(storage: Arc<dyn Storage>) -> ConformanceFuture {
             .await
             .map_err(|e| e.to_string())?;
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentChange {
                     id: source,
                     content: DocumentContent::Delta {
@@ -2705,7 +2711,7 @@ fn case_17_document_copies(storage: Arc<dyn Storage>) -> ConformanceFuture {
             fork: Some(crate::types::DocumentFork::AsOf),
         };
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::DocumentCopy {
                         record: child_record(historical_copy, child),
@@ -2761,7 +2767,7 @@ fn case_17_document_copies(storage: Arc<dyn Storage>) -> ConformanceFuture {
         );
 
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::DocumentChange {
                         id: source,
@@ -2803,7 +2809,7 @@ fn case_17_document_copies(storage: Arc<dyn Storage>) -> ConformanceFuture {
             fork: Some(crate::types::DocumentFork::Current),
         };
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentCreate {
                     record: latest_record.clone(),
                     content: DocumentContent::Base {
@@ -2819,7 +2825,7 @@ fn case_17_document_copies(storage: Arc<dyn Storage>) -> ConformanceFuture {
             .await
             .map_err(|e| e.to_string())?;
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentCopy {
                     record: DocumentCreate {
                         id: latest_copy,
@@ -2841,7 +2847,7 @@ fn case_17_document_copies(storage: Arc<dyn Storage>) -> ConformanceFuture {
             .await
             .map_err(|e| e.to_string())?;
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::DocumentChange {
                         id: latest_source,
@@ -2872,7 +2878,7 @@ fn case_17_document_copies(storage: Arc<dyn Storage>) -> ConformanceFuture {
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         check_rejected(
             storage
-                .commit(
+                .commit_one(
                     &[
                         StorageWrite::DocumentCopy {
                             record: child_record(conflict, child),
@@ -2910,7 +2916,7 @@ fn case_17_document_copies(storage: Arc<dyn Storage>) -> ConformanceFuture {
         mismatch_record.kind = "copy.mismatch".to_string();
         check_rejected(
             storage
-                .commit(
+                .commit_one(
                     &[StorageWrite::DocumentCopy {
                         record: mismatch_record,
                         source: crate::types::DocumentCopySource {
@@ -2939,7 +2945,7 @@ fn case_18_version_transitions(storage: Arc<dyn Storage>) -> ConformanceFuture {
         create_root(&storage).await?;
         let id: DocumentId = id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentCreate {
                     record: session_document(id, "session.settings"),
                     content: DocumentContent::Base {
@@ -2955,7 +2961,7 @@ fn case_18_version_transitions(storage: Arc<dyn Storage>) -> ConformanceFuture {
             .await
             .map_err(|e| e.to_string())?;
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentChange {
                     id,
                     content: DocumentContent::Delta {
@@ -2971,7 +2977,7 @@ fn case_18_version_transitions(storage: Arc<dyn Storage>) -> ConformanceFuture {
             .await
             .map_err(|e| e.to_string())?;
         let migrated_at = storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentChange {
                     id,
                     content: DocumentContent::Base {
@@ -3002,7 +3008,7 @@ fn case_18_version_transitions(storage: Arc<dyn Storage>) -> ConformanceFuture {
         )?;
         check_err(
             storage
-                .commit(
+                .commit_one(
                     &[StorageWrite::DocumentChange {
                         id,
                         content: DocumentContent::Delta {
@@ -3029,7 +3035,7 @@ fn case_18_version_transitions(storage: Arc<dyn Storage>) -> ConformanceFuture {
             Some(serde_json::json!(3))
         );
         storage
-            .commit(&[StorageWrite::DocumentRetire { id }], &BACKGROUND_CONTEXT)
+            .commit_one(&[StorageWrite::DocumentRetire { id }], &BACKGROUND_CONTEXT)
             .await
             .map_err(|e| e.to_string())?;
         check!(
@@ -3060,7 +3066,7 @@ fn case_19_document_addresses(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let task_other_kind: DocumentId =
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         let created_at = storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Task {
                         value: pending_task(task, root, "ready"),
@@ -3322,7 +3328,7 @@ fn case_20_document_lifecycle(storage: Arc<dyn Storage>) -> ConformanceFuture {
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         let record = session_document(first, "singleton");
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentCreate {
                     record: record.clone(),
                     content: DocumentContent::Base {
@@ -3339,7 +3345,7 @@ fn case_20_document_lifecycle(storage: Arc<dyn Storage>) -> ConformanceFuture {
             .map_err(|e| e.to_string())?;
         check_err(
             storage
-                .commit(
+                .commit_one(
                     &[
                         StorageWrite::DocumentCreate {
                             record: DocumentCreate {
@@ -3386,7 +3392,7 @@ fn case_20_document_lifecycle(storage: Arc<dyn Storage>) -> ConformanceFuture {
 
         let empty: DocumentId = id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         let empty_at = storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::DocumentCreate {
                         record: DocumentCreate {
@@ -3460,7 +3466,7 @@ fn case_21_document_rollback(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let submission_value = input_queued(submission, root, Some("atomic"));
         let record = session_document(document, "atomic");
         let baseline_seq = storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Task {
                         value: task_value.clone(),
@@ -3488,7 +3494,7 @@ fn case_21_document_rollback(storage: Arc<dyn Storage>) -> ConformanceFuture {
             id_from_number(storage.mint_id().await.map_err(|e| e.to_string())?);
         check_err(
             storage
-                .commit(
+                .commit_one(
                     &[
                         StorageWrite::Task {
                             value: TaskRecord {
@@ -3554,7 +3560,8 @@ fn case_21_document_rollback(storage: Arc<dyn Storage>) -> ConformanceFuture {
             storage
                 .submission_by_request(root, "atomic", &BACKGROUND_CONTEXT)
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| e.to_string())?
+                .map(|record| (*record).clone()),
             Some(submission_value)
         );
         check!(
@@ -3590,7 +3597,7 @@ fn case_21_document_rollback(storage: Arc<dyn Storage>) -> ConformanceFuture {
             Some(document)
         );
         let after = storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::DocumentChange {
                     id: document,
                     content: DocumentContent::Delta {
@@ -3639,7 +3646,7 @@ fn case_22_identities_lossless(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let mut second_task_value = pending_task(second_task, root, "ready");
         second_task_value.kind = second.to_string();
         storage
-            .commit(
+            .commit_one(
                 &[
                     StorageWrite::Task {
                         value: first_task_value,
@@ -3883,7 +3890,7 @@ fn case_23_global_id_namespace(storage: Arc<dyn Storage>) -> ConformanceFuture {
         let root = create_root(&storage).await?;
         let explicit: EntryId = id_from_number(100);
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Entry {
                     value: entry(explicit, root, "message"),
                 }],
@@ -3894,7 +3901,7 @@ fn case_23_global_id_namespace(storage: Arc<dyn Storage>) -> ConformanceFuture {
         check_eq!(storage.mint_id().await.map_err(|e| e.to_string())?, 101);
         check_err(
             storage
-                .commit(
+                .commit_one(
                     &[StorageWrite::Task {
                         value: pending_task(id_from_number(100), root, "ready"),
                     }],
@@ -3905,7 +3912,7 @@ fn case_23_global_id_namespace(storage: Arc<dyn Storage>) -> ConformanceFuture {
         )?;
         let max_id: EntryId = id_from_number(9_007_199_254_740_991);
         storage
-            .commit(
+            .commit_one(
                 &[StorageWrite::Entry {
                     value: entry(max_id, root, "last-id"),
                 }],
@@ -3931,8 +3938,80 @@ fn case_24_close_rejects(storage: Arc<dyn Storage>) -> ConformanceFuture {
                 .await,
             "closed",
         )?;
-        check_err(storage.commit(&[], &BACKGROUND_CONTEXT).await, "closed")?;
+        check_err(storage.commit_one(&[], &BACKGROUND_CONTEXT).await, "closed")?;
         check_err(storage.mint_id().await, "closed")
+    })
+}
+
+fn case_25_ordered_batch_refusal(storage: Arc<dyn Storage>) -> ConformanceFuture {
+    Box::pin(async move {
+        create_root(&storage).await?;
+        let batches = vec![
+            vec![StorageWrite::Entry {
+                value: entry(id_from_number(2), crate::ids::ROOT_CONVERSATION_ID, "first"),
+            }],
+            vec![StorageWrite::Entry {
+                value: entry(
+                    id_from_number(3),
+                    crate::ids::ROOT_CONVERSATION_ID,
+                    "second",
+                ),
+            }],
+            vec![StorageWrite::Entry {
+                value: entry(
+                    id_from_number(2),
+                    crate::ids::ROOT_CONVERSATION_ID,
+                    "refused",
+                ),
+            }],
+            vec![StorageWrite::Entry {
+                value: entry(
+                    id_from_number(4),
+                    crate::ids::ROOT_CONVERSATION_ID,
+                    "unstored",
+                ),
+            }],
+        ];
+        let mut receipts = Vec::new();
+        let result = storage
+            .commit(
+                &batches,
+                &mut |index, seq| receipts.push((index, seq)),
+                &BACKGROUND_CONTEXT,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        check_eq!(result.stored, 2);
+        check_eq!(receipts.len(), 2);
+        check_eq!(receipts[0].0, 0);
+        check_eq!(receipts[1].0, 1);
+        check!(receipts[0].1 < receipts[1].1, "receipts follow batch order");
+        check!(result.refused.is_some(), "duplicate ID must be refused");
+        check!(
+            storage
+                .entry(id_from_number(2), &BACKGROUND_CONTEXT)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some(),
+            "first batch is durable"
+        );
+        check!(
+            storage
+                .entry(id_from_number(3), &BACKGROUND_CONTEXT)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some(),
+            "second batch is durable"
+        );
+        check!(
+            storage
+                .entry(id_from_number(4), &BACKGROUND_CONTEXT)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none(),
+            "batch after the refusal is not stored"
+        );
+        Ok(())
     })
 }
 
@@ -4039,6 +4118,10 @@ pub fn create_storage_conformance() -> Vec<ConformanceCase> {
             name: "rejects every operation after close",
             run: case_24_close_rejects,
         },
+        ConformanceCase {
+            name: "stores ordered batches and stops at the first refusal with prior receipts",
+            run: case_25_ordered_batch_refusal,
+        },
     ]
 }
 
@@ -4077,7 +4160,7 @@ mod tests {
     #[test]
     fn includes_the_complete_upstream_case_list() {
         let cases = create_storage_conformance();
-        assert_eq!(cases.len(), 25);
+        assert_eq!(cases.len(), 26);
         assert_eq!(cases[12].name, "stores and scans sleeping tasks by status");
     }
 }

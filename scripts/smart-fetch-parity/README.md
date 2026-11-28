@@ -1,8 +1,22 @@
-# smart-fetch parity harness (TE06)
+# smart-fetch parity harness (TE06; dual track V19-03)
 
 Golden-fixture parity between the pinned upstream `agent-smart-fetch`
-(v0.3.17 / `b0111612`, submodule under `external/agent-smart-fetch`) and
+(submodule under `external/agent-smart-fetch`) and
 `crates/rpi-ext-smart-fetch` (design §5.1/§5.3).
+
+Dual track (V19-03 / ADR-0048):
+
+| Track | Upstream | Fixture directory |
+|---|---|---|
+| `regression` (default) | v0.3.17 `b0111612` | `fixtures/generated/smart-fetch-parity/` |
+| `target` | v0.3.23 `feb6da00` | `fixtures/generated/smart-fetch-parity-v0323/` |
+
+`run.sh` extracts the selected pin with `git archive` (the submodule stays
+read-only), stages the sources out of repo, and regenerates that track's
+fixtures. The Rust replay (`cargo test -p rpi-ext-smart-fetch --test
+parity_fixtures`) consumes both directories. The F02 alternate-order cases
+are an intentional v0.3.23 behavior change: the regression track records the
+retired DOM-first order as scope evidence, the target track is the oracle.
 
 - `gen-fixtures.mjs` — drives the pinned upstream TS sources over a fixed
   input matrix and writes input/output pairs to
@@ -16,6 +30,14 @@ Golden-fixture parity between the pinned upstream `agent-smart-fetch`
 - `crates/rpi-ext-smart-fetch/tests/parity_fixtures.rs` — replays the
   fixtures through the port (pipeline scenarios go through the injected
   transport/extractor seams).
+
+### Running a track
+
+```bash
+RPI_SF_TRACK=target bash scripts/smart-fetch-parity/run.sh gen
+RPI_SF_TRACK=regression bash scripts/smart-fetch-parity/run.sh gen
+cargo test -p rpi-ext-smart-fetch --test parity_fixtures
+```
 
 ## One-time setup
 

@@ -20,6 +20,7 @@ use crate::host;
 use crate::i18n;
 use crate::mode;
 use crate::plan_file;
+use crate::progress;
 use crate::review;
 use crate::view;
 
@@ -29,9 +30,6 @@ pub const TOOL_NAME: &str = config::WRITE_PLAN_TOOL;
 /// Command name registered for `/plan` (host routes `command` dispatches
 /// by name).
 pub const COMMAND_NAME: &str = "plan";
-
-/// Maximum injected plan-summary size (chars).
-pub const SUMMARY_LIMIT: usize = 4000;
 
 /// The `registerTool` payload.
 pub fn tool_definition() -> Value {
@@ -89,7 +87,8 @@ pub fn execute(host: &dyn HostCall, params: &Value) -> Value {
     match review::request(host, &path, content) {
         review::ReviewOutcome::Approved => {
             leave_plan_mode(host);
-            let summary = review::truncate_plan(content, SUMMARY_LIMIT);
+            progress::begin(host, content);
+            let summary = content.to_owned();
             let message = format!("{summary}\n\n{}", i18n::EXECUTION_INSTRUCTION);
             if let Err(error) = host.call(
                 "sendUserMessage",
@@ -208,10 +207,11 @@ mod tests {
     }
 
     #[test]
-    fn summary_limit_is_bounded() {
-        let long = "x".repeat(SUMMARY_LIMIT + 10);
-        let truncated = review::truncate_plan(&long, SUMMARY_LIMIT);
-        assert!(truncated.len() > SUMMARY_LIMIT, "marker is appended");
+    fn plan_preview_limit_is_bounded() {
+        let limit = 4000;
+        let long = "x".repeat(limit + 10);
+        let truncated = review::truncate_plan(&long, limit);
+        assert!(truncated.len() > limit, "marker is appended");
         assert!(truncated.contains(i18n::SUMMARY_TRUNCATED));
     }
 }

@@ -12,7 +12,8 @@ use crate::api::openai_responses::OpenAiResponses;
 use crate::api::session_affinity::with_opencode_session_header;
 use crate::api::typesafe_system_one::{TYPESAFE_SYSTEM_ONE_API, typesafe_system_one_api};
 use crate::auth::{ProviderAuth, env_api_key_auth};
-use crate::generated::{get_builtin_all_models, get_builtin_models};
+#[cfg(test)]
+use crate::generated::{get_builtin_all_models, get_builtin_chat_models};
 use crate::models::{
     CreateProviderOptions, Provider, ProviderApi, ProviderStreams, create_provider,
 };
@@ -32,8 +33,7 @@ pub fn opencode_provider() -> Arc<dyn Provider> {
             ))),
             oauth: None,
         },
-        models: get_builtin_models("opencode").to_vec(),
-        all_models: get_builtin_all_models("opencode").to_vec(),
+        shared_all_models: Some(crate::generated::get_builtin_all_models_shared("opencode")),
         classifiers: HashMap::from([(
             TYPESAFE_SYSTEM_ONE_API.to_owned(),
             typesafe_system_one_api(),
@@ -84,7 +84,7 @@ mod tests {
             assert!(map.contains_key(key), "missing dispatch key {key}");
         }
         assert_eq!(map.len(), 4);
-        for model in get_builtin_models("opencode") {
+        for model in get_builtin_chat_models("opencode") {
             assert!(
                 map.contains_key(model.api.as_str()),
                 "catalog model {} has undispatched api {}",
@@ -94,7 +94,10 @@ mod tests {
         }
         let gemini = get_builtin_model("opencode", "gemini-4-argon").expect("Gemini");
         assert_eq!(gemini.api, ApiKind::GOOGLE_GENERATIVE_AI.into());
-        assert_eq!(gemini.base_url, "https://opencode.ai/inference/v1");
+        assert_eq!(
+            gemini.base_url,
+            "https://opencode.ai/inference/google/v1beta"
+        );
         let classifier = get_builtin_all_models("opencode")
             .iter()
             .find_map(|model| match model {
@@ -102,7 +105,10 @@ mod tests {
                 _ => None,
             })
             .expect("OpenCode classifier");
-        assert_eq!(classifier.base_url, "https://opencode.ai/inference/v1");
+        assert_eq!(
+            classifier.base_url,
+            "https://opencode.ai/inference/systemone/v1"
+        );
     }
 
     /// #9326 (561a2e066): provider dispatch wraps every adapter with the

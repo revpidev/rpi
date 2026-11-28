@@ -454,44 +454,49 @@ fn test_catalog_github_copilot_eager_streaming_baked() {
 
 #[test]
 fn test_catalog_together_reasoning_variants_baked() {
-    // Reasoning-effort models: effort on, openai thinking format.
-    // G2 (2026-10-08 catalog refresh): the previous `openai/gpt-oss-20b` /
-    // `deepseek-ai/DeepSeek-V4-Pro` ids were retired by the snapshot; the
-    // same baked rules moved to their current siblings.
-    let gpt_oss = get_builtin_model("together", "openai/gpt-oss-120b").expect("gpt-oss-120b");
-    let compat = gpt_oss.compat.as_ref().expect("compat");
-    assert_eq!(compat.supports_reasoning_effort, Some(true));
-    assert_eq!(compat.thinking_format, Some(ThinkingFormat::Openai));
-    assert!(get_compat(gpt_oss).supports_reasoning_effort);
-    let map = gpt_oss.thinking_level_map.as_ref().expect("map");
-    assert_eq!(map.get(&ModelThinkingLevel::Off), Some(&None));
-
     // Default reasoning models keep the together toggle format with effort off.
+    // G2 (2026-11-28 catalog refresh): models.dev retired the last
+    // reasoning-effort Together ids (`openai/gpt-oss-120b`,
+    // `deepseek-ai/DeepSeek-V4-Pro-0813`), so the baked surface is the toggle
+    // family only; the sweep keeps an effort-on entry from reappearing
+    // unnoticed.
     let r1 =
-        get_builtin_model("together", "deepseek-ai/DeepSeek-V4-Pro-0813").expect("ds-v4-pro-0813");
+        get_builtin_model("together", "deepseek-ai/DeepSeek-V4.1-Flash").expect("ds-v4.1-flash");
     let compat = r1.compat.as_ref().expect("compat");
     assert_eq!(compat.thinking_format, Some(ThinkingFormat::Together));
+    assert_eq!(compat.supports_reasoning_effort, Some(false));
     assert_eq!(compat.supports_long_cache_retention, Some(false));
+    let map = r1.thinking_level_map.as_ref().expect("map");
+    assert_eq!(map.get(&ModelThinkingLevel::Minimal), Some(&None));
+    assert!(!get_compat(r1).supports_reasoning_effort);
+
+    for model in get_builtin_models("together") {
+        assert_eq!(
+            model
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.supports_reasoning_effort),
+            Some(false),
+            "{} unexpectedly exposes reasoning effort",
+            model.id
+        );
+    }
 }
 
 #[test]
-fn test_catalog_openrouter_cache_control_baked() {
-    // "~anthropic/..." ids bypass runtime detection (detect keys on an
-    // "anthropic/" prefix); the generator bakes cacheControlFormat instead.
+fn test_catalog_openrouter_latest_alias_and_cache_control() {
+    // v1.5.2 routes `~anthropic/claude-*-latest` through Anthropic Messages,
+    // so the OpenAI Completions cache-control compatibility no longer applies.
     let tilde = get_builtin_model("openrouter", "~anthropic/claude-fable-latest").expect("tilde");
+    assert_eq!(tilde.api.as_str(), "anthropic-messages");
     assert_eq!(
         tilde.compat.as_ref().and_then(|c| c.cache_control_format),
-        Some(CacheControlFormat::Anthropic)
-    );
-    assert_eq!(
-        get_compat(tilde).cache_control_format,
-        Some(CacheControlFormat::Anthropic)
+        None
     );
 
-    // Plain "anthropic/..." ids resolve through detection as well.
-    // (2026-10-01 v6 snapshot: `claude-3-haiku` left the OpenRouter
-    // catalog; the current Claude line id covers the same detection face.)
-    let plain = get_builtin_model("openrouter", "anthropic/claude-fable-5").expect("plain");
+    // Claude batch variants stay on OpenAI Completions and retain cache control.
+    let plain = get_builtin_model("openrouter", "anthropic/claude-fable-5:batch").expect("plain");
+    assert_eq!(plain.api.as_str(), "openai-completions");
     assert_eq!(
         get_compat(plain).cache_control_format,
         Some(CacheControlFormat::Anthropic)

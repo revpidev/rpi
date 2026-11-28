@@ -18,6 +18,7 @@ pub mod error;
 pub mod extensions;
 pub mod logging;
 pub mod modes;
+pub mod process_exit;
 pub mod sdk;
 pub mod tools;
 pub mod utils;
