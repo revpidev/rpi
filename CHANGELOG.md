@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.9] - 2026-11-26
+## [0.1.9] - 2026-11-28
 
 This release moves the behavioral gold standard to Pi v1.5.2 (ADR-0048), re-bases `rpi-subagents` and `rpi-smart-fetch`, and makes streaming performance and Linux memory the main line (ADR-0049): the main long-history + long-code-answer + fullscreen scenario runs at 38.3% of the v0.1.8 process CPU with pure-compute frame p95 at 44.1%, an empty Linux GNU session uses 60% less resident and 82% less virtual memory, and the statusline gains the `estimate` calculation mode. Every v0.1.9 host-call is additive and `rpiAbi` stays 1.
 
@@ -120,7 +120,11 @@ This release moves the behavioral gold standard to Pi v1.5.2 (ADR-0048), re-base
 
 - Two load-sensitive tests no longer flake in the full parallel suite. `agent_session_test::in_memory_fork_waits_for_active_tool_turn` hung for good when the blocking tool's `notify_waiters()` landed before the test created its `notified()` future (92 of 288 runs under 48-way parallel load on 16 cores); the tool now signals through a permit-storing `notify_one()`. `fullscreen_transcript_measures_history_through_the_height_index` missed its stable-frame floor when other tests bumped the process-wide Mermaid-mode or terminal-capability generations during its frames (3–5 bumps per 10 ms window under load, each a by-design re-measure); it now counts only frames bracketed by unchanged generations, requires every counted frame to be re-render free, and gathers the twelve frames it needs across as many renders as the loaded run takes.
 - The seven first-party extensions remain on `rpiAbi: 1`; Session JSONL outer framing and durable default isolation are unchanged. R2-A14's unified incremental tool-argument parser is delivered by V19-05; V19-02 D16 wires the shared argument validator into durable `afterTool`, and R2-M06 is closed through the M06-IN/OUT/CHECK handoff. No packaging, registry, endpoint, tag, release or issue-closing action is implied by this file; every distribution dry-run, release build, tag, endpoint and issue closing is initiated by the maintainer (ADR-0042). Verification uses offline fixtures, loopback servers and real release processes, never paid provider accounts.
-- Workspace version `0.1.9-rc.1` (the seven first-party extension crates follow `version.workspace`; `Cargo.lock` is synced in the same change). The v0.1.9 host additions are additive: `Component::cache_revision`, `cache_instance_id` and `as_transcript_document` are default methods, `ui.renderComponent` frames gain the optional `capturesViewportInput`, `ctx.sessionStats` gains the optional `countsOnly` argument, and `subagent_launch` is a new tool-call approval; the frozen `Component::render` signature, cumulative extension events and Session JSONL outer framing are unchanged.
+- Workspace version `0.1.9` (the seven first-party extension crates follow `version.workspace`; `Cargo.lock` is synced in the same change). The v0.1.9 host additions are additive: `Component::cache_revision`, `cache_instance_id` and `as_transcript_document` are default methods, `ui.renderComponent` frames gain the optional `capturesViewportInput`, `ctx.sessionStats` gains the optional `countsOnly` argument, and `subagent_launch` is a new tool-call approval; the frozen `Component::render` signature, cumulative extension events and Session JSONL outer framing are unchanged.
+
+### Thanks
+
+- @limn2o4 and @nicksLee for the Git extension update recovery-marker fix (#79).
 
 ## [0.1.8] - 2026-11-12
 

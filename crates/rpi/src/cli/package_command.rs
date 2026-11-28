@@ -4557,15 +4557,21 @@ mod update_cli_tests {
     fn the_stage_failure_line_names_the_dropped_extensions() {
         assert_eq!(
             stage_failure_line(true, 0),
-            "Nothing changed for rpi — rpi 0.1.9-rc.4 is still installed. Extension updates above (if any) remain applied."
+            format!(
+                "Nothing changed for rpi — rpi {VERSION} is still installed. Extension updates above (if any) remain applied."
+            )
         );
         assert_eq!(
             stage_failure_line(true, 2),
-            "Nothing changed for rpi — rpi 0.1.9-rc.4 is still installed. The 2 extension updates staged with it were dropped; run \"rpi update --extensions\" to apply them."
+            format!(
+                "Nothing changed for rpi — rpi {VERSION} is still installed. The 2 extension updates staged with it were dropped; run \"rpi update --extensions\" to apply them."
+            )
         );
         assert_eq!(
             stage_failure_line(true, 1),
-            "Nothing changed for rpi — rpi 0.1.9-rc.4 is still installed. The 1 extension update staged with it was dropped; run \"rpi update --extensions\" to apply them."
+            format!(
+                "Nothing changed for rpi — rpi {VERSION} is still installed. The 1 extension update staged with it was dropped; run \"rpi update --extensions\" to apply them."
+            )
         );
         // The self-only branch never has extensions in its batch.
         assert_eq!(stage_failure_line(false, 0), failure_line(false));
