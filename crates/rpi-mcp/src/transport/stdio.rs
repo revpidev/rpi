@@ -247,6 +247,7 @@ impl StdioTransport {
         {
             // Windows has no graceful signals; `taskkill /T /F` reaps the
             // tree (stdio.ts:31). Best effort.
+            let _ = signal;
             let _ = std::process::Command::new("taskkill")
                 .args(["/pid", &pid.to_string(), "/T", "/F"])
                 .stdout(Stdio::null())

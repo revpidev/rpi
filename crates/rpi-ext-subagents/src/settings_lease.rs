@@ -53,7 +53,7 @@ fn is_lock_contended(error: &io::Error) -> bool {
     }
     #[cfg(windows)]
     {
-        return error.raw_os_error() == Some(33);
+        error.raw_os_error() == Some(33)
     }
     #[cfg(not(windows))]
     {
@@ -711,6 +711,8 @@ fn write_temp_then_rename(
     body: &str,
     existing_mode: Option<u32>,
 ) -> io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = existing_mode;
     {
         use std::io::Write;
         let mut options = std::fs::OpenOptions::new();
@@ -725,12 +727,10 @@ fn write_temp_then_rename(
         let mut file = options.open(temp)?;
         file.write_all(body.as_bytes())?;
     }
+    #[cfg(unix)]
     if let Some(mode) = existing_mode {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(temp, std::fs::Permissions::from_mode(mode))?;
-        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp, std::fs::Permissions::from_mode(mode))?;
     }
     std::fs::rename(temp, target)
 }

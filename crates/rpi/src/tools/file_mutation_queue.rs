@@ -109,6 +109,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::tools::test_helpers::TempDir;
     use std::time::Duration;
 

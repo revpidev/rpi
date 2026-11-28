@@ -2622,6 +2622,7 @@ mod tests {
 #[cfg(test)]
 mod discovery_robustness_tests {
     use super::*;
+    #[cfg(unix)]
     use std::time::Duration;
 
     const HIDDEN_RPI_AGENT: &str = "---\nname: hidden-rpi-agent\ndescription: pruned\n---\nbody\n";

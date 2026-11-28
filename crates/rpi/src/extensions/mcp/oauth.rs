@@ -358,7 +358,7 @@ fn is_lock_contended(error: &std::io::Error) -> bool {
     #[cfg(windows)]
     {
         // `ERROR_LOCK_VIOLATION`.
-        return error.raw_os_error() == Some(33);
+        error.raw_os_error() == Some(33)
     }
     #[cfg(not(windows))]
     {
@@ -1406,6 +1406,8 @@ mod tests {
     #[tokio::test]
     async fn credential_store_rewrites_are_atomic_under_lock() {
         let (credentials, dir) = store("docs");
+        #[cfg(not(unix))]
+        let _ = &dir;
         let server = credentials.for_server("docs", "https://mcp.example/mcp");
         server
             .save(McpOAuthState {

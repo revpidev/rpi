@@ -433,7 +433,9 @@ fn credential_env(api_key_env: Option<&str>) -> UsageScriptEnv {
 mod tests {
     use super::*;
     use crate::core::settings_manager::{UsageProviderConfig, UsageSettings};
+    #[cfg(unix)]
     use async_trait::async_trait;
+    #[cfg(unix)]
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -503,10 +505,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct FakeResolver {
         result: Result<Option<UsageCredentials>, UsageErrorKind>,
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl UsageCredentialResolver for FakeResolver {
         async fn resolve(
@@ -518,6 +522,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn fake_identity(generation: &str) -> UsageCredentials {
         UsageCredentials {
             credential_kind: super::super::UsageCredentialKind::ApiKey,

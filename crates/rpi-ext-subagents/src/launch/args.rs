@@ -1430,6 +1430,7 @@ mod tests {
                 .ends_with("Do not print tool-call syntax, patches, or pseudo-tool calls as text."),
             "#2693: the boundary block is last, not first"
         );
+        #[cfg(unix)]
         let mode = std::fs::metadata(&prompt_path).unwrap();
         #[cfg(unix)]
         {

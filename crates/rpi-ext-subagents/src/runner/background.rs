@@ -807,6 +807,7 @@ pub(crate) fn pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
 /// Crate-visible liveness probe for other run-history surfaces
 /// (`foreground_history`); the boot-id guard is the same one the stale-run
 /// reconciler uses.
+#[cfg(unix)]
 pub(crate) fn recorded_pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
     pid_matches(pid, boot_id)
 }

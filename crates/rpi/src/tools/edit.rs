@@ -4,6 +4,7 @@
 //! `edits[].oldText` must match a unique, non-overlapping region of the original
 //! file. BOM and line-ending style are preserved across edits.
 
+#[cfg(unix)]
 use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};

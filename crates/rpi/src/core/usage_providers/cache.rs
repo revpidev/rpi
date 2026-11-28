@@ -110,7 +110,7 @@ impl UsageCache {
 
     /// Test-only TTL override (the registry's stale-branch tests need to
     /// expire an existing entry without dropping its identity).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_ttl(&mut self, ttl: Duration) {
         self.ttl = ttl;
     }

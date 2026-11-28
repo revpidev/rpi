@@ -57,7 +57,7 @@ pub(crate) fn is_lock_contended(error: &std::io::Error) -> bool {
     #[cfg(windows)]
     {
         // `LockFileEx` reports a held lock as ERROR_LOCK_VIOLATION (33).
-        return error.raw_os_error() == Some(33);
+        error.raw_os_error() == Some(33)
     }
     #[cfg(not(windows))]
     {
@@ -633,6 +633,8 @@ fn preserve_trailing_newline(current: Option<&str>, next: &str) -> String {
 }
 
 fn atomic_replace(target: &Path, body: &str, mode: Option<u32>) -> WriteResult<()> {
+    #[cfg(not(unix))]
+    let _ = mode;
     let temp = target.with_file_name(format!(
         ".{}.{}.{}.tmp",
         target

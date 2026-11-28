@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+#[cfg(unix)]
 use rpi_mcp::transport::McpTransport;
 use rpi_mcp::transport::stdio::StdioTransportOptions;
 use rpi_mcp::{

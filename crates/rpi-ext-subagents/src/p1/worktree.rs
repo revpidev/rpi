@@ -353,19 +353,23 @@ fn link_node_modules_if_present(toplevel: &Path, worktree_path: &Path) -> Result
         // Keep the explicit skip rather than fail-closing a platform whose
         // link mechanism std cannot express (see O-5).
         let _ = (&source_real, &link);
-        return Ok(false);
+        Ok(false)
     }
     // Created-link verification (#2288): the link must be a symlink that
     // resolves back to the source — a dangling or redirected link is a
     // half-built worktree, not a reusable dependency.
-    let link_meta = std::fs::symlink_metadata(&link).map_err(|error| wrap(error.to_string()))?;
-    let link_real = std::fs::canonicalize(&link).map_err(|error| wrap(error.to_string()))?;
-    if !link_meta.file_type().is_symlink() || link_real != source_real {
-        return Err(wrap(
-            "created link does not resolve to the source node_modules".to_string(),
-        ));
+    #[cfg(unix)]
+    {
+        let link_meta =
+            std::fs::symlink_metadata(&link).map_err(|error| wrap(error.to_string()))?;
+        let link_real = std::fs::canonicalize(&link).map_err(|error| wrap(error.to_string()))?;
+        if !link_meta.file_type().is_symlink() || link_real != source_real {
+            return Err(wrap(
+                "created link does not resolve to the source node_modules".to_string(),
+            ));
+        }
+        Ok(true)
     }
-    Ok(true)
 }
 
 /// `validateHookPath` (worktree.ts:268-294): non-empty, `~/` expandable,
@@ -1237,6 +1241,7 @@ fn resolve_repo_base(cwd: &Path) -> Result<(PathBuf, String), String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     pub(crate) fn test_repo_shared(tag: &str) -> (PathBuf, PathBuf, String) {
         test_repo(tag)
     }

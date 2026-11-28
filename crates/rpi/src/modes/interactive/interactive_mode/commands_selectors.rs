@@ -49,9 +49,9 @@ use rpi_ai::auth::types::{AuthCheck, AuthType, BoxFutureSend, CredentialType, Lo
 use rpi_ai::auth::{ModelsError, ModelsErrorCode};
 use rpi_ai::types::{Model, ModelThinkingLevel, ThinkingLevel};
 use rpi_tui::terminal_colors::TerminalColorScheme;
-use rpi_tui::tui::{
-    Component, Focusable, SharedComponent, TuiStopOptions, shared_component_from_boxed,
-};
+#[cfg(unix)]
+use rpi_tui::tui::TuiStopOptions;
+use rpi_tui::tui::{Component, Focusable, SharedComponent, shared_component_from_boxed};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 

@@ -145,7 +145,7 @@ pub fn save_status_line(
             let _ = fs2::FileExt::unlock(&host_lock);
             drop(host_lock);
             atomic_replace(&target, &body, mode)?;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(windows))]
         {
@@ -282,7 +282,7 @@ fn is_lock_contended(error: &io::Error) -> bool {
     }
     #[cfg(windows)]
     {
-        return error.raw_os_error() == Some(33);
+        error.raw_os_error() == Some(33)
     }
     #[cfg(not(windows))]
     {
@@ -680,6 +680,8 @@ fn new_token() -> String {
 }
 
 fn atomic_replace(target: &Path, body: &str, mode: Option<u32>) -> Result<(), WriteError> {
+    #[cfg(not(unix))]
+    let _ = mode;
     let temp = target.with_file_name(format!(
         ".{}.{}.{}.tmp",
         target

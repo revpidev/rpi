@@ -19,6 +19,7 @@
 //!   the async function immediately).
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -84,11 +85,13 @@ fn file_url(path: &Path) -> String {
 /// nodejs-env.test.ts:293-316). Process-global state: only used by the WSL
 /// stdin test, which changes PATH to a superset so concurrent spawns are
 /// unaffected.
+#[cfg(unix)]
 struct ProcessEnvGuard {
     original_cwd: PathBuf,
     original_path: Option<OsString>,
 }
 
+#[cfg(unix)]
 impl ProcessEnvGuard {
     fn enter(root: &Path) -> Self {
         let original_cwd = std::env::current_dir().expect("current dir");
@@ -107,6 +110,7 @@ impl ProcessEnvGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ProcessEnvGuard {
     fn drop(&mut self) {
         match &self.original_path {
@@ -216,6 +220,7 @@ async fn test_expands_home_relative_paths_and_file_urls() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_file_info_for_files_dirs_symlinks_without_following() {
     let root = TestDir::new();
@@ -259,6 +264,7 @@ async fn test_file_info_for_files_dirs_symlinks_without_following() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_lists_symlinks_as_symlinks() {
     let root = TestDir::new();
@@ -645,6 +651,7 @@ async fn test_exec_can_replace_instead_of_inherit_default_env() {
     assert_eq!(result.stdout, "::explicit");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_uses_stdin_command_transport_for_legacy_wsl_bash_paths() {
     // Upstream fakes `process.platform === "win32"` and points `shellPath` at

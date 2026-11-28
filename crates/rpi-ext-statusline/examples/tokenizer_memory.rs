@@ -24,6 +24,8 @@ fn measure(label: &str, baseline: (u64, u64), out: &mut String) {
     // Return every freed table to the OS first (glibc keeps large freed
     // chunks in its arenas): the deltas then show what the CURRENT tables
     // retain, which is what the resident memory of the statusline tracks.
+    #[cfg(all(unix, target_env = "gnu"))]
+    // SAFETY: `malloc_trim` only touches the allocator's own state.
     unsafe {
         libc::malloc_trim(0);
     }

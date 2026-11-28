@@ -235,6 +235,7 @@ pub(crate) mod test_helpers {
         }
 
         /// `SlowReadExecutionEnv` (tools.test.ts:40-45).
+        #[cfg(unix)]
         pub(crate) fn with_read_delay(mut self, delay: std::time::Duration) -> Self {
             self.read_text_file_delay = Some(delay);
             self
