@@ -119,15 +119,20 @@ fn the_known_limits_are_documented_in_the_readme_and_the_release_notes() {
         "a crash after the confirmation is not rolled back",
         "rpi update --cleanup",
         "logs\\update.log",
+        // The block-list guidance names the exact re-stage (round-5 review).
+        "rpi update --self --version <version> --force",
     ] {
         assert!(readme.contains(phrase), "README.md lacks {phrase:?}");
     }
+    let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(changelog.contains("rpi update --self --version <version> --force"));
     let readme_zh = std::fs::read_to_string(root.join("README.zh-CN.md")).unwrap();
     for phrase in [
         "Windows：更新在下次启动时生效",
         "新版本确认首启之前关机视同首启崩溃",
         "确认之后的崩溃不自动回滚",
         "rpi update --cleanup",
+        "rpi update --self --version <版本> --force",
     ] {
         assert!(
             readme_zh.contains(phrase),
@@ -149,6 +154,7 @@ fn the_known_limits_are_documented_in_the_readme_and_the_release_notes() {
         "shutting Windows down before the new version confirmed its first start",
         "a crash after the confirmation is not rolled back",
         "rpi update --cleanup",
+        "rpi update --self --version <version> --force",
     ] {
         assert!(
             notes.contains(phrase),

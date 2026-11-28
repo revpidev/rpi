@@ -556,6 +556,9 @@ mod tests {
         let release = f.release();
         let error = f.stage(&f.request(&release, false, false)).unwrap_err();
         assert!(error.contains("blocked list"), "{error}");
+        // The guidance names the exact re-stage, not a channel-following
+        // plain `--force` (round-5 review).
+        assert!(error.contains("--version 0.1.9-rc.4 --force"), "{error}");
         assert!(!f.paths.pending_path().exists());
         assert!(matches!(
             f.stage(&f.request(&release, true, false)).unwrap(),

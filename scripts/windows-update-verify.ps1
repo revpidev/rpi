@@ -37,7 +37,8 @@
 
 .PARAMETER FromVersion
     The version installed before the update (default: what `rpi --version`
-    prints at the start of the baseline phase).
+    prints before the first phase that compares against it — the baseline,
+    or the stage phase of a standalone run).
 
 .PARAMETER ToVersion
     The version to update to (default: the version of this source tree, read
@@ -155,7 +156,6 @@ function Show-Matrix {
 function Invoke-Baseline {
     Say 'Phase baseline: the installed state before the update'
     $version = Get-RpiVersion
-    # Standalone phases (no -FromVersion): the installed version is the from-version for every later phase.
     if (-not $FromVersion) { $FromVersion = $version }
     $script:FromVersion = $FromVersion
     Check-True ([bool]$version) 'rpi --version prints a version'
@@ -411,17 +411,19 @@ $script:ChannelFlag = if ($script:Rc) { @('--rc') } else { @() }
 $verifyDir = Join-Path $env:LOCALAPPDATA 'rpi\verify'
 New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
 $script:Transcript = Join-Path $verifyDir ('verify-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + $Phase + '.log')
-Add-Log ("# windows-update-verify phase={0} from={1} to={2} channel={3} exe={4}" -f $Phase, $FromVersion, $ToVersion, $Channel, $script:Exe)
-Write-Host ("transcript: " + $script:Transcript)
 
 $order = @('baseline', 'stage', 'switched', 'extensions', 'rollback', 'cleanup')
 $phases = if ($Phase -eq 'all') { $order } else { @($Phase) }
-if (-not $FromVersion) {
-    # Every later phase compares against the installed version: capture it before anything
-    # runs, whichever phase a standalone run starts at.
+if ($phases -contains 'stage' -and -not $FromVersion) {
+    # The stage phase compares against the installed version: capture it before anything
+    # runs, whether it follows the baseline or starts a standalone run. The other phases
+    # do not read it (and `rpi --version` would confirm an update that waits for its first
+    # start), so they leave it empty.
     $FromVersion = Get-RpiVersion
     $script:FromVersion = $FromVersion
 }
+Add-Log ("# windows-update-verify phase={0} from={1} to={2} channel={3} exe={4}" -f $Phase, $FromVersion, $ToVersion, $Channel, $script:Exe)
+Write-Host ("transcript: " + $script:Transcript)
 foreach ($name in $phases) {
     switch ($name) {
         'baseline' { Invoke-Baseline }

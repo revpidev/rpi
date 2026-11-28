@@ -4138,12 +4138,46 @@ mod update_cli_tests {
         );
 
         // The same-version re-stage of a blocked pre-release version: the
-        // exact command the block-list message and the verification kit
-        // name, `--version <installed> --force`.
+        // installed version is the target and the block list names it —
+        // the exact command the block-list message and the verification
+        // kit name, `--version <installed> --force`, and nothing less.
         crate::core::windows_update::records::write_record::<
             crate::core::windows_update::records::PendingUpdate,
         >(&fs, &paths.pending_path(), None)
         .unwrap();
+        crate::config::write_install_manifest_for(
+            &exe,
+            &crate::config::InstallManifest {
+                version: "99.0.0-rc.1".to_owned(),
+                target: "t".to_owned(),
+                installed_at: "2026-11-28T00:00:00Z".to_owned(),
+                source_url: String::new(),
+                sha256: "0".repeat(64),
+                install_path: exe.display().to_string(),
+                method: "binary".to_owned(),
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            paths.blocked_path(),
+            br#"{"schemaVersion":1,"versions":["99.0.0-rc.1"]}"#,
+        )
+        .unwrap();
+        let (_exe, seam, _downloads) = staged_binary_seam(&dirs, "99.0.0-rc.1", b"rc-binary");
+        let code = run_update_in(
+            &args(&["update", "--self", "--version", "99.0.0-rc.1"]),
+            &dirs.cwd,
+            &dirs.agent_dir,
+            Some(FakeRunner::npm_view_latest()),
+            Some(StubTransport::newer_version()),
+            Some(seam),
+        )
+        .await;
+        assert_eq!(
+            code, 1,
+            "the block list refuses the pinned version without --force"
+        );
+        assert!(!paths.pending_path().exists());
         let (_exe, seam, _downloads) = staged_binary_seam(&dirs, "99.0.0-rc.1", b"rc-binary");
         let code = run_update_in(
             &args(&["update", "--self", "--version", "99.0.0-rc.1", "--force"]),
@@ -4160,6 +4194,10 @@ mod update_cli_tests {
         >(&fs, &paths.pending_path())
         .expect("pending.json");
         assert_eq!(pending.channel, "rc");
+        assert_eq!(
+            pending.from_version, "99.0.0-rc.1",
+            "a same-version re-stage"
+        );
     }
 
     #[tokio::test]
