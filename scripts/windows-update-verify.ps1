@@ -123,6 +123,7 @@ function Get-Sha256 {
 function Show-Matrix {
     $rows = @(
         @('rename the running exe and place the new one; unsupported path degrades to manual steps', 'stage + switched (unsupported path: see install.ps1 preflight)'),
+        @('a renamed rpi.exe keeps its Length and LastWriteTimeUtc (the image identity the cleanup scan relies on)', 'manual: Get-Item rpi.exe before the switch; after the switch Get-Item rpi.exe.old-<version> must show the same two values'),
         @('a directory with a loaded DLL can be neither renamed nor deleted', 'windows-tests workflow: a_directory_with_a_loaded_library_is_neither_renamable_nor_deletable'),
         @('pointer atomic write leaves no half state under fault injection', 'Linux unit tests: generations::pointer_flip_retries_transient_failures_and_leaves_no_temp_file'),
         @('two instances coexist; old instance unaffected; subagent child starts no transaction', 'extensions + manual (keep one rpi open)'),
