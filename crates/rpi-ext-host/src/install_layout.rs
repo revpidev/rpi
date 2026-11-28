@@ -115,6 +115,21 @@ pub fn is_retired(container: &Path) -> bool {
     container.join(RETIRED_MARKER_FILE).exists()
 }
 
+/// Whether `name` is the aside name the Windows cleanup scan gives a
+/// leftover directory before deleting it: `<name>.garbage-<pid>` or
+/// `<name>.garbage-<pid>.t<stamp>`, with a non-empty `<name>`. Such a
+/// directory is on its way out — a half-deleted tree may still carry a
+/// pointer and a manifest — and is never resolved as an install.
+pub fn is_garbage_aside_name(name: &str) -> bool {
+    let Some((head, tail)) = name.rsplit_once(".garbage-") else {
+        return false;
+    };
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    !head.is_empty()
+        && (digits(tail)
+            || matches!(tail.rsplit_once(".t"), Some((pid, stamp)) if digits(pid) && digits(stamp)))
+}
+
 /// Resolve `container` without consulting the process cache. `None` means
 /// retired (uninstalled); otherwise the directory that holds the extension
 /// files: the generation the pointer names, or the container itself.
@@ -124,7 +139,12 @@ pub fn is_retired(container: &Path) -> bool {
 /// generation): loading nothing would be worse than loading the files that
 /// are still there.
 pub fn resolve_install_dir_uncached(container: &Path) -> Option<PathBuf> {
-    if is_retired(container) {
+    if is_retired(container)
+        || container
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_garbage_aside_name)
+    {
         return None;
     }
     let Some(pointer) = read_generation_pointer(container) else {
@@ -377,6 +397,42 @@ mod tests {
             resolve_install_dir_uncached(&container),
             Some(container.clone())
         );
+    }
+
+    #[test]
+    fn an_aside_directory_resolves_to_nothing_whatever_it_still_contains() {
+        // A half-deleted retired container that lost its marker but kept
+        // its pointer and generation is never loaded while it waits for
+        // its deletion.
+        for name in [
+            "rpi-todo.retired-77.garbage-78",
+            "rpi-todo.garbage-78.t1730000000000",
+        ] {
+            assert!(is_garbage_aside_name(name), "{name}");
+        }
+        for name in [
+            "rpi-todo",
+            "rpi.garbage",
+            ".garbage-7",
+            "rpi-todo.garbage-",
+            "rpi-todo.garbage-x",
+        ] {
+            assert!(!is_garbage_aside_name(name), "{name}");
+        }
+        let temp = TempDir::new();
+        let dir = &temp.0;
+        let container = dir.join("rpi-todo.garbage-78");
+        std::fs::create_dir_all(container.join("0.1.0")).unwrap();
+        std::fs::write(container.join("0.1.0/rpi-extension.json"), "{}").unwrap();
+        std::fs::write(
+            container.join("current.json"),
+            r#"{"schemaVersion":1,"version":"0.1.0","path":"0.1.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_install_dir_uncached(&container), None);
+        let plain = dir.join("rpi-todo");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(resolve_install_dir_uncached(&plain), Some(plain.clone()));
     }
 
     #[test]

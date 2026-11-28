@@ -127,10 +127,10 @@ function Show-Matrix {
         @('pointer atomic write leaves no half state under fault injection', 'Linux unit tests: generations::pointer_flip_retries_transient_failures_and_leaves_no_temp_file'),
         @('two instances coexist; old instance unaffected; subagent child starts no transaction', 'extensions + manual (keep one rpi open)'),
         @('trampoline: prompt returns after the new instance exits; exit code; quoted args; kill; Ctrl+C', 'switched (automated exit code) + manual in cmd/PowerShell/Windows Terminal/VS Code'),
-        @('exe gap between the two renames', 'manual: see the "two renames" note printed by the rollback phase'),
+        @('exe gap between the two renames', 'manual: see the "two renames" steps printed by the rollback phase'),
         @('pipe modes: rpi --mode rpc / --mode json through the trampoline', 'manual (switched phase prints the commands)'),
         @('first-start watchdog: --version / --help / argument error / failing one-shot / Ctrl+C / crash', 'rollback (+ switched for the non-crash counter-cases)'),
-        @('--force downgrade and --version pin apply at the next start; a re-run installer invalidates the pending', 'manual: stage with -ToVersion <older> -Channel stable --force... see the note'),
+        @('--force downgrade and --version pin apply at the next start; a re-run installer invalidates the pending', 'manual: the rollback phase prints the commands (--version <older> --force, install.ps1 re-run)'),
         @('target below 0.1.9-rc.4 switches without the first-start check', 'manual (only when an older RC asset exists)'),
         @('re-stage the rolled-back version with --force; resume an interrupted rollback', 'rollback + manual'),
         @('three cleanup notices; update --cleanup', 'switched (reminder/in-use) + cleanup'),
@@ -154,7 +154,9 @@ function Show-Matrix {
 function Invoke-Baseline {
     Say 'Phase baseline: the installed state before the update'
     $version = Get-RpiVersion
+    # Standalone phases (no -FromVersion): the installed version is the from-version for every later phase.
     if (-not $FromVersion) { $FromVersion = $version }
+    $script:FromVersion = $FromVersion
     Check-True ([bool]$version) 'rpi --version prints a version'
     Write-Host "  installed: $version (prefix $($script:Prefix))"
     $manifest = Read-JsonFile (Join-Path $script:Prefix 'rpi.install.json')
@@ -312,6 +314,18 @@ function Invoke-Rollback {
     Check-Equal '1' ([string]$refused.ExitCode) 'an update pinned to the blocked version is refused without --force'
     Check-True ($refused.Output -match 'blocked list') 'the refusal names the block list'
     Say 'Counter-cases that must NOT roll back (manual, re-stage with --force first each time): rpi --version, rpi --help, a mistyped flag, a failing one-shot command, Ctrl+C during the first TUI frame, rpi --resume with the picker cancelled (Esc). After each, rpi --version must print the new version and update-result.json must be confirmed (or still applied for the failing one-shot command).'
+    Say 'Manual steps the matrix maps to this phase (matrix rows 6, 9 and 11):'
+    Write-Host '  - The two renames: the startup transaction renames rpi.exe to rpi.exe.old-<version>, then the staged executable to rpi.exe.'
+    Write-Host '    A process that starts exactly between the two renames finds no rpi.exe (one "not found" start at most); to probe it, run'
+    Write-Host '    `while ($true) { rpi --version }` in a second terminal during the switch and note any failed start. The transaction is unaffected.'
+    Write-Host '  - Downgrade / pinned target: rpi update --self --version <older version> --force   (an RC target needs --rc as well;'
+    Write-Host "    without --force the downgrade is refused). Expect the same `Downloaded rpi <older>. It takes effect the next time rpi starts.` line,"
+    Write-Host '    then the switch at the next start. A plain --version <pinned newer> stages without --force.'
+    Write-Host '  - A re-run installer invalidates the pending: stage an update, run install.ps1 (rpi closed), start rpi: update.log says'
+    Write-Host '    "superseded by the installer" and .update\pending.json is gone.'
+    Write-Host '  - Interrupted rollback: re-stage, start rpi, end the newest rpi.exe (the child) before the first frame and end the trampoline'
+    Write-Host '    (the older rpi.exe) right after update.log shows "rollback:"; start rpi again: the rollback must complete (update.log'
+    Write-Host '    "rollback:" lines, rpi --version prints the restored version) and the block list holds the failed version.'
 }
 
 function Invoke-Cleanup {

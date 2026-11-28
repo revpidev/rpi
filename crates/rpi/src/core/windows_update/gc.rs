@@ -273,7 +273,15 @@ fn remove_leftover(
     // delete when the deletion does not finish (the aside name, so the
     // warning points at what exists).
     let mut left = path.to_path_buf();
-    let result = if directory {
+    let already_aside = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_garbage_name);
+    let result = if directory && already_aside {
+        // An aside of an earlier scan is deleted where it stands: renaming
+        // it aside again would grow its name on every failed attempt.
+        fs.remove_dir_all(path)
+    } else if directory {
         match rename_aside(fs, context, path) {
             Ok(aside) => {
                 left = aside;
@@ -339,9 +347,11 @@ fn rename_aside(
 /// Whether a directory name is the aside name of a leftover (`<name>
 /// .garbage-<pid>`): a half-deleted tree that no longer carries the marks
 /// the ordinary classification looks for (a generation's manifest, a
-/// retired container's marker).
+/// retired container's marker). The shared predicate is strict about the
+/// shape, so an extension name that merely contains `.garbage-` is not
+/// mistaken for an aside.
 fn is_garbage_name(name: &str) -> bool {
-    name.contains(".garbage-")
+    rpi_ext_host::install_layout::is_garbage_aside_name(name)
 }
 
 /// The instances that hold a leftover: old/new images by their version,
@@ -1510,6 +1520,46 @@ mod tests {
             report.stuck[0].path.display()
         );
         assert!(!old.exists(), "the original name is gone");
+
+        // An aside whose deletion fails again is deleted where it stands:
+        // its name does not grow on every attempt (round-4 review).
+        let f = Fixture::new();
+        let container = f.root().join("rpi-todo");
+        f.generation("rpi-todo", "0.2.0");
+        f.write(
+            &container.join("current.json"),
+            r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0"}"#,
+        );
+        let aside = container.join("0.1.0.garbage-77");
+        f.write(&aside.join("rpi-extension.json"), "{}");
+        f.fs.fail_with(
+            FsOp::RemoveDirAll,
+            "0.1.0.garbage-77",
+            1,
+            std::io::Error::from_raw_os_error(5),
+        );
+        f.fs.fail_with(
+            FsOp::Rename,
+            "0.1.0.garbage-77",
+            1,
+            std::io::Error::from_raw_os_error(5),
+        );
+        let report = cleanup_scan(&*f.fs, &f.context(UpdateState::Idle));
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(report.live.is_empty(), "{report:?}");
+        assert_eq!(report.stuck.len(), 1, "{report:?}");
+        assert_eq!(report.stuck[0].path, aside);
+        assert!(aside.exists());
+        // A legitimate name that merely contains `.garbage-` is not an
+        // aside: it keeps its ordinary classification.
+        let legit = f.root().join("rpi-notes.garbage-helper");
+        f.write(&legit.join("rpi-extension.json"), "{}");
+        let report = cleanup_scan(&*f.fs, &f.context(UpdateState::Idle));
+        assert!(
+            !report.removed.iter().any(|(_, path)| path == &legit),
+            "{report:?}"
+        );
+        assert!(legit.exists());
     }
 
     /// A directory is renamed aside before it is deleted: a loaded library
