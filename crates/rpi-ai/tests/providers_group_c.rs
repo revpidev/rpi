@@ -328,15 +328,20 @@ fn kimi_coding_oauth_slot_wired() {
 /// models and omit the image-generation models.
 #[test]
 fn qwen_token_plan_exposes_text_models_only() {
-    const TEXT_MODELS: [&str; 16] = [
+    // 2026-11-28 snapshot: the plan catalog retired `deepseek-v3.2` /
+    // `deepseek-v4-flash` and gained `deepseek-v4.1-flash*`, `glm-5.3` and
+    // `qwen4-max*`.
+    const TEXT_MODELS: [&str; 21] = [
         "MiniMax-M2.5",
-        "deepseek-v3.2",
-        "deepseek-v4-flash",
         "deepseek-v4-flash-0731",
         "deepseek-v4-pro",
+        "deepseek-v4-pro-0813",
+        "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-1017",
         "glm-5",
         "glm-5.1",
         "glm-5.2",
+        "glm-5.3",
         "kimi-k2.5",
         "kimi-k2.6",
         "kimi-k2.7-code",
@@ -344,7 +349,10 @@ fn qwen_token_plan_exposes_text_models_only() {
         "qwen3.6-plus",
         "qwen3.7-max",
         "qwen3.7-plus",
+        "qwen3.8-flash",
         "qwen3.8-max",
+        "qwen4-max",
+        "qwen4-max-preview",
     ];
     const IMAGE_MODELS: [&str; 4] = [
         "qwen-image-2.0",

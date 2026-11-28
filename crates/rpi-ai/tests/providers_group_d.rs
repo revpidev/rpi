@@ -93,7 +93,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.fireworks.ai/inference",
         "Fireworks API key",
         "FIREWORKS_API_KEY",
-        27, // 2026-11-17 snapshot: expanded Fireworks public catalog
+        42, // 2026-11-28 snapshot: expanded Fireworks public catalog
     ),
     spec(
         groq_provider,
@@ -111,7 +111,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://router.huggingface.co/v1",
         "Hugging Face token",
         "HF_TOKEN",
-        82, // 2026-11-17 snapshot: current Hugging Face tool-capable catalog
+        114, // 2026-11-28 snapshot: current Hugging Face tool-capable catalog
     ),
     spec(
         nvidia_provider,
@@ -120,7 +120,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://integrate.api.nvidia.com/v1",
         "NVIDIA API key",
         "NVIDIA_API_KEY",
-        13, // 2026-11-17 snapshot: current NVIDIA NIM ids after filtering
+        11, // 2026-11-28 snapshot: current NVIDIA NIM ids after filtering
     ),
     spec(
         together_provider,
@@ -129,7 +129,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.together.ai/v1",
         "Together API key",
         "TOGETHER_API_KEY",
-        16, // 2026-11-07 snapshot: 16 non-deprecated tool-capable models
+        24, // 2026-11-28 snapshot: 24 non-deprecated tool-capable models
     ),
     spec(
         xai_provider,
@@ -379,58 +379,43 @@ fn together_kimi_k3_catalog_entry() {
 }
 
 /// Upstream `together-models.test.ts`: reasoning controls per model family.
+///
+/// The 2026-11-28 snapshot retired the last reasoning-effort Together ids
+/// (`openai/gpt-oss-120b`, `deepseek-ai/DeepSeek-V4-Pro-0813`), so the
+/// observable surface is the toggle family: every current Together model
+/// keeps the `together` thinking format with effort off.
 #[test]
 fn together_reasoning_controls_match_api_surface() {
     let provider = together_provider();
 
-    let gpt_oss = get_model(&provider, "openai/gpt-oss-120b");
-    assert_eq!(
-        gpt_oss.thinking_level_map,
-        Some(ThinkingLevelMap::from([
-            (ModelThinkingLevel::Off, None),
-            (ModelThinkingLevel::Minimal, None),
-            (ModelThinkingLevel::Low, Some("low".to_owned())),
-            (ModelThinkingLevel::Medium, Some("medium".to_owned())),
-            (ModelThinkingLevel::High, Some("high".to_owned())),
-            (ModelThinkingLevel::Max, None),
-            (ModelThinkingLevel::Xhigh, None),
-        ]))
-    );
-    let compat = gpt_oss.compat.as_ref().expect("gpt-oss compat");
-    assert_eq!(compat.supports_reasoning_effort, Some(true));
-    assert_eq!(compat.thinking_format, Some(ThinkingFormat::Openai));
+    for id in ["moonshotai/Kimi-K3", "MiniMaxAI/MiniMax-M3.1-Flash"] {
+        let model = get_model(&provider, id);
+        assert_eq!(
+            model.thinking_level_map,
+            Some(ThinkingLevelMap::from([
+                (ModelThinkingLevel::Minimal, None),
+                (ModelThinkingLevel::Low, None),
+                (ModelThinkingLevel::Medium, None),
+            ])),
+            "{id} thinking level map"
+        );
+        let compat = model.compat.as_ref().expect("together compat");
+        assert_eq!(compat.supports_reasoning_effort, Some(false));
+        assert_eq!(compat.thinking_format, Some(ThinkingFormat::Together));
+        assert_eq!(compat.supports_long_cache_retention, Some(false));
+    }
 
-    let deepseek_v4 = get_model(&provider, "deepseek-ai/DeepSeek-V4-Pro-0813");
-    // 2026-10-12 rules regen @ abe508e1b: v1.0.1 #10336 followed the
-    // models.dev rename, so `TOGETHER_TOGGLE_REASONING_EFFORT_MODELS` now
-    // names the -0813 sibling — the toggle map gains `high: "high"` while
-    // the other levels stay off.
-    assert_eq!(
-        deepseek_v4.thinking_level_map,
-        Some(ThinkingLevelMap::from([
-            (ModelThinkingLevel::Minimal, None),
-            (ModelThinkingLevel::Low, None),
-            (ModelThinkingLevel::Medium, None),
-            (ModelThinkingLevel::High, Some("high".to_owned())),
-            (ModelThinkingLevel::Xhigh, None),
-        ]))
-    );
-    let compat = deepseek_v4.compat.as_ref().expect("deepseek compat");
-    assert_eq!(compat.supports_reasoning_effort, Some(true));
-    assert_eq!(compat.thinking_format, Some(ThinkingFormat::Together));
-
-    let minimax = get_model(&provider, "MiniMaxAI/MiniMax-M3");
-    assert_eq!(
-        minimax.thinking_level_map,
-        Some(ThinkingLevelMap::from([
-            (ModelThinkingLevel::Minimal, None),
-            (ModelThinkingLevel::Low, None),
-            (ModelThinkingLevel::Medium, None),
-        ]))
-    );
-    let compat = minimax.compat.as_ref().expect("minimax compat");
-    assert_eq!(compat.thinking_format, Some(ThinkingFormat::Together));
-    assert_eq!(compat.supports_reasoning_effort, Some(false));
+    for model in provider.get_models() {
+        assert_eq!(
+            model
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.supports_reasoning_effort),
+            Some(false),
+            "{} unexpectedly exposes reasoning effort",
+            model.id
+        );
+    }
 }
 
 #[test]

@@ -18,7 +18,10 @@ pub const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::Medium;
 
 /// `defaultModelPerProvider` (model-resolver.ts:20-62 @ b4afdddf) — ids
 /// pinned to the upstream commit; unknown providers fall through to
-/// "first available".
+/// "first available". The 2026-11-28 catalog refresh retired three pinned
+/// ids, so those rows follow the upstream v1.7.0 table instead:
+/// mistral `devstral-medium-latest` → `mistral-medium-latest` and both
+/// Cloudflare providers `kimi-k2.7-code` → `glm-5.3`.
 pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 42] = [
     ("amazon-bedrock", "us.anthropic.claude-opus-5-5"),
     ("ant-ling", "Ring-2.6-1T"),
@@ -42,7 +45,7 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 42] = [
     ("cerebras", "gpt-oss-120b"),
     ("zai", "glm-5.3"),
     ("zai-coding-cn", "glm-5.3"),
-    ("mistral", "devstral-medium-latest"),
+    ("mistral", "mistral-medium-latest"),
     ("minimax", "MiniMax-M3"),
     ("minimax-cn", "MiniMax-M3"),
     ("moonshotai", "kimi-k2.7-code"),
@@ -55,11 +58,8 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 42] = [
     ("opencode-go", "kimi-k3.1-pro"),
     ("kimi-coding", "kimi-for-coding"),
     ("meta", "muse-spark-1.3"),
-    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.7-code"),
-    (
-        "cloudflare-ai-gateway",
-        "workers-ai/@cf/moonshotai/kimi-k2.7-code",
-    ),
+    ("cloudflare-workers-ai", "@cf/zai-org/glm-5.3"),
+    ("cloudflare-ai-gateway", "workers-ai/@cf/zai-org/glm-5.3"),
     ("qwen-token-plan", "qwen3.8-max"),
     ("qwen-token-plan-cn", "qwen3.8-max"),
     ("qwen-token-plan-individual", "qwen3.8-max"),
