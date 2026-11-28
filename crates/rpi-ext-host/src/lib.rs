@@ -20,6 +20,7 @@ pub mod api;
 pub mod bridges;
 pub mod error;
 pub mod host;
+pub mod install_layout;
 pub mod interactive_ui;
 pub mod loader;
 pub mod native;

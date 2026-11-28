@@ -101,6 +101,133 @@ fn loader_discovery_missing_dir_yields_nothing() {
     assert!(discover_extensions_in_dir(missing).is_empty());
 }
 
+// ADR-0050 generational containers (V19-09 FR-W5): flat, generational and
+// mixed containers all resolve; installer state and retired containers do
+// not load.
+#[test]
+fn loader_discovery_resolves_flat_generational_and_mixed_containers() {
+    let temp = TempDir::new("generations");
+    // Flat (legacy): manifest at the container root.
+    let _flat = temp.write("flat/libflat.so", "lib");
+    temp.write(
+        "flat/rpi-extension.json",
+        r#"{"name": "flat", "native": "libflat.so", "rpiAbi": 1}"#,
+    );
+    // Generational: the pointer names the live generation; the older
+    // generation stays on disk for running instances.
+    let _generational = temp.write("gen/0.2.0/libgen.so", "lib");
+    temp.write(
+        "gen/0.2.0/rpi-extension.json",
+        r#"{"name": "gen", "native": "libgen.so", "rpiAbi": 1}"#,
+    );
+    temp.write("gen/0.1.0/libgen.so", "old");
+    temp.write(
+        "gen/0.1.0/rpi-extension.json",
+        r#"{"name": "gen", "native": "libgen.so", "rpiAbi": 1}"#,
+    );
+    temp.write(
+        "gen/current.json",
+        r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0","previous":"0.1.0"}"#,
+    );
+    // Mixed: legacy flat files plus a migrated generation — the pointer wins.
+    let _mixed = temp.write("mixed/0.3.0/index.wasm", "wasm");
+    temp.write(
+        "mixed/0.3.0/rpi-extension.json",
+        r#"{"name": "mixed", "wasm": "index.wasm", "rpiAbi": 1}"#,
+    );
+    temp.write("mixed/libmixed.so", "stale flat file");
+    temp.write(
+        "mixed/rpi-extension.json",
+        r#"{"name": "mixed", "native": "libmixed.so", "rpiAbi": 1}"#,
+    );
+    temp.write(
+        "mixed/current.json",
+        r#"{"schemaVersion":1,"version":"0.3.0","path":"0.3.0"}"#,
+    );
+    // Installer state under the root is not an extension.
+    temp.write(".staging/rpi-todo-0.2.0-1234/rpi-extension.json", "{}");
+    temp.write(".pins/1234.json", "{}");
+    // A retired container (`rpi remove`) must not fall back to its files.
+    let _retired = temp.write("retired/libretired.so", "lib");
+    temp.write(
+        "retired/rpi-extension.json",
+        r#"{"name": "retired", "native": "libretired.so", "rpiAbi": 1}"#,
+    );
+    temp.write("retired/.retired", "");
+
+    let mut discovered: Vec<PathBuf> = discover_extensions_in_dir(temp.path())
+        .into_iter()
+        .map(|p| {
+            p.strip_prefix(temp.path())
+                .expect("under root")
+                .to_path_buf()
+        })
+        .collect();
+    discovered.sort();
+    let mut expected = vec![
+        PathBuf::from("flat/libflat.so"),
+        PathBuf::from("gen/0.2.0/libgen.so"),
+        PathBuf::from("mixed/0.3.0/index.wasm"),
+    ];
+    expected.sort();
+    assert_eq!(discovered, expected);
+}
+
+// ADR-0050 process-fixed generation (V19-09 FR-W5 "固定代"): once this
+// process resolved a container, a pointer flip by another process does not
+// change what `/reload` discovers.
+#[test]
+fn loader_discovery_keeps_the_generation_fixed_for_the_process() {
+    let temp = TempDir::new("fixed-generation");
+    let container = temp.path().join("rpi-todo");
+    let write_generation = |version: &str| {
+        let dir = container.join(version);
+        std::fs::create_dir_all(dir.join("lib")).expect("mkdir generation");
+        std::fs::write(dir.join("lib/libtodo.so"), version).expect("write lib");
+        std::fs::write(
+            dir.join("rpi-extension.json"),
+            format!(
+                r#"{{"name": "rpi-todo", "version": "{version}", "native": "lib/libtodo.so", "rpiAbi": 1}}"#
+            ),
+        )
+        .expect("write manifest");
+        dir.join("lib/libtodo.so")
+    };
+    let first = write_generation("0.2.0");
+    std::fs::write(
+        container.join("current.json"),
+        r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0"}"#,
+    )
+    .expect("write pointer");
+    let first_discovery = discover_extensions_in_dir(temp.path());
+    assert_eq!(first_discovery, vec![first.clone()]);
+
+    // `rpi update --extensions` in another process places 0.3.0 and flips
+    // the pointer while this instance keeps running.
+    let second = write_generation("0.3.0");
+    std::fs::write(
+        container.join("current.json"),
+        r#"{"schemaVersion":1,"version":"0.3.0","path":"0.3.0","previous":"0.2.0"}"#,
+    )
+    .expect("flip pointer");
+    assert_eq!(
+        discover_extensions_in_dir(temp.path()),
+        vec![first.clone()],
+        "a running instance (and /reload) keeps the generation it started with"
+    );
+    // A fresh process (uncached resolution) sees the new generation.
+    assert_eq!(
+        rpi_ext_host::install_layout::resolve_install_dir_uncached(&container),
+        Some(
+            second
+                .parent()
+                .and_then(Path::parent)
+                .expect("generation dir")
+                .to_path_buf(),
+        )
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Inline factories: naming, hidden, error isolation
 // (resource-loader.ts:892-913, loader.ts:454-480, 485-498)
