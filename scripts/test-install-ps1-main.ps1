@@ -91,7 +91,7 @@ if (-not (Test-Path -LiteralPath $shellExe)) {
     exit 1
 }
 
-$Version = '0.1.8-rc.4'
+$Version = '0.1.9-rc.4'
 $Target = 'x86_64-pc-windows-msvc'
 $StandardPlugins = @(
     'rpi-subagents', 'rpi-todo', 'rpi-ask-user-question',
@@ -491,6 +491,28 @@ try {
         Check-True (Test-Path -LiteralPath (Join-Path $miniPrefix 'rpi.install.json')) 'mini writes the manifest'
         Check-True (-not (Test-Path -LiteralPath $miniAgent)) 'mini does not create an agent dir'
 
+        # ---- preflight restore (V19-09, ADR-0050) ---------------------------
+        # A startup update died between its two renames: rpi.exe is missing
+        # next to a parked rpi.exe.old-*. The installer restores it first.
+        $parkedPrefix = Join-Path $tempRoot 'prefix-parked'
+        New-Item -ItemType Directory -Force -Path $parkedPrefix | Out-Null
+        [IO.File]::WriteAllText((Join-Path $parkedPrefix 'rpi.exe.old-0.1.8'), 'parked-image')
+        $parkedAgent = Join-Path $tempRoot 'agent-parked'
+        $parkedCache = Join-Path $tempRoot 'cache-parked'
+        $result = Invoke-Installer -Prefix $parkedPrefix -ProfileName 'mini' `
+            -Env (New-InstallEnv -BaseUrl $normal.BaseUrl -AgentDir $parkedAgent -CacheDir $parkedCache)
+        if ($result.ExitCode -ne 0) {
+            Write-Host '--- parked-prefix install output ---'
+            Write-Host $result.Output
+        }
+        Check-Equal '0' ([string]$result.ExitCode) 'install over a missing rpi.exe with a parked image exits 0'
+        Check-True ($result.Output -match 'restored the parked executable rpi.exe.old-0.1.8 to rpi.exe') 'the parked image is announced as restored'
+        Check-True (-not (Test-Path -LiteralPath (Join-Path $parkedPrefix 'rpi.exe.old-0.1.8'))) 'the parked image is consumed'
+        Check-True (Test-Path -LiteralPath (Join-Path $parkedPrefix 'rpi.exe')) 'the new executable is installed'
+        $parkedExeText = ''
+        if (Test-Path -LiteralPath (Join-Path $parkedPrefix 'rpi.exe')) { $parkedExeText = [IO.File]::ReadAllText((Join-Path $parkedPrefix 'rpi.exe')) }
+        Check-Equal 'FAKE-RPI-mini' $parkedExeText 'the installed executable is the downloaded one, not the parked image'
+
         # ---- standard ------------------------------------------------------
         $stdPrefix = Join-Path $tempRoot 'prefix-standard'
         $stdAgent = Join-Path $tempRoot 'agent-standard'
@@ -510,6 +532,21 @@ try {
             $stdDirs = @(Get-ChildItem -LiteralPath (Join-Path $stdAgent 'extensions') -Directory)
         }
         Check-Equal '6' ([string]$stdDirs.Count) 'standard materializes six plugin directories'
+        # V19-09 (ADR-0050): plugins land as generations behind current.json.
+        $stdPointerPath = Join-Path $stdAgent 'extensions/rpi-todo/current.json'
+        Check-True (Test-Path -LiteralPath $stdPointerPath) 'standard writes the rpi-todo generation pointer'
+        $stdPointer = $null
+        if (Test-Path -LiteralPath $stdPointerPath) { $stdPointer = Get-Content -LiteralPath $stdPointerPath -Raw | ConvertFrom-Json }
+        Check-Equal $Version ([string]$stdPointer.version) 'pointer names the installed version'
+        Check-Equal $Version ([string]$stdPointer.path) 'pointer path is the generation directory'
+        Check-Equal '1' ([string]$stdPointer.schemaVersion) 'pointer schema version is 1'
+        Check-True (Test-Path -LiteralPath (Join-Path $stdAgent "extensions/rpi-todo/$Version/rpi-extension.json")) 'standard places the plugin as a generation'
+        Check-True (-not (Test-Path -LiteralPath (Join-Path $stdAgent 'extensions/rpi-todo/rpi-extension.json'))) 'standard leaves no flat manifest in the container root'
+        Check-True (-not (Test-Path -LiteralPath (Join-Path $stdAgent 'extensions/.staging'))) 'the staging root is removed once empty'
+        $stdGenManifest = Join-Path $stdAgent "extensions/rpi-todo/$Version/rpi-extension.json"
+        if (Test-Path -LiteralPath $stdGenManifest) {
+            Check-Equal (Get-Sha256 $stdGenManifest) ([string]$stdPointer.manifestSha256) 'pointer records the manifest sha256'
+        }
         $stdSettings = Join-Path $stdAgent 'settings.json'
         Check-True (Test-Path -LiteralPath $stdSettings) 'standard seeds settings.json'
         $stdSettingsText = ''
