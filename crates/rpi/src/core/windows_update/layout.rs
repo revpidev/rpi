@@ -210,7 +210,10 @@ pub fn safe_version_component(version: &str) -> String {
             }
         })
         .collect();
-    if cleaned.is_empty() {
+    // `.` and `..` would name other directories; the reader-side guard
+    // (`is_safe_generation_path`) rejects them, the writer never produces
+    // them.
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
         "_".to_owned()
     } else {
         cleaned
@@ -367,6 +370,8 @@ mod tests {
         assert_eq!(safe_version_component("0.1.9-rc.4"), "0.1.9-rc.4");
         assert_eq!(safe_version_component(" 1.2.3+build "), "1.2.3+build");
         assert_eq!(safe_version_component("../evil:x"), ".._evil_x");
+        assert_eq!(safe_version_component("."), "_");
+        assert_eq!(safe_version_component(".."), "_");
         assert_eq!(safe_version_component(""), "_");
     }
 

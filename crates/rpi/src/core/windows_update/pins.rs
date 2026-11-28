@@ -111,7 +111,7 @@ pub fn count_references<'a>(pins: impl IntoIterator<Item = &'a PinRecord>, dir: 
 
 /// Every registration whose process still runs, each verified by pid *and*
 /// start time. Files of dead processes are removed as they are found (the
-/// "dead pid 的 pin 被回收" rule of R7.5.1); a malformed file is removed
+/// dead-pid pins are reaped, R7.5.1); a malformed file is removed
 /// unless its name is the pid of a live process (leave a live process's
 /// corrupt file alone: its owner deletes it on exit).
 pub fn live_pins(fs: &dyn UpdateFs, pins_dir: &Path, probe: &dyn ProcessProbe) -> Vec<PinRecord> {

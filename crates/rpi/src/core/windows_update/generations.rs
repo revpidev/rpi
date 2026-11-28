@@ -165,7 +165,9 @@ pub fn place_generation(
         let replaced = if pinned {
             false
         } else {
-            fs.remove_dir_all(&generation).is_ok()
+            // Move the old directory aside first: a loaded library would
+            // otherwise keep a half-deleted tree.
+            replace_generation_copy(fs, root, name, version, &generation).is_ok()
         };
         if !replaced {
             let staged_manifest = fs
@@ -210,6 +212,66 @@ pub fn place_generation(
         reused,
         previous,
     })
+}
+
+/// Move an existing, unpinned generation out of the way (same volume, under
+/// the staging root as `<name>-<version>-<pid>.replaced`) and drop it. `Err`
+/// when the move fails (a loaded library keeps the directory pinned to its
+/// name): the caller then applies the reuse rules. A copy that moved but
+/// cannot be deleted yet stays under `.staging` and is swept by the next
+/// cleanup scan.
+pub fn replace_generation_copy(
+    fs: &dyn UpdateFs,
+    root: &Path,
+    name: &str,
+    version: &str,
+    generation: &Path,
+) -> std::io::Result<()> {
+    let aside = UpdatePaths::extension_staging_path(root, name, version, std::process::id());
+    let aside = PathBuf::from(format!("{}.replaced", aside.display()));
+    if fs.exists(&aside).unwrap_or(false) {
+        fs.remove_dir_all(&aside)?;
+    }
+    if let Some(parent) = aside.parent() {
+        fs.create_dir_all(parent)?;
+    }
+    fs.rename(generation, &aside)?;
+    let _ = fs.remove_dir_all(&aside);
+    Ok(())
+}
+
+/// Land the staged extensions of a self-update batch right away, as
+/// generations with flipped pointers — the outcome of `update --extensions`
+/// — when the batch cannot be staged as a whole (rpi is already current, an
+/// earlier update still waits for its first start, some other extension of
+/// the batch failed). Their load preflight already passed when they were
+/// extracted. Returns the names placed and, per failure, the reason.
+pub fn land_staged_extensions(
+    fs: &dyn UpdateFs,
+    pins_dir: &Path,
+    probe: &dyn super::boot::ProcessProbe,
+    extensions: &[super::records::StagedExtension],
+) -> (Vec<String>, Vec<(String, String)>) {
+    let pins = super::pins::live_pins(fs, pins_dir, probe);
+    let mut placed = Vec::new();
+    let mut failed = Vec::new();
+    for extension in extensions {
+        match place_generation(
+            fs,
+            &extension.install_root,
+            &extension.name,
+            &extension.version,
+            &extension.staged_path,
+            &pins,
+        ) {
+            Ok(_) => placed.push(extension.name.clone()),
+            Err(error) => {
+                let _ = fs.remove_dir_all(&extension.staged_path);
+                failed.push((extension.name.clone(), error));
+            }
+        }
+    }
+    (placed, failed)
 }
 
 /// Retire a whole container (`rpi remove`, R7.4.8): drop the pointer, mark
@@ -420,10 +482,11 @@ mod tests {
         let f = Fixture::new();
         let staged = f.stage("rpi-todo", "0.2.0", "same");
         place_generation(&*f.fs, &f.root, "rpi-todo", "0.2.0", &staged, &[]).unwrap();
-        // A scanner holds the library: deletion fails, the build is the same.
+        // A running instance holds the library: the directory cannot even
+        // be moved aside (the rename fails), the build is the same.
         f.fs.fail(
-            crate::core::windows_update::fs::FsOp::RemoveDirAll,
-            "rpi-todo/0.2.0",
+            crate::core::windows_update::fs::FsOp::Rename,
+            ".replaced",
             1,
         );
         let staged = f.stage("rpi-todo", "0.2.0", "same");
@@ -432,8 +495,8 @@ mod tests {
         assert_eq!(placed.previous.as_deref(), Some("0.2.0"));
 
         f.fs.fail(
-            crate::core::windows_update::fs::FsOp::RemoveDirAll,
-            "rpi-todo/0.2.0",
+            crate::core::windows_update::fs::FsOp::Rename,
+            ".replaced",
             1,
         );
         std::fs::write(
@@ -520,6 +583,51 @@ mod tests {
             leftovers,
             vec!["current.json"],
             "only the intact pointer remains"
+        );
+    }
+
+    /// The `--all` batch that cannot be staged as a whole: its staged
+    /// extensions land right away as generations.
+    #[test]
+    fn staged_extensions_land_as_generations_when_the_batch_is_not_staged() {
+        let f = Fixture::new();
+        let todo = f.stage("rpi-todo", "0.2.0", "x");
+        let plan = f.stage("rpi-plan-mode", "0.2.0", "y");
+        let staged = vec![
+            super::super::staging::describe_staged_extension(
+                &*f.fs, &f.root, "rpi-todo", "0.2.0", &todo,
+            )
+            .unwrap(),
+            super::super::staging::describe_staged_extension(
+                &*f.fs,
+                &f.root,
+                "rpi-plan-mode",
+                "0.2.0",
+                &plan,
+            )
+            .unwrap(),
+        ];
+        let probe = FakeProcessProbe::new(1, 1);
+        let (placed, failed) =
+            land_staged_extensions(&*f.fs, &f.root.join(".pins"), &probe, &staged);
+        assert_eq!(placed, vec!["rpi-todo", "rpi-plan-mode"]);
+        assert!(failed.is_empty());
+        assert!(!todo.exists() && !plan.exists());
+        assert_eq!(
+            read_generation_pointer(&f.root.join("rpi-todo"))
+                .unwrap()
+                .version,
+            "0.2.0"
+        );
+        assert_eq!(
+            read_generation_pointer(&f.root.join("rpi-plan-mode"))
+                .unwrap()
+                .version,
+            "0.2.0"
+        );
+        assert_eq!(
+            rpi_ext_host::install_layout::resolve_install_dir(&f.root.join("rpi-todo")),
+            Some(f.root.join("rpi-todo/0.2.0"))
         );
     }
 

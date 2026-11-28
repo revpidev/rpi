@@ -74,6 +74,9 @@ pub struct StuckLeftover {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScanReport {
     pub removed: Vec<(LeftoverKind, PathBuf)>,
+    /// Garbage found by a classify-only scan ([`cleanup_scan_with`] with
+    /// `remove == false`): would be deleted, nothing was touched.
+    pub garbage: Vec<(LeftoverKind, PathBuf)>,
     pub live: Vec<LiveLeftover>,
     pub retained: Vec<PathBuf>,
     pub stuck: Vec<StuckLeftover>,
@@ -111,7 +114,7 @@ pub struct ScanContext<'a> {
     pub now: SystemTime,
 }
 
-/// The reason category of a failed removal (R7.5.2 "原因类别").
+/// The reason category of a failed removal (R7.5.2).
 pub fn stuck_reason(error: &std::io::Error, kind: LeftoverKind) -> String {
     let raw = error.raw_os_error();
     match error.kind() {
@@ -142,14 +145,21 @@ const STATE_FILES: [&str; 6] = [
     super::layout::LOCK_FILE,
 ];
 
-/// Run the scan. Failures of individual removals become `stuck` entries;
-/// the scan itself cannot fail.
+/// Run the scan, removing what nobody uses. Failures of individual removals
+/// become `stuck` entries; the scan itself cannot fail.
 pub fn cleanup_scan(fs: &dyn UpdateFs, context: &ScanContext<'_>) -> ScanReport {
+    cleanup_scan_with(fs, context, true)
+}
+
+/// [`cleanup_scan`] with the removal switched off: a detection-only pass
+/// classifies everything (garbage, live, retained, stuck) and deletes
+/// nothing — `rpi self-uninstall` uses it to refuse while files are in use.
+pub fn cleanup_scan_with(fs: &dyn UpdateFs, context: &ScanContext<'_>, remove: bool) -> ScanReport {
     let mut report = ScanReport::default();
-    scan_executable_leftovers(fs, context, &mut report);
-    scan_update_dir(fs, context, &mut report);
+    scan_executable_leftovers(fs, context, &mut report, remove);
+    scan_update_dir(fs, context, &mut report, remove);
     for root in &context.paths.extension_roots {
-        scan_extension_root(fs, context, root, &mut report);
+        scan_extension_root(fs, context, root, &mut report, remove);
     }
     report.old_exe_gone = old_exe_is_gone(fs, context, &report);
     report
@@ -201,13 +211,43 @@ fn holders_of_dir(context: &ScanContext<'_>, dir: &Path) -> Vec<u32> {
     pids
 }
 
-fn remove(
+/// Delete one leftover (or, in a classify-only scan, only record it).
+/// The DELETE-access probe runs first (design §11.9): a path some process
+/// holds open without share-delete is *live* and is never touched — a
+/// loaded library would otherwise keep a half-deleted tree. `NotFound`
+/// means the path vanished meanwhile and counts as removed.
+fn remove_leftover(
     fs: &dyn UpdateFs,
+    context: &ScanContext<'_>,
     kind: LeftoverKind,
     path: &Path,
     report: &mut ScanReport,
     directory: bool,
+    remove: bool,
 ) {
+    match fs.probe_deletable(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if remove {
+                report.removed.push((kind, path.to_path_buf()));
+            } else {
+                report.garbage.push((kind, path.to_path_buf()));
+            }
+            return;
+        }
+        Err(_) => {
+            report.live.push(LiveLeftover {
+                kind,
+                path: path.to_path_buf(),
+                holders: holders_for(context, kind, path),
+            });
+            return;
+        }
+    }
+    if !remove {
+        report.garbage.push((kind, path.to_path_buf()));
+        return;
+    }
     let result = if directory {
         fs.remove_dir_all(path)
     } else {
@@ -215,6 +255,9 @@ fn remove(
     };
     match result {
         Ok(()) => report.removed.push((kind, path.to_path_buf())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            report.removed.push((kind, path.to_path_buf()));
+        }
         Err(error) => report.stuck.push(StuckLeftover {
             kind,
             path: path.to_path_buf(),
@@ -223,26 +266,43 @@ fn remove(
     }
 }
 
-/// Whether the old executable of the pending update is kept by policy.
+/// The instances that hold a leftover: old/new images by their version,
+/// everything else by the directories the pins name.
+fn holders_for(context: &ScanContext<'_>, kind: LeftoverKind, path: &Path) -> Vec<u32> {
+    let exe_name = context.paths.exe_file_name();
+    if matches!(kind, LeftoverKind::OldExe | LeftoverKind::NewExe)
+        && let Some(name) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        && let Some(version) = version_from_exe_leftover_name(&exe_name, &name)
+    {
+        return holders_of_version(context, &version);
+    }
+    holders_of_dir(context, path)
+}
+
+/// Whether the old executable of an applied or confirmed update is kept by
+/// policy: until the first normal exit after the confirmation (design
+/// §11.7). Judged by the update result, which outlives the pending the
+/// confirmation deletes.
 fn old_exe_retained(context: &ScanContext<'_>, version: &str) -> bool {
     if !context.state.keeps_old_exe() {
         return false;
     }
-    let Some(pending) = context.pending else {
+    let Some(result) = context.result else {
         return false;
     };
-    if !pending.applied || pending.from_version != version {
+    if result.from_version.as_deref() != Some(version) {
         return false;
     }
-    !context
-        .result
-        .is_some_and(|result| result.normal_exit_after_confirm)
+    !result.normal_exit_after_confirm
 }
 
 fn scan_executable_leftovers(
     fs: &dyn UpdateFs,
     context: &ScanContext<'_>,
     report: &mut ScanReport,
+    remove: bool,
 ) {
     let Some(prefix) = context.paths.exe_path.parent() else {
         return;
@@ -276,11 +336,16 @@ fn scan_executable_leftovers(
             });
             continue;
         }
-        remove(fs, kind, &entry.path, report, false);
+        remove_leftover(fs, context, kind, &entry.path, report, false, remove);
     }
 }
 
-fn scan_update_dir(fs: &dyn UpdateFs, context: &ScanContext<'_>, report: &mut ScanReport) {
+fn scan_update_dir(
+    fs: &dyn UpdateFs,
+    context: &ScanContext<'_>,
+    report: &mut ScanReport,
+    remove: bool,
+) {
     let update_dir = &context.paths.update_dir;
     // A staged (not yet applied) executable waits for the transaction; once
     // applied it was moved out and only an empty directory remains.
@@ -298,27 +363,67 @@ fn scan_update_dir(fs: &dyn UpdateFs, context: &ScanContext<'_>, report: &mut Sc
                 if staged.is_dir && Some(staged.path.clone()) == staged_binary_dir {
                     continue;
                 }
-                remove(fs, LeftoverKind::BinaryStaging, &staged.path, report, true);
+                remove_leftover(
+                    fs,
+                    context,
+                    LeftoverKind::BinaryStaging,
+                    &staged.path,
+                    report,
+                    true,
+                    remove,
+                );
             }
         } else if name == super::layout::BOOT_DIR_NAME {
             if context.state != UpdateState::Applied {
                 for record in fs.read_dir(&entry.path).unwrap_or_default() {
                     if !record.is_dir {
-                        remove(fs, LeftoverKind::BootRecord, &record.path, report, false);
+                        remove_leftover(
+                            fs,
+                            context,
+                            LeftoverKind::BootRecord,
+                            &record.path,
+                            report,
+                            false,
+                            remove,
+                        );
                     }
                 }
             }
         } else if entry.is_dir {
             // Only `staging/` and `boot/` are expected.
-            remove(fs, LeftoverKind::TempFile, &entry.path, report, true);
+            remove_leftover(
+                fs,
+                context,
+                LeftoverKind::TempFile,
+                &entry.path,
+                report,
+                true,
+                remove,
+            );
         } else if name == super::layout::UNDO_FILE {
             // The pre-image outlives its update only while the old
             // executable is kept (`applied` / `confirmed`).
             if !context.state.keeps_old_exe() {
-                remove(fs, LeftoverKind::TempFile, &entry.path, report, false);
+                remove_leftover(
+                    fs,
+                    context,
+                    LeftoverKind::TempFile,
+                    &entry.path,
+                    report,
+                    false,
+                    remove,
+                );
             }
         } else if !STATE_FILES.contains(&name) {
-            remove(fs, LeftoverKind::TempFile, &entry.path, report, false);
+            remove_leftover(
+                fs,
+                context,
+                LeftoverKind::TempFile,
+                &entry.path,
+                report,
+                false,
+                remove,
+            );
         }
     }
 }
@@ -334,6 +439,7 @@ fn scan_staging_dir(
     context: &ScanContext<'_>,
     staging: &Path,
     report: &mut ScanReport,
+    remove: bool,
 ) {
     let pending_paths: Vec<&Path> = context
         .pending
@@ -364,7 +470,15 @@ fn scan_staging_dir(
             report.skipped_staging += 1;
             continue;
         }
-        remove(fs, LeftoverKind::Staging, &entry.path, report, true);
+        remove_leftover(
+            fs,
+            context,
+            LeftoverKind::Staging,
+            &entry.path,
+            report,
+            true,
+            remove,
+        );
     }
 }
 
@@ -378,6 +492,7 @@ fn scan_extension_root(
     context: &ScanContext<'_>,
     root: &Path,
     report: &mut ScanReport,
+    remove: bool,
 ) {
     if !fs.exists(root).unwrap_or(false) {
         return;
@@ -387,7 +502,7 @@ fn scan_extension_root(
             continue;
         };
         if name == super::layout::EXTENSION_STAGING_DIR {
-            scan_staging_dir(fs, context, &entry.path, report);
+            scan_staging_dir(fs, context, &entry.path, report, remove);
             continue;
         }
         if name == super::layout::EXTENSION_PINS_DIR {
@@ -404,7 +519,15 @@ fn scan_extension_root(
             if owner_alive {
                 report.skipped_staging += 1;
             } else {
-                remove(fs, LeftoverKind::Staging, &entry.path, report, true);
+                remove_leftover(
+                    fs,
+                    context,
+                    LeftoverKind::Staging,
+                    &entry.path,
+                    report,
+                    true,
+                    remove,
+                );
             }
             continue;
         }
@@ -419,7 +542,15 @@ fn scan_extension_root(
             // A pin on any directory inside the container keeps it too.
             let holders = holders_within(context, &container);
             if holders.is_empty() {
-                remove(fs, LeftoverKind::RetiredContainer, &container, report, true);
+                remove_leftover(
+                    fs,
+                    context,
+                    LeftoverKind::RetiredContainer,
+                    &container,
+                    report,
+                    true,
+                    remove,
+                );
             } else {
                 report.live.push(LiveLeftover {
                     kind: LeftoverKind::RetiredContainer,
@@ -458,23 +589,39 @@ fn scan_extension_root(
                 });
                 continue;
             }
-            remove(fs, LeftoverKind::Generation, &sub.path, report, true);
+            remove_leftover(
+                fs,
+                context,
+                LeftoverKind::Generation,
+                &sub.path,
+                report,
+                true,
+                remove,
+            );
         }
         if pointer.is_some() {
-            scan_flat_leftovers(fs, context, &container, report);
+            scan_flat_leftovers(fs, context, &container, report, remove);
         }
     }
 }
 
 /// Files of a legacy flat install left in the container root after the
 /// install moved to a generation. Only unreferenced ones go: an instance
-/// that started before the migration still loads them.
+/// that started before the migration still loads them. While an update
+/// waits for its first start (`applied`) nothing is reclaimed at all —
+/// instances older than the pins (`0.1.9-rc.4`) write none, so a flat
+/// install they still use cannot be told from an unreferenced one until
+/// the first start confirmed (known limit, release notes).
 fn scan_flat_leftovers(
     fs: &dyn UpdateFs,
     context: &ScanContext<'_>,
     container: &Path,
     report: &mut ScanReport,
+    remove: bool,
 ) {
+    if context.state == UpdateState::Applied {
+        return;
+    }
     let keep = [
         GENERATION_POINTER_FILE,
         RETIRED_MARKER_FILE,
@@ -499,17 +646,28 @@ fn scan_flat_leftovers(
             });
             return;
         }
-        remove(fs, LeftoverKind::FlatFiles, &entry.path, report, false);
+        remove_leftover(
+            fs,
+            context,
+            LeftoverKind::FlatFiles,
+            &entry.path,
+            report,
+            false,
+            remove,
+        );
     }
 }
 
 /// Whether nothing of the old version is left in the executable prefix
 /// (the first-boot reminder then says the previous version was removed).
 fn old_exe_is_gone(fs: &dyn UpdateFs, context: &ScanContext<'_>, report: &ScanReport) -> bool {
-    let Some(pending) = context.pending.filter(|pending| pending.applied) else {
+    let Some(result) = context.result.filter(|result| result.state.keeps_old_exe()) else {
         return false;
     };
-    if old_exe_retained(context, &pending.from_version) {
+    let Some(from_version) = result.from_version.as_deref() else {
+        return false;
+    };
+    if old_exe_retained(context, from_version) {
         return false;
     }
     if report
@@ -534,7 +692,7 @@ fn old_exe_is_gone(fs: &dyn UpdateFs, context: &ScanContext<'_>, report: &ScanRe
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         version_from_exe_leftover_name(&exe_name, &name)
-            .is_some_and(|version| version == pending.from_version)
+            .is_some_and(|version| version == from_version)
     })
 }
 
@@ -683,17 +841,25 @@ mod tests {
         std::fs::write(&old, b"old").unwrap();
         let pending = applied_pending("0.1.9-rc.3", "0.1.9-rc.4");
 
-        // Applied, first boot open: kept, silently.
+        // Applied, first boot open: kept, silently. The update result
+        // names the version the old image belongs to (the pending is still
+        // there too).
+        let applied = UpdateResult::new(
+            UpdateState::Applied,
+            Some("0.1.9-rc.3".to_owned()),
+            Some("0.1.9-rc.4".to_owned()),
+        );
         let report = cleanup_scan(
             &*f.fs,
-            &f.context_with(UpdateState::Applied, Some(&pending), None),
+            &f.context_with(UpdateState::Applied, Some(&pending), Some(&applied)),
         );
         assert_eq!(report.retained, vec![old.clone()]);
         assert!(report.removed.is_empty());
         assert!(!report.old_exe_gone);
         assert!(old.exists());
 
-        // Confirmed but no normal exit since: still kept.
+        // Confirmed but no normal exit since: still kept. The confirmation
+        // deleted the pending; the result alone carries the retention.
         let confirmed = UpdateResult::new(
             UpdateState::Confirmed,
             Some("0.1.9-rc.3".to_owned()),
@@ -701,7 +867,7 @@ mod tests {
         );
         let report = cleanup_scan(
             &*f.fs,
-            &f.context_with(UpdateState::Confirmed, Some(&pending), Some(&confirmed)),
+            &f.context_with(UpdateState::Confirmed, None, Some(&confirmed)),
         );
         assert_eq!(report.retained, vec![old.clone()]);
 
@@ -710,7 +876,7 @@ mod tests {
         exited.normal_exit_after_confirm = true;
         let report = cleanup_scan(
             &*f.fs,
-            &f.context_with(UpdateState::Confirmed, Some(&pending), Some(&exited)),
+            &f.context_with(UpdateState::Confirmed, None, Some(&exited)),
         );
         assert_eq!(report.removed, vec![(LeftoverKind::OldExe, old.clone())]);
         assert!(report.old_exe_gone);
@@ -922,6 +1088,37 @@ mod tests {
         assert!(flat.join("dist/y.wasm").exists());
     }
 
+    /// While an update waits for its first start, legacy flat files stay:
+    /// a pre-`0.1.9-rc.4` instance still running has no pin to protect them.
+    #[test]
+    fn flat_leftovers_stay_while_an_update_waits_for_its_first_start() {
+        let f = Fixture::new();
+        let container = f.root().join("rpi-todo");
+        f.generation("rpi-todo", "0.2.0");
+        f.write(&container.join("rpi-extension.json"), "{}");
+        f.write(&container.join("libtodo.dll"), "x");
+        f.write(
+            &container.join("current.json"),
+            r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0"}"#,
+        );
+        let applied = UpdateResult::new(UpdateState::Applied, None, None);
+        let report = cleanup_scan(
+            &*f.fs,
+            &f.context_with(UpdateState::Applied, None, Some(&applied)),
+        );
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(container.join("libtodo.dll").exists());
+        // Confirmed: the old instances are gone by the pin registry's
+        // account, the leftovers go.
+        let confirmed = UpdateResult::new(UpdateState::Confirmed, None, None);
+        let report = cleanup_scan(
+            &*f.fs,
+            &f.context_with(UpdateState::Confirmed, None, Some(&confirmed)),
+        );
+        assert_eq!(report.removed.len(), 2, "{report:?}");
+        assert!(!container.join("libtodo.dll").exists());
+    }
+
     #[test]
     fn a_flat_container_without_a_pointer_is_never_touched() {
         let f = Fixture::new();
@@ -1050,6 +1247,67 @@ mod tests {
         let report = cleanup_scan(&*f.fs, &f.context(UpdateState::Applied));
         assert!(report.removed.is_empty(), "{report:?}");
         assert!(update.join("undo.json").exists());
+    }
+
+    /// Design §11.9: a path the DELETE-access probe finds held open (no
+    /// share-delete) is live — never touched — even when no pin names it
+    /// (a scanner, or an instance older than the pins). The in-use warning
+    /// then names no instance count.
+    #[test]
+    fn a_refused_delete_probe_keeps_the_path_live_without_a_pin() {
+        let f = Fixture::new();
+        let container = f.root().join("rpi-todo");
+        let v1 = f.generation("rpi-todo", "0.1.0");
+        let v2 = f.generation("rpi-todo", "0.2.0");
+        f.write(
+            &container.join("current.json"),
+            r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0"}"#,
+        );
+        f.fs.fail_with(
+            FsOp::ProbeDeletable,
+            "rpi-todo/0.1.0",
+            1,
+            std::io::Error::from_raw_os_error(32),
+        );
+        let report = cleanup_scan(&*f.fs, &f.context(UpdateState::Idle));
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(report.stuck.is_empty());
+        assert_eq!(
+            report.live,
+            vec![LiveLeftover {
+                kind: LeftoverKind::Generation,
+                path: v1.clone(),
+                holders: vec![],
+            }]
+        );
+        assert!(v1.exists() && v2.exists());
+        assert_eq!(
+            crate::core::windows_update::notices::warning_text(
+                &report,
+                Path::new("/log/update.log")
+            )
+            .as_deref(),
+            Some(
+                "Old version files are still in use by another running process. rpi removes them on a later start; run \"rpi update --cleanup\" to retry."
+            )
+        );
+    }
+
+    /// A classify-only scan deletes nothing and lists the garbage.
+    #[test]
+    fn a_classify_only_scan_touches_nothing() {
+        let f = Fixture::new();
+        let v1 = f.generation("rpi-todo", "0.1.0");
+        let v2 = f.generation("rpi-todo", "0.2.0");
+        f.write(
+            &f.root().join("rpi-todo/current.json"),
+            r#"{"schemaVersion":1,"version":"0.2.0","path":"0.2.0"}"#,
+        );
+        let report = cleanup_scan_with(&*f.fs, &f.context(UpdateState::Idle), false);
+        assert!(report.removed.is_empty());
+        assert_eq!(report.garbage, vec![(LeftoverKind::Generation, v1.clone())]);
+        assert!(v1.exists() && v2.exists());
+        assert!(!f.fs.called(FsOp::RemoveDirAll, "rpi-todo/0.1.0"));
     }
 
     #[test]

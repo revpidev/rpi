@@ -7,11 +7,11 @@
 //! them read, and the confirmation points report in ([`confirm_point`]).
 //!
 //! Every process registers its pin first (subagent and preflight children
-//! included). Then, unless it is such a child, it runs the startup
-//! transaction, launches the new instance as a trampoline when it just
-//! committed an update, runs the cleanup scan and classifies the notices.
-//! A non-interactive start writes its warning lines to stderr here; an
-//! interactive one hands them to the TUI.
+//! included). Then, unless it is such a child, the main executable runs
+//! the startup transaction, launches the new instance as a trampoline when
+//! it just committed an update, runs the cleanup scan and classifies the
+//! notices. A non-interactive start writes its warning lines to stderr
+//! here; an interactive one hands them to the TUI.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use super::boot::{
     ProcessProbe, SystemProcessProbe, mark_normal_exit, own_boot_record, write_boot_record,
 };
 use super::fs::{RealFs, UpdateFs};
-use super::gc::{ScanContext, cleanup_scan};
+use super::gc::{ScanContext, cleanup_scan, cleanup_scan_with};
 use super::layout::UpdatePaths;
 use super::lock;
 use super::notices::{NoticeInput, StartupNotice, build_notices};
@@ -31,6 +31,7 @@ use super::records::{
     PendingUpdate, PinRecord, UpdateResult, UpdateState, read_record, write_record,
 };
 use super::rollback::{RollbackReason, rollback_applied_update, rollback_message};
+use super::staging;
 use super::transaction::{
     StartupEnv, StartupOptions, TrampolineVerdict, TransactionOutcome, confirm_update,
     judge_trampoline_child, run_startup_transaction,
@@ -62,9 +63,10 @@ struct StartupState {
     /// This process takes part in the first boot of an applied update (it
     /// runs the target version and the update is still `applied`).
     first_boot_target: Option<String>,
-    /// Set when this process confirmed the update: its first normal exit
-    /// afterwards releases the previous executable for the cleanup scan.
-    confirmed_here: bool,
+    /// This process runs the version an update-result names as `to`: its
+    /// first normal exit after the confirmation releases the previous
+    /// executable for the cleanup scan (design §11.7).
+    runs_target_version: bool,
     state: UpdateState,
     notices: Vec<StartupNotice>,
 }
@@ -146,7 +148,6 @@ impl StartupState {
         }
         confirm_update(self.fs.as_ref(), &self.paths, &pending);
         self.state = UpdateState::Confirmed;
-        self.confirmed_here = true;
         self.first_boot_target = None;
         self.log("confirm", "update confirmed");
     }
@@ -237,11 +238,14 @@ impl Trampoline {
                     &state.paths,
                     state.probe.as_ref(),
                     pid,
+                    code,
                     &StartupOptions::default(),
                     &state.sink(),
                 )
             });
-            let code = i32::try_from(code).unwrap_or(i32::MAX);
+            // The exit code keeps its 32-bit pattern (a STATUS_* value such
+            // as the Ctrl+C termination 0xC000013A is not a positive int).
+            let code = code as i32;
             match verdict {
                 TrampolineVerdict::RolledBack => {
                     let relaunched = with_state(&self.state, |state| {
@@ -264,7 +268,9 @@ impl Trampoline {
                         let (_, tail) = platform::split_command_line(&raw);
                         let command_line =
                             platform::trampoline_command_line(&state.paths.exe_path, tail);
-                        platform::launch(&state.paths.exe_path, &command_line, &state.sink())
+                        // The relaunched previous version is nobody's first
+                        // boot: no trampoline pid in its environment.
+                        platform::launch(&state.paths.exe_path, &command_line, &[], &state.sink())
                     });
                     match relaunched {
                         Ok(child) => self.child = child,
@@ -315,7 +321,9 @@ const HEADLESS_SWITCHES: &[&str] = &[
 /// A conservative pre-check of `resolve_app_mode`: the notices go to the
 /// TUI only when both standard streams are terminals and nothing on the
 /// command line asks for a headless mode. A wrong guess only moves a
-/// warning between stderr and the TUI.
+/// warning between stderr and the TUI (the `rpi-rpc` entry, which always
+/// runs the stdio mode, is not recognized here and defers its warnings to
+/// the next interactive start).
 pub fn looks_interactive(args: &[std::ffi::OsString]) -> bool {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return false;
@@ -391,7 +399,7 @@ pub fn before_run(args: &[std::ffi::OsString]) -> Startup {
         env: env.clone(),
         pin,
         first_boot_target: None,
-        confirmed_here: false,
+        runs_target_version: false,
         state: UpdateState::Idle,
         notices: Vec::new(),
     });
@@ -416,6 +424,24 @@ pub fn before_run(args: &[std::ffi::OsString]) -> Startup {
             state.pin_extension_dirs();
             return Next::Run;
         }
+        // Only the main executable (`rpi.exe`, the image a release asset
+        // carries) runs the transaction. A sibling binary in the same
+        // prefix (`rpi-rpc.exe`) shares the installation but must not park
+        // its own image or receive the staged `rpi.exe` under its name: it
+        // registers its pin and lets the next `rpi.exe` start apply the
+        // update.
+        if !state
+            .paths
+            .exe_file_name()
+            .eq_ignore_ascii_case(staging::staged_exe_name())
+        {
+            state.log(
+                "transaction",
+                "skipped: this executable is not the main rpi image; the next rpi.exe start applies it",
+            );
+            state.pin_extension_dirs();
+            return Next::Run;
+        }
         // 3. The startup transaction.
         let outcome = run_startup_transaction(
             state.fs.as_ref(),
@@ -435,9 +461,16 @@ pub fn before_run(args: &[std::ffi::OsString]) -> Startup {
         match outcome {
             TransactionOutcome::Applied { .. } => {
                 // P2: this process is the previous version's image; the
-                // new instance takes over the console.
+                // new instance takes over the console. Its environment
+                // names the trampoline, which is how the first boot knows
+                // it is the first boot (design §11.6/§11.9).
                 let line = command_line(state);
-                match platform::launch(&state.paths.exe_path, &line, &state.sink()) {
+                let trampoline_env = vec![(
+                    super::ENV_TRAMPOLINE_PID.to_owned(),
+                    std::process::id().to_string(),
+                )];
+                match platform::launch(&state.paths.exe_path, &line, &trampoline_env, &state.sink())
+                {
                     Ok(launched) => child = Some(launched),
                     Err(error) => {
                         state.log(
@@ -453,7 +486,7 @@ pub fn before_run(args: &[std::ffi::OsString]) -> Startup {
                 // is back at its path. Say what happened and re-enter it.
                 let _ = writeln!(std::io::stderr(), "{message}");
                 let line = command_line(state);
-                match platform::launch(&state.paths.exe_path, &line, &state.sink()) {
+                match platform::launch(&state.paths.exe_path, &line, &[], &state.sink()) {
                     Ok(launched) => child = Some(launched),
                     Err(error) => {
                         let _ = writeln!(
@@ -564,10 +597,31 @@ fn run_cleanup_scan_and_notices(state: &mut StartupState, args: &[std::ffi::OsSt
         .map(|result| result.state)
         .unwrap_or(UpdateState::Idle);
     state.state = status;
+    state.runs_target_version = result
+        .as_ref()
+        .is_some_and(|result| result.to_version.as_deref() == Some(crate::config::VERSION));
     let scan = cleanup_scan(
         state.fs.as_ref(),
         &state.scan_context(live.clone(), result.as_ref(), pending.as_ref()),
     );
+    // A clean start writes nothing: the log must not cost a write per
+    // start (design §11.12 budget).
+    if !scan.removed.is_empty()
+        || !scan.live.is_empty()
+        || !scan.stuck.is_empty()
+        || scan.skipped_staging > 0
+    {
+        state.log(
+            "scan",
+            &format!(
+                "removed {} item(s), {} in use, {} stuck, {} staging skipped",
+                scan.removed.len(),
+                scan.live.len(),
+                scan.stuck.len(),
+                scan.skipped_staging
+            ),
+        );
+    }
     let notices = build_notices(
         &NoticeInput {
             state: status,
@@ -580,16 +634,6 @@ fn run_cleanup_scan_and_notices(state: &mut StartupState, args: &[std::ffi::OsSt
             live_pins: &live,
         },
         &state.paths.log_path,
-    );
-    state.log(
-        "scan",
-        &format!(
-            "removed {} item(s), {} in use, {} stuck, {} staging skipped",
-            scan.removed.len(),
-            scan.live.len(),
-            scan.stuck.len(),
-            scan.skipped_staging
-        ),
     );
     state.notices = notices;
     if !looks_interactive(args) {
@@ -647,12 +691,10 @@ pub enum ConfirmPoint {
     NoUserCommand,
     /// The TUI main loop is up.
     TuiReady,
-    /// The `mcp` stdio server is ready.
-    McpReady,
-    /// The `rpc` stdio loop is ready.
+    /// The `rpc` stdio loop is ready (the only resident stdio mode: `rpi
+    /// mcp` is a configuration subcommand, and `--mode json` is a one-shot
+    /// command that confirms through its exit code).
     RpcReady,
-    /// The `json` output mode is ready.
-    JsonReady,
 }
 
 /// Report a confirmation point. Only a process in the open first boot of
@@ -682,7 +724,9 @@ pub fn on_exit(code: i32, fatal: bool) {
                 if code == 0 && state.first_boot_target.is_some() {
                     state.confirm();
                 }
-                if state.confirmed_here
+                // The first normal exit of a process running the confirmed
+                // version releases the previous executable (design §11.7).
+                if state.runs_target_version
                     && state.result().is_some_and(|result| {
                         result.state == UpdateState::Confirmed && !result.normal_exit_after_confirm
                     })
@@ -754,6 +798,12 @@ pub fn run_cleanup_command() -> i32 {
              once those instances exit.",
             scan.live.len()
         );
+    } else if !scan.live.is_empty() {
+        println!(
+            "Still in use by another running process ({} item(s)); they are removed once it \
+             exits.",
+            scan.live.len()
+        );
     }
     if !scan.stuck.is_empty() {
         let mut reasons: Vec<String> = scan.stuck.iter().map(|item| item.reason.clone()).collect();
@@ -776,7 +826,7 @@ pub fn run_cleanup_command() -> i32 {
 
 /// `rpi self-uninstall` refuses while other instances use the installation
 /// (ADR-0050): a live pin of another process, or an old executable /
-/// generation still in use.
+/// generation still in use. A detection only — nothing is removed.
 pub fn self_uninstall_blocker(_exe_path: &Path) -> Option<String> {
     let (paths, fs, probe) = context();
     let live = live_pins(fs.as_ref(), &paths.pins_dir(), probe.as_ref());
@@ -799,7 +849,7 @@ pub fn self_uninstall_blocker(_exe_path: &Path) -> Option<String> {
     }
     let result = read_record::<UpdateResult>(fs.as_ref(), &paths.result_path());
     let pending = read_record::<PendingUpdate>(fs.as_ref(), &paths.pending_path());
-    let scan = cleanup_scan(
+    let scan = cleanup_scan_with(
         fs.as_ref(),
         &ScanContext {
             paths: &paths,
@@ -814,10 +864,11 @@ pub fn self_uninstall_blocker(_exe_path: &Path) -> Option<String> {
             result: result.as_ref(),
             now: std::time::SystemTime::now(),
         },
+        false,
     );
     if !scan.live.is_empty() {
         return Some(format!(
-            "Old version files of this installation are still in use ({} item(s)). Run \"rpi \
+            "Old version files of this installation are still in use ({} item(s)). Run \"rpi \\
              update --cleanup\" after the other instances exit and retry.",
             scan.live.len()
         ));

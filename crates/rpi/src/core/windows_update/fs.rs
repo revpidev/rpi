@@ -36,6 +36,8 @@ pub enum FsOp {
     RemoveDirAll,
     HashFile,
     ProbeDeletable,
+    Append,
+    FileLen,
 }
 
 impl FsOp {
@@ -53,6 +55,8 @@ impl FsOp {
             FsOp::RemoveDirAll => "remove_dir_all",
             FsOp::HashFile => "sha256_file",
             FsOp::ProbeDeletable => "probe_deletable",
+            FsOp::Append => "append",
+            FsOp::FileLen => "file_len",
         }
     }
 }
@@ -79,6 +83,17 @@ pub trait UpdateFs: Send + Sync {
     /// without share-delete, or no permission); succeed without changing
     /// anything otherwise.
     fn probe_deletable(&self, path: &Path) -> io::Result<()>;
+    /// Append `bytes` to `path` (the log). The default is a read-modify-write
+    /// over [`Self::write_atomic`]; the real file system appends in place.
+    fn append(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let mut next = self.read(path).unwrap_or_default();
+        next.extend_from_slice(bytes);
+        self.write_atomic(path, &next)
+    }
+    /// Size of `path` in bytes; `Ok(0)` when it does not exist.
+    fn file_len(&self, path: &Path) -> io::Result<u64> {
+        Ok(self.read(path).map(|bytes| bytes.len() as u64).unwrap_or(0))
+    }
     /// The wall clock, ISO 8601 UTC (`2026-11-28T01:02:03Z`).
     fn now_iso8601(&self) -> String;
     /// The pause between rename retries (tests record it instead).
@@ -160,6 +175,24 @@ impl UpdateFs for RealFs {
         probe_deletable(path)
     }
 
+    fn append(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)?;
+        file.write_all(bytes)
+    }
+
+    fn file_len(&self, path: &Path) -> io::Result<u64> {
+        Ok(std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0))
+    }
+
     fn now_iso8601(&self) -> String {
         crate::core::session_manager::now_iso8601()
     }
@@ -219,24 +252,12 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
-/// On Windows, open `path` with `DELETE` access and every sharing mode, then
-/// close the handle: a sharing violation or an access denial surfaces here,
-/// before anything is renamed or deleted. Elsewhere the check is the
-/// metadata lookup (removal itself may still fail).
-/// Open the three paths of the executable swap with `DELETE` access before
-/// the first rename (design §11.5): a sharing violation surfaces while
-/// nothing has moved yet. Elsewhere a no-op.
-pub fn preopen_for_swap(_paths: &[&Path]) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        super::platform::open_for_delete_all(_paths)
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(())
-    }
-}
-
+/// [`UpdateFs::probe_deletable`] for the real file system: on Windows, open
+/// `path` with `DELETE` access and every sharing mode, then close the handle
+/// — a sharing violation or an access denial surfaces here, before anything
+/// is renamed or deleted. Elsewhere the check is the metadata lookup
+/// (removal itself may still fail; tests inject the in-use case through
+/// `SpyFs`).
 pub fn probe_deletable(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -505,6 +526,16 @@ impl UpdateFs for SpyFs {
         self.record_sleep(duration);
     }
 
+    fn append(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.before(FsOp::Append, path)?;
+        self.inner.append(path, bytes)
+    }
+
+    fn file_len(&self, path: &Path) -> io::Result<u64> {
+        self.before(FsOp::FileLen, path)?;
+        self.inner.file_len(path)
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         // Both ends name the step in tests: a fault matches either path.
         self.before(FsOp::Rename, to)?;
@@ -652,6 +683,22 @@ mod tests {
         assert!(fs.called(FsOp::Exists, "nope"));
         fs.reset();
         assert_eq!(fs.count(FsOp::Exists), 0);
+    }
+
+    #[test]
+    fn append_extends_the_log_in_place_and_reports_its_length() {
+        let temp = TempDir::new();
+        let path = temp.0.join("update.log");
+        RealFs.append(&path, b"one\n").unwrap();
+        RealFs.append(&path, b"two\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\ntwo\n");
+        assert_eq!(RealFs.file_len(&path).unwrap(), 8);
+        assert_eq!(RealFs.file_len(&temp.0.join("missing")).unwrap(), 0);
+        let fs = SpyFs::new();
+        fs.append(&path, b"three\n").unwrap();
+        assert_eq!(fs.file_len(&path).unwrap(), 14);
+        assert!(fs.called(FsOp::Append, "update.log"));
+        assert!(fs.called(FsOp::FileLen, "update.log"));
     }
 
     #[test]

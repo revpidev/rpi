@@ -38,6 +38,7 @@
 //! byte-for-byte the pre-V19-09 one (R7.1.1).
 
 pub mod boot;
+pub mod env_block;
 pub mod fs;
 pub mod gc;
 pub mod generations;

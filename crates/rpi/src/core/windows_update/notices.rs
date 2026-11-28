@@ -122,13 +122,23 @@ fn file_plural(count: usize) -> &'static str {
     if count == 1 { "file" } else { "files" }
 }
 
-/// The one warning of a start (in use and/or stuck), if any.
+/// The one warning of a start (in use and/or stuck), if any. In-use files
+/// whose holder is a pinned rpi instance name its count; files the DELETE
+/// probe found held by something else (no pin: a scanner, an instance older
+/// than the pins) are reported without a count.
 pub fn warning_text(scan: &ScanReport, log_path: &Path) -> Option<String> {
     let in_use = scan.holders().len();
     let stuck = scan.stuck.len();
-    if in_use == 0 && stuck == 0 {
+    if scan.live.is_empty() && stuck == 0 {
         return None;
     }
+    let in_use_text = |n: usize| -> String {
+        if n > 0 {
+            format!("by {n} running rpi {}", instance_plural(n))
+        } else {
+            "by another running process".to_owned()
+        }
+    };
     let reasons: Vec<String> = {
         let mut reasons: Vec<String> = scan.stuck.iter().map(|item| item.reason.clone()).collect();
         reasons.sort();
@@ -138,9 +148,9 @@ pub fn warning_text(scan: &ScanReport, log_path: &Path) -> Option<String> {
     let reason = reasons.join(", ");
     match (in_use, stuck) {
         (n, 0) => Some(format!(
-            "Old version files are still in use by {n} running rpi {}. rpi removes them on a \
-             later start; run \"rpi update --cleanup\" to retry.",
-            instance_plural(n)
+            "Old version files are still in use {}. rpi removes them on a later start; run \
+             \"rpi update --cleanup\" to retry.",
+            in_use_text(n)
         )),
         (0, m) => Some(format!(
             "{m} old version {} could not be removed ({reason}). See {}. Run \"rpi update \
@@ -149,10 +159,9 @@ pub fn warning_text(scan: &ScanReport, log_path: &Path) -> Option<String> {
             log_path.display()
         )),
         (n, m) => Some(format!(
-            "Old version files are still in use by {n} running rpi {} and {m} {} could not be \
-             removed ({reason}). rpi removes them on a later start; run \"rpi update --cleanup\" \
-             to retry. See {}.",
-            instance_plural(n),
+            "Old version files are still in use {} and {m} {} could not be removed ({reason}). \
+             rpi removes them on a later start; run \"rpi update --cleanup\" to retry. See {}.",
+            in_use_text(n),
             file_plural(m),
             log_path.display()
         )),
@@ -179,23 +188,35 @@ pub fn build_notices(input: &NoticeInput<'_>, log_path: &Path) -> Vec<StartupNot
     let mut notices = Vec::new();
     let read = input.result.is_some_and(|result| result.read);
     match input.state {
+        // The reminder follows the update through its whole life: the
+        // versions come from the pending while the update waits for its
+        // first start (`applied`) and from the update result afterwards
+        // (`confirmed`, where the confirmation already deleted the pending).
         UpdateState::Applied | UpdateState::Confirmed => {
-            let Some(pending) = input.pending.filter(|pending| pending.applied) else {
-                return notices;
-            };
-            if !read {
+            let versions = input
+                .pending
+                .filter(|pending| pending.applied)
+                .map(|pending| (pending.from_version.clone(), pending.target_version.clone()))
+                .or_else(|| {
+                    input.result.and_then(|result| {
+                        result.from_version.clone().zip(result.to_version.clone())
+                    })
+                });
+            if let Some((from, to)) = versions
+                && !read
+            {
                 let others_on_old = input
                     .live_pins
                     .iter()
                     .filter(|pin| {
-                        pin.exe_version == pending.from_version
+                        pin.exe_version == from
                             && pin.pid != input.self_pid
                             && Some(pin.pid) != input.trampoline_pid
                     })
                     .count();
                 notices.push(StartupNotice::FirstBootReminder {
-                    from: pending.from_version.clone(),
-                    to: pending.target_version.clone(),
+                    from,
+                    to,
                     cleaned: !input.first_boot_launch && input.scan.old_exe_gone,
                     others_on_old,
                 });
@@ -458,7 +479,6 @@ mod tests {
 
     #[test]
     fn later_starts_warn_while_old_files_are_in_use_and_stop_when_they_are_gone() {
-        let pending = applied("0.1.9-rc.3", "0.1.9-rc.4");
         let result = UpdateResult {
             read: true,
             ..UpdateResult::new(UpdateState::Confirmed, None, None)
@@ -474,7 +494,7 @@ mod tests {
             &NoticeInput {
                 state: UpdateState::Confirmed,
                 result: Some(&result),
-                pending: Some(&pending),
+                pending: None,
                 scan: &scan,
                 first_boot_launch: false,
                 self_pid: 4242,
@@ -497,7 +517,7 @@ mod tests {
                 &NoticeInput {
                     state: UpdateState::Confirmed,
                     result: Some(&result),
-                    pending: Some(&pending),
+                    pending: None,
                     scan: &scan,
                     first_boot_launch: false,
                     self_pid: 4242,
@@ -553,7 +573,6 @@ mod tests {
 
     #[test]
     fn a_first_boot_launch_with_only_stuck_files_still_warns() {
-        let pending = applied("0.1.9-rc.3", "0.1.9-rc.4");
         let read = UpdateResult {
             read: true,
             ..UpdateResult::new(UpdateState::Confirmed, None, None)
@@ -574,7 +593,7 @@ mod tests {
             &NoticeInput {
                 state: UpdateState::Confirmed,
                 result: Some(&read),
-                pending: Some(&pending),
+                pending: None,
                 scan: &scan,
                 first_boot_launch: true,
                 self_pid: 4242,
@@ -587,6 +606,71 @@ mod tests {
         assert!(
             matches!(&notices[0], StartupNotice::Warning { line } if line.starts_with("1 old version file could not be removed (access denied)"))
         );
+    }
+
+    /// The steady state after a confirmation: the pending is gone, the
+    /// update result alone drives the reminder (when unread) and the
+    /// warnings are still classified.
+    #[test]
+    fn a_confirmed_result_without_a_pending_still_shows_the_reminder_and_warns() {
+        let result = UpdateResult::new(
+            UpdateState::Confirmed,
+            Some("0.1.9-rc.3".to_owned()),
+            Some("0.1.9-rc.4".to_owned()),
+        );
+        let mut scan = ScanReport::default();
+        scan.live.push(LiveLeftover {
+            kind: LeftoverKind::OldExe,
+            path: "/o".into(),
+            holders: vec![88],
+        });
+        scan.stuck.push(StuckLeftover {
+            kind: LeftoverKind::Generation,
+            path: "/g".into(),
+            reason: "access denied".to_owned(),
+        });
+        // `rpi --version` confirmed, then the TUI starts: not the first
+        // boot (no trampoline), so the in-use warning applies.
+        let notices = build_notices(
+            &NoticeInput {
+                state: UpdateState::Confirmed,
+                result: Some(&result),
+                pending: None,
+                scan: &scan,
+                first_boot_launch: false,
+                self_pid: 4242,
+                trampoline_pid: None,
+                live_pins: &[],
+            },
+            log_path(),
+        );
+        assert_eq!(notices.len(), 2);
+        assert!(
+            matches!(&notices[0], StartupNotice::FirstBootReminder { from, to, cleaned: false, others_on_old: 0 } if from == "0.1.9-rc.3" && to == "0.1.9-rc.4")
+        );
+        assert!(
+            matches!(&notices[1], StartupNotice::Warning { line } if line.contains("1 running rpi instance and 1 file could not be removed"))
+        );
+        // Read: the reminder is gone, the warning stays.
+        let read = UpdateResult {
+            read: true,
+            ..result.clone()
+        };
+        let notices = build_notices(
+            &NoticeInput {
+                state: UpdateState::Confirmed,
+                result: Some(&read),
+                pending: None,
+                scan: &scan,
+                first_boot_launch: false,
+                self_pid: 4242,
+                trampoline_pid: None,
+                live_pins: &[],
+            },
+            log_path(),
+        );
+        assert_eq!(notices.len(), 1);
+        assert!(matches!(&notices[0], StartupNotice::Warning { .. }));
     }
 
     #[test]

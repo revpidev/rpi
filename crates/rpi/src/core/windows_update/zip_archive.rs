@@ -404,9 +404,8 @@ mod tests {
     #[test]
     #[ignore = "reads the asset named by RPI_UPDATE_TEST_ASSET"]
     fn extracts_a_real_release_asset_against_the_zipfile_oracle() {
-        let Ok(path) = std::env::var("RPI_UPDATE_TEST_ASSET") else {
-            return;
-        };
+        let path = std::env::var("RPI_UPDATE_TEST_ASSET")
+            .expect("set RPI_UPDATE_TEST_ASSET to a release .zip to run this probe");
         let member =
             std::env::var("RPI_UPDATE_TEST_MEMBER").unwrap_or_else(|_| "rpi.exe".to_owned());
         let archive = std::fs::read(&path).unwrap();

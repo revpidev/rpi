@@ -167,6 +167,30 @@ pub fn run_startup_transaction(
     // A start that died mid-transaction left its journal behind.
     let context = UndoContext { paths, fs, log };
     journal::rollback_uncommitted(&context);
+    // A start that died between the journal commit and the pending's
+    // applied flag left the new manifest and the moved executable behind
+    // with nothing to undo: finalize the commit instead of discarding an
+    // update that is already in place.
+    if read_record::<crate::config::InstallManifest>(fs, &paths.manifest_path)
+        .is_some_and(|manifest| manifest.version == pending.target_version)
+    {
+        log("transaction: the manifest already names the target; finalizing the committed update");
+        let mut committed = pending.clone();
+        committed.applied = true;
+        let _ = write_record(fs, &paths.pending_path(), Some(&committed));
+        let mut result = UpdateResult::new(
+            UpdateState::Applied,
+            Some(pending.from_version.clone()),
+            Some(pending.target_version.clone()),
+        );
+        result.first_boot_protocol = pending.first_boot_protocol;
+        let _ = write_record(fs, &paths.result_path(), Some(&result));
+        clear_boot_records(fs, &paths.boot_dir());
+        if !pending.first_boot_protocol {
+            confirm_update(fs, paths, &committed);
+        }
+        return register_own_boot_record(fs, paths, probe, &committed, running_version, log);
+    }
     if let Err(reason) = reverify(fs, paths, &pending, running_version) {
         log(&format!("transaction: pending invalidated ({reason})"));
         discard_pending(fs, paths, &pending);
@@ -231,6 +255,38 @@ fn judge_open_first_boot(
     running_version: &str,
     log: &dyn Fn(&str),
 ) -> TransactionOutcome {
+    // The installer replaced the executable while the applied update waited
+    // for its first start (or restored the parked previous image): nothing
+    // of that update is current any more, so its state is cleared instead
+    // of blocking `rpi update` forever.
+    if let Some(installed) = read_record::<crate::config::InstallManifest>(fs, &paths.manifest_path)
+        && installed.version != pending.target_version
+    {
+        log(&format!(
+            "transaction: applied update to {} superseded by the installed rpi {}; clearing",
+            pending.target_version, installed.version
+        ));
+        let mut result = UpdateResult::new(
+            UpdateState::Degraded,
+            Some(pending.from_version.clone()),
+            Some(pending.target_version.clone()),
+        );
+        result.reason = Some(format!(
+            "superseded by the installer (rpi {} is installed)",
+            installed.version
+        ));
+        let _ = write_record(fs, &paths.result_path(), Some(&result));
+        let _ = write_record::<UndoData>(fs, &paths.undo_path(), None);
+        let _ = write_record::<PendingUpdate>(fs, &paths.pending_path(), None);
+        clear_boot_records(fs, &paths.boot_dir());
+        return TransactionOutcome::Degraded {
+            message: format!(
+                "The applied update to rpi {} was superseded by the installed rpi {}; its leftover state was cleared.",
+                pending.target_version, installed.version
+            ),
+            manual: None,
+        };
+    }
     if !pending.first_boot_protocol {
         // A target without the protocol is confirmed at commit; this
         // pending was left behind by an interrupted commit.
@@ -334,7 +390,7 @@ pub fn confirm_update(fs: &dyn UpdateFs, paths: &UpdatePaths, pending: &PendingU
 }
 
 /// What the trampoline concludes after its new instance exited
-/// (design §11.7 "跳板在场"). Holds the lock while it decides.
+/// (design §11.7, trampoline present). Holds the lock while it decides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrampolineVerdict {
     /// Exit with the child's code: confirmed, a target without the
@@ -353,6 +409,7 @@ pub fn judge_trampoline_child(
     paths: &UpdatePaths,
     probe: &dyn ProcessProbe,
     child_pid: u32,
+    child_exit_code: u32,
     options: &StartupOptions,
     log: &dyn Fn(&str),
 ) -> TrampolineVerdict {
@@ -409,9 +466,18 @@ pub fn judge_trampoline_child(
             TrampolineVerdict::PassThrough
         }
         // Another instance is still in its first boot: not this child's
-        // call. A child that exited without any record never reached P1:
-        // an unmarked termination is a crash (design §11.7).
+        // call.
         FirstBootVerdict::Live => TrampolineVerdict::PassThrough,
+        // No record at all: the child never reached P1. A normal exit code
+        // (a one-shot command that found the lock busy) is not a crash —
+        // the update keeps waiting for a later confirmation; any other
+        // termination is an unmarked one (design §11.7).
+        FirstBootVerdict::NoRecords if child_exit_code == 0 => {
+            log(&format!(
+                "trampoline: child {child_pid} exited normally without a boot record; not a crash"
+            ));
+            TrampolineVerdict::PassThrough
+        }
         FirstBootVerdict::NoRecords => {
             log(&format!(
                 "trampoline: child {child_pid} exited without a boot record; rolling back"
@@ -624,20 +690,40 @@ fn apply_inner(
 
     // --- extensions: place every generation, then flip every pointer ---
     for extension in &pending.extensions {
-        journal::append(
-            fs,
-            &paths.journal_path(),
-            JournalStep::PlaceExtension {
-                name: extension.name.clone(),
-                staged_path: extension.staged_path.clone(),
-                generation_path: extension.generation_path(),
-            },
-        )?;
-        place_staged_extension(fs, extension, pins).map_err(Failure)?;
-        log(&format!(
-            "transaction: extension {} {} placed",
-            extension.name, extension.version
-        ));
+        match plan_extension_placement(fs, extension, pins).map_err(Failure)? {
+            Placement::Reuse => {
+                // An identical generation is already in place and may be
+                // loaded by a running instance: nothing moves, so there is
+                // nothing to journal and nothing an undo may delete.
+                let _ = fs.remove_dir_all(&extension.staged_path);
+                log(&format!(
+                    "transaction: extension {} {} already present as the same build; reused",
+                    extension.name, extension.version
+                ));
+            }
+            Placement::Move => {
+                journal::append(
+                    fs,
+                    &paths.journal_path(),
+                    JournalStep::PlaceExtension {
+                        name: extension.name.clone(),
+                        staged_path: extension.staged_path.clone(),
+                        generation_path: extension.generation_path(),
+                    },
+                )?;
+                fs.rename(&extension.staged_path, &extension.generation_path())
+                    .map_err(|error| {
+                        Failure(format!(
+                            "could not move {} into place: {error}",
+                            extension.staged_path.display()
+                        ))
+                    })?;
+                log(&format!(
+                    "transaction: extension {} {} placed",
+                    extension.name, extension.version
+                ));
+            }
+        }
     }
     let mut new_pointers = Vec::new();
     for extension in &pending.extensions {
@@ -697,9 +783,19 @@ fn apply_inner(
             old_name: old_exe_name.clone(),
         },
     )?;
-    // Opening the three paths for DELETE first surfaces a sharing violation
-    // before anything has moved.
-    super::fs::preopen_for_swap(&[&paths.exe_path, &pending.binary.staged_path, &old_exe_path])?;
+    // Probing the two existing files and the directory of both renames for
+    // DELETE access first surfaces a sharing violation before anything has
+    // moved. The parked name does not exist yet and is not probed. The
+    // probe goes through the file-system seam, so tests can count it and
+    // inject a refusal.
+    let prefix = paths
+        .exe_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    for path in [&paths.exe_path, &pending.binary.staged_path, &prefix] {
+        fs.probe_deletable(path)?;
+    }
     rename(fs, &paths.exe_path, &old_exe_path)?;
     rename(fs, &pending.binary.staged_path, &paths.exe_path)?;
     log("transaction: executable swapped");
@@ -728,25 +824,48 @@ fn apply_inner(
     let mut committed = pending.clone();
     committed.applied = true;
     write_record(fs, &paths.pending_path(), Some(&committed))?;
-    let mut result = UpdateResult::new(
-        UpdateState::Applied,
-        Some(pending.from_version.clone()),
-        Some(pending.target_version.clone()),
-    );
-    result.first_boot_protocol = pending.first_boot_protocol;
-    write_record(fs, &paths.result_path(), Some(&result))?;
-    clear_boot_records(fs, &paths.boot_dir());
-    log("transaction: committed");
+    if pending.first_boot_protocol {
+        let mut result = UpdateResult::new(
+            UpdateState::Applied,
+            Some(pending.from_version.clone()),
+            Some(pending.target_version.clone()),
+        );
+        result.first_boot_protocol = true;
+        write_record(fs, &paths.result_path(), Some(&result))?;
+        clear_boot_records(fs, &paths.boot_dir());
+        log("transaction: committed; first boot open");
+    } else {
+        // Design §11.3 / §11.5 step 6: a target without the first-boot
+        // protocol has no boot records and no automatic rollback — it is
+        // confirmed here, and its pre-image goes with the pending.
+        confirm_update(fs, paths, &committed);
+        log("transaction: committed; the target has no first-boot protocol, confirmed");
+    }
     Ok(())
 }
 
-/// Move one staged extension to its generation directory, honouring the
-/// three rules for an existing directory (design §11.5).
-fn place_staged_extension(
+/// What the transaction does with one staged extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// An identical generation already exists (and may be in use): reuse
+    /// it, drop the staging copy, journal nothing.
+    Reuse,
+    /// Move the staging copy into place (journaled first).
+    Move,
+}
+
+/// Decide how `extension` lands, honouring the three rules for an existing
+/// generation directory (design §11.5): no pin names it → replace it;
+/// it cannot be deleted → reuse it when its manifest is identical; a pin
+/// names it → reuse it when its manifest is identical. A different
+/// manifest behind a pin or an undeletable directory is an error: the
+/// transaction is refused, not forced. The container is created and a
+/// retirement marker is cleared here; nothing else moves.
+fn plan_extension_placement(
     fs: &dyn UpdateFs,
     extension: &super::records::StagedExtension,
     pins: &[PinRecord],
-) -> Result<(), String> {
+) -> Result<Placement, String> {
     crate::core::extension_registry::ensure_safe_extension_name(&extension.name)?;
     let container = extension.container();
     fs.create_dir_all(&container)
@@ -757,28 +876,35 @@ fn place_staged_extension(
             .map_err(|error| error.to_string())?;
     }
     let generation = extension.generation_path();
-    if fs.exists(&generation).unwrap_or(false) {
-        let pinned = super::pins::count_references(pins, &generation) > 0;
-        let replaced = !pinned && fs.remove_dir_all(&generation).is_ok();
-        if !replaced {
-            let existing = fs.sha256_file(&generation.join("rpi-extension.json")).ok();
-            if existing.as_deref() != Some(extension.manifest_sha256.as_str()) {
-                return Err(format!(
-                    "{} {} is already installed as a different build and is in use",
-                    extension.name, extension.version
-                ));
-            }
-            let _ = fs.remove_dir_all(&extension.staged_path);
-            return Ok(());
-        }
+    if !fs.exists(&generation).unwrap_or(false) {
+        return Ok(Placement::Move);
     }
-    fs.rename(&extension.staged_path, &generation)
-        .map_err(|error| {
-            format!(
-                "could not move {} into place: {error}",
-                extension.staged_path.display()
-            )
-        })
+    let pinned = super::pins::count_references(pins, &generation) > 0;
+    let replaced = if pinned {
+        false
+    } else {
+        // Move the old directory aside first: a loaded library keeps a
+        // half-deleted tree otherwise.
+        super::generations::replace_generation_copy(
+            fs,
+            &extension.install_root,
+            &extension.name,
+            &extension.version,
+            &generation,
+        )
+        .is_ok()
+    };
+    if replaced {
+        return Ok(Placement::Move);
+    }
+    let existing = fs.sha256_file(&generation.join("rpi-extension.json")).ok();
+    if existing.as_deref() == Some(extension.manifest_sha256.as_str()) {
+        return Ok(Placement::Reuse);
+    }
+    Err(format!(
+        "{} {} is already installed as a different build and is in use",
+        extension.name, extension.version
+    ))
 }
 
 fn flip_pointer(fs: &dyn UpdateFs, container: &Path, text: &[u8]) -> Result<(), Failure> {
@@ -1612,9 +1738,15 @@ mod tests {
 
     // ---- the trampoline's judgement ----------------------------------------
 
-    /// Judge a child `pid` whose boot record (`normal_exit` `None`: no
-    /// record was written) is registered under a separate probe.
-    fn judge_child(f: &Fixture, pid: u32, normal_exit: Option<bool>) -> TrampolineVerdict {
+    /// Judge a child `pid` that exited with `exit_code`, whose boot record
+    /// (`normal_exit` `None`: no record was written) is registered under a
+    /// separate probe.
+    fn judge_child(
+        f: &Fixture,
+        pid: u32,
+        normal_exit: Option<bool>,
+        exit_code: u32,
+    ) -> TrampolineVerdict {
         let probe = FakeProcessProbe::new(1, 1);
         if let Some(normal_exit) = normal_exit {
             write_boot_record(
@@ -1635,6 +1767,7 @@ mod tests {
             &f.paths,
             &probe,
             pid,
+            exit_code,
             &StartupOptions::default(),
             &|_: &str| {},
         )
@@ -1645,7 +1778,10 @@ mod tests {
         // Still applied and no record at all (the child died before P1):
         // an unmarked termination is a crash.
         let f = applied(false);
-        assert_eq!(judge_child(&f, 5100, None), TrampolineVerdict::RolledBack);
+        assert_eq!(
+            judge_child(&f, 5100, None, 1),
+            TrampolineVerdict::RolledBack
+        );
         assert_eq!(
             std::fs::read(f.prefix().join("rpi.exe")).unwrap(),
             b"old exe"
@@ -1659,7 +1795,7 @@ mod tests {
         // keeps waiting for a later confirmation.
         let f = applied(false);
         assert_eq!(
-            judge_child(&f, 5101, Some(true)),
+            judge_child(&f, 5101, Some(true), 1),
             TrampolineVerdict::PassThrough,
             "normal exit without a confirmation"
         );
@@ -1679,7 +1815,7 @@ mod tests {
         // Exited without the normal-exit mark: a crash.
         let f = applied(false);
         assert_eq!(
-            judge_child(&f, 5102, Some(false)),
+            judge_child(&f, 5102, Some(false), 1),
             TrampolineVerdict::RolledBack,
             "no normal-exit mark"
         );
@@ -1688,7 +1824,7 @@ mod tests {
         let f = applied(false);
         confirm_update(&*f.fs, &f.paths, &f.pending);
         assert_eq!(
-            judge_child(&f, 5103, None),
+            judge_child(&f, 5103, None, 1),
             TrampolineVerdict::PassThrough,
             "confirmed"
         );
@@ -1715,6 +1851,7 @@ mod tests {
                 &f.paths,
                 &*probe,
                 6001,
+                1,
                 &StartupOptions::default(),
                 &|_: &str| {}
             ),
@@ -1739,6 +1876,7 @@ mod tests {
                 &f.paths,
                 &*probe,
                 5100,
+                1,
                 &StartupOptions {
                     lock_wait: Duration::from_millis(50)
                 },
@@ -1749,6 +1887,250 @@ mod tests {
         assert_eq!(
             std::fs::read(f.prefix().join("rpi.exe")).unwrap(),
             b"new exe"
+        );
+    }
+
+    // ---- round-1 review regressions ----------------------------------------
+
+    /// The DELETE-access probe before the executable swap touches the two
+    /// files that exist and the directory of both renames — never the
+    /// parked name, which does not exist yet (a probe there would fail
+    /// every first update on Windows).
+    #[test]
+    fn the_exe_swap_probes_the_two_files_and_the_directory_through_the_seam() {
+        let f = Fixture::staged(false);
+        assert!(matches!(
+            f.run(RUNNING_OLD),
+            TransactionOutcome::Applied { .. }
+        ));
+        let probes: Vec<PathBuf> =
+            f.fs.calls()
+                .iter()
+                .filter(|call| call.op == FsOp::ProbeDeletable)
+                .map(|call| call.path.clone())
+                .collect();
+        let prefix = f.prefix();
+        assert_eq!(
+            probes,
+            vec![
+                prefix.join("rpi.exe"),
+                prefix.join(".update/staging/0.1.9-rc.4/rpi.exe"),
+                prefix.clone(),
+            ]
+        );
+        assert!(
+            !probes
+                .iter()
+                .any(|path| path.to_string_lossy().contains(".old-")),
+            "the parked name is not probed"
+        );
+    }
+
+    /// A refused probe (a scanner holds the running image without
+    /// share-delete) degrades before the first rename: nothing moved.
+    #[test]
+    fn a_refused_delete_probe_degrades_before_any_rename() {
+        let f = Fixture::staged(false);
+        f.fs.fail_with(
+            FsOp::ProbeDeletable,
+            "prefix/rpi.exe",
+            1,
+            io::Error::from_raw_os_error(32),
+        );
+        let outcome = f.run(RUNNING_OLD);
+        assert!(matches!(outcome, TransactionOutcome::Degraded { .. }));
+        let prefix = f.prefix();
+        assert_eq!(std::fs::read(prefix.join("rpi.exe")).unwrap(), b"old exe");
+        assert!(!prefix.join("rpi.exe.old-0.1.9-rc.3").exists());
+        // No rename ran before the refused probe; the failed transaction
+        // discards its staging (R7.2.5), exactly like any other failure.
+        assert!(!f.fs.called(FsOp::Rename, "prefix/rpi.exe.old"));
+        assert!(!prefix.join(".update/staging/0.1.9-rc.4/rpi.exe").exists());
+        assert!(!f.paths.pending_path().exists());
+    }
+
+    /// An identical generation that is already in place (and pinned by a
+    /// running instance) is reused, not journaled: a later failure must
+    /// not delete it.
+    #[test]
+    fn a_reused_generation_survives_a_later_failure() {
+        let f = Fixture::staged(true);
+        // The batch's extension already exists as the same build, pinned by
+        // a live instance.
+        let extension = f.pending.extensions[0].clone();
+        let generation = extension.generation_path();
+        let staged_manifest =
+            std::fs::read(extension.staged_path.join("rpi-extension.json")).unwrap();
+        std::fs::create_dir_all(generation.join("lib")).unwrap();
+        std::fs::write(generation.join("rpi-extension.json"), &staged_manifest).unwrap();
+        std::fs::write(generation.join("lib/lib.dll"), b"in use").unwrap();
+        let pin = crate::core::windows_update::records::PinRecord {
+            dirs: vec![generation.clone()],
+            ..crate::core::windows_update::records::PinRecord::new(
+                7000,
+                1,
+                "s".to_owned(),
+                "0.1.9-rc.3",
+                &f.paths.exe_path,
+            )
+        };
+        f.probe.spawn(7000, 1);
+        // The handle stays alive: the pin file must exist while the
+        // transaction runs (releasing it would delete the file).
+        let _pin_handle = crate::core::windows_update::pins::PinHandle::register(
+            f.fs.clone() as Arc<dyn UpdateFs>,
+            &f.paths.pins_dir(),
+            pin,
+        )
+        .unwrap();
+        // The manifest write fails after the extension step.
+        f.fs.fail(FsOp::WriteAtomic, "rpi.install.json", 1);
+        let outcome = f.run(RUNNING_OLD);
+        assert!(
+            matches!(outcome, TransactionOutcome::Degraded { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(generation.join("lib/lib.dll")).unwrap(),
+            b"in use",
+            "the reused generation is intact"
+        );
+        assert!(generation.join("rpi-extension.json").exists());
+        assert!(
+            f.logs()
+                .iter()
+                .any(|line| line.contains("already present as the same build; reused")),
+            "{:?}",
+            f.logs()
+        );
+    }
+
+    /// A target without the first-boot protocol is confirmed at commit:
+    /// no pending, no pre-image, result `confirmed` (design §11.3).
+    #[test]
+    fn a_target_without_the_protocol_is_confirmed_at_commit() {
+        let f = Fixture::staged(false);
+        let mut pending = f.pending.clone();
+        pending.first_boot_protocol = false;
+        f.fs.write_atomic(&f.paths.pending_path(), to_json(&pending).as_bytes())
+            .unwrap();
+        let outcome = f.run(RUNNING_OLD);
+        assert_eq!(
+            outcome,
+            TransactionOutcome::Applied {
+                first_boot_protocol: false
+            }
+        );
+        assert!(
+            !f.paths.pending_path().exists(),
+            "the pending goes with the confirmation"
+        );
+        assert!(
+            !f.paths.undo_path().exists(),
+            "the pre-image goes with the confirmation"
+        );
+        let result = read_record::<UpdateResult>(&*f.fs, &f.paths.result_path()).unwrap();
+        assert_eq!(result.state, UpdateState::Confirmed);
+        assert!(!result.first_boot_protocol);
+    }
+
+    /// The installer replaced the executable while the applied update
+    /// waited for its first start: the stale state is cleared instead of
+    /// blocking `rpi update` forever.
+    #[test]
+    fn an_applied_pending_superseded_by_the_installer_is_cleared() {
+        let f = applied(false);
+        let mut pending = f.pending.clone();
+        pending.applied = true;
+        f.fs.write_atomic(&f.paths.pending_path(), to_json(&pending).as_bytes())
+            .unwrap();
+        std::fs::write(
+            &f.paths.manifest_path,
+            br#"{"version":"0.1.9-rc.3","target":"t","installedAt":"2026-11-29T00:00:00Z","sourceUrl":"u","sha256":"s","installPath":"p","method":"binary"}"#,
+        )
+        .unwrap();
+        f.probe.spawn(5000, 50);
+        write_boot_record(
+            &*f.fs,
+            &f.paths.boot_record_path(5000),
+            &super::super::records::BootRecord {
+                schema_version: 1,
+                pid: 5000,
+                process_start: 50,
+                version: "0.1.9-rc.4".to_owned(),
+                normal_exit: false,
+            },
+        )
+        .unwrap();
+        let TransactionOutcome::Degraded { message, manual } = f.run(RUNNING_OLD) else {
+            panic!("expected the stale state to be cleared")
+        };
+        assert!(manual.is_none());
+        assert!(
+            message.contains("superseded by the installed rpi 0.1.9-rc.3"),
+            "{message}"
+        );
+        assert!(!f.paths.pending_path().exists());
+        assert!(!f.paths.undo_path().exists());
+        assert!(!f.paths.boot_record_path(5000).exists());
+        let result = read_record::<UpdateResult>(&*f.fs, &f.paths.result_path()).unwrap();
+        assert_eq!(result.state, UpdateState::Degraded);
+    }
+
+    /// A start that died between the journal commit and the pending's
+    /// applied flag: the manifest already names the target, so the commit
+    /// is finalized instead of being discarded as "still on the old
+    /// version" while the executable is already the new one.
+    #[test]
+    fn a_commit_whose_applied_flag_was_not_written_is_finalized() {
+        let f = applied(false);
+        // Rewind the pending to "not applied" and drop the staged copy, as
+        // the interrupted commit left it.
+        let mut pending = f.pending.clone();
+        pending.applied = false;
+        f.fs.write_atomic(&f.paths.pending_path(), to_json(&pending).as_bytes())
+            .unwrap();
+        let outcome = f.run(RUNNING_NEW);
+        assert_eq!(
+            outcome,
+            TransactionOutcome::FirstBootOpen {
+                target_version: "0.1.9-rc.4".to_owned()
+            }
+        );
+        let stored = read_record::<PendingUpdate>(&*f.fs, &f.paths.pending_path()).unwrap();
+        assert!(stored.applied);
+        assert_eq!(
+            std::fs::read(f.prefix().join("rpi.exe")).unwrap(),
+            b"new exe",
+            "nothing was reverted"
+        );
+        assert!(
+            f.logs()
+                .iter()
+                .any(|line| line.contains("finalizing the committed update")),
+            "{:?}",
+            f.logs()
+        );
+    }
+
+    /// A child that exited normally without a boot record (it found the
+    /// lock busy) is not a crash; any other exit without a record is.
+    #[test]
+    fn a_normal_exit_without_a_boot_record_is_not_a_crash() {
+        let f = applied(false);
+        assert_eq!(
+            judge_child(&f, 5100, None, 0),
+            TrampolineVerdict::PassThrough
+        );
+        assert!(f.paths.pending_path().exists(), "the update keeps waiting");
+        assert_eq!(
+            std::fs::read(f.prefix().join("rpi.exe")).unwrap(),
+            b"new exe"
+        );
+        let f = applied(false);
+        assert_eq!(
+            judge_child(&f, 5101, None, 1),
+            TrampolineVerdict::RolledBack
         );
     }
 

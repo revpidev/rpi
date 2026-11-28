@@ -227,10 +227,19 @@ pub fn windows_manual_update_instructions(version: &str, exe_path: &Path) -> Str
         "then exit {APP_NAME} and replace {} with the extracted {APP_NAME}.exe (or re-run install.ps1).",
         exe_path.display()
     ));
-    lines.push(format!(
-        "Channel: {APP_NAME} update --self installs the latest stable build; pre-release (RC) \
-         builds such as this one need {APP_NAME} update --self --rc (or the RC asset named above)."
-    ));
+    if semver::Version::parse(version.trim().trim_start_matches(['v', 'V']))
+        .is_ok_and(|parsed| !parsed.pre.is_empty())
+    {
+        lines.push(format!(
+            "Channel: {version} is a pre-release (RC) build; {APP_NAME} update --self --rc installs the \
+             latest RC (the asset named above is the RC asset)."
+        ));
+    } else {
+        lines.push(format!(
+            "Channel: {version} is a stable build; {APP_NAME} update --self installs the latest \
+             stable build (the asset named above is the stable asset)."
+        ));
+    }
     lines.join("\n")
 }
 

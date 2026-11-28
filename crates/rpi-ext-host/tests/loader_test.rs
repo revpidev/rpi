@@ -173,7 +173,7 @@ fn loader_discovery_resolves_flat_generational_and_mixed_containers() {
     assert_eq!(discovered, expected);
 }
 
-// ADR-0050 process-fixed generation (V19-09 FR-W5 "固定代"): once this
+// ADR-0050 process-fixed generation (V19-09 FR-W5): once this
 // process resolved a container, a pointer flip by another process does not
 // change what `/reload` discovers.
 #[test]

@@ -211,9 +211,9 @@ pub enum FirstBootVerdict {
 /// (an old instance that started while the update was already applied) never
 /// writes one, and a record of another version never counts.
 ///
-/// A crashed record decides first (design §11.7 "存在…未标记 normalExit 的
-/// 记录，执行回滚流程"): rollback is idempotent and keeps live instances
-/// working, so one crash is enough. Without one, a live record keeps this
+/// A crashed record decides first (design §11.7: a record whose process
+/// ended without the normal-exit mark triggers the rollback): rollback is
+/// idempotent and keeps live instances working, so one crash is enough. Without one, a live record keeps this
 /// start out of the judgement; otherwise every record exited normally.
 pub fn judge_first_boot(
     fs: &dyn UpdateFs,

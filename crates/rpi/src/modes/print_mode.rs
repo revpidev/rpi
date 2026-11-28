@@ -135,14 +135,6 @@ pub async fn run_print_mode(
     let signal_exit_code = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
     let mut exit_code = 0;
 
-    // V19-09 (ADR-0050, Windows): the resident JSON output mode is ready.
-    #[cfg(windows)]
-    if options.mode == PrintOutputMode::Json {
-        crate::core::windows_update::startup::confirm_point(
-            crate::core::windows_update::startup::ConfirmPoint::JsonReady,
-        );
-    }
-
     // JSON mode: header line first (print-mode.ts:122-127).
     if options.mode == PrintOutputMode::Json {
         let manager = runtime.session().session_manager();

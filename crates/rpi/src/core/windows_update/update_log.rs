@@ -1,10 +1,10 @@
 //! `%LOCALAPPDATA%\rpi\logs\update.log` (R7.6.4).
 //!
 //! One line per event, ISO 8601 UTC timestamp first. The file is appended
-//! to and rotated to `update.log.1` once it passes 1 MiB (one generation).
-//! Logging never changes an outcome: a failed write is dropped. Only
-//! paths, versions, pids and error texts are logged — never credentials,
-//! environment values or file contents.
+//! to in place (`OpenOptions::append`) and rotated to `update.log.1` once it
+//! passes 1 MiB (one generation). Logging never changes an outcome: a
+//! failed write is dropped. Only paths, versions, pids and error texts are
+//! logged — never credentials, environment values or file contents.
 
 use std::path::{Path, PathBuf};
 
@@ -31,29 +31,19 @@ pub fn log_event(fs: &dyn UpdateFs, log_path: Option<&Path>, event: &str, detail
 
 /// Append `line`, rotating first when the file is over the cap. The first
 /// write failure (unwritable directory, full disk) is the caller's to
-/// ignore; the line is simply lost.
+/// ignore; the line is simply lost. One `stat`-length query plus one
+/// in-place append per event: no read-modify-write of the whole file.
 pub fn append_line(fs: &dyn UpdateFs, log_path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(dir) = log_path.parent() {
         fs.create_dir_all(dir)?;
     }
     rotate_if_needed(fs, log_path)?;
-    write_via(fs, log_path, line)
-}
-
-fn write_via(fs: &dyn UpdateFs, log_path: &Path, line: &str) -> std::io::Result<()> {
-    // `UpdateFs` has no append; read-modify-write through the atomic write
-    // keeps the log crash-consistent like every other state file.
-    let mut next = fs.read(log_path).unwrap_or_default();
-    next.extend_from_slice(line.as_bytes());
-    fs.write_atomic(log_path, &next)
+    fs.append(log_path, line.as_bytes())
 }
 
 /// Move an oversized log to `update.log.1` (replacing the previous one).
 pub fn rotate_if_needed(fs: &dyn UpdateFs, log_path: &Path) -> std::io::Result<()> {
-    let Ok(current) = fs.read(log_path) else {
-        return Ok(());
-    };
-    if current.len() < UPDATE_LOG_MAX_BYTES as usize {
+    if fs.file_len(log_path)? < UPDATE_LOG_MAX_BYTES {
         return Ok(());
     }
     let mut rotated = log_path.as_os_str().to_owned();

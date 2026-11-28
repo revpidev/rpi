@@ -32,11 +32,11 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, INFINITE,
-    InitializeProcThreadAttributeList, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetExitCodeProcess, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList, OpenProcess,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 /// NUL-terminated UTF-16 form of a path.
@@ -344,17 +344,22 @@ impl ChildProcess {
 }
 
 /// Start `executable` with `raw_command_line`, inheriting the console, the
-/// working directory, the environment and exactly the three standard
-/// handles (design §11.6). `CREATE_BREAKAWAY_FROM_JOB` is tried first so
-/// the new instance is not killed when a job the caller belongs to ends;
-/// an access denial (a job that forbids breakaway) retries without it.
+/// working directory and exactly the three standard handles (design
+/// §11.6). The environment is this process's environment plus `extra_env`
+/// (name, value), passed as a Unicode environment block — the trampoline
+/// adds `RPI_UPDATE_TRAMPOLINE_PID` this way without mutating its own
+/// environment. `CREATE_BREAKAWAY_FROM_JOB` is tried first so the new
+/// instance is not killed when a job the caller belongs to ends; an access
+/// denial (a job that forbids breakaway) retries without it.
 pub fn launch(
     executable: &Path,
     raw_command_line: &str,
+    extra_env: &[(String, String)],
     log: &dyn Fn(&str),
 ) -> io::Result<ChildProcess> {
     let application = wide(executable);
     let mut command: Vec<u16> = raw_command_line.encode_utf16().chain(Some(0)).collect();
+    let environment = super::env_block::environment_block(std::env::vars_os(), extra_env);
     let stdio = StdioHandles::capture();
 
     // The handle list restricts inheritance to the standard handles: a
@@ -410,8 +415,8 @@ pub fn launch(
             std::ptr::null(),
             std::ptr::null(),
             1,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_BREAKAWAY_FROM_JOB,
-            std::ptr::null(),
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB,
+            environment.as_ptr().cast(),
             std::ptr::null(),
             &startup.StartupInfo,
             &mut information,
@@ -428,8 +433,8 @@ pub fn launch(
                     std::ptr::null(),
                     std::ptr::null(),
                     1,
-                    EXTENDED_STARTUPINFO_PRESENT,
-                    std::ptr::null(),
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                    environment.as_ptr().cast(),
                     std::ptr::null(),
                     &startup.StartupInfo,
                     &mut information,
@@ -744,6 +749,36 @@ mod tests {
         Some(PathBuf::from(root).join("System32").join("cmd.exe"))
     }
 
+    /// The extra environment entry reaches the child (the trampoline pid).
+    #[test]
+    fn launch_passes_the_extra_environment_entry_to_the_child() {
+        let Some(cmd) = system_cmd() else {
+            eprintln!("skipping: SystemRoot is unset");
+            return;
+        };
+        let out = probe_temp_dir("env").join("out.txt");
+        let line = trampoline_command_line(
+            &cmd,
+            &format!(
+                r#" /c echo %RPI_UPDATE_TRAMPOLINE_PID% > "{}""#,
+                out.to_string_lossy()
+            ),
+        );
+        let child = launch(
+            &cmd,
+            &line,
+            &[(
+                super::super::ENV_TRAMPOLINE_PID.to_owned(),
+                "4242".to_owned(),
+            )],
+            &|_: &str| {},
+        )
+        .unwrap();
+        assert_eq!(child.wait().unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "4242");
+        let _ = std::fs::remove_dir_all(out.parent().unwrap());
+    }
+
     /// The trampoline relays the child's exit code and its quoted command
     /// line (design §11.6).
     #[test]
@@ -755,6 +790,7 @@ mod tests {
         let child = launch(
             &cmd,
             &trampoline_command_line(&cmd, " /c exit 3"),
+            &[],
             &|_: &str| {},
         )
         .unwrap();
@@ -762,6 +798,7 @@ mod tests {
         let child = launch(
             &cmd,
             &trampoline_command_line(&cmd, " /c exit 0"),
+            &[],
             &|_: &str| {},
         )
         .unwrap();
@@ -773,7 +810,7 @@ mod tests {
             &cmd,
             &format!(r#" /c echo "a b" > "{}""#, out.to_string_lossy()),
         );
-        let child = launch(&cmd, &line, &|_: &str| {}).unwrap();
+        let child = launch(&cmd, &line, &[], &|_: &str| {}).unwrap();
         assert_eq!(child.wait().unwrap(), 0);
         assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "a b");
         let _ = std::fs::remove_dir_all(out.parent().unwrap());
@@ -790,6 +827,7 @@ mod tests {
         let child = launch(
             &cmd,
             &trampoline_command_line(&cmd, " /c ping -n 60 127.0.0.1 > nul"),
+            &[],
             &|_: &str| {},
         )
         .unwrap();
