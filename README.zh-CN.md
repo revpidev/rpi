@@ -123,6 +123,8 @@ rpi update --models     # 刷新远程模型目录
 
 交互模式启动时会异步检查已安装的插件。正式版主体只比较最新正式版插件，RC 主体只比较最新 RC 插件；发现更新时会列出插件，并提示对应的 `rpi update --extensions` 或 `rpi update --extensions --rc` 命令。
 
+**Windows：更新在下次启动时生效。** Windows 不能替换运行中的程序，所以 `rpi update --self`（以及 `rpi update --all` 的本体部分）只把新版本下载并校验到 `rpi.exe` 旁的 `.update\` 目录，输出「Downloaded rpi <version>. It takes effect the next time rpi starts.」。下次启动时重新校验暂存文件，用一个带 journal 的事务把本体与同批扩展一并换入，随后旧进程用原始命令行启动新的 `rpi.exe` 并等待它：shell 提示符在 rpi 退出后才返回，Ctrl+C 只交给新实例。扩展以分代目录安装（`~/.rpi/agent/extensions/<name>/<version>/` 加 `current.json` 指针；旧版本写入的扁平布局照常加载），其他正在运行的 rpi 实例继续使用已加载的库，重启后切换。每次启动都会清理不再被任何实例使用的旧版本文件，并在交互模式的启动通知里说明：旧版本已清理；或旧文件仍被运行中的实例占用、或无法删除时给出警告（`rpi update --cleanup` 可重试）。新版本在首次启动确认之前崩溃时自动回滚——恢复旧的可执行文件、扩展指针与安装清单，禁用该版本并明确提示——之后用 `rpi update --self --force` 才能再次暂存。`%LOCALAPPDATA%\rpi\logs\update.log` 记录每一步。已知限制：新版本确认首启之前关机视同首启崩溃；确认之后的崩溃不自动回滚（旧映像以 `rpi.exe.old-<version>` 保留到下一次正常退出，可手动改回或重跑 `install.ps1`，它也会修复缺失的 `rpi.exe`）；低于 `0.1.9-rc.4` 的目标版本切换时没有首启检查；更新前已运行的实例派生的子代理子进程运行的是新版本。
+
 ### 卸载
 
 使用 `rpi remove <name>`（别名：`rpi uninstall <name>`）卸载单个插件；项目级安装需加 `--local`。settings 中登记的插件和 `rpi list` 显示为 `(untracked)` 的安装产物都支持卸载。已安装的插件文件会被删除；本地路径源只移除 settings 条目，不删除原目录。
@@ -139,7 +141,7 @@ rpi self-uninstall           # 删除二进制与安装清单；保留 ~/.rpi
 rpi self-uninstall --purge   # 连同 ~/.rpi（会话、认证、设置）一起删除
 ```
 
-手动清理遗留物：未加 `--purge` 卸载时，`~/.rpi/` 目录需要自行删除；Windows 上运行中的二进制无法删除自身，`self-uninstall` 会打印需要手动删除的准确路径（`rpi.exe`、`rpi.install.json`）。Unix 安装器写入的 `# rpi` PATH 块会被自动移除（symlink profile 和 symlink 安装目录会通过可执行文件路径与 manifest 的逻辑 `installPath` 匹配）；没有标记的手动 PATH 行不会被改动。Windows 上如安装器加入过用户 PATH，请手动删除该条目。
+手动清理遗留物：未加 `--purge` 卸载时，`~/.rpi/` 目录需要自行删除；Windows 上运行中的二进制无法删除自身，`self-uninstall` 会打印需要手动删除的准确路径（`rpi.exe`、`rpi.install.json`），在其他 rpi 实例仍在使用该安装时拒绝执行（关闭它们后重试），并列出更新遗留物（`.update\`、`rpi.exe.old-*`、分代扩展目录、更新日志）。Unix 安装器写入的 `# rpi` PATH 块会被自动移除（symlink profile 和 symlink 安装目录会通过可执行文件路径与 manifest 的逻辑 `installPath` 匹配）；没有标记的手动 PATH 行不会被改动。Windows 上如安装器加入过用户 PATH，请手动删除该条目。
 
 ## 使用
 
