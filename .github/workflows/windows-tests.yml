@@ -1,0 +1,109 @@
+name: windows-tests
+
+# V19-09 (ADR-0050): the Windows test leg of the startup self-update.
+#
+# The workspace has no Windows compile or test coverage outside the
+# manually dispatched distribution build (build.yml), so a `#[cfg(windows)]`
+# compile error only surfaced when a release was tagged. This workflow is
+# the development gate for the Windows-only code: format, clippy, a locked
+# check of every target, the platform-independent update tests re-run on
+# Windows, the `#[cfg(windows)]` probes (running-image rename, loaded-DLL
+# directory, trampoline launch) and both PowerShell installer suites under
+# PowerShell 7 and Windows PowerShell 5.1.
+#
+# `rpi-durable` is excluded from clippy and check: the experimental
+# durable crate never compiled on Windows (`node_watch.rs` uses the
+# unstable `MetadataExt::file_index`, tracked as a known issue in
+# rpi-docs plan/v0.1.9/known-issues.md) and is not on the default CLI path.
+#
+# Trigger: workflow_dispatch only (ADR-0042). It builds nothing for
+# distribution and uploads only logs; it never tags, packages or publishes.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  windows:
+    name: Windows compile and tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: . -> target
+          key: windows-tests
+
+      - name: Format
+        run: cargo fmt --all -- --check 2>&1 | Tee-Object -FilePath fmt.log; exit $LASTEXITCODE
+        shell: pwsh
+
+      - name: Clippy
+        run: cargo clippy --workspace --exclude rpi-durable --all-targets -- -D warnings 2>&1 | Tee-Object -FilePath clippy.log; exit $LASTEXITCODE
+        shell: pwsh
+
+      - name: Check every target (locked)
+        run: cargo check --workspace --exclude rpi-durable --all-targets --locked 2>&1 | Tee-Object -FilePath check.log; exit $LASTEXITCODE
+        shell: pwsh
+
+      # The native-plugin fixture is the non-system DLL the loaded-library
+      # probe renames under (a system DLL is a "known DLL" the loader may
+      # map from its original path regardless of the path handed to it).
+      - name: Build the native-plugin fixture
+        run: cargo build -p rpi-test-native-plugin --locked 2>&1 | Tee-Object -FilePath fixture.log; exit $LASTEXITCODE
+        shell: pwsh
+
+      - name: Update tests (platform-independent and cfg(windows) probes)
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path target/debug -Filter 'rpi_test_native_plugin.dll' -Recurse -File |
+              Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dll) { throw 'native plugin fixture not built' }
+          $env:RPI_TEST_NATIVE_PLUGIN_DLL = $dll
+          cargo test -p rpi-ext-host --locked 2>&1 | Tee-Object -FilePath tests-ext-host.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p rpi --lib --locked -- windows_update package_command package_manager::registry_tests self_update 2>&1 | Tee-Object -FilePath tests-update.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p rpi --test extension_host_w7_test --locked 2>&1 | Tee-Object -FilePath tests-extension-host.log
+          exit $LASTEXITCODE
+
+      - name: PowerShell installer tests (PowerShell 7)
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/test-install-ps1.ps1 2>&1 | Tee-Object -FilePath install-ps1.log; exit $LASTEXITCODE
+
+      - name: PowerShell main-flow tests (PowerShell 7)
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/test-install-ps1-main.ps1 2>&1 | Tee-Object -FilePath install-ps1-main.log; exit $LASTEXITCODE
+
+      - name: PowerShell installer tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-install-ps1.ps1 2>&1 | Tee-Object -FilePath install-ps1-51.log; exit $LASTEXITCODE
+
+      - name: PowerShell main-flow tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-install-ps1-main.ps1 2>&1 | Tee-Object -FilePath install-ps1-main-51.log; exit $LASTEXITCODE
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: windows-tests-logs
+          path: |
+            fmt.log
+            clippy.log
+            check.log
+            fixture.log
+            tests-*.log
+            install-ps1*.log
+          if-no-files-found: ignore
+          retention-days: 14
